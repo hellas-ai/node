@@ -1,0 +1,21 @@
+use hellas_rpc::pb::hellas::node_client::NodeClient;
+use hellas_rpc::pb::hellas::node_server::NodeServer;
+use hellas_rpc::pb::hellas::PingRequest;
+use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
+use tonic_iroh_transport::IrohConnect;
+
+pub async fn run(node_id: EndpointId) {
+    let endpoint = Endpoint::builder()
+        .bind()
+        .await
+        .expect("Failed to create iroh endpoint");
+
+    let channel = NodeServer::<()>::connect(&endpoint, node_id.into())
+        .await
+        .expect("Failed to connect");
+
+    let mut node_client = NodeClient::new(channel);
+    let _response = node_client.ping(PingRequest {}).await.expect("Ping failed");
+
+    println!("Pong!");
+}

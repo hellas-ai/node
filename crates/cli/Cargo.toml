@@ -1,0 +1,18 @@
+[package]
+name = "hellas-cli"
+description = "Command-line interface for the Hellas node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+hellas-rpc = { path = "../rpc", features = ["client", "server"] }
+tonic-iroh-transport = { path = "../../../tonic-iroh" }
+tonic = "0.14"
