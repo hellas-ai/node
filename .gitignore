@@ -1,0 +1,10 @@
+/target
+/result
+.direnv
+.envrc
+.claude
+.env
+*.swp
+*.swo
+*~
+.DS_Store

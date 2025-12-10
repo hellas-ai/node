@@ -1,0 +1,23 @@
+[package]
+name = "hellas-rpc"
+description = "RPC implementation for the Hellas node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+client = ["tonic/channel"]
+server = ["tonic/server"]
+compile = ["dep:tonic-prost-build"]
+
+[dependencies]
+tonic-iroh-transport = { path = "../../../tonic-iroh" }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14", optional = true }

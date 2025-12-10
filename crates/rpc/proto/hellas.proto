@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package hellas;
+
+service Node {
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {}
