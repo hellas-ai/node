@@ -18,3 +18,4 @@ hellas-rpc = { path = "../rpc", features = ["client", "server"] }
 hellas-executor = { path = "../executor" }
 tonic-iroh-transport = { path = "../../../tonic-iroh" }
 tonic = { workspace = true }
+tokio-stream = { workspace = true }

@@ -69,6 +69,8 @@ pub async fn run() -> CliResult<()> {
         Ok(result) => result.context("failed to shut down RPC server")?,
         Err(_) => {
             warn!("graceful shutdown timed out; forcing shutdown");
+            // At this point, drop will signal shutdown; exit to avoid hanging
+            std::process::exit(0);
         }
     }
 

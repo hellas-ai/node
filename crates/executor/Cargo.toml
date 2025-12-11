@@ -10,6 +10,7 @@ documentation.workspace = true
 [dependencies]
 hellas-rpc = { path = "../rpc", features = ["server"] }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

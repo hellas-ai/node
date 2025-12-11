@@ -2,23 +2,40 @@ syntax = "proto3";
 
 package hellas;
 
-message GetQuoteRequest {
-    bytes graph = 1;
-    uint32 max_seq = 2;
-    string prompt = 3;
-    WeightsHint weights_hint = 4;
+message WeightsHint {
+    string huggingface_model_id = 1;
+    string revision = 2;
+}
 
+message LlmpQuoteRequest {
+    string huggingface_model_id = 1;
+    string revision = 2;
+    string prompt = 3;
+    // Optional; default to 16 when unset/zero
+    uint32 max_seq = 4;
+}
+
+message GetQuoteRequest {
+    oneof payload {
+        bytes graph = 1;
+        LlmpQuoteRequest llm_prompt = 2;
+    }
 }
 
 message GetQuoteResponse {
     string quote_id = 1;
     string graph_id = 2;
     uint64 amount = 3;
+    string input = 4;
+    WeightsHint resolved_weights = 5;
 }
 
-message WeightsHint {
-    string huggingface_model_id = 1;
-    string revision = 2;
+message GetGraphRequest {
+    string graph_id = 1;
+}
+
+message GetGraphResponse {
+    bytes graph = 1;
 }
 
 message ExecuteRequest {
@@ -34,14 +51,20 @@ message ExecuteStatusRequest {
     string execution_id = 1;
 }
 
+message ExecuteStreamRequest {
+    string execution_id = 1;
+}
+
 message ExecuteStatusResponse {
     string status = 1;
     bytes result = 2;
+    string decoded = 3;
 }
 
 message ExecuteStatusDiff {
     string status = 1;
     bytes result = 2;
+    string decoded = 3;
 }
 
 message ExecuteResultRequest {
@@ -50,4 +73,5 @@ message ExecuteResultRequest {
 
 message ExecuteResultResponse {
     string result = 1;
+    string decoded = 2;
 }

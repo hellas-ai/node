@@ -1522,6 +1522,7 @@ dependencies = [
  "hellas-executor",
  "hellas-rpc",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-iroh-transport",
  "tracing",
@@ -1546,6 +1547,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokenizers",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]

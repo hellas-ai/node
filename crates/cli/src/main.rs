@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate tracing;
+
 use clap::{Parser, Subcommand};
 use tonic_iroh_transport::iroh::EndpointId;
 
