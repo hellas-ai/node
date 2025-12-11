@@ -12,6 +12,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hellas-rpc = { path = "../rpc", features = ["client", "server"] }
 hellas-executor = { path = "../executor" }

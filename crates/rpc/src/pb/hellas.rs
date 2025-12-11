@@ -3,6 +3,12 @@
 pub struct GetQuoteRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub graph: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub max_seq: u32,
+    #[prost(string, tag = "3")]
+    pub prompt: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub weights_hint: ::core::option::Option<WeightsHint>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetQuoteResponse {
@@ -12,6 +18,13 @@ pub struct GetQuoteResponse {
     pub graph_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
     pub amount: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WeightsHint {
+    #[prost(string, tag = "1")]
+    pub huggingface_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub revision: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteRequest {
@@ -34,6 +47,15 @@ pub struct ExecuteStatusRequest {
 pub struct ExecuteStatusResponse {
     #[prost(string, tag = "1")]
     pub status: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub result: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteStatusDiff {
+    #[prost(string, tag = "1")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub result: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultRequest {
