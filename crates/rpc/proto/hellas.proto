@@ -2,10 +2,26 @@ syntax = "proto3";
 
 package hellas;
 
-service Node {
-  rpc Ping(PingRequest) returns (PingResponse);
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  string version = 1;
+  uint64 uptime_seconds = 2;
+  string node_id = 3;
 }
 
-message PingRequest {}
+service Node {
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
 
-message PingResponse {}
+service Quote {
+  rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+}
+
+message GetQuoteRequest {
+    bytes graph = 1;
+}
+message GetQuoteResponse {
+    string quote_id = 1;
+    string graph_id = 2;
+    uint64 amount = 3;
+}

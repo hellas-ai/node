@@ -1,11 +1,8 @@
 [workspace]
 members = [
-    # "crates/node",
     "crates/cli",
     "crates/rpc",
-    # "crates/executor",
-    # "crates/explorer",
-    # "crates/shared"
+    "crates/executor",
 ]
 resolver = "2"
 
@@ -19,18 +16,6 @@ documentation = "https://docs.rs"
 [workspace.dependencies]
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tonic = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# serde = { version = "1.0", features = ["derive"] }
-# serde_json = "1.0"
-# warp = "0.3"
-# uuid = { version = "1.0", features = ["v4", "serde"] }
-
-# tonic = { version = "0.13", features = ["prost"] }
-# ed25519-dalek = "2.0"
-# prost = "0.13"
-# prost-types = "0.13"
-# tonic-build = "0.13"
-# chrono = { version = "0.4", features = ["serde"] }
-# tokio-stream = "0.1"
-# futures-core = "0.3"
