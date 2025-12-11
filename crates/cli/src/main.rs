@@ -16,9 +16,14 @@ struct Cli {
 enum Commands {
     /// Run the RPC server
     Serve,
-    /// Ping a remote node
-    Ping {
-        /// Node ID to ping
+    /// Check health of a remote node
+    Health {
+        /// Node ID to check
+        node_id: EndpointId,
+    },
+    /// Get a quote from a remote node
+    Quote {
+        /// Node ID to request quote from
         node_id: EndpointId,
     },
 }
@@ -36,6 +41,7 @@ async fn main() {
 
     match cli.command {
         Commands::Serve => commands::serve::run().await,
-        Commands::Ping { node_id } => commands::ping::run(node_id).await,
+        Commands::Health { node_id } => commands::health::run(node_id).await,
+        Commands::Quote { node_id } => commands::quote::run(node_id).await,
     }
 }

@@ -1,34 +1,58 @@
+use hellas_executor::{Executor, QuoteServer};
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
-use hellas_rpc::pb::hellas::{PingRequest, PingResponse};
-use tonic::transport::Server;
+use hellas_rpc::pb::hellas::{HealthCheckRequest, HealthCheckResponse};
 use tonic::{Request, Response, Status};
-use tonic_iroh_transport::iroh::protocol::Router;
-use tonic_iroh_transport::GrpcProtocolHandler;
+use tonic_iroh_transport::iroh::Endpoint;
+use tonic_iroh_transport::RpcServer;
 
-struct NodeService;
+use std::time::Instant;
+
+struct NodeService {
+    start_time: Instant,
+    node_id: String,
+}
 
 #[tonic::async_trait]
 impl Node for NodeService {
-    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        Ok(Response::new(PingResponse {}))
+    async fn health_check(
+        &self,
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        Ok(Response::new(HealthCheckResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            node_id: self.node_id.clone(),
+        }))
     }
 }
 
 pub async fn run() {
-    let endpoint = tonic_iroh_transport::iroh::Endpoint::builder()
+    let endpoint = Endpoint::builder()
         .bind()
         .await
         .expect("Failed to create iroh endpoint");
 
-    println!("Node Address: {}", endpoint.id());
+    let node_id = endpoint.id().to_string();
+    println!("Node Address: {node_id}");
 
-    let (handler, incoming, alpn) = GrpcProtocolHandler::for_service::<NodeServer<NodeService>>();
+    let node_service = NodeService {
+        start_time: Instant::now(),
+        node_id,
+    };
 
-    let _router = Router::builder(endpoint).accept(alpn, handler).spawn();
+    let executor = Executor::spawn();
 
-    Server::builder()
-        .add_service(NodeServer::new(NodeService))
-        .serve_with_incoming(incoming)
+    let rpc_guard = RpcServer::new(endpoint)
+        .add_service(NodeServer::new(node_service))
+        .add_service(QuoteServer::new(executor))
+        .serve()
         .await
-        .expect("Server failed");
+        .expect("Failed to start RPC server");
+
+    println!("RPC server running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for shutdown signal");
+
+    rpc_guard.shutdown().await.expect("Shutdown failed");
 }

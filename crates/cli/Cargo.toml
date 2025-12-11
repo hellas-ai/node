@@ -14,5 +14,6 @@ tracing-subscriber.workspace = true
 
 clap = { version = "4", features = ["derive"] }
 hellas-rpc = { path = "../rpc", features = ["client", "server"] }
+hellas-executor = { path = "../executor" }
 tonic-iroh-transport = { path = "../../../tonic-iroh" }
-tonic = "0.14"
+tonic = { workspace = true }

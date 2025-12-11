@@ -1068,12 +1068,23 @@ name = "hellas-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hellas-executor",
  "hellas-rpc",
  "tokio",
  "tonic",
  "tonic-iroh-transport",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hellas-executor"
+version = "0.1.0"
+dependencies = [
+ "hellas-rpc",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -3450,10 +3461,14 @@ dependencies = [
 
 [[package]]
 name = "tonic-iroh-transport"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
+ "axum",
+ "bytes",
  "futures-util",
  "http",
+ "http-body",
+ "hyper",
  "hyper-util",
  "iroh",
  "thiserror 2.0.17",
