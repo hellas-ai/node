@@ -2,26 +2,16 @@ syntax = "proto3";
 
 package hellas;
 
-message HealthCheckRequest {}
-message HealthCheckResponse {
-  string version = 1;
-  uint64 uptime_seconds = 2;
-  string node_id = 3;
-}
+import "execute.proto";
+import "node.proto";
 
 service Node {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
-service Quote {
-  rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
-}
-
-message GetQuoteRequest {
-    bytes graph = 1;
-}
-message GetQuoteResponse {
-    string quote_id = 1;
-    string graph_id = 2;
-    uint64 amount = 3;
+service Execute {
+    rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
+    rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
 }
