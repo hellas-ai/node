@@ -9,9 +9,24 @@ pub enum StateError {
     ExecutionNotFound(String),
 }
 
+#[derive(Clone)]
+pub struct WeightsHint {
+    pub huggingface_model_id: String,
+    pub revision: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ExecutionPlan {
+    pub graph: Vec<u8>,
+    pub weights_hint: Option<WeightsHint>,
+    pub prompt: String,
+    pub max_seq: u32,
+}
+
 pub struct Quote {
     pub graph_id: String,
     pub amount: u64,
+    pub plan: ExecutionPlan,
 }
 
 pub struct Execution {
@@ -20,6 +35,7 @@ pub struct Execution {
     pub result: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 pub enum ExecutionStatus {
     Pending,
     Running,
@@ -55,10 +71,17 @@ impl ExecutorState {
         }
     }
 
-    pub fn create_quote(&mut self, graph_id: String, amount: u64) -> String {
+    pub fn create_quote(&mut self, graph_id: String, amount: u64, plan: ExecutionPlan) -> String {
         let quote_id = format!("quote-{}", self.next_quote_id);
         self.next_quote_id += 1;
-        self.quotes.insert(quote_id.clone(), Quote { graph_id, amount });
+        self.quotes.insert(
+            quote_id.clone(),
+            Quote {
+                graph_id,
+                amount,
+                plan,
+            },
+        );
         quote_id
     }
 

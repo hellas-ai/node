@@ -13,3 +13,14 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+catgrad = { workspace = true }
+catgrad-llm = { workspace = true }
+tokenizers = { workspace = true }
+anyhow = { workspace = true }
+half = { workspace = true }
+memmap2 = { workspace = true }
+safetensors = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true, features = ["pycompat"] }

@@ -4,12 +4,21 @@ package hellas;
 
 message GetQuoteRequest {
     bytes graph = 1;
+    uint32 max_seq = 2;
+    string prompt = 3;
+    WeightsHint weights_hint = 4;
+
 }
 
 message GetQuoteResponse {
     string quote_id = 1;
     string graph_id = 2;
     uint64 amount = 3;
+}
+
+message WeightsHint {
+    string huggingface_model_id = 1;
+    string revision = 2;
 }
 
 message ExecuteRequest {
@@ -27,6 +36,12 @@ message ExecuteStatusRequest {
 
 message ExecuteStatusResponse {
     string status = 1;
+    bytes result = 2;
+}
+
+message ExecuteStatusDiff {
+    string status = 1;
+    bytes result = 2;
 }
 
 message ExecuteResultRequest {

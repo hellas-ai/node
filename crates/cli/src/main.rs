@@ -25,6 +25,19 @@ enum Commands {
     Execute {
         /// Node ID to execute on
         node_id: EndpointId,
+        /// HuggingFace model id used to fetch weights (e.g. HuggingFaceTB/SmolLM2-135M-Instruct)
+        #[arg(
+            short = 'm',
+            long = "model",
+            default_value = "HuggingFaceTB/SmolLM2-135M-Instruct"
+        )]
+        model: String,
+        /// Prompt to execute (required)
+        #[arg(short = 'p', long = "prompt")]
+        prompt: String,
+        /// Maximum number of new tokens to generate
+        #[arg(long = "max-seq", default_value_t = 16)]
+        max_seq: u32,
     },
 }
 
@@ -38,9 +51,19 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Commands::Serve => commands::serve::run().await,
         Commands::Health { node_id } => commands::health::run(node_id).await,
-        Commands::Execute { node_id } => commands::execute::run(node_id).await,
+        Commands::Execute {
+            node_id,
+            model,
+            prompt,
+            max_seq,
+        } => commands::execute::run(node_id, model, prompt, max_seq).await,
+    };
+
+    if let Err(err) = result {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
     }
 }
