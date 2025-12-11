@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package hellas;
+
+message GetQuoteRequest {
+    bytes graph = 1;
+}
+
+message GetQuoteResponse {
+    string quote_id = 1;
+    string graph_id = 2;
+    uint64 amount = 3;
+}
+
+message ExecuteRequest {
+    bytes quote_id = 1;
+}
+
+message ExecuteResponse {
+    string execution_id = 1;
+    string quote_id = 2;
+}
+
+message ExecuteStatusRequest {
+    string execution_id = 1;
+}
+
+message ExecuteStatusResponse {
+    string status = 1;
+}
+
+message ExecuteResultRequest {
+    string execution_id = 1;
+}
+
+message ExecuteResultResponse {
+    string result = 1;
+}

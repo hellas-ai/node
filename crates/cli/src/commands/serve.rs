@@ -1,4 +1,4 @@
-use hellas_executor::{Executor, QuoteServer};
+use hellas_executor::{ExecuteServer, Executor};
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{HealthCheckRequest, HealthCheckResponse};
 use tonic::{Request, Response, Status};
@@ -44,7 +44,7 @@ pub async fn run() {
 
     let rpc_guard = RpcServer::new(endpoint)
         .add_service(NodeServer::new(node_service))
-        .add_service(QuoteServer::new(executor))
+        .add_service(ExecuteServer::new(executor))
         .serve()
         .await
         .expect("Failed to start RPC server");

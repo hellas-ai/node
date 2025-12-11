@@ -21,9 +21,9 @@ enum Commands {
         /// Node ID to check
         node_id: EndpointId,
     },
-    /// Get a quote from a remote node
-    Quote {
-        /// Node ID to request quote from
+    /// Execute a job on a remote node
+    Execute {
+        /// Node ID to execute on
         node_id: EndpointId,
     },
 }
@@ -38,10 +38,9 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-
     match cli.command {
         Commands::Serve => commands::serve::run().await,
         Commands::Health { node_id } => commands::health::run(node_id).await,
-        Commands::Quote { node_id } => commands::quote::run(node_id).await,
+        Commands::Execute { node_id } => commands::execute::run(node_id).await,
     }
 }
