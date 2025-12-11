@@ -1,16 +1,17 @@
 use crate::commands::CliResult;
 use anyhow::Context;
-use hellas_executor::catgrad_support::dump_graph_for_model;
 use hellas_rpc::pb::hellas::execute_client::ExecuteClient;
 use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
 use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteResultRequest, ExecuteStatusRequest, GetQuoteRequest, WeightsHint,
+    get_quote_request, ExecuteRequest, ExecuteResultRequest, ExecuteStatusRequest, GetQuoteRequest,
+    LlmpQuoteRequest,
 };
-use tokio::time::{sleep, Duration};
+use tokio_stream::StreamExt;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::IrohConnect;
 
 const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
+
 pub async fn run(
     node_id: EndpointId,
     model: String,
@@ -30,59 +31,61 @@ pub async fn run(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let graph_bytes = dump_graph_for_model(&model, &prompt, max_seq, None)
-        .context("failed to build catgrad graph")?;
-
     // 1. Get quote
-    println!("Getting quote...");
-    let quote = client
-        .get_quote(GetQuoteRequest {
-            graph: graph_bytes,
-            weights_hint: Some(WeightsHint {
-                huggingface_model_id: model,
-                revision: String::new(),
-            }),
+    let req = GetQuoteRequest {
+        payload: Some(get_quote_request::Payload::LlmPrompt(LlmpQuoteRequest {
+            huggingface_model_id: model.clone(),
+            revision: String::new(),
+            prompt: prompt.clone(),
             max_seq,
-            prompt,
-        })
+        })),
+    };
+    info!("Getting quote... {req:?}");
+    let quote = client
+        .get_quote(req)
         .await
         .context("GetQuote RPC failed")?
         .into_inner();
-    println!("Quote ID: {}", quote.quote_id);
-    println!("Graph ID: {}", quote.graph_id);
-    println!("Amount: {}", quote.amount);
+
+    info!("Got quote: {quote:?}");
 
     // 2. Execute
-    println!("\nExecuting...");
+    let req = ExecuteRequest {
+        quote_id: quote.quote_id.as_bytes().to_vec(),
+    };
+    info!("Req: {req:?}");
     let exec = client
-        .execute(ExecuteRequest {
-            quote_id: quote.quote_id.as_bytes().to_vec(),
-        })
+        .execute(req)
         .await
         .context("Execute RPC failed")?
         .into_inner();
-    println!("Execution ID: {}", exec.execution_id);
+    info!("Executing: {exec:?}");
 
-    // 3. Poll status until completed
-    println!("\nPolling status...");
-    loop {
-        let status = client
-            .execute_status(ExecuteStatusRequest {
-                execution_id: exec.execution_id.clone(),
-            })
-            .await
-            .context("ExecuteStatus RPC failed")?
-            .into_inner();
-        println!("Status: {}", status.status);
+    // 3. Stream status until completed
+    let mut req = ExecuteStatusRequest {
+        execution_id: exec.execution_id.clone(),
+    };
+    info!("\nStreaming status: {req:?}");
+    let mut stream = client
+        .execute_stream(req)
+        .await
+        .context("ExecuteStream RPC failed")?
+        .into_inner();
 
-        if status.status == "completed" || status.status == "failed" {
+    while let Some(diff) = stream.next().await {
+        let diff = diff.context("ExecuteStream RPC diff failed")?;
+        if diff.decoded.is_empty() {
+            info!("Status: {}", diff.status);
+        } else {
+            info!("Status: {} | Decoded: {}", diff.status, diff.decoded);
+        }
+        if diff.status == "completed" || diff.status == "failed" {
             break;
         }
-        sleep(Duration::from_millis(500)).await;
     }
 
     // 4. Get result
-    println!("\nGetting result...");
+    info!("\nGetting result...");
     let result = client
         .execute_result(ExecuteResultRequest {
             execution_id: exec.execution_id.clone(),
@@ -90,6 +93,9 @@ pub async fn run(
         .await
         .context("ExecuteResult RPC failed")?
         .into_inner();
+    if !result.decoded.is_empty() {
+        println!("{}", result.decoded);
+    }
     println!("Result: {}", result.result);
 
     Ok(())

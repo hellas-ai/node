@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend, Interpreter};
+use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend, Backend, Interpreter};
 use catgrad::path::path;
 use catgrad::prelude::Dtype;
 use catgrad::prelude::*;
-use catgrad::interpreter::Backend;
 use catgrad::typecheck;
 use catgrad::typecheck::value_types::{DtypeExpr, NatExpr, NdArrayType, ShapeExpr, TypeExpr};
 use catgrad_llm::legacy::models::utils::Config;
@@ -16,6 +15,7 @@ use minijinja_contrib::pycompat::unknown_method_callback;
 use safetensors::SafeTensors;
 use serde_json;
 use tokenizers::tokenizer::Tokenizer;
+use tracing::warn;
 
 const DEFAULT_REVISION: &str = "main";
 
@@ -26,11 +26,6 @@ fn resolve_revision(revision: Option<&str>) -> &str {
 /// Format a user prompt using the model's chat template when available.
 /// Falls back to the raw prompt if no template exists or rendering fails.
 fn prepare_prompt(model_id: &str, revision: Option<&str>, prompt: &str) -> Result<String> {
-    // If the prompt already contains chat markers, assume it has been prepared upstream.
-    if prompt.contains("<|im_start|>") || prompt.contains("<|im_end|>") {
-        return Ok(prompt.to_string());
-    }
-
     let revision = resolve_revision(revision);
     let template = match get_model_chat_template(model_id, revision) {
         Ok(t) if !t.trim().is_empty() => t,
@@ -295,20 +290,18 @@ fn load_weights_and_types(
     Ok((parameter_values, parameter_types, config, tokenizer))
 }
 
-/// Build and serialize a catgrad graph for a HF model id and prompt.
-/// This mirrors the catgrad-llm example: we load config/tokenizer, compute a sequence length
-/// based on the prompt, and dump the resulting `TypedTerm` to JSON bytes.
-pub fn dump_graph_for_model(
+/// Build and serialize a catgrad graph for a HF model id and prompt, returning the templated input.
+pub fn build_graph_from_llm_prompt(
     model_id: &str,
     prompt: &str,
     max_new_tokens: u32,
     revision: Option<&str>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, String)> {
     let prepared_prompt = prepare_prompt(model_id, revision, prompt)?;
     let (config, tokenizer) = load_config_and_tokenizer(model_id, revision)?;
 
     let encoding = tokenizer
-        .encode(prepared_prompt, true)
+        .encode(prepared_prompt.clone(), true)
         .map_err(|e| anyhow!("tokenizer encode error: {e}"))?;
     let prompt_tokens = encoding.get_ids().len();
     let max_sequence_length = prompt_tokens + max_new_tokens as usize;
@@ -319,25 +312,24 @@ pub fn dump_graph_for_model(
         .ok_or_else(|| anyhow!("failed to construct typed term for model {}", model.path()))?;
 
     let graph_bytes = serde_json::to_vec_pretty(&typed_term)?;
-    Ok(graph_bytes)
+    Ok((graph_bytes, prepared_prompt))
 }
 
 /// Fetch weights, build the environment, and execute the provided TypedTerm, streaming decoded text.
 pub fn run_graph_streaming(
     model_id: &str,
-    prompt: &str,
+    prepared_input: &str,
     typed_term: &catgrad::category::lang::TypedTerm,
     max_seq: u32,
     revision: Option<&str>,
     mut on_partial: impl FnMut(&str, bool),
 ) -> Result<()> {
-    let prepared_prompt = prepare_prompt(model_id, revision, prompt)?;
     let backend = NdArrayBackend;
     let (parameter_values, parameter_types, config, tokenizer) =
         load_weights_and_types(model_id, revision, &backend)?;
 
     let encoding = tokenizer
-        .encode(prepared_prompt, true)
+        .encode(prepared_input, true)
         .map_err(|e| anyhow!("tokenizer encode error: {e}"))?;
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
 

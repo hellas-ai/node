@@ -7,8 +7,8 @@ fn main() {
 fn compile() {
     let protos = &[
         "proto/hellas.proto",
-        // "proto/execute.proto",
-        // "proto/node.proto",
+        "proto/execute.proto",
+        "proto/node.proto",
     ];
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
