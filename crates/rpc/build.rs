@@ -5,7 +5,11 @@ fn main() {
 
 #[cfg(feature = "compile")]
 fn compile() {
-    let protos = &["proto/hellas.proto"];
+    let protos = &[
+        "proto/hellas.proto",
+        // "proto/execute.proto",
+        // "proto/node.proto",
+    ];
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
     }

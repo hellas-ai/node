@@ -1,3 +1,5 @@
+use crate::commands::CliResult;
+use anyhow::Context;
 use hellas_executor::{ExecuteServer, Executor};
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{HealthCheckRequest, HealthCheckResponse};
@@ -6,6 +8,10 @@ use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::RpcServer;
 
 use std::time::Instant;
+use tokio::time::{timeout, Duration};
+use tracing::warn;
+
+const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
 
 struct NodeService {
     start_time: Instant,
@@ -26,11 +32,11 @@ impl Node for NodeService {
     }
 }
 
-pub async fn run() {
+pub async fn run() -> CliResult<()> {
     let endpoint = Endpoint::builder()
         .bind()
         .await
-        .expect("Failed to create iroh endpoint");
+        .context("failed to create iroh endpoint")?;
 
     let node_id = endpoint.id().to_string();
     println!("Node Address: {node_id}");
@@ -42,17 +48,29 @@ pub async fn run() {
 
     let executor = Executor::spawn();
 
+    let execute_service = ExecuteServer::new(executor)
+        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+
     let rpc_guard = RpcServer::new(endpoint)
         .add_service(NodeServer::new(node_service))
-        .add_service(ExecuteServer::new(executor))
+        .add_service(execute_service)
         .serve()
         .await
-        .expect("Failed to start RPC server");
+        .context("failed to start RPC server")?;
 
     println!("RPC server running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c()
         .await
-        .expect("Failed to listen for shutdown signal");
+        .context("failed to listen for shutdown signal")?;
 
-    rpc_guard.shutdown().await.expect("Shutdown failed");
+    println!("Shutting down RPC server...");
+    match timeout(Duration::from_secs(5), rpc_guard.shutdown()).await {
+        Ok(result) => result.context("failed to shut down RPC server")?,
+        Err(_) => {
+            warn!("graceful shutdown timed out; forcing shutdown");
+        }
+    }
+
+    Ok(())
 }
