@@ -8,7 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
-hellas-rpc = { path = "../rpc", features = ["server"] }
+hellas-rpc = { workspace = true, features = ["server"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
@@ -16,12 +16,9 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-catgrad = { workspace = true }
-catgrad-llm = { workspace = true }
-tokenizers = { workspace = true }
-anyhow = { workspace = true }
-half = { workspace = true }
-memmap2 = { workspace = true }
-safetensors = { workspace = true }
-minijinja = { workspace = true }
-minijinja-contrib = { workspace = true, features = ["pycompat"] }
+catgrad = { git = "https://github.com/hellas-ai/catgrad", default-features = false, features = ["serde", "ndarray-backend"] }
+catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", default-features = false }
+hf-hub = "0.4"
+tokenizers = "0.21"
+minijinja = "2.11"
+minijinja-contrib = { version = "2.11", features = ["pycompat"] }

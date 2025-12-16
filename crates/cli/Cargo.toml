@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = []
+serve = ["hellas-executor"]
+
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
@@ -14,8 +18,12 @@ tracing-subscriber.workspace = true
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-hellas-rpc = { path = "../rpc", features = ["client", "server"] }
-hellas-executor = { path = "../executor" }
-tonic-iroh-transport = { path = "../../../tonic-iroh" }
+hellas-rpc = { workspace = true, features = ["client", "server"] }
+hellas-executor = { workspace = true, optional = true }
+tonic-iroh-transport = { workspace = true, features = ["gossip"] }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+
+# dev-dependencies- add 'compile' feature to hellas-rpc
+[dev-dependencies]
+# hellas-rpc = { workspace = true, features = ["compile"] }

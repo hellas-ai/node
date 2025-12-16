@@ -7,15 +7,13 @@ pub struct WeightsHint {
     pub revision: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct LlmpQuoteRequest {
+pub struct LlmQuoteRequest {
     #[prost(string, tag = "1")]
     pub huggingface_model_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub revision: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
     pub prompt: ::prost::alloc::string::String,
     /// Optional; default to 16 when unset/zero
-    #[prost(uint32, tag = "4")]
+    #[prost(uint32, tag = "3")]
     pub max_seq: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -30,7 +28,7 @@ pub mod get_quote_request {
         #[prost(bytes, tag = "1")]
         Graph(::prost::alloc::vec::Vec<u8>),
         #[prost(message, tag = "2")]
-        LlmPrompt(super::LlmpQuoteRequest),
+        LlmPrompt(super::LlmQuoteRequest),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -74,27 +72,26 @@ pub struct ExecuteStatusRequest {
     pub execution_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteStreamRequest {
-    #[prost(string, tag = "1")]
-    pub execution_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStatusResponse {
     #[prost(string, tag = "1")]
     pub status: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(uint64, tag = "2")]
+    pub progress: u64,
+    #[prost(bytes = "vec", tag = "3")]
     pub result: ::prost::alloc::vec::Vec<u8>,
-    #[prost(string, tag = "3")]
-    pub decoded: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub decoded: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteStatusDiff {
+pub struct ExecuteProgress {
     #[prost(string, tag = "1")]
     pub status: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub result: ::prost::alloc::vec::Vec<u8>,
-    #[prost(string, tag = "3")]
-    pub decoded: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub progress: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub chunk: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "4")]
+    pub decoded: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultRequest {
@@ -103,8 +100,8 @@ pub struct ExecuteResultRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultResponse {
-    #[prost(string, tag = "1")]
-    pub result: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub result: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
     pub decoded: ::prost::alloc::string::String,
 }
@@ -118,6 +115,19 @@ pub struct HealthCheckResponse {
     pub uptime_seconds: u64,
     #[prost(string, tag = "3")]
     pub node_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Presence {
+    #[prost(string, tag = "1")]
+    pub hf_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub req_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub peer_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub ttl_ms: u64,
+    #[prost(bool, tag = "5")]
+    pub is_executor: bool,
 }
 /// Generated client implementations.
 pub mod node_client {
@@ -595,7 +605,7 @@ pub mod execute_client {
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteStatusRequest>,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::ExecuteStatusDiff>>,
+            tonic::Response<tonic::codec::Streaming<super::ExecuteProgress>>,
             tonic::Status,
         > {
             self.inner
@@ -681,7 +691,7 @@ pub mod execute_server {
         >;
         /// Server streaming response type for the ExecuteStream method.
         type ExecuteStreamStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::ExecuteStatusDiff, tonic::Status>,
+                Item = std::result::Result<super::ExecuteProgress, tonic::Status>,
             >
             + std::marker::Send
             + 'static;
@@ -957,7 +967,7 @@ pub mod execute_server {
                         T: Execute,
                     > tonic::server::ServerStreamingService<super::ExecuteStatusRequest>
                     for ExecuteStreamSvc<T> {
-                        type Response = super::ExecuteStatusDiff;
+                        type Response = super::ExecuteProgress;
                         type ResponseStream = T::ExecuteStreamStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,
