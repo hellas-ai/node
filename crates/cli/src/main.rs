@@ -4,6 +4,7 @@ extern crate tracing;
 use clap::{Parser, Subcommand};
 use tonic_iroh_transport::iroh::EndpointId;
 
+mod bootstrap_peers;
 mod commands;
 
 #[derive(Parser)]
@@ -17,8 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(feature = "serve")]
     /// Run the RPC server
-    Serve,
+    Serve {
+        /// Enable discovery (LAN mDNS + internet discovery via pkarr/DNS + DHT).
+        #[arg(long, default_value_t = false)]
+        discovery: bool,
+    },
     /// Check health of a remote node
     Health {
         /// Node ID to check
@@ -26,8 +32,8 @@ enum Commands {
     },
     /// Execute a job on a remote node
     Execute {
-        /// Node ID to execute on
-        node_id: EndpointId,
+        /// Node ID to execute on (omit to auto-discover)
+        node_id: Option<EndpointId>,
         /// HuggingFace model id used to fetch weights (e.g. HuggingFaceTB/SmolLM2-135M-Instruct)
         #[arg(
             short = 'm',
@@ -49,13 +55,14 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,hellas=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
 
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Serve => commands::serve::run().await,
+        #[cfg(feature = "serve")]
+        Commands::Serve { discovery } => commands::serve::run(discovery).await,
         Commands::Health { node_id } => commands::health::run(node_id).await,
         Commands::Execute {
             node_id,

@@ -10,10 +10,18 @@ service Node {
 }
 
 service Execute {
-    rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
-    rpc GetGraph(GetGraphRequest) returns (GetGraphResponse);
-    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-    rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
-    rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteStatusDiff);
-    rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
+  rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+  rpc GetGraph(GetGraphRequest) returns (GetGraphResponse);
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
+  rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteProgress);
+  rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
+}
+
+message Presence {
+  string hf_id = 1;
+  string req_id = 2;
+  string peer_id = 3;
+  uint64 ttl_ms = 4;
+  bool is_executor = 5;
 }

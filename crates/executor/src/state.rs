@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use thiserror::Error;
 
+use crate::weights::ResolvedWeightKey;
+
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error("quote not found: {0}")]
@@ -10,30 +12,21 @@ pub enum StateError {
 }
 
 #[derive(Clone)]
-pub struct WeightsHint {
-    pub huggingface_model_id: String,
-    pub revision: Option<String>,
-}
-
-#[derive(Clone)]
 pub struct ExecutionPlan {
     pub graph: Vec<u8>,
-    pub weights_hint: Option<WeightsHint>,
+    pub weights_hint: Option<ResolvedWeightKey>,
     pub input: String,
     pub max_seq: u32,
-    pub is_llm: bool,
 }
 
 pub struct Quote {
-    pub graph_id: String,
-    pub amount: u64,
     pub plan: ExecutionPlan,
 }
 
 pub struct Execution {
-    pub quote_id: String,
     pub status: ExecutionStatus,
-    pub result: Option<String>,
+    pub progress: u64,
+    pub result: Option<Vec<u8>>,
     pub decoded: Option<String>,
 }
 
@@ -75,18 +68,11 @@ impl ExecutorState {
         }
     }
 
-    pub fn create_quote(&mut self, graph_id: String, amount: u64, plan: ExecutionPlan) -> String {
+    pub fn create_quote(&mut self, graph_id: String, plan: ExecutionPlan) -> String {
         let quote_id = format!("quote-{}", self.next_quote_id);
         self.next_quote_id += 1;
         self.graphs.insert(graph_id.clone(), plan.graph.clone());
-        self.quotes.insert(
-            quote_id.clone(),
-            Quote {
-                graph_id,
-                amount,
-                plan,
-            },
-        );
+        self.quotes.insert(quote_id.clone(), Quote { plan });
         quote_id
     }
 
@@ -109,8 +95,8 @@ impl ExecutorState {
         self.executions.insert(
             execution_id.clone(),
             Execution {
-                quote_id,
                 status: ExecutionStatus::Pending,
+                progress: 0,
                 result: None,
                 decoded: None,
             },
@@ -125,10 +111,17 @@ impl ExecutorState {
             .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
     }
 
-    pub fn get_result(&self, execution_id: &str) -> Result<&str, StateError> {
+    pub fn get_result(&self, execution_id: &str) -> Result<&[u8], StateError> {
         self.executions
             .get(execution_id)
             .and_then(|e| e.result.as_deref())
+            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
+    }
+
+    pub fn get_progress(&self, execution_id: &str) -> Result<u64, StateError> {
+        self.executions
+            .get(execution_id)
+            .map(|e| e.progress)
             .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
     }
 
@@ -154,7 +147,7 @@ impl ExecutorState {
     pub fn set_result(
         &mut self,
         execution_id: &str,
-        result: String,
+        result: Vec<u8>,
         decoded: Option<String>,
     ) -> Result<(), StateError> {
         self.executions
@@ -164,6 +157,37 @@ impl ExecutorState {
                 exec.decoded = decoded;
             })
             .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
+    }
+
+    pub fn append_output_chunk(
+        &mut self,
+        execution_id: &str,
+        chunk: &[u8],
+        decoded_chunk: Option<&str>,
+        progress: u64,
+    ) -> Result<(), StateError> {
+        let exec = self
+            .executions
+            .get_mut(execution_id)
+            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))?;
+
+        exec.progress = progress;
+
+        if !chunk.is_empty() {
+            exec.result
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(chunk);
+        }
+
+        if let Some(decoded_chunk) = decoded_chunk {
+            if !decoded_chunk.is_empty() {
+                exec.decoded
+                    .get_or_insert_with(String::new)
+                    .push_str(decoded_chunk);
+            }
+        }
+
+        Ok(())
     }
 }
 
