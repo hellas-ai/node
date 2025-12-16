@@ -10,11 +10,11 @@ documentation.workspace = true
 [features]
 default = []
 client = ["tonic/channel"]
-server = ["tonic/server"]
+server = ["tonic/server", "tonic-iroh-transport/discovery"]
 compile = ["dep:tonic-prost-build"]
 
 [dependencies]
-tonic-iroh-transport = { path = "../../../tonic-iroh" }
+tonic-iroh-transport = { workspace = true}
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"

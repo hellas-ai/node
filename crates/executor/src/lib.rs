@@ -3,26 +3,29 @@ extern crate tracing;
 
 pub mod catgrad_support;
 mod error;
+mod execute_worker;
 mod state;
+mod weights;
 
 pub use error::ExecutorError;
 pub use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
 
-use ::catgrad::category::lang::TypedTerm;
-use state::{ExecutionPlan, ExecutionStatus, ExecutorState, StateError, WeightsHint};
+use execute_worker::{ExecuteJob, ExecuteWorker, ExecuteWorkerError};
+use state::{ExecutionPlan, ExecutionStatus, ExecutorState, StateError};
+use weights::{default_ref_cached, EnsureDisposition, ModelId, WeightsManager};
 
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
-    get_quote_request, ExecuteRequest, ExecuteResponse, ExecuteResultRequest,
-    ExecuteResultResponse, ExecuteStatusDiff, ExecuteStatusRequest, ExecuteStatusResponse,
-    GetGraphRequest, GetGraphResponse, GetQuoteRequest, GetQuoteResponse, LlmpQuoteRequest,
-    WeightsHint as RpcWeightsHint,
+    get_quote_request, ExecuteProgress, ExecuteRequest, ExecuteResponse, ExecuteResultRequest,
+    ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse, GetGraphRequest,
+    GetGraphResponse, GetQuoteRequest, GetQuoteResponse, WeightsHint as RpcWeightsHint,
 };
-use tokio::sync::{mpsc, oneshot};
-use tonic::{Request, Response, Status};
-use tonic::Status as TonicStatus;
+use std::collections::HashMap;
 use std::pin::Pin;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
+use tonic::Status as TonicStatus;
+use tonic::{Request, Response, Status};
 
 const DEFAULT_MAX_SEQ: u32 = 16;
 
@@ -37,7 +40,9 @@ enum ExecutorMessage {
     },
     Subscribe {
         execution_id: String,
-        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<ExecuteStatusDiff>, ExecutorError>>,
+        reply: oneshot::Sender<
+            Result<(ExecuteProgress, mpsc::UnboundedReceiver<ExecuteProgress>), ExecutorError>,
+        >,
     },
     Execute {
         request: ExecuteRequest,
@@ -53,32 +58,37 @@ enum ExecutorMessage {
     },
     Progress {
         execution_id: String,
-        result: String,
-        decoded: Option<String>,
+        chunk: Vec<u8>,
+        decoded_chunk: Option<String>,
+        progress: u64,
     },
     Complete {
         execution_id: String,
-        result: String,
+        result: Option<Vec<u8>>,
         decoded: Option<String>,
         success: bool,
     },
 }
 
 pub struct Executor {
-    tx: mpsc::UnboundedSender<ExecutorMessage>,
     rx: mpsc::UnboundedReceiver<ExecutorMessage>,
     state: ExecutorState,
-    watchers: std::collections::HashMap<String, Vec<mpsc::UnboundedSender<ExecuteStatusDiff>>>,
+    watchers: HashMap<String, Vec<mpsc::UnboundedSender<ExecuteProgress>>>,
+    weights: WeightsManager,
+    execute_worker: ExecuteWorker,
 }
 
 impl Executor {
     pub fn spawn() -> ExecutorHandle {
         let (tx, rx) = mpsc::unbounded_channel();
+        let weights = WeightsManager::spawn();
+        let execute_worker = ExecuteWorker::spawn(tx.clone());
         let executor = Self {
-            tx: tx.clone(),
             rx,
             state: ExecutorState::new(),
-            watchers: std::collections::HashMap::new(),
+            watchers: HashMap::new(),
+            weights,
+            execute_worker,
         };
         tokio::spawn(executor.run());
         ExecutorHandle { tx }
@@ -88,16 +98,19 @@ impl Executor {
         while let Some(msg) = self.rx.recv().await {
             match msg {
                 ExecutorMessage::Quote { request, reply } => {
-                    let _ = reply.send(self.handle_quote(request));
+                    let _ = reply.send(self.handle_quote(request).await);
                 }
                 ExecutorMessage::Graph { request, reply } => {
                     let _ = reply.send(self.handle_graph(request));
                 }
-                ExecutorMessage::Subscribe { execution_id, reply } => {
+                ExecutorMessage::Subscribe {
+                    execution_id,
+                    reply,
+                } => {
                     let _ = reply.send(self.handle_subscribe(execution_id));
                 }
                 ExecutorMessage::Execute { request, reply } => {
-                    let _ = reply.send(self.handle_execute(request));
+                    let _ = reply.send(self.handle_execute(request).await);
                 }
                 ExecutorMessage::Status { request, reply } => {
                     let _ = reply.send(self.handle_status(request));
@@ -107,11 +120,23 @@ impl Executor {
                 }
                 ExecutorMessage::Progress {
                     execution_id,
-                    result,
-                    decoded,
+                    chunk,
+                    decoded_chunk,
+                    progress,
                 } => {
-                    let _ = self.state.set_result(&execution_id, result, decoded);
-                    self.send_diff(&execution_id, ExecutionStatus::Running);
+                    let _ = self.state.append_output_chunk(
+                        &execution_id,
+                        &chunk,
+                        decoded_chunk.as_deref(),
+                        progress,
+                    );
+                    self.send_progress(
+                        &execution_id,
+                        ExecutionStatus::Running,
+                        progress,
+                        chunk,
+                        decoded_chunk,
+                    );
                 }
                 ExecutorMessage::Complete {
                     execution_id,
@@ -137,89 +162,107 @@ impl Executor {
     fn handle_subscribe(
         &mut self,
         execution_id: String,
-    ) -> Result<mpsc::UnboundedReceiver<ExecuteStatusDiff>, ExecutorError> {
+    ) -> Result<(ExecuteProgress, mpsc::UnboundedReceiver<ExecuteProgress>), ExecutorError> {
         // Validate existence and grab current snapshot
-        let status = self.state.get_status(&execution_id)?;
-        let result = self
-            .state
-            .get_result(&execution_id)
-            .map(|s| s.as_bytes().to_vec())
-            .unwrap_or_default();
-        let decoded = self
-            .state
-            .get_decoded(&execution_id)?
-            .unwrap_or_default()
-            .to_string();
+        let status = *self.state.get_status(&execution_id)?;
+        let progress = self.state.get_progress(&execution_id).unwrap_or(0);
 
         let (tx, rx) = mpsc::unbounded_channel();
-        // Send initial snapshot
-        let initial = ExecuteStatusDiff {
-            status: status.as_str().to_string(),
-            result,
-            decoded,
-        };
-        let _ = tx.send(initial);
 
-        self.watchers
-            .entry(execution_id)
-            .or_default()
-            .push(tx);
+        // Only keep watchers alive when more updates are expected
+        if !matches!(status, ExecutionStatus::Completed | ExecutionStatus::Failed) {
+            self.watchers.entry(execution_id).or_default().push(tx);
+        }
 
-        Ok(rx)
+        Ok((
+            ExecuteProgress {
+                status: status.as_str().to_string(),
+                progress,
+                chunk: Vec::new(),
+                decoded: None,
+            },
+            rx,
+        ))
     }
 
-    fn handle_quote(
+    async fn handle_quote(
         &mut self,
         request: GetQuoteRequest,
     ) -> Result<GetQuoteResponse, ExecutorError> {
-        let (graph, input, weights_hint, max_seq, is_llm) = match request
-            .payload
-            .as_ref()
-            .ok_or_else(|| ExecutorError::Execution("quote payload missing".into()))?
-        {
-            get_quote_request::Payload::Graph(graph) => {
-                serde_json::from_slice::<TypedTerm>(graph)
-                    .map_err(ExecutorError::InvalidGraph)?;
-                (
-                    graph.clone(),
-                    String::new(),
-                    None,
-                    DEFAULT_MAX_SEQ,
-                    false,
-                )
-            }
-            get_quote_request::Payload::LlmPrompt(LlmpQuoteRequest {
-                huggingface_model_id,
-                revision,
-                prompt,
-                max_seq,
-            }) => {
-                let max_seq = if *max_seq == 0 { DEFAULT_MAX_SEQ } else { *max_seq };
-                let revision = if revision.is_empty() {
-                    None
+        let payload = request.payload.ok_or(ExecutorError::MissingPayload)?;
+
+        enum QuoteKind {
+            Graph,
+            Llm { model_id: String, max_seq: u32 },
+        }
+
+        let (graph, input, weights_hint, max_seq, kind) = match payload {
+            get_quote_request::Payload::Graph(graph) => (
+                graph,
+                String::new(),
+                None,
+                DEFAULT_MAX_SEQ,
+                QuoteKind::Graph,
+            ),
+            get_quote_request::Payload::LlmPrompt(llm) => {
+                let max_seq = if llm.max_seq == 0 {
+                    DEFAULT_MAX_SEQ
                 } else {
-                    Some(revision.clone())
+                    llm.max_seq
                 };
 
-                let (graph_bytes, templated_input) = catgrad_support::build_graph_from_llm_prompt(
-                    huggingface_model_id,
-                    prompt,
-                    max_seq,
-                    revision.as_deref(),
-                )
-                .map_err(|e| ExecutorError::Execution(e.to_string()))?;
+                let model_id = llm.huggingface_model_id.clone();
+                let model_id_typed = ModelId(model_id.clone());
+                let disposition = self
+                    .weights
+                    .ensure_default_ready(model_id_typed.clone())
+                    .await;
 
-                let weights_hint = Some(WeightsHint {
-                    huggingface_model_id: huggingface_model_id.clone(),
-                    revision,
-                });
+                let key = match disposition {
+                    EnsureDisposition::Ready(key) => key,
+                    EnsureDisposition::Queued | EnsureDisposition::InFlight => {
+                        if default_ref_cached(&model_id) {
+                            let key = self
+                                .weights
+                                .ensure_default_ready_wait(
+                                    model_id_typed,
+                                    tokio::time::Duration::from_secs(2),
+                                )
+                                .await
+                                .map_err(|e| match e {
+                                    weights::WeightsError::NotReady => {
+                                        ExecutorError::WeightsNotReady(model_id.clone())
+                                    }
+                                    other => ExecutorError::WeightsError(other.to_string()),
+                                })?;
+                            key
+                        } else {
+                            return Err(ExecutorError::WeightsNotReady(model_id));
+                        }
+                    }
+                    EnsureDisposition::Failed(err) => {
+                        return Err(ExecutorError::WeightsError(err));
+                    }
+                };
+
+                let bundle = self
+                    .weights
+                    .bundle(&key)
+                    .await
+                    .map_err(|e| ExecutorError::WeightsError(e.to_string()))?;
+
+                let (graph_bytes, templated_input) = catgrad_support::build_graph_from_llm_prompt(
+                    bundle.as_ref(),
+                    &llm.prompt,
+                    max_seq,
+                )?;
 
                 (
                     graph_bytes,
                     templated_input,
-                    weights_hint,
+                    Some(key),
                     max_seq,
-                    true,
+                    QuoteKind::Llm { model_id, max_seq },
                 )
             }
         };
@@ -229,23 +272,21 @@ impl Executor {
             weights_hint: weights_hint.clone(),
             input: input.clone(),
             max_seq,
-            is_llm,
         };
         let graph_id = format!("{:x}", simple_hash(&graph));
         let amount = 1000; // stub
-        let quote_id = self.state.create_quote(graph_id.clone(), amount, plan);
+        let quote_id = self.state.create_quote(graph_id.clone(), plan);
 
-        match request.payload.as_ref().unwrap() {
-            get_quote_request::Payload::Graph(_) => {
+        match kind {
+            QuoteKind::Graph => {
                 info!(%quote_id, %graph_id, amount, "quoted raw graph");
             }
-            get_quote_request::Payload::LlmPrompt(llm) => {
+            QuoteKind::Llm { model_id, max_seq } => {
                 info!(
                     %quote_id,
                     %graph_id,
                     amount,
-                    model = llm.huggingface_model_id,
-                    revision = llm.revision,
+                    model = model_id,
                     max_seq,
                     input_len = input.len(),
                     "quoted llm prompt"
@@ -259,47 +300,60 @@ impl Executor {
             amount,
             input,
             resolved_weights: weights_hint.map(|hint| RpcWeightsHint {
-                huggingface_model_id: hint.huggingface_model_id,
-                revision: hint.revision.unwrap_or_default(),
+                huggingface_model_id: hint.model_id.0,
+                revision: hint.revision.0,
             }),
         })
     }
 
-    fn handle_execute(
+    async fn handle_execute(
         &mut self,
         request: ExecuteRequest,
     ) -> Result<ExecuteResponse, ExecutorError> {
         let quote_id = String::from_utf8_lossy(&request.quote_id).to_string();
-        let execution_id = self.state.create_execution(quote_id.clone())?;
         let plan = self.state.get_quote(&quote_id)?.plan.clone();
+
+        if self.execute_worker.is_busy() {
+            return Err(ExecutorError::Busy);
+        }
+
+        let bundle = match plan.weights_hint.clone() {
+            Some(key) => Some(self.weights.bundle(&key).await.map_err(|e| match e {
+                weights::WeightsError::NotReady => {
+                    ExecutorError::WeightsNotReady(key.model_id.0.clone())
+                }
+                weights::WeightsError::Failed(msg) => ExecutorError::WeightsError(msg),
+                other => ExecutorError::WeightsError(other.to_string()),
+            })?),
+            None => None,
+        };
+
+        let reservation = self.execute_worker.reserve().map_err(|e| match e {
+            ExecuteWorkerError::Busy => ExecutorError::Busy,
+            ExecuteWorkerError::Stopped => ExecutorError::ChannelClosed,
+        })?;
+
+        let execution_id = self.state.create_execution(quote_id.clone())?;
         self.state
             .set_status(&execution_id, ExecutionStatus::Running)?;
 
         info!(
             %execution_id,
             %quote_id,
-            is_llm = plan.is_llm,
             input_len = plan.input.len(),
             "starting execution"
         );
 
-        let tx = self.tx.clone();
-        let exec_id = execution_id.clone();
-        tokio::spawn(async move {
-            let (result, decoded, success) =
-                match execute_plan(&exec_id, plan, tx.clone()).await {
-                    Ok((result, decoded)) => (result, decoded, true),
-                    Err(err) => (err.to_string(), None, false),
-                };
-            if let Err(e) = tx.send(ExecutorMessage::Complete {
-                execution_id: exec_id.clone(),
-                result,
-                decoded,
-                success,
-            }) {
-                warn!("failed to send completion for {exec_id}: {e}");
-            }
-        });
+        reservation
+            .enqueue(ExecuteJob {
+                execution_id: execution_id.clone(),
+                plan,
+                bundle,
+            })
+            .map_err(|e| match e {
+                ExecuteWorkerError::Busy => ExecutorError::Busy,
+                ExecuteWorkerError::Stopped => ExecutorError::ChannelClosed,
+            })?;
 
         Ok(ExecuteResponse {
             execution_id,
@@ -310,7 +364,7 @@ impl Executor {
     fn handle_complete(
         &mut self,
         execution_id: String,
-        result: String,
+        result: Option<Vec<u8>>,
         decoded: Option<String>,
         success: bool,
     ) {
@@ -329,10 +383,12 @@ impl Executor {
             warn!("failed to set status for {execution_id}: {e}");
             return;
         }
-        if let Err(e) = self.state.set_result(&execution_id, result, decoded) {
-            warn!("failed to set result for {execution_id}: {e}");
+        if let Some(result) = result {
+            if let Err(e) = self.state.set_result(&execution_id, result, decoded) {
+                warn!("failed to set result for {execution_id}: {e}");
+            }
         }
-        self.send_diff(&execution_id, status);
+        self.send_status(&execution_id, status);
     }
 
     fn handle_status(
@@ -340,18 +396,19 @@ impl Executor {
         request: ExecuteStatusRequest,
     ) -> Result<ExecuteStatusResponse, ExecutorError> {
         let status = self.state.get_status(&request.execution_id)?;
+        let progress = self.state.get_progress(&request.execution_id).unwrap_or(0);
         let result_bytes = self
             .state
             .get_result(&request.execution_id)
-            .map(|s| s.as_bytes().to_vec())
+            .map(|s| s.to_vec())
             .unwrap_or_default();
         let decoded = self
             .state
             .get_decoded(&request.execution_id)?
-            .unwrap_or_default()
-            .to_string();
+            .map(|s| s.to_string());
         Ok(ExecuteStatusResponse {
             status: status.as_str().to_string(),
+            progress,
             result: result_bytes,
             decoded,
         })
@@ -367,80 +424,40 @@ impl Executor {
             .get_decoded(&request.execution_id)?
             .unwrap_or_default();
         Ok(ExecuteResultResponse {
-            result: result.to_string(),
+            result: result.to_vec(),
             decoded: decoded.to_string(),
         })
     }
 
-    fn send_diff(&mut self, execution_id: &str, status: ExecutionStatus) {
+    fn send_progress(
+        &mut self,
+        execution_id: &str,
+        status: ExecutionStatus,
+        progress: u64,
+        chunk: Vec<u8>,
+        decoded: Option<String>,
+    ) {
         if let Some(watchers) = self.watchers.get_mut(execution_id) {
-            let result = self
-                .state
-                .get_result(execution_id)
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_default();
-            let decoded = self
-                .state
-                .get_decoded(execution_id)
-                .unwrap_or(None)
-                .unwrap_or_default()
-                .to_string();
-
-            watchers.retain(|tx| tx.send(ExecuteStatusDiff {
-                status: status.as_str().to_string(),
-                result: result.clone(),
-                decoded: decoded.clone(),
-            })
-            .is_ok());
+            watchers.retain(|tx| {
+                tx.send(ExecuteProgress {
+                    status: status.as_str().to_string(),
+                    progress,
+                    chunk: chunk.clone(),
+                    decoded: decoded.clone(),
+                })
+                .is_ok()
+            });
 
             if matches!(status, ExecutionStatus::Completed | ExecutionStatus::Failed) {
                 self.watchers.remove(execution_id);
             }
         }
     }
-}
 
-async fn execute_plan(
-    execution_id: &str,
-    plan: ExecutionPlan,
-    tx: mpsc::UnboundedSender<ExecutorMessage>,
-) -> Result<(String, Option<String>), ExecutorError> {
-    let term: TypedTerm =
-        serde_json::from_slice(&plan.graph).map_err(ExecutorError::InvalidGraph)?;
-
-    let prompt = plan.input.clone();
-
-    let model_id = plan
-        .weights_hint
-        .as_ref()
-        .map(|hint| hint.huggingface_model_id.clone())
-        .ok_or_else(|| ExecutorError::Execution("weights hint missing model id".into()))?;
-
-    let mut last = String::new();
-    let revision = plan
-        .weights_hint
-        .as_ref()
-        .and_then(|hint| hint.revision.as_deref());
-
-    catgrad_support::run_graph_streaming(
-        &model_id,
-        &prompt,
-        &term,
-        plan.max_seq,
-        revision,
-        |partial, _done| {
-            last = partial.to_string();
-            let _ = tx.send(ExecutorMessage::Progress {
-                execution_id: execution_id.to_string(),
-                result: partial.to_string(),
-                decoded: plan.is_llm.then(|| partial.to_string()),
-            });
-        },
-    )
-    .map_err(|e| ExecutorError::Execution(e.to_string()))?;
-
-    let decoded = plan.is_llm.then(|| last.clone());
-    Ok((last, decoded))
+    fn send_status(&mut self, execution_id: &str, status: ExecutionStatus) {
+        let progress = self.state.get_progress(execution_id).unwrap_or(0);
+        self.send_progress(execution_id, status, progress, Vec::new(), None);
+    }
 }
 
 #[derive(Clone)]
@@ -494,7 +511,7 @@ impl ExecutorHandle {
     async fn subscribe(
         &self,
         execution_id: String,
-    ) -> Result<mpsc::UnboundedReceiver<ExecuteStatusDiff>, ExecutorError> {
+    ) -> Result<(ExecuteProgress, mpsc::UnboundedReceiver<ExecuteProgress>), ExecutorError> {
         self.send(|reply| ExecutorMessage::Subscribe {
             execution_id,
             reply,
@@ -534,15 +551,18 @@ impl Execute for ExecutorHandle {
     }
 
     type ExecuteStreamStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStatusDiff, TonicStatus>> + Send>>;
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteProgress, TonicStatus>> + Send>>;
 
     async fn execute_stream(
         &self,
         request: Request<ExecuteStatusRequest>,
     ) -> Result<Response<Self::ExecuteStreamStream>, Status> {
         let exec_id = request.into_inner().execution_id;
-        let rx = self.subscribe(exec_id).await?;
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
+        let (initial, rx) = self.subscribe(exec_id).await?;
+        let initial_stream = tokio_stream::once(Ok::<_, TonicStatus>(initial));
+        let updates =
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok::<_, TonicStatus>);
+        let stream = initial_stream.chain(updates);
         Ok(Response::new(Box::pin(stream) as Self::ExecuteStreamStream))
     }
 
@@ -573,9 +593,7 @@ mod tests {
         // Get quote
         let quote = handle
             .quote(GetQuoteRequest {
-                payload: Some(get_quote_request::Payload::Graph(
-                    b"test-graph".to_vec(),
-                )),
+                payload: Some(get_quote_request::Payload::Graph(b"test-graph".to_vec())),
             })
             .await
             .expect("should return quote");
@@ -602,5 +620,53 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_sends_snapshot_immediately() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx2 = tx.clone();
+        let mut executor = Executor {
+            rx,
+            state: ExecutorState::new(),
+            watchers: HashMap::new(),
+            weights: WeightsManager::spawn(),
+            execute_worker: ExecuteWorker::spawn(tx2),
+        };
+
+        let quote_id = executor.state.create_quote(
+            "graph-0".to_string(),
+            ExecutionPlan {
+                graph: Vec::new(),
+                weights_hint: None,
+                input: String::new(),
+                max_seq: DEFAULT_MAX_SEQ,
+            },
+        );
+        let execution_id = executor
+            .state
+            .create_execution(quote_id)
+            .expect("execution should be created");
+        executor
+            .state
+            .set_status(&execution_id, ExecutionStatus::Running)
+            .unwrap();
+
+        let (initial, mut updates) = executor
+            .handle_subscribe(execution_id.clone())
+            .expect("subscribe should succeed");
+
+        assert_eq!(initial.status, "running");
+        assert_eq!(initial.progress, 0);
+        assert!(initial.chunk.is_empty());
+        assert!(initial.decoded.is_none());
+
+        executor.send_status(&execution_id, ExecutionStatus::Completed);
+        let completed = updates.recv().await.expect("should receive completion");
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.progress, 0);
+        assert!(completed.chunk.is_empty());
+        assert!(completed.decoded.is_none());
+        assert!(updates.recv().await.is_none());
     }
 }
