@@ -6,6 +6,16 @@ pub struct WeightsHint {
     #[prost(string, tag = "2")]
     pub revision: ::prost::alloc::string::String,
 }
+impl ::prost::Name for WeightsHint {
+    const NAME: &'static str = "WeightsHint";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.WeightsHint".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.WeightsHint".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LlmQuoteRequest {
     #[prost(string, tag = "1")]
@@ -15,6 +25,16 @@ pub struct LlmQuoteRequest {
     /// Optional; default to 16 when unset/zero
     #[prost(uint32, tag = "3")]
     pub max_seq: u32,
+}
+impl ::prost::Name for LlmQuoteRequest {
+    const NAME: &'static str = "LlmQuoteRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.LlmQuoteRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.LlmQuoteRequest".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetQuoteRequest {
@@ -31,6 +51,16 @@ pub mod get_quote_request {
         LlmPrompt(super::LlmQuoteRequest),
     }
 }
+impl ::prost::Name for GetQuoteRequest {
+    const NAME: &'static str = "GetQuoteRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetQuoteRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetQuoteRequest".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetQuoteResponse {
     #[prost(string, tag = "1")]
@@ -44,20 +74,60 @@ pub struct GetQuoteResponse {
     #[prost(message, optional, tag = "5")]
     pub resolved_weights: ::core::option::Option<WeightsHint>,
 }
+impl ::prost::Name for GetQuoteResponse {
+    const NAME: &'static str = "GetQuoteResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetQuoteResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetQuoteResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetGraphRequest {
     #[prost(string, tag = "1")]
     pub graph_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for GetGraphRequest {
+    const NAME: &'static str = "GetGraphRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetGraphRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetGraphRequest".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetGraphResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub graph: ::prost::alloc::vec::Vec<u8>,
 }
+impl ::prost::Name for GetGraphResponse {
+    const NAME: &'static str = "GetGraphResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetGraphResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetGraphResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub quote_id: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for ExecuteRequest {
+    const NAME: &'static str = "ExecuteRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteRequest".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResponse {
@@ -66,10 +136,30 @@ pub struct ExecuteResponse {
     #[prost(string, tag = "2")]
     pub quote_id: ::prost::alloc::string::String,
 }
+impl ::prost::Name for ExecuteResponse {
+    const NAME: &'static str = "ExecuteResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStatusRequest {
     #[prost(string, tag = "1")]
     pub execution_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ExecuteStatusRequest {
+    const NAME: &'static str = "ExecuteStatusRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteStatusRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteStatusRequest".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStatusResponse {
@@ -82,6 +172,16 @@ pub struct ExecuteStatusResponse {
     #[prost(string, optional, tag = "4")]
     pub decoded: ::core::option::Option<::prost::alloc::string::String>,
 }
+impl ::prost::Name for ExecuteStatusResponse {
+    const NAME: &'static str = "ExecuteStatusResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteStatusResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteStatusResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteProgress {
     #[prost(string, tag = "1")]
@@ -93,10 +193,30 @@ pub struct ExecuteProgress {
     #[prost(string, optional, tag = "4")]
     pub decoded: ::core::option::Option<::prost::alloc::string::String>,
 }
+impl ::prost::Name for ExecuteProgress {
+    const NAME: &'static str = "ExecuteProgress";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteProgress".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteProgress".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultRequest {
     #[prost(string, tag = "1")]
     pub execution_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ExecuteResultRequest {
+    const NAME: &'static str = "ExecuteResultRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteResultRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteResultRequest".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultResponse {
@@ -105,8 +225,28 @@ pub struct ExecuteResultResponse {
     #[prost(string, tag = "2")]
     pub decoded: ::prost::alloc::string::String,
 }
+impl ::prost::Name for ExecuteResultResponse {
+    const NAME: &'static str = "ExecuteResultResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteResultResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteResultResponse".into()
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}
+impl ::prost::Name for HealthCheckRequest {
+    const NAME: &'static str = "HealthCheckRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.HealthCheckRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.HealthCheckRequest".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckResponse {
     #[prost(string, tag = "1")]
@@ -115,6 +255,16 @@ pub struct HealthCheckResponse {
     pub uptime_seconds: u64,
     #[prost(string, tag = "3")]
     pub node_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for HealthCheckResponse {
+    const NAME: &'static str = "HealthCheckResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.HealthCheckResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.HealthCheckResponse".into()
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Presence {
@@ -128,6 +278,16 @@ pub struct Presence {
     pub ttl_ms: u64,
     #[prost(bool, tag = "5")]
     pub is_executor: bool,
+}
+impl ::prost::Name for Presence {
+    const NAME: &'static str = "Presence";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.Presence".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.Presence".into()
+    }
 }
 /// Generated client implementations.
 pub mod node_client {
@@ -143,17 +303,6 @@ pub mod node_client {
     #[derive(Debug, Clone)]
     pub struct NodeClient<T> {
         inner: tonic::client::Grpc<T>,
-    }
-    impl NodeClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
     }
     impl<T> NodeClient<T>
     where
@@ -437,17 +586,6 @@ pub mod execute_client {
     #[derive(Debug, Clone)]
     pub struct ExecuteClient<T> {
         inner: tonic::client::Grpc<T>,
-    }
-    impl ExecuteClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
     }
     impl<T> ExecuteClient<T>
     where
