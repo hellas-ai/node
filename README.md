@@ -1,30 +1,38 @@
-hellas-cli
-==========
+# hellas-cli
 
-quickstart
-==========
+## Quickstart
 
-install:
+Install:
 
-  $ cargo install --git https://github.com/hellas-ai/node
+```bash
+cargo install --git https://github.com/hellas-ai/node
+```
 
-execute:
-  $ cargo run -- execute run -p hey
+Execute:
 
-end-to-end
-==========
+```bash
+cargo run -- execute run -p hey
+```
 
-install server features:
+## End-to-end
 
-  $ cargo install --git https://github.com/hellas-ai/node --features serve
+Install server features:
 
-run server:
+```bash
+cargo install --git https://github.com/hellas-ai/node --features serve
+```
 
-  $ hellas-cli serve --discovery
-  Node Address: bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
-  RPC server running. Press Ctrl+C to stop
-  
-run client:
+Run server:
 
-  $ cargo run -- execute run -p hey bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
-  Hello! How can I help you today?<|im_end|>%
+```bash
+hellas-cli serve --discovery
+Node Address: bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
+RPC server running. Press Ctrl+C to stop
+```
+
+Run client:
+
+```bash
+cargo run -- execute run -p hey bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
+Hello! How can I help you today?<|im_end|>%
+```
