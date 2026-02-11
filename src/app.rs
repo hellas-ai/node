@@ -1,20 +1,19 @@
 use bytes::Bytes;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
-    minimmit::types::Activity,
-    types::{Epoch, Round, View},
     Automaton as Au, Relay as Re, Reporter as Rp,
+    types::{Epoch, Round, View},
 };
-use commonware_cryptography::{sha256::Digest, Hasher, Sha256};
+use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_macros::select_loop;
-use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Spawner};
+use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::{
-    channels::fallible::{AsyncFallibleExt, OneshotExt},
     SystemTimeExt,
+    channels::fallible::{AsyncFallibleExt, OneshotExt},
 };
 use futures::{
-    channel::{mpsc, oneshot},
     SinkExt, StreamExt,
+    channel::{mpsc, oneshot},
 };
 use hellas_types::{Activity as HActivity, Context, PublicKey};
 use std::collections::HashMap;
@@ -233,9 +232,7 @@ impl Rp for TraceReporter {
     type Activity = HActivity;
 
     async fn report(&mut self, activity: Self::Activity) {
-        if let Activity::Finalization(f) = &activity {
-            info!(view = %f.round().view(), "finalized");
-        }
+        info!(activity = ?activity);
     }
 }
 
@@ -305,7 +302,14 @@ impl<E: Clock + Spawner> Application<E> {
             .get(&context.parent.1)
             .expect("parent dependency should be checked before verify");
         let now = self.context.current().epoch_millis();
-        match validate_payload(context.round, context.parent.1, payload, contents, now, parent_bytes) {
+        match validate_payload(
+            context.round,
+            context.parent.1,
+            payload,
+            contents,
+            now,
+            parent_bytes,
+        ) {
             Ok(()) => true,
             Err(PayloadValidationError::DigestMismatch { computed, expected }) => {
                 warn!(?computed, ?expected, "digest mismatch");
@@ -331,7 +335,10 @@ impl<E: Clock + Spawner> Application<E> {
                 warn!(timestamp, now, "timestamp too far in the future");
                 false
             }
-            Err(PayloadValidationError::TimestampRegression { timestamp, parent_timestamp }) => {
+            Err(PayloadValidationError::TimestampRegression {
+                timestamp,
+                parent_timestamp,
+            }) => {
                 warn!(timestamp, parent_timestamp, "timestamp before parent");
                 false
             }
@@ -371,9 +378,7 @@ impl<E: Clock + Spawner> Application<E> {
             .pending
             .get(&digest)
             .expect("broadcast called for unknown payload");
-        self.relay
-            .broadcast(me, (digest, contents.clone()))
-            .await;
+        self.relay.broadcast(me, (digest, contents.clone())).await;
     }
 
     pub fn start(mut self, me: PublicKey) -> Handle<()> {
@@ -436,8 +441,13 @@ impl<E: Clock + Spawner> Application<E> {
 
 pub struct InMemoryRelay {
     #[allow(clippy::type_complexity)]
-    recipients:
-        std::sync::Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<(Digest, Bytes)>>>>,
+    recipients: std::sync::Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<(Digest, Bytes)>>>>,
+}
+
+impl Default for InMemoryRelay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryRelay {
@@ -471,12 +481,6 @@ impl InMemoryRelay {
                 error!(?e, "failed to send to relay recipient");
             }
         }
-    }
-}
-
-impl Default for InMemoryRelay {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
