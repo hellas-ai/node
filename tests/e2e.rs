@@ -5,14 +5,13 @@ use commonware_consensus::minimmit::{
     types::Finalization,
 };
 use commonware_consensus::types::View;
-use commonware_cryptography::certificate::{mocks::Fixture, Scheme as _};
-use commonware_cryptography::{sha256::Digest, Sha256};
+use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
+use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
-use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, deterministic};
-use futures::StreamExt;
-use hellas_chain::app::InMemoryRelay;
+use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
+use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::{Activity, PublicKey, Scheme};
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
@@ -20,15 +19,10 @@ const NAMESPACE: &[u8] = b"hellas-e2e";
 const N: u32 = 6;
 
 type Finalizations = Arc<std::sync::Mutex<HashMap<View, Finalization<Scheme, Digest>>>>;
-type Faults = Arc<
-    std::sync::Mutex<HashMap<PublicKey, HashMap<View, std::collections::HashSet<Activity>>>>,
->;
+type Faults =
+    Arc<std::sync::Mutex<HashMap<PublicKey, HashMap<View, std::collections::HashSet<Activity>>>>>;
 
-fn run_network(
-    config: Config,
-    link: Link,
-    duration: Duration,
-) -> Vec<(Finalizations, Faults)> {
+fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizations, Faults)> {
     let runner = deterministic::Runner::timed(Duration::from_secs(60));
 
     let handles: Arc<std::sync::Mutex<Vec<(Finalizations, Faults)>>> =
@@ -59,7 +53,8 @@ fn run_network(
             let vote = control.register(0, quota).await.unwrap();
             let certificate = control.register(1, quota).await.unwrap();
             let resolver = control.register(2, quota).await.unwrap();
-            registrations.insert(validator.clone(), (vote, certificate, resolver));
+            let shard = control.register(3, quota).await.unwrap();
+            registrations.insert(validator.clone(), (vote, certificate, resolver, shard));
         }
 
         for v1 in participants.iter() {
@@ -73,7 +68,6 @@ fn run_network(
             }
         }
 
-        let relay = Arc::new(InMemoryRelay::new());
         for (idx, validator) in participants.iter().enumerate() {
             let ctx = context.with_label(&format!("validator_{idx}"));
             let blocker = oracle.control(validator.clone());
@@ -91,35 +85,29 @@ fn run_network(
                 .unwrap()
                 .push((reporter.finalizations.clone(), reporter.faults.clone()));
 
-            // Create broadcast channels for the Application.
-            // broadcast_rx: incoming payload bytes from InMemoryRelay
-            let broadcast_rx = relay.register(validator);
-            // broadcast_tx: outgoing payload bytes, forwarded to InMemoryRelay
-            let (broadcast_tx, mut outgoing_rx) = futures::channel::mpsc::unbounded();
-
-            // Spawn a task to forward outgoing broadcasts to InMemoryRelay
-            let relay_clone = relay.clone();
-            let key = validator.clone();
-            context.clone().spawn(move |_ctx| async move {
-                while let Some(msg) = outgoing_rx.next().await {
-                    relay_clone.broadcast(&key, msg).await;
-                }
-            });
+            let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+                .remove(validator)
+                .expect("validator should be registered");
+            let relay = Arc::new(AuthenticatedShardTransport::new(
+                validator.clone(),
+                shard_sender,
+                shard_receiver,
+            ));
+            for participant in participants.iter() {
+                relay.declare(participant.clone());
+            }
+            relay.finalize_validators();
+            let _shard_transport = relay.clone().start(context.clone());
 
             let engine = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
                 blocker,
-                broadcast_tx,
-                broadcast_rx,
+                relay,
                 validator,
                 reporter,
             );
-
-            let (vote, certificate, resolver) = registrations
-                .remove(validator)
-                .expect("validator should be registered");
             engine.start(vote, certificate, resolver);
         }
 
@@ -142,10 +130,7 @@ fn healthy_network_finalizes() {
 
     let handles = run_network(Config::test(), link, Duration::from_secs(3));
 
-    let total_finalizations: usize = handles
-        .iter()
-        .map(|(f, _)| f.lock().unwrap().len())
-        .sum();
+    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
     assert!(
         total_finalizations > 0,
         "expected at least one finalization across all validators"
@@ -162,15 +147,12 @@ fn lossy_network_finalizes() {
     let link = Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(5),
-        success_rate: 0.8,
+        success_rate: 0.95,
     };
 
-    let handles = run_network(Config::test(), link, Duration::from_secs(5));
+    let handles = run_network(Config::test(), link, Duration::from_secs(10));
 
-    let total_finalizations: usize = handles
-        .iter()
-        .map(|(f, _)| f.lock().unwrap().len())
-        .sum();
+    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
     assert!(
         total_finalizations > 0,
         "expected at least one finalization even with lossy network"

@@ -1,22 +1,28 @@
+use crate::shard::{
+    BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardReconstructor, ShardTransport,
+    ZodaCommitment, ZodaShard, coding_config,
+};
 use bytes::Bytes;
 use commonware_codec::{DecodeExt, Encode};
+use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::{
     Automaton as Au, Relay as Re, Reporter as Rp,
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_macros::select_loop;
+use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::{
     SystemTimeExt,
     channels::fallible::{AsyncFallibleExt, OneshotExt},
 };
 use futures::{
-    SinkExt, StreamExt,
+    StreamExt,
     channel::{mpsc, oneshot},
 };
 use hellas_types::{Activity as HActivity, Context, PublicKey};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Milliseconds in the future to allow for block timestamps.
 const SYNCHRONY_BOUND: u64 = 500;
@@ -243,37 +249,45 @@ impl Rp for TraceReporter {
 pub struct Application<E: Clock + Spawner> {
     context: ContextCell<E>,
 
-    /// Sender for outgoing payload bytes (to be distributed to peers).
-    broadcast_tx: mpsc::UnboundedSender<(Digest, Bytes)>,
-
-    /// Receiver for incoming payload bytes from peers.
-    broadcast_rx: mpsc::UnboundedReceiver<(Digest, Bytes)>,
+    relay: std::sync::Arc<dyn ShardTransport>,
+    shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
 
     mailbox_rx: mpsc::Receiver<Message>,
 
-    /// Block bytes we proposed, keyed by digest. Waiting to be broadcast.
     pending: HashMap<Digest, Bytes>,
-
-    /// Block bytes we've seen (from relay or our own proposals), keyed by digest.
+    pending_order: VecDeque<Digest>,
+    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     seen: HashMap<Digest, Bytes>,
+    shard_reconstructor: ShardReconstructor,
 }
 
 impl<E: Clock + Spawner> Application<E> {
+    const MAX_PENDING_DIGESTS: usize = 256;
+    const MAX_WAITER_KEYS: usize = 512;
+
     pub fn new(
         context: E,
-        broadcast_tx: mpsc::UnboundedSender<(Digest, Bytes)>,
-        broadcast_rx: mpsc::UnboundedReceiver<(Digest, Bytes)>,
+        relay: std::sync::Arc<dyn ShardTransport>,
+        me: &PublicKey,
     ) -> (Self, Mailbox) {
+        let shard_rx = relay.register(me);
         let (sender, receiver) = mpsc::channel(1024);
+        let my_index = relay
+            .validator_index(me)
+            .expect("validators must be declared and finalized before application construction");
+        let coding_config = coding_config(relay.validator_count());
 
         (
             Self {
                 context: ContextCell::new(context),
-                broadcast_tx,
-                broadcast_rx,
+                relay,
+                shard_rx,
                 mailbox_rx: receiver,
                 pending: HashMap::new(),
+                pending_order: VecDeque::new(),
+                pending_shards: HashMap::new(),
                 seen: HashMap::new(),
+                shard_reconstructor: ShardReconstructor::new(me.clone(), my_index, coding_config),
             },
             Mailbox { sender },
         )
@@ -290,7 +304,18 @@ impl<E: Clock + Spawner> Application<E> {
         let timestamp = self.context.current().epoch_millis();
         let payload = encode_payload(context.round, context.parent.1, timestamp);
         let digest = payload_digest(&payload);
+        let key = BlockKey::new(context.round, digest);
+        let (commitment, shards) = CodingImpl::encode(
+            self.shard_reconstructor.coding_config(),
+            payload.as_ref(),
+            &Sequential,
+        )
+        .expect("zoda encode failed");
+
         self.pending.insert(digest, payload.clone());
+        self.pending_shards
+            .insert(digest, (key, commitment, shards));
+        self.touch_pending(digest);
         self.seen.insert(digest, payload);
         digest
     }
@@ -345,21 +370,24 @@ impl<E: Clock + Spawner> Application<E> {
     }
 
     fn handle_verify_request(
-        &self,
+        &mut self,
         context: Context,
         payload: Digest,
         response: oneshot::Sender<bool>,
         waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
     ) {
         if let Some(missing_digest) = missing_dependency(&self.seen, &context, payload) {
-            waiters
-                .entry(missing_digest)
-                .or_default()
-                .push(DeferredVerify {
+            self.queue_waiter(
+                waiters,
+                waiter_order,
+                missing_digest,
+                DeferredVerify {
                     context,
                     payload,
                     response,
-                });
+                },
+            );
             return;
         }
 
@@ -372,23 +400,138 @@ impl<E: Clock + Spawner> Application<E> {
         response.send_lossy(valid);
     }
 
-    fn broadcast_payload(&self, digest: Digest) {
-        let contents = self
-            .pending
-            .get(&digest)
-            .expect("broadcast called for unknown payload");
-        if let Err(e) = self.broadcast_tx.unbounded_send((digest, contents.clone())) {
-            error!(?e, "failed to send payload to broadcast channel");
+    fn queue_waiter(
+        &self,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+        digest: Digest,
+        deferred: DeferredVerify,
+    ) {
+        if !waiters.contains_key(&digest) {
+            waiter_order.push_back(digest);
+        }
+        waiters.entry(digest).or_default().push(deferred);
+
+        while waiters.len() > Self::MAX_WAITER_KEYS {
+            let Some(oldest) = waiter_order.pop_front() else {
+                break;
+            };
+            if let Some(stale) = waiters.remove(&oldest) {
+                for deferred in stale {
+                    deferred.response.send_lossy(false);
+                }
+            }
         }
     }
 
-    pub fn start(mut self, me: PublicKey) -> Handle<()> {
-        spawn_cell!(self.context, self.run(me).await)
+    fn resolve_waiters(
+        &mut self,
+        digest: Digest,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+    ) {
+        if let Some(pos) = waiter_order.iter().position(|d| *d == digest) {
+            waiter_order.remove(pos);
+        }
+        if let Some(pending) = waiters.remove(&digest) {
+            for deferred in pending {
+                self.handle_verify_request(
+                    deferred.context,
+                    deferred.payload,
+                    deferred.response,
+                    waiters,
+                    waiter_order,
+                );
+            }
+        }
     }
 
-    async fn run(mut self, _me: PublicKey) {
-        // Pending verify requests waiting for block data
+    fn fail_waiters(
+        &self,
+        digest: Digest,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+    ) {
+        if let Some(pos) = waiter_order.iter().position(|d| *d == digest) {
+            waiter_order.remove(pos);
+        }
+        if let Some(stale) = waiters.remove(&digest) {
+            for deferred in stale {
+                deferred.response.send_lossy(false);
+            }
+        }
+    }
+
+    fn touch_pending(&mut self, digest: Digest) {
+        if !self.pending_order.contains(&digest) {
+            self.pending_order.push_back(digest);
+        }
+        while self.pending_order.len() > Self::MAX_PENDING_DIGESTS {
+            let Some(oldest) = self.pending_order.pop_front() else {
+                break;
+            };
+            self.pending.remove(&oldest);
+            self.pending_shards.remove(&oldest);
+        }
+    }
+
+    async fn apply_shard_effect(
+        &mut self,
+        effect: ShardEffect,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+    ) {
+        match effect {
+            ShardEffect::Broadcast(message) => {
+                self.relay
+                    .broadcast_except(self.shard_reconstructor.me(), *message)
+                    .await;
+            }
+            ShardEffect::Reconstructed { key, contents } => {
+                self.seen.insert(key.digest, contents);
+                self.pending.remove(&key.digest);
+                self.pending_shards.remove(&key.digest);
+                self.resolve_waiters(key.digest, waiters, waiter_order);
+            }
+            ShardEffect::Failed { key } => {
+                self.fail_waiters(key.digest, waiters, waiter_order);
+            }
+        }
+    }
+
+    async fn handle_shard_message(
+        &mut self,
+        message: ShardMessage,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+    ) {
+        let effects = self
+            .shard_reconstructor
+            .handle_message(message, &self.seen, |sender| {
+                self.relay.validator_index(sender)
+            });
+        for effect in effects {
+            self.apply_shard_effect(effect, waiters, waiter_order).await;
+        }
+    }
+
+    async fn broadcast_payload(&mut self, digest: Digest) {
+        let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
+            warn!(?digest, "broadcast requested for unknown pending shards");
+            return;
+        };
+        self.relay
+            .distribute_shards(self.shard_reconstructor.me(), key, commitment, shards)
+            .await;
+    }
+
+    pub fn start(mut self) -> Handle<()> {
+        spawn_cell!(self.context, self.run().await)
+    }
+
+    async fn run(mut self) {
         let mut waiters: HashMap<Digest, Vec<DeferredVerify>> = HashMap::new();
+        let mut waiter_order: VecDeque<Digest> = VecDeque::new();
 
         select_loop! {
             self.context,
@@ -410,76 +553,28 @@ impl<E: Clock + Spawner> Application<E> {
                         response.send_lossy(digest);
                     }
                     Message::Verify { context, payload, response } => {
-                        self.handle_verify_request(context, payload, response, &mut waiters);
+                        let key = BlockKey::new(context.round, payload);
+                        let leader = context.leader.clone();
+                        self.handle_verify_request(
+                            context,
+                            payload,
+                            response,
+                            &mut waiters,
+                            &mut waiter_order,
+                        );
+                        for msg in self.shard_reconstructor.note_known_key(key, leader) {
+                            self.handle_shard_message(msg, &mut waiters, &mut waiter_order)
+                                .await;
+                        }
                     }
                     Message::Broadcast { payload } => {
-                        self.broadcast_payload(payload);
+                        self.broadcast_payload(payload).await;
                     }
                 }
             },
-            broadcast = self.broadcast_rx.next() => {
-                let (digest, data) = broadcast.expect("broadcast relay closed");
-                self.seen.insert(digest, data.clone());
-                // Process any pending verifications
-                if let Some(pending) = waiters.remove(&digest) {
-                    for deferred in pending {
-                        self.handle_verify_request(
-                            deferred.context,
-                            deferred.payload,
-                            deferred.response,
-                            &mut waiters,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// InMemoryRelay — distributes block bytes between Application actors
-// ---------------------------------------------------------------------------
-
-pub struct InMemoryRelay {
-    #[allow(clippy::type_complexity)]
-    recipients: std::sync::Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<(Digest, Bytes)>>>>,
-}
-
-impl Default for InMemoryRelay {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InMemoryRelay {
-    pub fn new() -> Self {
-        Self {
-            recipients: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<(Digest, Bytes)> {
-        let (sender, receiver) = mpsc::unbounded();
-        let mut recipients = self.recipients.lock().unwrap();
-        recipients
-            .entry(public_key.clone())
-            .or_default()
-            .push(sender);
-        receiver
-    }
-
-    pub async fn broadcast(&self, sender: &PublicKey, (payload, data): (Digest, Bytes)) {
-        let channels: Vec<_> = {
-            let recipients = self.recipients.lock().unwrap();
-            recipients
-                .iter()
-                .filter(|(pk, _)| *pk != sender)
-                .flat_map(|(_, senders)| senders.clone())
-                .collect()
-        };
-        for mut ch in channels {
-            if let Err(e) = ch.send((payload, data.clone())).await {
-                error!(?e, "failed to send to relay recipient");
+            shard = self.shard_rx.next() => {
+                let shard = shard.expect("shard relay closed");
+                self.handle_shard_message(shard, &mut waiters, &mut waiter_order).await;
             }
         }
     }
@@ -488,8 +583,14 @@ impl InMemoryRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::MockShardTransport;
+    use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, View};
+    use commonware_cryptography::certificate::mocks::Fixture;
+    use commonware_runtime::{Clock, Metrics, Runner, deterministic};
+    use futures::channel::oneshot::Canceled;
     use proptest::prelude::*;
+    use std::{sync::Arc, time::Duration};
 
     /// Cap timestamp ranges to avoid saturating_add degeneracy near u64::MAX.
     const MAX_TIMESTAMP: u64 = u64::MAX - SYNCHRONY_BOUND - 10_001;
@@ -740,5 +841,76 @@ mod tests {
         let epoch = Epoch::new(1);
         let payload = genesis_payload(epoch);
         assert_eq!(decode_timestamp(&payload), Some(0));
+    }
+
+    #[test]
+    fn preleader_shards_drain_after_verify() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"app-shard-test", 6);
+
+            let relay = Arc::new(MockShardTransport::new());
+            for participant in participants.iter() {
+                relay.declare(participant.clone());
+            }
+            relay.finalize_validators();
+
+            let mut mailboxes = Vec::new();
+            let mut handles = Vec::new();
+            for (idx, participant) in participants.iter().enumerate() {
+                let (app, mailbox) = Application::new(
+                    context.with_label(&format!("app_{idx}")),
+                    relay.clone(),
+                    participant,
+                );
+                handles.push(app.start());
+                mailboxes.push(mailbox);
+            }
+
+            let epoch = Epoch::new(1);
+            let mut genesis = None;
+            for mailbox in mailboxes.iter_mut() {
+                let digest = mailbox.genesis(epoch).await;
+                if let Some(existing) = genesis {
+                    assert_eq!(existing, digest);
+                } else {
+                    genesis = Some(digest);
+                }
+            }
+            let genesis = genesis.expect("genesis should be set");
+
+            let round = Round::new(epoch, View::new(1));
+            let proposal_context = Context {
+                round,
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+
+            let digest = mailboxes[0]
+                .propose(proposal_context.clone())
+                .await
+                .await
+                .expect("proposal should resolve");
+
+            // Broadcast before any verify to force pre-leader buffering.
+            mailboxes[0].broadcast(digest).await;
+            context.sleep(Duration::from_millis(10)).await;
+
+            let mut verify_rx_1 = mailboxes[1].verify(proposal_context.clone(), digest).await;
+            context.sleep(Duration::from_millis(10)).await;
+            match verify_rx_1.try_recv() {
+                Ok(Some(v)) => panic!("verify should not resolve yet, got {:?}", v),
+                Ok(None) => {}
+                Err(Canceled) => panic!("verify receiver canceled unexpectedly"),
+            }
+
+            let verify_rx_2 = mailboxes[2].verify(proposal_context, digest).await;
+            assert!(verify_rx_2.await.expect("verify 2 should resolve"));
+            assert!(verify_rx_1.await.expect("verify 1 should resolve"));
+
+            drop(handles);
+        });
     }
 }

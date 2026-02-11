@@ -1,14 +1,17 @@
 use crate::app::Mailbox;
 use commonware_codec::{DecodeExt, Encode};
-use commonware_consensus::{elector::RoundRobin, minimmit, types::ViewDelta, Reporter as Rp};
-use commonware_cryptography::{Signer, ed25519, sha256::Digest, Sha256};
+use commonware_consensus::{Reporter as Rp, elector::RoundRobin, minimmit, types::ViewDelta};
+use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
 use commonware_p2p::{Address, Blocker};
 use commonware_parallel::Sequential;
 use commonware_runtime::buffer::PoolRef;
-use commonware_utils::{NZU16, ordered::{Map, Set}};
+use commonware_utils::{
+    NZU16,
+    ordered::{Map, Set},
+};
 use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -110,7 +113,6 @@ impl Config {
 pub struct NodeConfig {
     pub private_key: String,
     pub listen_port: u16,
-    pub storage_directory: String,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -124,6 +126,12 @@ impl NodeConfig {
     pub fn decode_private_key(&self) -> ed25519::PrivateKey {
         let bytes = hex::decode(&self.private_key).expect("invalid hex in private_key");
         ed25519::PrivateKey::decode(bytes.as_slice()).expect("invalid ed25519 private key")
+    }
+
+    pub fn storage_directory(&self) -> PathBuf {
+        let base = dirs::data_local_dir().expect("unable to determine data directory");
+        let pk_hex = hex::encode(self.decode_private_key().public_key().encode());
+        base.join("hellas").join(&pk_hex[..16])
     }
 
     pub fn public_key(&self) -> PublicKey {

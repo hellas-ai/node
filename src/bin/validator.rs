@@ -1,15 +1,14 @@
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use commonware_codec::Encode;
-use commonware_cryptography::{ed25519, sha256::Digest, Signer};
-use commonware_p2p::{Manager, Recipients, Receiver, Sender, authenticated::lookup};
-use commonware_runtime::{tokio, Metrics, Quota, Runner, Spawner};
-use futures::StreamExt;
+use commonware_cryptography::{Signer, ed25519};
+use commonware_p2p::{Manager, authenticated::lookup};
+use commonware_runtime::{Metrics, Quota, Runner, tokio};
 use hellas_chain::app::TraceReporter;
 use hellas_chain::config::{Config, NodeConfig, PeerEntry, encode_private_key};
 use hellas_chain::engine::Engine;
+use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 const NAMESPACE: &[u8] = b"hellas";
@@ -90,7 +89,6 @@ fn setup(validators: u32, node: u32, start_port: u16, seed: Option<u64>) {
     let config = NodeConfig {
         private_key: encode_private_key(my_key),
         listen_port: start_port + node as u16,
-        storage_directory: format!("/tmp/hellas/validator_{node}"),
         peers,
     };
 
@@ -119,74 +117,40 @@ fn run(config_path: PathBuf) {
         .expect("own key not found in participants");
 
     // Configure tokio runtime
-    let runtime_cfg =
-        tokio::Config::new().with_storage_directory(&node_config.storage_directory);
+    let storage_dir = node_config.storage_directory();
+    let runtime_cfg = tokio::Config::new()
+        .with_storage_directory(storage_dir.to_str().expect("non-UTF-8 data directory"));
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
         // Create lookup-based p2p network
-        let p2p_cfg = lookup::Config::local(
-            private_key,
-            NAMESPACE,
-            listen_addr,
-            MAX_MESSAGE_SIZE,
-        );
-        let (mut network, mut oracle) = lookup::Network::new(
-            context.with_label("network"),
-            p2p_cfg,
-        );
+        let p2p_cfg = lookup::Config::local(private_key, NAMESPACE, listen_addr, MAX_MESSAGE_SIZE);
+        let (mut network, mut oracle) =
+            lookup::Network::new(context.with_label("network"), p2p_cfg);
 
         // Register all validators with the oracle
         oracle.update(0, peer_map).await;
 
-        // Register consensus channels + payload broadcast channel
+        // Register consensus and shard channels.
         let quota = Quota::per_second(NonZeroU32::MAX);
         let vote = network.register(0, quota, CHANNEL_BACKLOG);
         let certificate = network.register(1, quota, CHANNEL_BACKLOG);
         let resolver = network.register(2, quota, CHANNEL_BACKLOG);
-        let (mut broadcast_sender, mut broadcast_receiver) =
-            network.register(3, quota, CHANNEL_BACKLOG);
+        let (shard_sender, shard_receiver) = network.register(3, quota, CHANNEL_BACKLOG);
 
         // Start networking
         let _network_handle = network.start();
 
-        // Create broadcast channels for the Application
-        let (broadcast_tx, mut outgoing_rx) =
-            futures::channel::mpsc::unbounded::<(Digest, Bytes)>();
-        let (incoming_tx, broadcast_rx) =
-            futures::channel::mpsc::unbounded::<(Digest, Bytes)>();
-
-        // Spawn outgoing bridge: Application → p2p broadcast to all peers
-        context.clone().spawn(move |_ctx| async move {
-            while let Some((digest, data)) = outgoing_rx.next().await {
-                let mut msg = Vec::with_capacity(32 + data.len());
-                msg.extend_from_slice(&digest.0);
-                msg.extend_from_slice(&data);
-                let _ = broadcast_sender
-                    .send(Recipients::All, msg, false)
-                    .await;
-            }
-        });
-
-        // Spawn incoming bridge: p2p broadcast → Application
-        context.clone().spawn(move |_ctx| async move {
-            loop {
-                match broadcast_receiver.recv().await {
-                    Ok((_sender, buf)) => {
-                        let data: &[u8] = buf.as_ref();
-                        if data.len() < 32 {
-                            continue;
-                        }
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&data[..32]);
-                        let digest = Digest::from(arr);
-                        let payload = Bytes::copy_from_slice(&data[32..]);
-                        let _ = incoming_tx.unbounded_send((digest, payload));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let relay = Arc::new(AuthenticatedShardTransport::new(
+            me.clone(),
+            shard_sender,
+            shard_receiver,
+        ));
+        for participant in participants.iter() {
+            relay.declare(participant.clone());
+        }
+        relay.finalize_validators();
+        let _shard_transport_handle = relay.clone().start(context.clone());
 
         // Create engine
         let engine = Engine::new(
@@ -194,8 +158,7 @@ fn run(config_path: PathBuf) {
             Config::mainnet(),
             scheme,
             oracle,
-            broadcast_tx,
-            broadcast_rx,
+            relay,
             &me,
             TraceReporter,
         );
