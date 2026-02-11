@@ -30,7 +30,7 @@ impl MockShardTransport {
         }
     }
 
-    pub fn declare(&self, public_key: PublicKey) {
+    pub fn declare(&self, public_key: &PublicKey) {
         self.validators.declare(public_key);
     }
 
@@ -107,8 +107,7 @@ impl MockShardTransport {
         };
 
         for (target, shard_index, shard) in assignments {
-            let message =
-                ShardMessage::initial(proposer.clone(), key, commitment, shard, shard_index);
+            let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
             self.send_to(&target, message).await;
         }
     }

@@ -2,6 +2,7 @@ use super::{
     BlockKey, BufferedReShare, CodingImpl, DuplicateStatus, RecoveryState, ShardMessage,
     WireShardMessage, ZodaCommitment,
 };
+use crate::effects::Effects;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
@@ -36,9 +37,9 @@ impl ShardRecoverer {
     const MAX_PRE_LEADER_KEYS: usize = 256;
     const MAX_KNOWN_KEYS: usize = 1024;
 
-    pub(crate) fn new(me: PublicKey, my_index: u16, coding_config: CodingConfig) -> Self {
+    pub(crate) fn new(me: &PublicKey, my_index: u16, coding_config: CodingConfig) -> Self {
         Self {
-            me,
+            me: me.clone(),
             my_index,
             coding_config,
             recovery: HashMap::new(),
@@ -58,11 +59,15 @@ impl ShardRecoverer {
         &self.coding_config
     }
 
-    pub(crate) fn note_known_key(&mut self, key: BlockKey, leader: PublicKey) -> Vec<ShardMessage> {
+    pub(crate) fn note_known_key(
+        &mut self,
+        key: BlockKey,
+        leader: &PublicKey,
+    ) -> Vec<ShardMessage> {
         if !self.known_keys.contains_key(&key) {
             self.known_key_order.push_back(key);
         }
-        self.known_keys.insert(key, leader);
+        self.known_keys.insert(key, leader.clone());
         self.evict_known_keys();
         self.remove_buffered_pre_leader_key(key)
             .map(|queue| queue.into_iter().collect())
@@ -74,18 +79,18 @@ impl ShardRecoverer {
         message: ShardMessage,
         seen: &HashMap<Digest, Bytes>,
         validator_index: F,
-    ) -> Vec<ShardEffect>
+    ) -> Effects<ShardEffect>
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
         let key = message.key();
         if seen.contains_key(&key.digest) {
-            return Vec::new();
+            return Effects::new();
         }
 
         if !self.known_keys.contains_key(&key) && !self.recovery.contains_key(&key) {
             self.buffer_pre_leader_message(key, message);
-            return Vec::new();
+            return Effects::new();
         }
 
         let ShardMessage { sender, body } = message;
@@ -119,18 +124,18 @@ impl ShardRecoverer {
         commitment: ZodaCommitment,
         shard: <CodingImpl as CodingScheme>::Shard,
         shard_index: u16,
-    ) -> Vec<ShardEffect> {
+    ) -> Effects<ShardEffect> {
         let expected_leader = self.known_keys.get(&key).cloned().or_else(|| {
             self.recovery
                 .get(&key)
                 .map(|recovery| recovery.leader.clone())
         });
         let Some(expected_leader) = expected_leader else {
-            return Vec::new();
+            return Effects::new();
         };
 
         if sender != expected_leader || shard_index != self.my_index {
-            return Vec::new();
+            return Effects::new();
         }
 
         let mut effects = self.ensure_recovery_state(key, commitment, expected_leader);
@@ -147,18 +152,8 @@ impl ShardRecoverer {
             warn!(digest = ?key.digest, "missing recovery state while processing initial shard");
             return effects;
         };
-        match status {
-            DuplicateStatus::New => {}
-            DuplicateStatus::Duplicate => return effects,
-            DuplicateStatus::Equivocation => {
-                warn!(
-                    digest = ?key.digest,
-                    shard_index,
-                    ?sender,
-                    "equivocation detected for initial shard"
-                );
-                return effects;
-            }
+        if !self.accept_new_shard_status(status, key, shard_index, &sender, "initial") {
+            return effects;
         }
 
         let (checking_data, checked_shard, reshard) =
@@ -174,7 +169,7 @@ impl ShardRecoverer {
         }
         self.process_buffered_reshards(key);
         effects.push(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
-            self.me.clone(),
+            &self.me,
             key,
             commitment,
             self.my_index,
@@ -194,7 +189,7 @@ impl ShardRecoverer {
         shard_index: u16,
         reshard: <CodingImpl as CodingScheme>::ReShard,
         validator_index: F,
-    ) -> Vec<ShardEffect>
+    ) -> Effects<ShardEffect>
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
@@ -205,14 +200,14 @@ impl ShardRecoverer {
         });
         let Some(leader) = leader else {
             warn!(digest = ?key.digest, "reshare key was neither known nor recovering");
-            return Vec::new();
+            return Effects::new();
         };
 
         let Some(expected_index) = validator_index(&sender) else {
-            return Vec::new();
+            return Effects::new();
         };
         if expected_index != shard_index {
-            return Vec::new();
+            return Effects::new();
         }
 
         let mut effects = self.ensure_recovery_state(key, commitment, leader);
@@ -235,18 +230,8 @@ impl ShardRecoverer {
             warn!(digest = ?key.digest, "missing recovery state while processing reshard");
             return effects;
         };
-        match status {
-            DuplicateStatus::New => {}
-            DuplicateStatus::Duplicate => return effects,
-            DuplicateStatus::Equivocation => {
-                warn!(
-                    digest = ?key.digest,
-                    shard_index,
-                    ?sender,
-                    "equivocation detected for reshard"
-                );
-                return effects;
-            }
+        if !self.accept_new_shard_status(status, key, shard_index, &sender, "reshare") {
+            return effects;
         }
 
         let checking_data = self
@@ -294,12 +279,12 @@ impl ShardRecoverer {
         key: BlockKey,
         commitment: ZodaCommitment,
         leader: PublicKey,
-    ) -> Vec<ShardEffect> {
+    ) -> Effects<ShardEffect> {
         if self.recovery.contains_key(&key) {
-            return Vec::new();
+            return Effects::new();
         }
 
-        let mut effects = Vec::new();
+        let mut effects = Effects::new();
         while self.recovery.len() >= Self::MAX_RECOVERY_ENTRIES {
             let Some(oldest) = self.recovery_order.pop_front() else {
                 break;
@@ -342,18 +327,14 @@ impl ShardRecoverer {
                 );
                 return;
             };
-            match status {
-                DuplicateStatus::New => {}
-                DuplicateStatus::Duplicate => continue,
-                DuplicateStatus::Equivocation => {
-                    warn!(
-                        digest = ?key.digest,
-                        shard_index = buffered.shard_index,
-                        sender = ?buffered.sender,
-                        "equivocation detected for buffered reshard"
-                    );
-                    continue;
-                }
+            if !self.accept_new_shard_status(
+                status,
+                key,
+                buffered.shard_index,
+                &buffered.sender,
+                "buffered_reshare",
+            ) {
+                continue;
             }
             let checked = match CodingImpl::check(
                 &self.coding_config,
@@ -426,6 +407,7 @@ impl ShardRecoverer {
         if recovery.commitment == commitment {
             return true;
         }
+        // Safe adoption window: we can switch commitment only before validating any shard.
         if recovery.checking_data.is_none() && recovery.checked_shards.is_empty() {
             recovery.commitment = commitment;
             return true;
@@ -478,6 +460,7 @@ impl ShardRecoverer {
             }
             self.known_keys.remove(&oldest);
             self.remove_buffered_pre_leader_key(oldest);
+            // Reset attempts after a successful eviction so we can keep scanning.
             attempts_left = self.known_key_order.len();
         }
 
@@ -495,6 +478,30 @@ impl ShardRecoverer {
             self.known_key_order.remove(pos);
         }
         self.known_keys.remove(&key);
+    }
+
+    fn accept_new_shard_status(
+        &self,
+        status: DuplicateStatus,
+        key: BlockKey,
+        shard_index: u16,
+        sender: &PublicKey,
+        source: &'static str,
+    ) -> bool {
+        match status {
+            DuplicateStatus::New => true,
+            DuplicateStatus::Duplicate => false,
+            DuplicateStatus::Equivocation => {
+                warn!(
+                    digest = ?key.digest,
+                    shard_index,
+                    ?sender,
+                    source,
+                    "equivocation detected for shard"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -515,6 +522,7 @@ mod tests {
 
     struct Fixture {
         validators: Vec<PublicKey>,
+        index_by_validator: HashMap<PublicKey, u16>,
         leader: PublicKey,
         my_index: u16,
         recoverer: ShardRecoverer,
@@ -529,9 +537,15 @@ mod tests {
             let my_index = 1u16;
             let me = validators[usize::from(my_index)].clone();
             let leader = validators[0].clone();
-            let recoverer = ShardRecoverer::new(me, my_index, coding_config(6));
+            let recoverer = ShardRecoverer::new(&me, my_index, coding_config(6));
+            let mut index_by_validator = HashMap::new();
+            for (idx, validator) in validators.iter().enumerate() {
+                let validator_index = u16::try_from(idx).expect("index should fit into u16");
+                index_by_validator.insert(validator.clone(), validator_index);
+            }
             Self {
                 validators,
+                index_by_validator,
                 leader,
                 my_index,
                 recoverer,
@@ -539,10 +553,21 @@ mod tests {
         }
 
         fn validator_index(&self, sender: &PublicKey) -> Option<u16> {
-            self.validators
-                .iter()
-                .position(|pk| pk == sender)
-                .and_then(|idx| u16::try_from(idx).ok())
+            self.index_by_validator.get(sender).copied()
+        }
+
+        fn handle_message(
+            &mut self,
+            message: ShardMessage,
+            seen: &HashMap<Digest, Bytes>,
+        ) -> Effects<ShardEffect> {
+            let index_by_validator = &self.index_by_validator;
+            self.recoverer
+                .handle_message(message, seen, |pk| index_by_validator.get(pk).copied())
+        }
+
+        fn note_known_key(&mut self, key: BlockKey) -> Vec<ShardMessage> {
+            self.recoverer.note_known_key(key, &self.leader)
         }
 
         fn make_artifacts(&self, view: u64, payload: &[u8]) -> BlockArtifacts {
@@ -574,9 +599,12 @@ mod tests {
         }
     }
 
-    fn has_recovered(effects: &[ShardEffect], key: BlockKey) -> bool {
+    fn has_recovered<'a, I>(effects: I, key: BlockKey) -> bool
+    where
+        I: IntoIterator<Item = &'a ShardEffect>,
+    {
         effects
-            .iter()
+            .into_iter()
             .any(|effect| matches!(effect, ShardEffect::Recovered { key: reconstructed, .. } if *reconstructed == key))
     }
 
@@ -589,22 +617,15 @@ mod tests {
         let reshare = artifacts.reshares[usize::from(shard_index)].clone();
 
         let seen = HashMap::<Digest, Bytes>::new();
-        let validators = fixture.validators.clone();
-        let buffered = fixture.recoverer.handle_message(
+        let buffered = fixture.handle_message(
             ShardMessage::reshare(
-                sender.clone(),
+                &sender,
                 artifacts.key,
                 artifacts.commitment,
                 shard_index,
                 reshare,
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
         assert!(buffered.is_empty());
         assert!(
@@ -614,39 +635,24 @@ mod tests {
                 .contains_key(&artifacts.key)
         );
 
-        let drained = fixture
-            .recoverer
-            .note_known_key(artifacts.key, fixture.leader.clone());
+        let drained = fixture.note_known_key(artifacts.key);
         assert_eq!(drained.len(), 1);
 
-        let validators = fixture.validators.clone();
         for msg in drained {
-            let _ = fixture.recoverer.handle_message(msg, &seen, |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            });
+            let _ = fixture.handle_message(msg, &seen);
         }
 
-        let validators = fixture.validators.clone();
-        let effects = fixture.recoverer.handle_message(
+        let effects = fixture.handle_message(
             ShardMessage::initial(
-                fixture.leader.clone(),
+                &fixture.leader,
                 artifacts.key,
                 artifacts.commitment,
                 artifacts.shards[usize::from(fixture.my_index)].clone(),
                 fixture.my_index,
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
-        assert!(has_recovered(&effects, artifacts.key));
+        assert!(has_recovered(effects.iter(), artifacts.key));
     }
 
     #[test]
@@ -657,67 +663,44 @@ mod tests {
         let attacker = fixture.validators[3].clone();
         let helper = fixture.validators[2].clone();
 
-        let _ = fixture
-            .recoverer
-            .note_known_key(good.key, fixture.leader.clone());
+        let _ = fixture.note_known_key(good.key);
         let seen = HashMap::<Digest, Bytes>::new();
 
-        let validators = fixture.validators.clone();
-        let malicious = fixture.recoverer.handle_message(
+        let malicious = fixture.handle_message(
             ShardMessage::initial(
-                attacker,
+                &attacker,
                 good.key,
                 bad.commitment,
                 bad.shards[usize::from(fixture.my_index)].clone(),
                 fixture.my_index,
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
         assert!(malicious.is_empty());
 
-        let validators = fixture.validators.clone();
-        let _ = fixture.recoverer.handle_message(
+        let _ = fixture.handle_message(
             ShardMessage::initial(
-                fixture.leader.clone(),
+                &fixture.leader,
                 good.key,
                 good.commitment,
                 good.shards[usize::from(fixture.my_index)].clone(),
                 fixture.my_index,
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
 
         let helper_index = fixture.validator_index(&helper).expect("known validator");
-        let validators = fixture.validators.clone();
-        let effects = fixture.recoverer.handle_message(
+        let effects = fixture.handle_message(
             ShardMessage::reshare(
-                helper,
+                &helper,
                 good.key,
                 good.commitment,
                 helper_index,
                 good.reshares[usize::from(helper_index)].clone(),
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
-        assert!(has_recovered(&effects, good.key));
+        assert!(has_recovered(effects.iter(), good.key));
     }
 
     #[test]
@@ -727,26 +710,17 @@ mod tests {
         let helper = fixture.validators[2].clone();
         let helper_index = fixture.validator_index(&helper).expect("known validator");
 
-        let _ = fixture
-            .recoverer
-            .note_known_key(active.key, fixture.leader.clone());
+        let _ = fixture.note_known_key(active.key);
         let seen = HashMap::<Digest, Bytes>::new();
-        let validators = fixture.validators.clone();
-        let _ = fixture.recoverer.handle_message(
+        let _ = fixture.handle_message(
             ShardMessage::reshare(
-                helper,
+                &helper,
                 active.key,
                 active.commitment,
                 helper_index,
                 active.reshares[usize::from(helper_index)].clone(),
             ),
             &seen,
-            |pk| {
-                validators
-                    .iter()
-                    .position(|validator| validator == pk)
-                    .and_then(|idx| u16::try_from(idx).ok())
-            },
         );
         assert!(fixture.recoverer.recovery.contains_key(&active.key));
 
@@ -755,9 +729,7 @@ mod tests {
                 Round::new(Epoch::new(2), View::new(view)),
                 Sha256::hash(&view.to_le_bytes()),
             );
-            let _ = fixture
-                .recoverer
-                .note_known_key(key, fixture.leader.clone());
+            let _ = fixture.note_known_key(key);
         }
 
         assert!(fixture.recoverer.known_keys.len() <= ShardRecoverer::MAX_KNOWN_KEYS);
@@ -774,19 +746,19 @@ mod tests {
             prop_assume!(peer_index != 1);
             let mut fixture = Fixture::new();
             let artifacts = fixture.make_artifacts(4, payload.as_slice());
-            let _ = fixture.recoverer.note_known_key(artifacts.key, fixture.leader.clone());
+            let _ = fixture.note_known_key(artifacts.key);
             let seen = HashMap::<Digest, Bytes>::new();
             let peer = fixture.validators[usize::from(peer_index)].clone();
 
             let initial = ShardMessage::initial(
-                fixture.leader.clone(),
+                &fixture.leader,
                 artifacts.key,
                 artifacts.commitment,
                 artifacts.shards[usize::from(fixture.my_index)].clone(),
                 fixture.my_index,
             );
             let reshare = ShardMessage::reshare(
-                peer,
+                &peer,
                 artifacts.key,
                 artifacts.commitment,
                 peer_index,
@@ -794,38 +766,15 @@ mod tests {
             );
 
             let mut effects = Vec::new();
-            let validators = fixture.validators.clone();
             if reshare_first {
-                effects.extend(fixture.recoverer.handle_message(reshare, &seen, |pk| {
-                    validators
-                        .iter()
-                        .position(|validator| validator == pk)
-                        .and_then(|idx| u16::try_from(idx).ok())
-                }));
-                let validators = fixture.validators.clone();
-                effects.extend(fixture.recoverer.handle_message(initial, &seen, |pk| {
-                    validators
-                        .iter()
-                        .position(|validator| validator == pk)
-                        .and_then(|idx| u16::try_from(idx).ok())
-                }));
+                effects.extend(fixture.handle_message(reshare, &seen));
+                effects.extend(fixture.handle_message(initial, &seen));
             } else {
-                effects.extend(fixture.recoverer.handle_message(initial, &seen, |pk| {
-                    validators
-                        .iter()
-                        .position(|validator| validator == pk)
-                        .and_then(|idx| u16::try_from(idx).ok())
-                }));
-                let validators = fixture.validators.clone();
-                effects.extend(fixture.recoverer.handle_message(reshare, &seen, |pk| {
-                    validators
-                        .iter()
-                        .position(|validator| validator == pk)
-                        .and_then(|idx| u16::try_from(idx).ok())
-                }));
+                effects.extend(fixture.handle_message(initial, &seen));
+                effects.extend(fixture.handle_message(reshare, &seen));
             }
 
-            prop_assert!(has_recovered(&effects, artifacts.key));
+            prop_assert!(has_recovered(effects.iter(), artifacts.key));
         }
     }
 }

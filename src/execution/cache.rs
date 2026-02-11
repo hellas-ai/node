@@ -69,28 +69,20 @@ impl ExecutionCache {
             return false;
         }
 
-        let Some((parent_payload, txs)) = decode_payload(payload) else {
-            stack.remove(&payload);
-            return false;
-        };
-        if !self.ensure_execution_for_payload_inner(parent_payload, decode_payload, stack) {
-            stack.remove(&payload);
-            return false;
-        }
+        let materialized = (|| {
+            let (parent_payload, txs) = decode_payload(payload)?;
+            if !self.ensure_execution_for_payload_inner(parent_payload, decode_payload, stack) {
+                return None;
+            }
+            let parent_state = self.executions.get(&parent_payload).cloned()?;
+            let exec = execute_block(&parent_state, &txs).ok()?;
+            self.executions.insert(payload, exec.state);
+            self.parent_by_digest.insert(payload, parent_payload);
+            Some(())
+        })();
 
-        let Some(parent_state) = self.executions.get(&parent_payload).cloned() else {
-            stack.remove(&payload);
-            return false;
-        };
-        let Ok(exec) = execute_block(&parent_state, &txs) else {
-            stack.remove(&payload);
-            return false;
-        };
-
-        self.executions.insert(payload, exec.state);
-        self.parent_by_digest.insert(payload, parent_payload);
         stack.remove(&payload);
-        true
+        materialized.is_some()
     }
 
     pub fn handle_finalized<F>(
@@ -142,6 +134,8 @@ impl ExecutionCache {
         if digest == ancestor {
             return true;
         }
+        // We walk at most parent_by_digest.len() + 1 steps to avoid looping forever
+        // on malformed parent links. A cycle must repeat within that bound.
         for _ in 0..=self.parent_by_digest.len() {
             let Some(parent) = self.parent_by_digest.get(&digest).copied() else {
                 return false;

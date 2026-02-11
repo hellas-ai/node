@@ -41,6 +41,7 @@ pub enum ExecutionError {
     OutputCollision { id: ObjectId },
 }
 
+#[must_use]
 pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
     let mut state = ObjectState::new();
     let mut created = Vec::new();
@@ -67,6 +68,7 @@ pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
     }
 }
 
+#[must_use]
 pub fn execute_block(
     parent_state: &ObjectState,
     txs: &[Transaction],
@@ -75,7 +77,7 @@ pub fn execute_block(
     let mut created = Vec::new();
     let mut deleted = Vec::new();
     for tx in txs {
-        execute_transaction(&mut state, tx, &mut created, &mut deleted)?;
+        execute_transaction_with_tracking(&mut state, tx, Some(&mut created), Some(&mut deleted))?;
     }
     Ok(BlockExecution {
         state,
@@ -87,8 +89,15 @@ pub fn execute_block(
 pub(crate) fn execute_transaction(
     state: &mut ObjectState,
     tx: &Transaction,
-    created: &mut Vec<(ObjectId, Coin)>,
-    deleted: &mut Vec<ObjectId>,
+) -> Result<(), ExecutionError> {
+    execute_transaction_with_tracking(state, tx, None, None)
+}
+
+fn execute_transaction_with_tracking(
+    state: &mut ObjectState,
+    tx: &Transaction,
+    mut created: Option<&mut Vec<(ObjectId, Coin)>>,
+    mut deleted: Option<&mut Vec<ObjectId>>,
 ) -> Result<(), ExecutionError> {
     match tx {
         Transaction::Transfer {
@@ -132,14 +141,18 @@ pub(crate) fn execute_transaction(
             };
 
             state.remove(input);
-            deleted.push(*input);
+            if let Some(deleted) = deleted.as_deref_mut() {
+                deleted.push(*input);
+            }
 
             let recipient_coin = Coin {
                 owner: recipient.clone(),
                 value: *amount,
             };
             state.insert(recipient_id, recipient_coin.clone());
-            created.push((recipient_id, recipient_coin));
+            if let Some(created) = created.as_deref_mut() {
+                created.push((recipient_id, recipient_coin));
+            }
 
             if let Some(change_id) = change_id {
                 let change_coin = Coin {
@@ -147,7 +160,9 @@ pub(crate) fn execute_transaction(
                     value: change_value,
                 };
                 state.insert(change_id, change_coin.clone());
-                created.push((change_id, change_coin));
+                if let Some(created) = created.as_deref_mut() {
+                    created.push((change_id, change_coin));
+                }
             }
             Ok(())
         }
@@ -197,14 +212,18 @@ pub(crate) fn execute_transaction(
 
             for input in inputs {
                 state.remove(input);
-                deleted.push(*input);
+                if let Some(deleted) = deleted.as_deref_mut() {
+                    deleted.push(*input);
+                }
             }
             let merged = Coin {
                 owner,
                 value: total,
             };
             state.insert(output_id, merged.clone());
-            created.push((output_id, merged));
+            if let Some(created) = created.as_deref_mut() {
+                created.push((output_id, merged));
+            }
             Ok(())
         }
     }

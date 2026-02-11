@@ -67,14 +67,14 @@ pub(crate) struct ShardMessage {
 
 impl ShardMessage {
     pub(crate) fn initial(
-        sender: PublicKey,
+        sender: &PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shard: ZodaShard,
         shard_index: u16,
     ) -> Self {
         Self {
-            sender,
+            sender: sender.clone(),
             body: WireShardMessage::Initial {
                 key,
                 commitment,
@@ -85,14 +85,14 @@ impl ShardMessage {
     }
 
     pub(crate) fn reshare(
-        sender: PublicKey,
+        sender: &PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shard_index: u16,
         reshard: ZodaReShard,
     ) -> Self {
         Self {
-            sender,
+            sender: sender.clone(),
             body: WireShardMessage::ReShare {
                 key,
                 commitment,

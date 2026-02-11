@@ -1,42 +1,19 @@
+mod core;
 mod mailbox;
 mod payload;
 
 pub use mailbox::Mailbox;
 
-use crate::shard::{
-    BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardRecoverer, ShardTransport,
-    ZodaCommitment, ZodaShard, coding_config,
-};
-use crate::{
-    execution::{
-        ExecutionCache, ExecutionError, ObjectState, execute_block, execute_transaction,
-        genesis_state,
-    },
-    object::{MAX_TXS_PER_BLOCK, Transaction},
-};
-use bytes::Bytes;
-use commonware_coding::Scheme as CodingScheme;
-#[cfg(test)]
-use commonware_consensus::types::Round;
-use commonware_consensus::{Reporter, types::Epoch};
+use crate::shard::{ShardMessage, ShardTransport, coding_config};
+use commonware_consensus::Reporter;
 use commonware_cryptography::sha256::Digest;
 use commonware_macros::select_loop;
-use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::{SystemTimeExt, channels::fallible::OneshotExt};
-use futures::{
-    StreamExt,
-    channel::{mpsc, oneshot},
-};
-use hellas_types::{Activity, Context, PublicKey};
+use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
+use futures::{StreamExt, channel::mpsc};
+use hellas_types::{Activity, PublicKey};
 use mailbox::Message;
-#[cfg(test)]
-use payload::{PayloadValidationError, SYNCHRONY_BOUND, decode_timestamp, encode_payload};
-use payload::{
-    decode_execution_payload, encode_payload_with_txs, genesis_digest, genesis_payload,
-    missing_dependency_or_execution, payload_digest, validate_payload,
-};
-use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizationNotice {
@@ -44,14 +21,8 @@ pub(crate) struct FinalizationNotice {
     pub parent_payload: Digest,
 }
 
-struct DeferredVerify {
-    context: Context,
-    payload: Digest,
-    response: oneshot::Sender<bool>,
-}
-
 // ---------------------------------------------------------------------------
-// NoopReporter — logs finalizations, discards other activity
+// TraceReporter — logs consensus activity
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -66,7 +37,7 @@ impl Reporter for TraceReporter {
 }
 
 // ---------------------------------------------------------------------------
-// Application actor — runs in a spawned task, handles the real logic
+// Application actor — async driver over AppCore
 // ---------------------------------------------------------------------------
 
 pub(crate) struct Application<E: Clock + Spawner> {
@@ -78,21 +49,11 @@ pub(crate) struct Application<E: Clock + Spawner> {
 
     mailbox_rx: mpsc::Receiver<Message>,
 
-    pending: HashMap<Digest, Bytes>,
-    pending_order: VecDeque<Digest>,
-    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
-    seen: HashMap<Digest, Bytes>,
-    mempool: VecDeque<Transaction>,
-    execution_cache: ExecutionCache,
-    validators: Vec<PublicKey>,
-    shard_recoverer: ShardRecoverer,
+    core: AppCore,
 }
 
 impl<E: Clock + Spawner> Application<E> {
-    const MAX_PENDING_DIGESTS: usize = 256;
-    const MAX_WAITER_KEYS: usize = 512;
-    const MAX_MEMPOOL_SIZE: usize = 1024;
-    const MAX_FINALIZED_EXECUTIONS: usize = 512;
+    const MAILBOX_CAPACITY: usize = 1024;
 
     pub(crate) fn new(
         context: E,
@@ -110,22 +71,17 @@ impl<E: Clock + Spawner> Application<E> {
         context: E,
         relay: std::sync::Arc<dyn ShardTransport>,
         me: &PublicKey,
-        mut validators: Vec<PublicKey>,
+        validators: Vec<PublicKey>,
         finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
     ) -> (Self, Mailbox) {
-        validators.sort();
-        validators.dedup();
-        if validators.is_empty() {
-            warn!("validator set was empty; defaulting to self-only validator set");
-            validators.push(me.clone());
-        }
         let shard_rx = relay.register(me);
-        let (sender, receiver) = mpsc::channel(1024);
+        let (sender, receiver) = mpsc::channel(Self::MAILBOX_CAPACITY);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
             warn!("validator index unavailable for local key; defaulting to index 0");
             0
         });
         let coding_config = coding_config(relay.validator_count());
+        let core = AppCore::new(me, validators, my_index, coding_config);
 
         (
             Self {
@@ -134,373 +90,51 @@ impl<E: Clock + Spawner> Application<E> {
                 shard_rx,
                 finalization_rx,
                 mailbox_rx: receiver,
-                pending: HashMap::new(),
-                pending_order: VecDeque::new(),
-                pending_shards: HashMap::new(),
-                seen: HashMap::new(),
-                mempool: VecDeque::new(),
-                execution_cache: ExecutionCache::new(Self::MAX_FINALIZED_EXECUTIONS),
-                validators,
-                shard_recoverer: ShardRecoverer::new(me.clone(), my_index, coding_config),
+                core,
             },
             Mailbox::new(sender),
         )
     }
 
-    fn genesis(&mut self, epoch: Epoch) -> Digest {
-        let payload = genesis_payload(epoch);
-        let digest = genesis_digest(epoch);
-        self.seen.insert(digest, payload);
-        let genesis_execution = genesis_state(&self.validators);
-        self.execution_cache
-            .insert_state(digest, Digest::from([0u8; 32]), genesis_execution.state);
-        digest
-    }
-
-    fn propose(&mut self, context: &Context) -> Digest {
-        let timestamp = self.context.current().epoch_millis();
-        let parent = context.parent.1;
-        let mut txs = Vec::new();
-        let mut resulting_state = None;
-
-        if self
-            .execution_cache
-            .ensure_execution_for_payload(parent, &|digest| {
-                decode_execution_payload(&self.seen, digest)
-            })
-        {
-            let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
-                warn!(
-                    parent = ?parent,
-                    "execution materialization reported success but parent state was missing"
-                );
-                return self.propose_empty(context, timestamp);
-            };
-            let mut running_state = parent_state;
-            let mut retained = VecDeque::new();
-            while let Some(tx) = self.mempool.pop_front() {
-                if txs.len() >= MAX_TXS_PER_BLOCK {
-                    retained.push_back(tx);
-                    continue;
-                }
-                match execute_transaction(&mut running_state, &tx, &mut Vec::new(), &mut Vec::new())
-                {
-                    Ok(()) => {
-                        txs.push(tx);
-                    }
-                    Err(ExecutionError::ObjectNotFound { .. }) => {
-                        retained.push_back(tx);
-                    }
-                    Err(err) => {
-                        warn!(?err, "dropping permanently invalid tx from mempool");
-                    }
-                }
-            }
-            self.mempool = retained;
-            resulting_state = Some(running_state);
-        } else {
-            warn!(parent = ?parent, "missing parent execution; proposing empty block");
-        }
-
-        self.propose_with_txs(context, timestamp, parent, txs, resulting_state)
-    }
-
-    fn propose_empty(&mut self, context: &Context, timestamp: u64) -> Digest {
-        self.propose_with_txs(context, timestamp, context.parent.1, Vec::new(), None)
-    }
-
-    fn propose_with_txs(
-        &mut self,
-        context: &Context,
-        timestamp: u64,
-        parent: Digest,
-        txs: Vec<Transaction>,
-        resulting_state: Option<ObjectState>,
-    ) -> Digest {
-        let payload = encode_payload_with_txs(context.round, parent, timestamp, &txs);
-        let digest = payload_digest(&payload);
-        let key = BlockKey::new(context.round, digest);
-        let encoded = CodingImpl::encode(
-            self.shard_recoverer.coding_config(),
-            payload.as_ref(),
-            &Sequential,
-        );
-
-        self.pending.insert(digest, payload.clone());
-        match encoded {
-            Ok((commitment, shards)) => {
-                self.pending_shards
-                    .insert(digest, (key, commitment, shards));
-            }
-            Err(err) => {
-                warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
-            }
-        }
-        self.touch_pending(digest);
-        self.seen.insert(digest, payload);
-        if let Some(state) = resulting_state {
-            self.execution_cache.insert_state(digest, parent, state);
-        } else {
-            self.execution_cache.note_parent(digest, parent);
-        }
-        digest
-    }
-
-    fn verify(&mut self, context: &Context, payload: Digest, contents: &Bytes) -> bool {
-        if !self
-            .execution_cache
-            .ensure_execution_for_payload(context.parent.1, &|digest| {
-                decode_execution_payload(&self.seen, digest)
-            })
-        {
-            warn!(
-                parent = ?context.parent.1,
-                "missing parent execution during verify"
-            );
-            return false;
-        }
-        let Some(parent_bytes) = self.seen.get(&context.parent.1) else {
-            warn!(
-                parent = ?context.parent.1,
-                "parent bytes missing during verify despite dependency check"
-            );
-            return false;
-        };
-        let Some(parent_state) = self.execution_cache.execution(context.parent.1).cloned() else {
-            warn!(
-                parent = ?context.parent.1,
-                "parent execution missing during verify despite dependency check"
-            );
-            return false;
-        };
-        let now = self.context.current().epoch_millis();
-        match validate_payload(
-            context.round,
-            context.parent.1,
-            payload,
-            contents,
-            now,
-            parent_bytes,
-        ) {
-            Ok(txs) => match execute_block(&parent_state, &txs) {
-                Ok(exec) => {
-                    self.execution_cache
-                        .insert_state(payload, context.parent.1, exec.state);
-                    true
-                }
-                Err(err) => {
-                    warn!(?err, payload = ?payload, "payload execution failed");
-                    false
-                }
-            },
-            Err(err) => {
-                warn!(%err, payload = ?payload, "payload validation failed");
-                false
-            }
-        }
-    }
-
-    fn handle_verify_request(
-        &mut self,
-        context: Context,
-        payload: Digest,
-        response: oneshot::Sender<bool>,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
-        if !self.execution_cache.contains_execution(context.parent.1) {
-            let _ = self
-                .execution_cache
-                .ensure_execution_for_payload(context.parent.1, &|digest| {
-                    decode_execution_payload(&self.seen, digest)
-                });
-        }
-        if let Some(missing_digest) =
-            missing_dependency_or_execution(&self.seen, &self.execution_cache, &context, payload)
-        {
-            self.queue_waiter(
-                waiters,
-                waiter_order,
-                missing_digest,
-                DeferredVerify {
-                    context,
-                    payload,
-                    response,
-                },
-            );
-            return;
-        }
-        let Some(contents) = self.seen.get(&payload).cloned() else {
-            warn!(
-                payload = ?payload,
-                "payload bytes missing during verify despite dependency check"
-            );
-            response.send_lossy(false);
-            return;
-        };
-        let valid = self.verify(&context, payload, &contents);
-        response.send_lossy(valid);
-        if valid {
-            self.resolve_waiters(payload, waiters, waiter_order);
-        } else {
-            self.fail_waiters(payload, waiters, waiter_order);
-        }
-    }
-
-    fn queue_waiter(
-        &self,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-        digest: Digest,
-        deferred: DeferredVerify,
-    ) {
-        if !waiters.contains_key(&digest) {
-            waiter_order.push_back(digest);
-        }
-        waiters.entry(digest).or_default().push(deferred);
-
-        while waiters.len() > Self::MAX_WAITER_KEYS {
-            let Some(oldest) = waiter_order.pop_front() else {
-                break;
-            };
-            if let Some(stale) = waiters.remove(&oldest) {
-                for deferred in stale {
-                    deferred.response.send_lossy(false);
-                }
-            }
-        }
-    }
-
-    fn resolve_waiters(
-        &mut self,
-        digest: Digest,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
-        if let Some(pos) = waiter_order.iter().position(|d| *d == digest) {
-            waiter_order.remove(pos);
-        }
-        if let Some(pending) = waiters.remove(&digest) {
-            for deferred in pending {
-                self.handle_verify_request(
-                    deferred.context,
-                    deferred.payload,
-                    deferred.response,
-                    waiters,
-                    waiter_order,
-                );
-            }
-        }
-    }
-
-    fn fail_waiters(
-        &self,
-        digest: Digest,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
-        if let Some(pos) = waiter_order.iter().position(|d| *d == digest) {
-            waiter_order.remove(pos);
-        }
-        if let Some(stale) = waiters.remove(&digest) {
-            for deferred in stale {
-                deferred.response.send_lossy(false);
-            }
-        }
-    }
-
-    fn touch_pending(&mut self, digest: Digest) {
-        if !self.pending_order.contains(&digest) {
-            self.pending_order.push_back(digest);
-        }
-        while self.pending_order.len() > Self::MAX_PENDING_DIGESTS {
-            let Some(oldest) = self.pending_order.pop_front() else {
-                break;
-            };
-            self.pending.remove(&oldest);
-            self.pending_shards.remove(&oldest);
-        }
-    }
-
-    fn handle_finalized(
-        &mut self,
-        payload: Digest,
-        parent_payload: Digest,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
-        let Some(pruned) =
-            self.execution_cache
-                .handle_finalized(payload, parent_payload, &|digest| {
-                    decode_execution_payload(&self.seen, digest)
-                })
-        else {
-            warn!(
-                ?payload,
-                "finalization arrived before local execution state was available"
-            );
-            return;
-        };
-
-        for digest in pruned {
-            self.seen.remove(&digest);
-            self.pending.remove(&digest);
-            self.pending_shards.remove(&digest);
-            self.fail_waiters(digest, waiters, waiter_order);
-        }
-
-        self.pending_order
-            .retain(|digest| self.pending.contains_key(digest));
-    }
-
-    async fn apply_shard_effect(
-        &mut self,
-        effect: ShardEffect,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
+    fn apply_reply_effect(&mut self, effect: CoreEffect) {
         match effect {
-            ShardEffect::Broadcast(message) => {
+            CoreEffect::RespondDigest { response, digest } => {
+                response.send_lossy(digest);
+            }
+            CoreEffect::RespondVerify { response, valid } => {
+                response.send_lossy(valid);
+            }
+            #[cfg(debug_assertions)]
+            CoreEffect::RespondCoin { response, coin } => {
+                response.send_lossy(coin);
+            }
+        }
+    }
+
+    async fn apply_network_effect(&mut self, effect: NetworkEffect) {
+        match effect {
+            NetworkEffect::BroadcastShard(message) => {
+                self.relay.broadcast_except(self.core.me(), *message).await;
+            }
+            NetworkEffect::DistributeShards {
+                key,
+                commitment,
+                shards,
+            } => {
                 self.relay
-                    .broadcast_except(self.shard_recoverer.me(), *message)
+                    .distribute_shards(self.core.me(), key, commitment, shards)
                     .await;
             }
-            ShardEffect::Recovered { key, contents } => {
-                self.seen.insert(key.digest, contents);
-                self.pending.remove(&key.digest);
-                self.pending_shards.remove(&key.digest);
-                self.resolve_waiters(key.digest, waiters, waiter_order);
-            }
-            ShardEffect::Failed { key } => {
-                self.fail_waiters(key.digest, waiters, waiter_order);
-            }
         }
     }
 
-    async fn handle_shard_message(
-        &mut self,
-        message: ShardMessage,
-        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
-        waiter_order: &mut VecDeque<Digest>,
-    ) {
-        let effects = self
-            .shard_recoverer
-            .handle_message(message, &self.seen, |sender| {
-                self.relay.validator_index(sender)
-            });
-        for effect in effects {
-            self.apply_shard_effect(effect, waiters, waiter_order).await;
+    async fn apply_core_effects(&mut self, effects: CoreEffects) {
+        for effect in effects.replies {
+            self.apply_reply_effect(effect);
         }
-    }
-
-    async fn broadcast_payload(&mut self, digest: Digest) {
-        let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
-            warn!(?digest, "broadcast requested for unknown pending shards");
-            return;
-        };
-        self.relay
-            .distribute_shards(self.shard_recoverer.me(), key, commitment, shards)
-            .await;
+        for effect in effects.network {
+            self.apply_network_effect(effect).await;
+        }
     }
 
     pub(crate) fn start(mut self) -> Handle<()> {
@@ -508,9 +142,6 @@ impl<E: Clock + Spawner> Application<E> {
     }
 
     async fn run(mut self) {
-        let mut waiters: HashMap<Digest, Vec<DeferredVerify>> = HashMap::new();
-        let mut waiter_order: VecDeque<Digest> = VecDeque::new();
-
         select_loop! {
             self.context,
             on_stopped => {
@@ -521,56 +152,22 @@ impl<E: Clock + Spawner> Application<E> {
                     Some(message) => message,
                     None => break,
                 };
-                match message {
-                    Message::Genesis { epoch, response } => {
-                        let digest = self.genesis(epoch);
-                        response.send_lossy(digest);
-                    }
-                    Message::Propose { context, response } => {
-                        let digest = self.propose(&context);
-                        response.send_lossy(digest);
-                    }
-                    Message::Verify { context, payload, response } => {
-                        let key = BlockKey::new(context.round, payload);
-                        let leader = context.leader.clone();
-                        self.handle_verify_request(
-                            context,
-                            payload,
-                            response,
-                            &mut waiters,
-                            &mut waiter_order,
-                        );
-                        for msg in self.shard_recoverer.note_known_key(key, leader) {
-                            self.handle_shard_message(msg, &mut waiters, &mut waiter_order)
-                                .await;
-                        }
-                    }
-                    Message::Broadcast { payload } => {
-                        self.broadcast_payload(payload).await;
-                    }
-                    Message::SubmitTx { tx } => {
-                        if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
-                            self.mempool.push_back(tx);
-                        }
-                    }
-                    #[cfg(debug_assertions)]
-                    Message::GetCoin {
-                        payload,
-                        object,
-                        response,
-                    } => {
-                        let coin = self
-                            .execution_cache
-                            .execution(payload)
-                            .and_then(|state| state.get(&object).cloned());
-                        response.send_lossy(coin);
-                    }
-                }
+                let now = self.context.current().epoch_millis();
+                let relay = &self.relay;
+                let effects = self
+                    .core
+                    .on_message(message, now, &|sender| relay.validator_index(sender));
+                self.apply_core_effects(effects).await;
             },
             shard = self.shard_rx.next() => {
                 match shard {
                     Some(shard) => {
-                        self.handle_shard_message(shard, &mut waiters, &mut waiter_order).await;
+                        let now = self.context.current().epoch_millis();
+                        let relay = &self.relay;
+                        let effects = self
+                            .core
+                            .on_shard_message(shard, now, &|sender| relay.validator_index(sender));
+                        self.apply_core_effects(effects).await;
                     }
                     None => {
                         warn!("shard relay closed");
@@ -581,7 +178,8 @@ impl<E: Clock + Spawner> Application<E> {
             finalized = self.finalization_rx.next() => {
                 match finalized {
                     Some(finalized) => {
-                        self.handle_finalized(finalized.payload, finalized.parent_payload, &mut waiters, &mut waiter_order);
+                        let effects = self.core.on_finalized(finalized.payload, finalized.parent_payload);
+                        self.apply_core_effects(effects).await;
                     }
                     None => {
                         warn!("finalization channel closed");
@@ -596,13 +194,19 @@ impl<E: Clock + Spawner> Application<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::payload::{
+        PayloadValidationError, SYNCHRONY_BOUND, decode_timestamp, encode_payload, genesis_payload,
+        payload_digest, validate_payload,
+    };
     use crate::shard::mock::MockShardTransport;
+    use bytes::Bytes;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
-    use commonware_consensus::types::{Epoch, View};
+    use commonware_consensus::types::{Epoch, Round, View};
     use commonware_consensus::{Automaton, Relay};
     use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_runtime::{Clock, Metrics, Runner, deterministic};
     use futures::channel::oneshot::Canceled;
+    use hellas_types::Context;
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
 
@@ -867,7 +471,7 @@ mod tests {
 
             let relay = Arc::new(MockShardTransport::new());
             for participant in participants.iter() {
-                relay.declare(participant.clone());
+                relay.declare(participant);
             }
             relay.finalize_validators();
 
@@ -932,56 +536,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn finalization_prunes_non_descendant_execution_state() {
-        let runner = deterministic::Runner::timed(Duration::from_secs(30));
-
-        runner.start(|mut context| async move {
-            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
-                minimmit_ed25519::fixture(&mut context, b"app-prune-test", 6);
-
-            let relay = Arc::new(MockShardTransport::new());
-            for participant in participants.iter() {
-                relay.declare(participant.clone());
-            }
-            relay.finalize_validators();
-
-            let me = participants[0].clone();
-            let (mut app, _mailbox, _finalization_tx) = Application::new(
-                context.with_label("app_prune"),
-                relay,
-                &me,
-                participants.clone(),
-            );
-
-            let epoch = Epoch::new(1);
-            let genesis = app.genesis(epoch);
-
-            let canonical_context = Context {
-                round: Round::new(epoch, View::new(1)),
-                leader: participants[0].clone(),
-                parent: (View::zero(), genesis),
-            };
-            let canonical = app.propose(&canonical_context);
-
-            let fork_context = Context {
-                round: Round::new(epoch, View::new(2)),
-                leader: participants[1].clone(),
-                parent: (View::zero(), genesis),
-            };
-            let fork = app.propose(&fork_context);
-
-            assert!(app.execution_cache.contains_execution(canonical));
-            assert!(app.execution_cache.contains_execution(fork));
-
-            let mut waiters: HashMap<Digest, Vec<DeferredVerify>> = HashMap::new();
-            let mut waiter_order: VecDeque<Digest> = VecDeque::new();
-            app.handle_finalized(canonical, genesis, &mut waiters, &mut waiter_order);
-
-            assert_eq!(app.execution_cache.latest_finalized(), Some(canonical));
-            assert!(app.execution_cache.contains_execution(canonical));
-            assert!(!app.execution_cache.contains_execution(fork));
-            assert!(!app.seen.contains_key(&fork));
-        });
-    }
 }

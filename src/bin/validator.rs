@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use commonware_codec::Encode;
+use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Manager, authenticated::lookup};
 use commonware_runtime::{Metrics, Quota, Runner, tokio};
@@ -155,7 +156,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", node_config.listen_port).parse()?;
 
     // Build consensus scheme
-    let scheme = match Scheme::signer(NAMESPACE, participants.clone(), private_key.clone()) {
+    let scheme = match Scheme::signer(NAMESPACE, participants, private_key.clone()) {
         Some(scheme) => scheme,
         None => {
             return Err(ValidatorError::Scheme(
@@ -192,12 +193,12 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let _network_handle = network.start();
 
         let relay = Arc::new(AuthenticatedShardTransport::new(
-            me.clone(),
+            &me,
             shard_sender,
             shard_receiver,
         ));
-        for participant in participants.iter() {
-            relay.declare(participant.clone());
+        for participant in scheme.participants() {
+            relay.declare(participant);
         }
         relay.finalize_validators();
         let _shard_transport_handle = relay.clone().start(context.clone());

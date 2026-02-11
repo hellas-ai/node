@@ -33,18 +33,18 @@ where
     S: P2pSender<PublicKey = PublicKey>,
     R: P2pReceiver<PublicKey = PublicKey>,
 {
-    pub fn new(me: PublicKey, network_sender: S, network_receiver: R) -> Self {
+    pub fn new(me: &PublicKey, network_sender: S, network_receiver: R) -> Self {
         let (network_sender, network_receiver) = wrap((), network_sender, network_receiver);
         Self {
             local_subscribers: Mutex::new(Vec::new()),
             validators: ValidatorSet::new(),
-            me,
+            me: me.clone(),
             network_sender: AsyncMutex::new(network_sender),
             network_receiver: AsyncMutex::new(network_receiver),
         }
     }
 
-    pub fn declare(&self, public_key: PublicKey) {
+    pub fn declare(&self, public_key: &PublicKey) {
         self.validators.declare(public_key);
     }
 

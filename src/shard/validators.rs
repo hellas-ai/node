@@ -26,14 +26,14 @@ impl ValidatorSet {
         }
     }
 
-    pub(crate) fn declare(&self, public_key: PublicKey) {
+    pub(crate) fn declare(&self, public_key: &PublicKey) {
         if self.finalized.load(Ordering::Relaxed) {
             warn!("attempted to declare validator after finalization; ignoring");
             return;
         }
         let mut validators = self.lock_validators();
-        if !validators.contains(&public_key) {
-            validators.push(public_key);
+        if !validators.contains(public_key) {
+            validators.push(public_key.clone());
         }
     }
 

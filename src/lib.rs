@@ -3,6 +3,7 @@ extern crate tracing;
 
 mod app;
 pub mod config;
+mod effects;
 pub mod engine;
 mod execution;
 pub mod object;

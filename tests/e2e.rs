@@ -108,12 +108,12 @@ fn run_network(
                 .remove(validator)
                 .expect("validator should be registered");
             let relay = Arc::new(AuthenticatedShardTransport::new(
-                validator.clone(),
+                validator,
                 shard_sender,
                 shard_receiver,
             ));
             for participant in participants.iter() {
-                relay.declare(participant.clone());
+                relay.declare(participant);
             }
             relay.finalize_validators();
             let _shard_transport = relay.clone().start(context.clone());
