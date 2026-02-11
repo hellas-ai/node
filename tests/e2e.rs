@@ -1,3 +1,4 @@
+use commonware_codec::Encode;
 use commonware_consensus::elector::RoundRobin;
 use commonware_consensus::minimmit::{
     mocks::reporter::{Config as ReporterConfig, Reporter as MockReporter},
@@ -5,14 +6,18 @@ use commonware_consensus::minimmit::{
     types::Finalization,
 };
 use commonware_consensus::types::View;
+use commonware_cryptography::Signer;
 use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
-use commonware_cryptography::{Sha256, sha256::Digest};
+use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
 use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
+use hellas_chain::object::{
+    Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id,
+};
 use hellas_chain::shard::AuthenticatedShardTransport;
-use hellas_types::{Activity, PublicKey, Scheme};
+use hellas_types::{Activity, PrivateKey, PublicKey, Scheme};
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 const NAMESPACE: &[u8] = b"hellas-e2e";
@@ -22,7 +27,19 @@ type Finalizations = Arc<std::sync::Mutex<HashMap<View, Finalization<Scheme, Dig
 type Faults =
     Arc<std::sync::Mutex<HashMap<PublicKey, HashMap<View, std::collections::HashSet<Activity>>>>>;
 
-fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizations, Faults)> {
+#[derive(Clone, Copy)]
+struct SubmitTransfer {
+    sender: usize,
+    recipient: usize,
+    amount: u64,
+}
+
+fn run_network(
+    config: Config,
+    link: Link,
+    duration: Duration,
+    transfer: Option<SubmitTransfer>,
+) -> Vec<(Finalizations, Faults)> {
     let runner = deterministic::Runner::timed(Duration::from_secs(60));
 
     let handles: Arc<std::sync::Mutex<Vec<(Finalizations, Faults)>>> =
@@ -43,6 +60,7 @@ fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizat
         let Fixture {
             participants,
             schemes,
+            private_keys,
             ..
         }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
 
@@ -68,6 +86,7 @@ fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizat
             }
         }
 
+        let mut tx_mailboxes = Vec::new();
         for (idx, validator) in participants.iter().enumerate() {
             let ctx = context.with_label(&format!("validator_{idx}"));
             let blocker = oracle.control(validator.clone());
@@ -99,7 +118,7 @@ fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizat
             relay.finalize_validators();
             let _shard_transport = relay.clone().start(context.clone());
 
-            let engine = Engine::new(
+            let (engine, tx_mailbox) = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
@@ -108,7 +127,89 @@ fn run_network(config: Config, link: Link, duration: Duration) -> Vec<(Finalizat
                 validator,
                 reporter,
             );
+            tx_mailboxes.push(tx_mailbox);
             engine.start(vote, certificate, resolver);
+        }
+
+        if let Some(transfer) = transfer {
+            let sender_key: PrivateKey = private_keys[transfer.sender].clone();
+            let sender_pk = sender_key.public_key();
+            let recipient_pk = participants[transfer.recipient].clone();
+            let mut sorted_validators = participants.clone();
+            sorted_validators.sort();
+            let sender_index = sorted_validators
+                .binary_search(&sender_pk)
+                .expect("sender must exist in validator set");
+            let input =
+                genesis_object_id(u16::try_from(sender_index).expect("sender index in u16"));
+            let tx =
+                Transaction::transfer(&sender_key, input, recipient_pk.clone(), transfer.amount);
+            let tx_digest = Sha256::hash(&tx.encode());
+            let recipient_output = output_object_id(&tx_digest, 0);
+            let change_output = output_object_id(&tx_digest, 1);
+            let mut mailbox = tx_mailboxes[transfer.sender].clone();
+            mailbox.submit_tx(tx).await;
+
+            context.sleep(duration).await;
+
+            let finalized_payloads = {
+                let handles = handles.lock().unwrap();
+                let (finalizations, _) = &handles[0];
+                let finalizations = finalizations.lock().unwrap();
+                let mut views: Vec<_> = finalizations.keys().cloned().collect();
+                views.sort();
+                views
+                    .into_iter()
+                    .filter_map(|view| finalizations.get(&view).map(|f| f.proposal.payload))
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                !finalized_payloads.is_empty(),
+                "expected at least one finalization before state assertions"
+            );
+
+            let mut matched_payload = None;
+            for payload in finalized_payloads {
+                let mut mailbox = tx_mailboxes[0].clone();
+                let Some(coin) = mailbox.get_coin(payload, recipient_output).await else {
+                    continue;
+                };
+                if coin.owner == recipient_pk && coin.value == transfer.amount {
+                    matched_payload = Some(payload);
+                    break;
+                }
+            }
+
+            let payload = matched_payload
+                .expect("submitted transfer was not observed in any finalized payload state");
+
+            let expected_recipient = Coin {
+                owner: recipient_pk.clone(),
+                value: transfer.amount,
+            };
+            let expected_change = Coin {
+                owner: sender_pk.clone(),
+                value: GENESIS_BALANCE - transfer.amount,
+            };
+
+            for mut mailbox in tx_mailboxes {
+                assert_eq!(
+                    mailbox.get_coin(payload, recipient_output).await,
+                    Some(expected_recipient.clone()),
+                    "recipient output missing in finalized state"
+                );
+                assert_eq!(
+                    mailbox.get_coin(payload, input).await,
+                    None,
+                    "sender input should be consumed in finalized state"
+                );
+                assert_eq!(
+                    mailbox.get_coin(payload, change_output).await,
+                    Some(expected_change.clone()),
+                    "change output missing in finalized state"
+                );
+            }
+            return;
         }
 
         context.sleep(duration).await;
@@ -128,7 +229,7 @@ fn healthy_network_finalizes() {
         success_rate: 1.0,
     };
 
-    let handles = run_network(Config::test(), link, Duration::from_secs(3));
+    let handles = run_network(Config::test(), link, Duration::from_secs(3), None);
 
     let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
     assert!(
@@ -150,11 +251,37 @@ fn lossy_network_finalizes() {
         success_rate: 0.95,
     };
 
-    let handles = run_network(Config::test(), link, Duration::from_secs(10));
+    let handles = run_network(Config::test(), link, Duration::from_secs(10), None);
 
     let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
     assert!(
         total_finalizations > 0,
         "expected at least one finalization even with lossy network"
+    );
+}
+
+#[test]
+fn submitted_transfer_network_finalizes() {
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
+
+    let handles = run_network(
+        Config::test(),
+        link,
+        Duration::from_secs(5),
+        Some(SubmitTransfer {
+            sender: 0,
+            recipient: 1,
+            amount: 1,
+        }),
+    );
+
+    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
+    assert!(
+        total_finalizations > 0,
+        "expected finalization progress with submitted transfer"
     );
 }

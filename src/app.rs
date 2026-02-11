@@ -2,8 +2,12 @@ use crate::shard::{
     BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardReconstructor, ShardTransport,
     ZodaCommitment, ZodaShard, coding_config,
 };
+use crate::{
+    object::{Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction},
+    state::{ExecutionError, ObjectState, execute_block, genesis_state},
+};
 use bytes::Bytes;
-use commonware_codec::{DecodeExt, Encode};
+use commonware_codec::{ReadExt, ReadRangeExt, Write};
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::{
     Automaton as Au, Relay as Re, Reporter as Rp,
@@ -56,15 +60,42 @@ enum PayloadValidationError {
 fn genesis_payload(epoch: Epoch) -> Bytes {
     let round = Round::new(epoch, View::zero());
     let parent = Digest::from([0u8; 32]);
-    encode_payload(round, parent, 0)
+    encode_payload_with_txs(round, parent, 0, &[])
 }
 
 fn genesis_digest(epoch: Epoch) -> Digest {
     payload_digest(&genesis_payload(epoch))
 }
 
+#[cfg(test)]
 fn encode_payload(round: Round, parent: Digest, timestamp: u64) -> Bytes {
-    (round, parent, timestamp).encode()
+    encode_payload_with_txs(round, parent, timestamp, &[])
+}
+
+fn encode_payload_with_txs(
+    round: Round,
+    parent: Digest,
+    timestamp: u64,
+    txs: &[Transaction],
+) -> Bytes {
+    let mut buf = bytes::BytesMut::new();
+    round.write(&mut buf);
+    parent.write(&mut buf);
+    timestamp.write(&mut buf);
+    txs.write(&mut buf);
+    buf.freeze()
+}
+
+fn decode_payload(contents: &Bytes) -> Option<(Round, Digest, u64, Vec<Transaction>)> {
+    let mut reader = contents.clone();
+    let round = Round::read(&mut reader).ok()?;
+    let parent = Digest::read(&mut reader).ok()?;
+    let timestamp = u64::read(&mut reader).ok()?;
+    let txs = Vec::<Transaction>::read_range(&mut reader, 0..=MAX_TXS_PER_BLOCK).ok()?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((round, parent, timestamp, txs))
 }
 
 fn payload_digest(contents: &Bytes) -> Digest {
@@ -74,7 +105,9 @@ fn payload_digest(contents: &Bytes) -> Digest {
 /// Decode the timestamp from an encoded payload.
 fn decode_timestamp(contents: &Bytes) -> Option<u64> {
     let mut reader = contents.clone();
-    let (_, _, timestamp) = <(Round, Digest, u64)>::decode(&mut reader).ok()?;
+    let _ = Round::read(&mut reader).ok()?;
+    let _ = Digest::read(&mut reader).ok()?;
+    let timestamp = u64::read(&mut reader).ok()?;
     Some(timestamp)
 }
 
@@ -85,7 +118,7 @@ fn validate_payload(
     contents: &Bytes,
     now: u64,
     parent_contents: &Bytes,
-) -> Result<(), PayloadValidationError> {
+) -> Result<Vec<Transaction>, PayloadValidationError> {
     let computed = payload_digest(contents);
     if computed != expected_payload {
         return Err(PayloadValidationError::DigestMismatch {
@@ -94,8 +127,7 @@ fn validate_payload(
         });
     }
 
-    let mut reader = contents.clone();
-    let Ok((parsed_round, parent, timestamp)) = <(Round, Digest, u64)>::decode(&mut reader) else {
+    let Some((parsed_round, parent, timestamp, txs)) = decode_payload(contents) else {
         return Err(PayloadValidationError::InvalidEncoding);
     };
 
@@ -127,11 +159,12 @@ fn validate_payload(
         });
     }
 
-    Ok(())
+    Ok(txs)
 }
 
-fn missing_dependency(
+fn missing_dependency_or_execution(
     seen: &HashMap<Digest, Bytes>,
+    executions: &HashMap<Digest, ObjectState>,
     context: &Context,
     payload: Digest,
 ) -> Option<Digest> {
@@ -139,6 +172,9 @@ fn missing_dependency(
         return Some(payload);
     }
     if !seen.contains_key(&context.parent.1) {
+        return Some(context.parent.1);
+    }
+    if !executions.contains_key(&context.parent.1) {
         return Some(context.parent.1);
     }
     None
@@ -164,6 +200,14 @@ pub enum Message {
     },
     Broadcast {
         payload: Digest,
+    },
+    SubmitTx {
+        tx: Transaction,
+    },
+    GetCoin {
+        payload: Digest,
+        object: ObjectId,
+        response: oneshot::Sender<Option<Coin>>,
     },
 }
 
@@ -227,6 +271,24 @@ impl Re for Mailbox {
     }
 }
 
+impl Mailbox {
+    pub async fn submit_tx(&mut self, tx: Transaction) {
+        self.sender.send_lossy(Message::SubmitTx { tx }).await;
+    }
+
+    pub async fn get_coin(&mut self, payload: Digest, object: ObjectId) -> Option<Coin> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send_lossy(Message::GetCoin {
+                payload,
+                object,
+                response,
+            })
+            .await;
+        receiver.await.unwrap_or(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NoopReporter — logs finalizations, discards other activity
 // ---------------------------------------------------------------------------
@@ -258,18 +320,29 @@ pub struct Application<E: Clock + Spawner> {
     pending_order: VecDeque<Digest>,
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     seen: HashMap<Digest, Bytes>,
+    mempool: VecDeque<Transaction>,
+    executions: HashMap<Digest, ObjectState>,
+    validators: Vec<PublicKey>,
     shard_reconstructor: ShardReconstructor,
 }
 
 impl<E: Clock + Spawner> Application<E> {
     const MAX_PENDING_DIGESTS: usize = 256;
     const MAX_WAITER_KEYS: usize = 512;
+    const MAX_MEMPOOL_SIZE: usize = 1024;
 
     pub fn new(
         context: E,
         relay: std::sync::Arc<dyn ShardTransport>,
         me: &PublicKey,
+        mut validators: Vec<PublicKey>,
     ) -> (Self, Mailbox) {
+        validators.sort();
+        validators.dedup();
+        assert!(
+            !validators.is_empty(),
+            "validator set must not be empty for genesis"
+        );
         let shard_rx = relay.register(me);
         let (sender, receiver) = mpsc::channel(1024);
         let my_index = relay
@@ -287,6 +360,9 @@ impl<E: Clock + Spawner> Application<E> {
                 pending_order: VecDeque::new(),
                 pending_shards: HashMap::new(),
                 seen: HashMap::new(),
+                mempool: VecDeque::new(),
+                executions: HashMap::new(),
+                validators,
                 shard_reconstructor: ShardReconstructor::new(me.clone(), my_index, coding_config),
             },
             Mailbox { sender },
@@ -297,12 +373,45 @@ impl<E: Clock + Spawner> Application<E> {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
         self.seen.insert(digest, payload);
+        let execution = genesis_state(&self.validators);
+        self.executions.insert(digest, execution.state);
         digest
     }
 
     fn propose(&mut self, context: &Context) -> Digest {
         let timestamp = self.context.current().epoch_millis();
-        let payload = encode_payload(context.round, context.parent.1, timestamp);
+        let parent = context.parent.1;
+        let mut txs = Vec::new();
+        let mut resulting_state = None;
+
+        if let Some(parent_state) = self.executions.get(&parent).cloned() {
+            let mut running_state = parent_state;
+            let mut retained = VecDeque::new();
+            while let Some(tx) = self.mempool.pop_front() {
+                if txs.len() >= MAX_TXS_PER_BLOCK {
+                    retained.push_back(tx);
+                    continue;
+                }
+                match execute_block(&running_state, std::slice::from_ref(&tx)) {
+                    Ok(exec) => {
+                        running_state = exec.state;
+                        txs.push(tx);
+                    }
+                    Err(ExecutionError::ObjectNotFound { .. }) => {
+                        retained.push_back(tx);
+                    }
+                    Err(err) => {
+                        warn!(?err, "dropping permanently invalid tx from mempool");
+                    }
+                }
+            }
+            self.mempool = retained;
+            resulting_state = Some(running_state);
+        } else {
+            warn!(parent = ?parent, "missing parent execution; proposing empty block");
+        }
+
+        let payload = encode_payload_with_txs(context.round, parent, timestamp, &txs);
         let digest = payload_digest(&payload);
         let key = BlockKey::new(context.round, digest);
         let (commitment, shards) = CodingImpl::encode(
@@ -317,14 +426,22 @@ impl<E: Clock + Spawner> Application<E> {
             .insert(digest, (key, commitment, shards));
         self.touch_pending(digest);
         self.seen.insert(digest, payload);
+        if let Some(state) = resulting_state {
+            self.executions.insert(digest, state);
+        }
         digest
     }
 
-    fn verify(&self, context: &Context, payload: Digest, contents: &Bytes) -> bool {
+    fn verify(&mut self, context: &Context, payload: Digest, contents: &Bytes) -> bool {
         let parent_bytes = self
             .seen
             .get(&context.parent.1)
             .expect("parent dependency should be checked before verify");
+        let parent_state = self
+            .executions
+            .get(&context.parent.1)
+            .expect("parent execution should be checked before verify")
+            .clone();
         let now = self.context.current().epoch_millis();
         match validate_payload(
             context.round,
@@ -334,7 +451,16 @@ impl<E: Clock + Spawner> Application<E> {
             now,
             parent_bytes,
         ) {
-            Ok(()) => true,
+            Ok(txs) => match execute_block(&parent_state, &txs) {
+                Ok(exec) => {
+                    self.executions.insert(payload, exec.state);
+                    true
+                }
+                Err(err) => {
+                    warn!(?err, payload = ?payload, "payload execution failed");
+                    false
+                }
+            },
             Err(PayloadValidationError::DigestMismatch { computed, expected }) => {
                 warn!(?computed, ?expected, "digest mismatch");
                 false
@@ -377,7 +503,9 @@ impl<E: Clock + Spawner> Application<E> {
         waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
         waiter_order: &mut VecDeque<Digest>,
     ) {
-        if let Some(missing_digest) = missing_dependency(&self.seen, &context, payload) {
+        if let Some(missing_digest) =
+            missing_dependency_or_execution(&self.seen, &self.executions, &context, payload)
+        {
             self.queue_waiter(
                 waiters,
                 waiter_order,
@@ -398,6 +526,11 @@ impl<E: Clock + Spawner> Application<E> {
             .clone();
         let valid = self.verify(&context, payload, &contents);
         response.send_lossy(valid);
+        if valid {
+            self.resolve_waiters(payload, waiters, waiter_order);
+        } else {
+            self.fail_waiters(payload, waiters, waiter_order);
+        }
     }
 
     fn queue_waiter(
@@ -570,6 +703,22 @@ impl<E: Clock + Spawner> Application<E> {
                     Message::Broadcast { payload } => {
                         self.broadcast_payload(payload).await;
                     }
+                    Message::SubmitTx { tx } => {
+                        if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
+                            self.mempool.push_back(tx);
+                        }
+                    }
+                    Message::GetCoin {
+                        payload,
+                        object,
+                        response,
+                    } => {
+                        let coin = self
+                            .executions
+                            .get(&payload)
+                            .and_then(|state| state.get(&object).cloned());
+                        response.send_lossy(coin);
+                    }
                 }
             },
             shard = self.shard_rx.next() => {
@@ -625,10 +774,10 @@ mod tests {
             let now = timestamp + slack;
             let parent_contents = default_parent_contents();
 
-            prop_assert_eq!(
+            prop_assert!(matches!(
                 validate_payload(round, parent, payload, &contents, now, &parent_contents),
-                Ok(())
-            );
+                Ok(txs) if txs.is_empty()
+            ));
         }
 
         #[test]
@@ -752,10 +901,10 @@ mod tests {
             let now = timestamp + age;
             let parent_contents = default_parent_contents();
 
-            prop_assert_eq!(
+            prop_assert!(matches!(
                 validate_payload(round, parent, payload, &contents, now, &parent_contents),
-                Ok(())
-            );
+                Ok(txs) if txs.is_empty()
+            ));
         }
 
         #[test]
@@ -801,10 +950,10 @@ mod tests {
             let parent_round = make_round(epoch, view.wrapping_sub(1));
             let parent_contents = encode_payload(parent_round, Digest::from([0u8; 32]), parent_ts);
 
-            prop_assert_eq!(
+            prop_assert!(matches!(
                 validate_payload(round, parent_digest, payload, &contents, now, &parent_contents),
-                Ok(())
-            );
+                Ok(txs) if txs.is_empty()
+            ));
         }
     }
 
@@ -864,6 +1013,7 @@ mod tests {
                     context.with_label(&format!("app_{idx}")),
                     relay.clone(),
                     participant,
+                    participants.clone(),
                 );
                 handles.push(app.start());
                 mailboxes.push(mailbox);

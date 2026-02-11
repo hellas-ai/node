@@ -153,7 +153,7 @@ fn run(config_path: PathBuf) {
         let _shard_transport_handle = relay.clone().start(context.clone());
 
         // Create engine
-        let engine = Engine::new(
+        let (engine, _tx_mailbox) = Engine::new(
             context,
             Config::mainnet(),
             scheme,

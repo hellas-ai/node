@@ -2,6 +2,7 @@ use crate::app::{Application, Mailbox};
 use crate::config::Config;
 use crate::shard::ShardTransport;
 use commonware_consensus::{Reporter as Rp, elector::RoundRobin, minimmit};
+use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
@@ -36,14 +37,16 @@ where
         relay: Arc<dyn ShardTransport>,
         me: &PublicKey,
         reporter: R,
-    ) -> Self {
-        let (app, mailbox) = Application::new(context.with_label("app"), relay, me);
+    ) -> (Self, Mailbox) {
+        let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
+        let (app, mailbox) = Application::new(context.with_label("app"), relay, me, validators);
         let app_handle = app.start();
+        let tx_mailbox = mailbox.clone();
 
         let cfg = config.into_minimmit(scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);
 
-        Self { inner, app_handle }
+        (Self { inner, app_handle }, tx_mailbox)
     }
 
     pub fn start(
