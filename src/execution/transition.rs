@@ -65,7 +65,7 @@ pub fn execute_block(
     })
 }
 
-fn execute_transaction(
+pub(crate) fn execute_transaction(
     state: &mut ObjectState,
     tx: &Transaction,
     created: &mut Vec<(ObjectId, Coin)>,

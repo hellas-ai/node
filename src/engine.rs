@@ -1,4 +1,4 @@
-use crate::app::{Application, Mailbox};
+use crate::app::{Application, FinalizationNotice, Mailbox};
 use crate::config::Config;
 use crate::shard::ShardTransport;
 use commonware_consensus::{Reporter as Rp, elector::RoundRobin, minimmit};
@@ -11,14 +11,60 @@ use hellas_types::{Activity, PublicKey, Scheme};
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
 
+#[derive(Clone)]
+struct AppReporter<R> {
+    finalization: futures::channel::mpsc::UnboundedSender<FinalizationNotice>,
+    inner: R,
+}
+
+impl<R> AppReporter<R> {
+    fn new(
+        finalization: futures::channel::mpsc::UnboundedSender<FinalizationNotice>,
+        inner: R,
+    ) -> Self {
+        Self {
+            finalization,
+            inner,
+        }
+    }
+}
+
+impl<R> Rp for AppReporter<R>
+where
+    R: Rp<Activity = Activity>,
+{
+    type Activity = Activity;
+
+    async fn report(&mut self, activity: Self::Activity) {
+        if let Activity::Finalization(finalization) = &activity {
+            self.finalization
+                .unbounded_send(FinalizationNotice {
+                    payload: finalization.proposal.payload,
+                    parent_payload: finalization.proposal.parent_payload,
+                })
+                .ok();
+        }
+        self.inner.report(activity).await;
+    }
+}
+
 pub struct Engine<E, B, R>
 where
     E: Clock + CryptoRngCore + Spawner + Storage + Metrics,
     B: Blocker<PublicKey = PublicKey>,
     R: Rp<Activity = Activity>,
 {
-    inner:
-        minimmit::Engine<E, Scheme, RoundRobin<Sha256>, B, Digest, Mailbox, Mailbox, R, Sequential>,
+    inner: minimmit::Engine<
+        E,
+        Scheme,
+        RoundRobin<Sha256>,
+        B,
+        Digest,
+        Mailbox,
+        Mailbox,
+        AppReporter<R>,
+        Sequential,
+    >,
     #[allow(dead_code)]
     app_handle: Handle<()>,
 }
@@ -39,9 +85,11 @@ where
         reporter: R,
     ) -> (Self, Mailbox) {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
-        let (app, mailbox) = Application::new(context.with_label("app"), relay, me, validators);
+        let (app, mailbox, finalization_tx) =
+            Application::new(context.with_label("app"), relay, me, validators);
         let app_handle = app.start();
         let tx_mailbox = mailbox.clone();
+        let reporter = AppReporter::new(finalization_tx, reporter);
 
         let cfg = config.into_minimmit(scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);

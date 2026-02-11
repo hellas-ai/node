@@ -135,9 +135,10 @@ fn run_network(
             let sender_key: PrivateKey = private_keys[transfer.sender].clone();
             let sender_pk = sender_key.public_key();
             let recipient_pk = participants[transfer.recipient].clone();
-            let mut sorted_validators = participants.clone();
-            sorted_validators.sort();
-            let sender_index = sorted_validators
+            let mut app_validators: Vec<PublicKey> =
+                schemes[0].participants().iter().cloned().collect();
+            app_validators.sort();
+            let sender_index = app_validators
                 .binary_search(&sender_pk)
                 .expect("sender must exist in validator set");
             let input =
@@ -147,8 +148,9 @@ fn run_network(
             let tx_digest = Sha256::hash(&tx.encode());
             let recipient_output = output_object_id(&tx_digest, 0);
             let change_output = output_object_id(&tx_digest, 1);
-            let mut mailbox = tx_mailboxes[transfer.sender].clone();
-            mailbox.submit_tx(tx).await;
+            for mut mailbox in tx_mailboxes.clone() {
+                mailbox.submit_tx(tx.clone()).await;
+            }
 
             context.sleep(duration).await;
 
@@ -169,7 +171,7 @@ fn run_network(
             );
 
             let mut matched_payload = None;
-            for payload in finalized_payloads {
+            for payload in finalized_payloads.iter().copied() {
                 let mut mailbox = tx_mailboxes[0].clone();
                 let Some(coin) = mailbox.get_coin(payload, recipient_output).await else {
                     continue;
@@ -271,7 +273,7 @@ fn submitted_transfer_network_finalizes() {
     let handles = run_network(
         Config::test(),
         link,
-        Duration::from_secs(5),
+        Duration::from_secs(10),
         Some(SubmitTransfer {
             sender: 0,
             recipient: 1,

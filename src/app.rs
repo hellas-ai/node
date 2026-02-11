@@ -1,10 +1,14 @@
+#[cfg(debug_assertions)]
+use crate::object::{Coin, ObjectId};
 use crate::shard::{
     BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardReconstructor, ShardTransport,
     ZodaCommitment, ZodaShard, coding_config,
 };
 use crate::{
-    object::{Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction},
-    state::{ExecutionError, ObjectState, execute_block, genesis_state},
+    execution::{
+        ExecutionCache, ExecutionError, execute_block, execute_transaction, genesis_state,
+    },
+    object::{MAX_TXS_PER_BLOCK, Transaction},
 };
 use bytes::Bytes;
 use commonware_codec::{ReadExt, ReadRangeExt, Write};
@@ -98,6 +102,15 @@ fn decode_payload(contents: &Bytes) -> Option<(Round, Digest, u64, Vec<Transacti
     Some((round, parent, timestamp, txs))
 }
 
+fn decode_execution_payload(
+    seen: &HashMap<Digest, Bytes>,
+    payload: Digest,
+) -> Option<(Digest, Vec<Transaction>)> {
+    let contents = seen.get(&payload)?;
+    let (_, parent, _, txs) = decode_payload(contents)?;
+    Some((parent, txs))
+}
+
 fn payload_digest(contents: &Bytes) -> Digest {
     Sha256::hash(contents)
 }
@@ -164,7 +177,7 @@ fn validate_payload(
 
 fn missing_dependency_or_execution(
     seen: &HashMap<Digest, Bytes>,
-    executions: &HashMap<Digest, ObjectState>,
+    execution_cache: &ExecutionCache,
     context: &Context,
     payload: Digest,
 ) -> Option<Digest> {
@@ -174,7 +187,7 @@ fn missing_dependency_or_execution(
     if !seen.contains_key(&context.parent.1) {
         return Some(context.parent.1);
     }
-    if !executions.contains_key(&context.parent.1) {
+    if !execution_cache.contains_execution(context.parent.1) {
         return Some(context.parent.1);
     }
     None
@@ -204,11 +217,18 @@ pub enum Message {
     SubmitTx {
         tx: Transaction,
     },
+    #[cfg(debug_assertions)]
     GetCoin {
         payload: Digest,
         object: ObjectId,
         response: oneshot::Sender<Option<Coin>>,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FinalizationNotice {
+    pub payload: Digest,
+    pub parent_payload: Digest,
 }
 
 struct DeferredVerify {
@@ -276,6 +296,7 @@ impl Mailbox {
         self.sender.send_lossy(Message::SubmitTx { tx }).await;
     }
 
+    #[cfg(debug_assertions)]
     pub async fn get_coin(&mut self, payload: Digest, object: ObjectId) -> Option<Coin> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -313,6 +334,7 @@ pub struct Application<E: Clock + Spawner> {
 
     relay: std::sync::Arc<dyn ShardTransport>,
     shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
+    finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
 
     mailbox_rx: mpsc::Receiver<Message>,
 
@@ -321,7 +343,7 @@ pub struct Application<E: Clock + Spawner> {
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     seen: HashMap<Digest, Bytes>,
     mempool: VecDeque<Transaction>,
-    executions: HashMap<Digest, ObjectState>,
+    execution_cache: ExecutionCache,
     validators: Vec<PublicKey>,
     shard_reconstructor: ShardReconstructor,
 }
@@ -330,12 +352,26 @@ impl<E: Clock + Spawner> Application<E> {
     const MAX_PENDING_DIGESTS: usize = 256;
     const MAX_WAITER_KEYS: usize = 512;
     const MAX_MEMPOOL_SIZE: usize = 1024;
+    const MAX_FINALIZED_EXECUTIONS: usize = 512;
 
-    pub fn new(
+    pub(crate) fn new(
+        context: E,
+        relay: std::sync::Arc<dyn ShardTransport>,
+        me: &PublicKey,
+        validators: Vec<PublicKey>,
+    ) -> (Self, Mailbox, mpsc::UnboundedSender<FinalizationNotice>) {
+        let (finalization_tx, finalization_rx) = mpsc::unbounded();
+        let (app, mailbox) =
+            Self::new_with_finalization_receiver(context, relay, me, validators, finalization_rx);
+        (app, mailbox, finalization_tx)
+    }
+
+    fn new_with_finalization_receiver(
         context: E,
         relay: std::sync::Arc<dyn ShardTransport>,
         me: &PublicKey,
         mut validators: Vec<PublicKey>,
+        finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
     ) -> (Self, Mailbox) {
         validators.sort();
         validators.dedup();
@@ -355,13 +391,14 @@ impl<E: Clock + Spawner> Application<E> {
                 context: ContextCell::new(context),
                 relay,
                 shard_rx,
+                finalization_rx,
                 mailbox_rx: receiver,
                 pending: HashMap::new(),
                 pending_order: VecDeque::new(),
                 pending_shards: HashMap::new(),
                 seen: HashMap::new(),
                 mempool: VecDeque::new(),
-                executions: HashMap::new(),
+                execution_cache: ExecutionCache::new(Self::MAX_FINALIZED_EXECUTIONS),
                 validators,
                 shard_reconstructor: ShardReconstructor::new(me.clone(), my_index, coding_config),
             },
@@ -373,8 +410,9 @@ impl<E: Clock + Spawner> Application<E> {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
         self.seen.insert(digest, payload);
-        let execution = genesis_state(&self.validators);
-        self.executions.insert(digest, execution.state);
+        let genesis_execution = genesis_state(&self.validators);
+        self.execution_cache
+            .insert_state(digest, Digest::from([0u8; 32]), genesis_execution.state);
         digest
     }
 
@@ -384,7 +422,17 @@ impl<E: Clock + Spawner> Application<E> {
         let mut txs = Vec::new();
         let mut resulting_state = None;
 
-        if let Some(parent_state) = self.executions.get(&parent).cloned() {
+        if self
+            .execution_cache
+            .ensure_execution_for_payload(parent, &|digest| {
+                decode_execution_payload(&self.seen, digest)
+            })
+        {
+            let parent_state = self
+                .execution_cache
+                .execution(parent)
+                .expect("parent execution should exist after materialization")
+                .clone();
             let mut running_state = parent_state;
             let mut retained = VecDeque::new();
             while let Some(tx) = self.mempool.pop_front() {
@@ -392,9 +440,9 @@ impl<E: Clock + Spawner> Application<E> {
                     retained.push_back(tx);
                     continue;
                 }
-                match execute_block(&running_state, std::slice::from_ref(&tx)) {
-                    Ok(exec) => {
-                        running_state = exec.state;
+                match execute_transaction(&mut running_state, &tx, &mut Vec::new(), &mut Vec::new())
+                {
+                    Ok(()) => {
                         txs.push(tx);
                     }
                     Err(ExecutionError::ObjectNotFound { .. }) => {
@@ -427,19 +475,33 @@ impl<E: Clock + Spawner> Application<E> {
         self.touch_pending(digest);
         self.seen.insert(digest, payload);
         if let Some(state) = resulting_state {
-            self.executions.insert(digest, state);
+            self.execution_cache.insert_state(digest, parent, state);
+        } else {
+            self.execution_cache.note_parent(digest, parent);
         }
         digest
     }
 
     fn verify(&mut self, context: &Context, payload: Digest, contents: &Bytes) -> bool {
+        if !self
+            .execution_cache
+            .ensure_execution_for_payload(context.parent.1, &|digest| {
+                decode_execution_payload(&self.seen, digest)
+            })
+        {
+            warn!(
+                parent = ?context.parent.1,
+                "missing parent execution during verify"
+            );
+            return false;
+        }
         let parent_bytes = self
             .seen
             .get(&context.parent.1)
             .expect("parent dependency should be checked before verify");
         let parent_state = self
-            .executions
-            .get(&context.parent.1)
+            .execution_cache
+            .execution(context.parent.1)
             .expect("parent execution should be checked before verify")
             .clone();
         let now = self.context.current().epoch_millis();
@@ -453,7 +515,8 @@ impl<E: Clock + Spawner> Application<E> {
         ) {
             Ok(txs) => match execute_block(&parent_state, &txs) {
                 Ok(exec) => {
-                    self.executions.insert(payload, exec.state);
+                    self.execution_cache
+                        .insert_state(payload, context.parent.1, exec.state);
                     true
                 }
                 Err(err) => {
@@ -503,8 +566,15 @@ impl<E: Clock + Spawner> Application<E> {
         waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
         waiter_order: &mut VecDeque<Digest>,
     ) {
+        if !self.execution_cache.contains_execution(context.parent.1) {
+            let _ = self
+                .execution_cache
+                .ensure_execution_for_payload(context.parent.1, &|digest| {
+                    decode_execution_payload(&self.seen, digest)
+                });
+        }
         if let Some(missing_digest) =
-            missing_dependency_or_execution(&self.seen, &self.executions, &context, payload)
+            missing_dependency_or_execution(&self.seen, &self.execution_cache, &context, payload)
         {
             self.queue_waiter(
                 waiters,
@@ -608,6 +678,37 @@ impl<E: Clock + Spawner> Application<E> {
         }
     }
 
+    fn handle_finalized(
+        &mut self,
+        payload: Digest,
+        parent_payload: Digest,
+        waiters: &mut HashMap<Digest, Vec<DeferredVerify>>,
+        waiter_order: &mut VecDeque<Digest>,
+    ) {
+        let Some(pruned) =
+            self.execution_cache
+                .handle_finalized(payload, parent_payload, &|digest| {
+                    decode_execution_payload(&self.seen, digest)
+                })
+        else {
+            warn!(
+                ?payload,
+                "finalization arrived before local execution state was available"
+            );
+            return;
+        };
+
+        for digest in pruned {
+            self.seen.remove(&digest);
+            self.pending.remove(&digest);
+            self.pending_shards.remove(&digest);
+            self.fail_waiters(digest, waiters, waiter_order);
+        }
+
+        self.pending_order
+            .retain(|digest| self.pending.contains_key(digest));
+    }
+
     async fn apply_shard_effect(
         &mut self,
         effect: ShardEffect,
@@ -708,14 +809,15 @@ impl<E: Clock + Spawner> Application<E> {
                             self.mempool.push_back(tx);
                         }
                     }
+                    #[cfg(debug_assertions)]
                     Message::GetCoin {
                         payload,
                         object,
                         response,
                     } => {
                         let coin = self
-                            .executions
-                            .get(&payload)
+                            .execution_cache
+                            .execution(payload)
                             .and_then(|state| state.get(&object).cloned());
                         response.send_lossy(coin);
                     }
@@ -724,6 +826,17 @@ impl<E: Clock + Spawner> Application<E> {
             shard = self.shard_rx.next() => {
                 let shard = shard.expect("shard relay closed");
                 self.handle_shard_message(shard, &mut waiters, &mut waiter_order).await;
+            },
+            finalized = self.finalization_rx.next() => {
+                match finalized {
+                    Some(finalized) => {
+                        self.handle_finalized(finalized.payload, finalized.parent_payload, &mut waiters, &mut waiter_order);
+                    }
+                    None => {
+                        warn!("finalization channel closed");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1008,8 +1121,9 @@ mod tests {
 
             let mut mailboxes = Vec::new();
             let mut handles = Vec::new();
+            let mut finalization_txs = Vec::new();
             for (idx, participant) in participants.iter().enumerate() {
-                let (app, mailbox) = Application::new(
+                let (app, mailbox, finalization_tx) = Application::new(
                     context.with_label(&format!("app_{idx}")),
                     relay.clone(),
                     participant,
@@ -1017,6 +1131,7 @@ mod tests {
                 );
                 handles.push(app.start());
                 mailboxes.push(mailbox);
+                finalization_txs.push(finalization_tx);
             }
 
             let epoch = Epoch::new(1);
@@ -1061,6 +1176,60 @@ mod tests {
             assert!(verify_rx_1.await.expect("verify 1 should resolve"));
 
             drop(handles);
+            drop(finalization_txs);
+        });
+    }
+
+    #[test]
+    fn finalization_prunes_non_descendant_execution_state() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"app-prune-test", 6);
+
+            let relay = Arc::new(MockShardTransport::new());
+            for participant in participants.iter() {
+                relay.declare(participant.clone());
+            }
+            relay.finalize_validators();
+
+            let me = participants[0].clone();
+            let (mut app, _mailbox, _finalization_tx) = Application::new(
+                context.with_label("app_prune"),
+                relay,
+                &me,
+                participants.clone(),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = app.genesis(epoch);
+
+            let canonical_context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let canonical = app.propose(&canonical_context);
+
+            let fork_context = Context {
+                round: Round::new(epoch, View::new(2)),
+                leader: participants[1].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let fork = app.propose(&fork_context);
+
+            assert!(app.execution_cache.contains_execution(canonical));
+            assert!(app.execution_cache.contains_execution(fork));
+
+            let mut waiters: HashMap<Digest, Vec<DeferredVerify>> = HashMap::new();
+            let mut waiter_order: VecDeque<Digest> = VecDeque::new();
+            app.handle_finalized(canonical, genesis, &mut waiters, &mut waiter_order);
+
+            assert_eq!(app.execution_cache.latest_finalized(), Some(canonical));
+            assert!(app.execution_cache.contains_execution(canonical));
+            assert!(!app.execution_cache.contains_execution(fork));
+            assert!(!app.seen.contains_key(&fork));
         });
     }
 }
