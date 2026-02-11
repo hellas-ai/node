@@ -1,59 +1,64 @@
 use crate::object::Transaction;
 #[cfg(debug_assertions)]
 use crate::object::{Coin, ObjectId};
+// We currently use actor `ingress!` only. ServiceBuilder is deferred while
+// minimmit and actor depend on different `commonware-runtime` lines.
+use commonware_actor::{ingress, mailbox::Mailbox as ActorMailbox};
 use commonware_consensus::{Automaton, Relay, types::Epoch};
 use commonware_cryptography::sha256::Digest;
-use commonware_utils::channels::fallible::AsyncFallibleExt;
-use futures::channel::{mpsc, oneshot};
+use futures::channel::oneshot;
 use hellas_types::Context;
+use tokio::sync::mpsc;
 
-pub(super) enum Message {
-    Genesis {
+ingress! {
+    AppMailbox,
+
+    tell Genesis {
         epoch: Epoch,
         response: oneshot::Sender<Digest>,
-    },
-    Propose {
+    };
+    tell Propose {
         context: Context,
         response: oneshot::Sender<Digest>,
-    },
-    Verify {
+    };
+    tell Verify {
         context: Context,
         payload: Digest,
         response: oneshot::Sender<bool>,
-    },
-    Broadcast {
+    };
+    tell Broadcast {
         payload: Digest,
-    },
-    SubmitTx {
+    };
+    tell SubmitTx {
         tx: Transaction,
-    },
+    };
     #[cfg(debug_assertions)]
-    GetCoin {
+    tell GetCoin {
         payload: Digest,
         object: ObjectId,
         response: oneshot::Sender<Option<Coin>>,
-    },
+    };
 }
 
-#[derive(Clone)]
-pub struct Mailbox {
-    sender: mpsc::Sender<Message>,
-}
+pub(super) type Ingress = AppMailboxMessage;
+pub(super) type Message = AppMailboxReadWriteMessage;
+pub type Mailbox = AppMailbox;
 
-impl Mailbox {
-    pub(super) fn new(sender: mpsc::Sender<Message>) -> Self {
-        Self { sender }
+impl AppMailbox {
+    pub(super) fn new(sender: mpsc::Sender<Ingress>) -> Self {
+        Self::from(ActorMailbox::new(sender))
     }
 
-    pub async fn submit_tx(&mut self, tx: Transaction) {
-        self.sender.send_lossy(Message::SubmitTx { tx }).await;
+    pub async fn submit_tx(&self, tx: Transaction) {
+        let _ = self.0.tell_lossy(SubmitTx { tx }).await;
     }
 
     #[cfg(debug_assertions)]
-    pub async fn get_coin(&mut self, payload: Digest, object: ObjectId) -> Option<Coin> {
+    pub async fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::GetCoin {
+        let _ = self
+            .0
+            .tell_lossy(GetCoin {
                 payload,
                 object,
                 response,
@@ -63,15 +68,16 @@ impl Mailbox {
     }
 }
 
-impl Automaton for Mailbox {
+impl Automaton for AppMailbox {
     type Digest = Digest;
     type Context = Context;
 
     async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Genesis { epoch, response })
-            .await;
+        if let Err(err) = self.0.tell(Genesis { epoch, response }).await {
+            error!(?err, "failed to enqueue genesis");
+            return Digest::from([0u8; 32]);
+        }
         match receiver.await {
             Ok(digest) => digest,
             Err(err) => {
@@ -83,9 +89,9 @@ impl Automaton for Mailbox {
 
     async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Propose { context, response })
-            .await;
+        if let Err(err) = self.0.tell(Propose { context, response }).await {
+            error!(?err, "failed to enqueue propose");
+        }
         receiver
     }
 
@@ -95,21 +101,27 @@ impl Automaton for Mailbox {
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Verify {
+        if let Err(err) = self
+            .0
+            .tell(Verify {
                 context,
                 payload,
                 response,
             })
-            .await;
+            .await
+        {
+            error!(?err, "failed to enqueue verify");
+        }
         receiver
     }
 }
 
-impl Relay for Mailbox {
+impl Relay for AppMailbox {
     type Digest = Digest;
 
     async fn broadcast(&mut self, payload: Self::Digest) {
-        self.sender.send_lossy(Message::Broadcast { payload }).await;
+        if let Err(err) = self.0.tell(Broadcast { payload }).await {
+            error!(?err, "failed to enqueue broadcast");
+        }
     }
 }

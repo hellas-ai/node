@@ -30,16 +30,16 @@ struct DeferredVerify {
 }
 
 pub(super) enum CoreEffect {
-    RespondDigest {
+    Digest {
         response: oneshot::Sender<Digest>,
         digest: Digest,
     },
-    RespondVerify {
+    Verify {
         response: oneshot::Sender<bool>,
         valid: bool,
     },
     #[cfg(debug_assertions)]
-    RespondCoin {
+    Coin {
         response: oneshot::Sender<Option<Coin>>,
         coin: Option<Coin>,
     },
@@ -95,6 +95,7 @@ impl AppCore {
     const MAX_MEMPOOL_SIZE: usize = 1024;
     const MAX_FINALIZED_EXECUTIONS: usize = 512;
 
+    // Construction + identity -------------------------------------------------
     pub(super) fn new(
         me: &PublicKey,
         mut validators: Vec<PublicKey>,
@@ -126,6 +127,7 @@ impl AppCore {
         self.shard_recoverer.me()
     }
 
+    // Driver entry points -----------------------------------------------------
     pub(super) fn on_message<F>(
         &mut self,
         message: Message,
@@ -139,11 +141,11 @@ impl AppCore {
         match message {
             Message::Genesis { epoch, response } => {
                 let digest = self.genesis(epoch);
-                effects.push_reply(CoreEffect::RespondDigest { response, digest });
+                effects.push_reply(CoreEffect::Digest { response, digest });
             }
             Message::Propose { context, response } => {
                 let digest = self.propose(&context, now);
-                effects.push_reply(CoreEffect::RespondDigest { response, digest });
+                effects.push_reply(CoreEffect::Digest { response, digest });
             }
             Message::Verify {
                 context,
@@ -151,13 +153,13 @@ impl AppCore {
                 response,
             } => {
                 let key = BlockKey::new(context.round, payload);
-                self.handle_verify_request(&context, payload, response, now, &mut effects);
+                self.process_verify_request(&context, payload, response, now, &mut effects);
                 for msg in self.shard_recoverer.note_known_key(key, &context.leader) {
                     self.handle_shard_message(msg, now, validator_index, &mut effects);
                 }
             }
             Message::Broadcast { payload } => {
-                self.queue_broadcast_payload(payload, &mut effects);
+                self.enqueue_broadcast(payload, &mut effects);
             }
             Message::SubmitTx { tx } => {
                 if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
@@ -171,7 +173,7 @@ impl AppCore {
                 response,
             } => {
                 let coin = self.get_coin(payload, object);
-                effects.push_reply(CoreEffect::RespondCoin { response, coin });
+                effects.push_reply(CoreEffect::Coin { response, coin });
             }
         }
         effects
@@ -191,16 +193,13 @@ impl AppCore {
         effects
     }
 
-    pub(super) fn on_finalized(
-        &mut self,
-        payload: Digest,
-        parent_payload: Digest,
-    ) -> CoreEffects {
+    pub(super) fn on_finalized(&mut self, payload: Digest, parent_payload: Digest) -> CoreEffects {
         let mut effects = CoreEffects::new();
         self.handle_finalized(payload, parent_payload, &mut effects);
         effects
     }
 
+    // Consensus callbacks -----------------------------------------------------
     pub(super) fn genesis(&mut self, epoch: Epoch) -> Digest {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
@@ -216,12 +215,7 @@ impl AppCore {
         let mut txs = Vec::new();
         let mut resulting_state = None;
 
-        if self
-            .execution_cache
-            .ensure_execution_for_payload(parent, &|digest| {
-                decode_execution_payload(&self.seen, digest)
-            })
-        {
+        if self.ensure_execution_materialized(parent) {
             let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
                 warn!(
                     parent = ?parent,
@@ -257,6 +251,7 @@ impl AppCore {
         self.propose_with_txs(context, now, parent, txs, resulting_state)
     }
 
+    // Proposal assembly -------------------------------------------------------
     fn propose_empty(&mut self, context: &Context, now: u64) -> Digest {
         self.propose_with_txs(context, now, context.parent.1, Vec::new(), None)
     }
@@ -288,7 +283,7 @@ impl AppCore {
                 warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
             }
         }
-        self.touch_pending(digest);
+        self.enforce_pending_capacity(digest);
         self.seen.insert(digest, payload);
         if let Some(state) = resulting_state {
             self.execution_cache.insert_state(digest, parent, state);
@@ -298,14 +293,16 @@ impl AppCore {
         digest
     }
 
-    fn verify(&mut self, context: &Context, payload: Digest, contents: &Bytes, now: u64) -> bool {
+    // Verification + execution ------------------------------------------------
+    fn verify_payload(
+        &mut self,
+        context: &Context,
+        payload: Digest,
+        contents: &Bytes,
+        now: u64,
+    ) -> bool {
         let parent = context.parent.1;
-        if !self
-            .execution_cache
-            .ensure_execution_for_payload(parent, &|digest| {
-                decode_execution_payload(&self.seen, digest)
-            })
-        {
+        if !self.ensure_execution_materialized(parent) {
             warn!(
                 parent = ?parent,
                 "missing parent execution during verify"
@@ -345,7 +342,8 @@ impl AppCore {
         }
     }
 
-    fn handle_verify_request(
+    // Deferred verify queue ---------------------------------------------------
+    fn process_verify_request(
         &mut self,
         context: &Context,
         payload: Digest,
@@ -355,11 +353,7 @@ impl AppCore {
     ) {
         let parent = context.parent.1;
         if !self.execution_cache.contains_execution(parent) {
-            let _ = self
-                .execution_cache
-                .ensure_execution_for_payload(parent, &|digest| {
-                    decode_execution_payload(&self.seen, digest)
-                });
+            let _ = self.ensure_execution_materialized(parent);
         }
         if let Some(missing_digest) =
             missing_dependency_or_execution(&self.seen, &self.execution_cache, context, payload)
@@ -380,18 +374,18 @@ impl AppCore {
                 payload = ?payload,
                 "payload bytes missing during verify despite dependency check"
             );
-            effects.push_reply(CoreEffect::RespondVerify {
+            effects.push_reply(CoreEffect::Verify {
                 response,
                 valid: false,
             });
             return;
         };
-        let valid = self.verify(context, payload, &contents, now);
-        effects.push_reply(CoreEffect::RespondVerify { response, valid });
+        let valid = self.verify_payload(context, payload, &contents, now);
+        effects.push_reply(CoreEffect::Verify { response, valid });
         if valid {
-            self.resolve_waiters(payload, now, effects);
+            self.retry_waiters(payload, now, effects);
         } else {
-            self.fail_waiters(payload, effects);
+            self.reject_waiters(payload, effects);
         }
     }
 
@@ -412,7 +406,7 @@ impl AppCore {
             };
             if let Some(stale) = self.waiters.remove(&oldest) {
                 for deferred in stale {
-                    effects.push_reply(CoreEffect::RespondVerify {
+                    effects.push_reply(CoreEffect::Verify {
                         response: deferred.response,
                         valid: false,
                     });
@@ -421,38 +415,36 @@ impl AppCore {
         }
     }
 
-    fn resolve_waiters(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
-        if let Some(pos) = self.waiter_order.iter().position(|d| *d == digest) {
-            self.waiter_order.remove(pos);
-        }
-        if let Some(pending) = self.waiters.remove(&digest) {
-            for deferred in pending {
-                self.handle_verify_request(
-                    &deferred.context,
-                    deferred.payload,
-                    deferred.response,
-                    now,
-                    effects,
-                );
-            }
+    fn retry_waiters(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
+        for deferred in self.take_waiters_for(digest) {
+            self.process_verify_request(
+                &deferred.context,
+                deferred.payload,
+                deferred.response,
+                now,
+                effects,
+            );
         }
     }
 
-    fn fail_waiters(&mut self, digest: Digest, effects: &mut CoreEffects) {
-        if let Some(pos) = self.waiter_order.iter().position(|d| *d == digest) {
-            self.waiter_order.remove(pos);
-        }
-        if let Some(stale) = self.waiters.remove(&digest) {
-            for deferred in stale {
-                effects.push_reply(CoreEffect::RespondVerify {
-                    response: deferred.response,
-                    valid: false,
-                });
-            }
+    fn reject_waiters(&mut self, digest: Digest, effects: &mut CoreEffects) {
+        for deferred in self.take_waiters_for(digest) {
+            effects.push_reply(CoreEffect::Verify {
+                response: deferred.response,
+                valid: false,
+            });
         }
     }
 
-    fn touch_pending(&mut self, digest: Digest) {
+    fn take_waiters_for(&mut self, digest: Digest) -> Vec<DeferredVerify> {
+        if let Some(pos) = self.waiter_order.iter().position(|d| *d == digest) {
+            self.waiter_order.remove(pos);
+        }
+        self.waiters.remove(&digest).unwrap_or_default()
+    }
+
+    // Pending payload retention -----------------------------------------------
+    fn enforce_pending_capacity(&mut self, digest: Digest) {
         if !self.pending_order.contains(&digest) {
             self.pending_order.push_back(digest);
         }
@@ -465,6 +457,7 @@ impl AppCore {
         }
     }
 
+    // Finalization pruning ----------------------------------------------------
     fn handle_finalized(
         &mut self,
         payload: Digest,
@@ -488,19 +481,15 @@ impl AppCore {
             self.seen.remove(&digest);
             self.pending.remove(&digest);
             self.pending_shards.remove(&digest);
-            self.fail_waiters(digest, effects);
+            self.reject_waiters(digest, effects);
         }
 
         self.pending_order
             .retain(|digest| self.pending.contains_key(digest));
     }
 
-    fn apply_shard_effect(
-        &mut self,
-        effect: ShardEffect,
-        now: u64,
-        effects: &mut CoreEffects,
-    ) {
+    // Shard recovery + broadcast ----------------------------------------------
+    fn apply_shard_effect(&mut self, effect: ShardEffect, now: u64, effects: &mut CoreEffects) {
         match effect {
             ShardEffect::Broadcast(message) => {
                 effects.push_network(NetworkEffect::BroadcastShard(message));
@@ -509,10 +498,10 @@ impl AppCore {
                 self.seen.insert(key.digest, contents);
                 self.pending.remove(&key.digest);
                 self.pending_shards.remove(&key.digest);
-                self.resolve_waiters(key.digest, now, effects);
+                self.retry_waiters(key.digest, now, effects);
             }
             ShardEffect::Failed { key } => {
-                self.fail_waiters(key.digest, effects);
+                self.reject_waiters(key.digest, effects);
             }
         }
     }
@@ -534,7 +523,7 @@ impl AppCore {
         }
     }
 
-    fn queue_broadcast_payload(&mut self, digest: Digest, effects: &mut CoreEffects) {
+    fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
         let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
             warn!(?digest, "broadcast requested for unknown pending shards");
             return;
@@ -546,11 +535,20 @@ impl AppCore {
         });
     }
 
+    // Debug-only read API -----------------------------------------------------
     #[cfg(debug_assertions)]
     fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
         self.execution_cache
             .execution(payload)
             .and_then(|state| state.get(&object).cloned())
+    }
+
+    // Shared helper -----------------------------------------------------------
+    fn ensure_execution_materialized(&mut self, digest: Digest) -> bool {
+        self.execution_cache
+            .ensure_execution_for_payload(digest, &|candidate| {
+                decode_execution_payload(&self.seen, candidate)
+            })
     }
 }
 

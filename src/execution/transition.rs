@@ -41,7 +41,7 @@ pub enum ExecutionError {
     OutputCollision { id: ObjectId },
 }
 
-#[must_use]
+#[must_use = "genesis execution must be captured to initialize state deterministically"]
 pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
     let mut state = ObjectState::new();
     let mut created = Vec::new();
@@ -68,7 +68,7 @@ pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
     }
 }
 
-#[must_use]
+#[must_use = "block execution result must be applied or rejected explicitly"]
 pub fn execute_block(
     parent_state: &ObjectState,
     txs: &[Transaction],
@@ -141,7 +141,7 @@ fn execute_transaction_with_tracking(
             };
 
             state.remove(input);
-            if let Some(deleted) = deleted.as_deref_mut() {
+            if let Some(deleted) = deleted.as_mut() {
                 deleted.push(*input);
             }
 
@@ -150,7 +150,7 @@ fn execute_transaction_with_tracking(
                 value: *amount,
             };
             state.insert(recipient_id, recipient_coin.clone());
-            if let Some(created) = created.as_deref_mut() {
+            if let Some(created) = created.as_mut() {
                 created.push((recipient_id, recipient_coin));
             }
 
@@ -160,7 +160,7 @@ fn execute_transaction_with_tracking(
                     value: change_value,
                 };
                 state.insert(change_id, change_coin.clone());
-                if let Some(created) = created.as_deref_mut() {
+                if let Some(created) = created.as_mut() {
                     created.push((change_id, change_coin));
                 }
             }
@@ -212,7 +212,7 @@ fn execute_transaction_with_tracking(
 
             for input in inputs {
                 state.remove(input);
-                if let Some(deleted) = deleted.as_deref_mut() {
+                if let Some(deleted) = deleted.as_mut() {
                     deleted.push(*input);
                 }
             }
@@ -221,7 +221,7 @@ fn execute_transaction_with_tracking(
                 value: total,
             };
             state.insert(output_id, merged.clone());
-            if let Some(created) = created.as_deref_mut() {
+            if let Some(created) = created.as_mut() {
                 created.push((output_id, merged));
             }
             Ok(())

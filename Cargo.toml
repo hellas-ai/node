@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 hellas-types = { workspace = true }
 commonware-codec = { workspace = true }
+commonware-actor = { workspace = true }
 commonware-coding = { workspace = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
@@ -28,6 +29,7 @@ hex = { workspace = true }
 dirs = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz"] }

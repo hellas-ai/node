@@ -13,7 +13,7 @@ use commonware_utils::{SystemTimeExt, channels::fallible::OneshotExt};
 use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::{Activity, PublicKey};
-use mailbox::Message;
+use mailbox::Ingress;
 
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizationNotice {
@@ -47,7 +47,7 @@ pub(crate) struct Application<E: Clock + Spawner> {
     shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
     finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
 
-    mailbox_rx: mpsc::Receiver<Message>,
+    mailbox_rx: tokio::sync::mpsc::Receiver<Ingress>,
 
     core: AppCore,
 }
@@ -75,7 +75,7 @@ impl<E: Clock + Spawner> Application<E> {
         finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
     ) -> (Self, Mailbox) {
         let shard_rx = relay.register(me);
-        let (sender, receiver) = mpsc::channel(Self::MAILBOX_CAPACITY);
+        let (sender, receiver) = tokio::sync::mpsc::channel(Self::MAILBOX_CAPACITY);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
             warn!("validator index unavailable for local key; defaulting to index 0");
             0
@@ -98,14 +98,14 @@ impl<E: Clock + Spawner> Application<E> {
 
     fn apply_reply_effect(&mut self, effect: CoreEffect) {
         match effect {
-            CoreEffect::RespondDigest { response, digest } => {
+            CoreEffect::Digest { response, digest } => {
                 response.send_lossy(digest);
             }
-            CoreEffect::RespondVerify { response, valid } => {
+            CoreEffect::Verify { response, valid } => {
                 response.send_lossy(valid);
             }
             #[cfg(debug_assertions)]
-            CoreEffect::RespondCoin { response, coin } => {
+            CoreEffect::Coin { response, coin } => {
                 response.send_lossy(coin);
             }
         }
@@ -147,10 +147,14 @@ impl<E: Clock + Spawner> Application<E> {
             on_stopped => {
                 debug!("application shutting down");
             },
-            message = self.mailbox_rx.next() => {
-                let message = match message {
-                    Some(message) => message,
+            message = self.mailbox_rx.recv() => {
+                let ingress = match message {
+                    Some(ingress) => ingress,
                     None => break,
+                };
+                let message = match ingress {
+                    Ingress::ReadWrite(message) => message,
+                    Ingress::ReadOnly(_) => continue,
                 };
                 let now = self.context.current().epoch_millis();
                 let relay = &self.relay;
@@ -193,11 +197,11 @@ impl<E: Clock + Spawner> Application<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::payload::{
         PayloadValidationError, SYNCHRONY_BOUND, decode_timestamp, encode_payload, genesis_payload,
         payload_digest, validate_payload,
     };
+    use super::*;
     use crate::shard::mock::MockShardTransport;
     use bytes::Bytes;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
@@ -535,5 +539,4 @@ mod tests {
             drop(finalization_txs);
         });
     }
-
 }

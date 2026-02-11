@@ -148,7 +148,7 @@ fn run_network(
             let tx_digest = Sha256::hash(&tx.encode());
             let recipient_output = output_object_id(&tx_digest, 0);
             let change_output = output_object_id(&tx_digest, 1);
-            for mut mailbox in tx_mailboxes.clone() {
+            for mailbox in tx_mailboxes.clone() {
                 mailbox.submit_tx(tx.clone()).await;
             }
 
@@ -172,7 +172,7 @@ fn run_network(
 
             let mut matched_payload = None;
             for payload in finalized_payloads.iter().copied() {
-                let mut mailbox = tx_mailboxes[0].clone();
+                let mailbox = tx_mailboxes[0].clone();
                 let Some(coin) = mailbox.get_coin(payload, recipient_output).await else {
                     continue;
                 };
@@ -194,7 +194,7 @@ fn run_network(
                 value: GENESIS_BALANCE - transfer.amount,
             };
 
-            for mut mailbox in tx_mailboxes {
+            for mailbox in tx_mailboxes {
                 assert_eq!(
                     mailbox.get_coin(payload, recipient_output).await,
                     Some(expected_recipient.clone()),

@@ -57,6 +57,8 @@ impl Read for Coin {
     }
 }
 
+// Keep transactions inline/stack-allocated to avoid per-transaction heap churn in hot paths.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Transaction {
     Transfer {
