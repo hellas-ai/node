@@ -71,7 +71,11 @@ pub enum Transaction {
     },
 }
 
-pub fn transfer_signed_bytes(input: &ObjectId, recipient: &PublicKey, amount: u64) -> BytesMut {
+pub(crate) fn transfer_signed_bytes(
+    input: &ObjectId,
+    recipient: &PublicKey,
+    amount: u64,
+) -> BytesMut {
     let mut buf = BytesMut::new();
     input.write(&mut buf);
     recipient.write(&mut buf);
@@ -79,7 +83,7 @@ pub fn transfer_signed_bytes(input: &ObjectId, recipient: &PublicKey, amount: u6
     buf
 }
 
-pub fn merge_signed_bytes(sorted_inputs: &[ObjectId]) -> BytesMut {
+pub(crate) fn merge_signed_bytes(sorted_inputs: &[ObjectId]) -> BytesMut {
     let mut buf = BytesMut::new();
     sorted_inputs.write(&mut buf);
     buf

@@ -6,117 +6,115 @@ use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_utils::{Faults, N5f1};
 use hellas_types::PublicKey;
 
-pub type CodingImpl = Zoda<Sha256>;
-pub type ZodaShard = <CodingImpl as CodingScheme>::Shard;
-pub type ZodaReShard = <CodingImpl as CodingScheme>::ReShard;
-pub type ZodaCheckedShard = <CodingImpl as CodingScheme>::CheckedShard;
-pub type ZodaCheckingData = <CodingImpl as CodingScheme>::CheckingData;
-pub type ZodaCommitment = <CodingImpl as CodingScheme>::Commitment;
+pub(crate) type CodingImpl = Zoda<Sha256>;
+pub(crate) type ZodaShard = <CodingImpl as CodingScheme>::Shard;
+pub(crate) type ZodaReShard = <CodingImpl as CodingScheme>::ReShard;
+pub(crate) type ZodaCheckedShard = <CodingImpl as CodingScheme>::CheckedShard;
+pub(crate) type ZodaCheckingData = <CodingImpl as CodingScheme>::CheckingData;
+pub(crate) type ZodaCommitment = <CodingImpl as CodingScheme>::Commitment;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockKey {
+pub(crate) struct BlockKey {
     pub round: Round,
     pub digest: Digest,
 }
 
 impl BlockKey {
-    pub const fn new(round: Round, digest: Digest) -> Self {
+    pub(crate) const fn new(round: Round, digest: Digest) -> Self {
         Self { round, digest }
     }
 }
 
-pub fn coding_config(validators: u16) -> CodingConfig {
-    assert!(validators > 0, "validator set must not be empty");
+pub(crate) fn coding_config(validators: u16) -> CodingConfig {
+    if validators == 0 {
+        warn!(
+            "validator set was empty; defaulting coding config to minimum_shards=1 extra_shards=0"
+        );
+        return CodingConfig {
+            minimum_shards: 1,
+            extra_shards: 0,
+        };
+    }
     let faults = N5f1::max_faults(validators);
-    let minimum_shards = u16::try_from(faults + 1).expect("fault count should fit into u16");
-    let extra_shards = validators
-        .checked_sub(minimum_shards)
-        .expect("minimum shards must not exceed validator count");
+    let minimum_shards = match u16::try_from(faults.saturating_add(1)) {
+        Ok(value) => value.clamp(1, validators),
+        Err(_) => {
+            warn!(
+                faults,
+                validators,
+                "fault count overflowed u16; clamping minimum shards to validator count"
+            );
+            validators
+        }
+    };
+    let extra_shards = validators.saturating_sub(minimum_shards);
     CodingConfig {
         minimum_shards,
         extra_shards,
     }
 }
 
-pub fn hash_encoded<T: Encode>(value: &T) -> Digest {
+pub(crate) fn hash_encoded<T: Encode>(value: &T) -> Digest {
     Sha256::hash(&value.encode())
 }
 
 /// Internal shard message after transport authentication.
 #[derive(Clone)]
-pub enum ShardMessage {
-    Initial {
+pub(crate) struct ShardMessage {
+    pub(crate) sender: PublicKey,
+    pub(crate) body: WireShardMessage,
+}
+
+impl ShardMessage {
+    pub(crate) fn initial(
         sender: PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shard: ZodaShard,
         shard_index: u16,
-    },
-    ReShare {
+    ) -> Self {
+        Self {
+            sender,
+            body: WireShardMessage::Initial {
+                key,
+                commitment,
+                shard,
+                shard_index,
+            },
+        }
+    }
+
+    pub(crate) fn reshare(
         sender: PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shard_index: u16,
         reshard: ZodaReShard,
-    },
-}
-
-impl ShardMessage {
-    pub const fn key(&self) -> BlockKey {
-        match self {
-            Self::Initial { key, .. } => *key,
-            Self::ReShare { key, .. } => *key,
-        }
-    }
-
-    pub fn sender(&self) -> &PublicKey {
-        match self {
-            Self::Initial { sender, .. } => sender,
-            Self::ReShare { sender, .. } => sender,
-        }
-    }
-
-    pub const fn shard_index(&self) -> u16 {
-        match self {
-            Self::Initial { shard_index, .. } => *shard_index,
-            Self::ReShare { shard_index, .. } => *shard_index,
-        }
-    }
-
-    pub fn commitment(&self) -> &ZodaCommitment {
-        match self {
-            Self::Initial { commitment, .. } => commitment,
-            Self::ReShare { commitment, .. } => commitment,
-        }
-    }
-
-    pub fn to_wire(&self) -> WireShardMessage {
-        match self {
-            Self::Initial {
-                key,
-                commitment,
-                shard,
-                shard_index,
-                ..
-            } => WireShardMessage::Initial {
-                key: *key,
-                commitment: *commitment,
-                shard: shard.clone(),
-                shard_index: *shard_index,
-            },
-            Self::ReShare {
+    ) -> Self {
+        Self {
+            sender,
+            body: WireShardMessage::ReShare {
                 key,
                 commitment,
                 shard_index,
                 reshard,
-                ..
-            } => WireShardMessage::ReShare {
-                key: *key,
-                commitment: *commitment,
-                shard_index: *shard_index,
-                reshard: reshard.clone(),
             },
         }
+    }
+
+    pub(crate) const fn key(&self) -> BlockKey {
+        match &self.body {
+            WireShardMessage::Initial { key, .. } => *key,
+            WireShardMessage::ReShare { key, .. } => *key,
+        }
+    }
+
+    pub(crate) fn sender(&self) -> &PublicKey {
+        &self.sender
+    }
+
+    pub(crate) fn to_wire(&self) -> WireShardMessage {
+        self.body.clone()
     }
 }
 

@@ -1,17 +1,36 @@
 use crate::app::Mailbox;
 use commonware_codec::{DecodeExt, Encode};
-use commonware_consensus::{Reporter as Rp, elector::RoundRobin, minimmit, types::ViewDelta};
+use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewDelta};
 use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
 use commonware_p2p::{Address, Blocker};
 use commonware_parallel::Sequential;
 use commonware_runtime::buffer::PoolRef;
-use commonware_utils::{
-    NZU16,
-    ordered::{Map, Set},
-};
+use commonware_utils::ordered::{Map, Set};
 use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroUsize},
+    path::PathBuf,
+    time::Duration,
+};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid hex key data")]
+    InvalidHex(#[from] hex::FromHexError),
+    #[error("invalid ed25519 key bytes")]
+    InvalidKey(#[from] commonware_codec::Error),
+    #[error("unable to determine local data directory")]
+    MissingDataDirectory,
+    #[error("duplicate public keys in config")]
+    DuplicatePublicKeys,
+    #[error("invalid network address")]
+    InvalidAddress(#[from] std::net::AddrParseError),
+    #[error("duplicate keys in peer address map")]
+    DuplicatePeerAddressKeys,
+}
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -75,8 +94,14 @@ impl Config {
     ) -> minimmit::Config<Scheme, RoundRobin<Sha256>, B, Digest, Mailbox, Mailbox, R, Sequential>
     where
         B: Blocker<PublicKey = PublicKey>,
-        R: Rp<Activity = Activity>,
+        R: Reporter<Activity = Activity>,
     {
+        let replay_buffer = NonZeroUsize::new(self.replay_buffer).unwrap_or(NonZeroUsize::MIN);
+        let write_buffer = NonZeroUsize::new(self.write_buffer).unwrap_or(NonZeroUsize::MIN);
+        let buffer_page_count =
+            NonZeroUsize::new(self.buffer_page_count).unwrap_or(NonZeroUsize::MIN);
+        let buffer_page_size = NonZeroU16::new(self.buffer_page_size).unwrap_or(NonZeroU16::MIN);
+
         minimmit::Config {
             scheme,
             elector: RoundRobin::<Sha256>::default(),
@@ -88,12 +113,9 @@ impl Config {
             partition: partition.to_string(),
             mailbox_size: self.mailbox_size,
             epoch: EPOCH,
-            replay_buffer: NonZeroUsize::new(self.replay_buffer).unwrap(),
-            write_buffer: NonZeroUsize::new(self.write_buffer).unwrap(),
-            buffer_pool: PoolRef::new(
-                NZU16!(self.buffer_page_size),
-                NonZeroUsize::new(self.buffer_page_count).unwrap(),
-            ),
+            replay_buffer,
+            write_buffer,
+            buffer_pool: PoolRef::new(buffer_page_size, buffer_page_count),
             leader_timeout: self.leader_timeout,
             notarization_timeout: self.notarization_timeout,
             nullify_retry: self.nullify_retry,
@@ -123,53 +145,58 @@ pub struct PeerEntry {
 }
 
 impl NodeConfig {
-    pub fn decode_private_key(&self) -> ed25519::PrivateKey {
-        let bytes = hex::decode(&self.private_key).expect("invalid hex in private_key");
-        ed25519::PrivateKey::decode(bytes.as_slice()).expect("invalid ed25519 private key")
+    pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
+        let bytes = hex::decode(&self.private_key)?;
+        Ok(ed25519::PrivateKey::decode(bytes.as_slice())?)
     }
 
-    pub fn storage_directory(&self) -> PathBuf {
-        let base = dirs::data_local_dir().expect("unable to determine data directory");
-        let pk_hex = hex::encode(self.decode_private_key().public_key().encode());
-        base.join("hellas").join(&pk_hex[..16])
+    pub fn storage_directory(&self) -> Result<PathBuf, ConfigError> {
+        let base = dirs::data_local_dir().ok_or(ConfigError::MissingDataDirectory)?;
+        let pk_hex = hex::encode(self.public_key()?.encode());
+        Ok(base.join("hellas").join(&pk_hex[..16]))
     }
 
-    pub fn public_key(&self) -> PublicKey {
-        self.decode_private_key().public_key()
+    pub fn public_key(&self) -> Result<PublicKey, ConfigError> {
+        Ok(self.decode_private_key()?.public_key())
     }
 
-    pub fn participants(&self) -> Set<PublicKey> {
-        let me = self.public_key();
+    pub fn participants(&self) -> Result<Set<PublicKey>, ConfigError> {
+        let me = self.public_key()?;
         let mut keys: Vec<PublicKey> = self
             .peers
             .iter()
-            .map(|p| {
-                let bytes = hex::decode(&p.public_key).expect("invalid hex in peer public_key");
-                PublicKey::decode(bytes.as_slice()).expect("invalid ed25519 public key")
+            .map(|p| -> Result<PublicKey, ConfigError> {
+                let bytes = hex::decode(&p.public_key)?;
+                let key: PublicKey = PublicKey::decode(bytes.as_slice())?;
+                Ok(key)
             })
-            .collect();
+            .collect::<Result<Vec<_>, ConfigError>>()?;
         keys.push(me);
-        Set::try_from(keys).expect("duplicate public keys in config")
+        match Set::try_from(keys) {
+            Ok(set) => Ok(set),
+            Err(_) => Err(ConfigError::DuplicatePublicKeys),
+        }
     }
 
-    pub fn peer_address_map(&self) -> Map<PublicKey, Address> {
-        let me = self.public_key();
-        let listen: SocketAddr = format!("0.0.0.0:{}", self.listen_port)
-            .parse()
-            .expect("invalid listen port");
+    pub fn peer_address_map(&self) -> Result<Map<PublicKey, Address>, ConfigError> {
+        let me = self.public_key()?;
+        let listen: SocketAddr = format!("0.0.0.0:{}", self.listen_port).parse()?;
 
         let mut entries: Vec<(PublicKey, Address)> = self
             .peers
             .iter()
-            .map(|p| {
-                let bytes = hex::decode(&p.public_key).expect("invalid hex in peer public_key");
-                let key = PublicKey::decode(bytes.as_slice()).expect("invalid ed25519 public key");
-                let addr: SocketAddr = p.address.parse().expect("invalid peer address");
-                (key, Address::Symmetric(addr))
+            .map(|p| -> Result<(PublicKey, Address), ConfigError> {
+                let bytes = hex::decode(&p.public_key)?;
+                let key: PublicKey = PublicKey::decode(bytes.as_slice())?;
+                let addr: SocketAddr = p.address.parse()?;
+                Ok((key, Address::Symmetric(addr)))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ConfigError>>()?;
         entries.push((me, Address::Symmetric(listen)));
-        Map::try_from(entries).expect("duplicate keys in peer address map")
+        match Map::try_from(entries) {
+            Ok(map) => Ok(map),
+            Err(_) => Err(ConfigError::DuplicatePeerAddressKeys),
+        }
     }
 }
 

@@ -27,6 +27,7 @@ toml = { workspace = true }
 hex = { workspace = true }
 dirs = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz"] }

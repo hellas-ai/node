@@ -1,4 +1,8 @@
-use super::{BlockKey, ShardMessage, ShardTransport, WireShardMessage, ZodaCommitment, ZodaShard};
+use super::transport::ShardTransport;
+use super::{
+    BlockKey, DistributionError, ShardMessage, ValidatorSet, WireShardMessage, ZodaCommitment,
+    ZodaShard,
+};
 use commonware_p2p::{
     Receiver as P2pReceiver, Recipients, Sender as P2pSender,
     utils::codec::{WrappedReceiver, WrappedSender, wrap},
@@ -9,10 +13,7 @@ use hellas_types::PublicKey;
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 pub struct AuthenticatedShardTransport<S, R>
@@ -21,8 +22,7 @@ where
     R: P2pReceiver<PublicKey = PublicKey>,
 {
     local_subscribers: Mutex<Vec<mpsc::UnboundedSender<ShardMessage>>>,
-    validators: Mutex<Vec<PublicKey>>,
-    finalized: AtomicBool,
+    validators: ValidatorSet,
     me: PublicKey,
     network_sender: AsyncMutex<WrappedSender<S, WireShardMessage>>,
     network_receiver: AsyncMutex<WrappedReceiver<R, WireShardMessage>>,
@@ -37,8 +37,7 @@ where
         let (network_sender, network_receiver) = wrap((), network_sender, network_receiver);
         Self {
             local_subscribers: Mutex::new(Vec::new()),
-            validators: Mutex::new(Vec::new()),
-            finalized: AtomicBool::new(false),
+            validators: ValidatorSet::new(),
             me,
             network_sender: AsyncMutex::new(network_sender),
             network_receiver: AsyncMutex::new(network_receiver),
@@ -46,21 +45,11 @@ where
     }
 
     pub fn declare(&self, public_key: PublicKey) {
-        assert!(
-            !self.finalized.load(Ordering::Relaxed),
-            "validators already finalized"
-        );
-        let mut validators = self.validators.lock().unwrap();
-        if !validators.contains(&public_key) {
-            validators.push(public_key);
-        }
+        self.validators.declare(public_key);
     }
 
     pub fn finalize_validators(&self) {
-        let mut validators = self.validators.lock().unwrap();
-        validators.sort();
-        validators.dedup();
-        self.finalized.store(true, Ordering::Relaxed);
+        self.validators.finalize();
     }
 
     pub fn start<E>(self: Arc<Self>, context: E) -> Handle<()>
@@ -99,7 +88,7 @@ where
 
     async fn dispatch_local(&self, message: ShardMessage) {
         let channels: Vec<_> = {
-            let subscribers = self.local_subscribers.lock().unwrap();
+            let subscribers = self.lock_subscribers();
             subscribers.clone()
         };
         for mut ch in channels {
@@ -122,14 +111,7 @@ where
             return;
         }
 
-        let targets: Vec<_> = {
-            let validators = self.validators.lock().unwrap();
-            validators
-                .iter()
-                .filter(|pk| *pk != sender)
-                .cloned()
-                .collect()
-        };
+        let targets = self.validators.others(sender);
         if targets.is_empty() {
             return;
         }
@@ -144,25 +126,24 @@ where
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
     ) {
-        let validators = self.validators.lock().unwrap().clone();
-        if shards.len() != validators.len() {
-            warn!(
-                digest = ?key.digest,
-                shards = shards.len(),
-                validators = validators.len(),
-                "shard count does not match validator count"
-            );
-            return;
-        }
-
-        for (idx, (target, shard)) in validators.into_iter().zip(shards).enumerate() {
-            if &target == proposer {
-                continue;
+        let assignments = match self.validators.assign_shards(proposer, shards) {
+            Ok(assignments) => assignments,
+            Err(DistributionError::CountMismatch { shards, validators }) => {
+                warn!(
+                    digest = ?key.digest,
+                    shards,
+                    validators,
+                    "shard count does not match validator count"
+                );
+                return;
             }
-            let Some(shard_index) = u16::try_from(idx).ok() else {
-                warn!(index = idx, "validator index too large");
-                continue;
-            };
+            Err(DistributionError::IndexTooLarge { index }) => {
+                warn!(digest = ?key.digest, index, "validator index too large");
+                return;
+            }
+        };
+
+        for (target, shard_index, shard) in assignments {
             let wire_message = WireShardMessage::Initial {
                 key,
                 commitment,
@@ -180,30 +161,27 @@ where
     R: P2pReceiver<PublicKey = PublicKey>,
 {
     fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage> {
-        assert_eq!(
-            public_key, &self.me,
-            "authenticated transport only supports local subscription for self"
-        );
+        if public_key != &self.me {
+            warn!(
+                requested = ?public_key,
+                local = ?self.me,
+                "authenticated transport only supports local subscription for self"
+            );
+            let (_sender, receiver) = mpsc::unbounded();
+            return receiver;
+        }
         let (sender, receiver) = mpsc::unbounded();
-        let mut subscribers = self.local_subscribers.lock().unwrap();
+        let mut subscribers = self.lock_subscribers();
         subscribers.push(sender);
         receiver
     }
 
     fn validator_count(&self) -> u16 {
-        let validators = self.validators.lock().unwrap();
-        u16::try_from(validators.len()).expect("validator count should fit in u16")
+        self.validators.count()
     }
 
     fn validator_index(&self, public_key: &PublicKey) -> Option<u16> {
-        if !self.finalized.load(Ordering::Relaxed) {
-            return None;
-        }
-        let validators = self.validators.lock().unwrap();
-        validators
-            .binary_search(public_key)
-            .ok()
-            .and_then(|idx| u16::try_from(idx).ok())
+        self.validators.index(public_key)
     }
 
     fn broadcast_except<'a>(
@@ -225,5 +203,21 @@ where
             self.distribute_shards_internal(proposer, key, commitment, shards)
                 .await;
         })
+    }
+}
+
+impl<S, R> AuthenticatedShardTransport<S, R>
+where
+    S: P2pSender<PublicKey = PublicKey>,
+    R: P2pReceiver<PublicKey = PublicKey>,
+{
+    fn lock_subscribers(&self) -> MutexGuard<'_, Vec<mpsc::UnboundedSender<ShardMessage>>> {
+        match self.local_subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("local subscriber lock poisoned; continuing with inner state");
+                poisoned.into_inner()
+            }
+        }
     }
 }

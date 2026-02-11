@@ -13,7 +13,7 @@ use hellas_types::PublicKey;
 /// Sender is intentionally omitted from the wire payload. Sender identity must
 /// come from authenticated transport metadata.
 #[derive(Clone)]
-pub enum WireShardMessage {
+pub(crate) enum WireShardMessage {
     Initial {
         key: BlockKey,
         commitment: ZodaCommitment,
@@ -112,32 +112,23 @@ impl WireEnvelope {
     }
 }
 
-fn decode_shard_payload(payload: Vec<u8>) -> Option<ZodaShard> {
+fn decode_payload_part<T>(payload: Vec<u8>) -> Option<T>
+where
+    T: Read<Cfg = CodecConfig>,
+{
     let read_cfg = CodecConfig {
         maximum_shard_size: payload.len(),
     };
     let mut payload_reader = Bytes::from(payload);
-    let shard = ZodaShard::read_cfg(&mut payload_reader, &read_cfg).ok()?;
+    let value = T::read_cfg(&mut payload_reader, &read_cfg).ok()?;
     if payload_reader.has_remaining() {
         return None;
     }
-    Some(shard)
-}
-
-fn decode_reshard_payload(payload: Vec<u8>) -> Option<ZodaReShard> {
-    let read_cfg = CodecConfig {
-        maximum_shard_size: payload.len(),
-    };
-    let mut payload_reader = Bytes::from(payload);
-    let reshard = ZodaReShard::read_cfg(&mut payload_reader, &read_cfg).ok()?;
-    if payload_reader.has_remaining() {
-        return None;
-    }
-    Some(reshard)
+    Some(value)
 }
 
 impl WireShardMessage {
-    pub fn encode(&self) -> Bytes {
+    pub(crate) fn encode(&self) -> Bytes {
         let envelope = match self {
             Self::Initial {
                 key,
@@ -163,7 +154,7 @@ impl WireShardMessage {
         envelope.encode()
     }
 
-    pub fn decode(buf: &[u8]) -> Option<Self> {
+    pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
         let envelope = WireEnvelope::decode(buf)?;
         let WireEnvelope {
             tag,
@@ -172,7 +163,7 @@ impl WireShardMessage {
         } = envelope;
         match tag {
             WireTag::Initial => {
-                let shard = decode_shard_payload(payload)?;
+                let shard = decode_payload_part(payload)?;
                 Some(Self::Initial {
                     key: header.key,
                     commitment: header.commitment,
@@ -181,7 +172,7 @@ impl WireShardMessage {
                 })
             }
             WireTag::ReShare => {
-                let reshard = decode_reshard_payload(payload)?;
+                let reshard = decode_payload_part(payload)?;
                 Some(Self::ReShare {
                     key: header.key,
                     commitment: header.commitment,
@@ -192,33 +183,8 @@ impl WireShardMessage {
         }
     }
 
-    pub fn with_sender(self, sender: PublicKey) -> ShardMessage {
-        match self {
-            Self::Initial {
-                key,
-                commitment,
-                shard,
-                shard_index,
-            } => ShardMessage::Initial {
-                sender,
-                key,
-                commitment,
-                shard,
-                shard_index,
-            },
-            Self::ReShare {
-                key,
-                commitment,
-                shard_index,
-                reshard,
-            } => ShardMessage::ReShare {
-                sender,
-                key,
-                commitment,
-                shard_index,
-                reshard,
-            },
-        }
+    pub(crate) fn with_sender(self, sender: PublicKey) -> ShardMessage {
+        ShardMessage { sender, body: self }
     }
 }
 

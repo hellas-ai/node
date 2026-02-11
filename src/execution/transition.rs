@@ -5,26 +5,39 @@ use commonware_codec::Encode;
 use commonware_cryptography::{Hasher, Sha256};
 use hellas_types::PublicKey;
 use std::collections::HashMap;
+use thiserror::Error;
 
 pub type ObjectState = HashMap<ObjectId, Coin>;
 
 pub struct BlockExecution {
     pub state: ObjectState,
+    #[allow(dead_code)]
     pub created: Vec<(ObjectId, Coin)>,
+    #[allow(dead_code)]
     pub deleted: Vec<ObjectId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecutionError {
+    #[error("object not found: {id:?}")]
     ObjectNotFound { id: ObjectId },
+    #[error("invalid signature")]
     InvalidSignature,
+    #[error("insufficient balance: available={available} requested={requested}")]
     InsufficientBalance { available: u64, requested: u64 },
+    #[error("transfer amount must be > 0")]
     ZeroAmount,
+    #[error("duplicate merge input: {id:?}")]
     DuplicateInput { id: ObjectId },
+    #[error("merge requires at least 2 inputs")]
     TooFewMergeInputs,
+    #[error("merge inputs must be strictly increasing")]
     NonCanonicalMergeInputs,
+    #[error("merge inputs must have the same owner")]
     MergeOwnerMismatch,
+    #[error("merge overflowed u64 total")]
     MergeOverflow,
+    #[error("output object collision: {id:?}")]
     OutputCollision { id: ObjectId },
 }
 
@@ -32,7 +45,13 @@ pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
     let mut state = ObjectState::new();
     let mut created = Vec::new();
     for (idx, validator) in validators.iter().enumerate() {
-        let validator_index = u16::try_from(idx).expect("validator index should fit in u16");
+        let Ok(validator_index) = u16::try_from(idx) else {
+            warn!(
+                index = idx,
+                "validator index overflow; truncating genesis allocation"
+            );
+            break;
+        };
         let id = genesis_object_id(validator_index);
         let coin = Coin {
             owner: validator.clone(),
@@ -163,7 +182,9 @@ pub(crate) fn execute_transaction(
                     .checked_add(coin.value)
                     .ok_or(ExecutionError::MergeOverflow)?;
             }
-            let owner = owner.expect("merge with >=2 inputs must have owner");
+            let Some(owner) = owner else {
+                return Err(ExecutionError::MergeOwnerMismatch);
+            };
             if !tx.verify_signature(&owner) {
                 return Err(ExecutionError::InvalidSignature);
             }

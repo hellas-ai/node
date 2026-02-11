@@ -1,229 +1,42 @@
-#[cfg(debug_assertions)]
-use crate::object::{Coin, ObjectId};
+mod mailbox;
+mod payload;
+
+pub use mailbox::Mailbox;
+
 use crate::shard::{
-    BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardReconstructor, ShardTransport,
+    BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardRecoverer, ShardTransport,
     ZodaCommitment, ZodaShard, coding_config,
 };
 use crate::{
     execution::{
-        ExecutionCache, ExecutionError, execute_block, execute_transaction, genesis_state,
+        ExecutionCache, ExecutionError, ObjectState, execute_block, execute_transaction,
+        genesis_state,
     },
     object::{MAX_TXS_PER_BLOCK, Transaction},
 };
 use bytes::Bytes;
-use commonware_codec::{ReadExt, ReadRangeExt, Write};
 use commonware_coding::Scheme as CodingScheme;
-use commonware_consensus::{
-    Automaton as Au, Relay as Re, Reporter as Rp,
-    types::{Epoch, Round, View},
-};
-use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
+#[cfg(test)]
+use commonware_consensus::types::Round;
+use commonware_consensus::{Reporter, types::Epoch};
+use commonware_cryptography::sha256::Digest;
 use commonware_macros::select_loop;
 use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
-use commonware_utils::{
-    SystemTimeExt,
-    channels::fallible::{AsyncFallibleExt, OneshotExt},
-};
+use commonware_utils::{SystemTimeExt, channels::fallible::OneshotExt};
 use futures::{
     StreamExt,
     channel::{mpsc, oneshot},
 };
-use hellas_types::{Activity as HActivity, Context, PublicKey};
-use std::collections::{HashMap, VecDeque};
-
-/// Milliseconds in the future to allow for block timestamps.
-const SYNCHRONY_BOUND: u64 = 500;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PayloadValidationError {
-    DigestMismatch {
-        computed: Digest,
-        expected: Digest,
-    },
-    InvalidEncoding,
-    RoundMismatch {
-        parsed: Round,
-        expected: Round,
-    },
-    ParentMismatch {
-        parsed: Digest,
-        expected: Digest,
-    },
-    InvalidParentEncoding,
-    FutureTimestamp {
-        timestamp: u64,
-        now: u64,
-    },
-    TimestampRegression {
-        timestamp: u64,
-        parent_timestamp: u64,
-    },
-}
-
-fn genesis_payload(epoch: Epoch) -> Bytes {
-    let round = Round::new(epoch, View::zero());
-    let parent = Digest::from([0u8; 32]);
-    encode_payload_with_txs(round, parent, 0, &[])
-}
-
-fn genesis_digest(epoch: Epoch) -> Digest {
-    payload_digest(&genesis_payload(epoch))
-}
-
+use hellas_types::{Activity, Context, PublicKey};
+use mailbox::Message;
 #[cfg(test)]
-fn encode_payload(round: Round, parent: Digest, timestamp: u64) -> Bytes {
-    encode_payload_with_txs(round, parent, timestamp, &[])
-}
-
-fn encode_payload_with_txs(
-    round: Round,
-    parent: Digest,
-    timestamp: u64,
-    txs: &[Transaction],
-) -> Bytes {
-    let mut buf = bytes::BytesMut::new();
-    round.write(&mut buf);
-    parent.write(&mut buf);
-    timestamp.write(&mut buf);
-    txs.write(&mut buf);
-    buf.freeze()
-}
-
-fn decode_payload(contents: &Bytes) -> Option<(Round, Digest, u64, Vec<Transaction>)> {
-    let mut reader = contents.clone();
-    let round = Round::read(&mut reader).ok()?;
-    let parent = Digest::read(&mut reader).ok()?;
-    let timestamp = u64::read(&mut reader).ok()?;
-    let txs = Vec::<Transaction>::read_range(&mut reader, 0..=MAX_TXS_PER_BLOCK).ok()?;
-    if !reader.is_empty() {
-        return None;
-    }
-    Some((round, parent, timestamp, txs))
-}
-
-fn decode_execution_payload(
-    seen: &HashMap<Digest, Bytes>,
-    payload: Digest,
-) -> Option<(Digest, Vec<Transaction>)> {
-    let contents = seen.get(&payload)?;
-    let (_, parent, _, txs) = decode_payload(contents)?;
-    Some((parent, txs))
-}
-
-fn payload_digest(contents: &Bytes) -> Digest {
-    Sha256::hash(contents)
-}
-
-/// Decode the timestamp from an encoded payload.
-fn decode_timestamp(contents: &Bytes) -> Option<u64> {
-    let mut reader = contents.clone();
-    let _ = Round::read(&mut reader).ok()?;
-    let _ = Digest::read(&mut reader).ok()?;
-    let timestamp = u64::read(&mut reader).ok()?;
-    Some(timestamp)
-}
-
-fn validate_payload(
-    expected_round: Round,
-    expected_parent: Digest,
-    expected_payload: Digest,
-    contents: &Bytes,
-    now: u64,
-    parent_contents: &Bytes,
-) -> Result<Vec<Transaction>, PayloadValidationError> {
-    let computed = payload_digest(contents);
-    if computed != expected_payload {
-        return Err(PayloadValidationError::DigestMismatch {
-            computed,
-            expected: expected_payload,
-        });
-    }
-
-    let Some((parsed_round, parent, timestamp, txs)) = decode_payload(contents) else {
-        return Err(PayloadValidationError::InvalidEncoding);
-    };
-
-    if parsed_round != expected_round {
-        return Err(PayloadValidationError::RoundMismatch {
-            parsed: parsed_round,
-            expected: expected_round,
-        });
-    }
-
-    if parent != expected_parent {
-        return Err(PayloadValidationError::ParentMismatch {
-            parsed: parent,
-            expected: expected_parent,
-        });
-    }
-
-    if timestamp > now.saturating_add(SYNCHRONY_BOUND) {
-        return Err(PayloadValidationError::FutureTimestamp { timestamp, now });
-    }
-
-    let Some(parent_timestamp) = decode_timestamp(parent_contents) else {
-        return Err(PayloadValidationError::InvalidParentEncoding);
-    };
-    if timestamp < parent_timestamp {
-        return Err(PayloadValidationError::TimestampRegression {
-            timestamp,
-            parent_timestamp,
-        });
-    }
-
-    Ok(txs)
-}
-
-fn missing_dependency_or_execution(
-    seen: &HashMap<Digest, Bytes>,
-    execution_cache: &ExecutionCache,
-    context: &Context,
-    payload: Digest,
-) -> Option<Digest> {
-    if !seen.contains_key(&payload) {
-        return Some(payload);
-    }
-    if !seen.contains_key(&context.parent.1) {
-        return Some(context.parent.1);
-    }
-    if !execution_cache.contains_execution(context.parent.1) {
-        return Some(context.parent.1);
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Mailbox messages
-// ---------------------------------------------------------------------------
-
-pub enum Message {
-    Genesis {
-        epoch: Epoch,
-        response: oneshot::Sender<Digest>,
-    },
-    Propose {
-        context: Context,
-        response: oneshot::Sender<Digest>,
-    },
-    Verify {
-        context: Context,
-        payload: Digest,
-        response: oneshot::Sender<bool>,
-    },
-    Broadcast {
-        payload: Digest,
-    },
-    SubmitTx {
-        tx: Transaction,
-    },
-    #[cfg(debug_assertions)]
-    GetCoin {
-        payload: Digest,
-        object: ObjectId,
-        response: oneshot::Sender<Option<Coin>>,
-    },
-}
+use payload::{PayloadValidationError, SYNCHRONY_BOUND, decode_timestamp, encode_payload};
+use payload::{
+    decode_execution_payload, encode_payload_with_txs, genesis_digest, genesis_payload,
+    missing_dependency_or_execution, payload_digest, validate_payload,
+};
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizationNotice {
@@ -238,87 +51,14 @@ struct DeferredVerify {
 }
 
 // ---------------------------------------------------------------------------
-// Mailbox — the Clone+Send frontend that implements Automaton + Relay
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct Mailbox {
-    sender: mpsc::Sender<Message>,
-}
-
-impl Au for Mailbox {
-    type Digest = Digest;
-    type Context = Context;
-
-    async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Genesis { epoch, response })
-            .await;
-        receiver.await.expect("genesis failed")
-    }
-
-    async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Propose { context, response })
-            .await;
-        receiver
-    }
-
-    async fn verify(
-        &mut self,
-        context: Self::Context,
-        payload: Self::Digest,
-    ) -> oneshot::Receiver<bool> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::Verify {
-                context,
-                payload,
-                response,
-            })
-            .await;
-        receiver
-    }
-}
-
-impl Re for Mailbox {
-    type Digest = Digest;
-
-    async fn broadcast(&mut self, payload: Self::Digest) {
-        self.sender.send_lossy(Message::Broadcast { payload }).await;
-    }
-}
-
-impl Mailbox {
-    pub async fn submit_tx(&mut self, tx: Transaction) {
-        self.sender.send_lossy(Message::SubmitTx { tx }).await;
-    }
-
-    #[cfg(debug_assertions)]
-    pub async fn get_coin(&mut self, payload: Digest, object: ObjectId) -> Option<Coin> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(Message::GetCoin {
-                payload,
-                object,
-                response,
-            })
-            .await;
-        receiver.await.unwrap_or(None)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // NoopReporter — logs finalizations, discards other activity
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct TraceReporter;
 
-impl Rp for TraceReporter {
-    type Activity = HActivity;
+impl Reporter for TraceReporter {
+    type Activity = Activity;
 
     async fn report(&mut self, activity: Self::Activity) {
         info!(activity = ?activity);
@@ -329,7 +69,7 @@ impl Rp for TraceReporter {
 // Application actor — runs in a spawned task, handles the real logic
 // ---------------------------------------------------------------------------
 
-pub struct Application<E: Clock + Spawner> {
+pub(crate) struct Application<E: Clock + Spawner> {
     context: ContextCell<E>,
 
     relay: std::sync::Arc<dyn ShardTransport>,
@@ -345,7 +85,7 @@ pub struct Application<E: Clock + Spawner> {
     mempool: VecDeque<Transaction>,
     execution_cache: ExecutionCache,
     validators: Vec<PublicKey>,
-    shard_reconstructor: ShardReconstructor,
+    shard_recoverer: ShardRecoverer,
 }
 
 impl<E: Clock + Spawner> Application<E> {
@@ -375,15 +115,16 @@ impl<E: Clock + Spawner> Application<E> {
     ) -> (Self, Mailbox) {
         validators.sort();
         validators.dedup();
-        assert!(
-            !validators.is_empty(),
-            "validator set must not be empty for genesis"
-        );
+        if validators.is_empty() {
+            warn!("validator set was empty; defaulting to self-only validator set");
+            validators.push(me.clone());
+        }
         let shard_rx = relay.register(me);
         let (sender, receiver) = mpsc::channel(1024);
-        let my_index = relay
-            .validator_index(me)
-            .expect("validators must be declared and finalized before application construction");
+        let my_index = relay.validator_index(me).unwrap_or_else(|| {
+            warn!("validator index unavailable for local key; defaulting to index 0");
+            0
+        });
         let coding_config = coding_config(relay.validator_count());
 
         (
@@ -400,9 +141,9 @@ impl<E: Clock + Spawner> Application<E> {
                 mempool: VecDeque::new(),
                 execution_cache: ExecutionCache::new(Self::MAX_FINALIZED_EXECUTIONS),
                 validators,
-                shard_reconstructor: ShardReconstructor::new(me.clone(), my_index, coding_config),
+                shard_recoverer: ShardRecoverer::new(me.clone(), my_index, coding_config),
             },
-            Mailbox { sender },
+            Mailbox::new(sender),
         )
     }
 
@@ -428,11 +169,13 @@ impl<E: Clock + Spawner> Application<E> {
                 decode_execution_payload(&self.seen, digest)
             })
         {
-            let parent_state = self
-                .execution_cache
-                .execution(parent)
-                .expect("parent execution should exist after materialization")
-                .clone();
+            let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
+                warn!(
+                    parent = ?parent,
+                    "execution materialization reported success but parent state was missing"
+                );
+                return self.propose_empty(context, timestamp);
+            };
             let mut running_state = parent_state;
             let mut retained = VecDeque::new();
             while let Some(tx) = self.mempool.pop_front() {
@@ -459,19 +202,40 @@ impl<E: Clock + Spawner> Application<E> {
             warn!(parent = ?parent, "missing parent execution; proposing empty block");
         }
 
+        self.propose_with_txs(context, timestamp, parent, txs, resulting_state)
+    }
+
+    fn propose_empty(&mut self, context: &Context, timestamp: u64) -> Digest {
+        self.propose_with_txs(context, timestamp, context.parent.1, Vec::new(), None)
+    }
+
+    fn propose_with_txs(
+        &mut self,
+        context: &Context,
+        timestamp: u64,
+        parent: Digest,
+        txs: Vec<Transaction>,
+        resulting_state: Option<ObjectState>,
+    ) -> Digest {
         let payload = encode_payload_with_txs(context.round, parent, timestamp, &txs);
         let digest = payload_digest(&payload);
         let key = BlockKey::new(context.round, digest);
-        let (commitment, shards) = CodingImpl::encode(
-            self.shard_reconstructor.coding_config(),
+        let encoded = CodingImpl::encode(
+            self.shard_recoverer.coding_config(),
             payload.as_ref(),
             &Sequential,
-        )
-        .expect("zoda encode failed");
+        );
 
         self.pending.insert(digest, payload.clone());
-        self.pending_shards
-            .insert(digest, (key, commitment, shards));
+        match encoded {
+            Ok((commitment, shards)) => {
+                self.pending_shards
+                    .insert(digest, (key, commitment, shards));
+            }
+            Err(err) => {
+                warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
+            }
+        }
         self.touch_pending(digest);
         self.seen.insert(digest, payload);
         if let Some(state) = resulting_state {
@@ -495,15 +259,20 @@ impl<E: Clock + Spawner> Application<E> {
             );
             return false;
         }
-        let parent_bytes = self
-            .seen
-            .get(&context.parent.1)
-            .expect("parent dependency should be checked before verify");
-        let parent_state = self
-            .execution_cache
-            .execution(context.parent.1)
-            .expect("parent execution should be checked before verify")
-            .clone();
+        let Some(parent_bytes) = self.seen.get(&context.parent.1) else {
+            warn!(
+                parent = ?context.parent.1,
+                "parent bytes missing during verify despite dependency check"
+            );
+            return false;
+        };
+        let Some(parent_state) = self.execution_cache.execution(context.parent.1).cloned() else {
+            warn!(
+                parent = ?context.parent.1,
+                "parent execution missing during verify despite dependency check"
+            );
+            return false;
+        };
         let now = self.context.current().epoch_millis();
         match validate_payload(
             context.round,
@@ -524,35 +293,8 @@ impl<E: Clock + Spawner> Application<E> {
                     false
                 }
             },
-            Err(PayloadValidationError::DigestMismatch { computed, expected }) => {
-                warn!(?computed, ?expected, "digest mismatch");
-                false
-            }
-            Err(PayloadValidationError::InvalidEncoding) => {
-                warn!("invalid payload encoding");
-                false
-            }
-            Err(PayloadValidationError::RoundMismatch { parsed, expected }) => {
-                warn!(?parsed, ?expected, "round mismatch");
-                false
-            }
-            Err(PayloadValidationError::ParentMismatch { parsed, expected }) => {
-                warn!(?parsed, ?expected, "parent mismatch");
-                false
-            }
-            Err(PayloadValidationError::InvalidParentEncoding) => {
-                warn!(parent = ?context.parent.1, "invalid parent payload encoding");
-                false
-            }
-            Err(PayloadValidationError::FutureTimestamp { timestamp, now }) => {
-                warn!(timestamp, now, "timestamp too far in the future");
-                false
-            }
-            Err(PayloadValidationError::TimestampRegression {
-                timestamp,
-                parent_timestamp,
-            }) => {
-                warn!(timestamp, parent_timestamp, "timestamp before parent");
+            Err(err) => {
+                warn!(%err, payload = ?payload, "payload validation failed");
                 false
             }
         }
@@ -588,12 +330,14 @@ impl<E: Clock + Spawner> Application<E> {
             );
             return;
         }
-
-        let contents = self
-            .seen
-            .get(&payload)
-            .expect("payload dependency should be checked before verify")
-            .clone();
+        let Some(contents) = self.seen.get(&payload).cloned() else {
+            warn!(
+                payload = ?payload,
+                "payload bytes missing during verify despite dependency check"
+            );
+            response.send_lossy(false);
+            return;
+        };
         let valid = self.verify(&context, payload, &contents);
         response.send_lossy(valid);
         if valid {
@@ -718,10 +462,10 @@ impl<E: Clock + Spawner> Application<E> {
         match effect {
             ShardEffect::Broadcast(message) => {
                 self.relay
-                    .broadcast_except(self.shard_reconstructor.me(), *message)
+                    .broadcast_except(self.shard_recoverer.me(), *message)
                     .await;
             }
-            ShardEffect::Reconstructed { key, contents } => {
+            ShardEffect::Recovered { key, contents } => {
                 self.seen.insert(key.digest, contents);
                 self.pending.remove(&key.digest);
                 self.pending_shards.remove(&key.digest);
@@ -740,7 +484,7 @@ impl<E: Clock + Spawner> Application<E> {
         waiter_order: &mut VecDeque<Digest>,
     ) {
         let effects = self
-            .shard_reconstructor
+            .shard_recoverer
             .handle_message(message, &self.seen, |sender| {
                 self.relay.validator_index(sender)
             });
@@ -755,11 +499,11 @@ impl<E: Clock + Spawner> Application<E> {
             return;
         };
         self.relay
-            .distribute_shards(self.shard_reconstructor.me(), key, commitment, shards)
+            .distribute_shards(self.shard_recoverer.me(), key, commitment, shards)
             .await;
     }
 
-    pub fn start(mut self) -> Handle<()> {
+    pub(crate) fn start(mut self) -> Handle<()> {
         spawn_cell!(self.context, self.run().await)
     }
 
@@ -796,7 +540,7 @@ impl<E: Clock + Spawner> Application<E> {
                             &mut waiters,
                             &mut waiter_order,
                         );
-                        for msg in self.shard_reconstructor.note_known_key(key, leader) {
+                        for msg in self.shard_recoverer.note_known_key(key, leader) {
                             self.handle_shard_message(msg, &mut waiters, &mut waiter_order)
                                 .await;
                         }
@@ -824,8 +568,15 @@ impl<E: Clock + Spawner> Application<E> {
                 }
             },
             shard = self.shard_rx.next() => {
-                let shard = shard.expect("shard relay closed");
-                self.handle_shard_message(shard, &mut waiters, &mut waiter_order).await;
+                match shard {
+                    Some(shard) => {
+                        self.handle_shard_message(shard, &mut waiters, &mut waiter_order).await;
+                    }
+                    None => {
+                        warn!("shard relay closed");
+                        break;
+                    }
+                }
             },
             finalized = self.finalization_rx.next() => {
                 match finalized {
@@ -845,9 +596,10 @@ impl<E: Clock + Spawner> Application<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::MockShardTransport;
+    use crate::shard::mock::MockShardTransport;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, View};
+    use commonware_consensus::{Automaton, Relay};
     use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_runtime::{Clock, Metrics, Runner, deterministic};
     use futures::channel::oneshot::Canceled;

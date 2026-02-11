@@ -3,17 +3,41 @@ use commonware_codec::Encode;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Manager, authenticated::lookup};
 use commonware_runtime::{Metrics, Quota, Runner, tokio};
-use hellas_chain::app::TraceReporter;
-use hellas_chain::config::{Config, NodeConfig, PeerEntry, encode_private_key};
+use hellas_chain::TraceReporter;
+use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_private_key};
 use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
+use std::io;
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
+use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
+
+#[derive(Debug, Error)]
+enum ValidatorError {
+    #[error("invalid setup args: {0}")]
+    InvalidSetup(String),
+    #[error("failed to serialize config")]
+    SerializeConfig(#[from] toml::ser::Error),
+    #[error("failed to parse log directive")]
+    InvalidLogDirective(#[from] tracing_subscriber::filter::ParseError),
+    #[error("failed to read config file")]
+    ReadConfig(#[from] io::Error),
+    #[error("failed to parse config file")]
+    ParseConfig(#[from] toml::de::Error),
+    #[error("invalid node configuration")]
+    Config(#[from] ConfigError),
+    #[error("invalid listen address")]
+    InvalidListenAddress(#[from] std::net::AddrParseError),
+    #[error("failed to build consensus scheme: {0}")]
+    Scheme(String),
+    #[error("storage directory is not valid UTF-8: {0}")]
+    NonUtf8StorageDirectory(PathBuf),
+}
 
 #[derive(Parser)]
 #[command(name = "validator")]
@@ -49,8 +73,7 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-
-    match cli.command {
+    let result = match cli.command {
         Command::Setup {
             validators,
             node,
@@ -58,12 +81,30 @@ fn main() {
             seed,
         } => setup(validators, node, start_port, seed),
         Command::Run { config } => run(config),
+    };
+
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }
 
-fn setup(validators: u32, node: u32, start_port: u16, seed: Option<u64>) {
-    assert!(node < validators, "node index must be less than validators");
-    assert!(validators >= 1, "need at least one validator");
+fn setup(
+    validators: u32,
+    node: u32,
+    start_port: u16,
+    seed: Option<u64>,
+) -> Result<(), ValidatorError> {
+    if validators == 0 {
+        return Err(ValidatorError::InvalidSetup(
+            "need at least one validator".to_string(),
+        ));
+    }
+    if node >= validators {
+        return Err(ValidatorError::InvalidSetup(
+            "node index must be less than validators".to_string(),
+        ));
+    }
 
     let keys: Vec<ed25519::PrivateKey> = (0..validators)
         .map(|i| match seed {
@@ -92,34 +133,43 @@ fn setup(validators: u32, node: u32, start_port: u16, seed: Option<u64>) {
         peers,
     };
 
-    println!("{}", toml::to_string_pretty(&config).unwrap());
+    let rendered = toml::to_string_pretty(&config)?;
+    println!("{rendered}");
+    Ok(())
 }
 
-fn run(config_path: PathBuf) {
+fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
+    let log_directive = "info".parse()?;
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::from_default_env().add_directive(log_directive))
         .init();
 
-    let config_str = std::fs::read_to_string(&config_path).expect("failed to read config file");
-    let node_config: NodeConfig = toml::from_str(&config_str).expect("failed to parse config");
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let node_config: NodeConfig = toml::from_str(&config_str)?;
 
-    let private_key = node_config.decode_private_key();
+    let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
-    let participants = node_config.participants();
-    let peer_map = node_config.peer_address_map();
+    let participants = node_config.participants()?;
+    let peer_map = node_config.peer_address_map()?;
 
-    let listen_addr: SocketAddr = format!("0.0.0.0:{}", node_config.listen_port)
-        .parse()
-        .unwrap();
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", node_config.listen_port).parse()?;
 
     // Build consensus scheme
-    let scheme = Scheme::signer(NAMESPACE, participants.clone(), private_key.clone())
-        .expect("own key not found in participants");
+    let scheme = match Scheme::signer(NAMESPACE, participants.clone(), private_key.clone()) {
+        Some(scheme) => scheme,
+        None => {
+            return Err(ValidatorError::Scheme(
+                "own key not found in participants".to_string(),
+            ));
+        }
+    };
 
     // Configure tokio runtime
-    let storage_dir = node_config.storage_directory();
-    let runtime_cfg = tokio::Config::new()
-        .with_storage_directory(storage_dir.to_str().expect("non-UTF-8 data directory"));
+    let storage_dir = node_config.storage_directory()?;
+    let storage_dir_utf8 = storage_dir
+        .to_str()
+        .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
+    let runtime_cfg = tokio::Config::new().with_storage_directory(storage_dir_utf8);
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -168,4 +218,5 @@ fn run(config_path: PathBuf) {
         // Block forever — consensus runs in background tasks
         std::future::pending::<()>().await;
     });
+    Ok(())
 }
