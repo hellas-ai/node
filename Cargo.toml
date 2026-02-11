@@ -1,0 +1,31 @@
+[package]
+name = "hellas-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hellas-types = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-consensus = { workspace = true, features = ["mocks"] }
+commonware-cryptography = { workspace = true, features = ["mocks"] }
+commonware-macros = { workspace = true }
+commonware-p2p = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-utils = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
+prometheus-client = { workspace = true }
+
+[dev-dependencies]
+commonware-consensus = { workspace = true, features = ["fuzz"] }
+proptest = "1.6"
+
+[[bin]]
+name = "validator"
+path = "src/bin/validator.rs"
