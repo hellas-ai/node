@@ -8,7 +8,8 @@ use commonware_consensus::types::View;
 use commonware_cryptography::certificate::{mocks::Fixture, Scheme as _};
 use commonware_cryptography::{sha256::Digest, Sha256};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
-use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
+use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, deterministic};
+use futures::StreamExt;
 use hellas_chain::app::InMemoryRelay;
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
@@ -90,12 +91,28 @@ fn run_network(
                 .unwrap()
                 .push((reporter.finalizations.clone(), reporter.faults.clone()));
 
+            // Create broadcast channels for the Application.
+            // broadcast_rx: incoming payload bytes from InMemoryRelay
+            let broadcast_rx = relay.register(validator);
+            // broadcast_tx: outgoing payload bytes, forwarded to InMemoryRelay
+            let (broadcast_tx, mut outgoing_rx) = futures::channel::mpsc::unbounded();
+
+            // Spawn a task to forward outgoing broadcasts to InMemoryRelay
+            let relay_clone = relay.clone();
+            let key = validator.clone();
+            context.clone().spawn(move |_ctx| async move {
+                while let Some(msg) = outgoing_rx.next().await {
+                    relay_clone.broadcast(&key, msg).await;
+                }
+            });
+
             let engine = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
                 blocker,
-                relay.clone(),
+                broadcast_tx,
+                broadcast_rx,
                 validator,
                 reporter,
             );

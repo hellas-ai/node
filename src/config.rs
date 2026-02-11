@@ -1,12 +1,14 @@
 use crate::app::Mailbox;
+use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{elector::RoundRobin, minimmit, types::ViewDelta, Reporter as Rp};
-use commonware_cryptography::{sha256::Digest, Sha256};
-use commonware_p2p::Blocker;
+use commonware_cryptography::{Signer, ed25519, sha256::Digest, Sha256};
+use commonware_p2p::{Address, Blocker};
 use commonware_parallel::Sequential;
 use commonware_runtime::buffer::PoolRef;
-use commonware_utils::NZU16;
+use commonware_utils::{NZU16, ordered::{Map, Set}};
 use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
-use std::{num::NonZeroUsize, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -98,4 +100,71 @@ impl Config {
             fetch_concurrent: self.fetch_concurrent,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node configuration (serialized to/from TOML)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub private_key: String,
+    pub listen_port: u16,
+    pub storage_directory: String,
+    pub peers: Vec<PeerEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PeerEntry {
+    pub public_key: String,
+    pub address: String,
+}
+
+impl NodeConfig {
+    pub fn decode_private_key(&self) -> ed25519::PrivateKey {
+        let bytes = hex::decode(&self.private_key).expect("invalid hex in private_key");
+        ed25519::PrivateKey::decode(bytes.as_slice()).expect("invalid ed25519 private key")
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        self.decode_private_key().public_key()
+    }
+
+    pub fn participants(&self) -> Set<PublicKey> {
+        let me = self.public_key();
+        let mut keys: Vec<PublicKey> = self
+            .peers
+            .iter()
+            .map(|p| {
+                let bytes = hex::decode(&p.public_key).expect("invalid hex in peer public_key");
+                PublicKey::decode(bytes.as_slice()).expect("invalid ed25519 public key")
+            })
+            .collect();
+        keys.push(me);
+        Set::try_from(keys).expect("duplicate public keys in config")
+    }
+
+    pub fn peer_address_map(&self) -> Map<PublicKey, Address> {
+        let me = self.public_key();
+        let listen: SocketAddr = format!("0.0.0.0:{}", self.listen_port)
+            .parse()
+            .expect("invalid listen port");
+
+        let mut entries: Vec<(PublicKey, Address)> = self
+            .peers
+            .iter()
+            .map(|p| {
+                let bytes = hex::decode(&p.public_key).expect("invalid hex in peer public_key");
+                let key = PublicKey::decode(bytes.as_slice()).expect("invalid ed25519 public key");
+                let addr: SocketAddr = p.address.parse().expect("invalid peer address");
+                (key, Address::Symmetric(addr))
+            })
+            .collect();
+        entries.push((me, Address::Symmetric(listen)));
+        Map::try_from(entries).expect("duplicate keys in peer address map")
+    }
+}
+
+pub fn encode_private_key(key: &ed25519::PrivateKey) -> String {
+    hex::encode(key.encode())
 }

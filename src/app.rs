@@ -243,10 +243,10 @@ impl Rp for TraceReporter {
 pub struct Application<E: Clock + Spawner> {
     context: ContextCell<E>,
 
-    /// Relay for distributing block bytes to peers.
-    relay: std::sync::Arc<InMemoryRelay>,
+    /// Sender for outgoing payload bytes (to be distributed to peers).
+    broadcast_tx: mpsc::UnboundedSender<(Digest, Bytes)>,
 
-    /// Receiver for block bytes from other peers via the relay.
+    /// Receiver for incoming payload bytes from peers.
     broadcast_rx: mpsc::UnboundedReceiver<(Digest, Bytes)>,
 
     mailbox_rx: mpsc::Receiver<Message>,
@@ -261,16 +261,15 @@ pub struct Application<E: Clock + Spawner> {
 impl<E: Clock + Spawner> Application<E> {
     pub fn new(
         context: E,
-        relay: std::sync::Arc<InMemoryRelay>,
-        me: &PublicKey,
+        broadcast_tx: mpsc::UnboundedSender<(Digest, Bytes)>,
+        broadcast_rx: mpsc::UnboundedReceiver<(Digest, Bytes)>,
     ) -> (Self, Mailbox) {
-        let broadcast_rx = relay.register(me);
         let (sender, receiver) = mpsc::channel(1024);
 
         (
             Self {
                 context: ContextCell::new(context),
-                relay,
+                broadcast_tx,
                 broadcast_rx,
                 mailbox_rx: receiver,
                 pending: HashMap::new(),
@@ -373,19 +372,21 @@ impl<E: Clock + Spawner> Application<E> {
         response.send_lossy(valid);
     }
 
-    async fn broadcast_payload(&self, me: &PublicKey, digest: Digest) {
+    fn broadcast_payload(&self, digest: Digest) {
         let contents = self
             .pending
             .get(&digest)
             .expect("broadcast called for unknown payload");
-        self.relay.broadcast(me, (digest, contents.clone())).await;
+        if let Err(e) = self.broadcast_tx.unbounded_send((digest, contents.clone())) {
+            error!(?e, "failed to send payload to broadcast channel");
+        }
     }
 
     pub fn start(mut self, me: PublicKey) -> Handle<()> {
         spawn_cell!(self.context, self.run(me).await)
     }
 
-    async fn run(mut self, me: PublicKey) {
+    async fn run(mut self, _me: PublicKey) {
         // Pending verify requests waiting for block data
         let mut waiters: HashMap<Digest, Vec<DeferredVerify>> = HashMap::new();
 
@@ -412,7 +413,7 @@ impl<E: Clock + Spawner> Application<E> {
                         self.handle_verify_request(context, payload, response, &mut waiters);
                     }
                     Message::Broadcast { payload } => {
-                        self.broadcast_payload(&me, payload).await;
+                        self.broadcast_payload(payload);
                     }
                 }
             },

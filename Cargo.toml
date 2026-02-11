@@ -21,6 +21,10 @@ futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 prometheus-client = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz"] }
