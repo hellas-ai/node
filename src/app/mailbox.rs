@@ -1,4 +1,3 @@
-#[cfg(debug_assertions)]
 use crate::object::Coin;
 use crate::object::{ObjectId, Transaction};
 
@@ -36,23 +35,16 @@ ingress! {
     tell SubmitTx {
         tx: Transaction,
     };
-    #[cfg(debug_assertions)]
-    tell GetCoin {
+    ask read_write GetCoin {
         payload: Digest,
         object: ObjectId,
-        response: oneshot::Sender<Option<Coin>>,
-    };
+    } -> Option<Coin>;
     pub ask GetStateRoot -> Option<Digest>;
     pub ask GetProof { object: ObjectId } -> Option<ProofResponse>;
 }
 
-pub(super) type Ingress = AppMailboxMessage;
-pub(super) type Message = AppMailboxReadWriteMessage;
-pub(super) type ReadOnlyMessage = AppMailboxReadOnlyMessage;
-pub type Mailbox = AppMailbox;
-
 impl AppMailbox {
-    pub(super) fn new(sender: mpsc::Sender<Ingress>) -> Self {
+    pub(super) fn new(sender: mpsc::Sender<AppMailboxMessage>) -> Self {
         Self::from(ActorMailbox::new(sender))
     }
 
@@ -62,16 +54,10 @@ impl AppMailbox {
 
     #[cfg(debug_assertions)]
     pub async fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
-        let (response, receiver) = oneshot::channel();
-        let _ = self
-            .0
-            .tell_lossy(GetCoin {
-                payload,
-                object,
-                response,
-            })
-            .await;
-        receiver.await.unwrap_or(None)
+        self.0
+            .ask(GetCoin { payload, object })
+            .await
+            .unwrap_or(None)
     }
 }
 

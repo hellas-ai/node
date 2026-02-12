@@ -1,13 +1,13 @@
-use super::mailbox::Message;
+use super::mailbox::AppMailboxReadWriteMessage;
 use super::payload::{
     decode_execution_payload, encode_payload_with_txs, genesis_digest, genesis_payload,
     missing_dependency_or_execution, payload_digest, validate_payload,
 };
-use crate::effects::Effects;
 use crate::execution::{
-    ExecutionCache, ExecutionError, FinalizationDiffs, ObjectState, execute_block,
-    execute_transaction, genesis_state,
+    ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
+    execute_block, execute_transaction, genesis_state,
 };
+use crate::object::{Coin, ObjectId};
 use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
 use crate::shard::core::{ShardEffect, ShardRecoverer};
 use crate::shard::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard};
@@ -15,19 +15,114 @@ use bytes::Bytes;
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::sha256::Digest;
-use commonware_parallel::Sequential;
+use commonware_parallel::Rayon;
 use futures::channel::oneshot;
 use hellas_types::{Context, PublicKey};
 use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, VecDeque};
 
-#[cfg(debug_assertions)]
-use crate::object::{Coin, ObjectId};
-
 struct DeferredVerify {
     context: Context,
     payload: Digest,
     response: oneshot::Sender<bool>,
+}
+
+struct PayloadBook {
+    seen: HashMap<Digest, Bytes>,
+    pending: IndexSet<Digest>,
+    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
+    waiters: IndexMap<Digest, Vec<DeferredVerify>>,
+}
+
+impl PayloadBook {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            pending: IndexSet::new(),
+            pending_shards: HashMap::new(),
+            waiters: IndexMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_seen(&self, digest: Digest) -> bool {
+        self.seen.contains_key(&digest)
+    }
+
+    fn seen(&self, digest: Digest) -> Option<&Bytes> {
+        self.seen.get(&digest)
+    }
+
+    fn seen_cloned(&self, digest: Digest) -> Option<Bytes> {
+        self.seen.get(&digest).cloned()
+    }
+
+    fn note_seen(&mut self, digest: Digest, payload: Bytes) {
+        self.seen.insert(digest, payload);
+    }
+
+    fn mark_pending(&mut self, digest: Digest) {
+        self.pending.insert(digest);
+    }
+
+    fn note_pending_shards(
+        &mut self,
+        digest: Digest,
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        shards: Vec<ZodaShard>,
+    ) {
+        self.pending_shards
+            .insert(digest, (key, commitment, shards));
+    }
+
+    fn take_pending_shards(
+        &mut self,
+        digest: Digest,
+    ) -> Option<(BlockKey, ZodaCommitment, Vec<ZodaShard>)> {
+        self.pending.shift_remove(&digest);
+        self.pending_shards.remove(&digest)
+    }
+
+    fn clear_pending(&mut self, digest: Digest) {
+        self.pending.shift_remove(&digest);
+        self.pending_shards.remove(&digest);
+    }
+
+    fn enforce_pending_capacity(&mut self, max_pending: usize) {
+        while self.pending.len() > max_pending {
+            let Some(oldest) = self.pending.shift_remove_index(0) else {
+                break;
+            };
+            self.pending_shards.remove(&oldest);
+        }
+    }
+
+    fn queue_waiter(&mut self, digest: Digest, deferred: DeferredVerify) {
+        self.waiters.entry(digest).or_default().push(deferred);
+    }
+
+    fn trim_waiter_keys(&mut self, max_waiter_keys: usize) -> Vec<DeferredVerify> {
+        let mut evicted = Vec::new();
+        while self.waiters.len() > max_waiter_keys {
+            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
+                break;
+            };
+            evicted.extend(stale);
+        }
+        evicted
+    }
+
+    fn take_waiters(&mut self, digest: Digest) -> Vec<DeferredVerify> {
+        self.waiters.shift_remove(&digest).unwrap_or_default()
+    }
+
+    fn remove_digest(&mut self, digest: Digest) -> Vec<DeferredVerify> {
+        self.seen.remove(&digest);
+        self.pending.shift_remove(&digest);
+        self.pending_shards.remove(&digest);
+        self.take_waiters(digest)
+    }
 }
 
 pub(super) enum CoreEffect {
@@ -39,9 +134,8 @@ pub(super) enum CoreEffect {
         response: oneshot::Sender<bool>,
         valid: bool,
     },
-    #[cfg(debug_assertions)]
     Coin {
-        response: oneshot::Sender<Option<Coin>>,
+        response: tokio::sync::oneshot::Sender<Option<Coin>>,
         coin: Option<Coin>,
     },
 }
@@ -56,35 +150,26 @@ pub(super) enum NetworkEffect {
 }
 
 pub(super) struct CoreEffects {
-    pub(super) replies: Effects<CoreEffect>,
-    pub(super) network: Effects<NetworkEffect>,
+    pub(super) replies: VecDeque<CoreEffect>,
+    pub(super) network: VecDeque<NetworkEffect>,
 }
 
 impl CoreEffects {
     fn new() -> Self {
         Self {
-            replies: Effects::new(),
-            network: Effects::new(),
+            replies: VecDeque::new(),
+            network: VecDeque::new(),
         }
-    }
-
-    fn push_reply(&mut self, effect: CoreEffect) {
-        self.replies.push(effect);
-    }
-
-    fn push_network(&mut self, effect: NetworkEffect) {
-        self.network.push(effect);
     }
 }
 
 pub(super) struct AppCore {
-    pending: IndexSet<Digest>,
-    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
-    seen: HashMap<Digest, Bytes>,
-    waiters: IndexMap<Digest, Vec<DeferredVerify>>,
+    payloads: PayloadBook,
     mempool: VecDeque<Transaction>,
-    execution_cache: ExecutionCache,
+    speculative_store: SpeculativeExecutionStore,
+    finalized: FinalizationTracker,
     validators: Vec<PublicKey>,
+    strategy: Rayon,
     shard_recoverer: ShardRecoverer,
 }
 
@@ -100,6 +185,7 @@ impl AppCore {
         mut validators: Vec<PublicKey>,
         my_index: u16,
         coding_config: commonware_coding::Config,
+        strategy: Rayon,
     ) -> Self {
         validators.sort();
         validators.dedup();
@@ -109,14 +195,13 @@ impl AppCore {
         }
 
         Self {
-            pending: IndexSet::new(),
-            pending_shards: HashMap::new(),
-            seen: HashMap::new(),
-            waiters: IndexMap::new(),
+            payloads: PayloadBook::new(),
             mempool: VecDeque::new(),
-            execution_cache: ExecutionCache::new(Self::MAX_FINALIZED_EXECUTIONS),
+            speculative_store: SpeculativeExecutionStore::new(),
+            finalized: FinalizationTracker::new(Self::MAX_FINALIZED_EXECUTIONS),
             validators,
-            shard_recoverer: ShardRecoverer::new(me, my_index, coding_config),
+            strategy: strategy.clone(),
+            shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy),
         }
     }
 
@@ -131,7 +216,7 @@ impl AppCore {
     // Driver entry points -----------------------------------------------------
     pub(super) fn on_message<F>(
         &mut self,
-        message: Message,
+        message: AppMailboxReadWriteMessage,
         now: u64,
         validator_index: &F,
     ) -> CoreEffects
@@ -140,15 +225,19 @@ impl AppCore {
     {
         let mut effects = CoreEffects::new();
         match message {
-            Message::Genesis { epoch, response } => {
+            AppMailboxReadWriteMessage::Genesis { epoch, response } => {
                 let digest = self.genesis(epoch);
-                effects.push_reply(CoreEffect::Digest { response, digest });
+                effects
+                    .replies
+                    .push_back(CoreEffect::Digest { response, digest });
             }
-            Message::Propose { context, response } => {
+            AppMailboxReadWriteMessage::Propose { context, response } => {
                 let digest = self.propose(&context, now);
-                effects.push_reply(CoreEffect::Digest { response, digest });
+                effects
+                    .replies
+                    .push_back(CoreEffect::Digest { response, digest });
             }
-            Message::Verify {
+            AppMailboxReadWriteMessage::Verify {
                 context,
                 payload,
                 response,
@@ -159,22 +248,23 @@ impl AppCore {
                     self.handle_shard_message(msg, now, validator_index, &mut effects);
                 }
             }
-            Message::Broadcast { payload } => {
+            AppMailboxReadWriteMessage::Broadcast { payload } => {
                 self.enqueue_broadcast(payload, &mut effects);
             }
-            Message::SubmitTx { tx } => {
+            AppMailboxReadWriteMessage::SubmitTx { tx } => {
                 if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
                     self.mempool.push_back(tx);
                 }
             }
-            #[cfg(debug_assertions)]
-            Message::GetCoin {
+            AppMailboxReadWriteMessage::GetCoin {
                 payload,
                 object,
                 response,
             } => {
                 let coin = self.get_coin(payload, object);
-                effects.push_reply(CoreEffect::Coin { response, coin });
+                effects
+                    .replies
+                    .push_back(CoreEffect::Coin { response, coin });
             }
         }
         effects
@@ -200,29 +290,29 @@ impl AppCore {
         effects
     }
 
-    pub(super) fn next_unpersisted_finalization(&self) -> Option<(Digest, FinalizationDiffs)> {
-        self.execution_cache.next_unpersisted_finalization()
+    pub(super) fn next_unpersisted_finalization(&self) -> Option<(Digest, &FinalizationDiffs)> {
+        self.finalized.next_unpersisted_finalization()
     }
 
     pub(super) fn mark_finalization_persisted(&mut self, payload: Digest) -> bool {
-        self.execution_cache.mark_persisted(payload)
+        self.finalized.mark_persisted(payload)
     }
 
     pub(super) fn unpersisted_finalization_count(&self) -> usize {
-        self.execution_cache.unpersisted_finalization_count()
+        self.finalized.unpersisted_finalization_count()
     }
 
     // Consensus callbacks -----------------------------------------------------
     pub(super) fn genesis(&mut self, epoch: Epoch) -> Digest {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
-        self.seen.insert(digest, payload);
+        self.payloads.note_seen(digest, payload);
         let genesis_execution = genesis_state(&self.validators);
         let diffs = FinalizationDiffs {
             created: genesis_execution.created,
             deleted: genesis_execution.deleted,
         };
-        self.execution_cache.insert_state_with_diffs(
+        self.speculative_store.insert_state_with_diffs(
             digest,
             Digest::from([0u8; 32]),
             genesis_execution.state,
@@ -238,7 +328,7 @@ impl AppCore {
         let mut resulting_diffs = None;
 
         if self.ensure_execution_materialized(parent) {
-            let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
+            let Some(parent_state) = self.speculative_store.execution(parent).cloned() else {
                 warn!(
                     parent = ?parent,
                     "execution materialization reported success but parent state was missing"
@@ -324,24 +414,24 @@ impl AppCore {
         let encoded = CodingImpl::encode(
             self.shard_recoverer.coding_config(),
             payload.as_ref(),
-            &Sequential,
+            &self.strategy,
         );
 
-        self.pending.insert(digest);
+        self.payloads.mark_pending(digest);
         match encoded {
             Ok((commitment, shards)) => {
-                self.pending_shards
-                    .insert(digest, (key, commitment, shards));
+                self.payloads
+                    .note_pending_shards(digest, key, commitment, shards);
             }
             Err(err) => {
                 warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
             }
         }
         self.enforce_pending_capacity();
-        self.seen.insert(digest, payload);
+        self.payloads.note_seen(digest, payload);
         match (resulting_state, resulting_diffs) {
             (Some(state), Some(diffs)) => {
-                self.execution_cache
+                self.speculative_store
                     .insert_state_with_diffs(digest, parent, state, diffs);
             }
             (Some(_), None) => {
@@ -351,7 +441,7 @@ impl AppCore {
                 std::process::abort();
             }
             _ => {
-                self.execution_cache.note_parent(digest, parent);
+                self.speculative_store.note_parent(digest, parent);
             }
         }
         digest
@@ -373,14 +463,14 @@ impl AppCore {
             );
             return false;
         }
-        let Some(parent_bytes) = self.seen.get(&parent) else {
+        let Some(parent_bytes) = self.payloads.seen(parent) else {
             warn!(
                 parent = ?parent,
                 "parent bytes missing during verify despite dependency check"
             );
             return false;
         };
-        let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
+        let Some(parent_state) = self.speculative_store.execution(parent).cloned() else {
             warn!(
                 parent = ?parent,
                 "parent execution missing during verify despite dependency check"
@@ -394,7 +484,7 @@ impl AppCore {
                         created: exec.created,
                         deleted: exec.deleted,
                     };
-                    self.execution_cache
+                    self.speculative_store
                         .insert_state_with_diffs(payload, parent, exec.state, diffs);
                     true
                 }
@@ -420,12 +510,15 @@ impl AppCore {
         effects: &mut CoreEffects,
     ) {
         let parent = context.parent.1;
-        if !self.execution_cache.contains_execution(parent) {
+        if !self.speculative_store.contains_execution(parent) {
             let _ = self.ensure_execution_materialized(parent);
         }
-        if let Some(missing_digest) =
-            missing_dependency_or_execution(&self.seen, &self.execution_cache, context, payload)
-        {
+        if let Some(missing_digest) = missing_dependency_or_execution(
+            &self.payloads.seen,
+            &self.speculative_store,
+            context,
+            payload,
+        ) {
             self.queue_waiter(
                 missing_digest,
                 DeferredVerify {
@@ -437,19 +530,21 @@ impl AppCore {
             );
             return;
         }
-        let Some(contents) = self.seen.get(&payload).cloned() else {
+        let Some(contents) = self.payloads.seen_cloned(payload) else {
             warn!(
                 payload = ?payload,
                 "payload bytes missing during verify despite dependency check"
             );
-            effects.push_reply(CoreEffect::Verify {
+            effects.replies.push_back(CoreEffect::Verify {
                 response,
                 valid: false,
             });
             return;
         };
         let valid = self.verify_payload(context, payload, &contents, now);
-        effects.push_reply(CoreEffect::Verify { response, valid });
+        effects
+            .replies
+            .push_back(CoreEffect::Verify { response, valid });
         if valid {
             self.retry_waiters(payload, now, effects);
         } else {
@@ -463,18 +558,12 @@ impl AppCore {
         deferred: DeferredVerify,
         effects: &mut CoreEffects,
     ) {
-        self.waiters.entry(digest).or_default().push(deferred);
-
-        while self.waiters.len() > Self::MAX_WAITER_KEYS {
-            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
-                break;
-            };
-            for deferred in stale {
-                effects.push_reply(CoreEffect::Verify {
-                    response: deferred.response,
-                    valid: false,
-                });
-            }
+        self.payloads.queue_waiter(digest, deferred);
+        for stale in self.payloads.trim_waiter_keys(Self::MAX_WAITER_KEYS) {
+            effects.replies.push_back(CoreEffect::Verify {
+                response: stale.response,
+                valid: false,
+            });
         }
     }
 
@@ -492,7 +581,7 @@ impl AppCore {
 
     fn reject_waiters(&mut self, digest: Digest, effects: &mut CoreEffects) {
         for deferred in self.take_waiters_for(digest) {
-            effects.push_reply(CoreEffect::Verify {
+            effects.replies.push_back(CoreEffect::Verify {
                 response: deferred.response,
                 valid: false,
             });
@@ -500,17 +589,13 @@ impl AppCore {
     }
 
     fn take_waiters_for(&mut self, digest: Digest) -> Vec<DeferredVerify> {
-        self.waiters.shift_remove(&digest).unwrap_or_default()
+        self.payloads.take_waiters(digest)
     }
 
     // Pending payload retention -----------------------------------------------
     fn enforce_pending_capacity(&mut self) {
-        while self.pending.len() > Self::MAX_PENDING_DIGESTS {
-            let Some(oldest) = self.pending.shift_remove_index(0) else {
-                break;
-            };
-            self.pending_shards.remove(&oldest);
-        }
+        self.payloads
+            .enforce_pending_capacity(Self::MAX_PENDING_DIGESTS);
     }
 
     // Finalization pruning ----------------------------------------------------
@@ -520,24 +605,36 @@ impl AppCore {
         parent_payload: Digest,
         effects: &mut CoreEffects,
     ) {
-        let Some(outcome) =
-            self.execution_cache
-                .handle_finalized(payload, parent_payload, &|digest| {
-                    decode_execution_payload(&self.seen, digest)
-                })
-        else {
+        self.speculative_store
+            .note_parent_if_absent(payload, parent_payload);
+        if !self.ensure_execution_materialized(payload) {
             warn!(
                 ?payload,
                 "finalization arrived before local execution state was available"
             );
             return;
-        };
+        }
+        let was_finalized = self.finalized.is_finalized(payload);
+        let diffs = self.speculative_store.take_diffs(payload);
+        if diffs.is_none() && !was_finalized {
+            warn!(
+                ?payload,
+                "finalized payload had no execution diffs; persistence queue will skip it"
+            );
+        }
+        self.finalized.observe_finalized(payload, diffs);
 
-        for digest in outcome.pruned {
-            self.seen.remove(&digest);
-            self.pending.shift_remove(&digest);
-            self.pending_shards.remove(&digest);
-            self.reject_waiters(digest, effects);
+        let finalized = &self.finalized;
+        let pruned = self
+            .speculative_store
+            .prune_non_descendants(payload, |digest| finalized.is_finalized(digest));
+        for digest in pruned {
+            for deferred in self.payloads.remove_digest(digest) {
+                effects.replies.push_back(CoreEffect::Verify {
+                    response: deferred.response,
+                    valid: false,
+                });
+            }
         }
     }
 
@@ -545,12 +642,13 @@ impl AppCore {
     fn apply_shard_effect(&mut self, effect: ShardEffect, now: u64, effects: &mut CoreEffects) {
         match effect {
             ShardEffect::Broadcast(message) => {
-                effects.push_network(NetworkEffect::BroadcastShard(message));
+                effects
+                    .network
+                    .push_back(NetworkEffect::BroadcastShard(message));
             }
             ShardEffect::Recovered { key, contents } => {
-                self.seen.insert(key.digest, contents);
-                self.pending.shift_remove(&key.digest);
-                self.pending_shards.remove(&key.digest);
+                self.payloads.note_seen(key.digest, contents);
+                self.payloads.clear_pending(key.digest);
                 self.retry_waiters(key.digest, now, effects);
             }
             ShardEffect::Failed { key } => {
@@ -570,37 +668,36 @@ impl AppCore {
     {
         let shard_effects =
             self.shard_recoverer
-                .handle_message(message, &self.seen, validator_index);
+                .handle_message(message, &self.payloads.seen, validator_index);
         for effect in shard_effects {
             self.apply_shard_effect(effect, now, effects);
         }
     }
 
     fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
-        let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
+        let Some((key, commitment, shards)) = self.payloads.take_pending_shards(digest) else {
             warn!(?digest, "broadcast requested for unknown pending shards");
             return;
         };
-        effects.push_network(NetworkEffect::DistributeShards {
+        effects.network.push_back(NetworkEffect::DistributeShards {
             key,
             commitment,
             shards,
         });
     }
 
-    // Debug-only read API -----------------------------------------------------
-    #[cfg(debug_assertions)]
+    // Read API ----------------------------------------------------------------
     fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
-        self.execution_cache
+        self.speculative_store
             .execution(payload)
             .and_then(|state| state.get(&object).cloned())
     }
 
     // Shared helper -----------------------------------------------------------
     fn ensure_execution_materialized(&mut self, digest: Digest) -> bool {
-        self.execution_cache
+        self.speculative_store
             .ensure_execution_for_payload(digest, &|candidate| {
-                decode_execution_payload(&self.seen, candidate)
+                decode_execution_payload(&self.payloads.seen, candidate)
             })
     }
 }
@@ -625,7 +722,8 @@ mod tests {
                 minimmit_ed25519::fixture(&mut context, b"core-prune-test", 6);
 
             let me = participants[0].clone();
-            let mut core = AppCore::new(&me, participants.clone(), 0, coding_config(6));
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(&me, participants.clone(), 0, coding_config(6), strategy);
 
             let epoch = Epoch::new(1);
             let genesis = core.genesis(epoch);
@@ -644,17 +742,17 @@ mod tests {
             };
             let fork = core.propose(&fork_context, 101);
 
-            assert!(core.execution_cache.contains_execution(canonical));
-            assert!(core.execution_cache.contains_execution(fork));
+            assert!(core.speculative_store.contains_execution(canonical));
+            assert!(core.speculative_store.contains_execution(fork));
 
             let effects = core.on_finalized(canonical, genesis);
             assert!(effects.replies.is_empty());
             assert!(effects.network.is_empty());
 
-            assert_eq!(core.execution_cache.latest_finalized(), Some(canonical));
-            assert!(core.execution_cache.contains_execution(canonical));
-            assert!(!core.execution_cache.contains_execution(fork));
-            assert!(!core.seen.contains_key(&fork));
+            assert_eq!(core.finalized.latest_finalized(), Some(canonical));
+            assert!(core.speculative_store.contains_execution(canonical));
+            assert!(!core.speculative_store.contains_execution(fork));
+            assert!(!core.payloads.contains_seen(fork));
         });
     }
 }

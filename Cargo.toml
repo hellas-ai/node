@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+perf-harness = []
+loom-tests = ["dep:loom"]
+
 [dependencies]
 hellas-types = { workspace = true }
 commonware-codec = { workspace = true }
@@ -32,11 +37,18 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 indexmap = { workspace = true }
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz"] }
 proptest = "1.6"
+criterion = "0.5"
 
 [[bin]]
 name = "validator"
 path = "src/bin/validator.rs"
+
+[[bench]]
+name = "shard_perf"
+harness = false
+required-features = ["perf-harness"]

@@ -1,4 +1,4 @@
-use crate::app::{Application, FinalizationNotice, Mailbox};
+use crate::app::{AppMailbox, Application, FinalizationNotice};
 use crate::config::Config;
 use crate::shard::AuthenticatedShardTransport;
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit};
@@ -64,12 +64,12 @@ where
         RoundRobin<Sha256>,
         B,
         Digest,
-        Mailbox,
-        Mailbox,
+        AppMailbox,
+        AppMailbox,
         AppReporter<R>,
         Sequential,
     >,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // keep app alive
     app_handle: Handle<()>,
 }
 
@@ -87,7 +87,7 @@ where
         relay: Arc<AuthenticatedShardTransport<S, N>>,
         me: &PublicKey,
         reporter: R,
-    ) -> (Self, Mailbox)
+    ) -> (Self, AppMailbox)
     where
         S: Sender<PublicKey = PublicKey>,
         N: Receiver<PublicKey = PublicKey>,

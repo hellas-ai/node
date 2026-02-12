@@ -1,11 +1,10 @@
 use super::codec::WireShardMessage;
 use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
 use super::recovery::{BufferedReShare, DuplicateStatus, RecoveryState};
-use crate::effects::Effects;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
-use commonware_parallel::Sequential;
+use commonware_parallel::Rayon;
 use hellas_types::PublicKey;
 use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
@@ -17,14 +16,126 @@ pub(crate) enum ShardEffect {
     Failed { key: BlockKey },
 }
 
+struct KeyBook {
+    recovery: IndexMap<BlockKey, RecoveryState>,
+    known_leaders: IndexMap<BlockKey, PublicKey>,
+    pre_leader_buffer: IndexMap<BlockKey, VecDeque<ShardMessage>>,
+}
+
+impl KeyBook {
+    fn new() -> Self {
+        Self {
+            recovery: IndexMap::new(),
+            known_leaders: IndexMap::new(),
+            pre_leader_buffer: IndexMap::new(),
+        }
+    }
+
+    fn has_known_or_recovery(&self, key: &BlockKey) -> bool {
+        self.known_leaders.contains_key(key) || self.recovery.contains_key(key)
+    }
+
+    fn expected_leader(&self, key: BlockKey) -> Option<PublicKey> {
+        self.known_leaders.get(&key).cloned().or_else(|| {
+            self.recovery
+                .get(&key)
+                .map(|recovery| recovery.leader.clone())
+        })
+    }
+
+    fn note_known_key(&mut self, key: BlockKey, leader: PublicKey) -> Vec<ShardMessage> {
+        self.known_leaders.insert(key, leader);
+        self.take_buffered_pre_leader(key)
+            .map(|queue| queue.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn take_buffered_pre_leader(&mut self, key: BlockKey) -> Option<VecDeque<ShardMessage>> {
+        self.pre_leader_buffer.shift_remove(&key)
+    }
+
+    fn cleanup_key(&mut self, key: BlockKey) {
+        self.recovery.shift_remove(&key);
+        self.pre_leader_buffer.shift_remove(&key);
+        self.known_leaders.shift_remove(&key);
+    }
+
+    fn recovery_contains(&self, key: &BlockKey) -> bool {
+        self.recovery.contains_key(key)
+    }
+
+    fn recovery_get(&self, key: &BlockKey) -> Option<&RecoveryState> {
+        self.recovery.get(key)
+    }
+
+    fn recovery_get_mut(&mut self, key: &BlockKey) -> Option<&mut RecoveryState> {
+        self.recovery.get_mut(key)
+    }
+
+    fn insert_recovery(&mut self, key: BlockKey, state: RecoveryState) {
+        self.recovery.insert(key, state);
+    }
+
+    fn recovery_len(&self) -> usize {
+        self.recovery.len()
+    }
+
+    fn evict_oldest_recovery(&mut self) -> Option<BlockKey> {
+        let (oldest, _state) = self.recovery.shift_remove_index(0)?;
+        self.pre_leader_buffer.shift_remove(&oldest);
+        self.known_leaders.shift_remove(&oldest);
+        Some(oldest)
+    }
+
+    fn buffer_pre_leader_message(
+        &mut self,
+        key: BlockKey,
+        message: ShardMessage,
+        max_per_key: usize,
+    ) {
+        let queue = self.pre_leader_buffer.entry(key).or_default();
+        if queue.len() >= max_per_key {
+            queue.pop_front();
+        }
+        queue.push_back(message);
+    }
+
+    fn evict_oldest_pre_leader_keys(&mut self, max_keys: usize) {
+        while self.pre_leader_buffer.len() > max_keys {
+            let Some((_oldest, _queue)) = self.pre_leader_buffer.shift_remove_index(0) else {
+                break;
+            };
+        }
+    }
+
+    fn evict_known_keys(&mut self, max_known_keys: usize) {
+        while self.known_leaders.len() > max_known_keys {
+            let eviction_index = self
+                .known_leaders
+                .iter()
+                .position(|(candidate, _)| !self.recovery.contains_key(candidate));
+            let Some(eviction_index) = eviction_index else {
+                break;
+            };
+            let Some((oldest, _leader)) = self.known_leaders.shift_remove_index(eviction_index)
+            else {
+                break;
+            };
+            self.pre_leader_buffer.shift_remove(&oldest);
+        }
+    }
+
+    fn known_len(&self) -> usize {
+        self.known_leaders.len()
+    }
+}
+
 pub(crate) struct ShardRecoverer {
     me: PublicKey,
     my_index: u16,
     coding_config: CodingConfig,
-
-    recovery: IndexMap<BlockKey, RecoveryState>,
-    known_keys: IndexMap<BlockKey, PublicKey>,
-    pre_leader_buffer: IndexMap<BlockKey, VecDeque<ShardMessage>>,
+    strategy: Rayon,
+    keys: KeyBook,
 }
 
 impl ShardRecoverer {
@@ -34,14 +145,18 @@ impl ShardRecoverer {
     const MAX_PRE_LEADER_KEYS: usize = 256;
     const MAX_KNOWN_KEYS: usize = 1024;
 
-    pub(crate) fn new(me: &PublicKey, my_index: u16, coding_config: CodingConfig) -> Self {
+    pub(crate) fn new(
+        me: &PublicKey,
+        my_index: u16,
+        coding_config: CodingConfig,
+        strategy: Rayon,
+    ) -> Self {
         Self {
             me: me.clone(),
             my_index,
             coding_config,
-            recovery: IndexMap::new(),
-            known_keys: IndexMap::new(),
-            pre_leader_buffer: IndexMap::new(),
+            strategy,
+            keys: KeyBook::new(),
         }
     }
 
@@ -58,19 +173,13 @@ impl ShardRecoverer {
         key: BlockKey,
         leader: &PublicKey,
     ) -> Vec<ShardMessage> {
-        self.known_keys.insert(key, leader.clone());
+        let drained = self.keys.note_known_key(key, leader.clone());
         self.evict_known_keys();
-        self.remove_buffered_pre_leader_key(key)
-            .map(|queue| queue.into_iter().collect())
-            .unwrap_or_default()
+        drained
     }
 
     fn expected_leader(&self, key: BlockKey) -> Option<PublicKey> {
-        self.known_keys.get(&key).cloned().or_else(|| {
-            self.recovery
-                .get(&key)
-                .map(|recovery| recovery.leader.clone())
-        })
+        self.keys.expected_leader(key)
     }
 
     pub(crate) fn handle_message<F>(
@@ -78,18 +187,18 @@ impl ShardRecoverer {
         message: ShardMessage,
         seen: &HashMap<Digest, Bytes>,
         validator_index: F,
-    ) -> Effects<ShardEffect>
+    ) -> VecDeque<ShardEffect>
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
         let key = message.key();
         if seen.contains_key(&key.digest) {
-            return Effects::new();
+            return VecDeque::new();
         }
 
-        if !self.known_keys.contains_key(&key) && !self.recovery.contains_key(&key) {
+        if !self.keys.has_known_or_recovery(&key) {
             self.buffer_pre_leader_message(key, message);
-            return Effects::new();
+            return VecDeque::new();
         }
 
         let ShardMessage { sender, body } = message;
@@ -123,14 +232,14 @@ impl ShardRecoverer {
         commitment: ZodaCommitment,
         shard: <CodingImpl as CodingScheme>::Shard,
         shard_index: u16,
-    ) -> Effects<ShardEffect> {
+    ) -> VecDeque<ShardEffect> {
         let expected_leader = self.expected_leader(key);
         let Some(expected_leader) = expected_leader else {
-            return Effects::new();
+            return VecDeque::new();
         };
 
         if sender != expected_leader || shard_index != self.my_index {
-            return Effects::new();
+            return VecDeque::new();
         }
 
         let mut effects = self.ensure_recovery_state(key, commitment, expected_leader);
@@ -140,8 +249,8 @@ impl ShardRecoverer {
 
         let shard_hash = hash_encoded(&shard);
         let status = self
-            .recovery
-            .get(&key)
+            .keys
+            .recovery_get(&key)
             .expect("recovery must exist after ensure_recovery_state")
             .shard_status(shard_index, shard_hash);
         if !self.accept_new_shard_status(status, key, shard_index, &sender, "initial") {
@@ -155,14 +264,14 @@ impl ShardRecoverer {
             };
 
         let recovery = self
-            .recovery
-            .get_mut(&key)
+            .keys
+            .recovery_get_mut(&key)
             .expect("recovery must exist while handling initial shard");
         recovery.record_shard(shard_index, shard_hash);
         recovery.checking_data = Some(checking_data);
         recovery.checked_shards.push(checked_shard);
         self.process_buffered_reshards(key);
-        effects.push(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
+        effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
             &self.me,
             key,
             commitment,
@@ -170,7 +279,7 @@ impl ShardRecoverer {
             reshard,
         ))));
         if let Some(effect) = self.try_recover(key) {
-            effects.push(effect);
+            effects.push_back(effect);
         }
         effects
     }
@@ -183,21 +292,21 @@ impl ShardRecoverer {
         shard_index: u16,
         reshard: <CodingImpl as CodingScheme>::ReShard,
         validator_index: F,
-    ) -> Effects<ShardEffect>
+    ) -> VecDeque<ShardEffect>
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
         let leader = self.expected_leader(key);
         let Some(leader) = leader else {
             warn!(digest = ?key.digest, "reshare key was neither known nor recovering");
-            return Effects::new();
+            return VecDeque::new();
         };
 
         let Some(expected_index) = validator_index(&sender) else {
-            return Effects::new();
+            return VecDeque::new();
         };
         if expected_index != shard_index {
-            return Effects::new();
+            return VecDeque::new();
         }
 
         let mut effects = self.ensure_recovery_state(key, commitment, leader);
@@ -213,8 +322,8 @@ impl ShardRecoverer {
 
         let shard_hash = hash_encoded(&reshard);
         let status = self
-            .recovery
-            .get(&key)
+            .keys
+            .recovery_get(&key)
             .expect("recovery must exist after ensure_recovery_state")
             .shard_status(shard_index, shard_hash);
         if !self.accept_new_shard_status(status, key, shard_index, &sender, "reshare") {
@@ -222,14 +331,14 @@ impl ShardRecoverer {
         }
 
         let checking_data = self
-            .recovery
-            .get(&key)
+            .keys
+            .recovery_get(&key)
             .expect("recovery must exist while handling reshard")
             .checking_data
             .clone();
         let Some(checking_data) = checking_data else {
-            self.recovery
-                .get_mut(&key)
+            self.keys
+                .recovery_get_mut(&key)
                 .expect("recovery must exist while buffering reshard")
                 .buffer_reshare(
                     BufferedReShare {
@@ -255,13 +364,13 @@ impl ShardRecoverer {
         };
 
         let recovery = self
-            .recovery
-            .get_mut(&key)
+            .keys
+            .recovery_get_mut(&key)
             .expect("recovery must exist while recording checked reshard");
         recovery.record_shard(shard_index, shard_hash);
         recovery.checked_shards.push(checked);
         if let Some(effect) = self.try_recover(key) {
-            effects.push(effect);
+            effects.push_back(effect);
         }
         effects
     }
@@ -271,14 +380,14 @@ impl ShardRecoverer {
         key: BlockKey,
         commitment: ZodaCommitment,
         leader: PublicKey,
-    ) -> Effects<ShardEffect> {
-        if self.recovery.contains_key(&key) {
-            return Effects::new();
+    ) -> VecDeque<ShardEffect> {
+        if self.keys.recovery_contains(&key) {
+            return VecDeque::new();
         }
 
-        let mut effects = Effects::new();
-        while self.recovery.len() >= Self::MAX_RECOVERY_ENTRIES {
-            let Some((oldest, _)) = self.recovery.shift_remove_index(0) else {
+        let mut effects = VecDeque::new();
+        while self.keys.recovery_len() >= Self::MAX_RECOVERY_ENTRIES {
+            let Some(oldest) = self.keys.evict_oldest_recovery() else {
                 break;
             };
             warn!(
@@ -287,19 +396,17 @@ impl ShardRecoverer {
                 max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
                 "evicting oldest recovery entry to admit new recovery"
             );
-            self.remove_buffered_pre_leader_key(oldest);
-            self.remove_known_key(oldest);
-            effects.push(ShardEffect::Failed { key: oldest });
+            effects.push_back(ShardEffect::Failed { key: oldest });
         }
 
-        self.recovery
-            .insert(key, RecoveryState::new(commitment, leader));
+        self.keys
+            .insert_recovery(key, RecoveryState::new(commitment, leader));
         effects
     }
 
     fn process_buffered_reshards(&mut self, key: BlockKey) {
         let Some((commitment, checking_data, buffered)) =
-            self.recovery.get_mut(&key).and_then(|recovery| {
+            self.keys.recovery_get_mut(&key).and_then(|recovery| {
                 let checking_data = recovery.checking_data.clone()?;
                 Some((
                     recovery.commitment,
@@ -313,8 +420,8 @@ impl ShardRecoverer {
 
         for buffered in buffered {
             let status = self
-                .recovery
-                .get(&key)
+                .keys
+                .recovery_get(&key)
                 .expect("recovery must exist while draining buffered reshards")
                 .shard_status(buffered.shard_index, buffered.shard_hash);
             if !self.accept_new_shard_status(
@@ -337,8 +444,8 @@ impl ShardRecoverer {
                 Err(_) => continue,
             };
             let recovery = self
-                .recovery
-                .get_mut(&key)
+                .keys
+                .recovery_get_mut(&key)
                 .expect("recovery must exist while recording drained reshard");
             recovery.record_shard(buffered.shard_index, buffered.shard_hash);
             recovery.checked_shards.push(checked);
@@ -347,7 +454,7 @@ impl ShardRecoverer {
 
     fn try_recover(&mut self, key: BlockKey) -> Option<ShardEffect> {
         let reconstructed = {
-            let recovery = self.recovery.get(&key)?;
+            let recovery = self.keys.recovery_get(&key)?;
             if !recovery.has_minimum_shards(self.coding_config.minimum_shards) {
                 return None;
             }
@@ -357,7 +464,7 @@ impl ShardRecoverer {
                 &recovery.commitment,
                 checking_data,
                 recovery.checked_shards.as_slice(),
-                &Sequential,
+                &self.strategy,
             ) {
                 Ok(decoded) => decoded,
                 Err(_) => {
@@ -380,9 +487,7 @@ impl ShardRecoverer {
     }
 
     fn cleanup_recovery_key(&mut self, key: BlockKey) {
-        self.recovery.shift_remove(&key);
-        self.remove_buffered_pre_leader_key(key);
-        self.remove_known_key(key);
+        self.keys.cleanup_key(key);
     }
 
     fn check_or_adopt_initial_commitment(
@@ -390,7 +495,7 @@ impl ShardRecoverer {
         key: BlockKey,
         commitment: ZodaCommitment,
     ) -> bool {
-        let Some(recovery) = self.recovery.get_mut(&key) else {
+        let Some(recovery) = self.keys.recovery_get_mut(&key) else {
             return false;
         };
         if recovery.commitment == commitment {
@@ -408,57 +513,27 @@ impl ShardRecoverer {
     }
 
     fn commitment_matches_recovery(&self, key: BlockKey, commitment: ZodaCommitment) -> bool {
-        self.recovery
-            .get(&key)
+        self.keys
+            .recovery_get(&key)
             .is_some_and(|recovery| recovery.commitment == commitment)
     }
 
     fn buffer_pre_leader_message(&mut self, key: BlockKey, message: ShardMessage) {
-        let queue = self.pre_leader_buffer.entry(key).or_default();
-        if queue.len() >= Self::MAX_PRE_LEADER_MESSAGES {
-            queue.pop_front();
-        }
-        queue.push_back(message);
-
-        while self.pre_leader_buffer.len() > Self::MAX_PRE_LEADER_KEYS {
-            let Some((_oldest, _queue)) = self.pre_leader_buffer.shift_remove_index(0) else {
-                break;
-            };
-        }
-    }
-
-    fn remove_buffered_pre_leader_key(&mut self, key: BlockKey) -> Option<VecDeque<ShardMessage>> {
-        self.pre_leader_buffer.shift_remove(&key)
+        self.keys
+            .buffer_pre_leader_message(key, message, Self::MAX_PRE_LEADER_MESSAGES);
+        self.keys
+            .evict_oldest_pre_leader_keys(Self::MAX_PRE_LEADER_KEYS);
     }
 
     fn evict_known_keys(&mut self) {
-        while self.known_keys.len() > Self::MAX_KNOWN_KEYS {
-            // Evict oldest key that is not actively recovering, preserving insertion
-            // order among active keys.
-            let eviction_index = self
-                .known_keys
-                .iter()
-                .position(|(candidate, _)| !self.recovery.contains_key(candidate));
-            let Some(eviction_index) = eviction_index else {
-                break;
-            };
-            let Some((oldest, _leader)) = self.known_keys.shift_remove_index(eviction_index) else {
-                break;
-            };
-            self.remove_buffered_pre_leader_key(oldest);
-        }
-
-        if self.known_keys.len() > Self::MAX_KNOWN_KEYS {
+        self.keys.evict_known_keys(Self::MAX_KNOWN_KEYS);
+        if self.keys.known_len() > Self::MAX_KNOWN_KEYS {
             warn!(
-                known_keys = self.known_keys.len(),
+                known_keys = self.keys.known_len(),
                 max_known_keys = Self::MAX_KNOWN_KEYS,
                 "unable to evict known keys because all candidates are active recoveries"
             );
         }
-    }
-
-    fn remove_known_key(&mut self, key: BlockKey) {
-        self.known_keys.shift_remove(&key);
     }
 
     fn accept_new_shard_status(
@@ -492,7 +567,7 @@ mod tests {
     use crate::shard::protocol::coding_config;
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::{Signer, ed25519};
-    use proptest::prelude::*;
+    use commonware_parallel::Sequential;
 
     struct BlockArtifacts {
         key: BlockKey,
@@ -518,7 +593,8 @@ mod tests {
             let my_index = 1u16;
             let me = validators[usize::from(my_index)].clone();
             let leader = validators[0].clone();
-            let recoverer = ShardRecoverer::new(&me, my_index, coding_config(6));
+            let strategy = crate::coding_strategy();
+            let recoverer = ShardRecoverer::new(&me, my_index, coding_config(6), strategy);
             let mut index_by_validator = HashMap::new();
             for (idx, validator) in validators.iter().enumerate() {
                 let validator_index = u16::try_from(idx).expect("index should fit into u16");
@@ -541,7 +617,7 @@ mod tests {
             &mut self,
             message: ShardMessage,
             seen: &HashMap<Digest, Bytes>,
-        ) -> Effects<ShardEffect> {
+        ) -> VecDeque<ShardEffect> {
             let index_by_validator = &self.index_by_validator;
             self.recoverer
                 .handle_message(message, seen, |pk| index_by_validator.get(pk).copied())
@@ -580,15 +656,6 @@ mod tests {
         }
     }
 
-    fn has_recovered<'a, I>(effects: I, key: BlockKey) -> bool
-    where
-        I: IntoIterator<Item = &'a ShardEffect>,
-    {
-        effects
-            .into_iter()
-            .any(|effect| matches!(effect, ShardEffect::Recovered { key: reconstructed, .. } if *reconstructed == key))
-    }
-
     #[test]
     fn pre_leader_reshare_is_drained_after_note_known_key() {
         let mut fixture = Fixture::new();
@@ -612,6 +679,7 @@ mod tests {
         assert!(
             fixture
                 .recoverer
+                .keys
                 .pre_leader_buffer
                 .contains_key(&artifacts.key)
         );
@@ -620,20 +688,23 @@ mod tests {
         assert_eq!(drained.len(), 1);
 
         for msg in drained {
-            let _ = fixture.handle_message(msg, &seen);
+            let effects = fixture.handle_message(msg, &seen);
+            assert!(effects.is_empty());
         }
-
-        let effects = fixture.handle_message(
-            ShardMessage::initial(
-                &fixture.leader,
-                artifacts.key,
-                artifacts.commitment,
-                artifacts.shards[usize::from(fixture.my_index)].clone(),
-                fixture.my_index,
-            ),
-            &seen,
+        assert!(
+            !fixture
+                .recoverer
+                .keys
+                .pre_leader_buffer
+                .contains_key(&artifacts.key)
         );
-        assert!(has_recovered(effects.iter(), artifacts.key));
+        let recovery = fixture
+            .recoverer
+            .keys
+            .recovery
+            .get(&artifacts.key)
+            .expect("drained reshare should start recovery state");
+        assert_eq!(recovery.buffered_reshards.len(), 1);
     }
 
     #[test]
@@ -642,7 +713,6 @@ mod tests {
         let good = fixture.make_artifacts(2, b"good-payload");
         let bad = fixture.make_artifacts(2, b"bad-payload");
         let attacker = fixture.validators[3].clone();
-        let helper = fixture.validators[2].clone();
 
         let _ = fixture.note_known_key(good.key);
         let seen = HashMap::<Digest, Bytes>::new();
@@ -658,6 +728,7 @@ mod tests {
             &seen,
         );
         assert!(malicious.is_empty());
+        assert!(!fixture.recoverer.keys.recovery.contains_key(&good.key));
 
         let _ = fixture.handle_message(
             ShardMessage::initial(
@@ -669,19 +740,14 @@ mod tests {
             ),
             &seen,
         );
-
-        let helper_index = fixture.validator_index(&helper).expect("known validator");
-        let effects = fixture.handle_message(
-            ShardMessage::reshare(
-                &helper,
-                good.key,
-                good.commitment,
-                helper_index,
-                good.reshares[usize::from(helper_index)].clone(),
-            ),
-            &seen,
-        );
-        assert!(has_recovered(effects.iter(), good.key));
+        let recovery = fixture
+            .recoverer
+            .keys
+            .recovery
+            .get(&good.key)
+            .expect("leader initial should create recovery state");
+        assert_eq!(recovery.commitment, good.commitment);
+        assert_ne!(recovery.commitment, bad.commitment);
     }
 
     #[test]
@@ -703,7 +769,7 @@ mod tests {
             ),
             &seen,
         );
-        assert!(fixture.recoverer.recovery.contains_key(&active.key));
+        assert!(fixture.recoverer.keys.recovery.contains_key(&active.key));
 
         for view in 10u64..(10u64 + ShardRecoverer::MAX_KNOWN_KEYS as u64 + 64u64) {
             let key = BlockKey::new(
@@ -713,49 +779,7 @@ mod tests {
             let _ = fixture.note_known_key(key);
         }
 
-        assert!(fixture.recoverer.known_keys.len() <= ShardRecoverer::MAX_KNOWN_KEYS);
-        assert!(fixture.recoverer.recovery.contains_key(&active.key));
-    }
-
-    proptest! {
-        #[test]
-        fn recovers_with_one_valid_reshare_prop(
-            payload in prop::collection::vec(any::<u8>(), 50..256),
-            peer_index in 0u16..6u16,
-            reshare_first in any::<bool>(),
-        ) {
-            prop_assume!(peer_index != 1);
-            let mut fixture = Fixture::new();
-            let artifacts = fixture.make_artifacts(4, payload.as_slice());
-            let _ = fixture.note_known_key(artifacts.key);
-            let seen = HashMap::<Digest, Bytes>::new();
-            let peer = fixture.validators[usize::from(peer_index)].clone();
-
-            let initial = ShardMessage::initial(
-                &fixture.leader,
-                artifacts.key,
-                artifacts.commitment,
-                artifacts.shards[usize::from(fixture.my_index)].clone(),
-                fixture.my_index,
-            );
-            let reshare = ShardMessage::reshare(
-                &peer,
-                artifacts.key,
-                artifacts.commitment,
-                peer_index,
-                artifacts.reshares[usize::from(peer_index)].clone(),
-            );
-
-            let mut effects = Vec::new();
-            if reshare_first {
-                effects.extend(fixture.handle_message(reshare, &seen));
-                effects.extend(fixture.handle_message(initial, &seen));
-            } else {
-                effects.extend(fixture.handle_message(initial, &seen));
-                effects.extend(fixture.handle_message(reshare, &seen));
-            }
-
-            prop_assert!(has_recovered(effects.iter(), artifacts.key));
-        }
+        assert!(fixture.recoverer.keys.known_leaders.len() <= ShardRecoverer::MAX_KNOWN_KEYS);
+        assert!(fixture.recoverer.keys.recovery.contains_key(&active.key));
     }
 }

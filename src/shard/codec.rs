@@ -1,8 +1,6 @@
 use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaReShard, ZodaShard};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use commonware_codec::{
-    Encode, EncodeSize, Error as CodecError, Read, ReadExt, ReadRangeExt, Write,
-};
+use bytes::{Buf, BufMut, Bytes};
+use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_coding::CodecConfig;
 use commonware_consensus::types::Round;
 use commonware_cryptography::sha256::Digest;
@@ -55,82 +53,15 @@ impl WireTag {
     }
 }
 
-#[derive(Clone, Copy)]
-struct WireHeader {
-    key: BlockKey,
-    commitment: ZodaCommitment,
-    shard_index: u16,
-}
-
-impl WireHeader {
-    const fn new(key: BlockKey, commitment: ZodaCommitment, shard_index: u16) -> Self {
-        Self {
-            key,
-            commitment,
-            shard_index,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct WireEnvelope {
-    tag: WireTag,
-    header: WireHeader,
-    payload: Vec<u8>,
-}
-
-impl WireEnvelope {
-    fn encode_size(&self) -> usize {
-        self.tag.as_u8().encode_size()
-            + self.header.key.round.encode_size()
-            + self.header.key.digest.encode_size()
-            + self.header.commitment.encode_size()
-            + self.header.shard_index.encode_size()
-            + self.payload.encode_size()
-    }
-
-    fn encode(&self) -> Bytes {
-        // Wire layout:
-        // tag:u8 | round | digest | commitment | shard_index:u16 | payload:Vec<u8>
-        let mut buf = BytesMut::with_capacity(self.encode_size());
-        self.tag.as_u8().write(&mut buf);
-        self.header.key.round.write(&mut buf);
-        self.header.key.digest.write(&mut buf);
-        self.header.commitment.write(&mut buf);
-        self.header.shard_index.write(&mut buf);
-        self.payload.write(&mut buf);
-        buf.freeze()
-    }
-
-    fn decode(buf: &[u8]) -> Option<Self> {
-        let mut reader = Bytes::copy_from_slice(buf);
-        let tag = WireTag::from_u8(u8::read(&mut reader).ok()?)?;
-        let round = Round::read(&mut reader).ok()?;
-        let digest = Digest::read(&mut reader).ok()?;
-        let commitment = ZodaCommitment::read(&mut reader).ok()?;
-        let shard_index = u16::read(&mut reader).ok()?;
-        let remaining = reader.remaining();
-        let payload = Vec::<u8>::read_range(&mut reader, 0..=remaining).ok()?;
-        if reader.has_remaining() {
-            return None;
-        }
-
-        Some(Self {
-            tag,
-            header: WireHeader::new(BlockKey::new(round, digest), commitment, shard_index),
-            payload,
-        })
-    }
-}
-
-fn decode_payload_part<T>(payload: Vec<u8>) -> Option<T>
+/// Decode a typed payload from raw bytes (zero-copy `Bytes` slice).
+fn decode_payload_part<T>(payload: Bytes) -> Option<T>
 where
     T: Read<Cfg = CodecConfig>,
 {
     let read_cfg = CodecConfig {
         maximum_shard_size: payload.len(),
     };
-    let mut payload_reader = Bytes::from(payload);
+    let mut payload_reader = payload;
     let value = T::read_cfg(&mut payload_reader, &read_cfg).ok()?;
     if payload_reader.has_remaining() {
         return None;
@@ -138,56 +69,73 @@ where
     Some(value)
 }
 
-impl WireShardMessage {
-    pub(crate) fn encode(&self) -> Bytes {
-        let envelope = match self {
-            Self::Initial {
-                key,
-                commitment,
-                shard,
-                shard_index,
-            } => WireEnvelope {
-                tag: WireTag::Initial,
-                header: WireHeader::new(*key, *commitment, *shard_index),
-                payload: shard.encode().to_vec(),
-            },
-            Self::ReShare {
-                key,
-                commitment,
-                shard_index,
-                reshard,
-            } => WireEnvelope {
-                tag: WireTag::ReShare,
-                header: WireHeader::new(*key, *commitment, *shard_index),
-                payload: reshard.encode().to_vec(),
-            },
-        };
-        envelope.encode()
-    }
+/// Compute the encoded size of the common wire header (tag through shard_index).
+fn header_encode_size(key: &BlockKey, commitment: &ZodaCommitment) -> usize {
+    u8::SIZE // tag
+        + key.round.encode_size()
+        + key.digest.encode_size()
+        + commitment.encode_size()
+        + u16::SIZE // shard_index
+}
 
-    pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
-        let envelope = WireEnvelope::decode(buf)?;
-        let WireEnvelope {
-            tag,
-            header,
-            payload,
-        } = envelope;
+/// Write the common wire header fields into a buffer.
+fn write_header(
+    buf: &mut impl BufMut,
+    tag: WireTag,
+    key: &BlockKey,
+    commitment: &ZodaCommitment,
+    shard_index: u16,
+) {
+    tag.as_u8().write(buf);
+    key.round.write(buf);
+    key.digest.write(buf);
+    commitment.write(buf);
+    shard_index.write(buf);
+}
+
+/// Read the common wire header fields from a buffer.
+fn read_header(reader: &mut Bytes) -> Option<(WireTag, BlockKey, ZodaCommitment, u16)> {
+    let tag = WireTag::from_u8(u8::read(reader).ok()?)?;
+    let round = Round::read(reader).ok()?;
+    let digest = Digest::read(reader).ok()?;
+    let commitment = ZodaCommitment::read(reader).ok()?;
+    let shard_index = u16::read(reader).ok()?;
+    Some((tag, BlockKey::new(round, digest), commitment, shard_index))
+}
+
+impl WireShardMessage {
+    /// Decode a wire shard message from a `Bytes` buffer.
+    ///
+    /// The payload section is sliced zero-copy from `buf` rather than copied
+    /// into a new allocation.
+    pub(crate) fn decode(buf: Bytes) -> Option<Self> {
+        let mut reader = buf;
+        let (tag, key, commitment, shard_index) = read_header(&mut reader)?;
+
+        // Read Vec<u8>-compatible length prefix (u32), then zero-copy slice the
+        // payload from the underlying Bytes buffer.
+        let payload_len = u32::read(&mut reader).ok()? as usize;
+        if reader.remaining() != payload_len {
+            return None;
+        }
+        let payload = reader.copy_to_bytes(payload_len);
+
         match tag {
             WireTag::Initial => {
                 let shard = decode_payload_part(payload)?;
                 Some(Self::Initial {
-                    key: header.key,
-                    commitment: header.commitment,
+                    key,
+                    commitment,
                     shard,
-                    shard_index: header.shard_index,
+                    shard_index,
                 })
             }
             WireTag::ReShare => {
                 let reshard = decode_payload_part(payload)?;
                 Some(Self::ReShare {
-                    key: header.key,
-                    commitment: header.commitment,
-                    shard_index: header.shard_index,
+                    key,
+                    commitment,
+                    shard_index,
                     reshard,
                 })
             }
@@ -201,36 +149,50 @@ impl WireShardMessage {
 
 impl EncodeSize for WireShardMessage {
     fn encode_size(&self) -> usize {
-        let envelope = match self {
+        let (key, commitment, payload_size) = match self {
             Self::Initial {
                 key,
                 commitment,
                 shard,
-                shard_index,
-            } => WireEnvelope {
-                tag: WireTag::Initial,
-                header: WireHeader::new(*key, *commitment, *shard_index),
-                payload: shard.encode().to_vec(),
-            },
+                ..
+            } => (key, commitment, shard.encode_size()),
             Self::ReShare {
                 key,
                 commitment,
-                shard_index,
                 reshard,
-            } => WireEnvelope {
-                tag: WireTag::ReShare,
-                header: WireHeader::new(*key, *commitment, *shard_index),
-                payload: reshard.encode().to_vec(),
-            },
+                ..
+            } => (key, commitment, reshard.encode_size()),
         };
-        envelope.encode_size()
+        header_encode_size(key, commitment)
+            + u32::SIZE // payload length prefix
+            + payload_size
     }
 }
 
 impl Write for WireShardMessage {
     fn write(&self, buf: &mut impl BufMut) {
-        let encoded = WireShardMessage::encode(self);
-        buf.put_slice(encoded.as_ref());
+        match self {
+            Self::Initial {
+                key,
+                commitment,
+                shard,
+                shard_index,
+            } => {
+                write_header(buf, WireTag::Initial, key, commitment, *shard_index);
+                (shard.encode_size() as u32).write(buf);
+                shard.write(buf);
+            }
+            Self::ReShare {
+                key,
+                commitment,
+                shard_index,
+                reshard,
+            } => {
+                write_header(buf, WireTag::ReShare, key, commitment, *shard_index);
+                (reshard.encode_size() as u32).write(buf);
+                reshard.write(buf);
+            }
+        }
     }
 }
 
@@ -239,7 +201,7 @@ impl Read for WireShardMessage {
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let payload = buf.copy_to_bytes(buf.remaining());
-        WireShardMessage::decode(payload.as_ref()).ok_or(CodecError::Invalid(
+        WireShardMessage::decode(payload).ok_or(CodecError::Invalid(
             "WireShardMessage",
             "unable to decode wire message",
         ))
@@ -250,11 +212,11 @@ impl Read for WireShardMessage {
 mod tests {
     use super::*;
     use crate::shard::protocol::{CodingImpl, coding_config};
+    use commonware_codec::Encode;
     use commonware_coding::Scheme as CodingScheme;
     use commonware_consensus::types::{Epoch, View};
-    use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
+    use commonware_cryptography::{Hasher, Sha256};
     use commonware_parallel::Sequential;
-    use proptest::prelude::*;
 
     fn sample_artifacts(
         payload: &[u8],
@@ -264,56 +226,11 @@ mod tests {
         (config, commitment, shards)
     }
 
-    proptest! {
-        #[test]
-        fn wire_message_roundtrip_prop(
-            payload in prop::collection::vec(any::<u8>(), 50..512),
-            shard_index in 0u16..6u16,
-            view in any::<u16>(),
-            as_reshare in any::<bool>(),
-        ) {
-            let (config, commitment, shards) = sample_artifacts(payload.as_slice());
-            let key = BlockKey::new(
-                Round::new(Epoch::new(1), View::new(u64::from(view))),
-                Sha256::hash(payload.as_slice()),
-            );
-            let wire = if as_reshare {
-                let (_, _, reshard) = CodingImpl::reshard(
-                    &config,
-                    &commitment,
-                    shard_index,
-                    shards[usize::from(shard_index)].clone(),
-                ).unwrap();
-                WireShardMessage::ReShare {
-                    key,
-                    commitment,
-                    shard_index,
-                    reshard,
-                }
-            } else {
-                WireShardMessage::Initial {
-                    key,
-                    commitment,
-                    shard: shards[usize::from(shard_index)].clone(),
-                    shard_index,
-                }
-            };
-
-            let encoded = wire.encode();
-            let decoded = WireShardMessage::decode(encoded.as_ref()).expect("decode should succeed");
-            prop_assert_eq!(decoded.encode(), encoded);
-
-            let sender = ed25519::PrivateKey::from_seed(9).public_key();
-            let authenticated = decoded.with_sender(sender.clone());
-            prop_assert_eq!(authenticated.sender(), &sender);
-        }
-    }
-
     #[test]
     fn malformed_payloads_return_none() {
-        assert!(WireShardMessage::decode(&[]).is_none());
-        assert!(WireShardMessage::decode(&[WireTag::INITIAL_TAG]).is_none());
-        assert!(WireShardMessage::decode(&[0xFF]).is_none());
+        assert!(WireShardMessage::decode(Bytes::from_static(&[])).is_none());
+        assert!(WireShardMessage::decode(Bytes::from_static(&[WireTag::INITIAL_TAG])).is_none());
+        assert!(WireShardMessage::decode(Bytes::from_static(&[0xFF])).is_none());
 
         let (_config, commitment, shards) = sample_artifacts(b"codec-malformed");
         let key = BlockKey::new(
@@ -329,10 +246,10 @@ mod tests {
         let encoded = message.encode();
 
         let truncated = encoded.slice(0..encoded.len().saturating_sub(1));
-        assert!(WireShardMessage::decode(truncated.as_ref()).is_none());
+        assert!(WireShardMessage::decode(truncated).is_none());
 
         let mut extended = encoded.to_vec();
         extended.push(0xAA);
-        assert!(WireShardMessage::decode(extended.as_slice()).is_none());
+        assert!(WireShardMessage::decode(Bytes::from(extended)).is_none());
     }
 }

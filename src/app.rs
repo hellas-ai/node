@@ -2,7 +2,7 @@ mod core;
 mod mailbox;
 mod payload;
 
-pub use mailbox::Mailbox;
+pub use mailbox::AppMailbox;
 
 use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
@@ -17,7 +17,7 @@ use commonware_utils::{SystemTimeExt, channels::fallible::OneshotExt};
 use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::{Activity, PublicKey};
-use mailbox::{Ingress, ReadOnlyMessage};
+use mailbox::{AppMailboxMessage, AppMailboxReadOnlyMessage};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ where
     shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
     finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
 
-    mailbox_rx: tokio::sync::mpsc::Receiver<Ingress>,
+    mailbox_rx: tokio::sync::mpsc::Receiver<AppMailboxMessage>,
 
     core: AppCore,
 
@@ -72,9 +72,6 @@ where
     /// QMDB for finalized UTXO state. `Option` for type-state take/put pattern
     /// during mutable transitions.
     db: Option<UtxoDb<ContextCell<E>>>,
-
-    /// Latest Merkle root from the QMDB after the most recent finalization commit.
-    state_root: Option<Digest>,
 
     /// Exponential backoff delay currently used for persistence retries.
     persistence_retry_delay: Duration,
@@ -103,7 +100,7 @@ where
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
-    ) -> (Self, Mailbox, mpsc::UnboundedSender<FinalizationNotice>) {
+    ) -> (Self, AppMailbox, mpsc::UnboundedSender<FinalizationNotice>) {
         let (finalization_tx, finalization_rx) = mpsc::unbounded();
         let (app, mailbox) = Self::new_with_finalization_receiver(
             context,
@@ -124,7 +121,7 @@ where
         validators: Vec<PublicKey>,
         partition_prefix: String,
         persistence_failures_remaining: usize,
-    ) -> (Self, Mailbox, mpsc::UnboundedSender<FinalizationNotice>) {
+    ) -> (Self, AppMailbox, mpsc::UnboundedSender<FinalizationNotice>) {
         let (mut app, mailbox, finalization_tx) =
             Self::new(context, relay, me, validators, partition_prefix);
         app.persistence_failures_remaining = persistence_failures_remaining;
@@ -138,7 +135,7 @@ where
         validators: Vec<PublicKey>,
         finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
         partition_prefix: String,
-    ) -> (Self, Mailbox) {
+    ) -> (Self, AppMailbox) {
         let shard_rx = relay.register(me);
         let (sender, receiver) = tokio::sync::mpsc::channel(Self::MAILBOX_CAPACITY);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
@@ -146,7 +143,8 @@ where
             0
         });
         let coding_config = coding_config(relay.validator_count());
-        let core = AppCore::new(me, validators, my_index, coding_config);
+        let strategy = crate::coding_strategy();
+        let core = AppCore::new(me, validators, my_index, coding_config, strategy);
 
         (
             Self {
@@ -158,13 +156,12 @@ where
                 core,
                 partition_prefix,
                 db: None,
-                state_root: None,
                 persistence_retry_delay: Self::PERSISTENCE_RETRY_BASE,
                 next_persistence_retry_at_ms: None,
                 #[cfg(test)]
                 persistence_failures_remaining: 0,
             },
-            Mailbox::new(sender),
+            AppMailbox::new(sender),
         )
     }
 
@@ -176,9 +173,8 @@ where
             CoreEffect::Verify { response, valid } => {
                 response.send_lossy(valid);
             }
-            #[cfg(debug_assertions)]
             CoreEffect::Coin { response, coin } => {
-                response.send_lossy(coin);
+                let _ = response.send(coin);
             }
         }
     }
@@ -262,7 +258,6 @@ where
                 return false;
             }
         };
-        self.state_root = Some(db.root());
         self.db = Some(db);
         true
     }
@@ -271,7 +266,6 @@ where
         let config = utxo_db_config(&self.partition_prefix);
         match UtxoDb::init(self.context.with_label("utxo_db_recover"), config).await {
             Ok(db) => {
-                self.state_root = if db.is_empty() { None } else { Some(db.root()) };
                 self.db = Some(db);
                 warn!(
                     stage,
@@ -291,6 +285,7 @@ where
         let mut attempted = false;
         while let Some((payload, diffs)) = self.core.next_unpersisted_finalization() {
             attempted = true;
+            let diffs = diffs.clone();
             if !self.apply_diffs_to_db(&diffs).await {
                 warn!(?payload, "failed to persist finalized state");
                 return PersistDrainStatus::Blocked;
@@ -355,7 +350,6 @@ where
             return;
         };
         if !db.is_empty() {
-            self.state_root = Some(db.root());
             return;
         }
 
@@ -367,12 +361,17 @@ where
         let _ = self.apply_diffs_to_db(&diffs).await;
     }
 
-    async fn handle_read_only(&self, msg: ReadOnlyMessage) {
+    fn state_root(&self) -> Option<Digest> {
+        let db = self.db.as_ref()?;
+        if db.is_empty() { None } else { Some(db.root()) }
+    }
+
+    async fn handle_read_only(&self, msg: AppMailboxReadOnlyMessage) {
         match msg {
-            ReadOnlyMessage::GetStateRoot { response } => {
-                let _ = response.send(self.state_root);
+            AppMailboxReadOnlyMessage::GetStateRoot { response } => {
+                let _ = response.send(self.state_root());
             }
-            ReadOnlyMessage::GetProof { object, response } => {
+            AppMailboxReadOnlyMessage::GetProof { object, response } => {
                 let proof = if let Some(db) = &self.db {
                     let mut hasher = Sha256::default();
                     db.key_value_proof(&mut hasher, object).await.ok()
@@ -424,7 +423,7 @@ where
                     None => break,
                 };
                 match ingress {
-                    Ingress::ReadWrite(message) => {
+                    AppMailboxMessage::ReadWrite(message) => {
                         let now = self.context.current().epoch_millis();
                         let relay = &self.relay;
                         let effects = self
@@ -432,7 +431,7 @@ where
                             .on_message(message, now, &|sender| relay.validator_index(sender));
                         self.apply_core_effects(effects).await;
                     }
-                    Ingress::ReadOnly(message) => {
+                    AppMailboxMessage::ReadOnly(message) => {
                         self.handle_read_only(message).await;
                     }
                 }

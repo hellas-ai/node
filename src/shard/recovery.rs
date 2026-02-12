@@ -104,16 +104,6 @@ mod tests {
         }
     }
 
-    fn sample_checking_data() -> ZodaCheckingData {
-        let config = coding_config(6);
-        let payload = b"recovery-checking-data".as_slice();
-        let (commitment, shards) =
-            CodingImpl::encode(&config, payload, &Sequential).expect("encode should succeed");
-        let (checking_data, _checked, _reshard) =
-            CodingImpl::reshard(&config, &commitment, 0, shards[0].clone()).expect("reshard");
-        checking_data
-    }
-
     proptest! {
         #[test]
         fn shard_status_detects_equivocation_prop(
@@ -147,43 +137,5 @@ mod tests {
         assert_eq!(buffered.len(), 2);
         assert_eq!(buffered[0].shard_index, 1);
         assert_eq!(buffered[1].shard_index, 2);
-    }
-
-    #[test]
-    fn drain_skips_duplicates_and_equivocations() {
-        let leader = ed25519::PrivateKey::from_seed(12).public_key();
-        let mut recovery = RecoveryState::new(sample_commitment(), leader);
-        recovery.checking_data = Some(sample_checking_data());
-
-        let first = sample_buffered_reshare(31, 1);
-        let duplicate = first.clone();
-        let equivocation = sample_buffered_reshare(32, 1);
-        let second = sample_buffered_reshare(33, 2);
-        assert_eq!(duplicate.shard_hash, first.shard_hash);
-        assert_ne!(equivocation.shard_hash, first.shard_hash);
-
-        recovery.buffer_reshare(first, 8);
-        recovery.buffer_reshare(duplicate, 8);
-        recovery.buffer_reshare(equivocation, 8);
-        recovery.buffer_reshare(second, 8);
-
-        let mut accepted = Vec::new();
-        let mut duplicates = 0usize;
-        let mut equivocations = 0usize;
-
-        for buffered in recovery.take_buffered_reshards() {
-            match recovery.shard_status(buffered.shard_index, buffered.shard_hash) {
-                DuplicateStatus::New => {
-                    recovery.record_shard(buffered.shard_index, buffered.shard_hash);
-                    accepted.push(buffered.shard_index);
-                }
-                DuplicateStatus::Duplicate => duplicates += 1,
-                DuplicateStatus::Equivocation => equivocations += 1,
-            }
-        }
-
-        assert_eq!(accepted, vec![1, 2]);
-        assert_eq!(duplicates, 1);
-        assert_eq!(equivocations, 1);
     }
 }

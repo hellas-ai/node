@@ -185,3 +185,151 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "loom-tests"))]
+mod loom_tests {
+    use loom::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use loom::thread;
+
+    struct LoomValidatorSet {
+        validators: Mutex<Vec<u8>>,
+        finalized: AtomicBool,
+    }
+
+    impl LoomValidatorSet {
+        fn new() -> Self {
+            Self {
+                validators: Mutex::new(Vec::new()),
+                finalized: AtomicBool::new(false),
+            }
+        }
+
+        fn declare(&self, public_key: &u8) {
+            let mut validators = self.validators.lock().expect("lock should succeed");
+            if self.finalized.load(Ordering::Acquire) {
+                return;
+            }
+            if !validators.contains(public_key) {
+                validators.push(public_key.clone());
+            }
+        }
+
+        fn finalize(&self) {
+            let mut validators = self.validators.lock().expect("lock should succeed");
+            validators.sort();
+            validators.dedup();
+            self.finalized.store(true, Ordering::Release);
+        }
+
+        fn count(&self) -> usize {
+            self.validators.lock().expect("lock should succeed").len()
+        }
+
+        fn index(&self, public_key: &u8) -> Option<usize> {
+            if !self.finalized.load(Ordering::Acquire) {
+                return None;
+            }
+            self.validators
+                .lock()
+                .expect("lock should succeed")
+                .binary_search(public_key)
+                .ok()
+        }
+    }
+
+    fn run_model<F>(f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut builder = loom::model::Builder::new();
+        builder.max_threads = 4;
+        builder.max_branches = 64;
+        builder.max_permutations = Some(2_000);
+        builder.preemption_bound = Some(2);
+        builder.check(f);
+    }
+
+    #[test]
+    fn declare_finalize_race_keeps_ordered_unique_membership() {
+        run_model(|| {
+            let set = Arc::new(LoomValidatorSet::new());
+            let a = 1u8;
+            let b = 2u8;
+            let c = 3u8;
+
+            set.declare(&a);
+
+            let set_b = set.clone();
+            let b_cloned = b.clone();
+            let join_b = thread::spawn(move || {
+                set_b.declare(&b_cloned);
+            });
+
+            let set_finalize = set.clone();
+            let join_finalize = thread::spawn(move || {
+                set_finalize.finalize();
+            });
+
+            let set_c = set.clone();
+            let c_cloned = c.clone();
+            let join_c = thread::spawn(move || {
+                set_c.declare(&c_cloned);
+            });
+
+            join_b.join().expect("declare b should join");
+            join_finalize.join().expect("finalize should join");
+            join_c.join().expect("declare c should join");
+
+            // Ensure visibility for index() checks even when finalize raced.
+            set.finalize();
+
+            let count = set.count();
+            assert!((1..=3).contains(&count));
+
+            let mut indexes = Vec::new();
+            for candidate in [&a, &b, &c] {
+                if let Some(idx) = set.index(candidate) {
+                    indexes.push(idx);
+                }
+            }
+            assert!(indexes.windows(2).all(|window| window[0] < window[1]));
+        });
+    }
+
+    #[test]
+    fn duplicate_declare_race_deduplicates() {
+        run_model(|| {
+            let set = Arc::new(LoomValidatorSet::new());
+            let a = 7u8;
+            set.declare(&a);
+
+            let set_1 = set.clone();
+            let a_1 = a.clone();
+            let join_1 = thread::spawn(move || {
+                set_1.declare(&a_1);
+            });
+
+            let set_2 = set.clone();
+            let a_2 = a.clone();
+            let join_2 = thread::spawn(move || {
+                set_2.declare(&a_2);
+            });
+
+            let set_finalize = set.clone();
+            let join_finalize = thread::spawn(move || {
+                set_finalize.finalize();
+            });
+
+            join_1.join().expect("declare #1 should join");
+            join_2.join().expect("declare #2 should join");
+            join_finalize.join().expect("finalize should join");
+
+            set.finalize();
+            assert_eq!(set.count(), 1);
+            assert_eq!(set.index(&a), Some(0));
+        });
+    }
+}

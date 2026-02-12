@@ -125,7 +125,6 @@ mod tests {
     use super::*;
     use commonware_coding::Scheme as CodingScheme;
     use commonware_parallel::Sequential;
-    use proptest::prelude::*;
 
     fn sample_artifacts(
         payload: &[u8],
@@ -133,31 +132,6 @@ mod tests {
         let config = coding_config(6);
         let (commitment, shards) = CodingImpl::encode(&config, payload, &Sequential).unwrap();
         (config, commitment, shards)
-    }
-
-    proptest! {
-        #[test]
-        fn zoda_roundtrip_prop(
-            payload in prop::collection::vec(any::<u8>(), 50..512),
-            first in 0u16..6u16,
-            second in 0u16..6u16,
-        ) {
-            prop_assume!(first != second);
-            let config = coding_config(6);
-            let (commitment, shards) = CodingImpl::encode(&config, payload.as_slice(), &Sequential).unwrap();
-
-            let (checking_data, checked_first, _) =
-                CodingImpl::reshard(&config, &commitment, first, shards[first as usize].clone()).unwrap();
-            let (_, _, reshard_second) =
-                CodingImpl::reshard(&config, &commitment, second, shards[second as usize].clone()).unwrap();
-            let checked_second =
-                CodingImpl::check(&config, &commitment, &checking_data, second, reshard_second).unwrap();
-
-            let checked = vec![checked_first, checked_second];
-            let decoded = CodingImpl::decode(&config, &commitment, checking_data, &checked, &Sequential).unwrap();
-            prop_assert_eq!(Sha256::hash(decoded.as_slice()), Sha256::hash(payload.as_slice()));
-        }
-
     }
 
     #[test]

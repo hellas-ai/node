@@ -1,4 +1,4 @@
-use crate::app::Mailbox;
+use crate::app::AppMailbox;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewDelta};
 use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
@@ -87,11 +87,20 @@ impl Config {
         self,
         scheme: Scheme,
         blocker: B,
-        automaton: Mailbox,
-        relay: Mailbox,
+        automaton: AppMailbox,
+        relay: AppMailbox,
         reporter: R,
         partition: &PublicKey,
-    ) -> minimmit::Config<Scheme, RoundRobin<Sha256>, B, Digest, Mailbox, Mailbox, R, Sequential>
+    ) -> minimmit::Config<
+        Scheme,
+        RoundRobin<Sha256>,
+        B,
+        Digest,
+        AppMailbox,
+        AppMailbox,
+        R,
+        Sequential,
+    >
     where
         B: Blocker<PublicKey = PublicKey>,
         R: Reporter<Activity = Activity>,

@@ -1,4 +1,4 @@
-use crate::execution::ExecutionCache;
+use crate::execution::SpeculativeExecutionStore;
 use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
 use bytes::Bytes;
 use commonware_codec::{ReadExt, ReadRangeExt, Write};
@@ -148,7 +148,7 @@ pub(super) fn validate_payload(
 
 pub(super) fn missing_dependency_or_execution(
     seen: &HashMap<Digest, Bytes>,
-    execution_cache: &ExecutionCache,
+    speculative_store: &SpeculativeExecutionStore,
     context: &Context,
     payload: Digest,
 ) -> Option<Digest> {
@@ -158,7 +158,7 @@ pub(super) fn missing_dependency_or_execution(
     if !seen.contains_key(&context.parent.1) {
         return Some(context.parent.1);
     }
-    if !execution_cache.contains_execution(context.parent.1) {
+    if !speculative_store.contains_execution(context.parent.1) {
         return Some(context.parent.1);
     }
     None

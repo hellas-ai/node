@@ -39,24 +39,6 @@ impl MockShardTransport {
         self.validators.finalize();
     }
 
-    pub fn validator_count(&self) -> u16 {
-        self.validators.count()
-    }
-
-    pub fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage> {
-        let (sender, receiver) = mpsc::unbounded();
-        let mut recipients = self.lock_recipients();
-        recipients
-            .entry(public_key.clone())
-            .or_default()
-            .push(sender);
-        receiver
-    }
-
-    pub fn validator_index(&self, public_key: &PublicKey) -> Option<u16> {
-        self.validators.index(public_key)
-    }
-
     async fn send_to(&self, target: &PublicKey, message: ShardMessage) {
         let channels: Vec<_> = {
             let recipients = self.lock_recipients();
@@ -68,63 +50,25 @@ impl MockShardTransport {
             }
         }
     }
-
-    pub async fn broadcast_except(&self, sender: &PublicKey, message: ShardMessage) {
-        let targets: Vec<_> = {
-            let recipients = self.lock_recipients();
-            recipients
-                .keys()
-                .filter(|pk| *pk != sender)
-                .cloned()
-                .collect()
-        };
-        for target in targets {
-            self.send_to(&target, message.clone()).await;
-        }
-    }
-
-    pub async fn distribute_shards(
-        &self,
-        proposer: &PublicKey,
-        key: BlockKey,
-        commitment: ZodaCommitment,
-        shards: Vec<ZodaShard>,
-    ) {
-        let assignments = match self.validators.assign_shards(proposer, shards) {
-            Ok(assignments) => assignments,
-            Err(DistributionError::CountMismatch { shards, validators }) => {
-                warn!(
-                    digest = ?key.digest,
-                    shards,
-                    validators,
-                    "shard count does not match validator count"
-                );
-                return;
-            }
-            Err(DistributionError::IndexTooLarge { index }) => {
-                warn!(digest = ?key.digest, index, "validator index too large");
-                return;
-            }
-        };
-
-        for (target, shard_index, shard) in assignments {
-            let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
-            self.send_to(&target, message).await;
-        }
-    }
 }
 
 impl ShardTransport for MockShardTransport {
     fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage> {
-        Self::register(self, public_key)
+        let (sender, receiver) = mpsc::unbounded();
+        let mut recipients = self.lock_recipients();
+        recipients
+            .entry(public_key.clone())
+            .or_default()
+            .push(sender);
+        receiver
     }
 
     fn validator_count(&self) -> u16 {
-        Self::validator_count(self)
+        self.validators.count()
     }
 
     fn validator_index(&self, public_key: &PublicKey) -> Option<u16> {
-        Self::validator_index(self, public_key)
+        self.validators.index(public_key)
     }
 
     fn broadcast_except<'a>(
@@ -132,7 +76,19 @@ impl ShardTransport for MockShardTransport {
         sender: &'a PublicKey,
         message: ShardMessage,
     ) -> impl Future<Output = ()> + Send + 'a {
-        async move { Self::broadcast_except(self, sender, message).await }
+        async move {
+            let targets: Vec<_> = {
+                let recipients = self.lock_recipients();
+                recipients
+                    .keys()
+                    .filter(|pk| *pk != sender)
+                    .cloned()
+                    .collect()
+            };
+            for target in targets {
+                self.send_to(&target, message.clone()).await;
+            }
+        }
     }
 
     fn distribute_shards<'a>(
@@ -142,7 +98,29 @@ impl ShardTransport for MockShardTransport {
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
     ) -> impl Future<Output = ()> + Send + 'a {
-        async move { Self::distribute_shards(self, proposer, key, commitment, shards).await }
+        async move {
+            let assignments = match self.validators.assign_shards(proposer, shards) {
+                Ok(assignments) => assignments,
+                Err(DistributionError::CountMismatch { shards, validators }) => {
+                    warn!(
+                        digest = ?key.digest,
+                        shards,
+                        validators,
+                        "shard count does not match validator count"
+                    );
+                    return;
+                }
+                Err(DistributionError::IndexTooLarge { index }) => {
+                    warn!(digest = ?key.digest, index, "validator index too large");
+                    return;
+                }
+            };
+
+            for (target, shard_index, shard) in assignments {
+                let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
+                self.send_to(&target, message).await;
+            }
+        }
     }
 }
 
