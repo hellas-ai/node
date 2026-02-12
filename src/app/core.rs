@@ -5,7 +5,8 @@ use super::payload::{
 };
 use crate::effects::Effects;
 use crate::execution::{
-    ExecutionCache, ExecutionError, ObjectState, execute_block, execute_transaction, genesis_state,
+    ExecutionCache, ExecutionError, FinalizationDiffs, ObjectState, execute_block,
+    execute_transaction, genesis_state,
 };
 use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
 use crate::shard::{
@@ -18,6 +19,7 @@ use commonware_cryptography::sha256::Digest;
 use commonware_parallel::Sequential;
 use futures::channel::oneshot;
 use hellas_types::{Context, PublicKey};
+use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, VecDeque};
 
 #[cfg(debug_assertions)]
@@ -77,12 +79,10 @@ impl CoreEffects {
 }
 
 pub(super) struct AppCore {
-    pending: HashMap<Digest, Bytes>,
-    pending_order: VecDeque<Digest>,
+    pending: IndexSet<Digest>,
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     seen: HashMap<Digest, Bytes>,
-    waiters: HashMap<Digest, Vec<DeferredVerify>>,
-    waiter_order: VecDeque<Digest>,
+    waiters: IndexMap<Digest, Vec<DeferredVerify>>,
     mempool: VecDeque<Transaction>,
     execution_cache: ExecutionCache,
     validators: Vec<PublicKey>,
@@ -110,12 +110,10 @@ impl AppCore {
         }
 
         Self {
-            pending: HashMap::new(),
-            pending_order: VecDeque::new(),
+            pending: IndexSet::new(),
             pending_shards: HashMap::new(),
             seen: HashMap::new(),
-            waiters: HashMap::new(),
-            waiter_order: VecDeque::new(),
+            waiters: IndexMap::new(),
             mempool: VecDeque::new(),
             execution_cache: ExecutionCache::new(Self::MAX_FINALIZED_EXECUTIONS),
             validators,
@@ -125,6 +123,10 @@ impl AppCore {
 
     pub(super) const fn me(&self) -> &PublicKey {
         self.shard_recoverer.me()
+    }
+
+    pub(super) fn validators(&self) -> &[PublicKey] {
+        &self.validators
     }
 
     // Driver entry points -----------------------------------------------------
@@ -199,14 +201,34 @@ impl AppCore {
         effects
     }
 
+    pub(super) fn next_unpersisted_finalization(&self) -> Option<(Digest, FinalizationDiffs)> {
+        self.execution_cache.next_unpersisted_finalization()
+    }
+
+    pub(super) fn mark_finalization_persisted(&mut self, payload: Digest) -> bool {
+        self.execution_cache.mark_persisted(payload)
+    }
+
+    pub(super) fn unpersisted_finalization_count(&self) -> usize {
+        self.execution_cache.unpersisted_finalization_count()
+    }
+
     // Consensus callbacks -----------------------------------------------------
     pub(super) fn genesis(&mut self, epoch: Epoch) -> Digest {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
         self.seen.insert(digest, payload);
         let genesis_execution = genesis_state(&self.validators);
-        self.execution_cache
-            .insert_state(digest, Digest::from([0u8; 32]), genesis_execution.state);
+        let diffs = FinalizationDiffs {
+            created: genesis_execution.created,
+            deleted: genesis_execution.deleted,
+        };
+        self.execution_cache.insert_state_with_diffs(
+            digest,
+            Digest::from([0u8; 32]),
+            genesis_execution.state,
+            diffs,
+        );
         digest
     }
 
@@ -214,6 +236,7 @@ impl AppCore {
         let parent = context.parent.1;
         let mut txs = Vec::new();
         let mut resulting_state = None;
+        let mut resulting_diffs = None;
 
         if self.ensure_execution_materialized(parent) {
             let Some(parent_state) = self.execution_cache.execution(parent).cloned() else {
@@ -223,7 +246,7 @@ impl AppCore {
                 );
                 return self.propose_empty(context, now);
             };
-            let mut running_state = parent_state;
+            let mut running_state = parent_state.clone();
             let mut retained = VecDeque::new();
             while let Some(tx) = self.mempool.pop_front() {
                 if txs.len() >= MAX_TXS_PER_BLOCK {
@@ -243,17 +266,48 @@ impl AppCore {
                 }
             }
             self.mempool = retained;
-            resulting_state = Some(running_state);
+
+            // Re-execute via execute_block to obtain diffs.
+            if !txs.is_empty() {
+                match execute_block(&parent_state, &txs) {
+                    Ok(exec) => {
+                        resulting_diffs = Some(FinalizationDiffs {
+                            created: exec.created,
+                            deleted: exec.deleted,
+                        });
+                        resulting_state = Some(exec.state);
+                    }
+                    Err(err) => {
+                        error!(
+                            ?err,
+                            parent = ?parent,
+                            tx_count = txs.len(),
+                            "failed to re-execute selected txs for proposal; proposing empty block"
+                        );
+                        // If we cannot derive diffs, do not cache or propose a stateful block.
+                        for tx in txs.into_iter().rev() {
+                            self.mempool.push_front(tx);
+                        }
+                        return self.propose_empty(context, now);
+                    }
+                }
+            } else {
+                resulting_diffs = Some(FinalizationDiffs {
+                    created: Vec::new(),
+                    deleted: Vec::new(),
+                });
+                resulting_state = Some(running_state);
+            }
         } else {
             warn!(parent = ?parent, "missing parent execution; proposing empty block");
         }
 
-        self.propose_with_txs(context, now, parent, txs, resulting_state)
+        self.propose_with_txs(context, now, parent, txs, resulting_state, resulting_diffs)
     }
 
     // Proposal assembly -------------------------------------------------------
     fn propose_empty(&mut self, context: &Context, now: u64) -> Digest {
-        self.propose_with_txs(context, now, context.parent.1, Vec::new(), None)
+        self.propose_with_txs(context, now, context.parent.1, Vec::new(), None, None)
     }
 
     fn propose_with_txs(
@@ -263,6 +317,7 @@ impl AppCore {
         parent: Digest,
         txs: Vec<Transaction>,
         resulting_state: Option<ObjectState>,
+        resulting_diffs: Option<FinalizationDiffs>,
     ) -> Digest {
         let payload = encode_payload_with_txs(context.round, parent, timestamp, &txs);
         let digest = payload_digest(&payload);
@@ -273,7 +328,7 @@ impl AppCore {
             &Sequential,
         );
 
-        self.pending.insert(digest, payload.clone());
+        self.pending.insert(digest);
         match encoded {
             Ok((commitment, shards)) => {
                 self.pending_shards
@@ -283,12 +338,22 @@ impl AppCore {
                 warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
             }
         }
-        self.enforce_pending_capacity(digest);
+        self.enforce_pending_capacity();
         self.seen.insert(digest, payload);
-        if let Some(state) = resulting_state {
-            self.execution_cache.insert_state(digest, parent, state);
-        } else {
-            self.execution_cache.note_parent(digest, parent);
+        match (resulting_state, resulting_diffs) {
+            (Some(state), Some(diffs)) => {
+                self.execution_cache
+                    .insert_state_with_diffs(digest, parent, state, diffs);
+            }
+            (Some(_), None) => {
+                error!(
+                    "internal invariant violated: proposal state was computed without finalization diffs; aborting"
+                );
+                std::process::abort();
+            }
+            _ => {
+                self.execution_cache.note_parent(digest, parent);
+            }
         }
         digest
     }
@@ -326,8 +391,12 @@ impl AppCore {
         match validate_payload(context.round, parent, payload, contents, now, parent_bytes) {
             Ok(txs) => match execute_block(&parent_state, &txs) {
                 Ok(exec) => {
+                    let diffs = FinalizationDiffs {
+                        created: exec.created,
+                        deleted: exec.deleted,
+                    };
                     self.execution_cache
-                        .insert_state(payload, parent, exec.state);
+                        .insert_state_with_diffs(payload, parent, exec.state, diffs);
                     true
                 }
                 Err(err) => {
@@ -395,22 +464,17 @@ impl AppCore {
         deferred: DeferredVerify,
         effects: &mut CoreEffects,
     ) {
-        if !self.waiters.contains_key(&digest) {
-            self.waiter_order.push_back(digest);
-        }
         self.waiters.entry(digest).or_default().push(deferred);
 
         while self.waiters.len() > Self::MAX_WAITER_KEYS {
-            let Some(oldest) = self.waiter_order.pop_front() else {
+            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
                 break;
             };
-            if let Some(stale) = self.waiters.remove(&oldest) {
-                for deferred in stale {
-                    effects.push_reply(CoreEffect::Verify {
-                        response: deferred.response,
-                        valid: false,
-                    });
-                }
+            for deferred in stale {
+                effects.push_reply(CoreEffect::Verify {
+                    response: deferred.response,
+                    valid: false,
+                });
             }
         }
     }
@@ -437,22 +501,15 @@ impl AppCore {
     }
 
     fn take_waiters_for(&mut self, digest: Digest) -> Vec<DeferredVerify> {
-        if let Some(pos) = self.waiter_order.iter().position(|d| *d == digest) {
-            self.waiter_order.remove(pos);
-        }
-        self.waiters.remove(&digest).unwrap_or_default()
+        self.waiters.shift_remove(&digest).unwrap_or_default()
     }
 
     // Pending payload retention -----------------------------------------------
-    fn enforce_pending_capacity(&mut self, digest: Digest) {
-        if !self.pending_order.contains(&digest) {
-            self.pending_order.push_back(digest);
-        }
-        while self.pending_order.len() > Self::MAX_PENDING_DIGESTS {
-            let Some(oldest) = self.pending_order.pop_front() else {
+    fn enforce_pending_capacity(&mut self) {
+        while self.pending.len() > Self::MAX_PENDING_DIGESTS {
+            let Some(oldest) = self.pending.shift_remove_index(0) else {
                 break;
             };
-            self.pending.remove(&oldest);
             self.pending_shards.remove(&oldest);
         }
     }
@@ -464,7 +521,7 @@ impl AppCore {
         parent_payload: Digest,
         effects: &mut CoreEffects,
     ) {
-        let Some(pruned) =
+        let Some(outcome) =
             self.execution_cache
                 .handle_finalized(payload, parent_payload, &|digest| {
                     decode_execution_payload(&self.seen, digest)
@@ -477,15 +534,12 @@ impl AppCore {
             return;
         };
 
-        for digest in pruned {
+        for digest in outcome.pruned {
             self.seen.remove(&digest);
-            self.pending.remove(&digest);
+            self.pending.shift_remove(&digest);
             self.pending_shards.remove(&digest);
             self.reject_waiters(digest, effects);
         }
-
-        self.pending_order
-            .retain(|digest| self.pending.contains_key(digest));
     }
 
     // Shard recovery + broadcast ----------------------------------------------
@@ -496,7 +550,7 @@ impl AppCore {
             }
             ShardEffect::Recovered { key, contents } => {
                 self.seen.insert(key.digest, contents);
-                self.pending.remove(&key.digest);
+                self.pending.shift_remove(&key.digest);
                 self.pending_shards.remove(&key.digest);
                 self.retry_waiters(key.digest, now, effects);
             }

@@ -8,6 +8,8 @@ pub(crate) trait ShardTransport: Send + Sync + 'static {
     fn validator_count(&self) -> u16;
     fn validator_index(&self, public_key: &PublicKey) -> Option<u16>;
 
+    // Boxed futures keep this trait object-safe (`dyn ShardTransport` is used by
+    // the application actor). `async fn` in traits would not be object-safe here.
     fn broadcast_except<'a>(
         &'a self,
         sender: &'a PublicKey,

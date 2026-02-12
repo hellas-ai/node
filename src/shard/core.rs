@@ -8,6 +8,7 @@ use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Sequential;
 use hellas_types::PublicKey;
+use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone)]
@@ -22,12 +23,9 @@ pub(crate) struct ShardRecoverer {
     my_index: u16,
     coding_config: CodingConfig,
 
-    recovery: HashMap<BlockKey, RecoveryState>,
-    recovery_order: VecDeque<BlockKey>,
-    known_keys: HashMap<BlockKey, PublicKey>,
-    known_key_order: VecDeque<BlockKey>,
-    pre_leader_buffer: HashMap<BlockKey, VecDeque<ShardMessage>>,
-    pre_leader_order: VecDeque<BlockKey>,
+    recovery: IndexMap<BlockKey, RecoveryState>,
+    known_keys: IndexMap<BlockKey, PublicKey>,
+    pre_leader_buffer: IndexMap<BlockKey, VecDeque<ShardMessage>>,
 }
 
 impl ShardRecoverer {
@@ -42,12 +40,9 @@ impl ShardRecoverer {
             me: me.clone(),
             my_index,
             coding_config,
-            recovery: HashMap::new(),
-            recovery_order: VecDeque::new(),
-            known_keys: HashMap::new(),
-            known_key_order: VecDeque::new(),
-            pre_leader_buffer: HashMap::new(),
-            pre_leader_order: VecDeque::new(),
+            recovery: IndexMap::new(),
+            known_keys: IndexMap::new(),
+            pre_leader_buffer: IndexMap::new(),
         }
     }
 
@@ -64,14 +59,19 @@ impl ShardRecoverer {
         key: BlockKey,
         leader: &PublicKey,
     ) -> Vec<ShardMessage> {
-        if !self.known_keys.contains_key(&key) {
-            self.known_key_order.push_back(key);
-        }
         self.known_keys.insert(key, leader.clone());
         self.evict_known_keys();
         self.remove_buffered_pre_leader_key(key)
             .map(|queue| queue.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    fn expected_leader(&self, key: BlockKey) -> Option<PublicKey> {
+        self.known_keys.get(&key).cloned().or_else(|| {
+            self.recovery
+                .get(&key)
+                .map(|recovery| recovery.leader.clone())
+        })
     }
 
     pub(crate) fn handle_message<F>(
@@ -125,11 +125,7 @@ impl ShardRecoverer {
         shard: <CodingImpl as CodingScheme>::Shard,
         shard_index: u16,
     ) -> Effects<ShardEffect> {
-        let expected_leader = self.known_keys.get(&key).cloned().or_else(|| {
-            self.recovery
-                .get(&key)
-                .map(|recovery| recovery.leader.clone())
-        });
+        let expected_leader = self.expected_leader(key);
         let Some(expected_leader) = expected_leader else {
             return Effects::new();
         };
@@ -144,14 +140,11 @@ impl ShardRecoverer {
         }
 
         let shard_hash = super::hash_encoded(&shard);
-        let Some(status) = self
+        let status = self
             .recovery
             .get(&key)
-            .map(|recovery| recovery.shard_status(shard_index, shard_hash))
-        else {
-            warn!(digest = ?key.digest, "missing recovery state while processing initial shard");
-            return effects;
-        };
+            .expect("recovery must exist after ensure_recovery_state")
+            .shard_status(shard_index, shard_hash);
         if !self.accept_new_shard_status(status, key, shard_index, &sender, "initial") {
             return effects;
         }
@@ -162,11 +155,13 @@ impl ShardRecoverer {
                 Err(_) => return effects,
             };
 
-        if let Some(recovery) = self.recovery.get_mut(&key) {
-            recovery.record_shard(shard_index, shard_hash);
-            recovery.checking_data = Some(checking_data);
-            recovery.checked_shards.push(checked_shard);
-        }
+        let recovery = self
+            .recovery
+            .get_mut(&key)
+            .expect("recovery must exist while handling initial shard");
+        recovery.record_shard(shard_index, shard_hash);
+        recovery.checking_data = Some(checking_data);
+        recovery.checked_shards.push(checked_shard);
         self.process_buffered_reshards(key);
         effects.push(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
             &self.me,
@@ -193,11 +188,7 @@ impl ShardRecoverer {
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
-        let leader = self.known_keys.get(&key).cloned().or_else(|| {
-            self.recovery
-                .get(&key)
-                .map(|recovery| recovery.leader.clone())
-        });
+        let leader = self.expected_leader(key);
         let Some(leader) = leader else {
             warn!(digest = ?key.digest, "reshare key was neither known nor recovering");
             return Effects::new();
@@ -222,14 +213,11 @@ impl ShardRecoverer {
         }
 
         let shard_hash = super::hash_encoded(&reshard);
-        let Some(status) = self
+        let status = self
             .recovery
             .get(&key)
-            .map(|recovery| recovery.shard_status(shard_index, shard_hash))
-        else {
-            warn!(digest = ?key.digest, "missing recovery state while processing reshard");
-            return effects;
-        };
+            .expect("recovery must exist after ensure_recovery_state")
+            .shard_status(shard_index, shard_hash);
         if !self.accept_new_shard_status(status, key, shard_index, &sender, "reshare") {
             return effects;
         }
@@ -237,10 +225,14 @@ impl ShardRecoverer {
         let checking_data = self
             .recovery
             .get(&key)
-            .and_then(|recovery| recovery.checking_data.clone());
+            .expect("recovery must exist while handling reshard")
+            .checking_data
+            .clone();
         let Some(checking_data) = checking_data else {
-            if let Some(recovery) = self.recovery.get_mut(&key) {
-                recovery.buffer_reshare(
+            self.recovery
+                .get_mut(&key)
+                .expect("recovery must exist while buffering reshard")
+                .buffer_reshare(
                     BufferedReShare {
                         sender,
                         shard_index,
@@ -249,7 +241,6 @@ impl ShardRecoverer {
                     },
                     Self::MAX_BUFFERED_RESHARDS,
                 );
-            }
             return effects;
         };
 
@@ -264,10 +255,12 @@ impl ShardRecoverer {
             Err(_) => return effects,
         };
 
-        if let Some(recovery) = self.recovery.get_mut(&key) {
-            recovery.record_shard(shard_index, shard_hash);
-            recovery.checked_shards.push(checked);
-        }
+        let recovery = self
+            .recovery
+            .get_mut(&key)
+            .expect("recovery must exist while recording checked reshard");
+        recovery.record_shard(shard_index, shard_hash);
+        recovery.checked_shards.push(checked);
         if let Some(effect) = self.try_recover(key) {
             effects.push(effect);
         }
@@ -286,10 +279,15 @@ impl ShardRecoverer {
 
         let mut effects = Effects::new();
         while self.recovery.len() >= Self::MAX_RECOVERY_ENTRIES {
-            let Some(oldest) = self.recovery_order.pop_front() else {
+            let Some((oldest, _)) = self.recovery.shift_remove_index(0) else {
                 break;
             };
-            self.recovery.remove(&oldest);
+            warn!(
+                evicted = ?oldest,
+                incoming = ?key,
+                max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
+                "evicting oldest recovery entry to admit new recovery"
+            );
             self.remove_buffered_pre_leader_key(oldest);
             self.remove_known_key(oldest);
             effects.push(ShardEffect::Failed { key: oldest });
@@ -297,7 +295,6 @@ impl ShardRecoverer {
 
         self.recovery
             .insert(key, RecoveryState::new(commitment, leader));
-        self.recovery_order.push_back(key);
         effects
     }
 
@@ -316,17 +313,11 @@ impl ShardRecoverer {
         };
 
         for buffered in buffered {
-            let Some(status) = self
+            let status = self
                 .recovery
                 .get(&key)
-                .map(|recovery| recovery.shard_status(buffered.shard_index, buffered.shard_hash))
-            else {
-                warn!(
-                    digest = ?key.digest,
-                    "missing recovery state while draining buffered reshards"
-                );
-                return;
-            };
+                .expect("recovery must exist while draining buffered reshards")
+                .shard_status(buffered.shard_index, buffered.shard_hash);
             if !self.accept_new_shard_status(
                 status,
                 key,
@@ -346,10 +337,12 @@ impl ShardRecoverer {
                 Ok(checked) => checked,
                 Err(_) => continue,
             };
-            if let Some(recovery) = self.recovery.get_mut(&key) {
-                recovery.record_shard(buffered.shard_index, buffered.shard_hash);
-                recovery.checked_shards.push(checked);
-            }
+            let recovery = self
+                .recovery
+                .get_mut(&key)
+                .expect("recovery must exist while recording drained reshard");
+            recovery.record_shard(buffered.shard_index, buffered.shard_hash);
+            recovery.checked_shards.push(checked);
         }
     }
 
@@ -388,10 +381,7 @@ impl ShardRecoverer {
     }
 
     fn cleanup_recovery_key(&mut self, key: BlockKey) {
-        self.recovery.remove(&key);
-        if let Some(pos) = self.recovery_order.iter().position(|item| *item == key) {
-            self.recovery_order.remove(pos);
-        }
+        self.recovery.shift_remove(&key);
         self.remove_buffered_pre_leader_key(key);
         self.remove_known_key(key);
     }
@@ -408,6 +398,8 @@ impl ShardRecoverer {
             return true;
         }
         // Safe adoption window: we can switch commitment only before validating any shard.
+        // This path is only reachable for the expected leader (validated in handle_initial),
+        // so this resolves leader self-equivalence before shard validation begins.
         if recovery.checking_data.is_none() && recovery.checked_shards.is_empty() {
             recovery.commitment = commitment;
             return true;
@@ -423,9 +415,6 @@ impl ShardRecoverer {
     }
 
     fn buffer_pre_leader_message(&mut self, key: BlockKey, message: ShardMessage) {
-        if !self.pre_leader_buffer.contains_key(&key) {
-            self.pre_leader_order.push_back(key);
-        }
         let queue = self.pre_leader_buffer.entry(key).or_default();
         if queue.len() >= Self::MAX_PRE_LEADER_MESSAGES {
             queue.pop_front();
@@ -433,35 +422,31 @@ impl ShardRecoverer {
         queue.push_back(message);
 
         while self.pre_leader_buffer.len() > Self::MAX_PRE_LEADER_KEYS {
-            let Some(oldest) = self.pre_leader_order.pop_front() else {
+            let Some((_oldest, _queue)) = self.pre_leader_buffer.shift_remove_index(0) else {
                 break;
             };
-            self.pre_leader_buffer.remove(&oldest);
         }
     }
 
     fn remove_buffered_pre_leader_key(&mut self, key: BlockKey) -> Option<VecDeque<ShardMessage>> {
-        if let Some(pos) = self.pre_leader_order.iter().position(|item| *item == key) {
-            self.pre_leader_order.remove(pos);
-        }
-        self.pre_leader_buffer.remove(&key)
+        self.pre_leader_buffer.shift_remove(&key)
     }
 
     fn evict_known_keys(&mut self) {
-        let mut attempts_left = self.known_key_order.len();
-        while self.known_keys.len() > Self::MAX_KNOWN_KEYS && attempts_left > 0 {
-            let Some(oldest) = self.known_key_order.pop_front() else {
+        while self.known_keys.len() > Self::MAX_KNOWN_KEYS {
+            // Evict oldest key that is not actively recovering, preserving insertion
+            // order among active keys.
+            let eviction_index = self
+                .known_keys
+                .iter()
+                .position(|(candidate, _)| !self.recovery.contains_key(candidate));
+            let Some(eviction_index) = eviction_index else {
                 break;
             };
-            if self.recovery.contains_key(&oldest) {
-                self.known_key_order.push_back(oldest);
-                attempts_left -= 1;
-                continue;
-            }
-            self.known_keys.remove(&oldest);
+            let Some((oldest, _leader)) = self.known_keys.shift_remove_index(eviction_index) else {
+                break;
+            };
             self.remove_buffered_pre_leader_key(oldest);
-            // Reset attempts after a successful eviction so we can keep scanning.
-            attempts_left = self.known_key_order.len();
         }
 
         if self.known_keys.len() > Self::MAX_KNOWN_KEYS {
@@ -474,10 +459,7 @@ impl ShardRecoverer {
     }
 
     fn remove_known_key(&mut self, key: BlockKey) {
-        if let Some(pos) = self.known_key_order.iter().position(|item| *item == key) {
-            self.known_key_order.remove(pos);
-        }
-        self.known_keys.remove(&key);
+        self.known_keys.shift_remove(&key);
     }
 
     fn accept_new_shard_status(

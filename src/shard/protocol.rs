@@ -35,6 +35,8 @@ pub(crate) fn coding_config(validators: u16) -> CodingConfig {
             extra_shards: 0,
         };
     }
+    // N5f1 means the configuration expects n >= 5f + 1.
+    // `max_faults` returns the largest f for the current validator count.
     let faults = N5f1::max_faults(validators);
     let minimum_shards = match u16::try_from(faults.saturating_add(1)) {
         Ok(value) => value.clamp(1, validators),

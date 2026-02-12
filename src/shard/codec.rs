@@ -1,5 +1,5 @@
 use super::{BlockKey, ShardMessage, ZodaCommitment, ZodaReShard, ZodaShard};
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use commonware_codec::{
     Encode, EncodeSize, Error as CodecError, Read, ReadExt, ReadRangeExt, Write,
 };
@@ -24,6 +24,7 @@ pub(crate) enum WireShardMessage {
         key: BlockKey,
         commitment: ZodaCommitment,
         shard_index: u16,
+        // Wire-level "ReShare" message carries a re-sharded fragment payload.
         reshard: ZodaReShard,
     },
 }
@@ -79,16 +80,26 @@ struct WireEnvelope {
 }
 
 impl WireEnvelope {
+    fn encode_size(&self) -> usize {
+        self.tag.as_u8().encode_size()
+            + self.header.key.round.encode_size()
+            + self.header.key.digest.encode_size()
+            + self.header.commitment.encode_size()
+            + self.header.shard_index.encode_size()
+            + self.payload.encode_size()
+    }
+
     fn encode(&self) -> Bytes {
-        (
-            self.tag.as_u8(),
-            self.header.key.round,
-            self.header.key.digest,
-            self.header.commitment,
-            self.header.shard_index,
-            self.payload.clone(),
-        )
-            .encode()
+        // Wire layout:
+        // tag:u8 | round | digest | commitment | shard_index:u16 | payload:Vec<u8>
+        let mut buf = BytesMut::with_capacity(self.encode_size());
+        self.tag.as_u8().write(&mut buf);
+        self.header.key.round.write(&mut buf);
+        self.header.key.digest.write(&mut buf);
+        self.header.commitment.write(&mut buf);
+        self.header.shard_index.write(&mut buf);
+        self.payload.write(&mut buf);
+        buf.freeze()
     }
 
     fn decode(buf: &[u8]) -> Option<Self> {
@@ -190,7 +201,29 @@ impl WireShardMessage {
 
 impl EncodeSize for WireShardMessage {
     fn encode_size(&self) -> usize {
-        WireShardMessage::encode(self).len()
+        let envelope = match self {
+            Self::Initial {
+                key,
+                commitment,
+                shard,
+                shard_index,
+            } => WireEnvelope {
+                tag: WireTag::Initial,
+                header: WireHeader::new(*key, *commitment, *shard_index),
+                payload: shard.encode().to_vec(),
+            },
+            Self::ReShare {
+                key,
+                commitment,
+                shard_index,
+                reshard,
+            } => WireEnvelope {
+                tag: WireTag::ReShare,
+                header: WireHeader::new(*key, *commitment, *shard_index),
+                payload: reshard.encode().to_vec(),
+            },
+        };
+        envelope.encode_size()
     }
 }
 

@@ -27,11 +27,13 @@ impl ValidatorSet {
     }
 
     pub(crate) fn declare(&self, public_key: &PublicKey) {
-        if self.finalized.load(Ordering::Relaxed) {
+        // Check finalization after taking the lock to avoid a declare/finalize
+        // race that could append unsorted entries after finalization.
+        let mut validators = self.lock_validators();
+        if self.finalized.load(Ordering::Acquire) {
             warn!("attempted to declare validator after finalization; ignoring");
             return;
         }
-        let mut validators = self.lock_validators();
         if !validators.contains(public_key) {
             validators.push(public_key.clone());
         }
@@ -41,7 +43,7 @@ impl ValidatorSet {
         let mut validators = self.lock_validators();
         validators.sort();
         validators.dedup();
-        self.finalized.store(true, Ordering::Relaxed);
+        self.finalized.store(true, Ordering::Release);
     }
 
     pub(crate) fn count(&self) -> u16 {
@@ -59,7 +61,7 @@ impl ValidatorSet {
     }
 
     pub(crate) fn index(&self, public_key: &PublicKey) -> Option<u16> {
-        if !self.finalized.load(Ordering::Relaxed) {
+        if !self.finalized.load(Ordering::Acquire) {
             return None;
         }
         let validators = self.lock_validators();
@@ -113,5 +115,26 @@ impl ValidatorSet {
                 poisoned.into_inner()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::{Signer, ed25519};
+
+    #[test]
+    fn declare_after_finalize_is_ignored() {
+        let set = ValidatorSet::new();
+        let a = ed25519::PrivateKey::from_seed(1).public_key();
+        let b = ed25519::PrivateKey::from_seed(2).public_key();
+
+        set.declare(&a);
+        set.finalize();
+        set.declare(&b);
+
+        assert_eq!(set.count(), 1);
+        assert!(set.index(&a).is_some());
+        assert!(set.index(&b).is_none());
     }
 }

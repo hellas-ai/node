@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use commonware_codec::Encode;
+use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Manager, authenticated::lookup};
@@ -9,6 +9,7 @@ use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_pr
 use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
+use rand::RngCore;
 use std::io;
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
 use thiserror::Error;
@@ -17,6 +18,13 @@ use tracing_subscriber::EnvFilter;
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
+
+fn random_private_key() -> ed25519::PrivateKey {
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    ed25519::PrivateKey::decode(raw.as_slice())
+        .expect("decoding 32 random bytes as an ed25519 private key should always succeed")
+}
 
 #[derive(Debug, Error)]
 enum ValidatorError {
@@ -107,13 +115,15 @@ fn setup(
         ));
     }
 
+    if seed.is_none() {
+        eprintln!(
+            "warning: generating cryptographically random keys without --seed; configs will not be reproducible"
+        );
+    }
     let keys: Vec<ed25519::PrivateKey> = (0..validators)
         .map(|i| match seed {
             Some(s) => ed25519::PrivateKey::from_seed(s + i as u64),
-            None => {
-                eprintln!("warning: generating random keys without --seed; configs will not be reproducible");
-                ed25519::PrivateKey::from_seed(i as u64)
-            }
+            None => random_private_key(),
         })
         .collect();
 

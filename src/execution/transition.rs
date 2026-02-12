@@ -11,9 +11,7 @@ pub type ObjectState = HashMap<ObjectId, Coin>;
 
 pub struct BlockExecution {
     pub state: ObjectState,
-    #[allow(dead_code)]
     pub created: Vec<(ObjectId, Coin)>,
-    #[allow(dead_code)]
     pub deleted: Vec<ObjectId>,
 }
 

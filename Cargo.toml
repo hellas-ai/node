@@ -15,6 +15,7 @@ commonware-macros = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-parallel = { workspace = true }
 commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
@@ -30,6 +31,7 @@ dirs = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+indexmap = { workspace = true }
 
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz"] }

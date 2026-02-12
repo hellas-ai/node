@@ -1,6 +1,7 @@
-use crate::object::Transaction;
 #[cfg(debug_assertions)]
-use crate::object::{Coin, ObjectId};
+use crate::object::Coin;
+use crate::object::{ObjectId, Transaction};
+
 // We currently use actor `ingress!` only. ServiceBuilder is deferred while
 // minimmit and actor depend on different `commonware-runtime` lines.
 use commonware_actor::{ingress, mailbox::Mailbox as ActorMailbox};
@@ -9,6 +10,9 @@ use commonware_cryptography::sha256::Digest;
 use futures::channel::oneshot;
 use hellas_types::Context;
 use tokio::sync::mpsc;
+
+/// Opaque proof returned by `get_proof()`.
+pub type ProofResponse = commonware_storage::qmdb::current::proof::OperationProof<Digest, 32>;
 
 ingress! {
     AppMailbox,
@@ -38,10 +42,13 @@ ingress! {
         object: ObjectId,
         response: oneshot::Sender<Option<Coin>>,
     };
+    pub ask GetStateRoot -> Option<Digest>;
+    pub ask GetProof { object: ObjectId } -> Option<ProofResponse>;
 }
 
 pub(super) type Ingress = AppMailboxMessage;
 pub(super) type Message = AppMailboxReadWriteMessage;
+pub(super) type ReadOnlyMessage = AppMailboxReadOnlyMessage;
 pub type Mailbox = AppMailbox;
 
 impl AppMailbox {
@@ -75,14 +82,17 @@ impl Automaton for AppMailbox {
     async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
         if let Err(err) = self.0.tell(Genesis { epoch, response }).await {
-            error!(?err, "failed to enqueue genesis");
-            return Digest::from([0u8; 32]);
+            error!(?err, "failed to enqueue genesis request; aborting");
+            std::process::abort();
         }
         match receiver.await {
             Ok(digest) => digest,
             Err(err) => {
-                error!(?err, "genesis response channel closed");
-                Digest::from([0u8; 32])
+                error!(
+                    ?err,
+                    "genesis response channel closed unexpectedly; aborting"
+                );
+                std::process::abort();
             }
         }
     }
@@ -90,7 +100,8 @@ impl Automaton for AppMailbox {
     async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
         if let Err(err) = self.0.tell(Propose { context, response }).await {
-            error!(?err, "failed to enqueue propose");
+            error!(?err, "failed to enqueue propose request; aborting");
+            std::process::abort();
         }
         receiver
     }
@@ -110,7 +121,8 @@ impl Automaton for AppMailbox {
             })
             .await
         {
-            error!(?err, "failed to enqueue verify");
+            error!(?err, "failed to enqueue verify request; aborting");
+            std::process::abort();
         }
         receiver
     }
@@ -121,7 +133,8 @@ impl Relay for AppMailbox {
 
     async fn broadcast(&mut self, payload: Self::Digest) {
         if let Err(err) = self.0.tell(Broadcast { payload }).await {
-            error!(?err, "failed to enqueue broadcast");
+            error!(?err, "failed to enqueue broadcast request; aborting");
+            std::process::abort();
         }
     }
 }

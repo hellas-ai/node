@@ -33,10 +33,8 @@ pub struct Coin {
     pub value: u64,
 }
 
-impl EncodeSize for Coin {
-    fn encode_size(&self) -> usize {
-        self.owner.encode_size() + self.value.encode_size()
-    }
+impl FixedSize for Coin {
+    const SIZE: usize = PublicKey::SIZE + u64::SIZE;
 }
 
 impl Write for Coin {

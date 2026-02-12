@@ -8,7 +8,7 @@ use commonware_p2p::{
     utils::codec::{WrappedReceiver, WrappedSender, wrap},
 };
 use commonware_runtime::{Handle, Spawner};
-use futures::{SinkExt, channel::mpsc, lock::Mutex as AsyncMutex};
+use futures::{channel::mpsc, lock::Mutex as AsyncMutex};
 use hellas_types::PublicKey;
 use std::{
     future::Future,
@@ -82,18 +82,19 @@ where
                 }
             };
             let message = wire_message.with_sender(sender);
-            self.dispatch_local(message).await;
+            self.dispatch_local(message);
         }
     }
 
-    async fn dispatch_local(&self, message: ShardMessage) {
-        let channels: Vec<_> = {
-            let subscribers = self.lock_subscribers();
-            subscribers.clone()
-        };
-        for mut ch in channels {
-            if let Err(err) = ch.send(message.clone()).await {
-                error!(?err, "failed to forward shard message to local app");
+    fn dispatch_local(&self, message: ShardMessage) {
+        let mut subscribers = self.lock_subscribers();
+        let mut idx = 0usize;
+        while idx < subscribers.len() {
+            if let Err(err) = subscribers[idx].unbounded_send(message.clone()) {
+                warn!(?err, "dropping dead local shard subscriber");
+                subscribers.swap_remove(idx);
+            } else {
+                idx += 1;
             }
         }
     }
