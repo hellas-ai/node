@@ -1,6 +1,9 @@
-use super::protocol::{ZodaCheckedShard, ZodaCheckingData, ZodaCommitment, ZodaReShard};
+use super::protocol::{
+    BlockKey, ShardMessage, ZodaCheckedShard, ZodaCheckingData, ZodaCommitment, ZodaReShard,
+};
 use commonware_cryptography::sha256::Digest;
 use hellas_types::PublicKey;
+use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone)]
@@ -67,11 +70,479 @@ impl RecoveryState {
     }
 }
 
+pub(crate) struct ReadyToCheckTask {
+    pub(crate) key: BlockKey,
+    pub(crate) commitment: ZodaCommitment,
+    pub(crate) checking_data: ZodaCheckingData,
+    pub(crate) shard_index: u16,
+    pub(crate) shard_hash: Digest,
+    pub(crate) reshard: ZodaReShard,
+}
+
+pub(crate) struct DecodeCandidate {
+    pub(crate) commitment: ZodaCommitment,
+    pub(crate) checking_data: ZodaCheckingData,
+    pub(crate) checked_shards: Vec<ZodaCheckedShard>,
+}
+
+pub(crate) enum RecoveryInput {
+    NoteKnownKey {
+        key: BlockKey,
+        leader: PublicKey,
+        max_known_keys: usize,
+    },
+    IngressMessage {
+        message: Box<ShardMessage>,
+        max_pre_leader_messages: usize,
+        max_pre_leader_keys: usize,
+    },
+    ObserveInitial {
+        key: BlockKey,
+        sender: PublicKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        leader: PublicKey,
+        max_recovery_entries: usize,
+    },
+    ApplyInitialValidated {
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        checking_data: ZodaCheckingData,
+        checked_shard: ZodaCheckedShard,
+    },
+    ObserveReShare {
+        key: BlockKey,
+        sender: PublicKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        reshard: ZodaReShard,
+        leader: PublicKey,
+        max_recovery_entries: usize,
+        max_buffered_reshards: usize,
+    },
+    ApplyCheckedReShare {
+        key: BlockKey,
+        shard_index: u16,
+        shard_hash: Digest,
+        checked_shard: ZodaCheckedShard,
+    },
+    TryTakeDecode {
+        key: BlockKey,
+        minimum_shards: u16,
+    },
+}
+
+pub(crate) enum RecoveryOutput {
+    IngressReady {
+        message: Box<ShardMessage>,
+        expected_leader: PublicKey,
+    },
+    BufferedPreLeader,
+    DrainedPreLeader(Vec<ShardMessage>),
+    Evicted {
+        key: BlockKey,
+    },
+    KnownKeysOverflow {
+        known_keys: usize,
+        max_known_keys: usize,
+    },
+    InitialAccepted,
+    ReShareBuffered,
+    ReadyToCheck(ReadyToCheckTask),
+    ReadyToDecode(DecodeCandidate),
+    CommitmentMismatch {
+        key: BlockKey,
+        shard_index: u16,
+        sender: PublicKey,
+        source: &'static str,
+    },
+    DuplicateShard,
+    Equivocation {
+        key: BlockKey,
+        shard_index: u16,
+        sender: PublicKey,
+        source: &'static str,
+    },
+}
+
+pub(crate) struct RecoveryMachine {
+    recovery: IndexMap<BlockKey, RecoveryState>,
+    known_leaders: IndexMap<BlockKey, PublicKey>,
+    pre_leader_buffer: IndexMap<BlockKey, VecDeque<ShardMessage>>,
+}
+
+impl RecoveryMachine {
+    pub(crate) fn new() -> Self {
+        Self {
+            recovery: IndexMap::new(),
+            known_leaders: IndexMap::new(),
+            pre_leader_buffer: IndexMap::new(),
+        }
+    }
+
+    pub(crate) fn step(&mut self, input: RecoveryInput) -> Vec<RecoveryOutput> {
+        match input {
+            RecoveryInput::NoteKnownKey {
+                key,
+                leader,
+                max_known_keys,
+            } => {
+                self.known_leaders.insert(key, leader);
+                let mut outputs = Vec::new();
+                if let Some(drained) = self.pre_leader_buffer.shift_remove(&key) {
+                    outputs.push(RecoveryOutput::DrainedPreLeader(
+                        drained.into_iter().collect(),
+                    ));
+                }
+                self.evict_known_keys(max_known_keys);
+                if self.known_leaders.len() > max_known_keys {
+                    outputs.push(RecoveryOutput::KnownKeysOverflow {
+                        known_keys: self.known_leaders.len(),
+                        max_known_keys,
+                    });
+                }
+                outputs
+            }
+            RecoveryInput::IngressMessage {
+                message,
+                max_pre_leader_messages,
+                max_pre_leader_keys,
+            } => {
+                let message = *message;
+                let key = message.key();
+                if !self.has_known_or_recovery(&key) {
+                    self.buffer_pre_leader_message(
+                        key,
+                        message,
+                        max_pre_leader_messages,
+                        max_pre_leader_keys,
+                    );
+                    return vec![RecoveryOutput::BufferedPreLeader];
+                }
+
+                let Some(expected_leader) = self.expected_leader(key) else {
+                    self.buffer_pre_leader_message(
+                        key,
+                        message,
+                        max_pre_leader_messages,
+                        max_pre_leader_keys,
+                    );
+                    return vec![RecoveryOutput::BufferedPreLeader];
+                };
+
+                vec![RecoveryOutput::IngressReady {
+                    message: Box::new(message),
+                    expected_leader,
+                }]
+            }
+            RecoveryInput::ObserveInitial {
+                key,
+                sender,
+                commitment,
+                shard_index,
+                shard_hash,
+                leader,
+                max_recovery_entries,
+            } => {
+                let mut outputs =
+                    self.ensure_recovery_state(key, commitment, leader, max_recovery_entries);
+                let Some(recovery) = self.recovery.get_mut(&key) else {
+                    return outputs;
+                };
+
+                if recovery.commitment != commitment {
+                    if recovery.checking_data.is_none() && recovery.checked_shards.is_empty() {
+                        recovery.commitment = commitment;
+                    } else {
+                        outputs.push(RecoveryOutput::CommitmentMismatch {
+                            key,
+                            shard_index,
+                            sender,
+                            source: "initial",
+                        });
+                        return outputs;
+                    }
+                }
+
+                match recovery.shard_status(shard_index, shard_hash) {
+                    DuplicateStatus::New => outputs.push(RecoveryOutput::InitialAccepted),
+                    DuplicateStatus::Duplicate => outputs.push(RecoveryOutput::DuplicateShard),
+                    DuplicateStatus::Equivocation => outputs.push(RecoveryOutput::Equivocation {
+                        key,
+                        shard_index,
+                        sender,
+                        source: "initial",
+                    }),
+                }
+
+                outputs
+            }
+            RecoveryInput::ApplyInitialValidated {
+                key,
+                commitment,
+                shard_index,
+                shard_hash,
+                checking_data,
+                checked_shard,
+            } => {
+                let Some(recovery) = self.recovery.get_mut(&key) else {
+                    return Vec::new();
+                };
+
+                let leader = recovery.leader.clone();
+                if recovery.commitment != commitment {
+                    return vec![RecoveryOutput::CommitmentMismatch {
+                        key,
+                        shard_index,
+                        sender: leader,
+                        source: "initial",
+                    }];
+                }
+
+                recovery.record_shard(shard_index, shard_hash);
+                recovery.checking_data = Some(checking_data.clone());
+                recovery.checked_shards.push(checked_shard);
+
+                let commitment = recovery.commitment;
+                let buffered = recovery.take_buffered_reshards();
+                let mut outputs = Vec::new();
+                for buffered in buffered {
+                    match recovery.shard_status(buffered.shard_index, buffered.shard_hash) {
+                        DuplicateStatus::New => {
+                            outputs.push(RecoveryOutput::ReadyToCheck(ReadyToCheckTask {
+                                key,
+                                commitment,
+                                checking_data: checking_data.clone(),
+                                shard_index: buffered.shard_index,
+                                shard_hash: buffered.shard_hash,
+                                reshard: buffered.reshard,
+                            }))
+                        }
+                        DuplicateStatus::Duplicate => outputs.push(RecoveryOutput::DuplicateShard),
+                        DuplicateStatus::Equivocation => {
+                            outputs.push(RecoveryOutput::Equivocation {
+                                key,
+                                shard_index: buffered.shard_index,
+                                sender: buffered.sender,
+                                source: "buffered_reshare",
+                            })
+                        }
+                    }
+                }
+                outputs
+            }
+            RecoveryInput::ObserveReShare {
+                key,
+                sender,
+                commitment,
+                shard_index,
+                shard_hash,
+                reshard,
+                leader,
+                max_recovery_entries,
+                max_buffered_reshards,
+            } => {
+                let mut outputs =
+                    self.ensure_recovery_state(key, commitment, leader, max_recovery_entries);
+                let Some(recovery) = self.recovery.get_mut(&key) else {
+                    return outputs;
+                };
+
+                if recovery.commitment != commitment {
+                    outputs.push(RecoveryOutput::CommitmentMismatch {
+                        key,
+                        shard_index,
+                        sender,
+                        source: "reshare",
+                    });
+                    return outputs;
+                }
+
+                match recovery.shard_status(shard_index, shard_hash) {
+                    DuplicateStatus::Duplicate => outputs.push(RecoveryOutput::DuplicateShard),
+                    DuplicateStatus::Equivocation => {
+                        outputs.push(RecoveryOutput::Equivocation {
+                            key,
+                            shard_index,
+                            sender,
+                            source: "reshare",
+                        });
+                    }
+                    DuplicateStatus::New => {
+                        if let Some(checking_data) = recovery.checking_data.clone() {
+                            outputs.push(RecoveryOutput::ReadyToCheck(ReadyToCheckTask {
+                                key,
+                                commitment,
+                                checking_data,
+                                shard_index,
+                                shard_hash,
+                                reshard,
+                            }));
+                        } else {
+                            recovery.buffer_reshare(
+                                BufferedReShare {
+                                    sender,
+                                    shard_index,
+                                    reshard,
+                                    shard_hash,
+                                },
+                                max_buffered_reshards,
+                            );
+                            outputs.push(RecoveryOutput::ReShareBuffered);
+                        }
+                    }
+                }
+
+                outputs
+            }
+            RecoveryInput::ApplyCheckedReShare {
+                key,
+                shard_index,
+                shard_hash,
+                checked_shard,
+            } => {
+                let Some(recovery) = self.recovery.get_mut(&key) else {
+                    return Vec::new();
+                };
+                if matches!(
+                    recovery.shard_status(shard_index, shard_hash),
+                    DuplicateStatus::New
+                ) {
+                    recovery.record_shard(shard_index, shard_hash);
+                    recovery.checked_shards.push(checked_shard);
+                }
+                Vec::new()
+            }
+            RecoveryInput::TryTakeDecode {
+                key,
+                minimum_shards,
+            } => {
+                let decode_ready = self.recovery.get(&key).is_some_and(|recovery| {
+                    recovery.has_minimum_shards(minimum_shards) && recovery.checking_data.is_some()
+                });
+                if !decode_ready {
+                    return Vec::new();
+                }
+
+                let Some(mut recovery) = self.recovery.shift_remove(&key) else {
+                    return Vec::new();
+                };
+                let Some(checking_data) = recovery.checking_data.take() else {
+                    self.recovery.insert(key, recovery);
+                    return Vec::new();
+                };
+
+                self.pre_leader_buffer.shift_remove(&key);
+                self.known_leaders.shift_remove(&key);
+                vec![RecoveryOutput::ReadyToDecode(DecodeCandidate {
+                    commitment: recovery.commitment,
+                    checking_data,
+                    checked_shards: recovery.checked_shards,
+                })]
+            }
+        }
+    }
+
+    fn has_known_or_recovery(&self, key: &BlockKey) -> bool {
+        self.known_leaders.contains_key(key) || self.recovery.contains_key(key)
+    }
+
+    fn expected_leader(&self, key: BlockKey) -> Option<PublicKey> {
+        self.known_leaders.get(&key).cloned().or_else(|| {
+            self.recovery
+                .get(&key)
+                .map(|recovery| recovery.leader.clone())
+        })
+    }
+
+    fn ensure_recovery_state(
+        &mut self,
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        leader: PublicKey,
+        max_recovery_entries: usize,
+    ) -> Vec<RecoveryOutput> {
+        if self.recovery.contains_key(&key) {
+            return Vec::new();
+        }
+
+        let mut outputs = Vec::new();
+        while self.recovery.len() >= max_recovery_entries {
+            let Some((oldest, _state)) = self.recovery.shift_remove_index(0) else {
+                break;
+            };
+            self.pre_leader_buffer.shift_remove(&oldest);
+            self.known_leaders.shift_remove(&oldest);
+            outputs.push(RecoveryOutput::Evicted { key: oldest });
+        }
+
+        self.recovery
+            .insert(key, RecoveryState::new(commitment, leader));
+        outputs
+    }
+
+    fn buffer_pre_leader_message(
+        &mut self,
+        key: BlockKey,
+        message: ShardMessage,
+        max_pre_leader_messages: usize,
+        max_pre_leader_keys: usize,
+    ) {
+        let queue = self.pre_leader_buffer.entry(key).or_default();
+        if queue.len() >= max_pre_leader_messages {
+            queue.pop_front();
+        }
+        queue.push_back(message);
+
+        while self.pre_leader_buffer.len() > max_pre_leader_keys {
+            let Some((_oldest, _queue)) = self.pre_leader_buffer.shift_remove_index(0) else {
+                break;
+            };
+        }
+    }
+
+    fn evict_known_keys(&mut self, max_known_keys: usize) {
+        while self.known_leaders.len() > max_known_keys {
+            let eviction_index = self
+                .known_leaders
+                .iter()
+                .position(|(candidate, _)| !self.recovery.contains_key(candidate));
+            let Some(eviction_index) = eviction_index else {
+                break;
+            };
+            let Some((oldest, _leader)) = self.known_leaders.shift_remove_index(eviction_index)
+            else {
+                break;
+            };
+            self.pre_leader_buffer.shift_remove(&oldest);
+        }
+    }
+}
+
+#[cfg(test)]
+impl RecoveryMachine {
+    pub(crate) fn inspect<R>(
+        &self,
+        f: impl FnOnce(
+            &IndexMap<BlockKey, RecoveryState>,
+            &IndexMap<BlockKey, PublicKey>,
+            &IndexMap<BlockKey, VecDeque<ShardMessage>>,
+        ) -> R,
+    ) -> R {
+        f(&self.recovery, &self.known_leaders, &self.pre_leader_buffer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shard::protocol::{CodingImpl, coding_config, hash_encoded};
     use commonware_coding::Scheme as CodingScheme;
+    use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
     use commonware_parallel::Sequential;
     use proptest::prelude::*;
@@ -84,9 +555,12 @@ mod tests {
         commitment
     }
 
-    fn sample_buffered_reshare(seed: u64, shard_index: u16) -> BufferedReShare {
+    fn sample_reshare(
+        seed: u64,
+        shard_index: u16,
+    ) -> (ZodaCommitment, ZodaReShard, Digest, PublicKey) {
         let config = coding_config(6);
-        let payload = vec![u8::try_from(seed % 255).unwrap_or(0); 128];
+        let payload = vec![u8::try_from(seed % 251).unwrap_or(0); 96];
         let (commitment, shards) =
             CodingImpl::encode(&config, payload.as_slice(), &Sequential).expect("encode");
         let (_, _, reshard) = CodingImpl::reshard(
@@ -96,46 +570,256 @@ mod tests {
             shards[usize::from(shard_index)].clone(),
         )
         .expect("reshard");
-        BufferedReShare {
-            sender: ed25519::PrivateKey::from_seed(seed).public_key(),
-            shard_index,
-            shard_hash: hash_encoded(&reshard),
-            reshard,
-        }
+        let shard_hash = hash_encoded(&reshard);
+        let sender = ed25519::PrivateKey::from_seed(seed.saturating_add(1000)).public_key();
+        (commitment, reshard, shard_hash, sender)
+    }
+
+    fn key_for_view(view: u16) -> BlockKey {
+        BlockKey::new(
+            Round::new(Epoch::new(1), View::new(u64::from(view))),
+            Sha256::hash(&view.to_le_bytes()),
+        )
     }
 
     proptest! {
         #[test]
-        fn shard_status_detects_equivocation_prop(
-            idx in any::<u16>(),
-            first in prop::collection::vec(any::<u8>(), 1..64),
-            second in prop::collection::vec(any::<u8>(), 1..64),
+        fn recovery_machine_step_preserves_bounds(
+            events in prop::collection::vec((0u8..3u8, any::<u16>(), any::<u64>(), 0u16..6u16), 1..120)
         ) {
-            prop_assume!(first != second);
-            let leader = ed25519::PrivateKey::from_seed(7).public_key();
-            let mut recovery = RecoveryState::new(sample_commitment(), leader);
-            let first_hash = Sha256::hash(first.as_slice());
-            let second_hash = Sha256::hash(second.as_slice());
+            const MAX_PRE_LEADER_MESSAGES: usize = 4;
+            const MAX_PRE_LEADER_KEYS: usize = 6;
+            const MAX_KNOWN_KEYS: usize = 8;
+            const MAX_RECOVERY_ENTRIES: usize = 5;
+            const MAX_BUFFERED_RESHARDS: usize = 3;
 
-            prop_assert_eq!(recovery.shard_status(idx, first_hash), DuplicateStatus::New);
-            recovery.record_shard(idx, first_hash);
-            prop_assert_eq!(recovery.shard_status(idx, first_hash), DuplicateStatus::Duplicate);
-            prop_assert_eq!(recovery.shard_status(idx, second_hash), DuplicateStatus::Equivocation);
+            let mut machine = RecoveryMachine::new();
+            let leader = ed25519::PrivateKey::from_seed(42).public_key();
+
+            for (kind, view, seed, shard_index_raw) in events {
+                let key = key_for_view(view);
+                let shard_index = shard_index_raw % 6;
+                let (commitment, reshard, shard_hash, sender) = sample_reshare(seed, shard_index);
+
+                match kind % 3 {
+                    0 => {
+                        let message = ShardMessage::reshare(
+                            &sender,
+                            key,
+                            commitment,
+                            shard_index,
+                            reshard,
+                        );
+                        let _ = machine.step(RecoveryInput::IngressMessage {
+                            message: Box::new(message),
+                            max_pre_leader_messages: MAX_PRE_LEADER_MESSAGES,
+                            max_pre_leader_keys: MAX_PRE_LEADER_KEYS,
+                        });
+                    }
+                    1 => {
+                        let _ = machine.step(RecoveryInput::NoteKnownKey {
+                            key,
+                            leader: leader.clone(),
+                            max_known_keys: MAX_KNOWN_KEYS,
+                        });
+                    }
+                    _ => {
+                        let _ = machine.step(RecoveryInput::ObserveReShare {
+                            key,
+                            sender,
+                            commitment,
+                            shard_index,
+                            shard_hash,
+                            reshard,
+                            leader: leader.clone(),
+                            max_recovery_entries: MAX_RECOVERY_ENTRIES,
+                            max_buffered_reshards: MAX_BUFFERED_RESHARDS,
+                        });
+                    }
+                }
+
+                let (
+                    pre_leader_key_len,
+                    pre_leader_max_messages,
+                    recovery_len,
+                    max_buffered_reshards,
+                    known_len,
+                    known_non_recovery_count,
+                ) = machine.inspect(|recovery, known_leaders, pre_leader_buffer| {
+                    (
+                        pre_leader_buffer.len(),
+                        pre_leader_buffer
+                            .values()
+                            .map(VecDeque::len)
+                            .max()
+                            .unwrap_or(0),
+                        recovery.len(),
+                        recovery
+                            .values()
+                            .map(|recovery| recovery.buffered_reshards.len())
+                            .max()
+                            .unwrap_or(0),
+                        known_leaders.len(),
+                        known_leaders
+                            .iter()
+                            .filter(|(key, _)| !recovery.contains_key(*key))
+                            .count(),
+                    )
+                });
+
+                prop_assert!(pre_leader_key_len <= MAX_PRE_LEADER_KEYS);
+                prop_assert!(pre_leader_max_messages <= MAX_PRE_LEADER_MESSAGES);
+                prop_assert!(recovery_len <= MAX_RECOVERY_ENTRIES);
+                prop_assert!(max_buffered_reshards <= MAX_BUFFERED_RESHARDS);
+                if known_len > MAX_KNOWN_KEYS {
+                    prop_assert_eq!(known_non_recovery_count, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn buffer_reshare_keeps_latest_entries(
+            max_buffered in 1usize..6usize,
+            entries in prop::collection::vec((any::<u64>(), 0u16..6u16), 1..40),
+        ) {
+            let leader = ed25519::PrivateKey::from_seed(11).public_key();
+            let mut recovery = RecoveryState::new(sample_commitment(), leader);
+            let (_template_commitment, template_reshard, _template_hash, _template_sender) =
+                sample_reshare(7, 0);
+            let mut expected = VecDeque::new();
+
+            for (seed, shard_index) in entries {
+                let shard_hash = Sha256::hash(&seed.to_le_bytes());
+                recovery.buffer_reshare(
+                    BufferedReShare {
+                        sender: ed25519::PrivateKey::from_seed(seed).public_key(),
+                        shard_index,
+                        reshard: template_reshard.clone(),
+                        shard_hash,
+                    },
+                    max_buffered,
+                );
+
+                if expected.len() >= max_buffered {
+                    expected.pop_front();
+                }
+                expected.push_back((shard_index, shard_hash));
+            }
+
+            let buffered = recovery.take_buffered_reshards();
+            prop_assert_eq!(buffered.len(), expected.len());
+            for (actual, (expected_index, expected_hash)) in buffered.iter().zip(expected.iter()) {
+                prop_assert_eq!(actual.shard_index, *expected_index);
+                prop_assert_eq!(actual.shard_hash, *expected_hash);
+            }
         }
     }
 
     #[test]
-    fn buffer_reshare_drops_oldest_when_capacity_is_hit() {
-        let leader = ed25519::PrivateKey::from_seed(11).public_key();
-        let mut recovery = RecoveryState::new(sample_commitment(), leader);
+    fn duplicate_checked_reshare_does_not_count_toward_decode_threshold() {
+        let validators = 11u16;
+        let config = coding_config(validators);
+        assert_eq!(config.minimum_shards, 3);
 
-        recovery.buffer_reshare(sample_buffered_reshare(1, 0), 2);
-        recovery.buffer_reshare(sample_buffered_reshare(2, 1), 2);
-        recovery.buffer_reshare(sample_buffered_reshare(3, 2), 2);
+        let payload = b"duplicate-checked-reshare-regression";
+        let (commitment, shards) = CodingImpl::encode(&config, payload.as_slice(), &Sequential)
+            .expect("encode should succeed");
+        let key = BlockKey::new(
+            Round::new(Epoch::new(7), View::new(1)),
+            Sha256::hash(payload),
+        );
 
-        let buffered = recovery.take_buffered_reshards();
-        assert_eq!(buffered.len(), 2);
-        assert_eq!(buffered[0].shard_index, 1);
-        assert_eq!(buffered[1].shard_index, 2);
+        let leader = ed25519::PrivateKey::from_seed(1).public_key();
+        let helper = ed25519::PrivateKey::from_seed(2).public_key();
+        let my_index = 1u16;
+        let helper_index = 2u16;
+
+        let mut machine = RecoveryMachine::new();
+        let initial_hash = hash_encoded(&shards[usize::from(my_index)]);
+        let outputs = machine.step(RecoveryInput::ObserveInitial {
+            key,
+            sender: leader.clone(),
+            commitment,
+            shard_index: my_index,
+            shard_hash: initial_hash,
+            leader: leader.clone(),
+            max_recovery_entries: 64,
+        });
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, RecoveryOutput::InitialAccepted))
+        );
+
+        let (checking_data, checked_shard, _reshard) = CodingImpl::reshard(
+            &config,
+            &commitment,
+            my_index,
+            shards[usize::from(my_index)].clone(),
+        )
+        .expect("reshard for initial");
+        let _ = machine.step(RecoveryInput::ApplyInitialValidated {
+            key,
+            commitment,
+            shard_index: my_index,
+            shard_hash: initial_hash,
+            checking_data: checking_data.clone(),
+            checked_shard,
+        });
+
+        let (_, _, helper_reshard) = CodingImpl::reshard(
+            &config,
+            &commitment,
+            helper_index,
+            shards[usize::from(helper_index)].clone(),
+        )
+        .expect("reshard for helper");
+        let helper_hash = hash_encoded(&helper_reshard);
+        for _ in 0..2 {
+            let outputs = machine.step(RecoveryInput::ObserveReShare {
+                key,
+                sender: helper.clone(),
+                commitment,
+                shard_index: helper_index,
+                shard_hash: helper_hash,
+                reshard: helper_reshard.clone(),
+                leader: leader.clone(),
+                max_recovery_entries: 64,
+                max_buffered_reshards: 32,
+            });
+            assert!(
+                outputs
+                    .iter()
+                    .any(|output| matches!(output, RecoveryOutput::ReadyToCheck(_)))
+            );
+        }
+
+        for _ in 0..2 {
+            let helper_checked = CodingImpl::check(
+                &config,
+                &commitment,
+                &checking_data,
+                helper_index,
+                helper_reshard.clone(),
+            )
+            .expect("helper check should succeed");
+            let _ = machine.step(RecoveryInput::ApplyCheckedReShare {
+                key,
+                shard_index: helper_index,
+                shard_hash: helper_hash,
+                checked_shard: helper_checked,
+            });
+        }
+
+        let outputs = machine.step(RecoveryInput::TryTakeDecode {
+            key,
+            minimum_shards: config.minimum_shards,
+        });
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, RecoveryOutput::ReadyToDecode(_))),
+            "duplicate checked reshare must not satisfy decode threshold",
+        );
     }
 }

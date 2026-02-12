@@ -44,11 +44,6 @@ impl PayloadBook {
         }
     }
 
-    #[cfg(test)]
-    fn contains_seen(&self, digest: Digest) -> bool {
-        self.seen.contains_key(&digest)
-    }
-
     fn seen(&self, digest: Digest) -> Option<&Bytes> {
         self.seen.get(&digest)
     }
@@ -759,7 +754,7 @@ mod tests {
             assert_eq!(core.finalized.latest_finalized(), Some(canonical));
             assert!(core.speculative_store.contains_execution(canonical));
             assert!(!core.speculative_store.contains_execution(fork));
-            assert!(!core.payloads.contains_seen(fork));
+            assert!(!core.payloads.seen.contains_key(&fork));
         });
     }
 }

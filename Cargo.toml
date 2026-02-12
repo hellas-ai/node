@@ -4,49 +4,49 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "validator"
+path = "src/bin/validator.rs"
+
 [features]
 default = []
 perf-harness = []
 loom-tests = ["dep:loom"]
 
 [dependencies]
-hellas-types = { workspace = true }
-commonware-codec = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
 commonware-actor = { workspace = true }
+commonware-codec = { workspace = true }
 commonware-coding = { workspace = true }
-commonware-consensus = { workspace = true, features = ["mocks"] }
-commonware-cryptography = { workspace = true, features = ["mocks"] }
+commonware-consensus = { workspace = true }
+commonware-cryptography = { workspace = true }
 commonware-macros = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-parallel = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
-bytes = { workspace = true }
-rand = { workspace = true }
-rand_core = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
-prometheus-client = { workspace = true }
-serde = { workspace = true }
-toml = { workspace = true }
-hex = { workspace = true }
 dirs = { workspace = true }
-clap = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
+futures = { workspace = true }
+hellas-types = { workspace = true }
+hex = { workspace = true }
 indexmap = { workspace = true }
 loom = { version = "0.7", optional = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 
 [dev-dependencies]
-commonware-consensus = { workspace = true, features = ["fuzz"] }
+commonware-consensus = { workspace = true, features = ["fuzz", "mocks"] }
+commonware-cryptography = { workspace = true, features = ["mocks"] }
+criterion = "0.8"
 proptest = "1.6"
-criterion = "0.5"
-
-[[bin]]
-name = "validator"
-path = "src/bin/validator.rs"
 
 [[bench]]
 name = "shard_perf"

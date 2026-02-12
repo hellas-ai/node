@@ -32,12 +32,6 @@ impl SpeculativeExecutionStore {
         self.diffs.remove(&digest)
     }
 
-    #[cfg(test)]
-    pub fn insert_state(&mut self, digest: Digest, parent: Digest, state: ObjectState) {
-        self.executions.insert(digest, state);
-        self.parent_by_digest.insert(digest, parent);
-    }
-
     pub(crate) fn insert_state_with_diffs(
         &mut self,
         digest: Digest,
@@ -179,7 +173,10 @@ mod tests {
         let block_a = Digest::from([2; 32]);
         let block_b = Digest::from([3; 32]);
 
-        store.insert_state(genesis, Digest::from([0; 32]), genesis_state);
+        store.executions.insert(genesis, genesis_state);
+        store
+            .parent_by_digest
+            .insert(genesis, Digest::from([0; 32]));
         let decode = |digest: Digest| -> Option<(Digest, Vec<Transaction>)> {
             if digest == block_a {
                 Some((genesis, vec![]))
@@ -203,7 +200,10 @@ mod tests {
         let canonical = Digest::from([2; 32]);
         let fork = Digest::from([9; 32]);
 
-        store.insert_state(genesis, Digest::from([0; 32]), genesis_state);
+        store.executions.insert(genesis, genesis_state);
+        store
+            .parent_by_digest
+            .insert(genesis, Digest::from([0; 32]));
         let decode = |digest: Digest| -> Option<(Digest, Vec<Transaction>)> {
             if digest == canonical || digest == fork {
                 Some((genesis, vec![]))
