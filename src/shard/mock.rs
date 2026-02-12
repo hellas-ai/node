@@ -6,7 +6,6 @@ use super::validators::{DistributionError, ValidatorSet};
 use futures::SinkExt;
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
-use std::future::Future;
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard},
@@ -71,55 +70,54 @@ impl ShardTransport for MockShardTransport {
         self.validators.index(public_key)
     }
 
-    fn broadcast_except<'a>(
-        &'a self,
-        sender: &'a PublicKey,
-        message: ShardMessage,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let targets: Vec<_> = {
-                let recipients = self.lock_recipients();
-                recipients
-                    .keys()
-                    .filter(|pk| *pk != sender)
-                    .cloned()
-                    .collect()
-            };
-            for target in targets {
-                self.send_to(&target, message.clone()).await;
-            }
+    async fn broadcast_except(&self, sender: &PublicKey, message: ShardMessage) {
+        let targets: Vec<_> = {
+            let recipients = self.lock_recipients();
+            recipients
+                .keys()
+                .filter(|pk| *pk != sender)
+                .cloned()
+                .collect()
+        };
+        for target in targets {
+            self.send_to(&target, message.clone()).await;
         }
     }
 
-    fn distribute_shards<'a>(
-        &'a self,
-        proposer: &'a PublicKey,
+    async fn distribute_shards(
+        &self,
+        proposer: &PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            let assignments = match self.validators.assign_shards(proposer, shards) {
-                Ok(assignments) => assignments,
-                Err(DistributionError::CountMismatch { shards, validators }) => {
-                    warn!(
-                        digest = ?key.digest,
-                        shards,
-                        validators,
-                        "shard count does not match validator count"
-                    );
-                    return;
-                }
-                Err(DistributionError::IndexTooLarge { index }) => {
-                    warn!(digest = ?key.digest, index, "validator index too large");
-                    return;
-                }
-            };
-
-            for (target, shard_index, shard) in assignments {
-                let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
-                self.send_to(&target, message).await;
+    ) {
+        let assignments = match self.validators.assign_shards(proposer, shards) {
+            Ok(assignments) => assignments,
+            Err(DistributionError::CountMismatch { shards, validators }) => {
+                warn!(
+                    digest = ?key.digest,
+                    shards,
+                    validators,
+                    "shard count does not match validator count"
+                );
+                return;
             }
+            Err(DistributionError::IndexTooLarge { index }) => {
+                warn!(digest = ?key.digest, index, "validator index too large");
+                return;
+            }
+            Err(DistributionError::NotFinalized) => {
+                warn!(
+                    digest = ?key.digest,
+                    "attempted shard distribution before validator finalization"
+                );
+                return;
+            }
+        };
+
+        for (target, shard_index, shard) in assignments {
+            let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
+            self.send_to(&target, message).await;
         }
     }
 }

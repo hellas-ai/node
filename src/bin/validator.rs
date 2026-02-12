@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::{Manager, authenticated::lookup};
+use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_runtime::{Metrics, Quota, Runner, tokio};
 use hellas_chain::TraceReporter;
 use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_private_key};
@@ -189,8 +189,10 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let (mut network, mut oracle) =
             lookup::Network::new(context.with_label("network"), p2p_cfg);
 
-        // Register all validators with the oracle
-        oracle.update(0, peer_map).await;
+        // Register all validators with the oracle, then allow address refreshes
+        // without introducing a new peer-set epoch.
+        oracle.track(0, peer_map.clone()).await;
+        oracle.overwrite(peer_map).await;
 
         // Register consensus and shard channels.
         let quota = Quota::per_second(NonZeroU32::MAX);

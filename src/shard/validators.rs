@@ -1,8 +1,5 @@
 use hellas_types::PublicKey;
-use std::sync::{
-    Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,48 +8,73 @@ pub(crate) enum DistributionError {
     CountMismatch { shards: usize, validators: usize },
     #[error("validator index too large: {index}")]
     IndexTooLarge { index: usize },
+    #[error("validator set not finalized")]
+    NotFinalized,
+}
+
+enum ValidatorPhase {
+    Collecting(Vec<PublicKey>),
+    Finalized(Vec<PublicKey>),
+}
+
+impl ValidatorPhase {
+    fn validators(&self) -> &Vec<PublicKey> {
+        match self {
+            Self::Collecting(validators) | Self::Finalized(validators) => validators,
+        }
+    }
+
+    fn finalized(&self) -> Option<&Vec<PublicKey>> {
+        match self {
+            Self::Finalized(validators) => Some(validators),
+            Self::Collecting(_) => None,
+        }
+    }
 }
 
 pub(crate) struct ValidatorSet {
-    validators: Mutex<Vec<PublicKey>>,
-    finalized: AtomicBool,
+    phase: Mutex<ValidatorPhase>,
 }
 
 impl ValidatorSet {
     pub(crate) fn new() -> Self {
         Self {
-            validators: Mutex::new(Vec::new()),
-            finalized: AtomicBool::new(false),
+            phase: Mutex::new(ValidatorPhase::Collecting(Vec::new())),
         }
     }
 
     pub(crate) fn declare(&self, public_key: &PublicKey) {
-        // Check finalization after taking the lock to avoid a declare/finalize
-        // race that could append unsorted entries after finalization.
-        let mut validators = self.lock_validators();
-        if self.finalized.load(Ordering::Acquire) {
-            warn!("attempted to declare validator after finalization; ignoring");
-            return;
-        }
-        if !validators.contains(public_key) {
-            validators.push(public_key.clone());
+        let mut phase = self.lock_phase();
+        match &mut *phase {
+            ValidatorPhase::Collecting(validators) => {
+                if !validators.contains(public_key) {
+                    validators.push(public_key.clone());
+                }
+            }
+            ValidatorPhase::Finalized(_) => {
+                warn!("attempted to declare validator after finalization; ignoring");
+            }
         }
     }
 
     pub(crate) fn finalize(&self) {
-        let mut validators = self.lock_validators();
+        let mut phase = self.lock_phase();
+        let ValidatorPhase::Collecting(validators) = &mut *phase else {
+            return;
+        };
         validators.sort();
         validators.dedup();
-        self.finalized.store(true, Ordering::Release);
+        let finalized = std::mem::take(validators);
+        *phase = ValidatorPhase::Finalized(finalized);
     }
 
     pub(crate) fn count(&self) -> u16 {
-        let validators = self.lock_validators();
-        match u16::try_from(validators.len()) {
+        let phase = self.lock_phase();
+        match u16::try_from(phase.validators().len()) {
             Ok(count) => count,
             Err(_) => {
                 warn!(
-                    validator_count = validators.len(),
+                    validator_count = phase.validators().len(),
                     "validator count overflowed u16; saturating to u16::MAX"
                 );
                 u16::MAX
@@ -61,10 +83,8 @@ impl ValidatorSet {
     }
 
     pub(crate) fn index(&self, public_key: &PublicKey) -> Option<u16> {
-        if !self.finalized.load(Ordering::Acquire) {
-            return None;
-        }
-        let validators = self.lock_validators();
+        let phase = self.lock_phase();
+        let validators = phase.finalized()?;
         validators
             .binary_search(public_key)
             .ok()
@@ -72,7 +92,11 @@ impl ValidatorSet {
     }
 
     pub(crate) fn others(&self, excluded: &PublicKey) -> Vec<PublicKey> {
-        let validators = self.lock_validators();
+        let phase = self.lock_phase();
+        let Some(validators) = phase.finalized() else {
+            warn!("attempted to list peers before validator finalization");
+            return Vec::new();
+        };
         validators
             .iter()
             .filter(|pk| *pk != excluded)
@@ -85,7 +109,13 @@ impl ValidatorSet {
         proposer: &PublicKey,
         shards: Vec<T>,
     ) -> Result<Vec<(PublicKey, u16, T)>, DistributionError> {
-        let validators = self.lock_validators().clone();
+        let validators = {
+            let phase = self.lock_phase();
+            match &*phase {
+                ValidatorPhase::Finalized(validators) => validators.clone(),
+                ValidatorPhase::Collecting(_) => return Err(DistributionError::NotFinalized),
+            }
+        };
         if shards.len() != validators.len() {
             return Err(DistributionError::CountMismatch {
                 shards: shards.len(),
@@ -107,8 +137,8 @@ impl ValidatorSet {
         Ok(assignments)
     }
 
-    fn lock_validators(&self) -> MutexGuard<'_, Vec<PublicKey>> {
-        match self.validators.lock() {
+    fn lock_phase(&self) -> MutexGuard<'_, ValidatorPhase> {
+        match self.phase.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 warn!("validator set lock poisoned; continuing with inner state");
@@ -184,59 +214,78 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn assign_shards_requires_finalized_validators() {
+        let set = ValidatorSet::new();
+        let proposer = ed25519::PrivateKey::from_seed(1).public_key();
+        set.declare(&proposer);
+
+        let err = set
+            .assign_shards(&proposer, vec![1u8])
+            .expect_err("assignment should fail before finalize");
+        assert!(matches!(err, DistributionError::NotFinalized));
+    }
 }
 
 #[cfg(all(test, feature = "loom-tests"))]
 mod loom_tests {
-    use loom::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
+    use loom::sync::{Arc, Mutex};
     use loom::thread;
 
+    enum LoomValidatorPhase {
+        Collecting(Vec<u8>),
+        Finalized(Vec<u8>),
+    }
+
     struct LoomValidatorSet {
-        validators: Mutex<Vec<u8>>,
-        finalized: AtomicBool,
+        phase: Mutex<LoomValidatorPhase>,
     }
 
     impl LoomValidatorSet {
         fn new() -> Self {
             Self {
-                validators: Mutex::new(Vec::new()),
-                finalized: AtomicBool::new(false),
+                phase: Mutex::new(LoomValidatorPhase::Collecting(Vec::new())),
             }
         }
 
         fn declare(&self, public_key: &u8) {
-            let mut validators = self.validators.lock().expect("lock should succeed");
-            if self.finalized.load(Ordering::Acquire) {
-                return;
-            }
-            if !validators.contains(public_key) {
-                validators.push(public_key.clone());
+            let mut phase = self.phase.lock().expect("lock should succeed");
+            match &mut *phase {
+                LoomValidatorPhase::Collecting(validators) => {
+                    if !validators.contains(public_key) {
+                        validators.push(*public_key);
+                    }
+                }
+                LoomValidatorPhase::Finalized(_) => {}
             }
         }
 
         fn finalize(&self) {
-            let mut validators = self.validators.lock().expect("lock should succeed");
+            let mut phase = self.phase.lock().expect("lock should succeed");
+            let LoomValidatorPhase::Collecting(validators) = &mut *phase else {
+                return;
+            };
             validators.sort();
             validators.dedup();
-            self.finalized.store(true, Ordering::Release);
+            let finalized = std::mem::take(validators);
+            *phase = LoomValidatorPhase::Finalized(finalized);
         }
 
         fn count(&self) -> usize {
-            self.validators.lock().expect("lock should succeed").len()
+            let phase = self.phase.lock().expect("lock should succeed");
+            match &*phase {
+                LoomValidatorPhase::Collecting(validators)
+                | LoomValidatorPhase::Finalized(validators) => validators.len(),
+            }
         }
 
         fn index(&self, public_key: &u8) -> Option<usize> {
-            if !self.finalized.load(Ordering::Acquire) {
+            let phase = self.phase.lock().expect("lock should succeed");
+            let LoomValidatorPhase::Finalized(validators) = &*phase else {
                 return None;
-            }
-            self.validators
-                .lock()
-                .expect("lock should succeed")
-                .binary_search(public_key)
-                .ok()
+            };
+            validators.binary_search(public_key).ok()
         }
     }
 
@@ -283,7 +332,7 @@ mod loom_tests {
             join_finalize.join().expect("finalize should join");
             join_c.join().expect("declare c should join");
 
-            // Ensure visibility for index() checks even when finalize raced.
+            // Ensure we end in finalized phase for index() checks.
             set.finalize();
 
             let count = set.count();

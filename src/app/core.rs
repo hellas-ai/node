@@ -16,7 +16,7 @@ use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::sha256::Digest;
 use commonware_parallel::Rayon;
-use futures::channel::oneshot;
+use commonware_utils::channel::oneshot;
 use hellas_types::{Context, PublicKey};
 use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, VecDeque};
@@ -135,7 +135,7 @@ pub(super) enum CoreEffect {
         valid: bool,
     },
     Coin {
-        response: tokio::sync::oneshot::Sender<Option<Coin>>,
+        response: oneshot::Sender<Option<Coin>>,
         coin: Option<Coin>,
     },
 }
@@ -265,6 +265,13 @@ impl AppCore {
                 effects
                     .replies
                     .push_back(CoreEffect::Coin { response, coin });
+            }
+            AppMailboxReadWriteMessage::GetStateRoot { .. }
+            | AppMailboxReadWriteMessage::GetProof { .. }
+            | AppMailboxReadWriteMessage::RetryPersistence => {
+                unreachable!(
+                    "application should intercept non-core ingress before AppCore::on_message"
+                );
             }
         }
         effects

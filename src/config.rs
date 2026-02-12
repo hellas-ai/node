@@ -4,7 +4,7 @@ use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewD
 use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
 use commonware_p2p::{Address, Blocker};
 use commonware_parallel::Sequential;
-use commonware_runtime::buffer::PoolRef;
+use commonware_runtime::buffer::paged::CacheRef;
 use commonware_utils::ordered::{Map, Set};
 use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
 use serde::{Deserialize, Serialize};
@@ -37,8 +37,8 @@ pub struct Config {
     pub mailbox_size: usize,
     pub replay_buffer: usize,
     pub write_buffer: usize,
-    pub buffer_page_size: u16,
-    pub buffer_page_count: usize,
+    pub page_cache_size: u16,
+    pub page_cache_count: usize,
     pub leader_timeout: Duration,
     pub notarization_timeout: Duration,
     pub nullify_retry: Duration,
@@ -54,8 +54,8 @@ impl Config {
             mailbox_size: 1024,
             replay_buffer: 1024 * 1024,
             write_buffer: 64 * 1024,
-            buffer_page_size: 4096,
-            buffer_page_count: 1024,
+            page_cache_size: 4096,
+            page_cache_count: 1024,
             leader_timeout: Duration::from_secs(1),
             notarization_timeout: Duration::from_secs(2),
             nullify_retry: Duration::from_millis(500),
@@ -71,8 +71,8 @@ impl Config {
             mailbox_size: 1024,
             replay_buffer: 1024 * 1024,
             write_buffer: 64 * 1024,
-            buffer_page_size: 4096,
-            buffer_page_count: 1024,
+            page_cache_size: 4096,
+            page_cache_count: 1024,
             leader_timeout: Duration::from_millis(100),
             notarization_timeout: Duration::from_millis(200),
             nullify_retry: Duration::from_millis(50),
@@ -107,9 +107,9 @@ impl Config {
     {
         let replay_buffer = NonZeroUsize::new(self.replay_buffer).unwrap_or(NonZeroUsize::MIN);
         let write_buffer = NonZeroUsize::new(self.write_buffer).unwrap_or(NonZeroUsize::MIN);
-        let buffer_page_count =
-            NonZeroUsize::new(self.buffer_page_count).unwrap_or(NonZeroUsize::MIN);
-        let buffer_page_size = NonZeroU16::new(self.buffer_page_size).unwrap_or(NonZeroU16::MIN);
+        let page_cache_count =
+            NonZeroUsize::new(self.page_cache_count).unwrap_or(NonZeroUsize::MIN);
+        let page_cache_size = NonZeroU16::new(self.page_cache_size).unwrap_or(NonZeroU16::MIN);
 
         minimmit::Config {
             scheme,
@@ -124,7 +124,7 @@ impl Config {
             epoch: EPOCH,
             replay_buffer,
             write_buffer,
-            buffer_pool: PoolRef::new(buffer_page_size, buffer_page_count),
+            page_cache: CacheRef::new(page_cache_size, page_cache_count),
             leader_timeout: self.leader_timeout,
             notarization_timeout: self.notarization_timeout,
             nullify_retry: self.nullify_retry,

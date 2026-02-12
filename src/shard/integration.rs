@@ -193,10 +193,10 @@ where
         }
 
         for _ in 0..max_ticks {
-            if let Some(expected) = expected_total {
-                if recovered.len() >= expected {
-                    break;
-                }
+            if let Some(expected) = expected_total
+                && recovered.len() >= expected
+            {
+                break;
             }
 
             for node_idx in 0..self.nodes.len() {
@@ -504,18 +504,19 @@ fn throughput_under_varying_conditions() {
             // have one from reshard; produce the rest via check.
             let mut checked_shards = vec![first_checked];
             let t = Instant::now();
-            for shard_idx in 1..usize::from(config.minimum_shards) {
+            for (shard_idx, shard) in shards
+                .iter()
+                .enumerate()
+                .take(usize::from(config.minimum_shards))
+                .skip(1)
+            {
                 let shard_index = u16::try_from(shard_idx).unwrap();
                 // In the real protocol each validator reshards its own shard and
                 // broadcasts; other validators call check(). Here we reshard
                 // each shard and immediately check it to get a checked_shard.
-                let (_, _, reshard) = CodingImpl::reshard(
-                    &config,
-                    &commitment,
-                    shard_index,
-                    shards[shard_idx].clone(),
-                )
-                .expect("reshard for check");
+                let (_, _, reshard) =
+                    CodingImpl::reshard(&config, &commitment, shard_index, shard.clone())
+                        .expect("reshard for check");
                 let checked =
                     CodingImpl::check(&config, &commitment, &checking_data, shard_index, reshard)
                         .expect("check");

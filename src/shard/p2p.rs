@@ -2,6 +2,7 @@ use super::codec::WireShardMessage;
 use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
 use super::validators::{DistributionError, ValidatorSet};
+use commonware_actor::{Actor, ingress, service::ServiceBuilder};
 use commonware_p2p::{
     Receiver as P2pReceiver, Recipients, Sender as P2pSender,
     utils::codec::{WrappedReceiver, WrappedSender, wrap},
@@ -9,8 +10,66 @@ use commonware_p2p::{
 use commonware_runtime::{Handle, Spawner};
 use futures::{channel::mpsc, lock::Mutex as AsyncMutex};
 use hellas_types::PublicKey;
-use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex, MutexGuard},
+};
+
+type WireSender<S> = WrappedSender<S, WireShardMessage>;
+type WireReceiver<R> = WrappedReceiver<R, WireShardMessage>;
+
+struct WireIo<S, R>
+where
+    S: P2pSender<PublicKey = PublicKey>,
+    R: P2pReceiver<PublicKey = PublicKey>,
+{
+    sender: AsyncMutex<WireSender<S>>,
+    receiver: Mutex<Option<WireReceiver<R>>>,
+}
+
+impl<S, R> WireIo<S, R>
+where
+    S: P2pSender<PublicKey = PublicKey>,
+    R: P2pReceiver<PublicKey = PublicKey>,
+{
+    fn new(network_sender: S, network_receiver: R) -> Self {
+        let (network_sender, network_receiver) = wrap((), network_sender, network_receiver);
+        Self {
+            sender: AsyncMutex::new(network_sender),
+            receiver: Mutex::new(Some(network_receiver)),
+        }
+    }
+
+    async fn send(&self, recipients: Recipients<PublicKey>, message: WireShardMessage) {
+        let mut sender = self.sender.lock().await;
+        if let Err(err) = sender.send(recipients, message, false).await {
+            warn!(?err, "failed to send shard wire message");
+        }
+    }
+
+    fn take_receiver(&self) -> Option<WireReceiver<R>> {
+        let mut receiver = self.lock_receiver();
+        receiver.take()
+    }
+
+    fn lock_receiver(&self) -> MutexGuard<'_, Option<WireReceiver<R>>> {
+        match self.receiver.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("network receiver lock poisoned; continuing with inner state");
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+ingress! {
+    InboundMailbox,
+
+    tell Dispatch {
+        message: ShardMessage,
+    };
+}
 
 pub struct AuthenticatedShardTransport<S, R>
 where
@@ -20,8 +79,16 @@ where
     local_subscribers: Mutex<Vec<mpsc::UnboundedSender<ShardMessage>>>,
     validators: ValidatorSet,
     me: PublicKey,
-    network_sender: AsyncMutex<WrappedSender<S, WireShardMessage>>,
-    network_receiver: AsyncMutex<WrappedReceiver<R, WireShardMessage>>,
+    io: WireIo<S, R>,
+}
+
+struct InboundActor<S, R>
+where
+    S: P2pSender<PublicKey = PublicKey>,
+    R: P2pReceiver<PublicKey = PublicKey>,
+{
+    transport: Arc<AuthenticatedShardTransport<S, R>>,
+    network_receiver: WireReceiver<R>,
 }
 
 impl<S, R> AuthenticatedShardTransport<S, R>
@@ -30,13 +97,11 @@ where
     R: P2pReceiver<PublicKey = PublicKey>,
 {
     pub fn new(me: &PublicKey, network_sender: S, network_receiver: R) -> Self {
-        let (network_sender, network_receiver) = wrap((), network_sender, network_receiver);
         Self {
             local_subscribers: Mutex::new(Vec::new()),
             validators: ValidatorSet::new(),
             me: me.clone(),
-            network_sender: AsyncMutex::new(network_sender),
-            network_receiver: AsyncMutex::new(network_receiver),
+            io: WireIo::new(network_sender, network_receiver),
         }
     }
 
@@ -52,34 +117,18 @@ where
     where
         E: Spawner,
     {
-        context.spawn(move |_ctx| async move {
-            self.run_inbound().await;
-        })
-    }
+        let network_receiver = self.io.take_receiver();
+        let Some(network_receiver) = network_receiver else {
+            warn!("shard inbound service already started; ignoring duplicate start");
+            return context.spawn(|_context| async {});
+        };
 
-    async fn run_inbound(&self) {
-        loop {
-            let recv_result = {
-                let mut receiver = self.network_receiver.lock().await;
-                receiver.recv().await
-            };
-            let (sender, wire_message) = match recv_result {
-                Ok(msg) => msg,
-                Err(err) => {
-                    warn!(?err, "shard transport receiver closed");
-                    break;
-                }
-            };
-            let wire_message = match wire_message {
-                Ok(wire_message) => wire_message,
-                Err(err) => {
-                    warn!(?sender, ?err, "failed to decode wire shard message");
-                    continue;
-                }
-            };
-            let message = wire_message.with_sender(sender);
-            self.dispatch_local(message);
-        }
+        let actor = InboundActor {
+            transport: self,
+            network_receiver,
+        };
+        let (mailbox, service) = ServiceBuilder::new(actor).build(context);
+        service.start_with(mailbox)
     }
 
     fn dispatch_local(&self, message: ShardMessage) {
@@ -96,10 +145,7 @@ where
     }
 
     async fn send_wire(&self, recipients: Recipients<PublicKey>, message: WireShardMessage) {
-        let mut sender = self.network_sender.lock().await;
-        if let Err(err) = sender.send(recipients, message, false).await {
-            warn!(?err, "failed to send shard wire message");
-        }
+        self.io.send(recipients, message).await;
     }
 
     async fn broadcast_except_internal(&self, sender: &PublicKey, message: ShardMessage) {
@@ -136,6 +182,13 @@ where
             }
             Err(DistributionError::IndexTooLarge { index }) => {
                 warn!(digest = ?key.digest, index, "validator index too large");
+                return;
+            }
+            Err(DistributionError::NotFinalized) => {
+                warn!(
+                    digest = ?key.digest,
+                    "attempted shard distribution before validator finalization"
+                );
                 return;
             }
         };
@@ -181,25 +234,19 @@ where
         self.validators.index(public_key)
     }
 
-    fn broadcast_except<'a>(
-        &'a self,
-        sender: &'a PublicKey,
-        message: ShardMessage,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move { self.broadcast_except_internal(sender, message).await }
+    async fn broadcast_except(&self, sender: &PublicKey, message: ShardMessage) {
+        self.broadcast_except_internal(sender, message).await;
     }
 
-    fn distribute_shards<'a>(
-        &'a self,
-        proposer: &'a PublicKey,
+    async fn distribute_shards(
+        &self,
+        proposer: &PublicKey,
         key: BlockKey,
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        async move {
-            self.distribute_shards_internal(proposer, key, commitment, shards)
-                .await;
-        }
+    ) {
+        self.distribute_shards_internal(proposer, key, commitment, shards)
+            .await;
     }
 }
 
@@ -215,6 +262,61 @@ where
                 warn!("local subscriber lock poisoned; continuing with inner state");
                 poisoned.into_inner()
             }
+        }
+    }
+}
+
+impl<E, S, R> Actor<E> for InboundActor<S, R>
+where
+    E: Spawner,
+    S: P2pSender<PublicKey = PublicKey>,
+    R: P2pReceiver<PublicKey = PublicKey>,
+{
+    type Mailbox = InboundMailbox;
+    type Ingress = InboundMailboxMessage;
+    type Error = Infallible;
+    type Snapshot = ();
+    type Args = InboundMailbox;
+
+    fn snapshot(&self, _args: &Self::Args) -> Self::Snapshot {}
+
+    async fn on_read_write(
+        &mut self,
+        _context: &mut E,
+        _args: &mut InboundMailbox,
+        message: InboundMailboxReadWriteMessage,
+    ) -> Result<(), Self::Error> {
+        match message {
+            InboundMailboxReadWriteMessage::Dispatch { message } => {
+                self.transport.dispatch_local(message);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_external(
+        &mut self,
+        _context: &mut E,
+        _args: &mut InboundMailbox,
+    ) -> Option<InboundMailboxReadWriteMessage> {
+        loop {
+            let recv_result = self.network_receiver.recv().await;
+            let (sender, wire_message) = match recv_result {
+                Ok(msg) => msg,
+                Err(err) => {
+                    warn!(?err, "shard transport receiver closed");
+                    return None;
+                }
+            };
+            let wire_message = match wire_message {
+                Ok(wire_message) => wire_message,
+                Err(err) => {
+                    warn!(?sender, ?err, "failed to decode wire shard message");
+                    continue;
+                }
+            };
+            let message = wire_message.with_sender(sender);
+            return Some(InboundMailboxReadWriteMessage::Dispatch { message });
         }
     }
 }

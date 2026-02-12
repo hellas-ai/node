@@ -33,10 +33,8 @@ impl FinalizationTracker {
             first_observation || diffs.is_none(),
             "duplicate finalization should not provide replacement diffs"
         );
-        if first_observation {
-            if let Some(diffs) = diffs {
-                self.pending_diffs.insert(payload, diffs);
-            }
+        if first_observation && let Some(diffs) = diffs {
+            self.pending_diffs.insert(payload, diffs);
         }
         self.trim_finalized_history();
     }

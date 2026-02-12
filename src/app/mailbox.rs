@@ -1,14 +1,11 @@
 use crate::object::Coin;
 use crate::object::{ObjectId, Transaction};
 
-// We currently use actor `ingress!` only. ServiceBuilder is deferred while
-// minimmit and actor depend on different `commonware-runtime` lines.
-use commonware_actor::{ingress, mailbox::Mailbox as ActorMailbox};
+use commonware_actor::ingress;
 use commonware_consensus::{Automaton, Relay, types::Epoch};
 use commonware_cryptography::sha256::Digest;
-use futures::channel::oneshot;
+use commonware_utils::channel::oneshot;
 use hellas_types::Context;
-use tokio::sync::mpsc;
 
 /// Opaque proof returned by `get_proof()`.
 pub type ProofResponse = commonware_storage::qmdb::current::proof::OperationProof<Digest, 32>;
@@ -35,19 +32,16 @@ ingress! {
     tell SubmitTx {
         tx: Transaction,
     };
+    tell RetryPersistence;
     ask read_write GetCoin {
         payload: Digest,
         object: ObjectId,
     } -> Option<Coin>;
-    pub ask GetStateRoot -> Option<Digest>;
-    pub ask GetProof { object: ObjectId } -> Option<ProofResponse>;
+    pub ask read_write GetStateRoot -> Option<Digest>;
+    pub ask read_write GetProof { object: ObjectId } -> Option<ProofResponse>;
 }
 
 impl AppMailbox {
-    pub(super) fn new(sender: mpsc::Sender<AppMailboxMessage>) -> Self {
-        Self::from(ActorMailbox::new(sender))
-    }
-
     pub async fn submit_tx(&self, tx: Transaction) {
         let _ = self.0.tell_lossy(SubmitTx { tx }).await;
     }

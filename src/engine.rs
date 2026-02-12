@@ -36,17 +36,17 @@ where
     type Activity = Activity;
 
     async fn report(&mut self, activity: Self::Activity) {
-        if let Activity::Finalization(finalization) = &activity {
-            if let Err(err) = self.finalization.unbounded_send(FinalizationNotice {
+        if let Activity::Finalization(finalization) = &activity
+            && let Err(err) = self.finalization.unbounded_send(FinalizationNotice {
                 payload: finalization.proposal.payload,
                 parent_payload: finalization.proposal.parent_payload,
-            }) {
-                error!(
-                    ?err,
-                    "failed to forward finalization notice to app; aborting"
-                );
-                std::process::abort();
-            }
+            })
+        {
+            error!(
+                ?err,
+                "failed to forward finalization notice to app; aborting"
+            );
+            std::process::abort();
         }
         self.inner.report(activity).await;
     }
@@ -94,14 +94,16 @@ where
     {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
         let partition_prefix = format!("hellas_{}", me);
-        let (app, mailbox, finalization_tx) = Application::new(
+        let (app, finalization_tx) = Application::new_with_page_cache(
             context.with_label("app"),
             relay.clone(),
             me,
             validators,
             partition_prefix,
+            config.page_cache_size,
+            config.page_cache_count,
         );
-        let app_handle = app.start();
+        let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();
         let reporter = AppReporter::new(finalization_tx, reporter);
 

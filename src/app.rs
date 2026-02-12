@@ -6,19 +6,20 @@ pub use mailbox::AppMailbox;
 
 use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
+use crate::object::ObjectId;
 use crate::shard::protocol::{ShardMessage, coding_config};
 use crate::shard::transport::ShardTransport;
+use commonware_actor::{Actor, service::ServiceBuilder};
 use commonware_consensus::Reporter;
 use commonware_cryptography::{Sha256, sha256::Digest};
-use commonware_macros::select_loop;
-use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, Storage, spawn_cell};
-use commonware_storage::kv::Batchable;
-use commonware_utils::{SystemTimeExt, channels::fallible::OneshotExt};
+use commonware_macros::select;
+use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, Storage};
+use commonware_utils::{SystemTimeExt, channel::fallible::OneshotExt};
 use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::{Activity, PublicKey};
-use mailbox::{AppMailboxMessage, AppMailboxReadOnlyMessage};
-use std::time::Duration;
+use mailbox::{AppMailboxMessage, AppMailboxReadWriteMessage};
+use std::{collections::VecDeque, convert::Infallible, num::NonZeroUsize, time::Duration};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizationNotice {
@@ -30,6 +31,18 @@ enum PersistDrainStatus {
     Idle,
     Drained,
     Blocked,
+}
+
+#[derive(Clone, Copy)]
+struct PageCacheConfig {
+    size: u16,
+    count: usize,
+}
+
+enum ExternalEvent {
+    Shard(Box<ShardMessage>),
+    Finalization(FinalizationNotice),
+    RetryTick,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,16 +75,21 @@ where
     shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
     finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
 
-    mailbox_rx: tokio::sync::mpsc::Receiver<AppMailboxMessage>,
-
     core: AppCore,
 
     /// Partition prefix for QMDB storage (unique per validator instance).
     partition_prefix: String,
 
+    /// QMDB page cache tuning.
+    page_cache: PageCacheConfig,
+
     /// QMDB for finalized UTXO state. `Option` for type-state take/put pattern
     /// during mutable transitions.
-    db: Option<UtxoDb<ContextCell<E>>>,
+    db: Option<UtxoDb<E>>,
+
+    /// External events captured in `on_external` and replayed through
+    /// `on_read_write` via `RetryPersistence`.
+    pending_external: VecDeque<ExternalEvent>,
 
     /// Exponential backoff delay currently used for persistence retries.
     persistence_retry_delay: Duration,
@@ -100,17 +118,40 @@ where
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
-    ) -> (Self, AppMailbox, mpsc::UnboundedSender<FinalizationNotice>) {
+    ) -> (Self, mpsc::UnboundedSender<FinalizationNotice>) {
+        let page_cache = PageCacheConfig {
+            size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
+            count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
+        };
         let (finalization_tx, finalization_rx) = mpsc::unbounded();
-        let (app, mailbox) = Self::new_with_finalization_receiver(
+        let app = Self::new_with_finalization_receiver(
             context,
             relay,
             me,
             validators,
-            finalization_rx,
             partition_prefix,
+            finalization_rx,
+            page_cache,
         );
-        (app, mailbox, finalization_tx)
+        (app, finalization_tx)
+    }
+
+    pub(crate) fn new_with_page_cache(
+        context: E,
+        relay: std::sync::Arc<T>,
+        me: &PublicKey,
+        validators: Vec<PublicKey>,
+        partition_prefix: String,
+        page_cache_size: u16,
+        page_cache_count: usize,
+    ) -> (Self, mpsc::UnboundedSender<FinalizationNotice>) {
+        let (mut app, finalization_tx) =
+            Self::new(context, relay, me, validators, partition_prefix);
+        app.page_cache = PageCacheConfig {
+            size: page_cache_size,
+            count: page_cache_count,
+        };
+        (app, finalization_tx)
     }
 
     #[cfg(test)]
@@ -121,11 +162,11 @@ where
         validators: Vec<PublicKey>,
         partition_prefix: String,
         persistence_failures_remaining: usize,
-    ) -> (Self, AppMailbox, mpsc::UnboundedSender<FinalizationNotice>) {
-        let (mut app, mailbox, finalization_tx) =
+    ) -> (Self, mpsc::UnboundedSender<FinalizationNotice>) {
+        let (mut app, finalization_tx) =
             Self::new(context, relay, me, validators, partition_prefix);
         app.persistence_failures_remaining = persistence_failures_remaining;
-        (app, mailbox, finalization_tx)
+        (app, finalization_tx)
     }
 
     fn new_with_finalization_receiver(
@@ -133,11 +174,11 @@ where
         relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
-        finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
         partition_prefix: String,
-    ) -> (Self, AppMailbox) {
+        finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
+        page_cache: PageCacheConfig,
+    ) -> Self {
         let shard_rx = relay.register(me);
-        let (sender, receiver) = tokio::sync::mpsc::channel(Self::MAILBOX_CAPACITY);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
             warn!("validator index unavailable for local key; defaulting to index 0");
             0
@@ -146,23 +187,21 @@ where
         let strategy = crate::coding_strategy();
         let core = AppCore::new(me, validators, my_index, coding_config, strategy);
 
-        (
-            Self {
-                context: ContextCell::new(context),
-                relay,
-                shard_rx,
-                finalization_rx,
-                mailbox_rx: receiver,
-                core,
-                partition_prefix,
-                db: None,
-                persistence_retry_delay: Self::PERSISTENCE_RETRY_BASE,
-                next_persistence_retry_at_ms: None,
-                #[cfg(test)]
-                persistence_failures_remaining: 0,
-            },
-            AppMailbox::new(sender),
-        )
+        Self {
+            context: ContextCell::new(context),
+            relay,
+            shard_rx,
+            finalization_rx,
+            core,
+            partition_prefix,
+            page_cache,
+            db: None,
+            pending_external: VecDeque::new(),
+            persistence_retry_delay: Self::PERSISTENCE_RETRY_BASE,
+            next_persistence_retry_at_ms: None,
+            #[cfg(test)]
+            persistence_failures_remaining: 0,
+        }
     }
 
     fn apply_reply_effect(&mut self, effect: CoreEffect) {
@@ -205,7 +244,7 @@ where
         }
     }
 
-    async fn apply_diffs_to_db(&mut self, diffs: &FinalizationDiffs) -> bool {
+    async fn apply_diffs_to_db(&mut self, context: &mut E, diffs: &FinalizationDiffs) -> bool {
         #[cfg(test)]
         if self.persistence_failures_remaining > 0
             && self.core.next_unpersisted_finalization().is_some()
@@ -238,7 +277,7 @@ where
 
         if let Err(err) = db.write_batch(batch.into_iter()).await {
             error!(?err, "QMDB write_batch failed");
-            self.reopen_db_after_failure("write_batch").await;
+            self.reopen_db_after_failure(context, "write_batch").await;
             return false;
         }
 
@@ -246,7 +285,7 @@ where
             Ok(result) => result,
             Err(err) => {
                 error!(?err, "QMDB commit failed");
-                self.reopen_db_after_failure("commit").await;
+                self.reopen_db_after_failure(context, "commit").await;
                 return false;
             }
         };
@@ -254,7 +293,7 @@ where
             Ok(db) => db,
             Err(err) => {
                 error!(?err, "QMDB merkleize failed");
-                self.reopen_db_after_failure("merkleize").await;
+                self.reopen_db_after_failure(context, "merkleize").await;
                 return false;
             }
         };
@@ -262,9 +301,13 @@ where
         true
     }
 
-    async fn reopen_db_after_failure(&mut self, stage: &'static str) {
-        let config = utxo_db_config(&self.partition_prefix);
-        match UtxoDb::init(self.context.with_label("utxo_db_recover"), config).await {
+    async fn reopen_db_after_failure(&mut self, context: &mut E, stage: &'static str) {
+        let config = utxo_db_config(
+            &self.partition_prefix,
+            self.page_cache.size,
+            self.page_cache.count,
+        );
+        match UtxoDb::init(context.with_label("utxo_db_recover"), config).await {
             Ok(db) => {
                 self.db = Some(db);
                 warn!(
@@ -281,12 +324,12 @@ where
         }
     }
 
-    async fn persist_pending_finalizations(&mut self) -> PersistDrainStatus {
+    async fn persist_pending_finalizations(&mut self, context: &mut E) -> PersistDrainStatus {
         let mut attempted = false;
         while let Some((payload, diffs)) = self.core.next_unpersisted_finalization() {
             attempted = true;
             let diffs = diffs.clone();
-            if !self.apply_diffs_to_db(&diffs).await {
+            if !self.apply_diffs_to_db(context, &diffs).await {
                 warn!(?payload, "failed to persist finalized state");
                 return PersistDrainStatus::Blocked;
             }
@@ -324,8 +367,8 @@ where
         self.persistence_retry_delay = Self::PERSISTENCE_RETRY_BASE;
     }
 
-    async fn drive_persistence(&mut self, now_ms: u64) {
-        match self.persist_pending_finalizations().await {
+    async fn drive_persistence(&mut self, context: &mut E, now_ms: u64) {
+        match self.persist_pending_finalizations(context).await {
             PersistDrainStatus::Idle | PersistDrainStatus::Drained => {
                 self.clear_persistence_retry();
             }
@@ -335,17 +378,17 @@ where
         }
     }
 
-    async fn on_persistence_retry_tick(&mut self, now_ms: u64) {
+    async fn on_persistence_retry_tick(&mut self, context: &mut E, now_ms: u64) {
         let Some(deadline_ms) = self.next_persistence_retry_at_ms else {
             return;
         };
         if now_ms < deadline_ms {
             return;
         }
-        self.drive_persistence(now_ms).await;
+        self.drive_persistence(context, now_ms).await;
     }
 
-    async fn bootstrap_genesis_state_if_empty(&mut self) {
+    async fn bootstrap_genesis_state_if_empty(&mut self, context: &mut E) {
         let Some(db) = self.db.as_ref() else {
             return;
         };
@@ -358,7 +401,7 @@ where
             created: genesis_execution.created,
             deleted: genesis_execution.deleted,
         };
-        let _ = self.apply_diffs_to_db(&diffs).await;
+        let _ = self.apply_diffs_to_db(context, &diffs).await;
     }
 
     fn state_root(&self) -> Option<Digest> {
@@ -366,34 +409,81 @@ where
         if db.is_empty() { None } else { Some(db.root()) }
     }
 
-    async fn handle_read_only(&self, msg: AppMailboxReadOnlyMessage) {
-        match msg {
-            AppMailboxReadOnlyMessage::GetStateRoot { response } => {
+    async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
+        let db = self.db.as_ref()?;
+        let mut hasher = Sha256::default();
+        db.key_value_proof(&mut hasher, object).await.ok()
+    }
+
+    async fn on_mailbox_message(&mut self, context: &mut E, message: AppMailboxReadWriteMessage) {
+        match message {
+            AppMailboxReadWriteMessage::RetryPersistence => {
+                if self.pending_external.is_empty() {
+                    self.pending_external.push_back(ExternalEvent::RetryTick);
+                }
+                while let Some(event) = self.pending_external.pop_front() {
+                    match event {
+                        ExternalEvent::Shard(message) => {
+                            let now = context.current().epoch_millis();
+                            let relay = &self.relay;
+                            let effects = self.core.on_shard_message(*message, now, &|sender| {
+                                relay.validator_index(sender)
+                            });
+                            self.apply_core_effects(effects).await;
+                        }
+                        ExternalEvent::Finalization(FinalizationNotice {
+                            payload,
+                            parent_payload,
+                        }) => {
+                            let effects = self.core.on_finalized(payload, parent_payload);
+                            let pending = self.core.unpersisted_finalization_count();
+                            if pending > Self::MAX_PENDING_PERSISTENCE_QUEUE {
+                                error!(
+                                    pending,
+                                    max = Self::MAX_PENDING_PERSISTENCE_QUEUE,
+                                    "pending persistence queue exceeded bound; entering fail-stop"
+                                );
+                                std::process::abort();
+                            }
+                            let now = context.current().epoch_millis();
+                            self.drive_persistence(context, now).await;
+                            self.apply_core_effects(effects).await;
+                        }
+                        ExternalEvent::RetryTick => {
+                            let now = context.current().epoch_millis();
+                            self.on_persistence_retry_tick(context, now).await;
+                        }
+                    }
+                }
+            }
+            AppMailboxReadWriteMessage::GetStateRoot { response } => {
                 let _ = response.send(self.state_root());
             }
-            AppMailboxReadOnlyMessage::GetProof { object, response } => {
-                let proof = if let Some(db) = &self.db {
-                    let mut hasher = Sha256::default();
-                    db.key_value_proof(&mut hasher, object).await.ok()
-                } else {
-                    None
-                };
+            AppMailboxReadWriteMessage::GetProof { object, response } => {
+                let proof = self.proof_for_object(object).await;
                 let _ = response.send(proof);
+            }
+            core_message => {
+                let now = context.current().epoch_millis();
+                let relay = &self.relay;
+                let effects = self
+                    .core
+                    .on_message(core_message, now, &|sender| relay.validator_index(sender));
+                self.apply_core_effects(effects).await;
             }
         }
     }
 
-    pub(crate) fn start(mut self) -> Handle<()> {
-        spawn_cell!(self.context, self.run().await)
-    }
-
-    async fn run(mut self) {
-        // Initialize QMDB.
-        let config = utxo_db_config(&self.partition_prefix);
-        match UtxoDb::init(self.context.with_label("utxo_db"), config).await {
+    async fn initialize_db(&mut self, context: &mut E) {
+        let config = utxo_db_config(
+            &self.partition_prefix,
+            self.page_cache.size,
+            self.page_cache.count,
+        );
+        match UtxoDb::init(context.with_label("utxo_db"), config).await {
             Ok(db) => {
                 self.db = Some(db);
-                self.bootstrap_genesis_state_if_empty().await;
+                self.bootstrap_genesis_state_if_empty(context).await;
             }
             Err(err) => {
                 error!(
@@ -402,85 +492,97 @@ where
                 );
             }
         }
+    }
 
-        select_loop! {
-            self.context,
-            on_start => {
-                let now_ms = self.context.current().epoch_millis();
-                let persistence_sleep = self.persistence_sleep_duration(now_ms);
-            },
-            on_stopped => {
-                if let Some(mut db) = self.db.take() {
-                    if let Err(err) = db.sync().await {
-                        warn!(?err, "QMDB sync on shutdown failed");
-                    }
-                }
-                debug!("application shutting down");
-            },
-            message = self.mailbox_rx.recv() => {
-                let ingress = match message {
-                    Some(ingress) => ingress,
-                    None => break,
-                };
-                match ingress {
-                    AppMailboxMessage::ReadWrite(message) => {
-                        let now = self.context.current().epoch_millis();
-                        let relay = &self.relay;
-                        let effects = self
-                            .core
-                            .on_message(message, now, &|sender| relay.validator_index(sender));
-                        self.apply_core_effects(effects).await;
-                    }
-                    AppMailboxMessage::ReadOnly(message) => {
-                        self.handle_read_only(message).await;
-                    }
-                }
-            },
+    async fn sync_db_on_shutdown(&mut self) {
+        if let Some(mut db) = self.db.take()
+            && let Err(err) = db.sync().await
+        {
+            warn!(?err, "QMDB sync on shutdown failed");
+        }
+    }
+
+    pub(crate) fn start(mut self) -> (Handle<()>, AppMailbox) {
+        let context = self.context.take();
+        let mailbox_capacity =
+            NonZeroUsize::new(Self::MAILBOX_CAPACITY).expect("mailbox capacity must be non-zero");
+        let (mailbox, service) =
+            ServiceBuilder::new(self).build_with_capacity(context, mailbox_capacity);
+        (service.start(), mailbox)
+    }
+}
+
+impl<E, T> Actor<E> for Application<E, T>
+where
+    E: Clock + Spawner + Storage + Metrics,
+    T: ShardTransport,
+{
+    type Mailbox = AppMailbox;
+    type Ingress = AppMailboxMessage;
+    type Error = Infallible;
+    type Snapshot = ();
+    type Args = ();
+
+    fn snapshot(&self, _args: &Self::Args) -> Self::Snapshot {}
+
+    async fn on_startup(&mut self, context: &mut E, _args: &mut Self::Args) {
+        self.initialize_db(context).await;
+    }
+
+    async fn on_shutdown(&mut self, _context: &mut E, _args: &mut Self::Args) {
+        self.sync_db_on_shutdown().await;
+        debug!("application shutting down");
+    }
+
+    async fn on_read_write(
+        &mut self,
+        context: &mut E,
+        _args: &mut Self::Args,
+        message: AppMailboxReadWriteMessage,
+    ) -> Result<(), Self::Error> {
+        self.on_mailbox_message(context, message).await;
+        Ok(())
+    }
+
+    async fn on_external(
+        &mut self,
+        context: &mut E,
+        _args: &mut Self::Args,
+    ) -> Option<AppMailboxReadWriteMessage> {
+        let now_ms = context.current().epoch_millis();
+        let persistence_sleep = self.persistence_sleep_duration(now_ms);
+
+        select! {
             shard = self.shard_rx.next() => {
                 match shard {
-                    Some(shard) => {
-                        let now = self.context.current().epoch_millis();
-                        let relay = &self.relay;
-                        let effects = self
-                            .core
-                            .on_shard_message(shard, now, &|sender| relay.validator_index(sender));
-                        self.apply_core_effects(effects).await;
+                    Some(message) => {
+                        self.pending_external
+                            .push_back(ExternalEvent::Shard(Box::new(message)));
+                        Some(AppMailboxReadWriteMessage::RetryPersistence)
                     }
                     None => {
                         warn!("shard relay closed");
-                        break;
+                        None
                     }
                 }
             },
             finalized = self.finalization_rx.next() => {
                 match finalized {
-                    Some(finalized) => {
-                        let effects = self.core.on_finalized(
-                            finalized.payload, finalized.parent_payload,
-                        );
-                        let pending = self.core.unpersisted_finalization_count();
-                        if pending > Self::MAX_PENDING_PERSISTENCE_QUEUE {
-                            error!(
-                                pending,
-                                max = Self::MAX_PENDING_PERSISTENCE_QUEUE,
-                                "pending persistence queue exceeded bound; entering fail-stop"
-                            );
-                            std::process::abort();
-                        }
-                        let now = self.context.current().epoch_millis();
-                        self.drive_persistence(now).await;
-                        self.apply_core_effects(effects).await;
+                    Some(finalization) => {
+                        self.pending_external
+                            .push_back(ExternalEvent::Finalization(finalization));
+                        Some(AppMailboxReadWriteMessage::RetryPersistence)
                     }
                     None => {
                         warn!("finalization channel closed");
-                        break;
+                        None
                     }
                 }
             },
-            _ = self.context.sleep(persistence_sleep) => {
-                let now = self.context.current().epoch_millis();
-                self.on_persistence_retry_tick(now).await;
-            }
+            _ = context.sleep(persistence_sleep) => {
+                self.pending_external.push_back(ExternalEvent::RetryTick);
+                Some(AppMailboxReadWriteMessage::RetryPersistence)
+            },
         }
     }
 }
@@ -503,10 +605,10 @@ mod tests {
     use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_cryptography::{Hasher, Sha256, Signer};
     use commonware_runtime::{Clock, ContextCell, Metrics, Runner, deterministic};
-    use futures::channel::oneshot::Canceled;
     use hellas_types::{Context, PrivateKey};
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
+    use tokio::sync::oneshot::error::TryRecvError;
 
     /// Cap timestamp ranges to avoid saturating_add degeneracy near u64::MAX.
     const MAX_TIMESTAMP: u64 = u64::MAX - SYNCHRONY_BOUND - 10_001;
@@ -777,14 +879,15 @@ mod tests {
             let mut handles = Vec::new();
             let mut finalization_txs = Vec::new();
             for (idx, participant) in participants.iter().enumerate() {
-                let (app, mailbox, finalization_tx) = Application::new(
+                let (app, finalization_tx) = Application::new(
                     context.with_label(&format!("app_{idx}")),
                     relay.clone(),
                     participant,
                     participants.clone(),
                     format!("test_app_{idx}"),
                 );
-                handles.push(app.start());
+                let (handle, mailbox) = app.start();
+                handles.push(handle);
                 mailboxes.push(mailbox);
                 finalization_txs.push(finalization_tx);
             }
@@ -821,9 +924,9 @@ mod tests {
             let mut verify_rx_1 = mailboxes[1].verify(proposal_context.clone(), digest).await;
             context.sleep(Duration::from_millis(10)).await;
             match verify_rx_1.try_recv() {
-                Ok(Some(v)) => panic!("verify should not resolve yet, got {:?}", v),
-                Ok(None) => {}
-                Err(Canceled) => panic!("verify receiver canceled unexpectedly"),
+                Ok(v) => panic!("verify should not resolve yet, got {:?}", v),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Closed) => panic!("verify receiver canceled unexpectedly"),
             }
 
             let verify_rx_2 = mailboxes[2].verify(proposal_context, digest).await;
@@ -845,14 +948,14 @@ mod tests {
             relay.declare(&key);
             relay.finalize_validators();
 
-            let (app, mut mailbox, _finalization_tx) = Application::new(
+            let (app, _finalization_tx) = Application::new(
                 context.with_label("bootstrap_app"),
                 relay,
                 &key,
                 vec![key.clone()],
                 "bootstrap_test_partition".to_string(),
             );
-            let _handle = app.start();
+            let (_handle, mut mailbox) = app.start();
 
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
@@ -905,14 +1008,14 @@ mod tests {
             let relay_a = Arc::new(MockShardTransport::new());
             relay_a.declare(&key);
             relay_a.finalize_validators();
-            let (app_a, mut mailbox_a, _finalization_tx_a) = Application::new(
+            let (app_a, _finalization_tx_a) = Application::new(
                 context.with_label("restart_app_a"),
                 relay_a,
                 &key,
                 validators.clone(),
                 partition.clone(),
             );
-            let app_a_handle = app_a.start();
+            let (app_a_handle, mut mailbox_a) = app_a.start();
             let _ = mailbox_a.genesis(Epoch::new(1)).await;
 
             let root_a = mailbox_a
@@ -947,14 +1050,14 @@ mod tests {
             let relay_b = Arc::new(MockShardTransport::new());
             relay_b.declare(&key);
             relay_b.finalize_validators();
-            let (app_b, mailbox_b, _finalization_tx_b) = Application::new(
+            let (app_b, _finalization_tx_b) = Application::new(
                 context.with_label("restart_app_b"),
                 relay_b,
                 &key,
                 validators,
                 partition,
             );
-            let _app_b_handle = app_b.start();
+            let (_app_b_handle, mailbox_b) = app_b.start();
 
             let root_b = mailbox_b
                 .get_state_root()
@@ -993,7 +1096,7 @@ mod tests {
             relay.declare(&sender_pk);
             relay.finalize_validators();
 
-            let (app, mut mailbox, finalization_tx) = Application::new_with_persistence_failures(
+            let (app, finalization_tx) = Application::new_with_persistence_failures(
                 context.with_label("retry_worker_app"),
                 relay,
                 &sender_pk,
@@ -1001,7 +1104,7 @@ mod tests {
                 "retry_worker_partition".to_string(),
                 2,
             );
-            let _app_handle = app.start();
+            let (_app_handle, mut mailbox) = app.start();
 
             let epoch = Epoch::new(1);
             let genesis = mailbox.genesis(epoch).await;

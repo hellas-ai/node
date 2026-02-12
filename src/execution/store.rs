@@ -1,6 +1,6 @@
 use crate::object::{Coin, ObjectId};
 use commonware_cryptography::Sha256;
-use commonware_runtime::buffer::PoolRef;
+use commonware_runtime::buffer::paged::CacheRef;
 use commonware_storage::{
     qmdb::current::{FixedConfig, unordered::fixed::Db as CurrentFixedDb},
     translator::EightCap,
@@ -26,16 +26,23 @@ const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 
 /// Buffer pool page size.
-const BUFFER_PAGE_SIZE: NonZeroU16 = NonZeroU16::new(4096).unwrap();
+pub const DEFAULT_PAGE_CACHE_SIZE: NonZeroU16 = NonZeroU16::new(4096).unwrap();
 
 /// Buffer pool page count.
-const BUFFER_PAGE_COUNT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+pub const DEFAULT_PAGE_CACHE_COUNT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// Build a [FixedConfig] for the UTXO database.
 ///
 /// The `partition_prefix` must be unique per validator instance to avoid
 /// storage collisions in tests or multi-process setups.
-pub fn utxo_db_config(partition_prefix: &str) -> FixedConfig<EightCap> {
+pub fn utxo_db_config(
+    partition_prefix: &str,
+    page_cache_size: u16,
+    page_cache_count: usize,
+) -> FixedConfig<EightCap> {
+    let page_cache_size = NonZeroU16::new(page_cache_size).unwrap_or(DEFAULT_PAGE_CACHE_SIZE);
+    let page_cache_count = NonZeroUsize::new(page_cache_count).unwrap_or(DEFAULT_PAGE_CACHE_COUNT);
+
     FixedConfig {
         mmr_journal_partition: format!("{partition_prefix}_utxo_mmr_journal"),
         mmr_items_per_blob: ITEMS_PER_BLOB,
@@ -47,6 +54,6 @@ pub fn utxo_db_config(partition_prefix: &str) -> FixedConfig<EightCap> {
         bitmap_metadata_partition: format!("{partition_prefix}_utxo_bitmap_metadata"),
         translator: EightCap,
         thread_pool: None,
-        buffer_pool: PoolRef::new(BUFFER_PAGE_SIZE, BUFFER_PAGE_COUNT),
+        page_cache: CacheRef::new(page_cache_size, page_cache_count),
     }
 }
