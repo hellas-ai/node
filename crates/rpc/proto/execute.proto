@@ -31,7 +31,7 @@ message GetQuoteResponse {
 message GetGraphRequest { string graph_id = 1; }
 message GetGraphResponse { bytes graph = 1; }
 
-message ExecuteRequest { bytes quote_id = 1; }
+message ExecuteRequest { string quote_id = 1; }
 message ExecuteResponse {
   string execution_id = 1;
   string quote_id = 2;

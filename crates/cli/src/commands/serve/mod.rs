@@ -5,15 +5,12 @@ use tracing::warn;
 
 mod node;
 
-pub async fn run(enable_discovery: bool) -> CliResult<()> {
-    let node = node::spawn_node(enable_discovery)
+pub async fn run() -> CliResult<()> {
+    let node = node::spawn_node()
         .await
         .context("failed to start node server")?;
 
     println!("Node Address: {}", node.node_id());
-    if !enable_discovery {
-        warn!("discovery disabled; clients must pass a node id or start the server with `serve --discovery`");
-    }
 
     println!("RPC server running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c()

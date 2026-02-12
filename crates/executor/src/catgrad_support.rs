@@ -2,9 +2,7 @@ use crate::weights::ModelBundle;
 use crate::ExecutorError;
 use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend, Backend, Interpreter};
 use catgrad::prelude::*;
-use catgrad_llm::utils::get_model;
-use minijinja::{context, Environment};
-use minijinja_contrib::pycompat::unknown_method_callback;
+use catgrad_llm::utils::{get_model, render_chat_template};
 use tracing::warn;
 
 /// Format a user prompt using the model's chat template when available.
@@ -19,26 +17,7 @@ fn prepare_prompt(model_id: &str, chat_template: Option<&str>, prompt: &str) -> 
         .replace("{% generation %}", "")
         .replace("{% endgeneration %}", "");
 
-    let mut env = Environment::new();
-    env.set_unknown_method_callback(unknown_method_callback);
-
-    if let Err(err) = env.add_template("chat", &template) {
-        warn!("failed to parse chat template for {model_id}: {err}");
-        return prompt.to_string();
-    }
-
-    let tmpl = match env.get_template("chat") {
-        Ok(t) => t,
-        Err(err) => {
-            warn!("failed to load chat template for {model_id}: {err}");
-            return prompt.to_string();
-        }
-    };
-
-    match tmpl.render(context! {
-        messages => vec![context!(role => "user", content => prompt)],
-        add_generation_prompt => true,
-    }) {
+    match render_chat_template(&template, prompt, false, false) {
         Ok(r) => r,
         Err(err) => {
             warn!("failed to render chat template for {model_id}: {err}");
@@ -69,7 +48,7 @@ pub fn build_graph_from_llm_prompt(
     let prompt_tokens = encoding.get_ids().len();
     let max_sequence_length = prompt_tokens + max_new_tokens as usize;
 
-    let model = get_model(config, max_sequence_length)?;
+    let (model, _cfg) = get_model(config, max_sequence_length)?;
     let typed_term = model
         .term()
         .ok_or_else(|| ExecutorError::ModelConstruction(model.path().to_string()))?;
@@ -100,7 +79,7 @@ pub fn run_graph_streaming(
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
 
     let max_sequence_length = tokens.len() + max_seq as usize;
-    let model = get_model(config, max_sequence_length)?;
+    let (model, llm_config) = get_model(config, max_sequence_length)?;
 
     let mut env = stdlib();
     env.declarations
@@ -109,19 +88,47 @@ pub fn run_graph_streaming(
     let interpreter = Interpreter::new(backend.clone(), env, parameter_values.clone());
 
     let mut decoded = String::new();
-    let mut current_tokens = tokens;
     let mut progress: u64 = 0;
+
+    // Initialize empty KV caches for the first (prefill) pass.
+    let num_layers = llm_config.num_hidden_layers();
+    let num_kv_heads = llm_config.num_key_value_heads();
+    let qk_head_dim = llm_config.get_qk_head_dim();
+    let v_head_dim = llm_config.get_v_head_dim();
+
+    let mut k_cache = interpreter::tensor(
+        &interpreter.backend,
+        Shape(vec![num_layers, 1, num_kv_heads, 0, qk_head_dim]),
+        Vec::<f32>::new(),
+    )
+    .map_err(ExecutorError::Backend)?;
+
+    let mut v_cache = interpreter::tensor(
+        &interpreter.backend,
+        Shape(vec![num_layers, 1, num_kv_heads, 0, v_head_dim]),
+        Vec::<f32>::new(),
+    )
+    .map_err(ExecutorError::Backend)?;
+
+    // First iteration uses the full prompt; subsequent iterations use only the new token.
+    let mut token_ids = tokens;
 
     for _ in 0..max_seq {
         let input_tensor = interpreter::tensor(
             &interpreter.backend,
-            Shape(vec![1, current_tokens.len()]),
-            current_tokens.clone(),
+            Shape(vec![1, token_ids.len()]),
+            token_ids.clone(),
         )
         .map_err(ExecutorError::Backend)?;
 
-        let mut results = interpreter.run(typed_term.term.clone(), vec![input_tensor])?;
+        let mut results = interpreter.run(
+            typed_term.term.clone(),
+            vec![input_tensor, k_cache, v_cache],
+        )?;
 
+        // Results order: [next_token, k_cache_out, v_cache_out]
+        v_cache = results.pop().ok_or(ExecutorError::NoOutput)?;
+        k_cache = results.pop().ok_or(ExecutorError::NoOutput)?;
         let output = results.pop().ok_or(ExecutorError::NoOutput)?;
 
         let next_token = match output {
@@ -138,16 +145,20 @@ pub fn run_graph_streaming(
             .decode(&[next_token], false)
             .unwrap_or_else(|_| next_token.to_string());
         decoded.push_str(&piece);
-        current_tokens.push(next_token);
         progress += 1;
 
-        let done = config.get_eos_token_ids().contains(&(next_token as i32));
+        let done = llm_config
+            .get_eos_token_ids()
+            .contains(&(next_token as i32));
         on_progress(progress, piece.as_bytes(), Some(piece.as_str()), done);
 
         // Stop if EOS
         if done {
             break;
         }
+
+        // Subsequent iterations: only feed the newly generated token.
+        token_ids = vec![next_token];
     }
 
     Ok(())
