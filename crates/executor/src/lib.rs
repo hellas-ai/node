@@ -310,7 +310,7 @@ impl Executor {
         &mut self,
         request: ExecuteRequest,
     ) -> Result<ExecuteResponse, ExecutorError> {
-        let quote_id = String::from_utf8_lossy(&request.quote_id).to_string();
+        let quote_id = request.quote_id;
         let plan = self.state.get_quote(&quote_id)?.plan.clone();
 
         if self.execute_worker.is_busy() {
@@ -602,7 +602,7 @@ mod tests {
         // Execute with quote
         let exec = handle
             .execute(ExecuteRequest {
-                quote_id: quote.quote_id.as_bytes().to_vec(),
+                quote_id: quote.quote_id.clone(),
             })
             .await
             .expect("should return execution");
@@ -616,7 +616,7 @@ mod tests {
 
         let result = handle
             .execute(ExecuteRequest {
-                quote_id: b"invalid-quote".to_vec(),
+                quote_id: "invalid-quote".to_string(),
             })
             .await;
         assert!(result.is_err());

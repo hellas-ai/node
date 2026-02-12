@@ -116,8 +116,8 @@ impl ::prost::Name for GetGraphResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub quote_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "1")]
+    pub quote_id: ::prost::alloc::string::String,
 }
 impl ::prost::Name for ExecuteRequest {
     const NAME: &'static str = "ExecuteRequest";
@@ -267,6 +267,36 @@ impl ::prost::Name for HealthCheckResponse {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetKnownPeersRequest {
+    #[prost(string, tag = "1")]
+    pub service_alpn: ::prost::alloc::string::String,
+}
+impl ::prost::Name for GetKnownPeersRequest {
+    const NAME: &'static str = "GetKnownPeersRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetKnownPeersRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetKnownPeersRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetKnownPeersResponse {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub peer_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
+impl ::prost::Name for GetKnownPeersResponse {
+    const NAME: &'static str = "GetKnownPeersResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetKnownPeersResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetKnownPeersResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Presence {
     #[prost(string, tag = "1")]
     pub hf_id: ::prost::alloc::string::String,
@@ -390,6 +420,29 @@ pub mod node_client {
             req.extensions_mut().insert(GrpcMethod::new("hellas.Node", "HealthCheck"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_known_peers(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetKnownPeersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetKnownPeersResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Node/GetKnownPeers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("hellas.Node", "GetKnownPeers"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -410,6 +463,13 @@ pub mod node_server {
             request: tonic::Request<super::HealthCheckRequest>,
         ) -> std::result::Result<
             tonic::Response<super::HealthCheckResponse>,
+            tonic::Status,
+        >;
+        async fn get_known_peers(
+            &self,
+            request: tonic::Request<super::GetKnownPeersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetKnownPeersResponse>,
             tonic::Status,
         >;
     }
@@ -517,6 +577,51 @@ pub mod node_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = HealthCheckSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Node/GetKnownPeers" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetKnownPeersSvc<T: Node>(pub Arc<T>);
+                    impl<
+                        T: Node,
+                    > tonic::server::UnaryService<super::GetKnownPeersRequest>
+                    for GetKnownPeersSvc<T> {
+                        type Response = super::GetKnownPeersResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetKnownPeersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Node>::get_known_peers(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetKnownPeersSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

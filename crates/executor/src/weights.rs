@@ -1,16 +1,15 @@
 use crate::ExecutorError;
 use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend};
 use catgrad::typecheck;
-use catgrad_llm::legacy::models::utils::Config;
 use catgrad_llm::utils::{get_model_chat_template, get_model_files, load_model};
 use hf_hub::Cache;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
+use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration, Instant};
-use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
 const DEFAULT_REF: &str = "main";
@@ -30,7 +29,7 @@ pub struct ResolvedWeightKey {
 #[derive(Clone)]
 pub struct ModelBundle {
     pub key: ResolvedWeightKey,
-    pub config: Config,
+    pub config: serde_json::Value,
     pub tokenizer: Tokenizer,
     pub chat_template: Option<String>,
     pub parameter_values: interpreter::Parameters<NdArrayBackend>,
@@ -96,13 +95,19 @@ enum Command {
 }
 
 enum JobEvent {
-    Resolved { model_id: ModelId, revision: ModelRevision },
+    Resolved {
+        model_id: ModelId,
+        revision: ModelRevision,
+    },
     Completed {
         model_id: ModelId,
         revision: ModelRevision,
         bundle: Arc<ModelBundle>,
     },
-    Failed { model_id: ModelId, error: String },
+    Failed {
+        model_id: ModelId,
+        error: String,
+    },
 }
 
 struct Entry {
@@ -191,10 +196,7 @@ impl WeightsManager {
         }
     }
 
-    pub async fn bundle(
-        &self,
-        key: &ResolvedWeightKey,
-    ) -> Result<Arc<ModelBundle>, WeightsError> {
+    pub async fn bundle(&self, key: &ResolvedWeightKey) -> Result<Arc<ModelBundle>, WeightsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Command::Bundle {
@@ -251,7 +253,9 @@ fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::Unbounde
                         EnsureDisposition::Failed(error.clone())
                     }
                 }
-                WeightsStatus::Queued | WeightsStatus::Resolving | WeightsStatus::Downloading { .. } => {
+                WeightsStatus::Queued
+                | WeightsStatus::Resolving
+                | WeightsStatus::Downloading { .. } => {
                     if !state.queue.contains(&model_id) && state.active.as_ref() != Some(&model_id)
                     {
                         state.queue.push_back(model_id.clone());
@@ -273,7 +277,9 @@ fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::Unbounde
                     Ok(bundle.clone())
                 }
                 Some((WeightsStatus::Ready { .. }, _)) => Err(WeightsError::UnknownKey),
-                Some((WeightsStatus::Failed { error }, _)) => Err(WeightsError::Failed(error.clone())),
+                Some((WeightsStatus::Failed { error }, _)) => {
+                    Err(WeightsError::Failed(error.clone()))
+                }
                 Some((_status, _)) => Err(WeightsError::NotReady),
                 None => Err(WeightsError::UnknownKey),
             };
@@ -377,21 +383,24 @@ fn load_default_bundle(
     // Ensure at least config is present and derive the resolved snapshot SHA from its path.
     let (_weights, config_path, _tokenizer_path, _tok_config) =
         get_model_files(&model_id.0, DEFAULT_REF)?;
-    let revision =
-        extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
-            ExecutorError::WeightsError(format!(
-                "unexpected hf cache path (no snapshots/<sha>): {config_path:?}"
-            ))
-        })?;
+    let revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
+        ExecutorError::WeightsError(format!(
+            "unexpected hf cache path (no snapshots/<sha>): {config_path:?}"
+        ))
+    })?;
 
-    info!(model = model_id.0, revision = revision.0, "weights resolved");
+    info!(
+        model = model_id.0,
+        revision = revision.0,
+        "weights resolved"
+    );
     let _ = job_tx.send(JobEvent::Resolved {
         model_id: model_id.clone(),
         revision: revision.clone(),
     });
 
     // Load full model weights + tokenizer + config into memory.
-    let (parameter_values, parameter_types, config, tokenizer) =
+    let (parameter_values, parameter_types, config, tokenizer, _total_params) =
         load_model(&model_id.0, DEFAULT_REF, &backend)?;
 
     let chat_template = match get_model_chat_template(&model_id.0, DEFAULT_REF) {
@@ -447,7 +456,9 @@ mod tests {
 
     #[test]
     fn extracts_revision_from_snapshot_path() {
-        let p = PathBuf::from("/x/.cache/huggingface/hub/models--foo--bar/snapshots/abcd1234/config.json");
+        let p = PathBuf::from(
+            "/x/.cache/huggingface/hub/models--foo--bar/snapshots/abcd1234/config.json",
+        );
         assert_eq!(
             extract_revision_from_snapshot_path(&p).unwrap().0,
             "abcd1234"
