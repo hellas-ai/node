@@ -1,6 +1,6 @@
 use crate::app::{Application, FinalizationNotice, Mailbox};
 use crate::config::Config;
-use crate::shard::{AuthenticatedShardTransport, ShardTransport};
+use crate::shard::AuthenticatedShardTransport;
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Sha256, sha256::Digest};
@@ -93,11 +93,10 @@ where
         N: Receiver<PublicKey = PublicKey>,
     {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
-        let relay_for_app: Arc<dyn ShardTransport> = relay;
         let partition_prefix = format!("hellas_{}", me);
         let (app, mailbox, finalization_tx) = Application::new(
             context.with_label("app"),
-            relay_for_app,
+            relay.clone(),
             me,
             validators,
             partition_prefix,

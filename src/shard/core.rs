@@ -1,7 +1,6 @@
-use super::{
-    BlockKey, BufferedReShare, CodingImpl, DuplicateStatus, RecoveryState, ShardMessage,
-    WireShardMessage, ZodaCommitment,
-};
+use super::codec::WireShardMessage;
+use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
+use super::recovery::{BufferedReShare, DuplicateStatus, RecoveryState};
 use crate::effects::Effects;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
@@ -139,7 +138,7 @@ impl ShardRecoverer {
             return effects;
         }
 
-        let shard_hash = super::hash_encoded(&shard);
+        let shard_hash = hash_encoded(&shard);
         let status = self
             .recovery
             .get(&key)
@@ -212,7 +211,7 @@ impl ShardRecoverer {
             return effects;
         }
 
-        let shard_hash = super::hash_encoded(&reshard);
+        let shard_hash = hash_encoded(&reshard);
         let status = self
             .recovery
             .get(&key)
@@ -490,7 +489,7 @@ impl ShardRecoverer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::coding_config;
+    use crate::shard::protocol::coding_config;
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::{Signer, ed25519};
     use proptest::prelude::*;

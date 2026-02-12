@@ -1,4 +1,4 @@
-use super::{BlockKey, ShardMessage, ZodaCommitment, ZodaReShard, ZodaShard};
+use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaReShard, ZodaShard};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use commonware_codec::{
     Encode, EncodeSize, Error as CodecError, Read, ReadExt, ReadRangeExt, Write,
@@ -249,7 +249,7 @@ impl Read for WireShardMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::{CodingImpl, coding_config};
+    use crate::shard::protocol::{CodingImpl, coding_config};
     use commonware_coding::Scheme as CodingScheme;
     use commonware_consensus::types::{Epoch, View};
     use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
@@ -307,5 +307,32 @@ mod tests {
             let authenticated = decoded.with_sender(sender.clone());
             prop_assert_eq!(authenticated.sender(), &sender);
         }
+    }
+
+    #[test]
+    fn malformed_payloads_return_none() {
+        assert!(WireShardMessage::decode(&[]).is_none());
+        assert!(WireShardMessage::decode(&[WireTag::INITIAL_TAG]).is_none());
+        assert!(WireShardMessage::decode(&[0xFF]).is_none());
+
+        let (_config, commitment, shards) = sample_artifacts(b"codec-malformed");
+        let key = BlockKey::new(
+            Round::new(Epoch::new(9), View::new(1)),
+            Sha256::hash(b"codec-malformed"),
+        );
+        let message = WireShardMessage::Initial {
+            key,
+            commitment,
+            shard: shards[0].clone(),
+            shard_index: 0,
+        };
+        let encoded = message.encode();
+
+        let truncated = encoded.slice(0..encoded.len().saturating_sub(1));
+        assert!(WireShardMessage::decode(truncated.as_ref()).is_none());
+
+        let mut extended = encoded.to_vec();
+        extended.push(0xAA);
+        assert!(WireShardMessage::decode(extended.as_slice()).is_none());
     }
 }

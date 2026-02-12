@@ -137,4 +137,51 @@ mod tests {
         assert!(set.index(&a).is_some());
         assert!(set.index(&b).is_none());
     }
+
+    #[test]
+    fn assign_shards_skips_proposer() {
+        let set = ValidatorSet::new();
+        let validators: Vec<_> = [9u64, 2u64, 7u64, 4u64]
+            .into_iter()
+            .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
+            .collect();
+        for validator in validators.iter() {
+            set.declare(validator);
+        }
+        set.finalize();
+
+        let proposer = validators[1].clone();
+        let shards = vec![10u8, 11u8, 12u8, 13u8];
+        let assignments = set
+            .assign_shards(&proposer, shards)
+            .expect("assignment should succeed");
+
+        assert_eq!(assignments.len(), validators.len().saturating_sub(1));
+        assert!(assignments.iter().all(|(target, _, _)| target != &proposer));
+    }
+
+    #[test]
+    fn assign_shards_count_mismatch() {
+        let set = ValidatorSet::new();
+        let validators: Vec<_> = [1u64, 2u64, 3u64, 4u64]
+            .into_iter()
+            .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
+            .collect();
+        for validator in validators.iter() {
+            set.declare(validator);
+        }
+        set.finalize();
+
+        let proposer = validators[0].clone();
+        let err = set
+            .assign_shards(&proposer, vec![1u8, 2u8, 3u8])
+            .expect_err("count mismatch should fail");
+        assert!(matches!(
+            err,
+            DistributionError::CountMismatch {
+                shards: 3,
+                validators: 4
+            }
+        ));
+    }
 }

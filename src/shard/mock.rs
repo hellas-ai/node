@@ -1,15 +1,16 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
-use super::{BlockKey, DistributionError, ShardMessage, ValidatorSet, ZodaCommitment, ZodaShard};
+use super::validators::{DistributionError, ValidatorSet};
 use futures::SinkExt;
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
+use std::future::Future;
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard},
 };
-use std::{future::Future, pin::Pin};
 
 pub struct MockShardTransport {
     recipients: Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<ShardMessage>>>>,
@@ -130,8 +131,8 @@ impl ShardTransport for MockShardTransport {
         &'a self,
         sender: &'a PublicKey,
         message: ShardMessage,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move { Self::broadcast_except(self, sender, message).await })
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move { Self::broadcast_except(self, sender, message).await }
     }
 
     fn distribute_shards<'a>(
@@ -140,10 +141,8 @@ impl ShardTransport for MockShardTransport {
         key: BlockKey,
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            Self::distribute_shards(self, proposer, key, commitment, shards).await;
-        })
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move { Self::distribute_shards(self, proposer, key, commitment, shards).await }
     }
 }
 

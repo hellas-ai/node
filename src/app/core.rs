@@ -9,9 +9,8 @@ use crate::execution::{
     execute_transaction, genesis_state,
 };
 use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
-use crate::shard::{
-    BlockKey, CodingImpl, ShardEffect, ShardMessage, ShardRecoverer, ZodaCommitment, ZodaShard,
-};
+use crate::shard::core::{ShardEffect, ShardRecoverer};
+use crate::shard::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard};
 use bytes::Bytes;
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::Epoch;
@@ -609,7 +608,7 @@ impl AppCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::coding_config;
+    use crate::shard::protocol::coding_config;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::certificate::mocks::Fixture;

@@ -1,8 +1,7 @@
+use super::codec::WireShardMessage;
+use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
-use super::{
-    BlockKey, DistributionError, ShardMessage, ValidatorSet, WireShardMessage, ZodaCommitment,
-    ZodaShard,
-};
+use super::validators::{DistributionError, ValidatorSet};
 use commonware_p2p::{
     Receiver as P2pReceiver, Recipients, Sender as P2pSender,
     utils::codec::{WrappedReceiver, WrappedSender, wrap},
@@ -10,11 +9,8 @@ use commonware_p2p::{
 use commonware_runtime::{Handle, Spawner};
 use futures::{channel::mpsc, lock::Mutex as AsyncMutex};
 use hellas_types::PublicKey;
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub struct AuthenticatedShardTransport<S, R>
 where
@@ -189,8 +185,8 @@ where
         &'a self,
         sender: &'a PublicKey,
         message: ShardMessage,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move { self.broadcast_except_internal(sender, message).await })
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move { self.broadcast_except_internal(sender, message).await }
     }
 
     fn distribute_shards<'a>(
@@ -199,11 +195,11 @@ where
         key: BlockKey,
         commitment: ZodaCommitment,
         shards: Vec<ZodaShard>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async move {
             self.distribute_shards_internal(proposer, key, commitment, shards)
                 .await;
-        })
+        }
     }
 }
 

@@ -6,7 +6,8 @@ pub use mailbox::Mailbox;
 
 use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
-use crate::shard::{ShardMessage, ShardTransport, coding_config};
+use crate::shard::protocol::{ShardMessage, coding_config};
+use crate::shard::transport::ShardTransport;
 use commonware_consensus::Reporter;
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_macros::select_loop;
@@ -50,10 +51,14 @@ impl Reporter for TraceReporter {
 // Application actor — async driver over AppCore
 // ---------------------------------------------------------------------------
 
-pub(crate) struct Application<E: Clock + Spawner + Storage + Metrics> {
+pub(crate) struct Application<E, T>
+where
+    E: Clock + Spawner + Storage + Metrics,
+    T: ShardTransport,
+{
     context: ContextCell<E>,
 
-    relay: std::sync::Arc<dyn ShardTransport>,
+    relay: std::sync::Arc<T>,
     shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
     finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,
 
@@ -81,7 +86,11 @@ pub(crate) struct Application<E: Clock + Spawner + Storage + Metrics> {
     persistence_failures_remaining: usize,
 }
 
-impl<E: Clock + Spawner + Storage + Metrics> Application<E> {
+impl<E, T> Application<E, T>
+where
+    E: Clock + Spawner + Storage + Metrics,
+    T: ShardTransport,
+{
     const MAILBOX_CAPACITY: usize = 1024;
     const MAX_PENDING_PERSISTENCE_QUEUE: usize = 1024;
     const PERSISTENCE_RETRY_BASE: Duration = Duration::from_millis(50);
@@ -90,7 +99,7 @@ impl<E: Clock + Spawner + Storage + Metrics> Application<E> {
 
     pub(crate) fn new(
         context: E,
-        relay: std::sync::Arc<dyn ShardTransport>,
+        relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
@@ -110,7 +119,7 @@ impl<E: Clock + Spawner + Storage + Metrics> Application<E> {
     #[cfg(test)]
     pub(crate) fn new_with_persistence_failures(
         context: E,
-        relay: std::sync::Arc<dyn ShardTransport>,
+        relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
@@ -124,7 +133,7 @@ impl<E: Clock + Spawner + Storage + Metrics> Application<E> {
 
     fn new_with_finalization_receiver(
         context: E,
-        relay: std::sync::Arc<dyn ShardTransport>,
+        relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
         finalization_rx: mpsc::UnboundedReceiver<FinalizationNotice>,

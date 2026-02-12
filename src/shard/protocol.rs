@@ -169,4 +169,28 @@ mod tests {
         let result = CodingImpl::reshard(&cfg_a, &commitment_a, 0, shards_b[0].clone());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn coding_config_boundary_values() {
+        let zero = coding_config(0);
+        assert_eq!(zero.minimum_shards, 1);
+        assert_eq!(zero.extra_shards, 0);
+
+        let one = coding_config(1);
+        assert_eq!(one.minimum_shards, 1);
+        assert_eq!(one.extra_shards, 0);
+
+        let six = coding_config(6);
+        assert_eq!(six.minimum_shards, 2);
+        assert_eq!(six.extra_shards, 4);
+
+        for validators in 1u16..=20u16 {
+            let cfg = coding_config(validators);
+            assert_eq!(
+                cfg.minimum_shards.saturating_add(cfg.extra_shards),
+                validators
+            );
+            assert!(cfg.minimum_shards >= 1);
+        }
+    }
 }
