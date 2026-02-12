@@ -263,7 +263,7 @@ impl AppCore {
             }
             AppMailboxReadWriteMessage::GetStateRoot { .. }
             | AppMailboxReadWriteMessage::GetProof { .. }
-            | AppMailboxReadWriteMessage::RetryPersistence => {
+            | AppMailboxReadWriteMessage::DrainExternalEvents => {
                 unreachable!(
                     "application should intercept non-core ingress before AppCore::on_message"
                 );

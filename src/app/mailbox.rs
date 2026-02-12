@@ -32,7 +32,7 @@ ingress! {
     tell SubmitTx {
         tx: Transaction,
     };
-    tell RetryPersistence;
+    tell DrainExternalEvents;
     ask read_write GetCoin {
         payload: Digest,
         object: ObjectId,

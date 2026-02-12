@@ -1,6 +1,8 @@
 use super::codec::WireShardMessage;
 use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
-use super::recovery::{ReadyToCheckTask, RecoveryInput, RecoveryMachine, RecoveryOutput};
+use super::recovery::{
+    ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
+};
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
@@ -48,7 +50,13 @@ impl ShardRecoverer {
             my_index,
             coding_config,
             strategy,
-            machine: RecoveryMachine::new(),
+            machine: RecoveryMachine::new(RecoveryLimits {
+                max_known_keys: Self::MAX_KNOWN_KEYS,
+                max_recovery_entries: Self::MAX_RECOVERY_ENTRIES,
+                max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
+                max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
+                max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
+            }),
         }
     }
 
@@ -69,7 +77,6 @@ impl ShardRecoverer {
         for output in self.machine.step(RecoveryInput::NoteKnownKey {
             key,
             leader: leader.clone(),
-            max_known_keys: Self::MAX_KNOWN_KEYS,
         }) {
             match output {
                 RecoveryOutput::DrainedPreLeader(messages) => drained.extend(messages),
@@ -106,8 +113,6 @@ impl ShardRecoverer {
         let mut effects = VecDeque::new();
         let outputs = self.machine.step(RecoveryInput::IngressMessage {
             message: Box::new(message),
-            max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
-            max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
         });
 
         for output in outputs {
@@ -179,7 +184,6 @@ impl ShardRecoverer {
             shard_index,
             shard_hash,
             leader: expected_leader,
-            max_recovery_entries: Self::MAX_RECOVERY_ENTRIES,
         }) {
             match output {
                 RecoveryOutput::InitialAccepted => accepted = true,
@@ -263,8 +267,6 @@ impl ShardRecoverer {
             shard_hash,
             reshard,
             leader: expected_leader,
-            max_recovery_entries: Self::MAX_RECOVERY_ENTRIES,
-            max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
         }) {
             match output {
                 RecoveryOutput::ReadyToCheck(task) => pending_checks.push(task),
@@ -319,9 +321,7 @@ impl ShardRecoverer {
             match output {
                 RecoveryOutput::ReadyToDecode(candidate) => decode_candidate = Some(candidate),
                 other => {
-                    let mut transient_effects = VecDeque::new();
-                    self.push_machine_effect(other, key, &mut transient_effects);
-                    if let Some(effect) = transient_effects.pop_front() {
+                    if let Some(effect) = self.machine_output_to_effect(other, key) {
                         return Some(effect);
                     }
                 }
@@ -356,6 +356,16 @@ impl ShardRecoverer {
         incoming: BlockKey,
         effects: &mut VecDeque<ShardEffect>,
     ) {
+        if let Some(effect) = self.machine_output_to_effect(output, incoming) {
+            effects.push_back(effect);
+        }
+    }
+
+    fn machine_output_to_effect(
+        &self,
+        output: RecoveryOutput,
+        incoming: BlockKey,
+    ) -> Option<ShardEffect> {
         match output {
             RecoveryOutput::Evicted { key } => {
                 warn!(
@@ -364,7 +374,7 @@ impl ShardRecoverer {
                     max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
                     "evicting oldest recovery entry to admit new recovery"
                 );
-                effects.push_back(ShardEffect::Failed { key });
+                Some(ShardEffect::Failed { key })
             }
             RecoveryOutput::KnownKeysOverflow {
                 known_keys,
@@ -375,6 +385,7 @@ impl ShardRecoverer {
                     max_known_keys,
                     "unable to evict known keys because all candidates are active recoveries"
                 );
+                None
             }
             RecoveryOutput::CommitmentMismatch {
                 key,
@@ -392,6 +403,7 @@ impl ShardRecoverer {
                 } else {
                     warn!(digest = ?key.digest, "commitment mismatch for initial shard");
                 }
+                None
             }
             RecoveryOutput::Equivocation {
                 key,
@@ -406,6 +418,7 @@ impl ShardRecoverer {
                     source,
                     "equivocation detected for shard"
                 );
+                None
             }
             RecoveryOutput::DuplicateShard
             | RecoveryOutput::BufferedPreLeader
@@ -414,7 +427,7 @@ impl ShardRecoverer {
             | RecoveryOutput::InitialAccepted
             | RecoveryOutput::ReShareBuffered
             | RecoveryOutput::ReadyToCheck(_)
-            | RecoveryOutput::ReadyToDecode(_) => {}
+            | RecoveryOutput::ReadyToDecode(_) => None,
         }
     }
 }
@@ -555,7 +568,7 @@ mod tests {
                 .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
                     recovery
                         .get(&artifacts.key)
-                        .map(|recovery| recovery.buffered_reshards.len())
+                        .map(|recovery| recovery.buffered_reshards_len())
                 });
         assert_eq!(
             buffered_reshards_len,
@@ -604,7 +617,9 @@ mod tests {
                 .recoverer
                 .machine
                 .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery.get(&good.key).map(|recovery| recovery.commitment)
+                    recovery
+                        .get(&good.key)
+                        .map(|recovery| recovery.commitment())
                 });
         let Some(commitment) = commitment else {
             panic!("leader initial should create recovery state");

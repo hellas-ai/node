@@ -1,25 +1,28 @@
 mod core;
 mod mailbox;
 mod payload;
+mod persistence;
 
 pub use mailbox::AppMailbox;
 
-use crate::execution::store::{UtxoDb, utxo_db_config};
-use crate::execution::{FinalizationDiffs, genesis_state};
 use crate::object::ObjectId;
 use crate::shard::protocol::{ShardMessage, coding_config};
 use crate::shard::transport::ShardTransport;
 use commonware_actor::{Actor, service::ServiceBuilder};
 use commonware_consensus::Reporter;
-use commonware_cryptography::{Sha256, sha256::Digest};
+use commonware_cryptography::sha256::Digest;
 use commonware_macros::select;
 use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, Storage};
-use commonware_utils::{SystemTimeExt, channel::fallible::OneshotExt};
+use commonware_utils::{
+    SystemTimeExt,
+    channel::{fallible::OneshotExt, oneshot},
+};
 use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::{Activity, PublicKey};
 use mailbox::{AppMailboxMessage, AppMailboxReadWriteMessage};
-use std::{collections::VecDeque, convert::Infallible, num::NonZeroUsize, time::Duration};
+use persistence::{PageCacheConfig, PersistenceCommand, PersistenceEvent, PersistenceWorker};
+use std::{collections::VecDeque, convert::Infallible, num::NonZeroUsize};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizationNotice {
@@ -27,22 +30,10 @@ pub(crate) struct FinalizationNotice {
     pub parent_payload: Digest,
 }
 
-enum PersistDrainStatus {
-    Idle,
-    Drained,
-    Blocked,
-}
-
-#[derive(Clone, Copy)]
-struct PageCacheConfig {
-    size: u16,
-    count: usize,
-}
-
 enum ExternalEvent {
     Shard(Box<ShardMessage>),
     Finalization(FinalizationNotice),
-    RetryTick,
+    Persistence(PersistenceEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -83,19 +74,27 @@ where
     /// QMDB page cache tuning.
     page_cache: PageCacheConfig,
 
-    /// QMDB for finalized UTXO state. `Option` for type-state take/put pattern
-    /// during mutable transitions.
-    db: Option<UtxoDb<E>>,
+    /// Commands sent to the background persistence worker.
+    persistence_tx: mpsc::UnboundedSender<PersistenceCommand>,
+
+    /// Events emitted by the background persistence worker.
+    persistence_rx: mpsc::UnboundedReceiver<PersistenceEvent>,
+
+    /// Handle to the background persistence worker task.
+    persistence_handle: Option<Handle<()>>,
+
+    /// Receiver consumed when spawning the background persistence worker.
+    persistence_cmd_rx: Option<mpsc::UnboundedReceiver<PersistenceCommand>>,
+
+    /// Sender consumed when spawning the background persistence worker.
+    persistence_event_tx: Option<mpsc::UnboundedSender<PersistenceEvent>>,
 
     /// External events captured in `on_external` and replayed through
-    /// `on_read_write` via `RetryPersistence`.
+    /// `on_read_write` via `DrainExternalEvents`.
     pending_external: VecDeque<ExternalEvent>,
 
-    /// Exponential backoff delay currently used for persistence retries.
-    persistence_retry_delay: Duration,
-
-    /// Next retry deadline in epoch millis for persistence, if a retry is pending.
-    next_persistence_retry_at_ms: Option<u64>,
+    /// Payload currently enqueued for persistence and awaiting acknowledgment.
+    inflight_persistence: Option<Digest>,
 
     #[cfg(test)]
     persistence_failures_remaining: usize,
@@ -108,9 +107,6 @@ where
 {
     const MAILBOX_CAPACITY: usize = 1024;
     const MAX_PENDING_PERSISTENCE_QUEUE: usize = 1024;
-    const PERSISTENCE_RETRY_BASE: Duration = Duration::from_millis(50);
-    const PERSISTENCE_RETRY_MAX: Duration = Duration::from_secs(5);
-    const PERSISTENCE_IDLE_SLEEP: Duration = Duration::from_secs(3600);
 
     pub(crate) fn new(
         context: E,
@@ -186,6 +182,8 @@ where
         let coding_config = coding_config(relay.validator_count());
         let strategy = crate::coding_strategy();
         let core = AppCore::new(me, validators, my_index, coding_config, strategy);
+        let (persistence_tx, persistence_cmd_rx) = mpsc::unbounded();
+        let (persistence_event_tx, persistence_rx) = mpsc::unbounded();
 
         Self {
             context: ContextCell::new(context),
@@ -195,10 +193,13 @@ where
             core,
             partition_prefix,
             page_cache,
-            db: None,
+            persistence_tx,
+            persistence_rx,
+            persistence_handle: None,
             pending_external: VecDeque::new(),
-            persistence_retry_delay: Self::PERSISTENCE_RETRY_BASE,
-            next_persistence_retry_at_ms: None,
+            inflight_persistence: None,
+            persistence_cmd_rx: Some(persistence_cmd_rx),
+            persistence_event_tx: Some(persistence_event_tx),
             #[cfg(test)]
             persistence_failures_remaining: 0,
         }
@@ -244,183 +245,139 @@ where
         }
     }
 
-    async fn apply_diffs_to_db(&mut self, context: &mut E, diffs: &FinalizationDiffs) -> bool {
-        #[cfg(test)]
-        if self.persistence_failures_remaining > 0
-            && self.core.next_unpersisted_finalization().is_some()
-        {
-            self.persistence_failures_remaining -= 1;
-            warn!(
-                remaining = self.persistence_failures_remaining,
-                "injecting persistence failure for retry-path test"
-            );
-            return false;
+    fn start_persistence_worker(&mut self, context: &mut E) {
+        if self.persistence_handle.is_some() {
+            return;
         }
-
-        let Some(db) = self.db.take() else {
-            warn!("QMDB unavailable; skipping persistence update");
-            return false;
+        let Some(command_rx) = self.persistence_cmd_rx.take() else {
+            warn!("persistence command receiver unavailable on startup");
+            return;
         };
-        let mut db = db.into_mutable();
-
-        let batch: Vec<_> = diffs
-            .deleted
-            .iter()
-            .map(|id| (*id, None))
-            .chain(
-                diffs
-                    .created
-                    .iter()
-                    .map(|(id, coin)| (*id, Some(coin.clone()))),
-            )
-            .collect();
-
-        if let Err(err) = db.write_batch(batch.into_iter()).await {
-            error!(?err, "QMDB write_batch failed");
-            self.reopen_db_after_failure(context, "write_batch").await;
-            return false;
-        }
-
-        let (db, _range) = match db.commit(None).await {
-            Ok(result) => result,
-            Err(err) => {
-                error!(?err, "QMDB commit failed");
-                self.reopen_db_after_failure(context, "commit").await;
-                return false;
-            }
+        let Some(event_tx) = self.persistence_event_tx.take() else {
+            warn!("persistence event sender unavailable on startup");
+            return;
         };
-        let db = match db.into_merkleized().await {
-            Ok(db) => db,
-            Err(err) => {
-                error!(?err, "QMDB merkleize failed");
-                self.reopen_db_after_failure(context, "merkleize").await;
-                return false;
-            }
-        };
-        self.db = Some(db);
-        true
-    }
 
-    async fn reopen_db_after_failure(&mut self, context: &mut E, stage: &'static str) {
-        let config = utxo_db_config(
-            &self.partition_prefix,
-            self.page_cache.size,
-            self.page_cache.count,
+        let worker = PersistenceWorker::new(
+            self.partition_prefix.clone(),
+            self.page_cache,
+            self.core.validators().to_vec(),
+            command_rx,
+            event_tx,
+            #[cfg(test)]
+            self.persistence_failures_remaining,
         );
-        match UtxoDb::init(context.with_label("utxo_db_recover"), config).await {
-            Ok(db) => {
-                self.db = Some(db);
-                warn!(
-                    stage,
-                    "re-opened QMDB after persistence failure; pending finalizations can be retried"
-                );
+        let handle = context.clone().spawn(move |mut worker_context| async move {
+            worker.run(&mut worker_context).await;
+        });
+        self.persistence_handle = Some(handle);
+    }
+
+    fn dispatch_next_persistence_if_idle(&mut self) {
+        if self.inflight_persistence.is_some() {
+            return;
+        }
+        let Some((payload, diffs)) = self.core.next_unpersisted_finalization() else {
+            return;
+        };
+        let command = PersistenceCommand::Enqueue {
+            payload,
+            diffs: diffs.clone(),
+        };
+        match self.persistence_tx.unbounded_send(command) {
+            Ok(()) => {
+                self.inflight_persistence = Some(payload);
             }
             Err(err) => {
-                error!(
-                    ?err,
-                    stage, "failed to re-open QMDB after persistence failure"
-                );
-            }
-        }
-    }
-
-    async fn persist_pending_finalizations(&mut self, context: &mut E) -> PersistDrainStatus {
-        let mut attempted = false;
-        while let Some((payload, diffs)) = self.core.next_unpersisted_finalization() {
-            attempted = true;
-            let diffs = diffs.clone();
-            if !self.apply_diffs_to_db(context, &diffs).await {
-                warn!(?payload, "failed to persist finalized state");
-                return PersistDrainStatus::Blocked;
-            }
-            if !self.core.mark_finalization_persisted(payload) {
                 warn!(
+                    ?err,
                     ?payload,
-                    "persisted finalization was not present in execution cache"
+                    "failed to enqueue finalized diffs for persistence"
                 );
-                return PersistDrainStatus::Blocked;
-            }
-        }
-        if attempted {
-            PersistDrainStatus::Drained
-        } else {
-            PersistDrainStatus::Idle
-        }
-    }
-
-    fn persistence_sleep_duration(&self, now_ms: u64) -> Duration {
-        let Some(deadline_ms) = self.next_persistence_retry_at_ms else {
-            return Self::PERSISTENCE_IDLE_SLEEP;
-        };
-        Duration::from_millis(deadline_ms.saturating_sub(now_ms))
-    }
-
-    fn schedule_persistence_retry(&mut self, now_ms: u64) {
-        let delay_ms = u64::try_from(self.persistence_retry_delay.as_millis()).unwrap_or(u64::MAX);
-        self.next_persistence_retry_at_ms = Some(now_ms.saturating_add(delay_ms));
-        self.persistence_retry_delay =
-            (self.persistence_retry_delay * 2).min(Self::PERSISTENCE_RETRY_MAX);
-    }
-
-    fn clear_persistence_retry(&mut self) {
-        self.next_persistence_retry_at_ms = None;
-        self.persistence_retry_delay = Self::PERSISTENCE_RETRY_BASE;
-    }
-
-    async fn drive_persistence(&mut self, context: &mut E, now_ms: u64) {
-        match self.persist_pending_finalizations(context).await {
-            PersistDrainStatus::Idle | PersistDrainStatus::Drained => {
-                self.clear_persistence_retry();
-            }
-            PersistDrainStatus::Blocked => {
-                self.schedule_persistence_retry(now_ms);
             }
         }
     }
 
-    async fn on_persistence_retry_tick(&mut self, context: &mut E, now_ms: u64) {
-        let Some(deadline_ms) = self.next_persistence_retry_at_ms else {
-            return;
-        };
-        if now_ms < deadline_ms {
-            return;
+    fn on_persisted(&mut self, payload: Digest) {
+        if self.inflight_persistence != Some(payload) {
+            warn!(
+                ?payload,
+                inflight = ?self.inflight_persistence,
+                "received persistence ack for unexpected payload"
+            );
         }
-        self.drive_persistence(context, now_ms).await;
+        if !self.core.mark_finalization_persisted(payload) {
+            warn!(
+                ?payload,
+                "persisted finalization was not present in execution cache"
+            );
+        }
+        if self.inflight_persistence == Some(payload) {
+            self.inflight_persistence = None;
+        }
+        self.dispatch_next_persistence_if_idle();
     }
 
-    async fn bootstrap_genesis_state_if_empty(&mut self, context: &mut E) {
-        let Some(db) = self.db.as_ref() else {
+    async fn state_root_via_worker(&mut self) -> Option<Digest> {
+        let (response, receiver) = oneshot::channel();
+        if let Err(err) = self
+            .persistence_tx
+            .unbounded_send(PersistenceCommand::GetStateRoot { response })
+        {
+            warn!(?err, "failed to request state root from persistence worker");
+            return None;
+        }
+        match receiver.await {
+            Ok(root) => root,
+            Err(err) => {
+                warn!(?err, "persistence worker dropped state root response");
+                None
+            }
+        }
+    }
+
+    async fn proof_for_object_via_worker(
+        &mut self,
+        object: ObjectId,
+    ) -> Option<mailbox::ProofResponse> {
+        let (response, receiver) = oneshot::channel();
+        if let Err(err) = self
+            .persistence_tx
+            .unbounded_send(PersistenceCommand::GetProof { object, response })
+        {
+            warn!(?err, "failed to request proof from persistence worker");
+            return None;
+        }
+        match receiver.await {
+            Ok(proof) => proof,
+            Err(err) => {
+                warn!(?err, "persistence worker dropped proof response");
+                None
+            }
+        }
+    }
+
+    async fn shutdown_persistence_worker(&mut self) {
+        let Some(handle) = self.persistence_handle.take() else {
             return;
         };
-        if !db.is_empty() {
-            return;
+
+        let (response, receiver) = oneshot::channel();
+        if let Err(err) = self
+            .persistence_tx
+            .unbounded_send(PersistenceCommand::Shutdown { response })
+        {
+            warn!(?err, "failed to signal persistence worker shutdown");
+        } else if let Err(err) = receiver.await {
+            warn!(?err, "persistence worker dropped shutdown response");
         }
 
-        let genesis_execution = genesis_state(self.core.validators());
-        let diffs = FinalizationDiffs {
-            created: genesis_execution.created,
-            deleted: genesis_execution.deleted,
-        };
-        let _ = self.apply_diffs_to_db(context, &diffs).await;
-    }
-
-    fn state_root(&self) -> Option<Digest> {
-        let db = self.db.as_ref()?;
-        if db.is_empty() { None } else { Some(db.root()) }
-    }
-
-    async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
-        let db = self.db.as_ref()?;
-        let mut hasher = Sha256::default();
-        db.key_value_proof(&mut hasher, object).await.ok()
+        let _ = handle.await;
     }
 
     async fn on_mailbox_message(&mut self, context: &mut E, message: AppMailboxReadWriteMessage) {
         match message {
-            AppMailboxReadWriteMessage::RetryPersistence => {
-                if self.pending_external.is_empty() {
-                    self.pending_external.push_back(ExternalEvent::RetryTick);
-                }
+            AppMailboxReadWriteMessage::DrainExternalEvents => {
                 while let Some(event) = self.pending_external.pop_front() {
                     match event {
                         ExternalEvent::Shard(message) => {
@@ -445,22 +402,20 @@ where
                                 );
                                 std::process::abort();
                             }
-                            let now = context.current().epoch_millis();
-                            self.drive_persistence(context, now).await;
+                            self.dispatch_next_persistence_if_idle();
                             self.apply_core_effects(effects).await;
                         }
-                        ExternalEvent::RetryTick => {
-                            let now = context.current().epoch_millis();
-                            self.on_persistence_retry_tick(context, now).await;
+                        ExternalEvent::Persistence(PersistenceEvent::Persisted { payload }) => {
+                            self.on_persisted(payload);
                         }
                     }
                 }
             }
             AppMailboxReadWriteMessage::GetStateRoot { response } => {
-                let _ = response.send(self.state_root());
+                let _ = response.send(self.state_root_via_worker().await);
             }
             AppMailboxReadWriteMessage::GetProof { object, response } => {
-                let proof = self.proof_for_object(object).await;
+                let proof = self.proof_for_object_via_worker(object).await;
                 let _ = response.send(proof);
             }
             core_message => {
@@ -471,34 +426,6 @@ where
                     .on_message(core_message, now, &|sender| relay.validator_index(sender));
                 self.apply_core_effects(effects).await;
             }
-        }
-    }
-
-    async fn initialize_db(&mut self, context: &mut E) {
-        let config = utxo_db_config(
-            &self.partition_prefix,
-            self.page_cache.size,
-            self.page_cache.count,
-        );
-        match UtxoDb::init(context.with_label("utxo_db"), config).await {
-            Ok(db) => {
-                self.db = Some(db);
-                self.bootstrap_genesis_state_if_empty(context).await;
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "QMDB initialization failed; running without persistence"
-                );
-            }
-        }
-    }
-
-    async fn sync_db_on_shutdown(&mut self) {
-        if let Some(mut db) = self.db.take()
-            && let Err(err) = db.sync().await
-        {
-            warn!(?err, "QMDB sync on shutdown failed");
         }
     }
 
@@ -526,11 +453,11 @@ where
     fn snapshot(&self, _args: &Self::Args) -> Self::Snapshot {}
 
     async fn on_startup(&mut self, context: &mut E, _args: &mut Self::Args) {
-        self.initialize_db(context).await;
+        self.start_persistence_worker(context);
     }
 
     async fn on_shutdown(&mut self, _context: &mut E, _args: &mut Self::Args) {
-        self.sync_db_on_shutdown().await;
+        self.shutdown_persistence_worker().await;
         debug!("application shutting down");
     }
 
@@ -546,19 +473,16 @@ where
 
     async fn on_external(
         &mut self,
-        context: &mut E,
+        _context: &mut E,
         _args: &mut Self::Args,
     ) -> Option<AppMailboxReadWriteMessage> {
-        let now_ms = context.current().epoch_millis();
-        let persistence_sleep = self.persistence_sleep_duration(now_ms);
-
         select! {
             shard = self.shard_rx.next() => {
                 match shard {
                     Some(message) => {
                         self.pending_external
                             .push_back(ExternalEvent::Shard(Box::new(message)));
-                        Some(AppMailboxReadWriteMessage::RetryPersistence)
+                        Some(AppMailboxReadWriteMessage::DrainExternalEvents)
                     }
                     None => {
                         warn!("shard relay closed");
@@ -571,7 +495,7 @@ where
                     Some(finalization) => {
                         self.pending_external
                             .push_back(ExternalEvent::Finalization(finalization));
-                        Some(AppMailboxReadWriteMessage::RetryPersistence)
+                        Some(AppMailboxReadWriteMessage::DrainExternalEvents)
                     }
                     None => {
                         warn!("finalization channel closed");
@@ -579,9 +503,18 @@ where
                     }
                 }
             },
-            _ = context.sleep(persistence_sleep) => {
-                self.pending_external.push_back(ExternalEvent::RetryTick);
-                Some(AppMailboxReadWriteMessage::RetryPersistence)
+            persistence = self.persistence_rx.next() => {
+                match persistence {
+                    Some(event) => {
+                        self.pending_external
+                            .push_back(ExternalEvent::Persistence(event));
+                        Some(AppMailboxReadWriteMessage::DrainExternalEvents)
+                    }
+                    None => {
+                        warn!("persistence worker event channel closed");
+                        None
+                    }
+                }
             },
         }
     }
@@ -605,7 +538,7 @@ mod tests {
     use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_cryptography::{Hasher, Sha256, Signer};
     use commonware_runtime::{Clock, ContextCell, Metrics, Runner, deterministic};
-    use hellas_types::{Context, PrivateKey};
+    use hellas_types::{Context, PrivateKey, PublicKey};
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
     use tokio::sync::oneshot::error::TryRecvError;
@@ -627,21 +560,206 @@ mod tests {
         genesis_payload(Epoch::new(0))
     }
 
+    fn build_payload_case(
+        epoch: u16,
+        view: u16,
+        parent: [u8; 32],
+        timestamp: u64,
+    ) -> (Round, Digest, Bytes, Digest) {
+        let round = make_round(epoch, view);
+        let parent = Digest::from(parent);
+        let contents = encode_payload(round, parent, timestamp);
+        let payload = payload_digest(&contents);
+        (round, parent, contents, payload)
+    }
+
+    fn parent_payload_contents(epoch: u16, view: u16, timestamp: u64) -> Bytes {
+        let parent_round = make_round(epoch, view.wrapping_sub(1));
+        encode_payload(parent_round, Digest::from([0u8; 32]), timestamp)
+    }
+
+    fn start_single_validator_app(
+        context: &deterministic::Context,
+        label: &str,
+        key: &PublicKey,
+        partition: &str,
+        persistence_failures: Option<usize>,
+    ) -> (
+        Handle<()>,
+        AppMailbox,
+        mpsc::UnboundedSender<FinalizationNotice>,
+    ) {
+        let relay = Arc::new(MockShardTransport::new());
+        relay.declare(key);
+        relay.finalize_validators();
+
+        let (app, finalization_tx) = match persistence_failures {
+            Some(failures) => Application::new_with_persistence_failures(
+                context.with_label(label),
+                relay,
+                key,
+                vec![key.clone()],
+                partition.to_string(),
+                failures,
+            ),
+            None => Application::new(
+                context.with_label(label),
+                relay,
+                key,
+                vec![key.clone()],
+                partition.to_string(),
+            ),
+        };
+        let (handle, mailbox) = app.start();
+        (handle, mailbox, finalization_tx)
+    }
+
+    fn start_validator_cluster(
+        context: &deterministic::Context,
+        participants: &[PublicKey],
+        label_prefix: &str,
+        partition_prefix: &str,
+    ) -> (
+        Vec<Handle<()>>,
+        Vec<AppMailbox>,
+        Vec<mpsc::UnboundedSender<FinalizationNotice>>,
+    ) {
+        let relay = Arc::new(MockShardTransport::new());
+        for participant in participants {
+            relay.declare(participant);
+        }
+        relay.finalize_validators();
+
+        let mut handles = Vec::with_capacity(participants.len());
+        let mut mailboxes = Vec::with_capacity(participants.len());
+        let mut finalization_txs = Vec::with_capacity(participants.len());
+
+        for (idx, participant) in participants.iter().enumerate() {
+            let (app, finalization_tx) = Application::new(
+                context.with_label(&format!("{label_prefix}_{idx}")),
+                relay.clone(),
+                participant,
+                participants.to_vec(),
+                format!("{partition_prefix}_{idx}"),
+            );
+            let (handle, mailbox) = app.start();
+            handles.push(handle);
+            mailboxes.push(mailbox);
+            finalization_txs.push(finalization_tx);
+        }
+
+        (handles, mailboxes, finalization_txs)
+    }
+
+    async fn initialize_cluster_genesis(mailboxes: &mut [AppMailbox], epoch: Epoch) -> Digest {
+        let mut genesis = None;
+        for mailbox in mailboxes {
+            let digest = mailbox.genesis(epoch).await;
+            if let Some(existing) = genesis {
+                assert_eq!(existing, digest);
+            } else {
+                genesis = Some(digest);
+            }
+        }
+        genesis.expect("genesis should be set")
+    }
+
+    async fn fetch_root(mailbox: &AppMailbox) -> Digest {
+        mailbox
+            .get_state_root()
+            .await
+            .expect("state root request should not fail")
+            .expect("state root should be set")
+    }
+
+    async fn fetch_root_and_proof(
+        mailbox: &AppMailbox,
+        object: ObjectId,
+    ) -> (Digest, mailbox::ProofResponse) {
+        let root = fetch_root(mailbox).await;
+        let proof = mailbox
+            .get_proof(object)
+            .await
+            .expect("proof request should not fail")
+            .expect("proof should exist");
+        (root, proof)
+    }
+
+    fn assert_coin_proof(
+        object: ObjectId,
+        expected_coin: Coin,
+        proof: &mailbox::ProofResponse,
+        root: Digest,
+    ) {
+        let mut hasher = Sha256::default();
+        assert!(
+            UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
+                &mut hasher,
+                object,
+                expected_coin,
+                proof,
+                &root,
+            )
+        );
+    }
+
+    struct FinalizedTransfer {
+        root_before: Digest,
+        recipient_output: ObjectId,
+    }
+
+    async fn submit_transfer_and_finalize(
+        mailbox: &mut AppMailbox,
+        finalization_tx: &mpsc::UnboundedSender<FinalizationNotice>,
+        sender: &PrivateKey,
+        recipient_pk: &PublicKey,
+    ) -> FinalizedTransfer {
+        let epoch = Epoch::new(1);
+        let genesis = mailbox.genesis(epoch).await;
+        let root_before = fetch_root(mailbox).await;
+
+        let tx = Transaction::transfer(sender, genesis_object_id(0), recipient_pk.clone(), 1);
+        let tx_digest = Sha256::hash(&tx.encode());
+        let recipient_output = output_object_id(&tx_digest, 0);
+        mailbox.submit_tx(tx).await;
+
+        let sender_pk = sender.public_key();
+        let proposal_context = Context {
+            round: Round::new(epoch, View::new(1)),
+            leader: sender_pk,
+            parent: (View::zero(), genesis),
+        };
+        let payload = mailbox
+            .propose(proposal_context)
+            .await
+            .await
+            .expect("proposal should resolve");
+
+        finalization_tx
+            .unbounded_send(FinalizationNotice {
+                payload,
+                parent_payload: genesis,
+            })
+            .expect("finalization should enqueue");
+
+        FinalizedTransfer {
+            root_before,
+            recipient_output,
+        }
+    }
+
     proptest! {
         #[test]
-        fn valid_payload_is_accepted(
+        fn payload_with_valid_encoding_and_non_future_timestamp_is_accepted(
             epoch in any::<u16>(),
             view in any::<u16>(),
             parent in any::<[u8; 32]>(),
             timestamp in 0u64..=MAX_TIMESTAMP,
-            slack in 0u64..=SYNCHRONY_BOUND,
+            age in 0u64..=1_000_000u64,
         ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let now = timestamp + slack;
+            let (round, parent, contents, payload) = build_payload_case(epoch, view, parent, timestamp);
             let parent_contents = default_parent_contents();
+            let now = timestamp.saturating_add(age);
 
             prop_assert!(matches!(
                 validate_payload(round, parent, payload, &contents, now, &parent_contents),
@@ -650,46 +768,23 @@ mod tests {
         }
 
         #[test]
-        fn mutated_payload_is_rejected(
+        fn payload_validation_rejects_digest_round_parent_and_future_errors(
             epoch in any::<u16>(),
             view in any::<u16>(),
             parent in any::<[u8; 32]>(),
             timestamp in 0u64..=MAX_TIMESTAMP,
             index in any::<usize>(),
+            future_delta in (SYNCHRONY_BOUND + 1)..=(SYNCHRONY_BOUND + 10_000),
         ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let mutated = Bytes::from(mutate_byte(contents.to_vec(), index));
+            let (round, parent, contents, payload) = build_payload_case(epoch, view, parent, timestamp);
             let parent_contents = default_parent_contents();
+            let now = timestamp.saturating_add(SYNCHRONY_BOUND);
 
+            let mutated = Bytes::from(mutate_byte(contents.to_vec(), index));
             assert!(matches!(
-                validate_payload(
-                    round,
-                    parent,
-                    payload,
-                    &mutated,
-                    timestamp + SYNCHRONY_BOUND,
-                    &parent_contents,
-                ),
+                validate_payload(round, parent, payload, &mutated, now, &parent_contents),
                 Err(PayloadValidationError::DigestMismatch { .. })
             ));
-        }
-
-        #[test]
-        fn round_mismatch_is_rejected(
-            epoch in any::<u16>(),
-            view in any::<u16>(),
-            parent in any::<[u8; 32]>(),
-            timestamp in 0u64..=MAX_TIMESTAMP,
-        ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let now = timestamp + SYNCHRONY_BOUND;
-            let parent_contents = default_parent_contents();
 
             let wrong_round = make_round(epoch.wrapping_add(1), view);
             assert!(matches!(
@@ -703,21 +798,6 @@ mod tests {
                 ),
                 Err(PayloadValidationError::RoundMismatch { .. })
             ));
-        }
-
-        #[test]
-        fn parent_mismatch_is_rejected(
-            epoch in any::<u16>(),
-            view in any::<u16>(),
-            parent in any::<[u8; 32]>(),
-            timestamp in 0u64..=MAX_TIMESTAMP,
-        ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let now = timestamp + SYNCHRONY_BOUND;
-            let parent_contents = default_parent_contents();
 
             let mut wrong_parent = parent.0;
             wrong_parent[0] ^= 0x01;
@@ -732,95 +812,65 @@ mod tests {
                 ),
                 Err(PayloadValidationError::ParentMismatch { .. })
             ));
-        }
 
-        #[test]
-        fn future_timestamp_is_rejected(
-            epoch in any::<u16>(),
-            view in any::<u16>(),
-            parent in any::<[u8; 32]>(),
-            now in 0u64..=MAX_TIMESTAMP,
-            delta in (SYNCHRONY_BOUND + 1)..=(SYNCHRONY_BOUND + 10_000),
-        ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let timestamp = now + delta;
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let parent_contents = default_parent_contents();
-
+            let future_timestamp = timestamp.saturating_add(future_delta);
+            let future_contents = encode_payload(round, parent, future_timestamp);
+            let future_payload = payload_digest(&future_contents);
             assert!(matches!(
-                validate_payload(round, parent, payload, &contents, now, &parent_contents),
+                validate_payload(
+                    round,
+                    parent,
+                    future_payload,
+                    &future_contents,
+                    timestamp,
+                    &parent_contents,
+                ),
                 Err(PayloadValidationError::FutureTimestamp { .. })
             ));
         }
 
         #[test]
-        fn past_timestamp_is_accepted(
-            epoch in any::<u16>(),
-            view in any::<u16>(),
-            parent in any::<[u8; 32]>(),
-            timestamp in 0u64..=MAX_TIMESTAMP,
-            age in 0u64..=1_000_000u64,
-        ) {
-            let round = make_round(epoch, view);
-            let parent = Digest::from(parent);
-            let contents = encode_payload(round, parent, timestamp);
-            let payload = payload_digest(&contents);
-            let now = timestamp + age;
-            let parent_contents = default_parent_contents();
-
-            prop_assert!(matches!(
-                validate_payload(round, parent, payload, &contents, now, &parent_contents),
-                Ok(txs) if txs.is_empty()
-            ));
-        }
-
-        #[test]
-        fn timestamp_regression_is_rejected(
+        fn payload_timestamp_must_be_monotonic_with_parent(
             epoch in any::<u16>(),
             view in any::<u16>(),
             parent_digest in any::<[u8; 32]>(),
-            parent_ts in 1u64..=MAX_TIMESTAMP,
+            parent_ts in 1u64..=(MAX_TIMESTAMP / 2),
             regression in 1u64..=1_000u64,
-        ) {
-            let round = make_round(epoch, view);
-            let parent_digest = Digest::from(parent_digest);
-            let child_ts = parent_ts - regression;
-            let contents = encode_payload(round, parent_digest, child_ts);
-            let payload = payload_digest(&contents);
-            let now = parent_ts + SYNCHRONY_BOUND;
-
-            // Build parent payload bytes
-            let parent_round = make_round(epoch, view.wrapping_sub(1));
-            let parent_contents = encode_payload(parent_round, Digest::from([0u8; 32]), parent_ts);
-
-            assert!(matches!(
-                validate_payload(round, parent_digest, payload, &contents, now, &parent_contents),
-                Err(PayloadValidationError::TimestampRegression { .. })
-            ));
-        }
-
-        #[test]
-        fn monotonic_timestamp_is_accepted(
-            epoch in any::<u16>(),
-            view in any::<u16>(),
-            parent_digest in any::<[u8; 32]>(),
-            parent_ts in 0u64..=(MAX_TIMESTAMP / 2),
             advance in 0u64..=1_000u64,
         ) {
+            prop_assume!(regression <= parent_ts);
+
             let round = make_round(epoch, view);
             let parent_digest = Digest::from(parent_digest);
-            let child_ts = parent_ts + advance;
+            let parent_contents = parent_payload_contents(epoch, view, parent_ts);
+
+            let regressed_ts = parent_ts - regression;
+            let regressed_contents = encode_payload(round, parent_digest, regressed_ts);
+            let regressed_payload = payload_digest(&regressed_contents);
+            assert!(matches!(
+                validate_payload(
+                    round,
+                    parent_digest,
+                    regressed_payload,
+                    &regressed_contents,
+                    parent_ts.saturating_add(SYNCHRONY_BOUND),
+                    &parent_contents,
+                ),
+                Err(PayloadValidationError::TimestampRegression { .. })
+            ));
+
+            let child_ts = parent_ts.saturating_add(advance);
             let contents = encode_payload(round, parent_digest, child_ts);
             let payload = payload_digest(&contents);
-            let now = child_ts + SYNCHRONY_BOUND;
-
-            let parent_round = make_round(epoch, view.wrapping_sub(1));
-            let parent_contents = encode_payload(parent_round, Digest::from([0u8; 32]), parent_ts);
-
             prop_assert!(matches!(
-                validate_payload(round, parent_digest, payload, &contents, now, &parent_contents),
+                validate_payload(
+                    round,
+                    parent_digest,
+                    payload,
+                    &contents,
+                    child_ts.saturating_add(SYNCHRONY_BOUND),
+                    &parent_contents,
+                ),
                 Ok(txs) if txs.is_empty()
             ));
         }
@@ -869,40 +919,10 @@ mod tests {
             let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
                 minimmit_ed25519::fixture(&mut context, b"app-shard-test", 6);
 
-            let relay = Arc::new(MockShardTransport::new());
-            for participant in participants.iter() {
-                relay.declare(participant);
-            }
-            relay.finalize_validators();
-
-            let mut mailboxes = Vec::new();
-            let mut handles = Vec::new();
-            let mut finalization_txs = Vec::new();
-            for (idx, participant) in participants.iter().enumerate() {
-                let (app, finalization_tx) = Application::new(
-                    context.with_label(&format!("app_{idx}")),
-                    relay.clone(),
-                    participant,
-                    participants.clone(),
-                    format!("test_app_{idx}"),
-                );
-                let (handle, mailbox) = app.start();
-                handles.push(handle);
-                mailboxes.push(mailbox);
-                finalization_txs.push(finalization_tx);
-            }
-
+            let (_handles, mut mailboxes, _finalization_txs) =
+                start_validator_cluster(&context, &participants, "app", "test_app");
             let epoch = Epoch::new(1);
-            let mut genesis = None;
-            for mailbox in mailboxes.iter_mut() {
-                let digest = mailbox.genesis(epoch).await;
-                if let Some(existing) = genesis {
-                    assert_eq!(existing, digest);
-                } else {
-                    genesis = Some(digest);
-                }
-            }
-            let genesis = genesis.expect("genesis should be set");
+            let genesis = initialize_cluster_genesis(&mut mailboxes, epoch).await;
 
             let round = Round::new(epoch, View::new(1));
             let proposal_context = Context {
@@ -932,9 +952,6 @@ mod tests {
             let verify_rx_2 = mailboxes[2].verify(proposal_context, digest).await;
             assert!(verify_rx_2.await.expect("verify 2 should resolve"));
             assert!(verify_rx_1.await.expect("verify 1 should resolve"));
-
-            drop(handles);
-            drop(finalization_txs);
         });
     }
 
@@ -943,55 +960,26 @@ mod tests {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
         runner.start(|context| async move {
-            let relay = Arc::new(MockShardTransport::new());
             let key = PrivateKey::from_seed(42).public_key();
-            relay.declare(&key);
-            relay.finalize_validators();
-
-            let (app, _finalization_tx) = Application::new(
-                context.with_label("bootstrap_app"),
-                relay,
+            let (_handle, mut mailbox, _finalization_tx) = start_single_validator_app(
+                &context,
+                "bootstrap_app",
                 &key,
-                vec![key.clone()],
-                "bootstrap_test_partition".to_string(),
+                "bootstrap_test_partition",
+                None,
             );
-            let (_handle, mut mailbox) = app.start();
-
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
-            let root = mailbox
-                .get_state_root()
-                .await
-                .expect("state root request should not fail");
-            assert!(
-                root.is_some(),
-                "state root should be available after startup"
-            );
-
-            let proof = mailbox
-                .get_proof(genesis_object_id(0))
-                .await
-                .expect("proof request should not fail");
-            assert!(
-                proof.is_some(),
-                "genesis object should be provable from the state root"
-            );
-
-            let root = root.expect("state root should be set");
-            let proof = proof.expect("proof should exist for genesis object");
-            let expected_coin = Coin {
-                owner: key.clone(),
-                value: GENESIS_BALANCE,
-            };
-            let mut hasher = Sha256::default();
-            assert!(
-                UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
-                    &mut hasher,
-                    genesis_object_id(0),
-                    expected_coin,
-                    &proof,
-                    &root,
-                )
+            let genesis_object = genesis_object_id(0);
+            let (root, proof) = fetch_root_and_proof(&mailbox, genesis_object).await;
+            assert_coin_proof(
+                genesis_object,
+                Coin {
+                    owner: key,
+                    value: GENESIS_BALANCE,
+                },
+                &proof,
+                root,
             );
         });
     }
@@ -1002,85 +990,28 @@ mod tests {
 
         runner.start(|context| async move {
             let key = PrivateKey::from_seed(77).public_key();
-            let validators = vec![key.clone()];
-            let partition = "restart_test_partition".to_string();
+            let partition = "restart_test_partition";
 
-            let relay_a = Arc::new(MockShardTransport::new());
-            relay_a.declare(&key);
-            relay_a.finalize_validators();
-            let (app_a, _finalization_tx_a) = Application::new(
-                context.with_label("restart_app_a"),
-                relay_a,
-                &key,
-                validators.clone(),
-                partition.clone(),
-            );
-            let (app_a_handle, mut mailbox_a) = app_a.start();
+            let (app_a_handle, mut mailbox_a, _finalization_tx_a) =
+                start_single_validator_app(&context, "restart_app_a", &key, partition, None);
             let _ = mailbox_a.genesis(Epoch::new(1)).await;
 
-            let root_a = mailbox_a
-                .get_state_root()
-                .await
-                .expect("state root request should not fail")
-                .expect("state root should be set before restart");
-            let proof_a = mailbox_a
-                .get_proof(genesis_object_id(0))
-                .await
-                .expect("proof request should not fail")
-                .expect("proof should exist before restart");
-
+            let genesis_object = genesis_object_id(0);
+            let (root_a, proof_a) = fetch_root_and_proof(&mailbox_a, genesis_object).await;
             let expected_coin = Coin {
                 owner: key.clone(),
                 value: GENESIS_BALANCE,
             };
-            let mut hasher = Sha256::default();
-            assert!(
-                UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
-                    &mut hasher,
-                    genesis_object_id(0),
-                    expected_coin.clone(),
-                    &proof_a,
-                    &root_a,
-                )
-            );
+            assert_coin_proof(genesis_object, expected_coin.clone(), &proof_a, root_a);
 
             app_a_handle.abort();
             let _ = app_a_handle.await;
 
-            let relay_b = Arc::new(MockShardTransport::new());
-            relay_b.declare(&key);
-            relay_b.finalize_validators();
-            let (app_b, _finalization_tx_b) = Application::new(
-                context.with_label("restart_app_b"),
-                relay_b,
-                &key,
-                validators,
-                partition,
-            );
-            let (_app_b_handle, mailbox_b) = app_b.start();
-
-            let root_b = mailbox_b
-                .get_state_root()
-                .await
-                .expect("state root request should not fail")
-                .expect("state root should be loaded after restart");
+            let (_app_b_handle, mailbox_b, _finalization_tx_b) =
+                start_single_validator_app(&context, "restart_app_b", &key, partition, None);
+            let (root_b, proof_b) = fetch_root_and_proof(&mailbox_b, genesis_object).await;
             assert_eq!(root_a, root_b);
-
-            let proof_b = mailbox_b
-                .get_proof(genesis_object_id(0))
-                .await
-                .expect("proof request should not fail")
-                .expect("proof should exist after restart");
-            let mut hasher = Sha256::default();
-            assert!(
-                UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
-                    &mut hasher,
-                    genesis_object_id(0),
-                    expected_coin,
-                    &proof_b,
-                    &root_b,
-                )
-            );
+            assert_coin_proof(genesis_object, expected_coin, &proof_b, root_b);
         });
     }
 
@@ -1089,83 +1020,98 @@ mod tests {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
         runner.start(|context| async move {
-            let relay = Arc::new(MockShardTransport::new());
             let sender = PrivateKey::from_seed(88);
             let sender_pk = sender.public_key();
             let recipient_pk = PrivateKey::from_seed(89).public_key();
-            relay.declare(&sender_pk);
-            relay.finalize_validators();
-
-            let (app, finalization_tx) = Application::new_with_persistence_failures(
-                context.with_label("retry_worker_app"),
-                relay,
+            let (_app_handle, mut mailbox, finalization_tx) = start_single_validator_app(
+                &context,
+                "retry_worker_app",
                 &sender_pk,
-                vec![sender_pk.clone()],
-                "retry_worker_partition".to_string(),
-                2,
+                "retry_worker_partition",
+                Some(2),
             );
-            let (_app_handle, mut mailbox) = app.start();
-
-            let epoch = Epoch::new(1);
-            let genesis = mailbox.genesis(epoch).await;
-            let root_before = mailbox
-                .get_state_root()
-                .await
-                .expect("state root request should not fail")
-                .expect("genesis root should exist");
-
-            let input = genesis_object_id(0);
-            let tx = Transaction::transfer(&sender, input, recipient_pk.clone(), 1);
-            let tx_digest = Sha256::hash(&tx.encode());
-            let recipient_output = output_object_id(&tx_digest, 0);
-            mailbox.submit_tx(tx).await;
-
-            let proposal_context = Context {
-                round: Round::new(epoch, View::new(1)),
-                leader: sender_pk.clone(),
-                parent: (View::zero(), genesis),
-            };
-            let payload = mailbox
-                .propose(proposal_context)
-                .await
-                .await
-                .expect("proposal should resolve");
-            finalization_tx
-                .unbounded_send(FinalizationNotice {
-                    payload,
-                    parent_payload: genesis,
-                })
-                .expect("finalization should enqueue");
+            let finalized = submit_transfer_and_finalize(
+                &mut mailbox,
+                &finalization_tx,
+                &sender,
+                &recipient_pk,
+            )
+            .await;
 
             // Retries are timer-driven (50ms base with exponential backoff). No additional
             // finalization events are sent here.
             context.sleep(Duration::from_secs(1)).await;
 
-            let root_after = mailbox
-                .get_state_root()
-                .await
-                .expect("state root request should not fail")
-                .expect("state root should be updated after retries");
-            assert_ne!(root_before, root_after);
+            let (root_after, proof) =
+                fetch_root_and_proof(&mailbox, finalized.recipient_output).await;
+            assert_ne!(finalized.root_before, root_after);
+            assert_coin_proof(
+                finalized.recipient_output,
+                Coin {
+                    owner: recipient_pk,
+                    value: 1,
+                },
+                &proof,
+                root_after,
+            );
+        });
+    }
 
-            let proof = mailbox
-                .get_proof(recipient_output)
-                .await
-                .expect("proof request should not fail")
-                .expect("recipient output proof should exist");
-            let expected_coin = Coin {
-                owner: recipient_pk,
-                value: 1,
-            };
-            let mut hasher = Sha256::default();
-            assert!(
-                UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
-                    &mut hasher,
-                    recipient_output,
-                    expected_coin,
-                    &proof,
-                    &root_after,
-                )
+    #[test]
+    fn durable_queue_replays_unapplied_finalization_after_restart() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let sender = PrivateKey::from_seed(188);
+            let sender_pk = sender.public_key();
+            let recipient_pk = PrivateKey::from_seed(189).public_key();
+            let partition = "durable_queue_restart_partition";
+
+            let (app_a_handle, mut mailbox_a, finalization_tx_a) = start_single_validator_app(
+                &context,
+                "durable_queue_app_a",
+                &sender_pk,
+                partition,
+                Some(100),
+            );
+            let finalized = submit_transfer_and_finalize(
+                &mut mailbox_a,
+                &finalization_tx_a,
+                &sender,
+                &recipient_pk,
+            )
+            .await;
+
+            context.sleep(Duration::from_millis(100)).await;
+            let root_during_failures = fetch_root(&mailbox_a).await;
+            assert_eq!(finalized.root_before, root_during_failures);
+
+            app_a_handle.abort();
+            let _ = app_a_handle.await;
+
+            let (_app_b_handle, mailbox_b, _finalization_tx_b) = start_single_validator_app(
+                &context,
+                "durable_queue_app_b",
+                &sender_pk,
+                partition,
+                None,
+            );
+
+            // No new finalization events are sent after restart. Recovery should come
+            // from the durable queue entry left by the first process.
+            context.sleep(Duration::from_secs(1)).await;
+
+            let (root_after, proof) =
+                fetch_root_and_proof(&mailbox_b, finalized.recipient_output).await;
+            assert_ne!(finalized.root_before, root_after);
+            assert_coin_proof(
+                finalized.recipient_output,
+                Coin {
+                    owner: recipient_pk,
+                    value: 1,
+                },
+                &proof,
+                root_after,
             );
         });
     }
