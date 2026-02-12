@@ -16,9 +16,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-catgrad = { git = "https://github.com/hellas-ai/catgrad", default-features = false, features = ["serde", "ndarray-backend"] }
-catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", default-features = false }
+catgrad = { workspace = true, default-features = false, features = ["serde", "ndarray-backend"] }
+catgrad-llm = { workspace = true, default-features = false }
 hf-hub = "0.4"
 tokenizers = "0.21"
-minijinja = "2.11"
-minijinja-contrib = { version = "2.11", features = ["pycompat"] }

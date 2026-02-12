@@ -17,13 +17,14 @@ repository = "https://github.com/hellas-ai/node"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
+catgrad = { path = "../catgrad/catgrad", default-features = false, features = ["serde", "ndarray-backend"] }
+catgrad-llm = { path = "../catgrad/catgrad-llm", default-features = false }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = "0.14"
-tonic-iroh-transport = "0.2"
-# tonic-iroh-transport = {path = "../tonic-iroh" }
-hellas-rpc = { path = "crates/rpc" }
+tonic-iroh-transport = { version = "0.3", default-features = false }
+hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-executor = { path = "crates/executor" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

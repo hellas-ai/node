@@ -4,7 +4,6 @@ extern crate tracing;
 use clap::{Parser, Subcommand};
 use tonic_iroh_transport::iroh::EndpointId;
 
-mod bootstrap_peers;
 mod commands;
 
 #[derive(Parser)]
@@ -20,11 +19,7 @@ struct Cli {
 enum Commands {
     #[cfg(feature = "serve")]
     /// Run the RPC server
-    Serve {
-        /// Enable discovery (LAN mDNS + internet discovery via pkarr/DNS + DHT).
-        #[arg(long, default_value_t = false)]
-        discovery: bool,
-    },
+    Serve,
     /// Check health of a remote node
     Health {
         /// Node ID to check
@@ -55,14 +50,15 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+                .add_directive("netlink_packet_route=error".parse().unwrap()),
         )
         .init();
 
     let cli = Cli::parse();
     let result = match cli.command {
         #[cfg(feature = "serve")]
-        Commands::Serve { discovery } => commands::serve::run(discovery).await,
+        Commands::Serve => commands::serve::run().await,
         Commands::Health { node_id } => commands::health::run(node_id).await,
         Commands::Execute {
             node_id,
