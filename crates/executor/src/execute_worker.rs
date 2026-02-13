@@ -102,7 +102,10 @@ fn worker_loop(
         let _busy_guard = BusyGuard { busy: busy.clone() };
         let exec_id = job.execution_id.clone();
 
-        let outcome = std::panic::catch_unwind(|| run_job(job, executor_tx.clone()));
+        // Candle backend types are not `UnwindSafe`; treat panic as job failure and continue.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_job(job, executor_tx.clone())
+        }));
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {

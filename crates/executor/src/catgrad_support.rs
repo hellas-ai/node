@@ -1,6 +1,7 @@
+use crate::backend::create_backend;
 use crate::weights::ModelBundle;
 use crate::ExecutorError;
-use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend, Backend, Interpreter};
+use catgrad::interpreter::{self, Backend, Interpreter};
 use catgrad::prelude::*;
 use catgrad_llm::utils::{get_model, render_chat_template};
 use tracing::warn;
@@ -67,7 +68,7 @@ pub fn run_graph_streaming(
 ) -> Result<(), ExecutorError> {
     use catgrad_llm::LLMError;
 
-    let backend = NdArrayBackend;
+    let backend = create_backend();
     let config = &bundle.config;
     let tokenizer = &bundle.tokenizer;
     let parameter_values = &bundle.parameter_values;

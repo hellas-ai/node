@@ -1,24 +1,28 @@
 #[macro_use]
 extern crate tracing;
 
+mod backend;
 pub mod catgrad_support;
+mod dispatch;
 mod error;
 mod execute_worker;
+mod progress;
+mod quote;
 mod state;
 mod weights;
 
 pub use error::ExecutorError;
 pub use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
 
-use execute_worker::{ExecuteJob, ExecuteWorker, ExecuteWorkerError};
-use state::{ExecutionPlan, ExecutionStatus, ExecutorState, StateError};
-use weights::{default_ref_cached, EnsureDisposition, ModelId, WeightsManager};
+use execute_worker::ExecuteWorker;
+use state::{ExecutionStatus, ExecutorState, StateError};
+use weights::WeightsManager;
 
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
-    get_quote_request, ExecuteProgress, ExecuteRequest, ExecuteResponse, ExecuteResultRequest,
-    ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse, GetGraphRequest,
-    GetGraphResponse, GetQuoteRequest, GetQuoteResponse, WeightsHint as RpcWeightsHint,
+    ExecuteProgress, ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
+    ExecuteStatusRequest, ExecuteStatusResponse, GetGraphRequest, GetGraphResponse,
+    GetQuoteRequest, GetQuoteResponse,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -27,7 +31,7 @@ use tokio_stream::StreamExt;
 use tonic::Status as TonicStatus;
 use tonic::{Request, Response, Status};
 
-const DEFAULT_MAX_SEQ: u32 = 16;
+pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;
 
 enum ExecutorMessage {
     Quote {
@@ -81,6 +85,7 @@ pub struct Executor {
 impl Executor {
     pub fn spawn() -> ExecutorHandle {
         let (tx, rx) = mpsc::unbounded_channel();
+        let _ = crate::backend::create_backend();
         let weights = WeightsManager::spawn();
         let execute_worker = ExecuteWorker::spawn(tx.clone());
         let executor = Self {
@@ -159,238 +164,6 @@ impl Executor {
         Ok(GetGraphResponse { graph })
     }
 
-    fn handle_subscribe(
-        &mut self,
-        execution_id: String,
-    ) -> Result<(ExecuteProgress, mpsc::UnboundedReceiver<ExecuteProgress>), ExecutorError> {
-        // Validate existence and grab current snapshot
-        let status = *self.state.get_status(&execution_id)?;
-        let progress = self.state.get_progress(&execution_id).unwrap_or(0);
-
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        // Only keep watchers alive when more updates are expected
-        if !matches!(status, ExecutionStatus::Completed | ExecutionStatus::Failed) {
-            self.watchers.entry(execution_id).or_default().push(tx);
-        }
-
-        Ok((
-            ExecuteProgress {
-                status: status.as_str().to_string(),
-                progress,
-                chunk: Vec::new(),
-                decoded: None,
-            },
-            rx,
-        ))
-    }
-
-    async fn handle_quote(
-        &mut self,
-        request: GetQuoteRequest,
-    ) -> Result<GetQuoteResponse, ExecutorError> {
-        let payload = request.payload.ok_or(ExecutorError::MissingPayload)?;
-
-        enum QuoteKind {
-            Graph,
-            Llm { model_id: String, max_seq: u32 },
-        }
-
-        let (graph, input, weights_hint, max_seq, kind) = match payload {
-            get_quote_request::Payload::Graph(graph) => (
-                graph,
-                String::new(),
-                None,
-                DEFAULT_MAX_SEQ,
-                QuoteKind::Graph,
-            ),
-            get_quote_request::Payload::LlmPrompt(llm) => {
-                let max_seq = if llm.max_seq == 0 {
-                    DEFAULT_MAX_SEQ
-                } else {
-                    llm.max_seq
-                };
-
-                let model_id = llm.huggingface_model_id.clone();
-                let model_id_typed = ModelId(model_id.clone());
-                let disposition = self
-                    .weights
-                    .ensure_default_ready(model_id_typed.clone())
-                    .await;
-
-                let key = match disposition {
-                    EnsureDisposition::Ready(key) => key,
-                    EnsureDisposition::Queued | EnsureDisposition::InFlight => {
-                        if default_ref_cached(&model_id) {
-                            let key = self
-                                .weights
-                                .ensure_default_ready_wait(
-                                    model_id_typed,
-                                    tokio::time::Duration::from_secs(2),
-                                )
-                                .await
-                                .map_err(|e| match e {
-                                    weights::WeightsError::NotReady => {
-                                        ExecutorError::WeightsNotReady(model_id.clone())
-                                    }
-                                    other => ExecutorError::WeightsError(other.to_string()),
-                                })?;
-                            key
-                        } else {
-                            return Err(ExecutorError::WeightsNotReady(model_id));
-                        }
-                    }
-                    EnsureDisposition::Failed(err) => {
-                        return Err(ExecutorError::WeightsError(err));
-                    }
-                };
-
-                let bundle = self
-                    .weights
-                    .bundle(&key)
-                    .await
-                    .map_err(|e| ExecutorError::WeightsError(e.to_string()))?;
-
-                let (graph_bytes, templated_input) = catgrad_support::build_graph_from_llm_prompt(
-                    bundle.as_ref(),
-                    &llm.prompt,
-                    max_seq,
-                )?;
-
-                (
-                    graph_bytes,
-                    templated_input,
-                    Some(key),
-                    max_seq,
-                    QuoteKind::Llm { model_id, max_seq },
-                )
-            }
-        };
-
-        let plan = ExecutionPlan {
-            graph: graph.clone(),
-            weights_hint: weights_hint.clone(),
-            input: input.clone(),
-            max_seq,
-        };
-        let graph_id = format!("{:x}", simple_hash(&graph));
-        let amount = 1000; // stub
-        let quote_id = self.state.create_quote(graph_id.clone(), plan);
-
-        match kind {
-            QuoteKind::Graph => {
-                info!(%quote_id, %graph_id, amount, "quoted raw graph");
-            }
-            QuoteKind::Llm { model_id, max_seq } => {
-                info!(
-                    %quote_id,
-                    %graph_id,
-                    amount,
-                    model = model_id,
-                    max_seq,
-                    input_len = input.len(),
-                    "quoted llm prompt"
-                );
-            }
-        }
-
-        Ok(GetQuoteResponse {
-            quote_id,
-            graph_id,
-            amount,
-            input,
-            resolved_weights: weights_hint.map(|hint| RpcWeightsHint {
-                huggingface_model_id: hint.model_id.0,
-                revision: hint.revision.0,
-            }),
-        })
-    }
-
-    async fn handle_execute(
-        &mut self,
-        request: ExecuteRequest,
-    ) -> Result<ExecuteResponse, ExecutorError> {
-        let quote_id = request.quote_id;
-        let plan = self.state.get_quote(&quote_id)?.plan.clone();
-
-        if self.execute_worker.is_busy() {
-            return Err(ExecutorError::Busy);
-        }
-
-        let bundle = match plan.weights_hint.clone() {
-            Some(key) => Some(self.weights.bundle(&key).await.map_err(|e| match e {
-                weights::WeightsError::NotReady => {
-                    ExecutorError::WeightsNotReady(key.model_id.0.clone())
-                }
-                weights::WeightsError::Failed(msg) => ExecutorError::WeightsError(msg),
-                other => ExecutorError::WeightsError(other.to_string()),
-            })?),
-            None => None,
-        };
-
-        let reservation = self.execute_worker.reserve().map_err(|e| match e {
-            ExecuteWorkerError::Busy => ExecutorError::Busy,
-            ExecuteWorkerError::Stopped => ExecutorError::ChannelClosed,
-        })?;
-
-        let execution_id = self.state.create_execution(quote_id.clone())?;
-        self.state
-            .set_status(&execution_id, ExecutionStatus::Running)?;
-
-        info!(
-            %execution_id,
-            %quote_id,
-            input_len = plan.input.len(),
-            "starting execution"
-        );
-
-        reservation
-            .enqueue(ExecuteJob {
-                execution_id: execution_id.clone(),
-                plan,
-                bundle,
-            })
-            .map_err(|e| match e {
-                ExecuteWorkerError::Busy => ExecutorError::Busy,
-                ExecuteWorkerError::Stopped => ExecutorError::ChannelClosed,
-            })?;
-
-        Ok(ExecuteResponse {
-            execution_id,
-            quote_id,
-        })
-    }
-
-    fn handle_complete(
-        &mut self,
-        execution_id: String,
-        result: Option<Vec<u8>>,
-        decoded: Option<String>,
-        success: bool,
-    ) {
-        let status = if success {
-            ExecutionStatus::Completed
-        } else {
-            ExecutionStatus::Failed
-        };
-        info!(
-            %execution_id,
-            success,
-            decoded_len = decoded.as_ref().map(|s| s.len()).unwrap_or(0),
-            "execution finished"
-        );
-        if let Err(e) = self.state.set_status(&execution_id, status) {
-            warn!("failed to set status for {execution_id}: {e}");
-            return;
-        }
-        if let Some(result) = result {
-            if let Err(e) = self.state.set_result(&execution_id, result, decoded) {
-                warn!("failed to set result for {execution_id}: {e}");
-            }
-        }
-        self.send_status(&execution_id, status);
-    }
-
     fn handle_status(
         &self,
         request: ExecuteStatusRequest,
@@ -427,36 +200,6 @@ impl Executor {
             result: result.to_vec(),
             decoded: decoded.to_string(),
         })
-    }
-
-    fn send_progress(
-        &mut self,
-        execution_id: &str,
-        status: ExecutionStatus,
-        progress: u64,
-        chunk: Vec<u8>,
-        decoded: Option<String>,
-    ) {
-        if let Some(watchers) = self.watchers.get_mut(execution_id) {
-            watchers.retain(|tx| {
-                tx.send(ExecuteProgress {
-                    status: status.as_str().to_string(),
-                    progress,
-                    chunk: chunk.clone(),
-                    decoded: decoded.clone(),
-                })
-                .is_ok()
-            });
-
-            if matches!(status, ExecutionStatus::Completed | ExecutionStatus::Failed) {
-                self.watchers.remove(execution_id);
-            }
-        }
-    }
-
-    fn send_status(&mut self, execution_id: &str, status: ExecutionStatus) {
-        let progress = self.state.get_progress(execution_id).unwrap_or(0);
-        self.send_progress(execution_id, status, progress, Vec::new(), None);
     }
 }
 
@@ -574,17 +317,11 @@ impl Execute for ExecutorHandle {
     }
 }
 
-fn simple_hash(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        hash = hash.wrapping_add((byte as u64).wrapping_mul(31_u64.wrapping_pow(i as u32)));
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ExecutionPlan;
+    use hellas_rpc::pb::hellas::get_quote_request;
 
     #[tokio::test]
     async fn quote_and_execute() {
