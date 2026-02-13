@@ -177,6 +177,24 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         queue_position: Option<u64>,
         label: &str,
     ) -> Result<Digest, Fatal> {
+        // QMDB advances an internal sequence on every commit, changing the
+        // Merkle root even when the batch is empty.  Skip the commit entirely
+        // when there are no state changes to preserve root determinism across
+        // validators with different persistence queue depths.
+        if batch.is_empty() {
+            if let Some(pos) = queue_position {
+                self.cursor_index.put(
+                    *QUEUE_CURSOR_KEY,
+                    pos.to_le_bytes().to_vec(),
+                );
+                self.cursor_index.sync().await.map_err(|err| {
+                    Fatal(format!("queue cursor sync failed for {label}: {err:?}"))
+                })?;
+                self.last_committed_position = Some(pos);
+            }
+            return Ok(self.root());
+        }
+
         let db = self
             .db
             .take()

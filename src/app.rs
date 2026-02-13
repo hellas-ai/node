@@ -1496,6 +1496,65 @@ mod tests {
         });
     }
 
+    /// QMDB empty commits still change the root.
+    ///
+    /// Even when the write batch is empty and metadata is `None`, each
+    /// `into_mutable → write_batch([]) → commit(None) → into_merkleized`
+    /// cycle advances an internal sequence number that is hashed into the
+    /// Merkle root.  This means that nodes with different persistence
+    /// queue depths will diverge even when no state has changed.
+    ///
+    /// The persistence layer must therefore **skip the QMDB commit when
+    /// the diff batch is empty**, preserving root determinism.
+    #[test_log::test]
+    fn empty_commit_changes_root() {
+        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
+        use crate::execution::genesis_state;
+
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let validators: Vec<PublicKey> = (0..6)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+
+            let cfg = utxo_db_config(
+                &context,
+                "empty_commit",
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let mut db = UtxoDb::init(context.with_label("empty_commit"), cfg)
+                .await
+                .expect("db init");
+
+            // Bootstrap genesis.
+            let genesis = genesis_state(&validators);
+            let batch: Vec<(ObjectId, Option<Coin>)> = genesis
+                .created
+                .iter()
+                .map(|(id, coin)| (*id, Some(coin.clone())))
+                .collect();
+            let mut m = db.into_mutable();
+            m.write_batch(batch).await.unwrap();
+            let (d, _) = m.commit(None).await.unwrap();
+            db = d.into_merkleized().await.unwrap();
+            let root_before = db.root();
+
+            // Empty commit — no writes, no metadata.
+            let mut m = db.into_mutable();
+            m.write_batch(Vec::<(ObjectId, Option<Coin>)>::new()).await.unwrap();
+            let (d, _) = m.commit(None).await.unwrap();
+            db = d.into_merkleized().await.unwrap();
+            let root_after = db.root();
+
+            assert_ne!(
+                root_before, root_after,
+                "empty QMDB commit changes the root (internal sequence is hashed)"
+            );
+        });
+    }
+
     /// After persisting a finalization (genesis + one transfer), restarting the
     /// Application from the same partition must recover the identical state root.
     #[test_log::test]
