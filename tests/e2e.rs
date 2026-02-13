@@ -47,11 +47,48 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Clone, Copy)]
 struct SubmitTransfer {
     sender: usize,
     recipient: usize,
     amount: u64,
+}
+
+fn assert_sustained_progress(
+    scenario: &str,
+    handles: &[(Finalizations, Faults)],
+    min_per_validator: usize,
+    min_total: usize,
+    min_validators_at_or_above: usize,
+) {
+    let per_validator_finalizations: Vec<usize> = handles
+        .iter()
+        .map(|(finalizations, _)| finalizations.lock().unwrap().len())
+        .collect();
+    let total_finalizations: usize = per_validator_finalizations.iter().sum();
+    let validators_at_or_above = per_validator_finalizations
+        .iter()
+        .filter(|count| **count >= min_per_validator)
+        .count();
+
+    println!(
+        "{scenario} sustained progress: total_finalizations={total_finalizations}, per_validator_finalizations={per_validator_finalizations:?}, min_per_validator={min_per_validator}, min_total={min_total}, min_validators_at_or_above={min_validators_at_or_above}, validators_at_or_above={validators_at_or_above}"
+    );
+    assert!(
+        total_finalizations >= min_total,
+        "{scenario}: expected sustained progress with total_finalizations >= {min_total}, got {total_finalizations}"
+    );
+    assert!(
+        validators_at_or_above >= min_validators_at_or_above,
+        "{scenario}: expected at least {min_validators_at_or_above} validators to reach {min_per_validator} finalizations, got {validators_at_or_above} (per-validator {per_validator_finalizations:?})"
+    );
 }
 
 fn run_network(
@@ -314,18 +351,28 @@ fn run_network(
 
 #[test_log::test]
 fn healthy_network_finalizes() {
+    let duration_secs = env_u64("E2E_HEALTHY_DURATION_SECS", 12);
+    let min_per_validator = env_usize("E2E_HEALTHY_MIN_PER_VALIDATOR", 12);
+    let min_validators = env_usize("E2E_HEALTHY_MIN_VALIDATORS", N as usize);
+    let min_total = env_usize("E2E_HEALTHY_MIN_TOTAL", min_per_validator * min_validators);
     let link = Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
         success_rate: 1.0,
     };
 
-    let handles = run_network(Config::test(), link, Duration::from_secs(3), None);
-
-    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
-    assert!(
-        total_finalizations > 0,
-        "expected at least one finalization across all validators"
+    let handles = run_network(
+        Config::test(),
+        link,
+        Duration::from_secs(duration_secs),
+        None,
+    );
+    assert_sustained_progress(
+        "healthy",
+        &handles,
+        min_per_validator,
+        min_total,
+        min_validators,
     );
 
     for (_, faults) in &handles {
@@ -338,6 +385,10 @@ fn healthy_network_finalizes() {
 fn lossy_network_finalizes() {
     let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.9);
     let duration_secs = env_u64("E2E_LOSSY_DURATION_SECS", 10);
+    let default_min_validators = (N as usize).saturating_mul(2) / 3;
+    let min_per_validator = env_usize("E2E_LOSSY_MIN_PER_VALIDATOR", 8);
+    let min_validators = env_usize("E2E_LOSSY_MIN_VALIDATORS", default_min_validators);
+    let min_total = env_usize("E2E_LOSSY_MIN_TOTAL", min_per_validator * min_validators);
     let link = Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(5),
@@ -351,7 +402,6 @@ fn lossy_network_finalizes() {
         None,
     );
 
-    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
     let per_validator_finalizations: Vec<usize> = handles
         .iter()
         .map(|(finalizations, _)| finalizations.lock().unwrap().len())
@@ -368,16 +418,23 @@ fn lossy_network_finalizes() {
         })
         .collect();
     println!(
-        "lossy e2e summary: success_rate={success_rate:.3}, duration_secs={duration_secs}, total_finalizations={total_finalizations}, per_validator_finalizations={per_validator_finalizations:?}, per_validator_fault_views={per_validator_fault_views:?}"
+        "lossy e2e summary: success_rate={success_rate:.3}, duration_secs={duration_secs}, per_validator_finalizations={per_validator_finalizations:?}, per_validator_fault_views={per_validator_fault_views:?}"
     );
-    assert!(
-        total_finalizations > 0,
-        "expected at least one finalization even with lossy network"
+    assert_sustained_progress(
+        "lossy",
+        &handles,
+        min_per_validator,
+        min_total,
+        min_validators,
     );
 }
 
 #[test_log::test]
 fn submitted_transfer_network_finalizes() {
+    let duration_secs = env_u64("E2E_TRANSFER_DURATION_SECS", 10);
+    let min_per_validator = env_usize("E2E_TRANSFER_MIN_PER_VALIDATOR", 8);
+    let min_validators = env_usize("E2E_TRANSFER_MIN_VALIDATORS", N as usize);
+    let min_total = env_usize("E2E_TRANSFER_MIN_TOTAL", min_per_validator * min_validators);
     let link = Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
@@ -387,17 +444,18 @@ fn submitted_transfer_network_finalizes() {
     let handles = run_network(
         Config::test(),
         link,
-        Duration::from_secs(10),
+        Duration::from_secs(duration_secs),
         Some(SubmitTransfer {
             sender: 0,
             recipient: 1,
             amount: 1,
         }),
     );
-
-    let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
-    assert!(
-        total_finalizations > 0,
-        "expected finalization progress with submitted transfer"
+    assert_sustained_progress(
+        "submitted_transfer",
+        &handles,
+        min_per_validator,
+        min_total,
+        min_validators,
     );
 }
