@@ -13,6 +13,8 @@ use std::sync::Arc;
 #[cfg(feature = "discovery")]
 use tokio::time::Duration;
 #[cfg(feature = "discovery")]
+use tonic::Code;
+#[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 #[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
@@ -63,10 +65,30 @@ pub async fn run(
         .await
         .context("failed to create iroh endpoint")?;
 
-    let channel = match node_id {
-        Some(id) => ExecuteService::connect(&endpoint, id.into())
-            .await
-            .with_context(|| format!("failed to connect to node {id}"))?,
+    let quote_req = GetQuoteRequest {
+        payload: Some(get_quote_request::Payload::LlmPrompt(LlmQuoteRequest {
+            huggingface_model_id: model.clone(),
+            prompt: prompt.clone(),
+            max_seq,
+        })),
+    };
+    info!("Getting quote... {quote_req:?}");
+
+    let (mut client, quote) = match node_id {
+        Some(id) => {
+            let channel = ExecuteService::connect(&endpoint, id.into())
+                .await
+                .with_context(|| format!("failed to connect to node {id}"))?;
+            let mut client = ExecuteClient::new(channel)
+                .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+                .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+            let quote = client
+                .get_quote(quote_req.clone())
+                .await
+                .context("GetQuote RPC failed")?
+                .into_inner();
+            (client, quote)
+        }
         None => {
             #[cfg(feature = "discovery")]
             {
@@ -99,12 +121,66 @@ pub async fn run(
                 let mut registry = ServiceRegistry::new(&endpoint);
                 registry.add(MdnsBackend::new(mdns));
                 registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
-                registry
+
+                let mut locator = registry
                     .find::<ExecuteService>()
                     .timeout(DISCOVERY_TIMEOUT)
-                    .first()
-                    .await
-                    .context("failed to discover and connect to executor")?
+                    .start();
+
+                let mut ready_client_quote = None;
+                let mut not_ready_count = 0usize;
+                let mut discovery_errors = 0usize;
+                let mut quote_errors = 0usize;
+
+                while let Some(next_channel) = tokio_stream::StreamExt::next(&mut locator).await {
+                    let channel = match next_channel {
+                        Ok(channel) => channel,
+                        Err(err) => {
+                            discovery_errors += 1;
+                            debug!("discovered candidate failed to connect: {err:#}");
+                            continue;
+                        }
+                    };
+
+                    let mut candidate = ExecuteClient::new(channel)
+                        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+                        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+
+                    match candidate.get_quote(quote_req.clone()).await {
+                        Ok(resp) => {
+                            ready_client_quote = Some((candidate, resp.into_inner()));
+                            break;
+                        }
+                        Err(status) => {
+                            let is_weights_not_ready = status.code() == Code::FailedPrecondition;
+                            if is_weights_not_ready {
+                                not_ready_count += 1;
+                                info!(
+                                    model = %model,
+                                    "discovered executor missing requested weights, trying next provider"
+                                );
+                                continue;
+                            }
+
+                            quote_errors += 1;
+                            debug!("discovered executor rejected quote: {status}");
+                        }
+                    }
+                }
+
+                match ready_client_quote {
+                    Some((client, quote)) => (client, quote),
+                    None => {
+                        if not_ready_count > 0 {
+                            anyhow::bail!(
+                                "no discovered executor had weights ready for model {model} (not_ready={not_ready_count}, discovery_errors={discovery_errors}, quote_errors={quote_errors})"
+                            );
+                        }
+                        anyhow::bail!(
+                            "failed to discover an executor that can serve the request (discovery_errors={discovery_errors}, quote_errors={quote_errors})"
+                        );
+                    }
+                }
             }
             #[cfg(not(feature = "discovery"))]
             {
@@ -114,25 +190,6 @@ pub async fn run(
             }
         }
     };
-
-    let mut client = ExecuteClient::new(channel)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-
-    // 1. Get quote
-    let req = GetQuoteRequest {
-        payload: Some(get_quote_request::Payload::LlmPrompt(LlmQuoteRequest {
-            huggingface_model_id: model.clone(),
-            prompt: prompt.clone(),
-            max_seq,
-        })),
-    };
-    info!("Getting quote... {req:?}");
-    let quote = client
-        .get_quote(req)
-        .await
-        .context("GetQuote RPC failed")?
-        .into_inner();
 
     info!("Got quote: {quote:?}");
 

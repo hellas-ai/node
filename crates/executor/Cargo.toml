@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = ["catgrad/candle-backend"]
+candle-cuda = ["catgrad/candle-backend", "catgrad/cuda"]
+candle-metal = ["catgrad/candle-backend", "catgrad/metal"]
+
 [dependencies]
 hellas-rpc = { workspace = true, features = ["server"] }
 tokio = { workspace = true }
@@ -16,7 +21,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-catgrad = { workspace = true, default-features = false, features = ["serde", "ndarray-backend"] }
+catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
 hf-hub = "0.4"
 tokenizers = "0.21"

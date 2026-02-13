@@ -1,5 +1,6 @@
+use crate::backend::{create_backend, ExecBackend};
 use crate::ExecutorError;
-use catgrad::interpreter::{self, backend::ndarray::NdArrayBackend};
+use catgrad::interpreter::{self};
 use catgrad::typecheck;
 use catgrad_llm::utils::{get_model_chat_template, get_model_files, load_model};
 use hf_hub::Cache;
@@ -32,7 +33,7 @@ pub struct ModelBundle {
     pub config: serde_json::Value,
     pub tokenizer: Tokenizer,
     pub chat_template: Option<String>,
-    pub parameter_values: interpreter::Parameters<NdArrayBackend>,
+    pub parameter_values: interpreter::Parameters<ExecBackend>,
     pub parameter_types: typecheck::Parameters,
 }
 
@@ -378,7 +379,7 @@ fn load_default_bundle(
     model_id: &ModelId,
     job_tx: mpsc::UnboundedSender<JobEvent>,
 ) -> Result<(), ExecutorError> {
-    let backend = NdArrayBackend;
+    let backend = create_backend();
 
     // Ensure at least config is present and derive the resolved snapshot SHA from its path.
     let (_weights, config_path, _tokenizer_path, _tok_config) =
