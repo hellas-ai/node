@@ -21,6 +21,7 @@ use indexmap::IndexMap;
 use std::{
     collections::VecDeque,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    sync::LazyLock,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +90,155 @@ type AnchorIndex<E> = Metadata<E, U64, Vec<u8>>;
 type FinalizationIndex<E> = Metadata<E, Digest, Vec<u8>>;
 type PayloadIndex<E> = Metadata<E, Digest, Vec<u8>>;
 
+/// Ed25519 basepoint (RFC 8032 §5.1) — always a valid public key.
+static QUEUE_CURSOR_OWNER: LazyLock<PublicKey> = LazyLock::new(|| {
+    let bytes: [u8; 32] = [
+        0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+    ];
+    PublicKey::read(&mut bytes.as_slice())
+        .expect("ed25519 basepoint is always valid")
+});
+
+/// Safe wrapper around [`UtxoDb`] that encapsulates the QMDB type-state
+/// machine and provides crash-safe commit semantics.
+///
+/// Every commit atomically records the originating queue position in the
+/// QMDB journal metadata.  On restart, [`was_committed`] lets callers
+/// skip queue items that were already applied before a crash.
+struct UtxoStore<E: Clock + Spawner + Storage + Metrics + BufferPooler> {
+    db: Option<UtxoDb<E>>,
+    last_committed_position: Option<u64>,
+}
+
+impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
+    async fn init(
+        context: &mut E,
+        partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+    ) -> Result<Self, Fatal> {
+        let config = utxo_db_config(
+            context,
+            partition_prefix,
+            page_cache_config.size,
+            page_cache_config.count,
+        );
+        let db = UtxoDb::init(context.with_label("utxo_db"), config)
+            .await
+            .map_err(|err| Fatal(format!("QMDB initialization failed: {err:?}")))?;
+
+        let last_committed_position = if db.is_empty() {
+            None
+        } else {
+            match db.get_metadata().await {
+                Ok(Some(coin)) => Some(coin.value),
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(Fatal(format!("QMDB get_metadata failed: {err:?}")))
+                }
+            }
+        };
+
+        Ok(Self {
+            db: Some(db),
+            last_committed_position,
+        })
+    }
+
+    fn was_committed(&self, queue_position: u64) -> bool {
+        self.last_committed_position
+            .is_some_and(|last| queue_position <= last)
+    }
+
+    fn diffs_to_batch(
+        created: &[(ObjectId, Coin)],
+        deleted: &[ObjectId],
+    ) -> Vec<(ObjectId, Option<Coin>)> {
+        deleted
+            .iter()
+            .map(|id| (*id, None))
+            .chain(created.iter().map(|(id, coin)| (*id, Some(coin.clone()))))
+            .collect()
+    }
+
+    async fn apply_diffs(
+        &mut self,
+        batch: Vec<(ObjectId, Option<Coin>)>,
+        queue_position: Option<u64>,
+        label: &str,
+    ) -> Result<Digest, Fatal> {
+        let db = self
+            .db
+            .take()
+            .expect("db is always present outside apply_diffs");
+
+        let metadata = queue_position.map(|pos| Coin {
+            owner: QUEUE_CURSOR_OWNER.clone(),
+            value: pos,
+        });
+
+        let mut db = db.into_mutable();
+
+        db.write_batch(batch).await.map_err(|err| {
+            Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
+        })?;
+
+        let (db, _range) = db.commit(metadata).await.map_err(|err| {
+            Fatal(format!("QMDB commit failed for {label}: {err:?}"))
+        })?;
+
+        let db = db.into_merkleized().await.map_err(|err| {
+            Fatal(format!("QMDB merkleize failed for {label}: {err:?}"))
+        })?;
+
+        let root = db.root();
+
+        if let Some(pos) = queue_position {
+            self.last_committed_position = Some(pos);
+        }
+        self.db = Some(db);
+        Ok(root)
+    }
+
+    fn root(&self) -> Digest {
+        self.db
+            .as_ref()
+            .expect("db is always present outside apply_diffs")
+            .root()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.db
+            .as_ref()
+            .expect("db is always present outside apply_diffs")
+            .is_empty()
+    }
+
+    async fn key_value_proof(
+        &self,
+        hasher: &mut Sha256,
+        object: ObjectId,
+    ) -> Option<mailbox::ProofResponse> {
+        self.db
+            .as_ref()
+            .expect("db is always present outside apply_diffs")
+            .key_value_proof(hasher, object)
+            .await
+            .ok()
+    }
+
+    async fn sync(&mut self) -> Result<(), Fatal> {
+        self.db
+            .as_mut()
+            .expect("db is always present outside apply_diffs")
+            .sync()
+            .await
+            .map_err(|err| Fatal(format!("QMDB sync failed: {err:?}")))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AnchorEntry {
     sequence: u64,
@@ -103,7 +253,7 @@ where
     command_rx: mpsc::UnboundedReceiver<Traced<PersistenceCommand>>,
     event_tx: mpsc::UnboundedSender<Traced<PersistenceEvent>>,
     metrics: PersistenceMetrics,
-    db: UtxoDb<E>,
+    store: UtxoStore<E>,
     queue: PersistenceQueue<E>,
     anchor_index: AnchorIndex<E>,
     anchor_history: VecDeque<AnchorEntry>,
@@ -139,24 +289,24 @@ where
         metrics: PersistenceMetrics,
     ) -> Result<Self, Fatal> {
         let queue = Self::initialize_queue(context, &partition_prefix, page_cache_config).await?;
-        let mut db = Self::initialize_db(context, &partition_prefix, page_cache_config).await?;
+        let mut store = UtxoStore::init(context, &partition_prefix, page_cache_config).await?;
         let (anchor_index, anchor_history, next_anchor_sequence) =
             Self::initialize_anchor_index(context, &partition_prefix).await?;
         let finalization_index =
             Self::initialize_finalization_index(context, &partition_prefix).await?;
         let payload_index = Self::initialize_payload_index(context, &partition_prefix).await?;
 
-        if db.is_empty() {
+        if store.is_empty() {
             let genesis = genesis_state(&validators);
-            let batch = Self::diffs_to_batch(&genesis.created, &genesis.deleted);
-            (db, _) = Self::apply_diffs(db, batch, "genesis bootstrap").await?;
+            let batch = UtxoStore::<E>::diffs_to_batch(&genesis.created, &genesis.deleted);
+            store.apply_diffs(batch, None, "genesis bootstrap").await?;
         }
 
         Ok(Self {
             command_rx,
             event_tx,
             metrics,
-            db,
+            store,
             queue,
             anchor_index,
             anchor_history,
@@ -170,7 +320,7 @@ where
 
     pub(super) async fn run(mut self, _context: &mut E) {
         self.metrics.worker_ready_total.inc();
-        let root = self.state_root();
+        let root = self.store.root();
         if let Err(err) = self
             .event_tx
             .unbounded_send(Traced::capture(PersistenceEvent::Ready { root }))
@@ -270,6 +420,31 @@ where
             )));
         };
 
+        // Skip queue items already committed before a crash.
+        if self.store.was_committed(position) {
+            info!(?payload, position, "skipping already-committed queue item");
+            self.queue.ack(position).await.map_err(|err| {
+                Fatal(format!(
+                    "failed to ack persistence intent at position {position} for {payload:?}: {err:?}"
+                ))
+            })?;
+            self.queue.sync().await.map_err(|err| {
+                Fatal(format!(
+                    "failed to sync persistence queue after ack for {payload:?}: {err:?}"
+                ))
+            })?;
+            // Re-record anchor (may have been lost if crash was between
+            // commit and anchor sync). record_persisted_anchor is idempotent
+            // when payload+root match.
+            let root = self.store.root();
+            self.record_persisted_anchor(payload, root).await?;
+            self.metrics.persist_success_total.inc();
+            let _ = self.event_tx.unbounded_send(
+                Traced::capture(PersistenceEvent::Persisted { payload, root }),
+            );
+            return Ok(self);
+        }
+
         info!(
             ?payload,
             queue_position = position,
@@ -280,10 +455,9 @@ where
 
         self.metrics.persist_attempt_total.inc();
 
-        let batch = Self::diffs_to_batch(&diffs.created, &diffs.deleted);
+        let batch = UtxoStore::<E>::diffs_to_batch(&diffs.created, &diffs.deleted);
         let label = format!("{payload:?}");
-        let (db, _root) = Self::apply_diffs(self.db, batch, &label).await?;
-        self.db = db;
+        let root = self.store.apply_diffs(batch, Some(position), &label).await?;
 
         // Ack the queue item so it won't be replayed on restart.
         self.queue.ack(position).await.map_err(|err| {
@@ -298,7 +472,6 @@ where
         })?;
 
         self.metrics.persist_success_total.inc();
-        let root = self.state_root();
         self.record_persisted_anchor(payload, root).await?;
         if let Err(err) = self
             .event_tx
@@ -381,7 +554,7 @@ where
                 Ok(true)
             }
             PersistenceCommand::GetStateRoot { response } => {
-                let _ = response.send(Some(self.state_root()));
+                let _ = response.send(Some(self.store.root()));
                 Ok(true)
             }
             PersistenceCommand::GetProof { object, response } => {
@@ -423,50 +596,11 @@ where
         }
     }
 
-    fn diffs_to_batch(
-        created: &[(ObjectId, Coin)],
-        deleted: &[ObjectId],
-    ) -> Vec<(ObjectId, Option<Coin>)> {
-        deleted
-            .iter()
-            .map(|id| (*id, None))
-            .chain(created.iter().map(|(id, coin)| (*id, Some(coin.clone()))))
-            .collect()
-    }
 
-    /// Apply a batch of state changes to the QMDB and return the new root.
-    ///
-    /// Type-state transition: merkleized → mutable → committed → merkleized.
-    async fn apply_diffs(
-        db: UtxoDb<E>,
-        batch: Vec<(ObjectId, Option<Coin>)>,
-        label: &str,
-    ) -> Result<(UtxoDb<E>, Digest), Fatal> {
-        let mut db = db.into_mutable();
-
-        db.write_batch(batch).await.map_err(|err| {
-            Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
-        })?;
-
-        let (db, _range) = db.commit(None).await.map_err(|err| {
-            Fatal(format!("QMDB commit failed for {label}: {err:?}"))
-        })?;
-
-        let db = db.into_merkleized().await.map_err(|err| {
-            Fatal(format!("QMDB merkleize failed for {label}: {err:?}"))
-        })?;
-
-        let root = db.root();
-        Ok((db, root))
-    }
-
-    fn state_root(&self) -> Digest {
-        self.db.root()
-    }
 
     async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
         let mut hasher = Sha256::default();
-        self.db.key_value_proof(&mut hasher, object).await.ok()
+        self.store.key_value_proof(&mut hasher, object).await
     }
 
     fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
@@ -769,31 +903,13 @@ where
             })
     }
 
-    async fn initialize_db(
-        context: &mut E,
-        partition_prefix: &str,
-        page_cache_config: PageCacheConfig,
-    ) -> Result<UtxoDb<E>, Fatal> {
-        let config = utxo_db_config(
-            context,
-            partition_prefix,
-            page_cache_config.size,
-            page_cache_config.count,
-        );
-        UtxoDb::init(context.with_label("utxo_db"), config)
-            .await
-            .map_err(|err| Fatal(format!("QMDB initialization failed: {err:?}")))
-    }
-
     async fn sync_on_shutdown(&mut self) -> Result<(), Fatal> {
         self.queue.sync().await.map_err(|err| {
             Fatal(format!(
                 "persistence queue sync on shutdown failed: {err:?}"
             ))
         })?;
-        self.db.sync().await.map_err(|err| {
-            Fatal(format!("QMDB sync on shutdown failed: {err:?}"))
-        })?;
+        self.store.sync().await?;
         self.anchor_index.sync().await.map_err(|err| {
             Fatal(format!(
                 "anchor index sync on shutdown failed: {err:?}"

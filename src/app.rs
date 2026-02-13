@@ -1344,4 +1344,264 @@ mod tests {
             }
         });
     }
+
+    /// Two independent QMDB instances applying the same operations must produce
+    /// identical roots.  This catches non-determinism in floor-raising, bitmap
+    /// merkleization, or any other commit-time side effect.
+    #[test_log::test]
+    fn two_qmdb_instances_agree_on_roots() {
+        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
+        use crate::execution::genesis_state;
+
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let validators: Vec<PublicKey> = (0..6)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+
+            // Create two completely independent DBs.
+            let cfg_a = utxo_db_config(
+                &context,
+                "determinism_a",
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let cfg_b = utxo_db_config(
+                &context,
+                "determinism_b",
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let mut db_a = UtxoDb::init(context.with_label("db_a"), cfg_a)
+                .await
+                .expect("db_a init");
+            let mut db_b = UtxoDb::init(context.with_label("db_b"), cfg_b)
+                .await
+                .expect("db_b init");
+
+            // --- Round 0: genesis bootstrap ---
+            let genesis = genesis_state(&validators);
+            let batch: Vec<(ObjectId, Option<Coin>)> = genesis
+                .created
+                .iter()
+                .map(|(id, coin)| (*id, Some(coin.clone())))
+                .collect();
+
+            let apply = |db: UtxoDb<_>, batch: Vec<(ObjectId, Option<Coin>)>| async move {
+                let mut db = db.into_mutable();
+                db.write_batch(batch).await.unwrap();
+                let (db, _range) = db.commit(None).await.unwrap();
+                let db = db.into_merkleized().await.unwrap();
+                let root = db.root();
+                (db, root)
+            };
+
+            let (da, root_a) = apply(db_a, batch.clone()).await;
+            let (db, root_b) = apply(db_b, batch).await;
+            db_a = da;
+            db_b = db;
+            assert_eq!(root_a, root_b, "genesis roots must match");
+
+            // --- Rounds 1..5: synthetic diffs ---
+            for round in 1u16..=5 {
+                // Delete the first validator's coin from a previous round
+                // and create a replacement with an incremented value.
+                let delete_id = genesis_object_id(round - 1);
+                let create_id = genesis_object_id(round + 100);
+                let coin = Coin {
+                    owner: validators[0].clone(),
+                    value: GENESIS_BALANCE + u64::from(round),
+                };
+                let batch = vec![(delete_id, None), (create_id, Some(coin))];
+
+                let (da, root_a) = apply(db_a, batch.clone()).await;
+                let (db, root_b) = apply(db_b, batch).await;
+                db_a = da;
+                db_b = db;
+                assert_eq!(
+                    root_a, root_b,
+                    "roots must match after round {round}"
+                );
+            }
+        });
+    }
+
+    /// After persisting a finalization (genesis + one transfer), restarting the
+    /// Application from the same partition must recover the identical state root.
+    #[test_log::test]
+    fn root_survives_restart_after_finalization() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let sender = PrivateKey::from_seed(500);
+            let sender_pk = sender.public_key();
+            let recipient_pk = PrivateKey::from_seed(501).public_key();
+            let partition = "restart_after_finalize";
+
+            let (handle_a, mut mailbox_a) =
+                start_single_validator_app(&context, "raf_a", &sender_pk, partition);
+
+            submit_transfer_and_finalize(&mut mailbox_a, &sender, &recipient_pk).await;
+
+            // Let persistence complete.
+            context.sleep(Duration::from_secs(2)).await;
+
+            let root_before = fetch_root(&mailbox_a).await;
+            assert_ne!(
+                root_before,
+                Digest::from([0u8; 32]),
+                "root should be non-zero after finalization"
+            );
+
+            // Kill then restart from the same partition.
+            handle_a.abort();
+            let _ = handle_a.await;
+
+            let (_handle_b, mailbox_b) =
+                start_single_validator_app(&context, "raf_b", &sender_pk, partition);
+
+            let root_after = fetch_root(&mailbox_b).await;
+            assert_eq!(
+                root_before, root_after,
+                "QMDB root must be identical after restart"
+            );
+        });
+    }
+
+    /// Minimal reproduction: a single UtxoDb synced to disk and reopened from
+    /// the same partition must report the same root.  This isolates the QMDB
+    /// journal-replay non-determinism without any Application-level machinery.
+    #[test_log::test]
+    fn qmdb_root_survives_sync_and_reopen() {
+        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
+        use crate::execution::genesis_state;
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let validators: Vec<PublicKey> = (0..6)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+            let partition = "reopen_determinism";
+
+            let cfg = utxo_db_config(
+                &context,
+                partition,
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let db = UtxoDb::init(context.with_label("db_init"), cfg)
+                .await
+                .expect("init");
+
+            // Bootstrap genesis.
+            let genesis = genesis_state(&validators);
+            let batch: Vec<(ObjectId, Option<Coin>)> = genesis
+                .created
+                .iter()
+                .map(|(id, coin)| (*id, Some(coin.clone())))
+                .collect();
+            let mut db = db.into_mutable();
+            db.write_batch(batch).await.unwrap();
+            let (db, _) = db.commit(None).await.unwrap();
+            let mut db = db.into_merkleized().await.unwrap();
+            let root_before = db.root();
+
+            // Flush to disk.
+            db.sync().await.unwrap();
+            drop(db);
+
+            // Reopen from the same partition.
+            let cfg = utxo_db_config(
+                &context,
+                partition,
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let db = UtxoDb::init(context.with_label("db_reopen"), cfg)
+                .await
+                .expect("reopen");
+
+            let root_after = db.root();
+            assert_eq!(
+                root_before, root_after,
+                "QMDB root must survive sync + reopen"
+            );
+        });
+    }
+
+    /// Same as above, but drops the DB *without* calling sync() first —
+    /// simulating a crash.  The journal is durable after commit(), but the MMR
+    /// may lag, requiring replay on reopen.
+    #[test_log::test]
+    fn qmdb_root_survives_crash_and_reopen() {
+        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
+        use crate::execution::genesis_state;
+
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let validators: Vec<PublicKey> = (0..6)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+            let partition = "crash_determinism";
+
+            let cfg = utxo_db_config(
+                &context,
+                partition,
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let mut db = UtxoDb::init(context.with_label("db_init"), cfg)
+                .await
+                .expect("init");
+
+            // Bootstrap genesis.
+            let genesis = genesis_state(&validators);
+            let batch: Vec<(ObjectId, Option<Coin>)> = genesis
+                .created
+                .iter()
+                .map(|(id, coin)| (*id, Some(coin.clone())))
+                .collect();
+            let mut mutable = db.into_mutable();
+            mutable.write_batch(batch).await.unwrap();
+            let (committed, _) = mutable.commit(None).await.unwrap();
+            db = committed.into_merkleized().await.unwrap();
+
+            // Apply a second round of diffs (simulating one finalized payload).
+            let delete_id = genesis_object_id(0);
+            let create_id = genesis_object_id(200);
+            let coin = Coin {
+                owner: validators[1].clone(),
+                value: 42,
+            };
+            let batch = vec![(delete_id, None), (create_id, Some(coin))];
+            let mut mutable = db.into_mutable();
+            mutable.write_batch(batch).await.unwrap();
+            let (committed, _) = mutable.commit(None).await.unwrap();
+            db = committed.into_merkleized().await.unwrap();
+
+            let root_before = db.root();
+
+            // Simulate crash: drop WITHOUT sync.
+            drop(db);
+
+            // Reopen — journal replay should recover the same root.
+            let cfg = utxo_db_config(
+                &context,
+                partition,
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let db = UtxoDb::init(context.with_label("db_crash_reopen"), cfg)
+                .await
+                .expect("reopen after crash");
+
+            let root_after = db.root();
+            assert_eq!(
+                root_before, root_after,
+                "QMDB root must survive crash (no sync) + reopen"
+            );
+        });
+    }
 }
