@@ -4,13 +4,17 @@ use crate::execution::{FinalizationDiffs, genesis_state};
 use hellas_types::{Coin, ObjectId};
 use crate::trace::Traced;
 use bytes::{Buf, Bytes};
-use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
+use commonware_codec::{FixedSize, RangeCfg, Read as CodecRead, ReadExt, ReadRangeExt, Write};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef,
 };
 use commonware_storage::{
     Persistable,
+    freezer::{
+        Checkpoint as FreezerCheckpoint, Config as FreezerConfig, Freezer,
+        Identifier as FreezerIdentifier,
+    },
     metadata::{Config as MetadataConfig, Metadata},
     queue::{Config as QueueConfig, Queue},
 };
@@ -88,14 +92,30 @@ pub(super) struct PageCacheConfig {
 
 type PersistenceQueue<E> = Queue<E, Vec<u8>>;
 type AnchorIndex<E> = Metadata<E, U64, Vec<u8>>;
-type FinalizationIndex<E> = Metadata<E, Digest, Vec<u8>>;
-type PayloadIndex<E> = Metadata<E, Digest, Vec<u8>>;
+type FinalizationIndex<E> = Freezer<E, Digest, Vec<u8>>;
+type PayloadIndex<E> = Freezer<E, Digest, Vec<u8>>;
 
 /// Well-known key used to store the queue cursor position in the
 /// dedicated metadata partition.
 static QUEUE_CURSOR_KEY: LazyLock<Digest> = LazyLock::new(|| {
     let mut bytes = [0u8; 32];
     bytes[0] = b'q';
+    bytes[1] = b'c';
+    Digest::from(bytes)
+});
+
+/// Well-known key for the finalization Freezer checkpoint.
+static FINALIZATION_CHECKPOINT_KEY: LazyLock<Digest> = LazyLock::new(|| {
+    let mut bytes = [0u8; 32];
+    bytes[0] = b'f';
+    bytes[1] = b'c';
+    Digest::from(bytes)
+});
+
+/// Well-known key for the payload Freezer checkpoint.
+static PAYLOAD_CHECKPOINT_KEY: LazyLock<Digest> = LazyLock::new(|| {
+    let mut bytes = [0u8; 32];
+    bytes[0] = b'p';
     bytes[1] = b'c';
     Digest::from(bytes)
 });
@@ -133,7 +153,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             context.with_label("queue_cursor"),
             MetadataConfig {
                 partition: format!("{partition_prefix}_queue_cursor"),
-                codec_config: ((0..=8usize).into(), ()),
+                codec_config: ((0..=FreezerCheckpoint::SIZE).into(), ()),
             },
         )
         .await
@@ -153,6 +173,18 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             cursor_index,
             last_committed_position,
         })
+    }
+
+    fn load_checkpoint(&self, key: &Digest) -> Option<FreezerCheckpoint> {
+        self.cursor_index.get(key).and_then(|bytes| {
+            FreezerCheckpoint::read_cfg(&mut bytes.as_slice(), &()).ok()
+        })
+    }
+
+    fn save_checkpoint(&mut self, key: Digest, cp: FreezerCheckpoint) {
+        let mut buf = Vec::with_capacity(FreezerCheckpoint::SIZE);
+        cp.write(&mut buf);
+        self.cursor_index.put(key, buf);
     }
 
     fn was_committed(&self, queue_position: u64) -> bool {
@@ -286,9 +318,9 @@ where
     anchor_index: AnchorIndex<E>,
     anchor_history: VecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
-    finalization_index: FinalizationIndex<E>,
+    finalization_index: Option<FinalizationIndex<E>>,
     volatile_finalizations: IndexMap<Digest, mailbox::FinalizationResponse>,
-    payload_index: PayloadIndex<E>,
+    payload_index: Option<PayloadIndex<E>>,
     volatile_payloads: IndexMap<Digest, Bytes>,
 }
 
@@ -320,9 +352,24 @@ where
         let mut store = UtxoStore::init(context, &partition_prefix, page_cache_config).await?;
         let (anchor_index, anchor_history, next_anchor_sequence) =
             Self::initialize_anchor_index(context, &partition_prefix).await?;
-        let finalization_index =
-            Self::initialize_finalization_index(context, &partition_prefix).await?;
-        let payload_index = Self::initialize_payload_index(context, &partition_prefix).await?;
+
+        let fin_checkpoint = store.load_checkpoint(&FINALIZATION_CHECKPOINT_KEY);
+        let pay_checkpoint = store.load_checkpoint(&PAYLOAD_CHECKPOINT_KEY);
+
+        let finalization_index = Self::initialize_finalization_index(
+            context,
+            &partition_prefix,
+            page_cache_config,
+            fin_checkpoint,
+        )
+        .await?;
+        let payload_index = Self::initialize_payload_index(
+            context,
+            &partition_prefix,
+            page_cache_config,
+            pay_checkpoint,
+        )
+        .await?;
 
         if store.is_empty() {
             let genesis = genesis_state(&validators);
@@ -339,9 +386,9 @@ where
             anchor_index,
             anchor_history,
             next_anchor_sequence,
-            finalization_index,
+            finalization_index: Some(finalization_index),
             volatile_finalizations: IndexMap::new(),
-            payload_index,
+            payload_index: Some(payload_index),
             volatile_payloads: IndexMap::new(),
         })
     }
@@ -590,7 +637,7 @@ where
                 Ok(true)
             }
             PersistenceCommand::GetPayload { payload, response } => {
-                let _ = response.send(self.payload(payload));
+                let _ = response.send(self.payload(payload).await);
                 Ok(true)
             }
             PersistenceCommand::GetPersistedAnchors { response } => {
@@ -602,7 +649,7 @@ where
                 Ok(true)
             }
             PersistenceCommand::GetFinalization { payload, response } => {
-                let _ = response.send(self.finalization(payload));
+                let _ = response.send(self.finalization(payload).await);
                 Ok(true)
             }
             PersistenceCommand::RecordFinalization {
@@ -630,14 +677,18 @@ where
         self.store.key_value_proof(&mut hasher, object).await
     }
 
-    fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
+    async fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
         if let Some(finalization) = self.volatile_finalizations.get(&payload) {
             return Some(finalization.clone());
         }
         let stored = self
             .finalization_index
-            .get(&payload)
-            .cloned()
+            .as_ref()
+            .expect("not shut down")
+            .get(FreezerIdentifier::Key(&payload))
+            .await
+            .ok()
+            .flatten()
             .map(mailbox::FinalizationResponse::from);
         if let Some(ref finalization) = stored {
             self.cache_finalization(payload, finalization.clone());
@@ -655,14 +706,18 @@ where
         gauge_set_len(&self.metrics.finalization_cache_entries, self.volatile_finalizations.len());
     }
 
-    fn payload(&mut self, payload: Digest) -> Option<Bytes> {
+    async fn payload(&mut self, payload: Digest) -> Option<Bytes> {
         if let Some(bytes) = self.volatile_payloads.get(&payload) {
             return Some(bytes.clone());
         }
         let stored = self
             .payload_index
-            .get(&payload)
-            .cloned()
+            .as_ref()
+            .expect("not shut down")
+            .get(FreezerIdentifier::Key(&payload))
+            .await
+            .ok()
+            .flatten()
             .map(Bytes::from);
         if let Some(ref bytes) = stored {
             self.cache_payload(payload, bytes.clone());
@@ -748,7 +803,18 @@ where
             return Ok(());
         }
 
-        if let Some(existing) = self.finalization_index.get(&payload) {
+        let fin = self
+            .finalization_index
+            .as_ref()
+            .expect("not shut down")
+            .get(FreezerIdentifier::Key(&payload))
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to read finalization index for {payload:?}: {err:?}"
+                ))
+            })?;
+        if let Some(existing) = fin {
             if existing.as_slice() != finalization.as_slice() {
                 return Err(Fatal(format!(
                     "conflicting stored finalization certificate for {payload:?}"
@@ -758,10 +824,30 @@ where
             return Ok(());
         }
         self.finalization_index
-            .put(payload, finalization.as_slice().to_vec());
-        self.finalization_index.sync().await.map_err(|err| {
+            .as_mut()
+            .expect("not shut down")
+            .put(payload, finalization.as_slice().to_vec())
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to put finalization certificate for {payload:?}: {err:?}"
+                ))
+            })?;
+        let cp = self
+            .finalization_index
+            .as_mut()
+            .expect("not shut down")
+            .sync()
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to sync finalization certificate index for {payload:?}: {err:?}"
+                ))
+            })?;
+        self.store.save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, cp);
+        self.store.cursor_index.sync().await.map_err(|err| {
             Fatal(format!(
-                "failed to sync finalization certificate index for {payload:?}: {err:?}"
+                "failed to sync cursor index after finalization checkpoint for {payload:?}: {err:?}"
             ))
         })?;
 
@@ -779,7 +865,18 @@ where
             return Ok(());
         }
 
-        if let Some(existing) = self.payload_index.get(&payload) {
+        let existing = self
+            .payload_index
+            .as_ref()
+            .expect("not shut down")
+            .get(FreezerIdentifier::Key(&payload))
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to read payload index for {payload:?}: {err:?}"
+                ))
+            })?;
+        if let Some(existing) = existing {
             if existing.as_slice() != bytes.as_ref() {
                 return Err(Fatal(format!(
                     "conflicting stored payload bytes for {payload:?}"
@@ -788,10 +885,31 @@ where
             self.cache_payload(payload, bytes);
             return Ok(());
         }
-        self.payload_index.put(payload, bytes.as_ref().to_vec());
-        self.payload_index.sync().await.map_err(|err| {
+        self.payload_index
+            .as_mut()
+            .expect("not shut down")
+            .put(payload, bytes.as_ref().to_vec())
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to put payload for {payload:?}: {err:?}"
+                ))
+            })?;
+        let cp = self
+            .payload_index
+            .as_mut()
+            .expect("not shut down")
+            .sync()
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to sync payload index for {payload:?}: {err:?}"
+                ))
+            })?;
+        self.store.save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, cp);
+        self.store.cursor_index.sync().await.map_err(|err| {
             Fatal(format!(
-                "failed to sync payload index for {payload:?}: {err:?}"
+                "failed to sync cursor index after payload checkpoint for {payload:?}: {err:?}"
             ))
         })?;
 
@@ -808,20 +926,54 @@ where
         }
     }
 
-    fn finalization_metadata_config(
+    fn finalization_freezer_config(
+        context: &E,
         partition_prefix: &str,
-    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
-        MetadataConfig {
-            partition: format!("{partition_prefix}_finalizations_by_payload"),
+        page_cache_config: PageCacheConfig,
+    ) -> FreezerConfig<(RangeCfg<usize>, ())> {
+        let page_cache_size = NonZeroU16::new(page_cache_config.size)
+            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
+        let page_cache_count = NonZeroUsize::new(page_cache_config.count)
+            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_COUNT);
+        FreezerConfig {
+            key_partition: format!("{partition_prefix}_fin_key"),
+            key_write_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
+            key_page_cache: CacheRef::from_pooler(context, page_cache_size, page_cache_count),
+            value_partition: format!("{partition_prefix}_fin_val"),
+            value_compression: Some(3),
+            value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
+            value_target_size: 100 * 1024 * 1024,
+            table_partition: format!("{partition_prefix}_fin_tbl"),
+            table_initial_size: 1024,
+            table_resize_frequency: 4,
+            table_resize_chunk_size: 4096,
+            table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
             codec_config: ((0..=Self::MAX_FINALIZATION_RECORD_BYTES).into(), ()),
         }
     }
 
-    fn payload_metadata_config(
+    fn payload_freezer_config(
+        context: &E,
         partition_prefix: &str,
-    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
-        MetadataConfig {
-            partition: format!("{partition_prefix}_payloads_by_digest"),
+        page_cache_config: PageCacheConfig,
+    ) -> FreezerConfig<(RangeCfg<usize>, ())> {
+        let page_cache_size = NonZeroU16::new(page_cache_config.size)
+            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
+        let page_cache_count = NonZeroUsize::new(page_cache_config.count)
+            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_COUNT);
+        FreezerConfig {
+            key_partition: format!("{partition_prefix}_pay_key"),
+            key_write_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
+            key_page_cache: CacheRef::from_pooler(context, page_cache_size, page_cache_count),
+            value_partition: format!("{partition_prefix}_pay_val"),
+            value_compression: Some(3),
+            value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
+            value_target_size: 100 * 1024 * 1024,
+            table_partition: format!("{partition_prefix}_pay_tbl"),
+            table_initial_size: 1024,
+            table_resize_frequency: 4,
+            table_resize_chunk_size: 4096,
+            table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
             codec_config: ((0..=Self::MAX_PAYLOAD_RECORD_BYTES).into(), ()),
         }
     }
@@ -894,25 +1046,38 @@ where
     async fn initialize_finalization_index(
         context: &mut E,
         partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+        checkpoint: Option<FreezerCheckpoint>,
     ) -> Result<FinalizationIndex<E>, Fatal> {
-        let config = Self::finalization_metadata_config(partition_prefix);
-        FinalizationIndex::init(context.with_label("finalization_index"), config)
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "finalization index initialization failed: {err:?}"
-                ))
-            })
+        let config =
+            Self::finalization_freezer_config(context, partition_prefix, page_cache_config);
+        Freezer::init_with_checkpoint(
+            context.with_label("finalization_index"),
+            config,
+            checkpoint,
+        )
+        .await
+        .map_err(|err| {
+            Fatal(format!(
+                "finalization index initialization failed: {err:?}"
+            ))
+        })
     }
 
     async fn initialize_payload_index(
         context: &mut E,
         partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+        checkpoint: Option<FreezerCheckpoint>,
     ) -> Result<PayloadIndex<E>, Fatal> {
-        let config = Self::payload_metadata_config(partition_prefix);
-        PayloadIndex::init(context.with_label("payload_index"), config)
-            .await
-            .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
+        let config = Self::payload_freezer_config(context, partition_prefix, page_cache_config);
+        Freezer::init_with_checkpoint(
+            context.with_label("payload_index"),
+            config,
+            checkpoint,
+        )
+        .await
+        .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
     }
 
     async fn initialize_queue(
@@ -942,14 +1107,37 @@ where
                 "anchor index sync on shutdown failed: {err:?}"
             ))
         })?;
-        self.finalization_index.sync().await.map_err(|err| {
+
+        let fin_cp = self
+            .finalization_index
+            .take()
+            .expect("not shut down")
+            .close()
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "finalization index close on shutdown failed: {err:?}"
+                ))
+            })?;
+        let pay_cp = self
+            .payload_index
+            .take()
+            .expect("not shut down")
+            .close()
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "payload index close on shutdown failed: {err:?}"
+                ))
+            })?;
+
+        self.store
+            .save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, fin_cp);
+        self.store
+            .save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, pay_cp);
+        self.store.cursor_index.sync().await.map_err(|err| {
             Fatal(format!(
-                "finalization index sync on shutdown failed: {err:?}"
-            ))
-        })?;
-        self.payload_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "payload index sync on shutdown failed: {err:?}"
+                "cursor index sync on shutdown failed: {err:?}"
             ))
         })
     }

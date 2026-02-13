@@ -8,6 +8,7 @@ use commonware_cryptography::sha256::Digest;
 use commonware_parallel::Strategy;
 use futures::{StreamExt, channel::mpsc};
 use std::collections::{BTreeMap, VecDeque};
+use tracing::Span;
 
 pub(super) enum Command {
     Reshard {
@@ -53,6 +54,7 @@ enum Task {
         shard_index: u16,
         shard_hash: Digest,
         shard: ZodaShard,
+        parent_span: Span,
     },
     Check {
         key: BlockKey,
@@ -61,6 +63,7 @@ enum Task {
         shard_index: u16,
         shard_hash: Digest,
         reshard: ZodaReShard,
+        parent_span: Span,
     },
 }
 
@@ -101,14 +104,14 @@ impl<S: Strategy> Scheduler<S> {
                     debug!("coding scheduler command channel closed; shutting down");
                     break;
                 };
-                let (cmd, _span) = traced.into_parts();
-                self.enqueue(cmd);
+                let (cmd, parent_span) = traced.into_parts();
+                self.enqueue(cmd, parent_span);
             }
 
             // Drain all additional commands without blocking.
             while let Ok(Some(traced)) = self.command_rx.try_next() {
-                let (cmd, _span) = traced.into_parts();
-                self.enqueue(cmd);
+                let (cmd, parent_span) = traced.into_parts();
+                self.enqueue(cmd, parent_span);
             }
 
             // Flatten tasks from queue in BTreeMap key order (earliest first).
@@ -127,15 +130,22 @@ impl<S: Strategy> Scheduler<S> {
             let _span = debug_span!("coding_worker.batch", task_count).entered();
             trace!(task_count, "processing coding batch");
 
-            // Process all tasks in parallel via strategy.
+            // Process all tasks in parallel via strategy.  Each task enters
+            // its caller's span during execution (synchronous — .enter() is
+            // safe) and returns it alongside the result so the event can be
+            // sent with the original span rather than the scheduler's.
             let config = self.coding_config;
-            let results: Vec<Event> =
+            let results: Vec<(Event, Span)> =
                 self.strategy
                     .map_collect_vec(tasks, move |task| execute_task(config, task));
 
-            // Send results back.
-            for event in results {
-                if self.event_tx.unbounded_send(Traced::capture(event)).is_err() {
+            // Send results back, preserving the caller's span.
+            for (event, parent_span) in results {
+                if self
+                    .event_tx
+                    .unbounded_send(Traced::with_span(event, parent_span))
+                    .is_err()
+                {
                     warn!("coding scheduler event channel closed; shutting down");
                     return;
                 }
@@ -144,7 +154,7 @@ impl<S: Strategy> Scheduler<S> {
         debug!("coding scheduler stopped");
     }
 
-    fn enqueue(&mut self, cmd: Command) {
+    fn enqueue(&mut self, cmd: Command, parent_span: Span) {
         match cmd {
             Command::Reshard {
                 key,
@@ -168,6 +178,7 @@ impl<S: Strategy> Scheduler<S> {
                         shard_index,
                         shard_hash,
                         shard,
+                        parent_span,
                     });
             }
             Command::Check {
@@ -194,6 +205,7 @@ impl<S: Strategy> Scheduler<S> {
                         shard_index,
                         shard_hash,
                         reshard,
+                        parent_span,
                     });
             }
             Command::Cancel { key } => {
@@ -210,7 +222,7 @@ impl<S: Strategy> Scheduler<S> {
     }
 }
 
-fn execute_task(config: CodingConfig, task: Task) -> Event {
+fn execute_task(config: CodingConfig, task: Task) -> (Event, Span) {
     match task {
         Task::Reshard {
             key,
@@ -218,24 +230,32 @@ fn execute_task(config: CodingConfig, task: Task) -> Event {
             shard_index,
             shard_hash,
             shard,
+            parent_span,
         } => {
-            let result =
-                CodingImpl::reshard(&config, &commitment, shard_index, shard).map_err(|err| {
-                    warn!(
-                        digest = ?key.digest,
-                        round = ?key.round,
-                        shard_index,
-                        ?err,
-                        "reshard failed"
-                    );
-                });
-            Event::ReshardDone {
-                key,
-                commitment,
-                shard_index,
-                shard_hash,
-                result,
-            }
+            // Enter the caller's span so that tracing events (including
+            // failure warnings) are associated with the originating block
+            // operation.  This is synchronous code so .enter() is safe.
+            let event = {
+                let _entered = parent_span.enter();
+                let result = CodingImpl::reshard(&config, &commitment, shard_index, shard)
+                    .map_err(|err| {
+                        warn!(
+                            digest = ?key.digest,
+                            round = ?key.round,
+                            shard_index,
+                            ?err,
+                            "reshard failed"
+                        );
+                    });
+                Event::ReshardDone {
+                    key,
+                    commitment,
+                    shard_index,
+                    shard_hash,
+                    result,
+                }
+            };
+            (event, parent_span)
         }
         Task::Check {
             key,
@@ -244,24 +264,34 @@ fn execute_task(config: CodingConfig, task: Task) -> Event {
             shard_index,
             shard_hash,
             reshard,
+            parent_span,
         } => {
-            let result =
-                CodingImpl::check(&config, &commitment, &checking_data, shard_index, reshard)
-                    .map_err(|err| {
-                        warn!(
-                            digest = ?key.digest,
-                            round = ?key.round,
-                            shard_index,
-                            ?err,
-                            "check failed"
-                        );
-                    });
-            Event::CheckDone {
-                key,
-                shard_index,
-                shard_hash,
-                result,
-            }
+            let event = {
+                let _entered = parent_span.enter();
+                let result = CodingImpl::check(
+                    &config,
+                    &commitment,
+                    &checking_data,
+                    shard_index,
+                    reshard,
+                )
+                .map_err(|err| {
+                    warn!(
+                        digest = ?key.digest,
+                        round = ?key.round,
+                        shard_index,
+                        ?err,
+                        "check failed"
+                    );
+                });
+                Event::CheckDone {
+                    key,
+                    shard_index,
+                    shard_hash,
+                    result,
+                }
+            };
+            (event, parent_span)
         }
     }
 }

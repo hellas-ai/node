@@ -103,7 +103,13 @@ impl<S: Strategy> ShardRecoverer<S> {
         let mut effects = VecDeque::new();
         let mut drained = 0u32;
         while let Ok(Some(traced)) = self.coding_event_rx.try_next() {
-            let (event, _span) = traced.into_parts();
+            let (event, parent_span) = traced.into_parts();
+            // Re-enter the caller's span so that downstream work
+            // (apply_reshard_result, try_recover, etc.) appears as children
+            // of the original handle_message span.  This is synchronous code,
+            // so .enter() is safe and cannot cause the "enormous spans"
+            // problem that occurs with .enter() across .await points.
+            let _entered = parent_span.enter();
             self.apply_coding_event(event, &mut effects);
             drained += 1;
         }
@@ -318,12 +324,26 @@ impl<S: Strategy> ShardRecoverer<S> {
         if seen.contains_key(&key.digest) {
             return VecDeque::new();
         }
-        let _span = debug_span!(
+        let span = debug_span!(
             "shard.handle_message",
             payload = ?key.digest,
             round = ?key.round,
-        )
-        .entered();
+        );
+        // Derive a deterministic trace ID from the block digest so that all
+        // validators processing shards for the same payload share a single
+        // trace, with per-node subtrees rooted at unique span IDs.
+        let trace_id: [u8; 16] = key.digest.0[..16]
+            .try_into()
+            .expect("digest has at least 16 bytes");
+        let mut span_id_input = Vec::with_capacity(64);
+        span_id_input.extend_from_slice(&key.digest.0);
+        span_id_input.extend_from_slice(commonware_codec::Encode::encode(&self.me).as_ref());
+        let span_id_hash = Sha256::hash(&span_id_input);
+        let span_id: [u8; 8] = span_id_hash.0[..8]
+            .try_into()
+            .expect("hash has at least 8 bytes");
+        crate::trace::set_block_trace_context(&span, trace_id, span_id);
+        let _span = span.entered();
 
         let mut effects = VecDeque::new();
         let outputs = self.machine.step(RecoveryInput::IngressMessage {
