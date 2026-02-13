@@ -13,6 +13,7 @@ use commonware_runtime::{Handle, Spawner};
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
 use std::collections::{HashMap, VecDeque};
+use tracing::{debug, debug_span, info_span, warn};
 
 #[derive(Clone)]
 pub(crate) enum ShardEffect {
@@ -100,9 +101,18 @@ impl<S: Strategy> ShardRecoverer<S> {
 
     pub(crate) fn drain_coding_events(&mut self) -> VecDeque<ShardEffect> {
         let mut effects = VecDeque::new();
+        let mut drained = 0u32;
         while let Ok(Some(traced)) = self.coding_event_rx.try_next() {
             let (event, _span) = traced.into_parts();
             self.apply_coding_event(event, &mut effects);
+            drained += 1;
+        }
+        if drained > 0 {
+            debug!(
+                drained,
+                recoveries = effects.iter().filter(|e| matches!(e, ShardEffect::Recovered { .. })).count(),
+                "drained coding events"
+            );
         }
         effects
     }
@@ -152,6 +162,13 @@ impl<S: Strategy> ShardRecoverer<S> {
         >,
         effects: &mut VecDeque<ShardEffect>,
     ) {
+        let _span = debug_span!(
+            "shard.apply_reshard_result",
+            payload = ?key.digest,
+            round = ?key.round,
+            shard_index,
+        )
+        .entered();
         let Ok((checking_data, checked_shard, reshard)) = result else {
             // Crypto failure already logged by the scheduler.
             return;
@@ -191,6 +208,13 @@ impl<S: Strategy> ShardRecoverer<S> {
         result: Result<<CodingImpl as CodingScheme>::CheckedShard, ()>,
         effects: &mut VecDeque<ShardEffect>,
     ) {
+        let _span = debug_span!(
+            "shard.apply_check_result",
+            payload = ?key.digest,
+            round = ?key.round,
+            shard_index,
+        )
+        .entered();
         let Ok(checked_shard) = result else {
             // Crypto failure already logged by the scheduler.
             return;
@@ -294,6 +318,12 @@ impl<S: Strategy> ShardRecoverer<S> {
         if seen.contains_key(&key.digest) {
             return VecDeque::new();
         }
+        let _span = debug_span!(
+            "shard.handle_message",
+            payload = ?key.digest,
+            round = ?key.round,
+        )
+        .entered();
 
         let mut effects = VecDeque::new();
         let outputs = self.machine.step(RecoveryInput::IngressMessage {
@@ -434,6 +464,12 @@ impl<S: Strategy> ShardRecoverer<S> {
     }
 
     fn try_recover(&mut self, key: BlockKey) -> Option<ShardEffect> {
+        let _span = info_span!(
+            "shard.try_recover",
+            payload = ?key.digest,
+            round = ?key.round,
+        )
+        .entered();
         let mut decode_candidate = None;
         for output in self.machine.step(RecoveryInput::TryTakeDecode {
             key,
