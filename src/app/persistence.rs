@@ -455,7 +455,8 @@ where
     }
 
     async fn sync_or_abort(&mut self) {
-        if let Err(err) = self.sync_on_shutdown().await {
+        // Box::pin to keep the Freezer close() futures off the run() stack.
+        if let Err(err) = Box::pin(self.sync_on_shutdown()).await {
             Self::abort(err);
         }
     }
@@ -465,7 +466,10 @@ where
         command: Traced<PersistenceCommand>,
     ) -> Result<bool, Fatal> {
         let (command, parent_span) = command.into_parts();
-        self.handle_command(command).instrument(parent_span).await
+        // Box::pin to keep the Freezer get/put/sync futures off the run() stack.
+        Box::pin(self.handle_command(command))
+            .instrument(parent_span)
+            .await
     }
 
     async fn has_pending_work(&self) -> bool {
