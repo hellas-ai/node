@@ -1427,6 +1427,75 @@ mod tests {
         });
     }
 
+    /// QMDB commit metadata IS part of the Merkle root (it is hashed into
+    /// the authenticated log).  Two instances that apply identical diffs but
+    /// commit with different metadata will produce DIFFERENT roots.
+    ///
+    /// This means we must NEVER pass node-local values (like queue position)
+    /// as commit metadata — doing so would cause state divergence across
+    /// validators.  The persistence layer must always use `commit(None)`.
+    #[test_log::test]
+    fn commit_metadata_affects_root() {
+        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
+        use crate::execution::genesis_state;
+
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let validators: Vec<PublicKey> = (0..6)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+
+            let cfg_a = utxo_db_config(
+                &context,
+                "meta_a",
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let cfg_b = utxo_db_config(
+                &context,
+                "meta_b",
+                DEFAULT_PAGE_CACHE_SIZE.get(),
+                DEFAULT_PAGE_CACHE_COUNT.get(),
+            );
+            let mut db_a = UtxoDb::init(context.with_label("meta_a"), cfg_a)
+                .await
+                .expect("db_a init");
+            let mut db_b = UtxoDb::init(context.with_label("meta_b"), cfg_b)
+                .await
+                .expect("db_b init");
+
+            let genesis = genesis_state(&validators);
+            let batch: Vec<(ObjectId, Option<Coin>)> = genesis
+                .created
+                .iter()
+                .map(|(id, coin)| (*id, Some(coin.clone())))
+                .collect();
+
+            // db_a commits with metadata, db_b commits without.
+            let meta = Some(Coin {
+                owner: validators[0].clone(),
+                value: 42,
+            });
+
+            let mut db = db_a.into_mutable();
+            db.write_batch(batch.clone()).await.unwrap();
+            let (db, _) = db.commit(meta).await.unwrap();
+            db_a = db.into_merkleized().await.unwrap();
+
+            let mut db = db_b.into_mutable();
+            db.write_batch(batch).await.unwrap();
+            let (db, _) = db.commit(None).await.unwrap();
+            db_b = db.into_merkleized().await.unwrap();
+
+            assert_ne!(
+                db_a.root(),
+                db_b.root(),
+                "commit metadata is part of the Merkle root; different metadata must produce different roots"
+            );
+        });
+    }
+
     /// After persisting a finalization (genesis + one transfer), restarting the
     /// Application from the same partition must recover the identical state root.
     #[test_log::test]

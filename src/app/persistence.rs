@@ -90,26 +90,25 @@ type AnchorIndex<E> = Metadata<E, U64, Vec<u8>>;
 type FinalizationIndex<E> = Metadata<E, Digest, Vec<u8>>;
 type PayloadIndex<E> = Metadata<E, Digest, Vec<u8>>;
 
-/// Ed25519 basepoint (RFC 8032 §5.1) — always a valid public key.
-static QUEUE_CURSOR_OWNER: LazyLock<PublicKey> = LazyLock::new(|| {
-    let bytes: [u8; 32] = [
-        0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-    ];
-    PublicKey::read(&mut bytes.as_slice())
-        .expect("ed25519 basepoint is always valid")
+/// Well-known key used to store the queue cursor position in the
+/// dedicated metadata partition.
+static QUEUE_CURSOR_KEY: LazyLock<Digest> = LazyLock::new(|| {
+    let mut bytes = [0u8; 32];
+    bytes[0] = b'q';
+    bytes[1] = b'c';
+    Digest::from(bytes)
 });
 
 /// Safe wrapper around [`UtxoDb`] that encapsulates the QMDB type-state
 /// machine and provides crash-safe commit semantics.
 ///
-/// Every commit atomically records the originating queue position in the
-/// QMDB journal metadata.  On restart, [`was_committed`] lets callers
-/// skip queue items that were already applied before a crash.
+/// The last successfully committed queue position is persisted in a
+/// separate [`Metadata`] partition (not in QMDB commit metadata, which
+/// would pollute the Merkle root).  On restart, [`was_committed`] lets
+/// callers skip queue items that were already applied before a crash.
 struct UtxoStore<E: Clock + Spawner + Storage + Metrics + BufferPooler> {
     db: Option<UtxoDb<E>>,
+    cursor_index: Metadata<E, Digest, Vec<u8>>,
     last_committed_position: Option<u64>,
 }
 
@@ -129,20 +128,28 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             .await
             .map_err(|err| Fatal(format!("QMDB initialization failed: {err:?}")))?;
 
-        let last_committed_position = if db.is_empty() {
-            None
-        } else {
-            match db.get_metadata().await {
-                Ok(Some(coin)) => Some(coin.value),
-                Ok(None) => None,
-                Err(err) => {
-                    return Err(Fatal(format!("QMDB get_metadata failed: {err:?}")))
-                }
-            }
-        };
+        let cursor_index = Metadata::init(
+            context.with_label("queue_cursor"),
+            MetadataConfig {
+                partition: format!("{partition_prefix}_queue_cursor"),
+                codec_config: ((0..=8usize).into(), ()),
+            },
+        )
+        .await
+        .map_err(|err| Fatal(format!("queue cursor init failed: {err:?}")))?;
+
+        let last_committed_position = cursor_index
+            .get(&*QUEUE_CURSOR_KEY)
+            .map(|bytes: &Vec<u8>| {
+                let arr: [u8; 8] = bytes[..8]
+                    .try_into()
+                    .expect("queue cursor value is 8 bytes");
+                u64::from_le_bytes(arr)
+            });
 
         Ok(Self {
             db: Some(db),
+            cursor_index,
             last_committed_position,
         })
     }
@@ -174,18 +181,13 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             .take()
             .expect("db is always present outside apply_diffs");
 
-        let metadata = queue_position.map(|pos| Coin {
-            owner: QUEUE_CURSOR_OWNER.clone(),
-            value: pos,
-        });
-
         let mut db = db.into_mutable();
 
         db.write_batch(batch).await.map_err(|err| {
             Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
         })?;
 
-        let (db, _range) = db.commit(metadata).await.map_err(|err| {
+        let (db, _range) = db.commit(None).await.map_err(|err| {
             Fatal(format!("QMDB commit failed for {label}: {err:?}"))
         })?;
 
@@ -196,6 +198,13 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         let root = db.root();
 
         if let Some(pos) = queue_position {
+            self.cursor_index.put(
+                *QUEUE_CURSOR_KEY,
+                pos.to_le_bytes().to_vec(),
+            );
+            self.cursor_index.sync().await.map_err(|err| {
+                Fatal(format!("queue cursor sync failed for {label}: {err:?}"))
+            })?;
             self.last_committed_position = Some(pos);
         }
         self.db = Some(db);

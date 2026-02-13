@@ -1,9 +1,9 @@
 use super::codec::WireShardMessage;
-use super::scheduler;
 use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
 use super::recovery::{
     ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
 };
+use super::scheduler;
 use crate::trace::Traced;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
@@ -42,9 +42,9 @@ pub(crate) struct ShardRecoverer<S: Strategy> {
 }
 
 impl<S: Strategy> ShardRecoverer<S> {
-    const MAX_RECOVERY_ENTRIES: usize = 64;
-    const MAX_BUFFERED_RESHARDS: usize = 32;
-    const MAX_PRE_LEADER_MESSAGES: usize = 64;
+    const MAX_RECOVERY_ENTRIES: usize = 256;
+    const MAX_BUFFERED_RESHARDS: usize = 128;
+    const MAX_PRE_LEADER_MESSAGES: usize = 128;
     const MAX_PRE_LEADER_KEYS: usize = 256;
     const MAX_KNOWN_KEYS: usize = 1024;
 
@@ -602,8 +602,7 @@ mod tests {
             let me = validators[usize::from(my_index)].clone();
             let leader = validators[0].clone();
             let strategy = crate::coding_strategy();
-            let recoverer =
-                ShardRecoverer::new(&me, my_index, coding_config(6), strategy, context);
+            let recoverer = ShardRecoverer::new(&me, my_index, coding_config(6), strategy, context);
             let mut index_by_validator = HashMap::new();
             for (idx, validator) in validators.iter().enumerate() {
                 let validator_index = u16::try_from(idx).expect("index should fit into u16");
@@ -701,15 +700,13 @@ mod tests {
                     pre_leader_buffer.contains_key(&artifacts.key)
                 }
             ));
-            let buffered_reshards_len =
-                fixture
-                    .recoverer
-                    .machine
-                    .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
-                        recovery
-                            .get(&artifacts.key)
-                            .map(|recovery| recovery.buffered_reshards_len())
-                    });
+            let buffered_reshards_len = fixture.recoverer.machine.inspect(
+                |recovery, _known_leaders, _pre_leader_buffer| {
+                    recovery
+                        .get(&artifacts.key)
+                        .map(|recovery| recovery.buffered_reshards_len())
+                },
+            );
             assert_eq!(
                 buffered_reshards_len,
                 Some(1),
@@ -742,9 +739,7 @@ mod tests {
             );
             assert!(malicious.is_empty());
             assert!(!fixture.recoverer.machine.inspect(
-                |recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery.contains_key(&good.key)
-                }
+                |recovery, _known_leaders, _pre_leader_buffer| { recovery.contains_key(&good.key) }
             ));
 
             let _ = fixture.handle_message(
@@ -757,15 +752,13 @@ mod tests {
                 ),
                 &seen,
             );
-            let commitment =
-                fixture
-                    .recoverer
-                    .machine
-                    .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
-                        recovery
-                            .get(&good.key)
-                            .map(|recovery| recovery.commitment())
-                    });
+            let commitment = fixture.recoverer.machine.inspect(
+                |recovery, _known_leaders, _pre_leader_buffer| {
+                    recovery
+                        .get(&good.key)
+                        .map(|recovery| recovery.commitment())
+                },
+            );
             let Some(commitment) = commitment else {
                 panic!("leader initial should create recovery state");
             };
@@ -773,5 +766,4 @@ mod tests {
             assert_ne!(commitment, bad.commitment);
         });
     }
-
 }
