@@ -179,7 +179,7 @@ impl AppCore {
         let mut effects = CoreEffects::new();
         match message {
             AppMailboxReadWriteMessage::Propose { context, response } => {
-                let digest = self.propose(&context, now);
+                let digest = self.propose_with_effects(&context, now, &mut effects);
                 effects
                     .replies
                     .push_back(CoreEffect::Digest { response, digest });
@@ -326,7 +326,12 @@ impl AppCore {
         digest
     }
 
-    pub(super) fn propose(&mut self, context: &Context, now: u64) -> Digest {
+    fn propose_with_effects(
+        &mut self,
+        context: &Context,
+        now: u64,
+        effects: &mut CoreEffects,
+    ) -> Digest {
         let parent = context.parent.1;
         let _span = info_span!(
             "app.core.propose",
@@ -408,7 +413,15 @@ impl AppCore {
                 }
             }
         } else {
-            warn!(parent = ?parent, "missing parent execution; proposing empty block");
+            let missing =
+                first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
+                    .unwrap_or(parent);
+            self.schedule_dependency_fetch(missing, now, effects);
+            warn!(
+                parent = ?parent,
+                missing_dependency = ?missing,
+                "missing parent execution; proposing empty block and requesting dependency fetch"
+            );
         }
 
         let digest =
@@ -1153,6 +1166,7 @@ mod tests {
     use commonware_runtime::{Metrics, Runner, deterministic};
     use commonware_utils::channel::oneshot;
     use hellas_types::Context;
+    use proptest::prelude::*;
     use std::time::Duration;
 
     fn test_metrics(context: &deterministic::Context, label: &str) -> CoreMetrics {
@@ -1161,6 +1175,13 @@ mod tests {
 
     const TEST_FETCH_RETRY_MS: u64 = 50;
     const TEST_WAIT_TIMEOUT_MS: u64 = 500;
+
+    fn has_valid_verify_reply(effects: &CoreEffects) -> bool {
+        effects
+            .replies
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::Verify { valid: true, .. }))
+    }
 
     #[test_log::test]
     fn finalization_prunes_non_descendant_execution_state() {
@@ -1192,14 +1213,17 @@ mod tests {
                 leader: participants[0].clone(),
                 parent: (View::zero(), genesis),
             };
-            let canonical = core.propose(&canonical_context, 100);
+            let mut canonical_effects = CoreEffects::new();
+            let canonical =
+                core.propose_with_effects(&canonical_context, 100, &mut canonical_effects);
 
             let fork_context = Context {
                 round: Round::new(epoch, View::new(2)),
                 leader: participants[1].clone(),
                 parent: (View::zero(), genesis),
             };
-            let fork = core.propose(&fork_context, 101);
+            let mut fork_effects = CoreEffects::new();
+            let fork = core.propose_with_effects(&fork_context, 101, &mut fork_effects);
 
             assert!(core.speculative_store.contains_execution(canonical));
             assert!(core.speculative_store.contains_execution(fork));
@@ -1246,7 +1270,8 @@ mod tests {
                 leader: participants[0].clone(),
                 parent: (View::zero(), genesis),
             };
-            let payload = core.propose(&context, 100);
+            let mut propose_effects = CoreEffects::new();
+            let payload = core.propose_with_effects(&context, 100, &mut propose_effects);
             let contents = core
                 .seen
                 .get(&payload)
@@ -1296,7 +1321,9 @@ mod tests {
                 leader: participants[0].clone(),
                 parent: (View::zero(), genesis),
             };
-            let payload = proposer.propose(&proposal_context, 123);
+            let mut propose_effects = CoreEffects::new();
+            let payload =
+                proposer.propose_with_effects(&proposal_context, 123, &mut propose_effects);
             let payload_contents = proposer
                 .seen
                 .get(&payload)
@@ -1367,7 +1394,9 @@ mod tests {
                 leader: participants[0].clone(),
                 parent: (View::zero(), genesis),
             };
-            let payload = proposer.propose(&proposal_context, 200);
+            let mut propose_effects = CoreEffects::new();
+            let payload =
+                proposer.propose_with_effects(&proposal_context, 200, &mut propose_effects);
             let payload_contents = proposer
                 .seen
                 .get(&payload)
@@ -1661,6 +1690,281 @@ mod tests {
                 _ => panic!("expected fetch payload request"),
             }
         });
+    }
+
+    #[test_log::test]
+    fn propose_missing_parent_requests_fetch_and_stops_after_repair() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-propose-missing-parent-fetch", 6);
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_FETCH_RETRY_MS,
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_propose_missing_parent_fetch"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([10u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            let missing_contents = encode_payload(
+                Round::new(epoch, View::new(1)),
+                genesis,
+                100,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let missing_digest = payload_digest(&missing_contents);
+            let parent_contents = encode_payload(
+                Round::new(epoch, View::new(2)),
+                missing_digest,
+                101,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let parent_payload = payload_digest(&parent_contents);
+            core.note_payload_seen(parent_payload, parent_contents);
+
+            let propose_context = Context {
+                round: Round::new(epoch, View::new(3)),
+                leader: participants[1].clone(),
+                parent: (View::new(2), parent_payload),
+            };
+
+            let (first_response, _first_receiver) = oneshot::channel();
+            let first = core.on_message(
+                AppMailboxReadWriteMessage::Propose {
+                    context: propose_context.clone(),
+                    response: first_response,
+                },
+                200,
+                &|_| Some(0),
+            );
+            assert_eq!(first.replies.len(), 1);
+            assert!(
+                first.network.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        NetworkEffect::BroadcastShard(message)
+                            if matches!(
+                                message.body,
+                                WireShardMessage::FetchPayload { digest }
+                                    if digest == missing_digest
+                            )
+                    )
+                }),
+                "propose should request fetch for missing parent dependency"
+            );
+
+            let repaired = core.on_shard_message(
+                ShardMessage::payload_response(&participants[0], missing_digest, missing_contents),
+                201,
+                &|_| None,
+            );
+            assert!(repaired.replies.is_empty());
+            assert!(repaired.network.is_empty());
+
+            assert!(
+                core.ensure_execution_materialized(parent_payload),
+                "parent execution should become materializable after repair"
+            );
+
+            let second_context = Context {
+                round: Round::new(epoch, View::new(4)),
+                leader: participants[1].clone(),
+                parent: (View::new(2), parent_payload),
+            };
+            let (second_response, _second_receiver) = oneshot::channel();
+            let second = core.on_message(
+                AppMailboxReadWriteMessage::Propose {
+                    context: second_context,
+                    response: second_response,
+                },
+                202,
+                &|_| Some(0),
+            );
+            assert_eq!(second.replies.len(), 1);
+            assert!(
+                second.network.is_empty(),
+                "propose should stop requesting fetch once dependencies are repaired"
+            );
+        });
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn eventual_repair_unblocks_deferred_verify_and_finalization(
+            chain_len in 3usize..8usize,
+            missing_prefix in 1usize..6usize,
+            shuffle_seed in any::<u64>(),
+            maintenance_offsets in prop::collection::vec(1u64..20u64, 0..12),
+        ) {
+            let available_from = 1 + missing_prefix;
+            prop_assume!(available_from < chain_len);
+
+            let runner = deterministic::Runner::timed(Duration::from_secs(30));
+            runner.start(|mut context| async move {
+                let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                    minimmit_ed25519::fixture(
+                        &mut context,
+                        b"core-eventual-repair-proptest",
+                        6,
+                    );
+                let strategy = crate::coding_strategy();
+                let mut core = AppCore::new(
+                    &participants[1],
+                    participants.clone(),
+                    1,
+                    coding_config(6),
+                    TEST_FETCH_RETRY_MS,
+                    10_000,
+                    strategy,
+                    test_metrics(&context, "core_eventual_repair_proptest"),
+                );
+
+                let epoch = Epoch::new(1);
+                let genesis = core.genesis(epoch);
+                let anchor_root = Digest::from([21u8; 32]);
+                core.note_persisted_root(genesis, anchor_root);
+
+                let mut digests = vec![genesis];
+                let mut payloads = HashMap::new();
+                for idx in 1..=chain_len {
+                    let round = Round::new(epoch, View::new(u64::try_from(idx).unwrap_or(u64::MAX)));
+                    let parent = digests[idx - 1];
+                    let contents = encode_payload(
+                        round,
+                        parent,
+                        100 + u64::try_from(idx).unwrap_or(0),
+                        genesis,
+                        anchor_root,
+                        &[],
+                    );
+                    let digest = payload_digest(&contents);
+                    digests.push(digest);
+                    payloads.insert(digest, contents);
+                }
+
+                for idx in available_from..=chain_len {
+                    let digest = digests[idx];
+                    let bytes = payloads
+                        .get(&digest)
+                        .expect("payload bytes for known digest should exist")
+                        .clone();
+                    core.note_payload_seen(digest, bytes);
+                }
+
+                let tip = digests[chain_len];
+                let tip_parent = digests[chain_len - 1];
+                let verify_context = Context {
+                    round: Round::new(epoch, View::new(u64::try_from(chain_len).unwrap_or(u64::MAX))),
+                    leader: participants[0].clone(),
+                    parent: (
+                        View::new(u64::try_from(chain_len - 1).unwrap_or(u64::MAX)),
+                        tip_parent,
+                    ),
+                };
+                let expected_first_missing = digests[available_from - 1];
+
+                let (response, _receiver) = oneshot::channel();
+                let initial_verify = core.on_message(
+                    AppMailboxReadWriteMessage::Verify {
+                        context: verify_context,
+                        payload: tip,
+                        response,
+                    },
+                    200,
+                    &|_| Some(0),
+                );
+                assert!(initial_verify.replies.is_empty());
+                assert!(
+                    initial_verify.network.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            NetworkEffect::BroadcastShard(message)
+                                if matches!(
+                                    message.body,
+                                    WireShardMessage::FetchPayload { digest }
+                                        if digest == expected_first_missing
+                                )
+                        )
+                    }),
+                    "initial verify should fetch first missing ancestor"
+                );
+
+                let initial_finalized = core.on_finalized(tip, tip_parent);
+                assert!(initial_finalized.replies.is_empty());
+                assert!(initial_finalized.network.is_empty());
+                assert!(!core.finalized.is_finalized(tip));
+                assert!(core.pending_finalizations.contains_key(&tip));
+
+                let mut missing_indices: Vec<usize> = (1..available_from).collect();
+                missing_indices.sort_by_key(|idx| {
+                    (u64::try_from(*idx).unwrap_or(0))
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ shuffle_seed
+                });
+
+                let mut now = 250u64;
+                let mut saw_valid_verify = false;
+
+                for (step, idx) in missing_indices.into_iter().enumerate() {
+                    if !maintenance_offsets.is_empty() {
+                        let delta = maintenance_offsets[step % maintenance_offsets.len()];
+                        now = now.saturating_add(delta);
+                        let tick = core.on_message(
+                            AppMailboxReadWriteMessage::MaintenanceTick,
+                            now,
+                            &|_| Some(0),
+                        );
+                        saw_valid_verify |= has_valid_verify_reply(&tick);
+                    }
+
+                    let digest = digests[idx];
+                    let bytes = payloads
+                        .get(&digest)
+                        .expect("payload bytes for missing digest should exist")
+                        .clone();
+                    now = now.saturating_add(1);
+                    let repaired = core.on_shard_message(
+                        ShardMessage::payload_response(&participants[0], digest, bytes),
+                        now,
+                        &|_| None,
+                    );
+                    saw_valid_verify |= has_valid_verify_reply(&repaired);
+                }
+
+                for _ in 0..3 {
+                    now = now.saturating_add(1);
+                    let tick = core.on_message(
+                        AppMailboxReadWriteMessage::MaintenanceTick,
+                        now,
+                        &|_| Some(0),
+                    );
+                    saw_valid_verify |= has_valid_verify_reply(&tick);
+                }
+
+                assert!(
+                    saw_valid_verify,
+                    "verify should become valid once missing ancestors are repaired"
+                );
+                assert!(core.finalized.is_finalized(tip));
+                assert!(!core.pending_finalizations.contains_key(&tip));
+            });
+        }
     }
 
     #[test_log::test]

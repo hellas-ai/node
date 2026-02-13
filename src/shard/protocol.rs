@@ -69,6 +69,7 @@ pub(crate) struct ShardMessage {
 }
 
 impl ShardMessage {
+    #[cfg(test)]
     pub(crate) fn initial(
         sender: &PublicKey,
         key: BlockKey,

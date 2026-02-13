@@ -7,7 +7,9 @@ use bytes::{Buf, Bytes};
 use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_macros::select;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef,
+};
 use commonware_storage::{
     Persistable,
     metadata::{Config as MetadataConfig, Metadata},
@@ -95,7 +97,7 @@ struct AnchorEntry {
 
 pub(super) struct PersistenceWorker<E>
 where
-    E: Clock + Spawner + Storage + Metrics,
+    E: Clock + Spawner + Storage + Metrics + BufferPooler,
 {
     partition_prefix: String,
     page_cache: PageCacheConfig,
@@ -121,7 +123,7 @@ where
 
 impl<E> PersistenceWorker<E>
 where
-    E: Clock + Spawner + Storage + Metrics,
+    E: Clock + Spawner + Storage + Metrics + BufferPooler,
 {
     const RETRY_BASE: Duration = Duration::from_millis(50);
     const RETRY_MAX: Duration = Duration::from_secs(5);
@@ -195,11 +197,11 @@ where
             }
 
             let now_ms = context.current().epoch_millis();
-            if self.should_attempt_persist(now_ms) {
+            if self.should_attempt_persist(now_ms).await {
                 self.persist_next_pending(context, now_ms).await;
             }
 
-            let sleep_duration = self.persistence_sleep_duration(context.current().epoch_millis());
+            let sleep_duration = self.persistence_sleep_duration(context.current().epoch_millis()).await;
             select! {
                 command = self.command_rx.next() => {
                     let Some(command) = command else {
@@ -236,8 +238,8 @@ where
         self.handle_command(command).await
     }
 
-    fn should_attempt_persist(&self, now_ms: u64) -> bool {
-        if self.pending.is_none() && self.queue_is_empty() {
+    async fn should_attempt_persist(&self, now_ms: u64) -> bool {
+        if self.pending.is_none() && self.queue_is_empty().await {
             return false;
         }
         match self.next_retry_at_ms {
@@ -246,8 +248,8 @@ where
         }
     }
 
-    fn persistence_sleep_duration(&self, now_ms: u64) -> Duration {
-        if self.pending.is_none() && self.queue_is_empty() {
+    async fn persistence_sleep_duration(&self, now_ms: u64) -> Duration {
+        if self.pending.is_none() && self.queue_is_empty().await {
             return Self::IDLE_SLEEP;
         }
         let Some(deadline_ms) = self.next_retry_at_ms else {
@@ -256,8 +258,11 @@ where
         Duration::from_millis(deadline_ms.saturating_sub(now_ms))
     }
 
-    fn queue_is_empty(&self) -> bool {
-        self.queue.as_ref().map_or(true, PersistenceQueue::is_empty)
+    async fn queue_is_empty(&self) -> bool {
+        match self.queue.as_ref() {
+            Some(queue) => queue.is_empty().await,
+            None => true,
+        }
     }
 
     fn schedule_retry(&mut self, now_ms: u64) {
@@ -351,7 +356,7 @@ where
                     self.schedule_retry(now_ms);
                     return;
                 };
-                if let Err(err) = queue.ack(position) {
+                if let Err(err) = queue.ack(position).await {
                     error!(?err, position, ?payload, "failed to ack persistence intent");
                     queue.reset();
                     self.metrics.persist_failure_total.inc();
@@ -577,6 +582,7 @@ where
 
     async fn reopen_db_after_failure(&mut self, context: &mut E, stage: &'static str) {
         let config = utxo_db_config(
+            context,
             &self.partition_prefix,
             self.page_cache.size,
             self.page_cache.count,
@@ -835,7 +841,7 @@ where
         }
     }
 
-    fn queue_config(&self) -> QueueConfig<(RangeCfg<usize>, ())> {
+    fn queue_config(&self, context: &E) -> QueueConfig<(RangeCfg<usize>, ())> {
         let page_cache_size = NonZeroU16::new(self.page_cache.size)
             .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
         let page_cache_count = NonZeroUsize::new(self.page_cache.count)
@@ -845,7 +851,7 @@ where
             items_per_section: Self::QUEUE_ITEMS_PER_SECTION,
             compression: None,
             codec_config: ((0..=Self::MAX_QUEUE_ITEM_BYTES).into(), ()),
-            page_cache: CacheRef::new(page_cache_size, page_cache_count),
+            page_cache: CacheRef::from_pooler(context, page_cache_size, page_cache_count),
             write_buffer: Self::QUEUE_WRITE_BUFFER,
         }
     }
@@ -932,7 +938,7 @@ where
     }
 
     async fn initialize_queue(&mut self, context: &mut E) {
-        let config = self.queue_config();
+        let config = self.queue_config(context);
         match PersistenceQueue::init(context.with_label("persistence_queue"), config).await {
             Ok(queue) => {
                 self.queue = Some(queue);
@@ -948,6 +954,7 @@ where
 
     async fn initialize_db(&mut self, context: &mut E) {
         let config = utxo_db_config(
+            context,
             &self.partition_prefix,
             self.page_cache.size,
             self.page_cache.count,

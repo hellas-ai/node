@@ -16,7 +16,7 @@ use commonware_actor::{Actor, service::ServiceBuilder};
 use commonware_consensus::Reporter;
 use commonware_cryptography::sha256::Digest;
 use commonware_macros::select;
-use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
 use commonware_utils::{
     SystemTimeExt,
     channel::{fallible::OneshotExt, oneshot},
@@ -124,7 +124,7 @@ where
 
 impl<E, T> Application<E, T>
 where
-    E: Clock + Spawner + Storage + Metrics,
+    E: Clock + Spawner + Storage + Metrics + BufferPooler,
     T: ShardTransport,
 {
     const MAILBOX_CAPACITY: usize = 1024;
@@ -857,7 +857,7 @@ where
 
 impl<E, T> Actor<E> for Application<E, T>
 where
-    E: Clock + Spawner + Storage + Metrics,
+    E: Clock + Spawner + Storage + Metrics + BufferPooler,
     T: ShardTransport,
 {
     type Mailbox = AppMailbox;

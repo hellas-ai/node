@@ -2,7 +2,7 @@ mod codec;
 pub(crate) mod core;
 #[cfg(test)]
 mod integration;
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test))]
 pub(crate) mod mock;
 mod p2p;
 #[cfg(feature = "perf-harness")]

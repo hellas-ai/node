@@ -8,7 +8,7 @@ use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Clock, Handle, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
 use hellas_types::{Activity, PublicKey, Scheme};
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ where
 
 pub struct Engine<E, B, R>
 where
-    E: Clock + CryptoRngCore + Spawner + Storage + Metrics,
+    E: Clock + CryptoRngCore + Spawner + Storage + Metrics + BufferPooler,
     B: Blocker<PublicKey = PublicKey>,
     R: Reporter<Activity = Activity>,
 {
@@ -80,7 +80,7 @@ where
 
 impl<E, B, R> Engine<E, B, R>
 where
-    E: Clock + CryptoRngCore + Spawner + Storage + Metrics,
+    E: Clock + CryptoRngCore + Spawner + Storage + Metrics + BufferPooler,
     B: Blocker<PublicKey = PublicKey>,
     R: Reporter<Activity = Activity>,
 {
@@ -114,7 +114,7 @@ where
         let tx_mailbox = mailbox.clone();
         let reporter = AppReporter::new(finalization_tx, reporter);
 
-        let cfg = config.into_minimmit(scheme, blocker, mailbox.clone(), mailbox, reporter, me);
+        let cfg = config.into_minimmit(&context, scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);
 
         (Self { inner, app_handle }, tx_mailbox)

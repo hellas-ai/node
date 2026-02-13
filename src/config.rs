@@ -4,7 +4,7 @@ use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewD
 use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
 use commonware_p2p::{Address, Blocker};
 use commonware_parallel::Sequential;
-use commonware_runtime::buffer::paged::CacheRef;
+use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
 use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,7 @@ impl Config {
 
     pub fn into_minimmit<B, R>(
         self,
+        pooler: &impl BufferPooler,
         scheme: Scheme,
         blocker: B,
         automaton: AppMailbox,
@@ -124,7 +125,7 @@ impl Config {
             epoch: EPOCH,
             replay_buffer,
             write_buffer,
-            page_cache: CacheRef::new(page_cache_size, page_cache_count),
+            page_cache: CacheRef::from_pooler(pooler, page_cache_size, page_cache_count),
             leader_timeout: self.leader_timeout,
             notarization_timeout: self.notarization_timeout,
             nullify_retry: self.nullify_retry,

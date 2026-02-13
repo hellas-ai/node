@@ -1,6 +1,6 @@
 use crate::object::{Coin, ObjectId};
 use commonware_cryptography::Sha256;
-use commonware_runtime::buffer::paged::CacheRef;
+use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{
     qmdb::current::{FixedConfig, unordered::fixed::Db as CurrentFixedDb},
     translator::EightCap,
@@ -36,6 +36,7 @@ pub const DEFAULT_PAGE_CACHE_COUNT: NonZeroUsize = NonZeroUsize::new(1024).unwra
 /// The `partition_prefix` must be unique per validator instance to avoid
 /// storage collisions in tests or multi-process setups.
 pub fn utxo_db_config(
+    pooler: &impl BufferPooler,
     partition_prefix: &str,
     page_cache_size: u16,
     page_cache_count: usize,
@@ -54,6 +55,6 @@ pub fn utxo_db_config(
         bitmap_metadata_partition: format!("{partition_prefix}_utxo_bitmap_metadata"),
         translator: EightCap,
         thread_pool: None,
-        page_cache: CacheRef::new(page_cache_size, page_cache_count),
+        page_cache: CacheRef::from_pooler(pooler, page_cache_size, page_cache_count),
     }
 }
