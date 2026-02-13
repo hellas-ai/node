@@ -164,10 +164,6 @@ impl AppCore {
         self.shard_recoverer.me()
     }
 
-    pub(super) fn validators(&self) -> &[PublicKey] {
-        &self.validators
-    }
-
     // Driver entry points -----------------------------------------------------
     pub(super) fn on_message<F>(
         &mut self,
@@ -225,7 +221,9 @@ impl AppCore {
             | AppMailboxReadWriteMessage::GetStateRoot { .. }
             | AppMailboxReadWriteMessage::GetProof { .. }
             | AppMailboxReadWriteMessage::GetFinalization { .. }
-            | AppMailboxReadWriteMessage::DrainExternalEvents => {
+            | AppMailboxReadWriteMessage::ShardEvent { .. }
+            | AppMailboxReadWriteMessage::FinalizationEvent { .. }
+            | AppMailboxReadWriteMessage::Persisted { .. } => {
                 unreachable!(
                     "application should intercept non-core ingress before AppCore::on_message"
                 );

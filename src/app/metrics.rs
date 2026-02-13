@@ -10,7 +10,6 @@ pub(super) struct ApplicationMetrics {
     pub(crate) persistence_ack_total: Counter,
     pub(crate) persistence_ack_unexpected_total: Counter,
     pub(crate) genesis_anchor_seeded_total: Counter,
-    pub(crate) pending_external_events: Gauge<i64, AtomicI64>,
     pub(crate) inflight_persistence: Gauge<i64, AtomicI64>,
 }
 
@@ -23,13 +22,12 @@ impl ApplicationMetrics {
             persistence_ack_total: Counter::default(),
             persistence_ack_unexpected_total: Counter::default(),
             genesis_anchor_seeded_total: Counter::default(),
-            pending_external_events: Gauge::default(),
             inflight_persistence: Gauge::default(),
         };
 
         context.register(
             "external_events_total",
-            "external events queued for mailbox replay",
+            "external events processed by app actor",
             metrics.external_events_total.clone(),
         );
         context.register(
@@ -58,17 +56,11 @@ impl ApplicationMetrics {
             metrics.genesis_anchor_seeded_total.clone(),
         );
         context.register(
-            "pending_external_events",
-            "current number of queued external events",
-            metrics.pending_external_events.clone(),
-        );
-        context.register(
             "inflight_persistence",
             "whether a persistence intent is currently inflight (0/1)",
             metrics.inflight_persistence.clone(),
         );
 
-        metrics.pending_external_events.set(0);
         metrics.inflight_persistence.set(0);
         metrics
     }

@@ -1,7 +1,6 @@
 use crate::app::{AppMailbox, Application, FinalizationNotice};
 use crate::config::Config;
 use crate::shard::AuthenticatedShardTransport;
-use crate::trace::Traced;
 use commonware_codec::Encode;
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit};
 use commonware_cryptography::certificate::Scheme as _;
@@ -16,17 +15,13 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppReporter<R> {
-    finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
+    mailbox: AppMailbox,
     inner: R,
     notarize_total: Counter,
 }
 
 impl<R> AppReporter<R> {
-    fn new(
-        context: &impl Metrics,
-        finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
-        inner: R,
-    ) -> Self {
+    fn new(context: &impl Metrics, mailbox: AppMailbox, inner: R) -> Self {
         let notarize_total = Counter::default();
         context.register(
             "notarize_total",
@@ -34,7 +29,7 @@ impl<R> AppReporter<R> {
             notarize_total.clone(),
         );
         Self {
-            finalization,
+            mailbox,
             inner,
             notarize_total,
         }
@@ -51,20 +46,14 @@ where
         if let Activity::Notarize(_) = &activity {
             self.notarize_total.inc();
         }
-        if let Activity::Finalization(finalization) = &activity
-            && let Err(err) =
-                self.finalization
-                    .unbounded_send(Traced::capture(FinalizationNotice {
-                        payload: finalization.proposal.payload,
-                        parent_payload: finalization.proposal.parent_payload,
-                        certificate_bytes: Some(finalization.encode().to_vec().into()),
-                    }))
-        {
-            error!(
-                ?err,
-                "failed to forward finalization notice to app; aborting"
-            );
-            std::process::abort();
+        if let Activity::Finalization(finalization) = &activity {
+            self.mailbox
+                .finalize(FinalizationNotice {
+                    payload: finalization.proposal.payload,
+                    parent_payload: finalization.proposal.parent_payload,
+                    certificate_bytes: Some(finalization.encode().to_vec().into()),
+                })
+                .await;
         }
         self.inner.report(activity).await;
     }
@@ -112,7 +101,7 @@ where
     {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
         let partition_prefix = format!("hellas_{}", me);
-        let (app, finalization_tx) = Application::new_with_page_cache_and_timing(
+        let app = Application::new_with_page_cache_and_timing(
             context.with_label("app"),
             relay.clone(),
             me,
@@ -125,7 +114,7 @@ where
         );
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();
-        let reporter = AppReporter::new(&context.with_label("chain"), finalization_tx, reporter);
+        let reporter = AppReporter::new(&context.with_label("chain"), mailbox.clone(), reporter);
 
         let cfg = config.into_minimmit(&context, scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);

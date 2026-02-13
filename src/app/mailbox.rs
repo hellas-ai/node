@@ -1,6 +1,10 @@
+#![allow(private_interfaces)]
+
 use crate::object::Coin;
 use crate::object::{ObjectId, Transaction};
+use crate::shard::protocol::ShardMessage;
 
+use super::FinalizationNotice;
 use commonware_actor::ingress;
 use commonware_consensus::{Automaton, Relay, types::Epoch};
 use commonware_cryptography::sha256::Digest;
@@ -53,7 +57,16 @@ ingress! {
     tell SubmitTx {
         tx: Transaction,
     };
-    tell DrainExternalEvents;
+    tell ShardEvent {
+        message: ShardMessage,
+    };
+    tell FinalizationEvent {
+        notice: FinalizationNotice,
+    };
+    tell Persisted {
+        payload: Digest,
+        root: Digest,
+    };
     tell MaintenanceTick;
     ask read_write GetCoin {
         payload: Digest,
@@ -67,6 +80,25 @@ ingress! {
 impl AppMailbox {
     pub async fn submit_tx(&self, tx: Transaction) {
         let _ = self.0.tell_lossy(SubmitTx { tx }).await;
+    }
+
+    pub(crate) async fn finalize(&self, notice: FinalizationNotice) {
+        if let Err(err) = self.0.tell(FinalizationEvent { notice }).await {
+            error!(?err, "failed to enqueue finalization; aborting");
+            std::process::abort();
+        }
+    }
+
+    pub(super) async fn tell_shard_event(&self, message: ShardMessage) -> bool {
+        self.0.tell(ShardEvent { message }).await.is_ok()
+    }
+
+    pub(super) async fn tell_persisted(&self, payload: Digest, root: Digest) -> bool {
+        self.0.tell(Persisted { payload, root }).await.is_ok()
+    }
+
+    pub(super) async fn tell_maintenance_tick(&self) -> bool {
+        self.0.tell(MaintenanceTick).await.is_ok()
     }
 
     pub async fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
