@@ -16,6 +16,7 @@ use commonware_storage::{
 };
 use commonware_utils::{channel::oneshot, sequence::U64};
 use futures::{StreamExt, channel::mpsc};
+use tracing::Instrument;
 use hellas_types::PublicKey;
 use indexmap::IndexMap;
 use std::{
@@ -399,8 +400,7 @@ where
         command: Traced<PersistenceCommand>,
     ) -> Result<bool, Fatal> {
         let (command, parent_span) = command.into_parts();
-        let _entered = parent_span.enter();
-        self.handle_command(command).await
+        self.handle_command(command).instrument(parent_span).await
     }
 
     async fn has_pending_work(&self) -> bool {
