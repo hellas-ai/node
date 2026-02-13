@@ -4,6 +4,11 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    catgrad = {
+      url = "path:/home/grw/src/catgrad";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+    };
   };
 
   outputs = {
@@ -11,12 +16,15 @@
     nixpkgs,
     flake-utils,
     rust-overlay,
+    catgrad,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [(import rust-overlay)];
       pkgs = import nixpkgs {
         inherit system overlays;
+        config.allowUnfree = true;
       };
+      catgradCudaEnv = catgrad.lib.${system}.cudaEnv;
 
       rust-toolchain = pkgs.buildPackages.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       rustPlatform = pkgs.makeRustPlatform {
@@ -31,7 +39,8 @@
         cargoLock = {
           lockFile = ./Cargo.lock;
           outputHashes = {
-            # "catgrad-0.2.1" = "sha256-rlhwlUACdJyIlRg2jTA5nb2KcPQ+lCpWnhu68Z2idbM=";
+            "catgrad-0.2.1" = "sha256-mwscSjIfVBtBxvv//gZEM9rkZrkNjnSD3HqbgOTOIhM=";
+            "catgrad-llm-0.2.1" = "sha256-mwscSjIfVBtBxvv//gZEM9rkZrkNjnSD3HqbgOTOIhM=";
           };
         };
         auditable = false;
@@ -213,10 +222,34 @@
 
       cli = rustPlatform.buildRustPackage commonArgs;
       server = rustPlatform.buildRustPackage (commonArgs // {buildFeatures = ["serve"];});
+      serverCuda = rustPlatform.buildRustPackage (commonArgs // {
+        buildFeatures = ["serve" "cuda"];
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper] ++ catgradCudaEnv.nativeBuildInputs;
+        buildInputs = commonArgs.buildInputs ++ catgradCudaEnv.buildInputs;
+        CUDA_COMPUTE_CAP = catgradCudaEnv.CUDA_COMPUTE_CAP;
+        CUDA_TOOLKIT_ROOT_DIR = catgradCudaEnv.CUDA_TOOLKIT_ROOT_DIR;
+        doCheck = false;
+        postInstall = ''
+          for bin in $out/bin/*; do
+            if [ -x "$bin" ] && [ ! -L "$bin" ]; then
+              wrapProgram "$bin" \
+                --prefix LD_LIBRARY_PATH : "${catgradCudaEnv.runtimeLibraryPath}"
+            fi
+          done
+        '';
+      });
+      catgradShells = catgrad.devShells.${system} or {};
+      catgradCudaShell =
+        if catgradShells ? cuda
+        then catgradShells.cuda
+        else if catgradShells ? default
+        then catgradShells.default
+        else throw "catgrad flake has no devShells.${system}.cuda";
     in {
       packages = {
         default = cli;
-        inherit cli server;
+        inherit cli server serverCuda;
+        "server-cuda" = serverCuda;
         "dep-hygiene" = depHygiene;
       };
 
@@ -240,6 +273,13 @@
           cargo-watch
           gh
           depHygiene
+        ];
+      };
+
+      devShells.cuda = pkgs.mkShell {
+        inputsFrom = [
+          self.devShells.${system}.default
+          catgradCudaShell
         ];
       };
     })

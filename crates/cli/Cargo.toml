@@ -10,8 +10,10 @@ documentation.workspace = true
 [features]
 default = ["client", "discovery"]
 client = ["hellas-rpc/client", "dep:tonic-iroh-transport", "tonic-iroh-transport/client"]
-discovery = ["client", "tonic-iroh-transport/discovery", "dep:pkarr"]
+discovery = ["client", "dep:tonic", "tonic-iroh-transport/discovery", "dep:pkarr"]
 serve = ["discovery", "hellas-rpc/server", "dep:hellas-executor", "dep:tonic", "tonic-iroh-transport/server"]
+cuda = ["serve", "hellas-executor/candle-cuda"]
+metal = ["serve", "hellas-executor/candle-metal"]
 
 [dependencies]
 tokio.workspace = true
@@ -26,6 +28,9 @@ tonic-iroh-transport = { workspace = true, default-features = false, optional = 
 tonic = { workspace = true, optional = true }
 tokio-stream = { workspace = true }
 pkarr = { version = "5", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }
 
 # dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]

@@ -17,8 +17,8 @@ repository = "https://github.com/hellas-ai/node"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
-catgrad = { path = "../catgrad/catgrad", default-features = false, features = ["serde", "ndarray-backend"] }
-catgrad-llm = { path = "../catgrad/catgrad-llm", default-features = false }
+catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false, features = ["serde"] }
+catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
