@@ -1,8 +1,9 @@
 use super::mailbox::AppMailboxReadWriteMessage;
 use super::metrics::CoreMetrics;
 use super::payload::{
-    decode_anchor, decode_execution_payload, encode_payload, genesis_digest, genesis_payload,
-    missing_dependency_or_execution, payload_digest, validate_payload,
+    decode_anchor, decode_execution_payload, encode_payload, first_missing_execution_dependency,
+    genesis_digest, genesis_payload, missing_dependency_or_execution, payload_digest,
+    validate_payload,
 };
 use crate::execution::{
     ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
@@ -837,10 +838,10 @@ impl AppCore {
             }
 
             if let Some((parent, _txs)) = decode_execution_payload(&self.seen, payload)
-                && (!self.seen.contains_key(&parent)
-                    || !self.speculative_store.contains_execution(parent))
+                && let Some(missing) =
+                    first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
             {
-                self.schedule_dependency_fetch(parent, now, effects);
+                self.schedule_dependency_fetch(missing, now, effects);
             }
         }
     }
@@ -1580,6 +1581,77 @@ mod tests {
             assert!(deferred.replies.is_empty());
             assert_eq!(deferred.network.len(), 1);
             let Some(NetworkEffect::BroadcastShard(message)) = deferred.network.front() else {
+                panic!("expected fetch request network effect");
+            };
+            match &message.body {
+                WireShardMessage::FetchPayload { digest } => {
+                    assert_eq!(*digest, missing_ancestor)
+                }
+                _ => panic!("expected fetch payload request"),
+            }
+        });
+    }
+
+    #[test_log::test]
+    fn pending_finalization_fetches_first_missing_ancestor_dependency() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(
+                    &mut context,
+                    b"core-finalization-ancestor-fetch-test",
+                    6,
+                );
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_FETCH_RETRY_MS,
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_finalization_ancestor_fetch"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([6u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            let missing_ancestor = Digest::from([8u8; 32]);
+            let parent_contents = encode_payload(
+                Round::new(epoch, View::new(1)),
+                missing_ancestor,
+                100,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let parent_payload = payload_digest(&parent_contents);
+            core.note_payload_seen(parent_payload, parent_contents);
+
+            let payload_contents = encode_payload(
+                Round::new(epoch, View::new(2)),
+                parent_payload,
+                101,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let payload = payload_digest(&payload_contents);
+            core.note_payload_seen(payload, payload_contents);
+
+            let deferred = core.on_finalized(payload, parent_payload);
+            assert!(deferred.replies.is_empty());
+            assert!(deferred.network.is_empty());
+
+            let retry = core.on_message(AppMailboxReadWriteMessage::MaintenanceTick, 200, &|_| {
+                Some(0)
+            });
+            assert_eq!(retry.network.len(), 1);
+            let Some(NetworkEffect::BroadcastShard(message)) = retry.network.front() else {
                 panic!("expected fetch request network effect");
             };
             match &message.body {

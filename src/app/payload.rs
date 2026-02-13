@@ -165,7 +165,14 @@ pub(super) fn missing_dependency_or_execution(
     if !seen.contains_key(&payload) {
         return Some(payload);
     }
-    let mut current = context.parent.1;
+    first_missing_execution_dependency(seen, speculative_store, context.parent.1)
+}
+
+pub(super) fn first_missing_execution_dependency(
+    seen: &HashMap<Digest, Bytes>,
+    speculative_store: &SpeculativeExecutionStore,
+    mut current: Digest,
+) -> Option<Digest> {
     if !seen.contains_key(&current) {
         return Some(current);
     }
