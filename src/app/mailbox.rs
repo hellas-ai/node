@@ -77,6 +77,26 @@ ingress! {
     pub ask read_write GetFinalization { payload: Digest } -> Option<FinalizationResponse>;
 }
 
+impl AppMailboxReadWriteMessage {
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::Genesis { .. } => "genesis",
+            Self::Propose { .. } => "propose",
+            Self::Verify { .. } => "verify",
+            Self::Broadcast { .. } => "broadcast",
+            Self::SubmitTx { .. } => "submit_tx",
+            Self::MaintenanceTick => "maintenance_tick",
+            Self::ShardEvent { .. } => "shard_event",
+            Self::FinalizationEvent { .. } => "finalization_event",
+            Self::Persisted { .. } => "persisted",
+            Self::GetCoin { .. } => "get_coin",
+            Self::GetStateRoot { .. } => "get_state_root",
+            Self::GetProof { .. } => "get_proof",
+            Self::GetFinalization { .. } => "get_finalization",
+        }
+    }
+}
+
 impl AppMailbox {
     pub async fn submit_tx(&self, tx: Transaction) {
         let _ = self.0.tell_lossy(SubmitTx { tx }).await;

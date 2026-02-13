@@ -36,6 +36,28 @@ pub(crate) struct FinalizationNotice {
 }
 
 // ---------------------------------------------------------------------------
+// ApplicationConfig — tunable parameters for the Application actor
+// ---------------------------------------------------------------------------
+
+pub(crate) struct ApplicationConfig {
+    pub page_cache_size: u16,
+    pub page_cache_count: usize,
+    pub maintenance_interval: Duration,
+    pub verify_wait_timeout: Duration,
+}
+
+impl Default for ApplicationConfig {
+    fn default() -> Self {
+        Self {
+            page_cache_size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
+            page_cache_count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
+            maintenance_interval: Duration::from_millis(50),
+            verify_wait_timeout: Duration::from_millis(500),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TraceReporter — logs consensus activity
 // ---------------------------------------------------------------------------
 
@@ -262,22 +284,18 @@ where
 {
     const MAILBOX_CAPACITY: usize = 1024;
     const MAX_PENDING_PERSISTENCE_QUEUE: usize = 1024;
-    #[allow(dead_code)]
-    const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(50);
-    #[allow(dead_code)]
-    const DEFAULT_VERIFY_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
-    #[allow(dead_code)]
     pub(crate) fn new(
         context: E,
         relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
+        config: ApplicationConfig,
     ) -> Self {
         let page_cache_config = PageCacheConfig {
-            size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
-            count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
+            size: config.page_cache_size,
+            count: config.page_cache_count,
         };
         Self::new_inner(
             context,
@@ -286,58 +304,8 @@ where
             validators,
             partition_prefix,
             page_cache_config,
-            Self::DEFAULT_MAINTENANCE_INTERVAL,
-            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
-        )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn new_with_page_cache(
-        context: E,
-        relay: std::sync::Arc<T>,
-        me: &PublicKey,
-        validators: Vec<PublicKey>,
-        partition_prefix: String,
-        page_cache_size: u16,
-        page_cache_count: usize,
-    ) -> Self {
-        Self::new_with_page_cache_and_timing(
-            context,
-            relay,
-            me,
-            validators,
-            partition_prefix,
-            page_cache_size,
-            page_cache_count,
-            Self::DEFAULT_MAINTENANCE_INTERVAL,
-            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
-        )
-    }
-
-    pub(crate) fn new_with_page_cache_and_timing(
-        context: E,
-        relay: std::sync::Arc<T>,
-        me: &PublicKey,
-        validators: Vec<PublicKey>,
-        partition_prefix: String,
-        page_cache_size: u16,
-        page_cache_count: usize,
-        maintenance_interval: Duration,
-        verify_wait_timeout: Duration,
-    ) -> Self {
-        let page_cache_config = PageCacheConfig {
-            size: page_cache_size,
-            count: page_cache_count,
-        };
-        Self::new_inner(
-            context,
-            relay,
-            me,
-            validators,
-            partition_prefix,
-            page_cache_config,
-            maintenance_interval,
-            verify_wait_timeout,
+            config.maintenance_interval,
+            config.verify_wait_timeout,
         )
     }
 
@@ -541,22 +509,7 @@ where
     }
 
     async fn on_mailbox_message(&mut self, context: &mut E, message: AppMailboxReadWriteMessage) {
-        let message_kind = match &message {
-            AppMailboxReadWriteMessage::Genesis { .. } => "genesis",
-            AppMailboxReadWriteMessage::Propose { .. } => "propose",
-            AppMailboxReadWriteMessage::Verify { .. } => "verify",
-            AppMailboxReadWriteMessage::Broadcast { .. } => "broadcast",
-            AppMailboxReadWriteMessage::SubmitTx { .. } => "submit_tx",
-            AppMailboxReadWriteMessage::MaintenanceTick => "maintenance_tick",
-            AppMailboxReadWriteMessage::ShardEvent { .. } => "shard_event",
-            AppMailboxReadWriteMessage::FinalizationEvent { .. } => "finalization_event",
-            AppMailboxReadWriteMessage::Persisted { .. } => "persisted",
-            AppMailboxReadWriteMessage::GetCoin { .. } => "get_coin",
-            AppMailboxReadWriteMessage::GetStateRoot { .. } => "get_state_root",
-            AppMailboxReadWriteMessage::GetProof { .. } => "get_proof",
-            AppMailboxReadWriteMessage::GetFinalization { .. } => "get_finalization",
-        };
-        debug!(kind = message_kind, "processing mailbox message");
+        debug!(kind = message.kind(), "processing mailbox message");
         match message {
             AppMailboxReadWriteMessage::ShardEvent { message } => {
                 self.app_metrics.external_events_total.inc();
@@ -765,20 +718,18 @@ mod tests {
     };
     use super::*;
     use crate::execution::store::UtxoDb;
-    use crate::object::{Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id};
+    use crate::object::{Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
     use crate::shard::mock::MockShardTransport;
     use bytes::Bytes;
-    use commonware_codec::Encode;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_consensus::{Automaton, Relay};
     use commonware_cryptography::certificate::mocks::Fixture;
-    use commonware_cryptography::{Hasher, Sha256, Signer};
+    use commonware_cryptography::{Sha256, Signer};
     use commonware_runtime::{Clock, ContextCell, Metrics, Runner, deterministic};
     use hellas_types::{Context, PrivateKey, PublicKey};
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
-
 
     /// Cap timestamp ranges to avoid saturating_add degeneracy near u64::MAX.
     const MAX_TIMESTAMP: u64 = u64::MAX - SYNCHRONY_BOUND - 10_001;
@@ -842,6 +793,7 @@ mod tests {
             key,
             vec![key.clone()],
             partition.to_string(),
+            ApplicationConfig::default(),
         );
         let (handle, mailbox) = app.start();
         (handle, mailbox)
@@ -869,6 +821,7 @@ mod tests {
                 participant,
                 participants.to_vec(),
                 format!("{partition_prefix}_{idx}"),
+                ApplicationConfig::default(),
             );
             let (handle, mailbox) = app.start();
             handles.push(handle);
@@ -941,23 +894,15 @@ mod tests {
         );
     }
 
-    struct FinalizedTransfer {
-        root_before: Digest,
-        recipient_output: ObjectId,
-    }
-
     async fn submit_transfer_and_finalize(
         mailbox: &mut AppMailbox,
         sender: &PrivateKey,
         recipient_pk: &PublicKey,
-    ) -> FinalizedTransfer {
+    ) {
         let epoch = Epoch::new(1);
         let genesis = mailbox.genesis(epoch).await;
-        let root_before = fetch_root(mailbox).await;
 
         let tx = Transaction::transfer(sender, genesis_object_id(0), recipient_pk.clone(), 1);
-        let tx_digest = Sha256::hash(&tx.encode());
-        let recipient_output = output_object_id(&tx_digest, 0);
         mailbox.submit_tx(tx).await;
 
         let sender_pk = sender.public_key();
@@ -979,11 +924,6 @@ mod tests {
                 certificate_bytes: None,
             })
             .await;
-
-        FinalizedTransfer {
-            root_before,
-            recipient_output,
-        }
     }
 
     proptest! {

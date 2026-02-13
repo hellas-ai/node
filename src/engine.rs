@@ -1,4 +1,4 @@
-use crate::app::{AppMailbox, Application, FinalizationNotice};
+use crate::app::{AppMailbox, Application, ApplicationConfig, FinalizationNotice};
 use crate::config::Config;
 use crate::shard::AuthenticatedShardTransport;
 use commonware_codec::Encode;
@@ -101,16 +101,18 @@ where
     {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
         let partition_prefix = format!("hellas_{}", me);
-        let app = Application::new_with_page_cache_and_timing(
+        let app = Application::new(
             context.with_label("app"),
             relay.clone(),
             me,
             validators,
             partition_prefix,
-            config.page_cache_size,
-            config.page_cache_count,
-            config.nullify_retry,
-            config.fetch_timeout,
+            ApplicationConfig {
+                page_cache_size: config.page_cache_size,
+                page_cache_count: config.page_cache_count,
+                maintenance_interval: config.nullify_retry,
+                verify_wait_timeout: config.fetch_timeout,
+            },
         );
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();

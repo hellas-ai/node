@@ -1,4 +1,4 @@
-use super::{mailbox, metrics::PersistenceMetrics};
+use super::{mailbox, metrics::{PersistenceMetrics, gauge_set_len}};
 use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
 use crate::object::{Coin, ObjectId};
@@ -519,9 +519,7 @@ where
                 break;
             };
         }
-        self.metrics
-            .finalization_cache_entries
-            .set(i64::try_from(self.volatile_finalizations.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.finalization_cache_entries, self.volatile_finalizations.len());
     }
 
     fn payload(&mut self, payload: Digest) -> Option<Bytes> {

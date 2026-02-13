@@ -2,6 +2,10 @@ use commonware_runtime::Metrics;
 use prometheus_client::metrics::{counter::Counter, gauge::Gauge};
 use std::sync::atomic::AtomicI64;
 
+pub(super) fn gauge_set_len(gauge: &Gauge<i64, AtomicI64>, len: usize) {
+    gauge.set(i64::try_from(len).unwrap_or(i64::MAX));
+}
+
 #[derive(Clone)]
 pub(super) struct ApplicationMetrics {
     pub(crate) external_events_total: Counter,

@@ -211,6 +211,12 @@ impl<S: Strategy> ShardRecoverer<S> {
 
     // ---- Dispatch commands to the coding scheduler ----
 
+    fn dispatch_coding_command(&self, cmd: scheduler::Command) {
+        if let Err(err) = self.coding_tx.unbounded_send(Traced::capture(cmd)) {
+            warn!(?err, "coding scheduler command channel closed");
+        }
+    }
+
     fn dispatch_reshard(
         &self,
         key: BlockKey,
@@ -219,43 +225,28 @@ impl<S: Strategy> ShardRecoverer<S> {
         shard_hash: Digest,
         shard: <CodingImpl as CodingScheme>::Shard,
     ) {
-        if let Err(err) = self
-            .coding_tx
-            .unbounded_send(Traced::capture(scheduler::Command::Reshard {
-                key,
-                commitment,
-                shard_index,
-                shard_hash,
-                shard,
-            }))
-        {
-            warn!(?err, "coding scheduler command channel closed");
-        }
+        self.dispatch_coding_command(scheduler::Command::Reshard {
+            key,
+            commitment,
+            shard_index,
+            shard_hash,
+            shard,
+        });
     }
 
     fn dispatch_check(&self, task: ReadyToCheckTask) {
-        if let Err(err) = self
-            .coding_tx
-            .unbounded_send(Traced::capture(scheduler::Command::Check {
-                key: task.key,
-                commitment: task.commitment,
-                checking_data: task.checking_data,
-                shard_index: task.shard_index,
-                shard_hash: task.shard_hash,
-                reshard: task.reshard,
-            }))
-        {
-            warn!(?err, "coding scheduler command channel closed");
-        }
+        self.dispatch_coding_command(scheduler::Command::Check {
+            key: task.key,
+            commitment: task.commitment,
+            checking_data: task.checking_data,
+            shard_index: task.shard_index,
+            shard_hash: task.shard_hash,
+            reshard: task.reshard,
+        });
     }
 
     fn dispatch_cancel(&self, key: BlockKey) {
-        if let Err(err) = self
-            .coding_tx
-            .unbounded_send(Traced::capture(scheduler::Command::Cancel { key }))
-        {
-            warn!(?err, "coding scheduler command channel closed");
-        }
+        self.dispatch_coding_command(scheduler::Command::Cancel { key });
     }
 
     // ---- Message handling ----

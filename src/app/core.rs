@@ -1,5 +1,5 @@
 use super::mailbox::AppMailboxReadWriteMessage;
-use super::metrics::CoreMetrics;
+use super::metrics::{CoreMetrics, gauge_set_len};
 use super::payload::{
     decode_anchor, decode_execution_payload, encode_payload, first_missing_execution_dependency,
     genesis_digest, genesis_payload, missing_dependency_or_execution, payload_digest,
@@ -199,9 +199,7 @@ impl AppCore {
             AppMailboxReadWriteMessage::SubmitTx { tx } => {
                 if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
                     self.mempool.push_back(tx);
-                    self.metrics
-                        .mempool_size
-                        .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
+                    gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
                 }
             }
             AppMailboxReadWriteMessage::MaintenanceTick => {
@@ -276,9 +274,7 @@ impl AppCore {
             };
         }
         self.latest_anchor = Some((payload, root));
-        self.metrics
-            .persisted_roots
-            .set(i64::try_from(self.persisted_roots.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.persisted_roots, self.persisted_roots.len());
     }
 
     pub(super) fn has_persisted_roots(&self) -> bool {
@@ -374,9 +370,7 @@ impl AppCore {
                 }
             }
             self.mempool = retained;
-            self.metrics
-                .mempool_size
-                .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
+            gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
 
             // Re-execute via execute_block to obtain diffs.
             if txs.is_empty() {
@@ -405,9 +399,7 @@ impl AppCore {
                         for tx in txs.into_iter().rev() {
                             self.mempool.push_front(tx);
                         }
-                        self.metrics
-                            .mempool_size
-                            .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
+                        gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
                         return self.propose_empty(context, now);
                     }
                 }
@@ -502,9 +494,7 @@ impl AppCore {
             }
         }
         self.enforce_pending_capacity();
-        self.metrics
-            .pending_payloads
-            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         self.note_payload_seen(digest, payload);
         match (resulting_state, resulting_diffs) {
             (Some(state), Some(diffs)) => {
@@ -762,13 +752,9 @@ impl AppCore {
     }
 
     fn update_waiter_metrics(&self) {
-        self.metrics
-            .waiter_keys
-            .set(i64::try_from(self.waiters.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.waiter_keys, self.waiters.len());
         let waiter_total = self.waiters.values().map(Vec::len).sum::<usize>();
-        self.metrics
-            .waiter_total
-            .set(i64::try_from(waiter_total).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.waiter_total, waiter_total);
     }
 
     fn on_maintenance_tick(&mut self, now: u64, effects: &mut CoreEffects) {
@@ -909,9 +895,7 @@ impl AppCore {
                 "evicting oldest pending payload before broadcast"
             );
         }
-        self.metrics
-            .pending_payloads
-            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
     }
 
     // Finalization pruning ----------------------------------------------------
@@ -992,9 +976,7 @@ impl AppCore {
         self.pending_shards.remove(&digest);
         self.dependency_fetch_last_requested.shift_remove(&digest);
         let removed = self.waiters.shift_remove(&digest).unwrap_or_default();
-        self.metrics
-            .pending_payloads
-            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         self.update_waiter_metrics();
         removed
     }
@@ -1023,9 +1005,7 @@ impl AppCore {
                 self.note_payload_seen(key.digest, contents);
                 self.pending.shift_remove(&key.digest);
                 self.pending_shards.remove(&key.digest);
-                self.metrics
-                    .pending_payloads
-                    .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+                gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(key.digest, now, effects);
                 self.retry_pending_finalizations(now, effects);
             }
@@ -1085,9 +1065,7 @@ impl AppCore {
                 self.note_payload_seen(*digest, payload.clone());
                 self.pending.shift_remove(digest);
                 self.pending_shards.remove(digest);
-                self.metrics
-                    .pending_payloads
-                    .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+                gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(*digest, now, effects);
                 self.retry_pending_finalizations(now, effects);
                 return;
@@ -1107,9 +1085,7 @@ impl AppCore {
     fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
         let _span = info_span!("app.core.enqueue_broadcast", payload = ?digest).entered();
         self.pending.shift_remove(&digest);
-        self.metrics
-            .pending_payloads
-            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
             warn!(?digest, "broadcast requested for unknown pending shards");
             return;
