@@ -376,7 +376,7 @@ where
                 shards,
             } => {
                 let shard_count = shards.len();
-                info!(
+                debug!(
                     payload = ?key.digest,
                     round = ?key.round,
                     shard_count,

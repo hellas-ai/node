@@ -421,7 +421,7 @@ fn healthy_network_finalizes() {
 
 #[test_log::test]
 fn lossy_network_finalizes() {
-    let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.95);
+    let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.90);
     let duration_secs = env_u64("E2E_LOSSY_DURATION_SECS", 10);
     let default_min_validators = (N as usize).saturating_mul(2) / 3;
     let min_per_validator = env_usize("E2E_LOSSY_MIN_PER_VALIDATOR", 8);

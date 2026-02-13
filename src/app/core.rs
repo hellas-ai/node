@@ -82,6 +82,7 @@ impl CoreEffects {
 pub(super) struct AppCore {
     seen: HashMap<Digest, Bytes>,
     persistable_payloads: IndexMap<Digest, Bytes>,
+    pending_finalizations: IndexMap<Digest, Digest>,
     pending: IndexSet<Digest>,
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     waiters: IndexMap<Digest, Vec<DeferredVerify>>,
@@ -102,6 +103,7 @@ pub(super) struct AppCore {
 impl AppCore {
     const MAX_PENDING_DIGESTS: usize = 256;
     const MAX_PERSISTABLE_PAYLOADS: usize = 2048;
+    const MAX_PENDING_FINALIZATIONS: usize = 2048;
     const MAX_WAITER_KEYS: usize = 512;
     const MAX_MEMPOOL_SIZE: usize = 1024;
     const MAX_FINALIZED_EXECUTIONS: usize = 512;
@@ -129,6 +131,7 @@ impl AppCore {
         let core = Self {
             seen: HashMap::new(),
             persistable_payloads: IndexMap::new(),
+            pending_finalizations: IndexMap::new(),
             pending: IndexSet::new(),
             pending_shards: HashMap::new(),
             waiters: IndexMap::new(),
@@ -757,6 +760,7 @@ impl AppCore {
     fn on_maintenance_tick(&mut self, now: u64, effects: &mut CoreEffects) {
         self.expire_waiters(now, effects);
         self.retry_dependency_fetches(now, effects);
+        self.retry_pending_finalizations(now, effects);
     }
 
     fn expire_waiters(&mut self, now: u64, effects: &mut CoreEffects) {
@@ -808,6 +812,36 @@ impl AppCore {
         }
         for digest in missing {
             self.schedule_dependency_fetch(digest, now, effects);
+        }
+    }
+
+    fn retry_pending_finalizations(&mut self, now: u64, effects: &mut CoreEffects) {
+        if self.pending_finalizations.is_empty() {
+            return;
+        }
+        let pending: Vec<(Digest, Digest)> = self
+            .pending_finalizations
+            .iter()
+            .map(|(payload, parent)| (*payload, *parent))
+            .collect();
+        for (payload, parent_payload) in pending {
+            if self.ensure_execution_materialized(payload) {
+                self.pending_finalizations.shift_remove(&payload);
+                self.handle_finalized(payload, parent_payload, effects);
+                continue;
+            }
+
+            if !self.seen.contains_key(&payload) {
+                self.schedule_dependency_fetch(payload, now, effects);
+                continue;
+            }
+
+            if let Some((parent, _txs)) = decode_execution_payload(&self.seen, payload)
+                && (!self.seen.contains_key(&parent)
+                    || !self.speculative_store.contains_execution(parent))
+            {
+                self.schedule_dependency_fetch(parent, now, effects);
+            }
         }
     }
 
@@ -866,12 +900,30 @@ impl AppCore {
         self.speculative_store
             .note_parent_if_absent(payload, parent_payload);
         if !self.ensure_execution_materialized(payload) {
+            if let Some(existing_parent) = self.pending_finalizations.get(&payload)
+                && *existing_parent != parent_payload
+            {
+                error!(
+                    ?payload,
+                    existing_parent = ?existing_parent,
+                    incoming_parent = ?parent_payload,
+                    "conflicting parent observed for deferred finalization; entering fail-stop"
+                );
+                std::process::abort();
+            }
+            self.pending_finalizations.insert(payload, parent_payload);
+            while self.pending_finalizations.len() > Self::MAX_PENDING_FINALIZATIONS {
+                let Some((_oldest, _)) = self.pending_finalizations.shift_remove_index(0) else {
+                    break;
+                };
+            }
             warn!(
                 ?payload,
                 "finalization arrived before local execution state was available"
             );
             return;
         }
+        self.pending_finalizations.shift_remove(&payload);
         let was_finalized = self.finalized.is_finalized(payload);
         let diffs = self.speculative_store.take_diffs(payload);
         if diffs.is_none() && !was_finalized {
@@ -902,6 +954,7 @@ impl AppCore {
     fn remove_digest(&mut self, digest: Digest) -> Vec<DeferredVerify> {
         self.seen.remove(&digest);
         self.persistable_payloads.shift_remove(&digest);
+        self.pending_finalizations.shift_remove(&digest);
         self.pending.shift_remove(&digest);
         self.pending_shards.remove(&digest);
         self.dependency_fetch_last_requested.shift_remove(&digest);
@@ -929,7 +982,7 @@ impl AppCore {
                     .push_back(NetworkEffect::BroadcastShard(message));
             }
             ShardEffect::Recovered { key, contents } => {
-                info!(
+                debug!(
                     payload = ?key.digest,
                     round = ?key.round,
                     "recovered payload from shards"
@@ -941,6 +994,7 @@ impl AppCore {
                     .pending_payloads
                     .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
                 self.retry_waiters(key.digest, now, effects);
+                self.retry_pending_finalizations(now, effects);
             }
             ShardEffect::Failed { key } => {
                 warn!(
@@ -1002,6 +1056,7 @@ impl AppCore {
                     .pending_payloads
                     .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
                 self.retry_waiters(*digest, now, effects);
+                self.retry_pending_finalizations(now, effects);
                 return;
             }
             WireShardMessage::Initial { .. } | WireShardMessage::ReShare { .. } => {}
@@ -1444,6 +1499,59 @@ mod tests {
                 panic!("expected repaired verify reply");
             };
             assert!(*valid);
+        });
+    }
+
+    #[test_log::test]
+    fn finalization_retries_after_payload_recovery() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-finalization-retry-test", 6);
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_FETCH_RETRY_MS,
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_finalization_retry"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([7u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            let context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let payload_contents =
+                encode_payload(context.round, genesis, 101, genesis, anchor_root, &[]);
+            let payload = payload_digest(&payload_contents);
+
+            let deferred = core.on_finalized(payload, genesis);
+            assert!(deferred.replies.is_empty());
+            assert!(deferred.network.is_empty());
+            assert!(!core.finalized.is_finalized(payload));
+
+            let recovered = core.on_shard_message(
+                ShardMessage::payload_response(&participants[0], payload, payload_contents),
+                102,
+                &|_| None,
+            );
+            assert!(recovered.replies.is_empty());
+            assert!(core.finalized.is_finalized(payload));
+            assert_eq!(
+                core.next_unpersisted_finalization()
+                    .map(|(digest, _)| digest),
+                Some(payload)
+            );
         });
     }
 }
