@@ -878,6 +878,11 @@ impl AppCore {
                 break;
             };
             self.pending_shards.remove(&oldest);
+            warn!(
+                ?oldest,
+                max_pending = Self::MAX_PENDING_DIGESTS,
+                "evicting oldest pending payload before broadcast"
+            );
         }
         self.metrics
             .pending_payloads
@@ -912,10 +917,13 @@ impl AppCore {
                 std::process::abort();
             }
             self.pending_finalizations.insert(payload, parent_payload);
-            while self.pending_finalizations.len() > Self::MAX_PENDING_FINALIZATIONS {
-                let Some((_oldest, _)) = self.pending_finalizations.shift_remove_index(0) else {
-                    break;
-                };
+            if self.pending_finalizations.len() > Self::MAX_PENDING_FINALIZATIONS {
+                error!(
+                    pending = self.pending_finalizations.len(),
+                    max = Self::MAX_PENDING_FINALIZATIONS,
+                    "pending finalization queue overflowed; refusing to drop deferred finalizations"
+                );
+                std::process::abort();
             }
             warn!(
                 ?payload,
@@ -1121,9 +1129,14 @@ impl AppCore {
         self.seen.insert(digest, payload.clone());
         self.persistable_payloads.insert(digest, payload);
         while self.persistable_payloads.len() > Self::MAX_PERSISTABLE_PAYLOADS {
-            let Some((_oldest, _)) = self.persistable_payloads.shift_remove_index(0) else {
+            let Some((oldest, _)) = self.persistable_payloads.shift_remove_index(0) else {
                 break;
             };
+            warn!(
+                ?oldest,
+                max_persistable = Self::MAX_PERSISTABLE_PAYLOADS,
+                "evicting oldest payload before persistence handoff"
+            );
         }
     }
 }
@@ -1499,6 +1512,82 @@ mod tests {
                 panic!("expected repaired verify reply");
             };
             assert!(*valid);
+        });
+    }
+
+    #[test_log::test]
+    fn verify_fetches_first_missing_ancestor_dependency() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-missing-ancestor-fetch-test", 6);
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_FETCH_RETRY_MS,
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_missing_ancestor_fetch"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([4u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            let missing_ancestor = Digest::from([9u8; 32]);
+            let parent_contents = encode_payload(
+                Round::new(epoch, View::new(1)),
+                missing_ancestor,
+                100,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let parent_payload = payload_digest(&parent_contents);
+            core.note_payload_seen(parent_payload, parent_contents);
+
+            let verify_context = Context {
+                round: Round::new(epoch, View::new(2)),
+                leader: participants[0].clone(),
+                parent: (View::new(1), parent_payload),
+            };
+            let payload_contents = encode_payload(
+                verify_context.round,
+                parent_payload,
+                101,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let payload = payload_digest(&payload_contents);
+            core.note_payload_seen(payload, payload_contents);
+
+            let (response, _receiver) = oneshot::channel();
+            let deferred = core.on_message(
+                AppMailboxReadWriteMessage::Verify {
+                    context: verify_context,
+                    payload,
+                    response,
+                },
+                101,
+                &|_| Some(0),
+            );
+            assert!(deferred.replies.is_empty());
+            assert_eq!(deferred.network.len(), 1);
+            let Some(NetworkEffect::BroadcastShard(message)) = deferred.network.front() else {
+                panic!("expected fetch request network effect");
+            };
+            match &message.body {
+                WireShardMessage::FetchPayload { digest } => {
+                    assert_eq!(*digest, missing_ancestor)
+                }
+                _ => panic!("expected fetch payload request"),
+            }
         });
     }
 

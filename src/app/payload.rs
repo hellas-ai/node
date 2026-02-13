@@ -165,11 +165,31 @@ pub(super) fn missing_dependency_or_execution(
     if !seen.contains_key(&payload) {
         return Some(payload);
     }
-    if !seen.contains_key(&context.parent.1) {
-        return Some(context.parent.1);
+    let mut current = context.parent.1;
+    if !seen.contains_key(&current) {
+        return Some(current);
     }
-    if !speculative_store.contains_execution(context.parent.1) {
-        return Some(context.parent.1);
+    if speculative_store.contains_execution(current) {
+        return None;
+    }
+
+    // Walk parent links until we find the first missing payload bytes.
+    // If links are malformed or cyclic, let verification fail as invalid
+    // instead of deferring forever on an unresolvable dependency.
+    for _ in 0..=seen.len() {
+        let Some((parent, _txs)) = decode_execution_payload(seen, current) else {
+            return None;
+        };
+        if parent == current {
+            return None;
+        }
+        if !seen.contains_key(&parent) {
+            return Some(parent);
+        }
+        if speculative_store.contains_execution(parent) {
+            return None;
+        }
+        current = parent;
     }
     None
 }
