@@ -92,8 +92,6 @@ pub(super) struct AppCore {
     finalized: FinalizationTracker,
     persisted_roots: IndexMap<Digest, Digest>,
     latest_anchor: Option<(Digest, Digest)>,
-    dependency_fetch_last_requested: IndexMap<Digest, u64>,
-    dependency_fetch_retry_ms: u64,
     verify_wait_timeout_ms: u64,
     validators: Vec<PublicKey>,
     strategy: Rayon,
@@ -109,7 +107,6 @@ impl AppCore {
     const MAX_MEMPOOL_SIZE: usize = 1024;
     const MAX_FINALIZED_EXECUTIONS: usize = 512;
     const MAX_PERSISTED_ROOTS: usize = 2048;
-    const MAX_PENDING_FETCHES: usize = 2048;
 
     // Construction + identity -------------------------------------------------
     pub(super) fn new(
@@ -117,7 +114,6 @@ impl AppCore {
         mut validators: Vec<PublicKey>,
         my_index: u16,
         coding_config: commonware_coding::Config,
-        dependency_fetch_retry_ms: u64,
         verify_wait_timeout_ms: u64,
         strategy: Rayon,
         metrics: CoreMetrics,
@@ -142,8 +138,6 @@ impl AppCore {
             finalized: FinalizationTracker::new(Self::MAX_FINALIZED_EXECUTIONS),
             persisted_roots: IndexMap::new(),
             latest_anchor: None,
-            dependency_fetch_last_requested: IndexMap::new(),
-            dependency_fetch_retry_ms: dependency_fetch_retry_ms.max(1),
             verify_wait_timeout_ms: verify_wait_timeout_ms.max(1),
             validators,
             strategy: strategy.clone(),
@@ -201,9 +195,6 @@ impl AppCore {
                     gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
                 }
             }
-            AppMailboxReadWriteMessage::MaintenanceTick => {
-                self.on_maintenance_tick(now, &mut effects);
-            }
             AppMailboxReadWriteMessage::GetCoin {
                 payload,
                 object,
@@ -226,6 +217,11 @@ impl AppCore {
                 );
             }
         }
+        // Inline maintenance: run after every message instead of on a timer.
+        self.drain_coding_events(now, &mut effects);
+        self.expire_waiters(now, &mut effects);
+        self.retry_dependency_fetches(&mut effects);
+        self.retry_pending_finalizations(&mut effects);
         effects
     }
 
@@ -407,7 +403,7 @@ impl AppCore {
             let missing =
                 first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
                     .unwrap_or(parent);
-            self.schedule_dependency_fetch(missing, now, effects);
+            self.schedule_dependency_fetch(missing, effects);
             warn!(
                 parent = ?parent,
                 missing_dependency = ?missing,
@@ -621,7 +617,7 @@ impl AppCore {
                 ?missing_digest,
                 "deferring verify while waiting for dependency"
             );
-            self.schedule_dependency_fetch(missing_digest, now, effects);
+            self.schedule_dependency_fetch(missing_digest, effects);
             self.queue_waiter(
                 missing_digest,
                 DeferredVerify {
@@ -714,7 +710,6 @@ impl AppCore {
     }
 
     fn retry_waiters(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
-        self.dependency_fetch_last_requested.shift_remove(&digest);
         for deferred in self.waiters.shift_remove(&digest).unwrap_or_default() {
             self.process_verify_request(
                 &deferred.context,
@@ -728,7 +723,6 @@ impl AppCore {
     }
 
     fn reject_waiters(&mut self, digest: Digest, effects: &mut CoreEffects) {
-        self.dependency_fetch_last_requested.shift_remove(&digest);
         for deferred in self.waiters.shift_remove(&digest).unwrap_or_default() {
             effects.replies.push_back(CoreEffect::Verify {
                 response: deferred.response,
@@ -741,10 +735,9 @@ impl AppCore {
     fn trim_waiter_keys(&mut self) -> Vec<DeferredVerify> {
         let mut evicted = Vec::new();
         while self.waiters.len() > Self::MAX_WAITER_KEYS {
-            let Some((oldest, stale)) = self.waiters.shift_remove_index(0) else {
+            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
                 break;
             };
-            self.dependency_fetch_last_requested.shift_remove(&oldest);
             evicted.extend(stale);
         }
         evicted
@@ -754,13 +747,6 @@ impl AppCore {
         gauge_set_len(&self.metrics.waiter_keys, self.waiters.len());
         let waiter_total = self.waiters.values().map(Vec::len).sum::<usize>();
         gauge_set_len(&self.metrics.waiter_total, waiter_total);
-    }
-
-    fn on_maintenance_tick(&mut self, now: u64, effects: &mut CoreEffects) {
-        self.drain_coding_events(now, effects);
-        self.expire_waiters(now, effects);
-        self.retry_dependency_fetches(now, effects);
-        self.retry_pending_finalizations(now, effects);
     }
 
     pub(super) fn shutdown_shard_recoverer(&mut self) {
@@ -798,13 +784,12 @@ impl AppCore {
             }
             if remove_key {
                 self.waiters.shift_remove(&digest);
-                self.dependency_fetch_last_requested.shift_remove(&digest);
             }
         }
         self.update_waiter_metrics();
     }
 
-    fn retry_dependency_fetches(&mut self, now: u64, effects: &mut CoreEffects) {
+    fn retry_dependency_fetches(&mut self, effects: &mut CoreEffects) {
         if self.waiters.is_empty() {
             return;
         }
@@ -821,11 +806,11 @@ impl AppCore {
             }
         }
         for digest in missing {
-            self.schedule_dependency_fetch(digest, now, effects);
+            self.schedule_dependency_fetch(digest, effects);
         }
     }
 
-    fn retry_pending_finalizations(&mut self, now: u64, effects: &mut CoreEffects) {
+    fn retry_pending_finalizations(&mut self, effects: &mut CoreEffects) {
         if self.pending_finalizations.is_empty() {
             return;
         }
@@ -842,7 +827,7 @@ impl AppCore {
             }
 
             if !self.seen.contains_key(&payload) {
-                self.schedule_dependency_fetch(payload, now, effects);
+                self.schedule_dependency_fetch(payload, effects);
                 continue;
             }
 
@@ -850,29 +835,14 @@ impl AppCore {
                 && let Some(missing) =
                     first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
             {
-                self.schedule_dependency_fetch(missing, now, effects);
+                self.schedule_dependency_fetch(missing, effects);
             }
         }
     }
 
-    fn schedule_dependency_fetch(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
+    fn schedule_dependency_fetch(&self, digest: Digest, effects: &mut CoreEffects) {
         if self.seen.contains_key(&digest) {
-            self.dependency_fetch_last_requested.shift_remove(&digest);
             return;
-        }
-
-        if let Some(last) = self.dependency_fetch_last_requested.get(&digest)
-            && now.saturating_sub(*last) < self.dependency_fetch_retry_ms
-        {
-            return;
-        }
-
-        self.dependency_fetch_last_requested.insert(digest, now);
-        while self.dependency_fetch_last_requested.len() > Self::MAX_PENDING_FETCHES {
-            let Some((_oldest, _)) = self.dependency_fetch_last_requested.shift_remove_index(0)
-            else {
-                break;
-            };
         }
         effects
             .network
@@ -973,7 +943,6 @@ impl AppCore {
         self.pending_finalizations.shift_remove(&digest);
         self.pending.shift_remove(&digest);
         self.pending_shards.remove(&digest);
-        self.dependency_fetch_last_requested.shift_remove(&digest);
         let removed = self.waiters.shift_remove(&digest).unwrap_or_default();
         gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         self.update_waiter_metrics();
@@ -1006,7 +975,7 @@ impl AppCore {
                 self.pending_shards.remove(&key.digest);
                 gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(key.digest, now, effects);
-                self.retry_pending_finalizations(now, effects);
+                self.retry_pending_finalizations(effects);
             }
             ShardEffect::Failed { key } => {
                 warn!(
@@ -1066,7 +1035,7 @@ impl AppCore {
                 self.pending_shards.remove(digest);
                 gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(*digest, now, effects);
-                self.retry_pending_finalizations(now, effects);
+                self.retry_pending_finalizations(effects);
                 return;
             }
             WireShardMessage::Initial { .. } | WireShardMessage::ReShare { .. } => {}
@@ -1160,7 +1129,6 @@ mod tests {
         CoreMetrics::register(&context.with_label(label))
     }
 
-    const TEST_FETCH_RETRY_MS: u64 = 50;
     const TEST_WAIT_TIMEOUT_MS: u64 = 500;
 
     fn has_valid_verify_reply(effects: &CoreEffects) -> bool {
@@ -1185,7 +1153,6 @@ mod tests {
                 participants.clone(),
                 0,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_prune"),
@@ -1242,7 +1209,6 @@ mod tests {
                 participants.clone(),
                 0,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_proposal_anchor"),
@@ -1283,7 +1249,6 @@ mod tests {
                 participants.clone(),
                 0,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_defer_proposer"),
@@ -1294,7 +1259,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_defer_verifier"),
@@ -1357,7 +1321,6 @@ mod tests {
                 participants.clone(),
                 0,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_mismatch_proposer"),
@@ -1368,7 +1331,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_mismatch_verifier"),
@@ -1425,7 +1387,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_fetch_timeout"),
@@ -1453,20 +1414,23 @@ mod tests {
                 &|_| Some(0),
             );
             assert!(deferred.replies.is_empty());
-            assert_eq!(deferred.network.len(), 1);
-            let Some(NetworkEffect::BroadcastShard(message)) = deferred.network.front() else {
-                panic!("expected fetch request network effect");
-            };
-            match &message.body {
-                WireShardMessage::FetchPayload { digest } => assert_eq!(*digest, missing_payload),
-                _ => panic!("expected fetch payload request"),
-            }
-
-            let timeout = core.on_message(
-                AppMailboxReadWriteMessage::MaintenanceTick,
-                100 + TEST_WAIT_TIMEOUT_MS + 1,
-                &|_| Some(0),
+            assert!(
+                deferred.network.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        NetworkEffect::BroadcastShard(message)
+                            if matches!(
+                                message.body,
+                                WireShardMessage::FetchPayload { digest }
+                                    if digest == missing_payload
+                            )
+                    )
+                }),
+                "expected at least one fetch request for the missing payload"
             );
+
+            let mut timeout = CoreEffects::new();
+            core.expire_waiters(100 + TEST_WAIT_TIMEOUT_MS + 1, &mut timeout);
             assert_eq!(timeout.replies.len(), 1);
             let Some(CoreEffect::Verify { valid, .. }) = timeout.replies.front() else {
                 panic!("expected timed-out verify reply");
@@ -1488,7 +1452,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_fetch_repair"),
@@ -1553,7 +1516,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_missing_ancestor_fetch"),
@@ -1604,16 +1566,20 @@ mod tests {
                 &|_| Some(0),
             );
             assert!(deferred.replies.is_empty());
-            assert_eq!(deferred.network.len(), 1);
-            let Some(NetworkEffect::BroadcastShard(message)) = deferred.network.front() else {
-                panic!("expected fetch request network effect");
-            };
-            match &message.body {
-                WireShardMessage::FetchPayload { digest } => {
-                    assert_eq!(*digest, missing_ancestor)
-                }
-                _ => panic!("expected fetch payload request"),
-            }
+            assert!(
+                deferred.network.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        NetworkEffect::BroadcastShard(message)
+                            if matches!(
+                                message.body,
+                                WireShardMessage::FetchPayload { digest }
+                                    if digest == missing_ancestor
+                            )
+                    )
+                }),
+                "expected at least one fetch request for the missing ancestor"
+            );
         });
     }
 
@@ -1634,7 +1600,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_finalization_ancestor_fetch"),
@@ -1673,9 +1638,8 @@ mod tests {
             assert!(deferred.replies.is_empty());
             assert!(deferred.network.is_empty());
 
-            let retry = core.on_message(AppMailboxReadWriteMessage::MaintenanceTick, 200, &|_| {
-                Some(0)
-            });
+            let mut retry = CoreEffects::new();
+            core.retry_pending_finalizations(&mut retry);
             assert_eq!(retry.network.len(), 1);
             let Some(NetworkEffect::BroadcastShard(message)) = retry.network.front() else {
                 panic!("expected fetch request network effect");
@@ -1702,7 +1666,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_propose_missing_parent_fetch"),
@@ -1827,7 +1790,6 @@ mod tests {
                     participants.clone(),
                     1,
                     coding_config(6),
-                    TEST_FETCH_RETRY_MS,
                     10_000,
                     strategy,
                     test_metrics(&context, "core_eventual_repair_proptest"),
@@ -1924,11 +1886,11 @@ mod tests {
                     if !maintenance_offsets.is_empty() {
                         let delta = maintenance_offsets[step % maintenance_offsets.len()];
                         now = now.saturating_add(delta);
-                        let tick = core.on_message(
-                            AppMailboxReadWriteMessage::MaintenanceTick,
-                            now,
-                            &|_| Some(0),
-                        );
+                        let mut tick = CoreEffects::new();
+                        core.drain_coding_events(now, &mut tick);
+                        core.expire_waiters(now, &mut tick);
+                        core.retry_dependency_fetches(&mut tick);
+                        core.retry_pending_finalizations(&mut tick);
                         saw_valid_verify |= has_valid_verify_reply(&tick);
                     }
 
@@ -1948,11 +1910,11 @@ mod tests {
 
                 for _ in 0..3 {
                     now = now.saturating_add(1);
-                    let tick = core.on_message(
-                        AppMailboxReadWriteMessage::MaintenanceTick,
-                        now,
-                        &|_| Some(0),
-                    );
+                    let mut tick = CoreEffects::new();
+                    core.drain_coding_events(now, &mut tick);
+                    core.expire_waiters(now, &mut tick);
+                    core.retry_dependency_fetches(&mut tick);
+                    core.retry_pending_finalizations(&mut tick);
                     saw_valid_verify |= has_valid_verify_reply(&tick);
                 }
 
@@ -1979,7 +1941,6 @@ mod tests {
                 participants.clone(),
                 1,
                 coding_config(6),
-                TEST_FETCH_RETRY_MS,
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_finalization_retry"),

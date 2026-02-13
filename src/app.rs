@@ -42,7 +42,6 @@ pub(crate) struct FinalizationNotice {
 pub(crate) struct ApplicationConfig {
     pub page_cache_size: u16,
     pub page_cache_count: usize,
-    pub maintenance_interval: Duration,
     pub verify_wait_timeout: Duration,
 }
 
@@ -51,7 +50,6 @@ impl Default for ApplicationConfig {
         Self {
             page_cache_size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
             page_cache_count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
-            maintenance_interval: Duration::from_millis(50),
             verify_wait_timeout: Duration::from_millis(500),
         }
     }
@@ -254,12 +252,6 @@ where
 
     persistence: PersistenceHandle,
 
-    /// Interval for maintenance ticks (dependency fetch retries + waiter expiry).
-    maintenance_interval: Duration,
-
-    /// Handle to the maintenance ticker task.
-    maintenance_handle: Option<Handle<()>>,
-
     /// Handle to the shard bridge task.
     shard_bridge_handle: Option<Handle<()>>,
 
@@ -304,7 +296,6 @@ where
             validators,
             partition_prefix,
             page_cache_config,
-            config.maintenance_interval,
             config.verify_wait_timeout,
         )
     }
@@ -316,7 +307,6 @@ where
         validators: Vec<PublicKey>,
         partition_prefix: String,
         page_cache_config: PageCacheConfig,
-        maintenance_interval: Duration,
         verify_wait_timeout: Duration,
     ) -> Self {
         let shard_rx = relay.register(me);
@@ -335,10 +325,6 @@ where
             validators.clone(),
             my_index,
             coding_config,
-            maintenance_interval
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
             verify_wait_timeout
                 .as_millis()
                 .try_into()
@@ -361,8 +347,6 @@ where
             shard_rx: Some(shard_rx),
             core,
             persistence,
-            maintenance_interval,
-            maintenance_handle: None,
             shard_bridge_handle: None,
             persistence_bridge_handle: None,
             inflight_persistence: None,
@@ -677,24 +661,12 @@ where
             }));
         }
 
-        // Spawn maintenance ticker → mailbox.
-        let mailbox = args.clone();
-        let interval = self.maintenance_interval;
-        self.maintenance_handle = Some(context.clone().spawn(move |ctx| async move {
-            loop {
-                ctx.sleep(interval).await;
-                if !mailbox.tell_maintenance_tick().await {
-                    break;
-                }
-            }
-        }));
     }
 
     async fn on_shutdown(&mut self, _context: &mut E, _args: &mut AppMailbox) {
         self.core.shutdown_shard_recoverer();
         self.shard_bridge_handle.take();
         self.persistence_bridge_handle.take();
-        self.maintenance_handle.take();
         self.persistence.shutdown().await;
         debug!("application shutting down");
     }

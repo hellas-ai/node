@@ -110,7 +110,6 @@ where
             ApplicationConfig {
                 page_cache_size: config.page_cache_size,
                 page_cache_count: config.page_cache_count,
-                maintenance_interval: config.nullify_retry,
                 verify_wait_timeout: config.fetch_timeout,
             },
         );

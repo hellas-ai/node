@@ -66,7 +66,6 @@ ingress! {
         payload: Digest,
         root: Digest,
     };
-    tell MaintenanceTick;
     ask read_write GetCoin {
         payload: Digest,
         object: ObjectId,
@@ -84,7 +83,6 @@ impl AppMailboxReadWriteMessage {
             Self::Verify { .. } => "verify",
             Self::Broadcast { .. } => "broadcast",
             Self::SubmitTx { .. } => "submit_tx",
-            Self::MaintenanceTick => "maintenance_tick",
             Self::ShardEvent { .. } => "shard_event",
             Self::FinalizationEvent { .. } => "finalization_event",
             Self::Persisted { .. } => "persisted",
@@ -114,10 +112,6 @@ impl AppMailbox {
 
     pub(super) async fn tell_persisted(&self, payload: Digest, root: Digest) -> bool {
         self.0.tell(Persisted { payload, root }).await.is_ok()
-    }
-
-    pub(super) async fn tell_maintenance_tick(&self) -> bool {
-        self.0.tell(MaintenanceTick).await.is_ok()
     }
 
     pub async fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
