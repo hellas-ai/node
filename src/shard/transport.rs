@@ -1,10 +1,11 @@
 use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
+use crate::trace::Traced;
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
 use std::future::Future;
 
 pub(crate) trait ShardTransport: Send + Sync + 'static {
-    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage>;
+    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<Traced<ShardMessage>>;
     fn validator_count(&self) -> u16;
     fn validator_index(&self, public_key: &PublicKey) -> Option<u16>;
 

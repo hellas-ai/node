@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, Encode};
 
-    #[test]
+    #[test_log::test]
     fn coin_codec_roundtrip() {
         let owner = PrivateKey::from_seed(1).public_key();
         let coin = Coin { owner, value: 123 };
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(decoded, coin);
     }
 
-    #[test]
+    #[test_log::test]
     fn transfer_codec_roundtrip() {
         let sender = PrivateKey::from_seed(1);
         let recipient = PrivateKey::from_seed(2).public_key();
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(decoded.encode(), tx.encode());
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_codec_roundtrip() {
         let sender = PrivateKey::from_seed(1);
         let tx = Transaction::merge(
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(decoded.encode(), tx.encode());
     }
 
-    #[test]
+    #[test_log::test]
     fn signature_verification_succeeds_with_correct_key() {
         let sender = PrivateKey::from_seed(1);
         let sender_pk = sender.public_key();
@@ -264,7 +264,7 @@ mod tests {
         assert!(merge.verify_signature(&sender_pk));
     }
 
-    #[test]
+    #[test_log::test]
     fn signature_verification_fails_with_wrong_key() {
         let sender = PrivateKey::from_seed(1);
         let wrong = PrivateKey::from_seed(2).public_key();
@@ -273,7 +273,7 @@ mod tests {
         assert!(!transfer.verify_signature(&wrong));
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_inputs_are_canonicalized() {
         let sender = PrivateKey::from_seed(1);
         let tx = Transaction::merge(

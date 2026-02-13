@@ -1,4 +1,4 @@
-use commonware_codec::Encode;
+use commonware_codec::{Decode, Encode};
 use commonware_consensus::elector::RoundRobin;
 use commonware_consensus::minimmit::{
     mocks::reporter::{Config as ReporterConfig, Reporter as MockReporter},
@@ -10,7 +10,11 @@ use commonware_cryptography::Signer;
 use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
+use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
+use commonware_storage::{
+    qmdb::current::unordered::fixed::Db as FixedUtxoDb, translator::EightCap,
+};
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
 use hellas_chain::object::{
@@ -18,6 +22,7 @@ use hellas_chain::object::{
 };
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::{Activity, PrivateKey, PublicKey, Scheme};
+use rand::rngs::OsRng;
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 const NAMESPACE: &[u8] = b"hellas-e2e";
@@ -26,6 +31,21 @@ const N: u32 = 6;
 type Finalizations = Arc<std::sync::Mutex<HashMap<View, Finalization<Scheme, Digest>>>>;
 type Faults =
     Arc<std::sync::Mutex<HashMap<PublicKey, HashMap<View, std::collections::HashSet<Activity>>>>>;
+type ProofVerifierDb = FixedUtxoDb<deterministic::Context, Digest, Coin, Sha256, EightCap, 32>;
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 #[derive(Clone, Copy)]
 struct SubmitTransfer {
@@ -194,7 +214,7 @@ fn run_network(
                 value: GENESIS_BALANCE - transfer.amount,
             };
 
-            for mailbox in tx_mailboxes {
+            for mailbox in &tx_mailboxes {
                 assert_eq!(
                     mailbox.get_coin(payload, recipient_output).await,
                     Some(expected_recipient.clone()),
@@ -211,6 +231,75 @@ fn run_network(
                     "change output missing in finalized state"
                 );
             }
+
+            // E2E retrieval checks:
+            // 1) retrieve and verify the finalized certificate bytes,
+            // 2) retrieve a root and proof and verify QMDB proof validity.
+            //
+            // NOTE: This test does NOT assert a full trust chain between the certificate and
+            // returned state root. Under lagged-anchor, proofs are anchored to persisted state
+            // roots tracked separately from the finalized payload certificate.
+            let validator_mailbox = tx_mailboxes[0].clone();
+            let mut cert = None;
+            for _ in 0..50 {
+                if let Ok(Some(bytes)) = validator_mailbox.get_finalization(payload).await {
+                    cert = Some(bytes);
+                    break;
+                }
+                context.sleep(Duration::from_millis(100)).await;
+            }
+            let cert = cert.expect("expected persisted finalization certificate for payload");
+
+            let finalization = Finalization::<Scheme, Digest>::decode_cfg(
+                cert.as_slice(),
+                &schemes[0].participants().len(),
+            )
+            .expect("finalization certificate should decode");
+            assert_eq!(
+                finalization.proposal.payload, payload,
+                "certificate must match finalized payload"
+            );
+            assert!(
+                finalization.verify(&mut OsRng, &schemes[0], &Sequential),
+                "finalization certificate should verify"
+            );
+
+            let mut proof_verified_against_reported_root = false;
+            for _ in 0..50 {
+                let Some(root) = validator_mailbox
+                    .get_state_root()
+                    .await
+                    .expect("state root request should not fail")
+                else {
+                    context.sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let Some(proof) = validator_mailbox
+                    .get_proof(recipient_output)
+                    .await
+                    .expect("proof request should not fail")
+                else {
+                    context.sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+
+                let mut hasher = Sha256::default();
+                if ProofVerifierDb::verify_key_value_proof(
+                    &mut hasher,
+                    recipient_output,
+                    expected_recipient.clone(),
+                    &proof,
+                    &root,
+                ) {
+                    proof_verified_against_reported_root = true;
+                    break;
+                }
+                context.sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                proof_verified_against_reported_root,
+                "expected recipient coin proof to verify against a persisted root"
+            );
             return;
         }
 
@@ -223,7 +312,7 @@ fn run_network(
         .unwrap()
 }
 
-#[test]
+#[test_log::test]
 fn healthy_network_finalizes() {
     let link = Link {
         latency: Duration::from_millis(10),
@@ -245,24 +334,49 @@ fn healthy_network_finalizes() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn lossy_network_finalizes() {
+    let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.9);
+    let duration_secs = env_u64("E2E_LOSSY_DURATION_SECS", 10);
     let link = Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(5),
-        success_rate: 0.95,
+        success_rate,
     };
 
-    let handles = run_network(Config::test(), link, Duration::from_secs(10), None);
+    let handles = run_network(
+        Config::test(),
+        link,
+        Duration::from_secs(duration_secs),
+        None,
+    );
 
     let total_finalizations: usize = handles.iter().map(|(f, _)| f.lock().unwrap().len()).sum();
+    let per_validator_finalizations: Vec<usize> = handles
+        .iter()
+        .map(|(finalizations, _)| finalizations.lock().unwrap().len())
+        .collect();
+    let per_validator_fault_views: Vec<usize> = handles
+        .iter()
+        .map(|(_, faults)| {
+            faults
+                .lock()
+                .unwrap()
+                .values()
+                .map(HashMap::len)
+                .sum::<usize>()
+        })
+        .collect();
+    println!(
+        "lossy e2e summary: success_rate={success_rate:.3}, duration_secs={duration_secs}, total_finalizations={total_finalizations}, per_validator_finalizations={per_validator_finalizations:?}, per_validator_fault_views={per_validator_fault_views:?}"
+    );
     assert!(
         total_finalizations > 0,
         "expected at least one finalization even with lossy network"
     );
 }
 
-#[test]
+#[test_log::test]
 fn submitted_transfer_network_finalizes() {
     let link = Link {
         latency: Duration::from_millis(10),

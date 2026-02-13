@@ -35,42 +35,47 @@ pub(super) enum PayloadValidationError {
 pub(super) fn genesis_payload(epoch: Epoch) -> Bytes {
     let round = Round::new(epoch, View::zero());
     let parent = Digest::from([0u8; 32]);
-    encode_payload_with_txs(round, parent, 0, &[])
+    let anchor_payload = Digest::from([0u8; 32]);
+    let anchor_root = Digest::from([0u8; 32]);
+    encode_payload(round, parent, 0, anchor_payload, anchor_root, &[])
 }
 
 pub(super) fn genesis_digest(epoch: Epoch) -> Digest {
     payload_digest(&genesis_payload(epoch))
 }
 
-#[cfg(test)]
-pub(super) fn encode_payload(round: Round, parent: Digest, timestamp: u64) -> Bytes {
-    encode_payload_with_txs(round, parent, timestamp, &[])
-}
-
-pub(super) fn encode_payload_with_txs(
+pub(super) fn encode_payload(
     round: Round,
     parent: Digest,
     timestamp: u64,
+    anchor_payload: Digest,
+    anchor_root: Digest,
     txs: &[Transaction],
 ) -> Bytes {
     let mut buf = bytes::BytesMut::new();
     round.write(&mut buf);
     parent.write(&mut buf);
     timestamp.write(&mut buf);
+    anchor_payload.write(&mut buf);
+    anchor_root.write(&mut buf);
     txs.write(&mut buf);
     buf.freeze()
 }
 
-fn decode_payload(contents: &Bytes) -> Option<(Round, Digest, u64, Vec<Transaction>)> {
+fn decode_payload(
+    contents: &Bytes,
+) -> Option<(Round, Digest, u64, Digest, Digest, Vec<Transaction>)> {
     let mut reader = contents.clone();
     let round = Round::read(&mut reader).ok()?;
     let parent = Digest::read(&mut reader).ok()?;
     let timestamp = u64::read(&mut reader).ok()?;
+    let anchor_payload = Digest::read(&mut reader).ok()?;
+    let anchor_root = Digest::read(&mut reader).ok()?;
     let txs = Vec::<Transaction>::read_range(&mut reader, 0..=MAX_TXS_PER_BLOCK).ok()?;
     if !reader.is_empty() {
         return None;
     }
-    Some((round, parent, timestamp, txs))
+    Some((round, parent, timestamp, anchor_payload, anchor_root, txs))
 }
 
 pub(super) fn decode_execution_payload(
@@ -78,8 +83,13 @@ pub(super) fn decode_execution_payload(
     payload: Digest,
 ) -> Option<(Digest, Vec<Transaction>)> {
     let contents = seen.get(&payload)?;
-    let (_, parent, _, txs) = decode_payload(contents)?;
+    let (_, parent, _, _, _, txs) = decode_payload(contents)?;
     Some((parent, txs))
+}
+
+pub(super) fn decode_anchor(contents: &Bytes) -> Option<(Digest, Digest)> {
+    let (_, _, _, anchor_payload, anchor_root, _) = decode_payload(contents)?;
+    Some((anchor_payload, anchor_root))
 }
 
 pub(super) fn payload_digest(contents: &Bytes) -> Digest {
@@ -111,7 +121,7 @@ pub(super) fn validate_payload(
         });
     }
 
-    let Some((parsed_round, parent, timestamp, txs)) = decode_payload(contents) else {
+    let Some((parsed_round, parent, timestamp, _, _, txs)) = decode_payload(contents) else {
         return Err(PayloadValidationError::InvalidEncoding);
     };
 

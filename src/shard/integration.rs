@@ -4,6 +4,7 @@ use super::protocol::{
     BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard, coding_config,
 };
 use super::transport::ShardTransport;
+use crate::trace::Traced;
 use bytes::Bytes;
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::{Epoch, Round, View};
@@ -40,7 +41,7 @@ where
 {
     public_key: PublicKey,
     relay: Arc<AuthenticatedShardTransport<S, R>>,
-    shard_rx: mpsc::UnboundedReceiver<ShardMessage>,
+    shard_rx: mpsc::UnboundedReceiver<Traced<ShardMessage>>,
     recoverer: ShardRecoverer,
     seen: HashMap<Digest, Bytes>,
 }
@@ -208,6 +209,8 @@ where
                     let Some(message) = maybe_message else {
                         break;
                     };
+                    let (message, parent_span) = message.into_parts();
+                    let _entered = parent_span.enter();
                     self.handle_message(node_idx, message, &mut recovered).await;
                 }
             }
@@ -255,7 +258,7 @@ fn base_network_config() -> NetworkConfig {
     }
 }
 
-#[test]
+#[test_log::test]
 fn lossy_delivery_still_recovers() {
     let runner = deterministic::Runner::timed(Duration::from_secs(30));
     runner.start(|mut context| async move {
@@ -317,7 +320,7 @@ fn lossy_delivery_still_recovers() {
     });
 }
 
-#[test]
+#[test_log::test]
 fn concurrent_block_recoveries() {
     let runner = deterministic::Runner::timed(Duration::from_secs(30));
     runner.start(|mut context| async move {
@@ -410,7 +413,7 @@ fn concurrent_block_recoveries() {
 ///
 /// Run with:
 ///   cargo test -p hellas-chain throughput_under_varying_conditions -- --ignored --nocapture
-#[test]
+#[test_log::test]
 #[ignore]
 fn throughput_under_varying_conditions() {
     use std::time::Instant;

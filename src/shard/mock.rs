@@ -3,6 +3,7 @@
 use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
 use super::validators::{DistributionError, ValidatorSet};
+use crate::trace::Traced;
 use futures::SinkExt;
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
@@ -12,7 +13,7 @@ use std::{
 };
 
 pub struct MockShardTransport {
-    recipients: Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<ShardMessage>>>>,
+    recipients: Mutex<HashMap<PublicKey, Vec<mpsc::UnboundedSender<Traced<ShardMessage>>>>>,
     validators: ValidatorSet,
 }
 
@@ -44,7 +45,7 @@ impl MockShardTransport {
             recipients.get(target).cloned().unwrap_or_default()
         };
         for mut ch in channels {
-            if let Err(err) = ch.send(message.clone()).await {
+            if let Err(err) = ch.send(Traced::capture(message.clone())).await {
                 error!(?err, ?target, "failed to send shard relay message");
             }
         }
@@ -52,7 +53,7 @@ impl MockShardTransport {
 }
 
 impl ShardTransport for MockShardTransport {
-    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage> {
+    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<Traced<ShardMessage>> {
         let (sender, receiver) = mpsc::unbounded();
         let mut recipients = self.lock_recipients();
         recipients
@@ -125,7 +126,7 @@ impl ShardTransport for MockShardTransport {
 impl MockShardTransport {
     fn lock_recipients(
         &self,
-    ) -> MutexGuard<'_, HashMap<PublicKey, Vec<mpsc::UnboundedSender<ShardMessage>>>> {
+    ) -> MutexGuard<'_, HashMap<PublicKey, Vec<mpsc::UnboundedSender<Traced<ShardMessage>>>>> {
         match self.recipients.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {

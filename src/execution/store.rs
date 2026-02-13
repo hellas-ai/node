@@ -23,7 +23,7 @@ pub type UtxoDb<E> = CurrentFixedDb<E, ObjectId, Coin, Sha256, EightCap, CHUNK_S
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 
 /// Write buffer size for journals.
-const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
 
 /// Buffer pool page size.
 pub const DEFAULT_PAGE_CACHE_SIZE: NonZeroU16 = NonZeroU16::new(4096).unwrap();

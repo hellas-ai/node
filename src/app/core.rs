@@ -1,6 +1,7 @@
 use super::mailbox::AppMailboxReadWriteMessage;
+use super::metrics::CoreMetrics;
 use super::payload::{
-    decode_execution_payload, encode_payload_with_txs, genesis_digest, genesis_payload,
+    decode_anchor, decode_execution_payload, encode_payload, genesis_digest, genesis_payload,
     missing_dependency_or_execution, payload_digest, validate_payload,
 };
 use crate::execution::{
@@ -25,99 +26,6 @@ struct DeferredVerify {
     context: Context,
     payload: Digest,
     response: oneshot::Sender<bool>,
-}
-
-struct PayloadBook {
-    seen: HashMap<Digest, Bytes>,
-    pending: IndexSet<Digest>,
-    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
-    waiters: IndexMap<Digest, Vec<DeferredVerify>>,
-}
-
-impl PayloadBook {
-    fn new() -> Self {
-        Self {
-            seen: HashMap::new(),
-            pending: IndexSet::new(),
-            pending_shards: HashMap::new(),
-            waiters: IndexMap::new(),
-        }
-    }
-
-    fn seen(&self, digest: Digest) -> Option<&Bytes> {
-        self.seen.get(&digest)
-    }
-
-    fn seen_cloned(&self, digest: Digest) -> Option<Bytes> {
-        self.seen.get(&digest).cloned()
-    }
-
-    fn note_seen(&mut self, digest: Digest, payload: Bytes) {
-        self.seen.insert(digest, payload);
-    }
-
-    fn mark_pending(&mut self, digest: Digest) {
-        self.pending.insert(digest);
-    }
-
-    fn note_pending_shards(
-        &mut self,
-        digest: Digest,
-        key: BlockKey,
-        commitment: ZodaCommitment,
-        shards: Vec<ZodaShard>,
-    ) {
-        self.pending_shards
-            .insert(digest, (key, commitment, shards));
-    }
-
-    fn take_pending_shards(
-        &mut self,
-        digest: Digest,
-    ) -> Option<(BlockKey, ZodaCommitment, Vec<ZodaShard>)> {
-        self.pending.shift_remove(&digest);
-        self.pending_shards.remove(&digest)
-    }
-
-    fn clear_pending(&mut self, digest: Digest) {
-        self.pending.shift_remove(&digest);
-        self.pending_shards.remove(&digest);
-    }
-
-    fn enforce_pending_capacity(&mut self, max_pending: usize) {
-        while self.pending.len() > max_pending {
-            let Some(oldest) = self.pending.shift_remove_index(0) else {
-                break;
-            };
-            self.pending_shards.remove(&oldest);
-        }
-    }
-
-    fn queue_waiter(&mut self, digest: Digest, deferred: DeferredVerify) {
-        self.waiters.entry(digest).or_default().push(deferred);
-    }
-
-    fn trim_waiter_keys(&mut self, max_waiter_keys: usize) -> Vec<DeferredVerify> {
-        let mut evicted = Vec::new();
-        while self.waiters.len() > max_waiter_keys {
-            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
-                break;
-            };
-            evicted.extend(stale);
-        }
-        evicted
-    }
-
-    fn take_waiters(&mut self, digest: Digest) -> Vec<DeferredVerify> {
-        self.waiters.shift_remove(&digest).unwrap_or_default()
-    }
-
-    fn remove_digest(&mut self, digest: Digest) -> Vec<DeferredVerify> {
-        self.seen.remove(&digest);
-        self.pending.shift_remove(&digest);
-        self.pending_shards.remove(&digest);
-        self.take_waiters(digest)
-    }
 }
 
 pub(super) enum CoreEffect {
@@ -150,7 +58,7 @@ pub(super) struct CoreEffects {
 }
 
 impl CoreEffects {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             replies: VecDeque::new(),
             network: VecDeque::new(),
@@ -159,13 +67,19 @@ impl CoreEffects {
 }
 
 pub(super) struct AppCore {
-    payloads: PayloadBook,
+    seen: HashMap<Digest, Bytes>,
+    pending: IndexSet<Digest>,
+    pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
+    waiters: IndexMap<Digest, Vec<DeferredVerify>>,
     mempool: VecDeque<Transaction>,
     speculative_store: SpeculativeExecutionStore,
     finalized: FinalizationTracker,
+    persisted_roots: IndexMap<Digest, Digest>,
+    latest_anchor: Option<(Digest, Digest)>,
     validators: Vec<PublicKey>,
     strategy: Rayon,
     shard_recoverer: ShardRecoverer,
+    metrics: CoreMetrics,
 }
 
 impl AppCore {
@@ -173,6 +87,7 @@ impl AppCore {
     const MAX_WAITER_KEYS: usize = 512;
     const MAX_MEMPOOL_SIZE: usize = 1024;
     const MAX_FINALIZED_EXECUTIONS: usize = 512;
+    const MAX_PERSISTED_ROOTS: usize = 2048;
 
     // Construction + identity -------------------------------------------------
     pub(super) fn new(
@@ -181,6 +96,7 @@ impl AppCore {
         my_index: u16,
         coding_config: commonware_coding::Config,
         strategy: Rayon,
+        metrics: CoreMetrics,
     ) -> Self {
         validators.sort();
         validators.dedup();
@@ -189,15 +105,28 @@ impl AppCore {
             validators.push(me.clone());
         }
 
-        Self {
-            payloads: PayloadBook::new(),
+        let core = Self {
+            seen: HashMap::new(),
+            pending: IndexSet::new(),
+            pending_shards: HashMap::new(),
+            waiters: IndexMap::new(),
             mempool: VecDeque::new(),
             speculative_store: SpeculativeExecutionStore::new(),
             finalized: FinalizationTracker::new(Self::MAX_FINALIZED_EXECUTIONS),
+            persisted_roots: IndexMap::new(),
+            latest_anchor: None,
             validators,
             strategy: strategy.clone(),
             shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy),
-        }
+            metrics,
+        };
+        core.metrics.waiter_keys.set(0);
+        core.metrics.waiter_total.set(0);
+        core.metrics.mempool_size.set(0);
+        core.metrics.pending_payloads.set(0);
+        core.metrics.persisted_roots.set(0);
+        core.metrics.unpersisted_finalizations.set(0);
+        core
     }
 
     pub(super) const fn me(&self) -> &PublicKey {
@@ -220,12 +149,6 @@ impl AppCore {
     {
         let mut effects = CoreEffects::new();
         match message {
-            AppMailboxReadWriteMessage::Genesis { epoch, response } => {
-                let digest = self.genesis(epoch);
-                effects
-                    .replies
-                    .push_back(CoreEffect::Digest { response, digest });
-            }
             AppMailboxReadWriteMessage::Propose { context, response } => {
                 let digest = self.propose(&context, now);
                 effects
@@ -249,6 +172,9 @@ impl AppCore {
             AppMailboxReadWriteMessage::SubmitTx { tx } => {
                 if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
                     self.mempool.push_back(tx);
+                    self.metrics
+                        .mempool_size
+                        .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
                 }
             }
             AppMailboxReadWriteMessage::GetCoin {
@@ -261,8 +187,10 @@ impl AppCore {
                     .replies
                     .push_back(CoreEffect::Coin { response, coin });
             }
-            AppMailboxReadWriteMessage::GetStateRoot { .. }
+            AppMailboxReadWriteMessage::Genesis { .. }
+            | AppMailboxReadWriteMessage::GetStateRoot { .. }
             | AppMailboxReadWriteMessage::GetProof { .. }
+            | AppMailboxReadWriteMessage::GetFinalization { .. }
             | AppMailboxReadWriteMessage::DrainExternalEvents => {
                 unreachable!(
                     "application should intercept non-core ingress before AppCore::on_message"
@@ -297,18 +225,51 @@ impl AppCore {
     }
 
     pub(super) fn mark_finalization_persisted(&mut self, payload: Digest) -> bool {
-        self.finalized.mark_persisted(payload)
+        let marked = self.finalized.mark_persisted(payload);
+        self.metrics.unpersisted_finalizations.set(
+            i64::try_from(self.finalized.unpersisted_finalization_count()).unwrap_or(i64::MAX),
+        );
+        marked
     }
 
     pub(super) fn unpersisted_finalization_count(&self) -> usize {
         self.finalized.unpersisted_finalization_count()
     }
 
+    pub(super) fn note_persisted_root(&mut self, payload: Digest, root: Digest) {
+        self.persisted_roots.insert(payload, root);
+        while self.persisted_roots.len() > Self::MAX_PERSISTED_ROOTS {
+            let Some((_oldest, _)) = self.persisted_roots.shift_remove_index(0) else {
+                break;
+            };
+        }
+        self.latest_anchor = Some((payload, root));
+        self.metrics
+            .persisted_roots
+            .set(i64::try_from(self.persisted_roots.len()).unwrap_or(i64::MAX));
+    }
+
+    pub(super) fn has_persisted_roots(&self) -> bool {
+        !self.persisted_roots.is_empty()
+    }
+
+    pub(super) fn on_persisted_root(
+        &mut self,
+        payload: Digest,
+        root: Digest,
+        now: u64,
+    ) -> CoreEffects {
+        self.note_persisted_root(payload, root);
+        let mut effects = CoreEffects::new();
+        self.retry_waiters(payload, now, &mut effects);
+        effects
+    }
+
     // Consensus callbacks -----------------------------------------------------
     pub(super) fn genesis(&mut self, epoch: Epoch) -> Digest {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
-        self.payloads.note_seen(digest, payload);
+        self.seen.insert(digest, payload);
         let genesis_execution = genesis_state(&self.validators);
         let diffs = FinalizationDiffs {
             created: genesis_execution.created,
@@ -325,6 +286,15 @@ impl AppCore {
 
     pub(super) fn propose(&mut self, context: &Context, now: u64) -> Digest {
         let parent = context.parent.1;
+        let _span = info_span!(
+            "app.core.propose",
+            round = ?context.round,
+            parent = ?parent,
+            now_ms = now,
+            payload = tracing::field::Empty
+        )
+        .entered();
+        self.metrics.propose_total.inc();
         let mut txs = Vec::new();
         let mut resulting_state = None;
         let mut resulting_diffs = None;
@@ -357,9 +327,18 @@ impl AppCore {
                 }
             }
             self.mempool = retained;
+            self.metrics
+                .mempool_size
+                .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
 
             // Re-execute via execute_block to obtain diffs.
-            if !txs.is_empty() {
+            if txs.is_empty() {
+                resulting_diffs = Some(FinalizationDiffs {
+                    created: Vec::new(),
+                    deleted: Vec::new(),
+                });
+                resulting_state = Some(running_state);
+            } else {
                 match execute_block(&parent_state, &txs) {
                     Ok(exec) => {
                         resulting_diffs = Some(FinalizationDiffs {
@@ -379,26 +358,26 @@ impl AppCore {
                         for tx in txs.into_iter().rev() {
                             self.mempool.push_front(tx);
                         }
+                        self.metrics
+                            .mempool_size
+                            .set(i64::try_from(self.mempool.len()).unwrap_or(i64::MAX));
                         return self.propose_empty(context, now);
                     }
                 }
-            } else {
-                resulting_diffs = Some(FinalizationDiffs {
-                    created: Vec::new(),
-                    deleted: Vec::new(),
-                });
-                resulting_state = Some(running_state);
             }
         } else {
             warn!(parent = ?parent, "missing parent execution; proposing empty block");
         }
 
-        self.propose_with_txs(context, now, parent, txs, resulting_state, resulting_diffs)
+        let digest =
+            self.propose_with_txs(context, now, parent, &txs, resulting_state, resulting_diffs);
+        tracing::Span::current().record("payload", tracing::field::debug(&digest));
+        digest
     }
 
     // Proposal assembly -------------------------------------------------------
     fn propose_empty(&mut self, context: &Context, now: u64) -> Digest {
-        self.propose_with_txs(context, now, context.parent.1, Vec::new(), None, None)
+        self.propose_with_txs(context, now, context.parent.1, &[], None, None)
     }
 
     fn propose_with_txs(
@@ -406,12 +385,46 @@ impl AppCore {
         context: &Context,
         timestamp: u64,
         parent: Digest,
-        txs: Vec<Transaction>,
+        txs: &[Transaction],
         resulting_state: Option<ObjectState>,
         resulting_diffs: Option<FinalizationDiffs>,
     ) -> Digest {
-        let payload = encode_payload_with_txs(context.round, parent, timestamp, &txs);
+        let tx_count = txs.len();
+        let _span = debug_span!(
+            "app.core.proposal_assembly",
+            round = ?context.round,
+            parent = ?parent,
+            timestamp,
+            tx_count
+        )
+        .entered();
+        let Some((anchor_payload, anchor_root)) = self
+            .latest_anchor
+            .or_else(|| self.persisted_root(parent).map(|root| (parent, root)))
+        else {
+            self.metrics.propose_missing_anchor_total.inc();
+            error!(
+                parent = ?parent,
+                "no persisted state root anchor available for proposal; aborting to avoid unverifiable payload"
+            );
+            std::process::abort();
+        };
+        let payload = encode_payload(
+            context.round,
+            parent,
+            timestamp,
+            anchor_payload,
+            anchor_root,
+            &txs,
+        );
         let digest = payload_digest(&payload);
+        trace!(
+            payload = ?digest,
+            ?anchor_payload,
+            ?anchor_root,
+            tx_count,
+            "assembled proposal payload"
+        );
         let key = BlockKey::new(context.round, digest);
         let encoded = CodingImpl::encode(
             self.shard_recoverer.coding_config(),
@@ -419,18 +432,21 @@ impl AppCore {
             &self.strategy,
         );
 
-        self.payloads.mark_pending(digest);
+        self.pending.insert(digest);
         match encoded {
             Ok((commitment, shards)) => {
-                self.payloads
-                    .note_pending_shards(digest, key, commitment, shards);
+                self.pending_shards
+                    .insert(digest, (key, commitment, shards));
             }
             Err(err) => {
                 warn!(?err, digest = ?digest, "zoda encode failed; payload will not be broadcast");
             }
         }
         self.enforce_pending_capacity();
-        self.payloads.note_seen(digest, payload);
+        self.metrics
+            .pending_payloads
+            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        self.seen.insert(digest, payload);
         match (resulting_state, resulting_diffs) {
             (Some(state), Some(diffs)) => {
                 self.speculative_store
@@ -455,9 +471,21 @@ impl AppCore {
         context: &Context,
         payload: Digest,
         contents: &Bytes,
+        anchor_payload: Digest,
+        anchor_root: Digest,
+        local_anchor_root: Digest,
         now: u64,
     ) -> bool {
         let parent = context.parent.1;
+        let _span = debug_span!(
+            "app.core.verify_payload",
+            round = ?context.round,
+            parent = ?parent,
+            payload = ?payload,
+            anchor_payload = ?anchor_payload,
+            now_ms = now
+        )
+        .entered();
         if !self.ensure_execution_materialized(parent) {
             warn!(
                 parent = ?parent,
@@ -465,7 +493,7 @@ impl AppCore {
             );
             return false;
         }
-        let Some(parent_bytes) = self.payloads.seen(parent) else {
+        let Some(parent_bytes) = self.seen.get(&parent) else {
             warn!(
                 parent = ?parent,
                 "parent bytes missing during verify despite dependency check"
@@ -479,6 +507,17 @@ impl AppCore {
             );
             return false;
         };
+        if local_anchor_root != anchor_root {
+            self.metrics.anchor_mismatch_total.inc();
+            error!(
+                payload = ?payload,
+                anchor_payload = ?anchor_payload,
+                claimed_anchor_root = ?anchor_root,
+                local_anchor_root = ?local_anchor_root,
+                "anchor root mismatch for known anchor payload; possible Byzantine proposal or local state divergence"
+            );
+            return false;
+        }
         match validate_payload(context.round, parent, payload, contents, now, parent_bytes) {
             Ok(txs) => match execute_block(&parent_state, &txs) {
                 Ok(exec) => {
@@ -512,15 +551,27 @@ impl AppCore {
         effects: &mut CoreEffects,
     ) {
         let parent = context.parent.1;
+        let _span = info_span!(
+            "app.core.verify_request",
+            round = ?context.round,
+            parent = ?parent,
+            payload = ?payload,
+            now_ms = now
+        )
+        .entered();
+        self.metrics.verify_requests_total.inc();
         if !self.speculative_store.contains_execution(parent) {
             let _ = self.ensure_execution_materialized(parent);
         }
-        if let Some(missing_digest) = missing_dependency_or_execution(
-            &self.payloads.seen,
-            &self.speculative_store,
-            context,
-            payload,
-        ) {
+        if let Some(missing_digest) =
+            missing_dependency_or_execution(&self.seen, &self.speculative_store, context, payload)
+        {
+            self.metrics.verify_deferred_dependency_total.inc();
+            debug!(
+                ?payload,
+                ?missing_digest,
+                "deferring verify while waiting for dependency"
+            );
             self.queue_waiter(
                 missing_digest,
                 DeferredVerify {
@@ -532,24 +583,62 @@ impl AppCore {
             );
             return;
         }
-        let Some(contents) = self.payloads.seen_cloned(payload) else {
+        let Some(contents) = self.seen.get(&payload).cloned() else {
             warn!(
                 payload = ?payload,
                 "payload bytes missing during verify despite dependency check"
             );
+            self.metrics.verify_invalid_total.inc();
             effects.replies.push_back(CoreEffect::Verify {
                 response,
                 valid: false,
             });
             return;
         };
-        let valid = self.verify_payload(context, payload, &contents, now);
+        let Some((anchor_payload, anchor_root)) = decode_anchor(&contents) else {
+            warn!(payload = ?payload, "payload missing anchor fields");
+            self.metrics.verify_invalid_total.inc();
+            effects.replies.push_back(CoreEffect::Verify {
+                response,
+                valid: false,
+            });
+            return;
+        };
+        let Some(local_anchor_root) = self.persisted_root(anchor_payload) else {
+            self.metrics.verify_deferred_anchor_total.inc();
+            debug!(
+                ?payload,
+                ?anchor_payload,
+                "deferring verify while waiting for anchor root"
+            );
+            self.queue_waiter(
+                anchor_payload,
+                DeferredVerify {
+                    context: context.clone(),
+                    payload,
+                    response,
+                },
+                effects,
+            );
+            return;
+        };
+        let valid = self.verify_payload(
+            context,
+            payload,
+            &contents,
+            anchor_payload,
+            anchor_root,
+            local_anchor_root,
+            now,
+        );
         effects
             .replies
             .push_back(CoreEffect::Verify { response, valid });
         if valid {
+            self.metrics.verify_valid_total.inc();
             self.retry_waiters(payload, now, effects);
         } else {
+            self.metrics.verify_invalid_total.inc();
             self.reject_waiters(payload, effects);
         }
     }
@@ -560,17 +649,18 @@ impl AppCore {
         deferred: DeferredVerify,
         effects: &mut CoreEffects,
     ) {
-        self.payloads.queue_waiter(digest, deferred);
-        for stale in self.payloads.trim_waiter_keys(Self::MAX_WAITER_KEYS) {
+        self.waiters.entry(digest).or_default().push(deferred);
+        for stale in self.trim_waiter_keys() {
             effects.replies.push_back(CoreEffect::Verify {
                 response: stale.response,
                 valid: false,
             });
         }
+        self.update_waiter_metrics();
     }
 
     fn retry_waiters(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
-        for deferred in self.take_waiters_for(digest) {
+        for deferred in self.waiters.shift_remove(&digest).unwrap_or_default() {
             self.process_verify_request(
                 &deferred.context,
                 deferred.payload,
@@ -579,25 +669,51 @@ impl AppCore {
                 effects,
             );
         }
+        self.update_waiter_metrics();
     }
 
     fn reject_waiters(&mut self, digest: Digest, effects: &mut CoreEffects) {
-        for deferred in self.take_waiters_for(digest) {
+        for deferred in self.waiters.shift_remove(&digest).unwrap_or_default() {
             effects.replies.push_back(CoreEffect::Verify {
                 response: deferred.response,
                 valid: false,
             });
         }
+        self.update_waiter_metrics();
     }
 
-    fn take_waiters_for(&mut self, digest: Digest) -> Vec<DeferredVerify> {
-        self.payloads.take_waiters(digest)
+    fn trim_waiter_keys(&mut self) -> Vec<DeferredVerify> {
+        let mut evicted = Vec::new();
+        while self.waiters.len() > Self::MAX_WAITER_KEYS {
+            let Some((_oldest, stale)) = self.waiters.shift_remove_index(0) else {
+                break;
+            };
+            evicted.extend(stale);
+        }
+        evicted
+    }
+
+    fn update_waiter_metrics(&self) {
+        self.metrics
+            .waiter_keys
+            .set(i64::try_from(self.waiters.len()).unwrap_or(i64::MAX));
+        let waiter_total = self.waiters.values().map(Vec::len).sum::<usize>();
+        self.metrics
+            .waiter_total
+            .set(i64::try_from(waiter_total).unwrap_or(i64::MAX));
     }
 
     // Pending payload retention -----------------------------------------------
     fn enforce_pending_capacity(&mut self) {
-        self.payloads
-            .enforce_pending_capacity(Self::MAX_PENDING_DIGESTS);
+        while self.pending.len() > Self::MAX_PENDING_DIGESTS {
+            let Some(oldest) = self.pending.shift_remove_index(0) else {
+                break;
+            };
+            self.pending_shards.remove(&oldest);
+        }
+        self.metrics
+            .pending_payloads
+            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
     }
 
     // Finalization pruning ----------------------------------------------------
@@ -607,6 +723,12 @@ impl AppCore {
         parent_payload: Digest,
         effects: &mut CoreEffects,
     ) {
+        let _span = info_span!(
+            "app.core.finalize",
+            payload = ?payload,
+            parent_payload = ?parent_payload
+        )
+        .entered();
         self.speculative_store
             .note_parent_if_absent(payload, parent_payload);
         if !self.ensure_execution_materialized(payload) {
@@ -625,13 +747,16 @@ impl AppCore {
             );
         }
         self.finalized.observe_finalized(payload, diffs);
+        self.metrics.unpersisted_finalizations.set(
+            i64::try_from(self.finalized.unpersisted_finalization_count()).unwrap_or(i64::MAX),
+        );
 
         let finalized = &self.finalized;
         let pruned = self
             .speculative_store
             .prune_non_descendants(payload, |digest| finalized.is_finalized(digest));
         for digest in pruned {
-            for deferred in self.payloads.remove_digest(digest) {
+            for deferred in self.remove_digest(digest) {
                 effects.replies.push_back(CoreEffect::Verify {
                     response: deferred.response,
                     valid: false,
@@ -640,20 +765,52 @@ impl AppCore {
         }
     }
 
+    fn remove_digest(&mut self, digest: Digest) -> Vec<DeferredVerify> {
+        self.seen.remove(&digest);
+        self.pending.shift_remove(&digest);
+        self.pending_shards.remove(&digest);
+        let removed = self.waiters.shift_remove(&digest).unwrap_or_default();
+        self.metrics
+            .pending_payloads
+            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        self.update_waiter_metrics();
+        removed
+    }
+
     // Shard recovery + broadcast ----------------------------------------------
     fn apply_shard_effect(&mut self, effect: ShardEffect, now: u64, effects: &mut CoreEffects) {
         match effect {
             ShardEffect::Broadcast(message) => {
+                let key = message.key();
+                trace!(
+                    payload = ?key.digest,
+                    round = ?key.round,
+                    "queueing shard rebroadcast"
+                );
                 effects
                     .network
                     .push_back(NetworkEffect::BroadcastShard(message));
             }
             ShardEffect::Recovered { key, contents } => {
-                self.payloads.note_seen(key.digest, contents);
-                self.payloads.clear_pending(key.digest);
+                info!(
+                    payload = ?key.digest,
+                    round = ?key.round,
+                    "recovered payload from shards"
+                );
+                self.seen.insert(key.digest, contents);
+                self.pending.shift_remove(&key.digest);
+                self.pending_shards.remove(&key.digest);
+                self.metrics
+                    .pending_payloads
+                    .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
                 self.retry_waiters(key.digest, now, effects);
             }
             ShardEffect::Failed { key } => {
+                warn!(
+                    payload = ?key.digest,
+                    round = ?key.round,
+                    "shard recovery failed for payload"
+                );
                 self.reject_waiters(key.digest, effects);
             }
         }
@@ -668,16 +825,29 @@ impl AppCore {
     ) where
         F: Fn(&PublicKey) -> Option<u16>,
     {
+        let key = message.key();
+        let _span = debug_span!(
+            "app.core.shard_message",
+            payload = ?key.digest,
+            round = ?key.round,
+            sender = ?message.sender()
+        )
+        .entered();
         let shard_effects =
             self.shard_recoverer
-                .handle_message(message, &self.payloads.seen, validator_index);
+                .handle_message(message, &self.seen, validator_index);
         for effect in shard_effects {
             self.apply_shard_effect(effect, now, effects);
         }
     }
 
     fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
-        let Some((key, commitment, shards)) = self.payloads.take_pending_shards(digest) else {
+        let _span = info_span!("app.core.enqueue_broadcast", payload = ?digest).entered();
+        self.pending.shift_remove(&digest);
+        self.metrics
+            .pending_payloads
+            .set(i64::try_from(self.pending.len()).unwrap_or(i64::MAX));
+        let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
             warn!(?digest, "broadcast requested for unknown pending shards");
             return;
         };
@@ -695,11 +865,15 @@ impl AppCore {
             .and_then(|state| state.get(&object).cloned())
     }
 
+    fn persisted_root(&self, payload: Digest) -> Option<Digest> {
+        self.persisted_roots.get(&payload).copied()
+    }
+
     // Shared helper -----------------------------------------------------------
     fn ensure_execution_materialized(&mut self, digest: Digest) -> bool {
         self.speculative_store
             .ensure_execution_for_payload(digest, &|candidate| {
-                decode_execution_payload(&self.payloads.seen, candidate)
+                decode_execution_payload(&self.seen, candidate)
             })
     }
 }
@@ -707,15 +881,21 @@ impl AppCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::payload::decode_anchor;
     use crate::shard::protocol::coding_config;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::certificate::mocks::Fixture;
-    use commonware_runtime::{Runner, deterministic};
+    use commonware_runtime::{Metrics, Runner, deterministic};
+    use commonware_utils::channel::oneshot;
     use hellas_types::Context;
     use std::time::Duration;
 
-    #[test]
+    fn test_metrics(context: &deterministic::Context, label: &str) -> CoreMetrics {
+        CoreMetrics::register(&context.with_label(label))
+    }
+
+    #[test_log::test]
     fn finalization_prunes_non_descendant_execution_state() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -725,10 +905,18 @@ mod tests {
 
             let me = participants[0].clone();
             let strategy = crate::coding_strategy();
-            let mut core = AppCore::new(&me, participants.clone(), 0, coding_config(6), strategy);
+            let mut core = AppCore::new(
+                &me,
+                participants.clone(),
+                0,
+                coding_config(6),
+                strategy,
+                test_metrics(&context, "core_prune"),
+            );
 
             let epoch = Epoch::new(1);
             let genesis = core.genesis(epoch);
+            core.note_persisted_root(genesis, Digest::from([1u8; 32]));
 
             let canonical_context = Context {
                 round: Round::new(epoch, View::new(1)),
@@ -754,7 +942,172 @@ mod tests {
             assert_eq!(core.finalized.latest_finalized(), Some(canonical));
             assert!(core.speculative_store.contains_execution(canonical));
             assert!(!core.speculative_store.contains_execution(fork));
-            assert!(!core.payloads.seen.contains_key(&fork));
+            assert!(!core.seen.contains_key(&fork));
+        });
+    }
+
+    #[test_log::test]
+    fn proposal_carries_latest_persisted_anchor() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-anchor-proposal-test", 6);
+
+            let me = participants[0].clone();
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &me,
+                participants.clone(),
+                0,
+                coding_config(6),
+                strategy,
+                test_metrics(&context, "core_proposal_anchor"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let genesis_root = Digest::from([7u8; 32]);
+            core.note_persisted_root(genesis, genesis_root);
+
+            let context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let payload = core.propose(&context, 100);
+            let contents = core
+                .seen
+                .get(&payload)
+                .expect("payload bytes should be cached");
+            assert_eq!(decode_anchor(contents), Some((genesis, genesis_root)));
+        });
+    }
+
+    #[test_log::test]
+    fn verify_deferred_until_anchor_root_is_persisted() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-anchor-defer-test", 6);
+
+            let strategy = crate::coding_strategy();
+            let mut proposer = AppCore::new(
+                &participants[0],
+                participants.clone(),
+                0,
+                coding_config(6),
+                strategy.clone(),
+                test_metrics(&context, "core_defer_proposer"),
+            );
+            let mut verifier = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                strategy,
+                test_metrics(&context, "core_defer_verifier"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = proposer.genesis(epoch);
+            let _ = verifier.genesis(epoch);
+            let anchor_root = Digest::from([9u8; 32]);
+            proposer.note_persisted_root(genesis, anchor_root);
+
+            let proposal_context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let payload = proposer.propose(&proposal_context, 123);
+            let payload_contents = proposer
+                .seen
+                .get(&payload)
+                .expect("proposed payload must exist")
+                .clone();
+            verifier.seen.insert(payload, payload_contents);
+
+            let (response, _receiver) = oneshot::channel();
+            let deferred = verifier.on_message(
+                AppMailboxReadWriteMessage::Verify {
+                    context: proposal_context.clone(),
+                    payload,
+                    response,
+                },
+                123,
+                &|_| Some(0),
+            );
+            assert!(deferred.replies.is_empty());
+
+            let resumed = verifier.on_persisted_root(genesis, anchor_root, 124);
+            assert_eq!(resumed.replies.len(), 1);
+            let Some(CoreEffect::Verify { valid, .. }) = resumed.replies.front() else {
+                panic!("expected deferred verify reply");
+            };
+            assert!(*valid);
+        });
+    }
+
+    #[test_log::test]
+    fn verify_rejects_payload_with_wrong_anchor_root() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-anchor-mismatch-test", 6);
+
+            let strategy = crate::coding_strategy();
+            let mut proposer = AppCore::new(
+                &participants[0],
+                participants.clone(),
+                0,
+                coding_config(6),
+                strategy.clone(),
+                test_metrics(&context, "core_mismatch_proposer"),
+            );
+            let mut verifier = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                strategy,
+                test_metrics(&context, "core_mismatch_verifier"),
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = proposer.genesis(epoch);
+            let _ = verifier.genesis(epoch);
+
+            proposer.note_persisted_root(genesis, Digest::from([11u8; 32]));
+            verifier.note_persisted_root(genesis, Digest::from([12u8; 32]));
+
+            let proposal_context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let payload = proposer.propose(&proposal_context, 200);
+            let payload_contents = proposer
+                .seen
+                .get(&payload)
+                .expect("proposed payload must exist")
+                .clone();
+            let (anchor_payload, anchor_root) =
+                decode_anchor(&payload_contents).expect("payload should include anchors");
+            let local_anchor_root = verifier
+                .persisted_root(anchor_payload)
+                .expect("verifier should have anchor root");
+            assert!(!verifier.verify_payload(
+                &proposal_context,
+                payload,
+                &payload_contents,
+                anchor_payload,
+                anchor_root,
+                local_anchor_root,
+                200
+            ));
         });
     }
 }

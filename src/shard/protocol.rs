@@ -134,7 +134,7 @@ mod tests {
         (config, commitment, shards)
     }
 
-    #[test]
+    #[test_log::test]
     fn commitment_mismatch_is_rejected() {
         let (cfg_a, commitment_a, _) = sample_artifacts(b"payload-a");
         let (_, commitment_b, shards_b) = sample_artifacts(b"payload-b");
@@ -144,7 +144,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
+    #[test_log::test]
     fn coding_config_boundary_values() {
         let zero = coding_config(0);
         assert_eq!(zero.minimum_shards, 1);

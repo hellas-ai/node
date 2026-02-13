@@ -7,6 +7,7 @@ pub mod engine;
 mod execution;
 pub mod object;
 pub mod shard;
+mod trace;
 
 pub use app::{AppMailbox, TraceReporter};
 

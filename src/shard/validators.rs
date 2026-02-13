@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use commonware_cryptography::{Signer, ed25519};
 
-    #[test]
+    #[test_log::test]
     fn declare_after_finalize_is_ignored() {
         let set = ValidatorSet::new();
         let a = ed25519::PrivateKey::from_seed(1).public_key();
@@ -168,7 +168,7 @@ mod tests {
         assert!(set.index(&b).is_none());
     }
 
-    #[test]
+    #[test_log::test]
     fn assign_shards_skips_proposer() {
         let set = ValidatorSet::new();
         let validators: Vec<_> = [9u64, 2u64, 7u64, 4u64]
@@ -190,7 +190,7 @@ mod tests {
         assert!(assignments.iter().all(|(target, _, _)| target != &proposer));
     }
 
-    #[test]
+    #[test_log::test]
     fn assign_shards_count_mismatch() {
         let set = ValidatorSet::new();
         let validators: Vec<_> = [1u64, 2u64, 3u64, 4u64]
@@ -215,7 +215,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn assign_shards_requires_finalized_validators() {
         let set = ValidatorSet::new();
         let proposer = ed25519::PrivateKey::from_seed(1).public_key();
@@ -301,7 +301,7 @@ mod loom_tests {
         builder.check(f);
     }
 
-    #[test]
+    #[test_log::test]
     fn declare_finalize_race_keeps_ordered_unique_membership() {
         run_model(|| {
             let set = Arc::new(LoomValidatorSet::new());
@@ -348,7 +348,7 @@ mod loom_tests {
         });
     }
 
-    #[test]
+    #[test_log::test]
     fn duplicate_declare_race_deduplicates() {
         run_model(|| {
             let set = Arc::new(LoomValidatorSet::new());

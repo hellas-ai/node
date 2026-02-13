@@ -1,4 +1,4 @@
-use super::diffs::FinalizationDiffs;
+use super::FinalizationDiffs;
 use super::transition::{ObjectState, execute_block};
 use crate::object::Transaction;
 use commonware_cryptography::sha256::Digest;
@@ -165,7 +165,7 @@ mod tests {
         state
     }
 
-    #[test]
+    #[test_log::test]
     fn materializes_execution_chain() {
         let mut store = SpeculativeExecutionStore::new();
         let genesis_state = sample_state();
@@ -192,7 +192,7 @@ mod tests {
         assert!(store.contains_execution(block_b));
     }
 
-    #[test]
+    #[test_log::test]
     fn prune_can_keep_named_non_descendants() {
         let mut store = SpeculativeExecutionStore::new();
         let genesis_state = sample_state();

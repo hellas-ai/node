@@ -247,7 +247,7 @@ mod tests {
         pks
     }
 
-    #[test]
+    #[test_log::test]
     fn genesis_state_creates_coins() {
         let validators = sorted_public_keys(4);
         let exec = genesis_state(&validators);
@@ -262,7 +262,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn genesis_state_is_deterministic_for_same_sorted_input() {
         let validators = sorted_public_keys(6);
         let a = genesis_state(&validators);
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(a.state, b.state);
     }
 
-    #[test]
+    #[test_log::test]
     fn transfer_debits_and_credits() {
         let keys = keys(2);
         let sender = keys[0].public_key();
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(exec.created[1].1.value, 60);
     }
 
-    #[test]
+    #[test_log::test]
     fn transfer_exact_amount_has_no_change() {
         let keys = keys(2);
         let sender = keys[0].public_key();
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(exec.created[0].1.value, 100);
     }
 
-    #[test]
+    #[test_log::test]
     fn transfer_self_splits_coin() {
         let keys = keys(1);
         let owner = keys[0].public_key();
@@ -338,7 +338,7 @@ mod tests {
         assert!(exec.created.iter().all(|(_, coin)| coin.owner == owner));
     }
 
-    #[test]
+    #[test_log::test]
     fn insufficient_balance_rejected() {
         let keys = keys(2);
         let input = Digest::from([4; 32]);
@@ -357,7 +357,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn zero_amount_rejected() {
         let keys = keys(2);
         let input = Digest::from([5; 32]);
@@ -376,7 +376,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn invalid_signature_rejected() {
         let keys = keys(2);
         let input = Digest::from([6; 32]);
@@ -395,7 +395,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn nonexistent_input_rejected() {
         let keys = keys(2);
         let tx = Transaction::transfer(&keys[0], Digest::from([7; 32]), keys[1].public_key(), 1);
@@ -405,7 +405,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_combines_values() {
         let keys = keys(1);
         let owner = keys[0].public_key();
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(exec.deleted.len(), 2);
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_different_owners_rejected() {
         let keys = keys(2);
         let input_a = Digest::from([10; 32]);
@@ -463,7 +463,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_too_few_inputs_rejected() {
         let keys = keys(1);
         let tx = Transaction::merge(&keys[0], vec![Digest::from([12; 32])]);
@@ -473,7 +473,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn duplicate_input_rejected() {
         let keys = keys(1);
         let owner = keys[0].public_key();
@@ -493,7 +493,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn merge_overflow_rejected() {
         let keys = keys(1);
         let owner = keys[0].public_key();
@@ -515,7 +515,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn output_collision_is_checked() {
         let keys = keys(2);
         let sender = keys[0].public_key();
@@ -545,7 +545,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[test_log::test]
     fn non_canonical_merge_inputs_rejected() {
         let keys = keys(1);
         let owner = keys[0].public_key();

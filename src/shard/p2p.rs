@@ -2,6 +2,7 @@ use super::codec::WireShardMessage;
 use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
 use super::validators::{DistributionError, ValidatorSet};
+use crate::trace::Traced;
 use commonware_actor::{Actor, ingress, service::ServiceBuilder};
 use commonware_p2p::{
     Receiver as P2pReceiver, Recipients, Sender as P2pSender,
@@ -76,7 +77,7 @@ where
     S: P2pSender<PublicKey = PublicKey>,
     R: P2pReceiver<PublicKey = PublicKey>,
 {
-    local_subscribers: Mutex<Vec<mpsc::UnboundedSender<ShardMessage>>>,
+    local_subscribers: Mutex<Vec<mpsc::UnboundedSender<Traced<ShardMessage>>>>,
     validators: ValidatorSet,
     me: PublicKey,
     io: WireIo<S, R>,
@@ -135,7 +136,7 @@ where
         let mut subscribers = self.lock_subscribers();
         let mut idx = 0usize;
         while idx < subscribers.len() {
-            if let Err(err) = subscribers[idx].unbounded_send(message.clone()) {
+            if let Err(err) = subscribers[idx].unbounded_send(Traced::capture(message.clone())) {
                 warn!(?err, "dropping dead local shard subscriber");
                 subscribers.swap_remove(idx);
             } else {
@@ -210,7 +211,7 @@ where
     S: P2pSender<PublicKey = PublicKey>,
     R: P2pReceiver<PublicKey = PublicKey>,
 {
-    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<ShardMessage> {
+    fn register(&self, public_key: &PublicKey) -> mpsc::UnboundedReceiver<Traced<ShardMessage>> {
         if public_key != &self.me {
             warn!(
                 requested = ?public_key,
@@ -255,7 +256,7 @@ where
     S: P2pSender<PublicKey = PublicKey>,
     R: P2pReceiver<PublicKey = PublicKey>,
 {
-    fn lock_subscribers(&self) -> MutexGuard<'_, Vec<mpsc::UnboundedSender<ShardMessage>>> {
+    fn lock_subscribers(&self) -> MutexGuard<'_, Vec<mpsc::UnboundedSender<Traced<ShardMessage>>>> {
         match self.local_subscribers.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {

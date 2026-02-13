@@ -226,7 +226,7 @@ mod tests {
         (config, commitment, shards)
     }
 
-    #[test]
+    #[test_log::test]
     fn malformed_payloads_return_none() {
         assert!(WireShardMessage::decode(Bytes::from_static(&[])).is_none());
         assert!(WireShardMessage::decode(Bytes::from_static(&[WireTag::INITIAL_TAG])).is_none());

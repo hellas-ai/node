@@ -523,7 +523,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn pre_leader_reshare_is_drained_after_note_known_key() {
         let mut fixture = Fixture::new();
         let artifacts = fixture.make_artifacts(1, b"buffer-then-recover");
@@ -577,7 +577,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn wrong_sender_initial_does_not_poison_commitment() {
         let mut fixture = Fixture::new();
         let good = fixture.make_artifacts(2, b"good-payload");

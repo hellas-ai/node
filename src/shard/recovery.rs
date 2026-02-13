@@ -705,7 +705,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn duplicate_checked_reshare_does_not_count_toward_decode_threshold() {
         let validators = 11u16;
         let config = coding_config(validators);

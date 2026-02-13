@@ -1,6 +1,8 @@
 use crate::app::{AppMailbox, Application, FinalizationNotice};
 use crate::config::Config;
 use crate::shard::AuthenticatedShardTransport;
+use crate::trace::Traced;
+use commonware_codec::Encode;
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Sha256, sha256::Digest};
@@ -13,13 +15,13 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppReporter<R> {
-    finalization: futures::channel::mpsc::UnboundedSender<FinalizationNotice>,
+    finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
     inner: R,
 }
 
 impl<R> AppReporter<R> {
     fn new(
-        finalization: futures::channel::mpsc::UnboundedSender<FinalizationNotice>,
+        finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
         inner: R,
     ) -> Self {
         Self {
@@ -37,10 +39,13 @@ where
 
     async fn report(&mut self, activity: Self::Activity) {
         if let Activity::Finalization(finalization) = &activity
-            && let Err(err) = self.finalization.unbounded_send(FinalizationNotice {
-                payload: finalization.proposal.payload,
-                parent_payload: finalization.proposal.parent_payload,
-            })
+            && let Err(err) =
+                self.finalization
+                    .unbounded_send(Traced::capture(FinalizationNotice {
+                        payload: finalization.proposal.payload,
+                        parent_payload: finalization.proposal.parent_payload,
+                        certificate_bytes: Some(finalization.encode().to_vec().into()),
+                    }))
         {
             error!(
                 ?err,

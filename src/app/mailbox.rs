@@ -9,6 +9,27 @@ use hellas_types::Context;
 
 /// Opaque proof returned by `get_proof()`.
 pub type ProofResponse = commonware_storage::qmdb::current::proof::OperationProof<Digest, 32>;
+/// Opaque encoded finalization certificate bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizationResponse(Vec<u8>);
+
+impl FinalizationResponse {
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for FinalizationResponse {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<FinalizationResponse> for Vec<u8> {
+    fn from(value: FinalizationResponse) -> Self {
+        value.0
+    }
+}
 
 ingress! {
     AppMailbox,
@@ -39,6 +60,7 @@ ingress! {
     } -> Option<Coin>;
     pub ask read_write GetStateRoot -> Option<Digest>;
     pub ask read_write GetProof { object: ObjectId } -> Option<ProofResponse>;
+    pub ask read_write GetFinalization { payload: Digest } -> Option<FinalizationResponse>;
 }
 
 impl AppMailbox {
@@ -46,7 +68,6 @@ impl AppMailbox {
         let _ = self.0.tell_lossy(SubmitTx { tx }).await;
     }
 
-    #[cfg(debug_assertions)]
     pub async fn get_coin(&self, payload: Digest, object: ObjectId) -> Option<Coin> {
         self.0
             .ask(GetCoin { payload, object })

@@ -1,4 +1,4 @@
-use super::diffs::FinalizationDiffs;
+use super::FinalizationDiffs;
 use commonware_cryptography::sha256::Digest;
 use indexmap::IndexSet;
 use std::collections::HashMap;
@@ -96,7 +96,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn finalized_diffs_require_explicit_ack() {
         let mut tracker = FinalizationTracker::new(16);
         let canonical = Digest::from([2; 32]);
@@ -124,7 +124,7 @@ mod tests {
         assert!(tracker.next_unpersisted_finalization().is_none());
     }
 
-    #[test]
+    #[test_log::test]
     fn unpersisted_diffs_are_retried_in_order() {
         let mut tracker = FinalizationTracker::new(16);
         let a = Digest::from([2; 32]);
@@ -148,7 +148,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn trim_keeps_unpersisted_oldest_until_acked() {
         let mut tracker = FinalizationTracker::new(2);
         let a = Digest::from([1; 32]);
