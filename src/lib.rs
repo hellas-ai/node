@@ -5,7 +5,7 @@ mod app;
 pub mod config;
 pub mod engine;
 mod execution;
-pub mod object;
+
 pub mod shard;
 mod trace;
 

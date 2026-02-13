@@ -1,4 +1,4 @@
-use crate::object::{
+use hellas_types::{
     Coin, GENESIS_BALANCE, ObjectId, Transaction, genesis_object_id, output_object_id,
 };
 use commonware_codec::Encode;
@@ -230,7 +230,7 @@ fn execute_transaction_with_tracking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::Transaction;
+    use hellas_types::Transaction;
     use commonware_cryptography::Signer;
     use commonware_cryptography::sha256::Digest;
     use hellas_types::PrivateKey;
@@ -483,8 +483,8 @@ mod tests {
         let tx = Transaction::MergeCoin {
             inputs: vec![input, input],
             signature: keys[0].sign(
-                crate::object::MERGE_NAMESPACE,
-                &crate::object::merge_signed_bytes(&[input, input]),
+                hellas_types::MERGE_NAMESPACE,
+                &hellas_types::merge_signed_bytes(&[input, input]),
             ),
         };
         assert!(matches!(
@@ -564,8 +564,8 @@ mod tests {
         let tx = Transaction::MergeCoin {
             inputs: unsorted.to_vec(),
             signature: keys[0].sign(
-                crate::object::MERGE_NAMESPACE,
-                &crate::object::merge_signed_bytes(&unsorted),
+                hellas_types::MERGE_NAMESPACE,
+                &hellas_types::merge_signed_bytes(&unsorted),
             ),
         };
         assert!(matches!(

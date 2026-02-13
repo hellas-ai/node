@@ -78,7 +78,7 @@ impl FinalizationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::Coin;
+    use hellas_types::Coin;
     use commonware_cryptography::Signer;
     use commonware_cryptography::sha256::Digest;
     use hellas_types::PrivateKey;

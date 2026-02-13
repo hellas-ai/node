@@ -6,7 +6,7 @@ mod persistence;
 
 pub use mailbox::AppMailbox;
 
-use crate::object::ObjectId;
+use hellas_types::ObjectId;
 use crate::shard::WireShardMessage;
 use crate::shard::protocol::{ShardMessage, coding_config};
 use crate::shard::transport::ShardTransport;
@@ -718,7 +718,7 @@ mod tests {
     };
     use super::*;
     use crate::execution::store::UtxoDb;
-    use crate::object::{Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
+    use hellas_types::{Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
     use crate::shard::mock::MockShardTransport;
     use bytes::Bytes;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;

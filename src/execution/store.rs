@@ -1,4 +1,4 @@
-use crate::object::{Coin, ObjectId};
+use hellas_types::{Coin, ObjectId};
 use commonware_cryptography::Sha256;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{

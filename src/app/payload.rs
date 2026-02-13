@@ -1,5 +1,5 @@
 use crate::execution::SpeculativeExecutionStore;
-use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
+use hellas_types::{MAX_TXS_PER_BLOCK, Transaction};
 use bytes::Bytes;
 use commonware_codec::{ReadExt, ReadRangeExt, Write};
 use commonware_consensus::types::{Epoch, Round, View};

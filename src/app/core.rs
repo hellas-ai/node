@@ -9,8 +9,7 @@ use crate::execution::{
     ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
     execute_block, execute_transaction, genesis_state,
 };
-use crate::object::{Coin, ObjectId};
-use crate::object::{MAX_TXS_PER_BLOCK, Transaction};
+use hellas_types::{Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction};
 use crate::shard::WireShardMessage;
 use crate::shard::core::{ShardEffect, ShardRecoverer};
 use crate::shard::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard};

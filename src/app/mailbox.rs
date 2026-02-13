@@ -1,7 +1,6 @@
 #![allow(private_interfaces)]
 
-use crate::object::Coin;
-use crate::object::{ObjectId, Transaction};
+use hellas_types::{Coin, ObjectId, Transaction};
 use crate::shard::protocol::ShardMessage;
 
 use super::FinalizationNotice;

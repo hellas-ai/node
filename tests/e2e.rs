@@ -17,7 +17,7 @@ use commonware_storage::{
 };
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
-use hellas_chain::object::{
+use hellas_types::{
     Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id,
 };
 use hellas_chain::shard::AuthenticatedShardTransport;

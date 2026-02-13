@@ -1,7 +1,7 @@
 use super::{mailbox, metrics::{PersistenceMetrics, gauge_set_len}};
 use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
-use crate::object::{Coin, ObjectId};
+use hellas_types::{Coin, ObjectId};
 use crate::trace::Traced;
 use bytes::{Buf, Bytes};
 use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
@@ -147,7 +147,9 @@ where
         let payload_index = Self::initialize_payload_index(context, &partition_prefix).await?;
 
         if db.is_empty() {
-            db = Self::bootstrap_genesis(db, &validators).await?;
+            let genesis = genesis_state(&validators);
+            let batch = Self::diffs_to_batch(&genesis.created, &genesis.deleted);
+            (db, _) = Self::apply_diffs(db, batch, "genesis bootstrap").await?;
         }
 
         Ok(Self {
@@ -278,37 +280,10 @@ where
 
         self.metrics.persist_attempt_total.inc();
 
-        // Apply diffs to QMDB via the type-state transition:
-        // merkleized → mutable → committed → merkleized.
-        let db = self.db;
-
-        let batch: Vec<_> = diffs
-            .deleted
-            .iter()
-            .map(|id| (*id, None))
-            .chain(
-                diffs
-                    .created
-                    .iter()
-                    .map(|(id, coin)| (*id, Some(coin.clone()))),
-            )
-            .collect();
-
-        let mut db = db.into_mutable();
-
-        db.write_batch(batch).await.map_err(|err| {
-            Fatal(format!("QMDB write_batch failed for {payload:?}: {err:?}"))
-        })?;
-
-        let (db, _range) = db.commit(None).await.map_err(|err| {
-            Fatal(format!("QMDB commit failed for {payload:?}: {err:?}"))
-        })?;
-
-        self.db = db.into_merkleized().await.map_err(|err| {
-            Fatal(format!(
-                "QMDB merkleize failed for {payload:?}: {err:?}"
-            ))
-        })?;
+        let batch = Self::diffs_to_batch(&diffs.created, &diffs.deleted);
+        let label = format!("{payload:?}");
+        let (db, _root) = Self::apply_diffs(self.db, batch, &label).await?;
+        self.db = db;
 
         // Ack the queue item so it won't be replayed on restart.
         self.queue.ack(position).await.map_err(|err| {
@@ -448,44 +423,41 @@ where
         }
     }
 
-    /// Bootstrap genesis UTXO state into a fresh QMDB via the type-state
-    /// transition: merkleized → mutable → committed → merkleized.
-    async fn bootstrap_genesis(
-        db: UtxoDb<E>,
-        validators: &[PublicKey],
-    ) -> Result<UtxoDb<E>, Fatal> {
-        let genesis = genesis_state(validators);
-        let batch: Vec<_> = genesis
-            .deleted
+    fn diffs_to_batch(
+        created: &[(ObjectId, Coin)],
+        deleted: &[ObjectId],
+    ) -> Vec<(ObjectId, Option<Coin>)> {
+        deleted
             .iter()
             .map(|id| (*id, None))
-            .chain(
-                genesis
-                    .created
-                    .iter()
-                    .map(|(id, coin)| (*id, Some(coin.clone()))),
-            )
-            .collect();
+            .chain(created.iter().map(|(id, coin)| (*id, Some(coin.clone()))))
+            .collect()
+    }
 
+    /// Apply a batch of state changes to the QMDB and return the new root.
+    ///
+    /// Type-state transition: merkleized → mutable → committed → merkleized.
+    async fn apply_diffs(
+        db: UtxoDb<E>,
+        batch: Vec<(ObjectId, Option<Coin>)>,
+        label: &str,
+    ) -> Result<(UtxoDb<E>, Digest), Fatal> {
         let mut db = db.into_mutable();
 
         db.write_batch(batch).await.map_err(|err| {
-            Fatal(format!(
-                "QMDB write_batch failed during genesis bootstrap: {err:?}"
-            ))
+            Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
         })?;
 
         let (db, _range) = db.commit(None).await.map_err(|err| {
-            Fatal(format!(
-                "QMDB commit failed during genesis bootstrap: {err:?}"
-            ))
+            Fatal(format!("QMDB commit failed for {label}: {err:?}"))
         })?;
 
-        db.into_merkleized().await.map_err(|err| {
-            Fatal(format!(
-                "QMDB merkleize failed during genesis bootstrap: {err:?}"
-            ))
-        })
+        let db = db.into_merkleized().await.map_err(|err| {
+            Fatal(format!("QMDB merkleize failed for {label}: {err:?}"))
+        })?;
+
+        let root = db.root();
+        Ok((db, root))
     }
 
     fn state_root(&self) -> Digest {

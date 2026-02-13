@@ -1,6 +1,6 @@
 use super::FinalizationDiffs;
 use super::transition::{ObjectState, execute_block};
-use crate::object::Transaction;
+use hellas_types::Transaction;
 use commonware_cryptography::sha256::Digest;
 use std::collections::{HashMap, HashSet};
 
@@ -146,7 +146,7 @@ impl SpeculativeExecutionStore {
 mod tests {
     use super::super::transition::ObjectState;
     use super::*;
-    use crate::object::{Coin, GENESIS_BALANCE};
+    use hellas_types::{Coin, GENESIS_BALANCE};
     use commonware_cryptography::Signer;
     use commonware_cryptography::sha256::Digest;
     use hellas_types::PrivateKey;

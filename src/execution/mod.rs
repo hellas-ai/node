@@ -3,7 +3,7 @@ mod speculative;
 pub mod store;
 mod transition;
 
-use crate::object::{Coin, ObjectId};
+use hellas_types::{Coin, ObjectId};
 
 /// The created/deleted diffs produced by executing a block.
 ///
