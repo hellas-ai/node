@@ -87,6 +87,7 @@ pub(super) struct AppCore {
     pending: IndexSet<Digest>,
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     waiters: IndexMap<Digest, Vec<DeferredVerify>>,
+    pending_fetches: HashMap<Digest, u64>,
     mempool: VecDeque<Transaction>,
     speculative_store: SpeculativeExecutionStore,
     finalized: FinalizationTracker,
@@ -107,6 +108,7 @@ impl AppCore {
     const MAX_MEMPOOL_SIZE: usize = 1024;
     const MAX_FINALIZED_EXECUTIONS: usize = 512;
     const MAX_PERSISTED_ROOTS: usize = 2048;
+    const FETCH_RETRY_MS: u64 = 200;
 
     // Construction + identity -------------------------------------------------
     pub(super) fn new(
@@ -133,6 +135,7 @@ impl AppCore {
             pending: IndexSet::new(),
             pending_shards: HashMap::new(),
             waiters: IndexMap::new(),
+            pending_fetches: HashMap::new(),
             mempool: VecDeque::new(),
             speculative_store: SpeculativeExecutionStore::new(),
             finalized: FinalizationTracker::new(Self::MAX_FINALIZED_EXECUTIONS),
@@ -227,8 +230,8 @@ impl AppCore {
     pub(super) fn run_maintenance(&mut self, now: u64, effects: &mut CoreEffects) {
         self.drain_coding_events(now, effects);
         self.expire_waiters(now, effects);
-        self.retry_dependency_fetches(effects);
-        self.retry_pending_finalizations(effects);
+        self.retry_dependency_fetches(now, effects);
+        self.retry_pending_finalizations(now, effects);
     }
 
     pub(super) fn on_shard_message<F>(
@@ -409,7 +412,7 @@ impl AppCore {
             let missing =
                 first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
                     .unwrap_or(parent);
-            self.schedule_dependency_fetch(missing, effects);
+            self.schedule_dependency_fetch(missing, now, effects);
             warn!(
                 parent = ?parent,
                 missing_dependency = ?missing,
@@ -623,7 +626,7 @@ impl AppCore {
                 ?missing_digest,
                 "deferring verify while waiting for dependency"
             );
-            self.schedule_dependency_fetch(missing_digest, effects);
+            self.schedule_dependency_fetch(missing_digest, now, effects);
             self.queue_waiter(
                 missing_digest,
                 DeferredVerify {
@@ -795,7 +798,7 @@ impl AppCore {
         self.update_waiter_metrics();
     }
 
-    fn retry_dependency_fetches(&mut self, effects: &mut CoreEffects) {
+    fn retry_dependency_fetches(&mut self, now: u64, effects: &mut CoreEffects) {
         if self.waiters.is_empty() {
             return;
         }
@@ -812,11 +815,11 @@ impl AppCore {
             }
         }
         for digest in missing {
-            self.schedule_dependency_fetch(digest, effects);
+            self.schedule_dependency_fetch(digest, now, effects);
         }
     }
 
-    fn retry_pending_finalizations(&mut self, effects: &mut CoreEffects) {
+    fn retry_pending_finalizations(&mut self, now: u64, effects: &mut CoreEffects) {
         if self.pending_finalizations.is_empty() {
             return;
         }
@@ -833,7 +836,7 @@ impl AppCore {
             }
 
             if !self.seen.contains_key(&payload) {
-                self.schedule_dependency_fetch(payload, effects);
+                self.schedule_dependency_fetch(payload, now, effects);
                 continue;
             }
 
@@ -841,15 +844,22 @@ impl AppCore {
                 && let Some(missing) =
                     first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
             {
-                self.schedule_dependency_fetch(missing, effects);
+                self.schedule_dependency_fetch(missing, now, effects);
             }
         }
     }
 
-    fn schedule_dependency_fetch(&self, digest: Digest, effects: &mut CoreEffects) {
+    fn schedule_dependency_fetch(&mut self, digest: Digest, now: u64, effects: &mut CoreEffects) {
         if self.seen.contains_key(&digest) {
+            self.pending_fetches.remove(&digest);
             return;
         }
+        if let Some(&requested_at) = self.pending_fetches.get(&digest) {
+            if now.saturating_sub(requested_at) < Self::FETCH_RETRY_MS {
+                return; // too soon to retry
+            }
+        }
+        self.pending_fetches.insert(digest, now);
         effects
             .network
             .push_back(NetworkEffect::BroadcastShard(Box::new(
@@ -981,7 +991,7 @@ impl AppCore {
                 self.pending_shards.remove(&key.digest);
                 gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(key.digest, now, effects);
-                self.retry_pending_finalizations(effects);
+                self.retry_pending_finalizations(now, effects);
             }
             ShardEffect::Failed { key } => {
                 warn!(
@@ -1041,7 +1051,7 @@ impl AppCore {
                 self.pending_shards.remove(digest);
                 gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(*digest, now, effects);
-                self.retry_pending_finalizations(effects);
+                self.retry_pending_finalizations(now, effects);
                 return;
             }
             WireShardMessage::Initial { .. } | WireShardMessage::ReShare { .. } => {}
@@ -1103,6 +1113,7 @@ impl AppCore {
         }
 
         self.seen.insert(digest, payload.clone());
+        self.pending_fetches.remove(&digest);
         self.persistable_payloads.insert(digest, payload);
         while self.persistable_payloads.len() > Self::MAX_PERSISTABLE_PAYLOADS {
             let Some((oldest, _)) = self.persistable_payloads.shift_remove_index(0) else {
@@ -1645,7 +1656,7 @@ mod tests {
             assert!(deferred.network.is_empty());
 
             let mut retry = CoreEffects::new();
-            core.retry_pending_finalizations(&mut retry);
+            core.retry_pending_finalizations(200, &mut retry);
             assert_eq!(retry.network.len(), 1);
             let Some(NetworkEffect::BroadcastShard(message)) = retry.network.front() else {
                 panic!("expected fetch request network effect");
@@ -1895,8 +1906,8 @@ mod tests {
                         let mut tick = CoreEffects::new();
                         core.drain_coding_events(now, &mut tick);
                         core.expire_waiters(now, &mut tick);
-                        core.retry_dependency_fetches(&mut tick);
-                        core.retry_pending_finalizations(&mut tick);
+                        core.retry_dependency_fetches(now, &mut tick);
+                        core.retry_pending_finalizations(now, &mut tick);
                         saw_valid_verify |= has_valid_verify_reply(&tick);
                     }
 
@@ -1919,8 +1930,8 @@ mod tests {
                     let mut tick = CoreEffects::new();
                     core.drain_coding_events(now, &mut tick);
                     core.expire_waiters(now, &mut tick);
-                    core.retry_dependency_fetches(&mut tick);
-                    core.retry_pending_finalizations(&mut tick);
+                    core.retry_dependency_fetches(now, &mut tick);
+                    core.retry_pending_finalizations(now, &mut tick);
                     saw_valid_verify |= has_valid_verify_reply(&tick);
                 }
 
@@ -1983,6 +1994,126 @@ mod tests {
                 core.next_unpersisted_finalization()
                     .map(|(digest, _)| digest),
                 Some(payload)
+            );
+        });
+    }
+
+    fn count_fetch_broadcasts(effects: &CoreEffects) -> usize {
+        effects
+            .network
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    NetworkEffect::BroadcastShard(msg)
+                        if matches!(msg.body, WireShardMessage::FetchPayload { .. })
+                )
+            })
+            .count()
+    }
+
+    #[test_log::test]
+    fn dependency_fetch_dedup_and_retry_lifecycle() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-fetch-dedup-lifecycle", 6);
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_fetch_dedup"),
+                &context,
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([3u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            // Build a valid payload (parent=genesis, no txs) but withhold it from `seen`.
+            let payload_contents = encode_payload(
+                Round::new(epoch, View::new(1)),
+                genesis,
+                100,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let payload = payload_digest(&payload_contents);
+
+            let make_verify = |view: u64| -> (AppMailboxReadWriteMessage, oneshot::Receiver<bool>) {
+                let (response, receiver) = oneshot::channel();
+                (
+                    AppMailboxReadWriteMessage::Verify {
+                        context: Context {
+                            round: Round::new(epoch, View::new(view)),
+                            leader: participants[0].clone(),
+                            parent: (View::zero(), genesis),
+                        },
+                        payload,
+                        response,
+                    },
+                    receiver,
+                )
+            };
+
+            // ── Phase 1: First verify defers, emits exactly 1 fetch ──────────
+            let (msg1, _rx1) = make_verify(1);
+            let e1 = core.on_message(msg1, 100, &|_| Some(0));
+            assert!(e1.replies.is_empty(), "verify should defer (payload missing)");
+            assert_eq!(count_fetch_broadcasts(&e1), 1, "first verify: 1 fetch");
+
+            // ── Phase 2: Second verify for same payload — deduped ─────────────
+            // Same view=1 because the payload encodes view 1; a separate
+            // response channel still creates a distinct waiter.
+            let (msg2, _rx2) = make_verify(1);
+            let e2 = core.on_message(msg2, 101, &|_| Some(0));
+            assert!(e2.replies.is_empty(), "second verify should also defer");
+            assert_eq!(count_fetch_broadcasts(&e2), 0, "dedup: no fetch within retry window");
+
+            // ── Phase 3: Maintenance within retry window — no re-request ──────
+            let mut me1 = CoreEffects::new();
+            core.run_maintenance(102, &mut me1);
+            assert_eq!(count_fetch_broadcasts(&me1), 0, "maintenance within retry window: no fetch");
+
+            // ── Phase 4: Maintenance after retry window — re-requests ─────────
+            let mut me2 = CoreEffects::new();
+            core.run_maintenance(100 + AppCore::FETCH_RETRY_MS + 1, &mut me2);
+            assert_eq!(count_fetch_broadcasts(&me2), 1, "maintenance after retry window: 1 retry fetch");
+
+            // ── Phase 5: Another verify still deduped (maintenance just sent) ─
+            let (msg3, _rx3) = make_verify(1);
+            let e3 = core.on_message(msg3, 100 + AppCore::FETCH_RETRY_MS + 2, &|_| Some(0));
+            assert_eq!(count_fetch_broadcasts(&e3), 0, "dedup: maintenance already sent fetch");
+
+            // ── Phase 6: Payload arrives via shard → resolves all 3 waiters ───
+            let repaired = core.on_shard_message(
+                ShardMessage::payload_response(&participants[0], payload, payload_contents),
+                100 + AppCore::FETCH_RETRY_MS + 10,
+                &|_| None,
+            );
+            let valid_count = repaired
+                .replies
+                .iter()
+                .filter(|e| matches!(e, CoreEffect::Verify { valid: true, .. }))
+                .count();
+            assert_eq!(valid_count, 3, "all 3 deferred verifies resolved as valid");
+
+            // ── Phase 7: Maintenance after resolution — no fetches ────────────
+            let mut me3 = CoreEffects::new();
+            core.run_maintenance(100 + AppCore::FETCH_RETRY_MS + 20, &mut me3);
+            assert_eq!(count_fetch_broadcasts(&me3), 0, "no fetches after payload delivered");
+
+            // Verify the pending_fetches map is clean.
+            assert!(
+                core.pending_fetches.is_empty(),
+                "pending_fetches should be empty after delivery"
             );
         });
     }
