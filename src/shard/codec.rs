@@ -25,22 +25,35 @@ pub(crate) enum WireShardMessage {
         // Wire-level "ReShare" message carries a re-sharded fragment payload.
         reshard: ZodaReShard,
     },
+    FetchPayload {
+        digest: Digest,
+    },
+    PayloadResponse {
+        digest: Digest,
+        payload: Bytes,
+    },
 }
 
 #[derive(Clone, Copy)]
 enum WireTag {
     Initial,
     ReShare,
+    FetchPayload,
+    PayloadResponse,
 }
 
 impl WireTag {
     const INITIAL_TAG: u8 = 0;
     const RESHARE_TAG: u8 = 1;
+    const FETCH_PAYLOAD_TAG: u8 = 2;
+    const PAYLOAD_RESPONSE_TAG: u8 = 3;
 
     const fn as_u8(self) -> u8 {
         match self {
             Self::Initial => Self::INITIAL_TAG,
             Self::ReShare => Self::RESHARE_TAG,
+            Self::FetchPayload => Self::FETCH_PAYLOAD_TAG,
+            Self::PayloadResponse => Self::PAYLOAD_RESPONSE_TAG,
         }
     }
 
@@ -48,6 +61,8 @@ impl WireTag {
         match value {
             Self::INITIAL_TAG => Some(Self::Initial),
             Self::RESHARE_TAG => Some(Self::ReShare),
+            Self::FETCH_PAYLOAD_TAG => Some(Self::FetchPayload),
+            Self::PAYLOAD_RESPONSE_TAG => Some(Self::PayloadResponse),
             _ => None,
         }
     }
@@ -93,16 +108,6 @@ fn write_header(
     shard_index.write(buf);
 }
 
-/// Read the common wire header fields from a buffer.
-fn read_header(reader: &mut Bytes) -> Option<(WireTag, BlockKey, ZodaCommitment, u16)> {
-    let tag = WireTag::from_u8(u8::read(reader).ok()?)?;
-    let round = Round::read(reader).ok()?;
-    let digest = Digest::read(reader).ok()?;
-    let commitment = ZodaCommitment::read(reader).ok()?;
-    let shard_index = u16::read(reader).ok()?;
-    Some((tag, BlockKey::new(round, digest), commitment, shard_index))
-}
-
 impl WireShardMessage {
     /// Decode a wire shard message from a `Bytes` buffer.
     ///
@@ -110,34 +115,57 @@ impl WireShardMessage {
     /// into a new allocation.
     pub(crate) fn decode(buf: Bytes) -> Option<Self> {
         let mut reader = buf;
-        let (tag, key, commitment, shard_index) = read_header(&mut reader)?;
-
-        // Read Vec<u8>-compatible length prefix (u32), then zero-copy slice the
-        // payload from the underlying Bytes buffer.
-        let payload_len = u32::read(&mut reader).ok()? as usize;
-        if reader.remaining() != payload_len {
-            return None;
-        }
-        let payload = reader.copy_to_bytes(payload_len);
+        let tag = WireTag::from_u8(u8::read(&mut reader).ok()?)?;
 
         match tag {
-            WireTag::Initial => {
-                let shard = decode_payload_part(payload)?;
-                Some(Self::Initial {
-                    key,
-                    commitment,
-                    shard,
-                    shard_index,
-                })
+            WireTag::Initial | WireTag::ReShare => {
+                let round = Round::read(&mut reader).ok()?;
+                let digest = Digest::read(&mut reader).ok()?;
+                let key = BlockKey::new(round, digest);
+                let commitment = ZodaCommitment::read(&mut reader).ok()?;
+                let shard_index = u16::read(&mut reader).ok()?;
+                let payload_len = u32::read(&mut reader).ok()? as usize;
+                if reader.remaining() != payload_len {
+                    return None;
+                }
+                let payload = reader.copy_to_bytes(payload_len);
+                match tag {
+                    WireTag::Initial => {
+                        let shard = decode_payload_part(payload)?;
+                        Some(Self::Initial {
+                            key,
+                            commitment,
+                            shard,
+                            shard_index,
+                        })
+                    }
+                    WireTag::ReShare => {
+                        let reshard = decode_payload_part(payload)?;
+                        Some(Self::ReShare {
+                            key,
+                            commitment,
+                            shard_index,
+                            reshard,
+                        })
+                    }
+                    _ => None,
+                }
             }
-            WireTag::ReShare => {
-                let reshard = decode_payload_part(payload)?;
-                Some(Self::ReShare {
-                    key,
-                    commitment,
-                    shard_index,
-                    reshard,
-                })
+            WireTag::FetchPayload => {
+                let digest = Digest::read(&mut reader).ok()?;
+                if reader.has_remaining() {
+                    return None;
+                }
+                Some(Self::FetchPayload { digest })
+            }
+            WireTag::PayloadResponse => {
+                let digest = Digest::read(&mut reader).ok()?;
+                let payload_len = u32::read(&mut reader).ok()? as usize;
+                if reader.remaining() != payload_len {
+                    return None;
+                }
+                let payload = reader.copy_to_bytes(payload_len);
+                Some(Self::PayloadResponse { digest, payload })
             }
         }
     }
@@ -162,6 +190,12 @@ impl EncodeSize for WireShardMessage {
                 reshard,
                 ..
             } => (key, commitment, reshard.encode_size()),
+            Self::FetchPayload { digest } => {
+                return u8::SIZE + digest.encode_size();
+            }
+            Self::PayloadResponse { digest, payload } => {
+                return u8::SIZE + digest.encode_size() + u32::SIZE + payload.len();
+            }
         };
         header_encode_size(key, commitment)
             + u32::SIZE // payload length prefix
@@ -191,6 +225,16 @@ impl Write for WireShardMessage {
                 write_header(buf, WireTag::ReShare, key, commitment, *shard_index);
                 (reshard.encode_size() as u32).write(buf);
                 reshard.write(buf);
+            }
+            Self::FetchPayload { digest } => {
+                WireTag::FetchPayload.as_u8().write(buf);
+                digest.write(buf);
+            }
+            Self::PayloadResponse { digest, payload } => {
+                WireTag::PayloadResponse.as_u8().write(buf);
+                digest.write(buf);
+                (payload.len() as u32).write(buf);
+                buf.put_slice(payload.as_ref());
             }
         }
     }

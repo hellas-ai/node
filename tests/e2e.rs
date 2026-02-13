@@ -3,7 +3,7 @@ use commonware_consensus::elector::RoundRobin;
 use commonware_consensus::minimmit::{
     mocks::reporter::{Config as ReporterConfig, Reporter as MockReporter},
     scheme::ed25519 as minimmit_ed25519,
-    types::Finalization,
+    types::{Finalization, Nullification},
 };
 use commonware_consensus::types::View;
 use commonware_cryptography::Signer;
@@ -29,6 +29,7 @@ const NAMESPACE: &[u8] = b"hellas-e2e";
 const N: u32 = 6;
 
 type Finalizations = Arc<std::sync::Mutex<HashMap<View, Finalization<Scheme, Digest>>>>;
+type Nullifications = Arc<std::sync::Mutex<HashMap<View, Nullification<Scheme>>>>;
 type Faults =
     Arc<std::sync::Mutex<HashMap<PublicKey, HashMap<View, std::collections::HashSet<Activity>>>>>;
 type ProofVerifierDb = FixedUtxoDb<deterministic::Context, Digest, Coin, Sha256, EightCap, 32>;
@@ -54,6 +55,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Clone, Copy)]
 struct SubmitTransfer {
     sender: usize,
@@ -63,14 +71,14 @@ struct SubmitTransfer {
 
 fn assert_sustained_progress(
     scenario: &str,
-    handles: &[(Finalizations, Faults)],
+    handles: &[(Finalizations, Faults, Nullifications)],
     min_per_validator: usize,
     min_total: usize,
     min_validators_at_or_above: usize,
 ) {
     let per_validator_finalizations: Vec<usize> = handles
         .iter()
-        .map(|(finalizations, _)| finalizations.lock().unwrap().len())
+        .map(|(finalizations, _, _)| finalizations.lock().unwrap().len())
         .collect();
     let total_finalizations: usize = per_validator_finalizations.iter().sum();
     let validators_at_or_above = per_validator_finalizations
@@ -91,15 +99,22 @@ fn assert_sustained_progress(
     );
 }
 
+fn per_validator_nullifications(handles: &[(Finalizations, Faults, Nullifications)]) -> Vec<usize> {
+    handles
+        .iter()
+        .map(|(_, _, nullifications)| nullifications.lock().unwrap().len())
+        .collect()
+}
+
 fn run_network(
     config: Config,
     link: Link,
     duration: Duration,
     transfer: Option<SubmitTransfer>,
-) -> Vec<(Finalizations, Faults)> {
+) -> Vec<(Finalizations, Faults, Nullifications)> {
     let runner = deterministic::Runner::timed(Duration::from_secs(60));
 
-    let handles: Arc<std::sync::Mutex<Vec<(Finalizations, Faults)>>> =
+    let handles: Arc<std::sync::Mutex<Vec<(Finalizations, Faults, Nullifications)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let handles_ref = handles.clone();
 
@@ -156,10 +171,11 @@ fn run_network(
                     elector: RoundRobin::<Sha256>::default(),
                 },
             );
-            handles
-                .lock()
-                .unwrap()
-                .push((reporter.finalizations.clone(), reporter.faults.clone()));
+            handles.lock().unwrap().push((
+                reporter.finalizations.clone(),
+                reporter.faults.clone(),
+                reporter.nullifications.clone(),
+            ));
 
             let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
                 .remove(validator)
@@ -173,17 +189,17 @@ fn run_network(
                 relay.declare(participant);
             }
             relay.finalize_validators();
-            let _shard_transport = relay.clone().start(context.clone());
 
             let (engine, tx_mailbox) = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
                 blocker,
-                relay,
+                relay.clone(),
                 validator,
                 reporter,
             );
+            let _shard_transport = relay.start(context.clone());
             tx_mailboxes.push(tx_mailbox);
             engine.start(vote, certificate, resolver);
         }
@@ -213,7 +229,7 @@ fn run_network(
 
             let finalized_payloads = {
                 let handles = handles.lock().unwrap();
-                let (finalizations, _) = &handles[0];
+                let (finalizations, _, _) = &handles[0];
                 let finalizations = finalizations.lock().unwrap();
                 let mut views: Vec<_> = finalizations.keys().cloned().collect();
                 views.sort();
@@ -375,15 +391,37 @@ fn healthy_network_finalizes() {
         min_validators,
     );
 
-    for (_, faults) in &handles {
+    for (_, faults, _) in &handles {
         let faults = faults.lock().unwrap();
         assert!(faults.is_empty(), "unexpected faults detected");
     }
+
+    let per_validator_nullifications = per_validator_nullifications(&handles);
+    let total_nullifications: usize = per_validator_nullifications.iter().sum();
+    let max_nullifications_per_validator =
+        env_usize("E2E_HEALTHY_MAX_NULLIFICATIONS_PER_VALIDATOR", 1);
+    let max_total_nullifications = env_usize(
+        "E2E_HEALTHY_MAX_TOTAL_NULLIFICATIONS",
+        max_nullifications_per_validator * handles.len(),
+    );
+    println!(
+        "healthy nullification summary: total_nullifications={total_nullifications}, per_validator_nullifications={per_validator_nullifications:?}, max_per_validator={max_nullifications_per_validator}, max_total={max_total_nullifications}"
+    );
+    assert!(
+        total_nullifications <= max_total_nullifications,
+        "healthy: total nullifications too high (total_nullifications={total_nullifications}, max_total={max_total_nullifications}, per-validator {per_validator_nullifications:?})"
+    );
+    assert!(
+        per_validator_nullifications
+            .iter()
+            .all(|count| *count <= max_nullifications_per_validator),
+        "healthy: per-validator nullifications too high (per-validator {per_validator_nullifications:?}, max_per_validator={max_nullifications_per_validator})"
+    );
 }
 
 #[test_log::test]
 fn lossy_network_finalizes() {
-    let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.9);
+    let success_rate = env_f64("E2E_LOSSY_SUCCESS_RATE", 0.95);
     let duration_secs = env_u64("E2E_LOSSY_DURATION_SECS", 10);
     let default_min_validators = (N as usize).saturating_mul(2) / 3;
     let min_per_validator = env_usize("E2E_LOSSY_MIN_PER_VALIDATOR", 8);
@@ -404,11 +442,11 @@ fn lossy_network_finalizes() {
 
     let per_validator_finalizations: Vec<usize> = handles
         .iter()
-        .map(|(finalizations, _)| finalizations.lock().unwrap().len())
+        .map(|(finalizations, _, _)| finalizations.lock().unwrap().len())
         .collect();
     let per_validator_fault_views: Vec<usize> = handles
         .iter()
-        .map(|(_, faults)| {
+        .map(|(_, faults, _)| {
             faults
                 .lock()
                 .unwrap()
@@ -417,8 +455,12 @@ fn lossy_network_finalizes() {
                 .sum::<usize>()
         })
         .collect();
+    let per_validator_nullifications = per_validator_nullifications(&handles);
+    let total_finalizations: usize = per_validator_finalizations.iter().sum();
+    let total_nullifications: usize = per_validator_nullifications.iter().sum();
+    let max_nullification_ratio = env_f32("E2E_LOSSY_MAX_NULLIFICATION_RATIO", 1.5);
     println!(
-        "lossy e2e summary: success_rate={success_rate:.3}, duration_secs={duration_secs}, per_validator_finalizations={per_validator_finalizations:?}, per_validator_fault_views={per_validator_fault_views:?}"
+        "lossy e2e summary: success_rate={success_rate:.3}, duration_secs={duration_secs}, per_validator_finalizations={per_validator_finalizations:?}, per_validator_nullifications={per_validator_nullifications:?}, per_validator_fault_views={per_validator_fault_views:?}"
     );
     assert_sustained_progress(
         "lossy",
@@ -426,6 +468,12 @@ fn lossy_network_finalizes() {
         min_per_validator,
         min_total,
         min_validators,
+    );
+    let max_allowed_nullifications =
+        ((total_finalizations as f32) * max_nullification_ratio).ceil() as usize;
+    assert!(
+        total_nullifications <= max_allowed_nullifications,
+        "lossy: nullifications too high (total_nullifications={total_nullifications}, total_finalizations={total_finalizations}, ratio_limit={max_nullification_ratio})"
     );
 }
 

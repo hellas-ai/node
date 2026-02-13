@@ -97,6 +97,8 @@ where
     S: P2pSender<PublicKey = PublicKey>,
     R: P2pReceiver<PublicKey = PublicKey>,
 {
+    const INITIAL_SHARD_REDUNDANCY: usize = 1;
+
     pub fn new(me: &PublicKey, network_sender: S, network_receiver: R) -> Self {
         Self {
             local_subscribers: Mutex::new(Vec::new()),
@@ -201,8 +203,16 @@ where
                 shard,
                 shard_index,
             };
-            self.send_wire(Recipients::One(target), wire_message).await;
+            for _ in 0..Self::INITIAL_SHARD_REDUNDANCY {
+                self.send_wire(Recipients::One(target.clone()), wire_message.clone())
+                    .await;
+            }
         }
+    }
+
+    async fn send_to_internal(&self, recipient: &PublicKey, message: ShardMessage) {
+        self.send_wire(Recipients::One(recipient.clone()), message.to_wire())
+            .await;
     }
 }
 
@@ -237,6 +247,10 @@ where
 
     async fn broadcast_except(&self, sender: &PublicKey, message: ShardMessage) {
         self.broadcast_except_internal(sender, message).await;
+    }
+
+    async fn send_to(&self, recipient: &PublicKey, message: ShardMessage) {
+        self.send_to_internal(recipient, message).await;
     }
 
     async fn distribute_shards(

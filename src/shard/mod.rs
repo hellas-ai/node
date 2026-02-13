@@ -12,4 +12,5 @@ mod recovery;
 pub(crate) mod transport;
 mod validators;
 
+pub(crate) use codec::WireShardMessage;
 pub use p2p::AuthenticatedShardTransport;

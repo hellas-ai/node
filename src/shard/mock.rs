@@ -39,7 +39,7 @@ impl MockShardTransport {
         self.validators.finalize();
     }
 
-    async fn send_to(&self, target: &PublicKey, message: ShardMessage) {
+    async fn deliver_to(&self, target: &PublicKey, message: ShardMessage) {
         let channels: Vec<_> = {
             let recipients = self.lock_recipients();
             recipients.get(target).cloned().unwrap_or_default()
@@ -81,8 +81,12 @@ impl ShardTransport for MockShardTransport {
                 .collect()
         };
         for target in targets {
-            self.send_to(&target, message.clone()).await;
+            self.deliver_to(&target, message.clone()).await;
         }
+    }
+
+    async fn send_to(&self, recipient: &PublicKey, message: ShardMessage) {
+        self.deliver_to(recipient, message).await;
     }
 
     async fn distribute_shards(
@@ -118,7 +122,7 @@ impl ShardTransport for MockShardTransport {
 
         for (target, shard_index, shard) in assignments {
             let message = ShardMessage::initial(proposer, key, commitment, shard, shard_index);
-            self.send_to(&target, message).await;
+            self.deliver_to(&target, message).await;
         }
     }
 }

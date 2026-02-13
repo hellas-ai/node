@@ -15,6 +15,12 @@ pub(crate) trait ShardTransport: Send + Sync + 'static {
         message: ShardMessage,
     ) -> impl Future<Output = ()> + Send + 'a;
 
+    fn send_to<'a>(
+        &'a self,
+        recipient: &'a PublicKey,
+        message: ShardMessage,
+    ) -> impl Future<Output = ()> + Send + 'a;
+
     fn distribute_shards<'a>(
         &'a self,
         proposer: &'a PublicKey,

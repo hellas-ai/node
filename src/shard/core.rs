@@ -105,7 +105,9 @@ impl ShardRecoverer {
     where
         F: Fn(&PublicKey) -> Option<u16>,
     {
-        let key = message.key();
+        let Some(key) = message.key() else {
+            return VecDeque::new();
+        };
         if seen.contains_key(&key.digest) {
             return VecDeque::new();
         }
@@ -152,6 +154,8 @@ impl ShardRecoverer {
                             },
                             &validator_index,
                         )),
+                        WireShardMessage::FetchPayload { .. }
+                        | WireShardMessage::PayloadResponse { .. } => {}
                     }
                 }
                 RecoveryOutput::BufferedPreLeader => {}

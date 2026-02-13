@@ -3,7 +3,7 @@ use crate::execution::store::{UtxoDb, utxo_db_config};
 use crate::execution::{FinalizationDiffs, genesis_state};
 use crate::object::{Coin, ObjectId};
 use crate::trace::Traced;
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_macros::select;
@@ -36,6 +36,10 @@ pub(super) enum PersistenceCommand {
         object: ObjectId,
         response: oneshot::Sender<Option<mailbox::ProofResponse>>,
     },
+    GetPayload {
+        payload: Digest,
+        response: oneshot::Sender<Option<Bytes>>,
+    },
     GetPersistedAnchors {
         response: oneshot::Sender<Vec<(Digest, Digest)>>,
     },
@@ -50,6 +54,10 @@ pub(super) enum PersistenceCommand {
     RecordFinalization {
         payload: Digest,
         finalization: mailbox::FinalizationResponse,
+    },
+    RecordPayload {
+        payload: Digest,
+        bytes: Bytes,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -76,6 +84,7 @@ pub(super) struct PageCacheConfig {
 type PersistenceQueue<E> = Queue<E, Vec<u8>>;
 type AnchorIndex<E> = Metadata<E, U64, Vec<u8>>;
 type FinalizationIndex<E> = Metadata<E, Digest, Vec<u8>>;
+type PayloadIndex<E> = Metadata<E, Digest, Vec<u8>>;
 
 #[derive(Clone, Copy)]
 struct AnchorEntry {
@@ -104,6 +113,8 @@ where
     next_anchor_sequence: u64,
     finalization_index: Option<FinalizationIndex<E>>,
     volatile_finalizations: IndexMap<Digest, mailbox::FinalizationResponse>,
+    payload_index: Option<PayloadIndex<E>>,
+    volatile_payloads: IndexMap<Digest, Bytes>,
     #[cfg(test)]
     persistence_failures_remaining: usize,
 }
@@ -123,6 +134,8 @@ where
     const MAX_ANCHOR_HISTORY: usize = 2048;
     const MAX_FINALIZATION_RECORD_BYTES: usize = 1 << 20;
     const MAX_VOLATILE_FINALIZATIONS: usize = 4096;
+    const MAX_PAYLOAD_RECORD_BYTES: usize = 1 << 20;
+    const MAX_VOLATILE_PAYLOADS: usize = 4096;
 
     pub(super) fn new(
         partition_prefix: String,
@@ -150,6 +163,8 @@ where
             next_anchor_sequence: 0,
             finalization_index: None,
             volatile_finalizations: IndexMap::new(),
+            payload_index: None,
+            volatile_payloads: IndexMap::new(),
             #[cfg(test)]
             persistence_failures_remaining,
         }
@@ -160,6 +175,7 @@ where
         self.initialize_db(context).await;
         self.initialize_anchor_index(context).await;
         self.initialize_finalization_index(context).await;
+        self.initialize_payload_index(context).await;
         self.metrics.worker_ready_total.inc();
         if let Err(err) = self
             .event_tx
@@ -471,6 +487,10 @@ where
                 let _ = response.send(proof);
                 true
             }
+            PersistenceCommand::GetPayload { payload, response } => {
+                let _ = response.send(self.payload(payload));
+                true
+            }
             PersistenceCommand::GetPersistedAnchors { response } => {
                 let _ = response.send(self.persisted_anchor_history());
                 true
@@ -488,6 +508,10 @@ where
                 finalization,
             } => {
                 self.record_finalization(payload, finalization).await;
+                true
+            }
+            PersistenceCommand::RecordPayload { payload, bytes } => {
+                self.record_payload(payload, bytes).await;
                 true
             }
             PersistenceCommand::Shutdown { response } => {
@@ -628,6 +652,30 @@ where
             .set(i64::try_from(self.volatile_finalizations.len()).unwrap_or(i64::MAX));
     }
 
+    fn payload(&mut self, payload: Digest) -> Option<Bytes> {
+        if let Some(bytes) = self.volatile_payloads.get(&payload) {
+            return Some(bytes.clone());
+        }
+        let stored = self
+            .payload_index
+            .as_ref()
+            .and_then(|index| index.get(&payload).cloned())
+            .map(Bytes::from);
+        if let Some(ref bytes) = stored {
+            self.cache_payload(payload, bytes.clone());
+        }
+        stored
+    }
+
+    fn cache_payload(&mut self, payload: Digest, bytes: Bytes) {
+        self.volatile_payloads.insert(payload, bytes);
+        while self.volatile_payloads.len() > Self::MAX_VOLATILE_PAYLOADS {
+            let Some((_oldest, _)) = self.volatile_payloads.shift_remove_index(0) else {
+                break;
+            };
+        }
+    }
+
     fn persisted_anchor_history(&self) -> Vec<(Digest, Digest)> {
         self.anchor_history
             .iter()
@@ -727,6 +775,39 @@ where
         self.cache_finalization(payload, finalization);
     }
 
+    async fn record_payload(&mut self, payload: Digest, bytes: Bytes) {
+        if let Some(existing) = self.volatile_payloads.get(&payload) {
+            if existing != &bytes {
+                error!(
+                    ?payload,
+                    "detected conflicting payload bytes for digest; entering fail-stop"
+                );
+                std::process::abort();
+            }
+            return;
+        }
+
+        if let Some(index) = self.payload_index.as_mut() {
+            if let Some(existing) = index.get(&payload) {
+                if existing.as_slice() != bytes.as_ref() {
+                    error!(
+                        ?payload,
+                        "detected conflicting stored payload bytes for digest; entering fail-stop"
+                    );
+                    std::process::abort();
+                }
+                self.cache_payload(payload, bytes);
+                return;
+            }
+            index.put(payload, bytes.as_ref().to_vec());
+            if let Err(err) = index.sync().await {
+                warn!(?err, ?payload, "failed to sync payload index");
+            }
+        }
+
+        self.cache_payload(payload, bytes);
+    }
+
     fn anchor_metadata_config(&self) -> MetadataConfig<(RangeCfg<usize>, ())> {
         MetadataConfig {
             partition: format!("{prefix}_anchor_roots", prefix = self.partition_prefix),
@@ -741,6 +822,16 @@ where
                 prefix = self.partition_prefix
             ),
             codec_config: ((0..=Self::MAX_FINALIZATION_RECORD_BYTES).into(), ()),
+        }
+    }
+
+    fn payload_metadata_config(&self) -> MetadataConfig<(RangeCfg<usize>, ())> {
+        MetadataConfig {
+            partition: format!(
+                "{prefix}_payloads_by_digest",
+                prefix = self.partition_prefix
+            ),
+            codec_config: ((0..=Self::MAX_PAYLOAD_RECORD_BYTES).into(), ()),
         }
     }
 
@@ -825,6 +916,21 @@ where
         }
     }
 
+    async fn initialize_payload_index(&mut self, context: &mut E) {
+        let config = self.payload_metadata_config();
+        match PayloadIndex::init(context.with_label("payload_index"), config).await {
+            Ok(index) => {
+                self.payload_index = Some(index);
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "payload index initialization failed; payload fetch fallback disabled"
+                );
+            }
+        }
+    }
+
     async fn initialize_queue(&mut self, context: &mut E) {
         let config = self.queue_config();
         match PersistenceQueue::init(context.with_label("persistence_queue"), config).await {
@@ -880,6 +986,11 @@ where
             && let Err(err) = index.sync().await
         {
             warn!(?err, "finalization index sync on shutdown failed");
+        }
+        if let Some(index) = self.payload_index.as_mut()
+            && let Err(err) = index.sync().await
+        {
+            warn!(?err, "payload index sync on shutdown failed");
         }
     }
 }

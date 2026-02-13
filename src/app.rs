@@ -7,9 +7,11 @@ mod persistence;
 pub use mailbox::AppMailbox;
 
 use crate::object::ObjectId;
+use crate::shard::WireShardMessage;
 use crate::shard::protocol::{ShardMessage, coding_config};
 use crate::shard::transport::ShardTransport;
 use crate::trace::Traced;
+use bytes::Bytes;
 use commonware_actor::{Actor, service::ServiceBuilder};
 use commonware_consensus::Reporter;
 use commonware_cryptography::sha256::Digest;
@@ -25,7 +27,7 @@ use hellas_types::{Activity, PublicKey};
 use mailbox::{AppMailboxMessage, AppMailboxReadWriteMessage};
 use metrics::{ApplicationMetrics, CoreMetrics, PersistenceMetrics};
 use persistence::{PageCacheConfig, PersistenceCommand, PersistenceEvent, PersistenceWorker};
-use std::{collections::VecDeque, convert::Infallible, num::NonZeroUsize};
+use std::{collections::VecDeque, convert::Infallible, num::NonZeroUsize, time::Duration};
 
 #[derive(Clone)]
 pub(crate) struct FinalizationNotice {
@@ -38,6 +40,7 @@ enum ExternalEvent {
     Shard(Box<ShardMessage>),
     Finalization(FinalizationNotice),
     Persistence(PersistenceEvent),
+    MaintenanceTick,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +90,18 @@ where
     /// Handle to the background persistence worker task.
     persistence_handle: Option<Handle<()>>,
 
+    /// Interval for maintenance ticks (dependency fetch retries + waiter expiry).
+    maintenance_interval: Duration,
+
+    /// Sender consumed when spawning the maintenance ticker.
+    maintenance_tx: Option<mpsc::UnboundedSender<Traced<()>>>,
+
+    /// Receiver fed by the maintenance ticker.
+    maintenance_rx: mpsc::UnboundedReceiver<Traced<()>>,
+
+    /// Handle to the maintenance ticker task.
+    maintenance_handle: Option<Handle<()>>,
+
     /// Receiver consumed when spawning the background persistence worker.
     persistence_cmd_rx: Option<mpsc::UnboundedReceiver<Traced<PersistenceCommand>>>,
 
@@ -114,7 +129,12 @@ where
 {
     const MAILBOX_CAPACITY: usize = 1024;
     const MAX_PENDING_PERSISTENCE_QUEUE: usize = 1024;
+    #[allow(dead_code)]
+    const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(50);
+    #[allow(dead_code)]
+    const DEFAULT_VERIFY_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
+    #[allow(dead_code)]
     pub(crate) fn new(
         context: E,
         relay: std::sync::Arc<T>,
@@ -135,10 +155,13 @@ where
             partition_prefix,
             finalization_rx,
             page_cache,
+            Self::DEFAULT_MAINTENANCE_INTERVAL,
+            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
         );
         (app, finalization_tx)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_with_page_cache(
         context: E,
         relay: std::sync::Arc<T>,
@@ -148,12 +171,71 @@ where
         page_cache_size: u16,
         page_cache_count: usize,
     ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let (mut app, finalization_tx) =
-            Self::new(context, relay, me, validators, partition_prefix);
+        Self::new_with_page_cache_and_timing(
+            context,
+            relay,
+            me,
+            validators,
+            partition_prefix,
+            page_cache_size,
+            page_cache_count,
+            Self::DEFAULT_MAINTENANCE_INTERVAL,
+            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn new_with_page_cache_and_timing(
+        context: E,
+        relay: std::sync::Arc<T>,
+        me: &PublicKey,
+        validators: Vec<PublicKey>,
+        partition_prefix: String,
+        page_cache_size: u16,
+        page_cache_count: usize,
+        maintenance_interval: Duration,
+        verify_wait_timeout: Duration,
+    ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
+        let (mut app, finalization_tx) = Self::new_with_timing(
+            context,
+            relay,
+            me,
+            validators,
+            partition_prefix,
+            maintenance_interval,
+            verify_wait_timeout,
+        );
         app.page_cache = PageCacheConfig {
             size: page_cache_size,
             count: page_cache_count,
         };
+        (app, finalization_tx)
+    }
+
+    fn new_with_timing(
+        context: E,
+        relay: std::sync::Arc<T>,
+        me: &PublicKey,
+        validators: Vec<PublicKey>,
+        partition_prefix: String,
+        maintenance_interval: Duration,
+        verify_wait_timeout: Duration,
+    ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
+        let page_cache = PageCacheConfig {
+            size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
+            count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
+        };
+        let (finalization_tx, finalization_rx) = mpsc::unbounded();
+        let app = Self::new_with_finalization_receiver(
+            context,
+            relay,
+            me,
+            validators,
+            partition_prefix,
+            finalization_rx,
+            page_cache,
+            maintenance_interval,
+            verify_wait_timeout,
+        );
         (app, finalization_tx)
     }
 
@@ -166,8 +248,15 @@ where
         partition_prefix: String,
         persistence_failures_remaining: usize,
     ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let (mut app, finalization_tx) =
-            Self::new(context, relay, me, validators, partition_prefix);
+        let (mut app, finalization_tx) = Self::new_with_timing(
+            context,
+            relay,
+            me,
+            validators,
+            partition_prefix,
+            Self::DEFAULT_MAINTENANCE_INTERVAL,
+            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
+        );
         app.persistence_failures_remaining = persistence_failures_remaining;
         (app, finalization_tx)
     }
@@ -180,6 +269,8 @@ where
         partition_prefix: String,
         finalization_rx: mpsc::UnboundedReceiver<Traced<FinalizationNotice>>,
         page_cache: PageCacheConfig,
+        maintenance_interval: Duration,
+        verify_wait_timeout: Duration,
     ) -> Self {
         let shard_rx = relay.register(me);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
@@ -197,11 +288,20 @@ where
             validators,
             my_index,
             coding_config,
+            maintenance_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            verify_wait_timeout
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
             strategy,
             core_metrics,
         );
         let (persistence_tx, persistence_cmd_rx) = mpsc::unbounded();
         let (persistence_event_tx, persistence_rx) = mpsc::unbounded();
+        let (maintenance_tx, maintenance_rx) = mpsc::unbounded();
 
         Self {
             context: ContextCell::new(context),
@@ -214,6 +314,10 @@ where
             persistence_tx,
             persistence_rx,
             persistence_handle: None,
+            maintenance_interval,
+            maintenance_tx: Some(maintenance_tx),
+            maintenance_rx,
+            maintenance_handle: None,
             pending_external: VecDeque::new(),
             inflight_persistence: None,
             app_metrics,
@@ -242,13 +346,29 @@ where
     async fn apply_network_effect(&mut self, effect: NetworkEffect) {
         match effect {
             NetworkEffect::BroadcastShard(message) => {
-                let key = message.key();
-                debug!(
-                    payload = ?key.digest,
-                    round = ?key.round,
-                    "broadcasting shard message"
-                );
+                if let Some(key) = message.key() {
+                    debug!(
+                        payload = ?key.digest,
+                        round = ?key.round,
+                        "broadcasting shard message"
+                    );
+                } else {
+                    debug!("broadcasting payload repair message");
+                }
                 self.relay.broadcast_except(self.core.me(), *message).await;
+            }
+            NetworkEffect::SendShard { recipient, message } => {
+                if let Some(key) = message.key() {
+                    debug!(
+                        payload = ?key.digest,
+                        round = ?key.round,
+                        recipient = ?recipient,
+                        "sending shard message"
+                    );
+                } else {
+                    debug!(recipient = ?recipient, "sending payload repair message");
+                }
+                self.relay.send_to(&recipient, *message).await;
             }
             NetworkEffect::DistributeShards {
                 key,
@@ -305,6 +425,26 @@ where
             worker.run(&mut worker_context).await;
         });
         self.persistence_handle = Some(handle);
+    }
+
+    fn start_maintenance_worker(&mut self, context: &mut E) {
+        if self.maintenance_handle.is_some() {
+            return;
+        }
+        let Some(tick_tx) = self.maintenance_tx.take() else {
+            warn!("maintenance ticker sender unavailable on startup");
+            return;
+        };
+        let interval = self.maintenance_interval;
+        let handle = context.clone().spawn(move |worker_context| async move {
+            loop {
+                worker_context.sleep(interval).await;
+                if tick_tx.unbounded_send(Traced::capture(())).is_err() {
+                    break;
+                }
+            }
+        });
+        self.maintenance_handle = Some(handle);
     }
 
     fn dispatch_next_persistence_if_idle(&mut self) {
@@ -438,6 +578,24 @@ where
         }
     }
 
+    fn record_payload_via_worker(&mut self, payload: Digest, bytes: Bytes) {
+        if let Err(err) =
+            self.persistence_tx
+                .unbounded_send(Traced::capture(PersistenceCommand::RecordPayload {
+                    payload,
+                    bytes,
+                }))
+        {
+            warn!(?err, ?payload, "failed to persist payload bytes");
+        }
+    }
+
+    fn drain_persistable_payloads_to_worker(&mut self) {
+        for (payload, bytes) in self.core.drain_persistable_payloads() {
+            self.record_payload_via_worker(payload, bytes);
+        }
+    }
+
     async fn hydrate_anchor_index_from_worker(&mut self) {
         for (payload, root) in self.persisted_anchors_via_worker().await {
             self.core.note_persisted_root(payload, root);
@@ -461,6 +619,13 @@ where
     ) -> Option<mailbox::ProofResponse> {
         self.query_worker::<Option<mailbox::ProofResponse>, _>("proof", move |response| {
             PersistenceCommand::GetProof { object, response }
+        })
+        .await?
+    }
+
+    async fn payload_via_worker(&mut self, payload: Digest) -> Option<Bytes> {
+        self.query_worker::<Option<Bytes>, _>("payload", move |response| {
+            PersistenceCommand::GetPayload { payload, response }
         })
         .await?
     }
@@ -523,6 +688,14 @@ where
         let _ = handle.await;
     }
 
+    async fn shutdown_maintenance_worker(&mut self) {
+        let Some(handle) = self.maintenance_handle.take() else {
+            return;
+        };
+        self.maintenance_rx.close();
+        let _ = handle.await;
+    }
+
     async fn on_mailbox_message(&mut self, context: &mut E, message: AppMailboxReadWriteMessage) {
         let message_kind = match &message {
             AppMailboxReadWriteMessage::Genesis { .. } => "genesis",
@@ -530,6 +703,7 @@ where
             AppMailboxReadWriteMessage::Verify { .. } => "verify",
             AppMailboxReadWriteMessage::Broadcast { .. } => "broadcast",
             AppMailboxReadWriteMessage::SubmitTx { .. } => "submit_tx",
+            AppMailboxReadWriteMessage::MaintenanceTick => "maintenance_tick",
             AppMailboxReadWriteMessage::DrainExternalEvents => "drain_external",
             AppMailboxReadWriteMessage::GetCoin { .. } => "get_coin",
             AppMailboxReadWriteMessage::GetStateRoot { .. } => "get_state_root",
@@ -552,13 +726,37 @@ where
                     match event {
                         ExternalEvent::Shard(message) => {
                             let now = context.current().epoch_millis();
-                            let key = message.key();
-                            debug!(
-                                payload = ?key.digest,
-                                round = ?key.round,
-                                sender = ?message.sender(),
-                                "received shard message"
-                            );
+                            if let WireShardMessage::FetchPayload { digest } = &message.body
+                                && self.core.payload_bytes(digest).is_none()
+                            {
+                                if let Some(payload) = self.payload_via_worker(*digest).await {
+                                    let sender = message.sender().clone();
+                                    self.relay
+                                        .send_to(
+                                            &sender,
+                                            ShardMessage::payload_response(
+                                                self.core.me(),
+                                                *digest,
+                                                payload,
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                continue;
+                            }
+                            if let Some(key) = message.key() {
+                                debug!(
+                                    payload = ?key.digest,
+                                    round = ?key.round,
+                                    sender = ?message.sender(),
+                                    "received shard message"
+                                );
+                            } else {
+                                debug!(
+                                    sender = ?message.sender(),
+                                    "received payload repair message"
+                                );
+                            }
                             let relay = &self.relay;
                             let effects = self.core.on_shard_message(*message, now, &|sender| {
                                 relay.validator_index(sender)
@@ -606,6 +804,16 @@ where
                         ExternalEvent::Persistence(PersistenceEvent::Ready { .. }) => {
                             // Startup consumes the ready signal directly; ignore if it reappears.
                         }
+                        ExternalEvent::MaintenanceTick => {
+                            let now = context.current().epoch_millis();
+                            let relay = &self.relay;
+                            let effects = self.core.on_message(
+                                AppMailboxReadWriteMessage::MaintenanceTick,
+                                now,
+                                &|sender| relay.validator_index(sender),
+                            );
+                            self.apply_core_effects(effects).await;
+                        }
                     }
                 }
             }
@@ -634,6 +842,7 @@ where
                 self.apply_core_effects(effects).await;
             }
         }
+        self.drain_persistable_payloads_to_worker();
     }
 
     pub(crate) fn start(mut self) -> (Handle<()>, AppMailbox) {
@@ -663,9 +872,11 @@ where
         self.start_persistence_worker(context);
         let _ = self.wait_for_persistence_ready().await;
         self.hydrate_anchor_index_from_worker().await;
+        self.start_maintenance_worker(context);
     }
 
     async fn on_shutdown(&mut self, _context: &mut E, _args: &mut Self::Args) {
+        self.shutdown_maintenance_worker().await;
         self.shutdown_persistence_worker().await;
         debug!("application shutting down");
     }
@@ -734,6 +945,23 @@ where
                     }
                     None => {
                         warn!("persistence worker event channel closed");
+                        None
+                    }
+                }
+            },
+            maintenance = self.maintenance_rx.next() => {
+                match maintenance {
+                    Some(tick) => {
+                        self.pending_external
+                            .push_back(tick.map(|_| ExternalEvent::MaintenanceTick));
+                        self.app_metrics.external_events_total.inc();
+                        self.app_metrics.pending_external_events.set(
+                            i64::try_from(self.pending_external.len()).unwrap_or(i64::MAX),
+                        );
+                        Some(AppMailboxReadWriteMessage::DrainExternalEvents)
+                    }
+                    None => {
+                        warn!("maintenance ticker channel closed");
                         None
                     }
                 }
@@ -1270,13 +1498,7 @@ mod tests {
             mailboxes[0].broadcast(digest).await;
             context.sleep(Duration::from_millis(10)).await;
 
-            let mut verify_rx_1 = mailboxes[1].verify(proposal_context.clone(), digest).await;
-            context.sleep(Duration::from_millis(10)).await;
-            match verify_rx_1.try_recv() {
-                Ok(v) => panic!("verify should not resolve yet, got {:?}", v),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Closed) => panic!("verify receiver canceled unexpectedly"),
-            }
+            let verify_rx_1 = mailboxes[1].verify(proposal_context.clone(), digest).await;
 
             let verify_rx_2 = mailboxes[2].verify(proposal_context, digest).await;
             assert!(verify_rx_2.await.expect("verify 2 should resolve"));
@@ -1285,7 +1507,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn verify_defers_until_anchor_persistence_catches_up() {
+    fn verify_completes_when_anchor_persistence_lags() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
         runner.start(|context| async move {
@@ -1366,21 +1588,12 @@ mod tests {
             mailboxes[0].broadcast(payload_b).await;
 
             let mut verify_b = mailboxes[1].verify(context_b.clone(), payload_b).await;
-            context.sleep(Duration::from_millis(10)).await;
             let verify_b_2 = mailboxes[2].verify(context_b, payload_b).await;
             assert!(
                 verify_b_2
                     .await
                     .expect("validator 2 should verify payload B")
             );
-            context.sleep(Duration::from_millis(20)).await;
-            match verify_b.try_recv() {
-                Err(TryRecvError::Empty) => {}
-                Ok(value) => {
-                    panic!("verification should defer while anchor persistence lags, got {value}")
-                }
-                Err(TryRecvError::Closed) => panic!("verify receiver closed unexpectedly"),
-            }
 
             let mut resolved = None;
             for _ in 0..500 {

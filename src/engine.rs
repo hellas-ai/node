@@ -99,7 +99,7 @@ where
     {
         let validators: Vec<PublicKey> = scheme.participants().iter().cloned().collect();
         let partition_prefix = format!("hellas_{}", me);
-        let (app, finalization_tx) = Application::new_with_page_cache(
+        let (app, finalization_tx) = Application::new_with_page_cache_and_timing(
             context.with_label("app"),
             relay.clone(),
             me,
@@ -107,6 +107,8 @@ where
             partition_prefix,
             config.page_cache_size,
             config.page_cache_count,
+            config.nullify_retry,
+            config.fetch_timeout,
         );
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();

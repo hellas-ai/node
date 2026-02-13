@@ -1,4 +1,5 @@
 use super::codec::WireShardMessage;
+use bytes::Bytes;
 use commonware_codec::Encode;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme, Zoda};
 use commonware_consensus::types::Round;
@@ -104,10 +105,27 @@ impl ShardMessage {
         }
     }
 
-    pub(crate) const fn key(&self) -> BlockKey {
+    pub(crate) fn fetch_payload(sender: &PublicKey, digest: Digest) -> Self {
+        Self {
+            sender: sender.clone(),
+            body: WireShardMessage::FetchPayload { digest },
+        }
+    }
+
+    pub(crate) fn payload_response(sender: &PublicKey, digest: Digest, payload: Bytes) -> Self {
+        Self {
+            sender: sender.clone(),
+            body: WireShardMessage::PayloadResponse { digest, payload },
+        }
+    }
+
+    pub(crate) const fn key(&self) -> Option<BlockKey> {
         match &self.body {
-            WireShardMessage::Initial { key, .. } => *key,
-            WireShardMessage::ReShare { key, .. } => *key,
+            WireShardMessage::Initial { key, .. } => Some(*key),
+            WireShardMessage::ReShare { key, .. } => Some(*key),
+            WireShardMessage::FetchPayload { .. } | WireShardMessage::PayloadResponse { .. } => {
+                None
+            }
         }
     }
 

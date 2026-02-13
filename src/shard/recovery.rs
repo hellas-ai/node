@@ -221,7 +221,9 @@ impl RecoveryMachine {
             }
             RecoveryInput::IngressMessage { message } => {
                 let message = *message;
-                let key = message.key();
+                let Some(key) = message.key() else {
+                    return Vec::new();
+                };
                 if !self.has_known_or_recovery(&key) {
                     self.buffer_pre_leader_message(key, message);
                     return vec![RecoveryOutput::BufferedPreLeader];

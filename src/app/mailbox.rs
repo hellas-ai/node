@@ -54,6 +54,7 @@ ingress! {
         tx: Transaction,
     };
     tell DrainExternalEvents;
+    tell MaintenanceTick;
     ask read_write GetCoin {
         payload: Digest,
         object: ObjectId,

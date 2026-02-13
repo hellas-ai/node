@@ -422,9 +422,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let resolver = network.register(2, quota, CHANNEL_BACKLOG);
         let (shard_sender, shard_receiver) = network.register(3, quota, CHANNEL_BACKLOG);
 
-        // Start networking
-        let network_handle = network.start();
-
         // Start metrics server (if configured)
         if let Some(metrics_port) = node_config.metrics_port {
             let metrics_addr: SocketAddr = format!("0.0.0.0:{metrics_port}")
@@ -446,18 +443,22 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             relay.declare(participant);
         }
         relay.finalize_validators();
-        let shard_transport_handle = relay.clone().start(context.clone());
 
-        // Create engine
+        // Create engine first so the application can subscribe to shard ingress
+        // before the transport starts dispatching inbound shard messages.
         let (engine, _tx_mailbox) = Engine::new(
             context.clone(),
             Config::mainnet(),
             scheme,
             oracle,
-            relay,
+            relay.clone(),
             &me,
             TraceReporter,
         );
+        let shard_transport_handle = relay.start(context.clone());
+
+        // Start networking only after the app + shard transport are initialized.
+        let network_handle = network.start();
 
         let engine_handle = engine.start(vote, certificate, resolver);
 
