@@ -59,6 +59,164 @@ impl Reporter for TraceReporter {
 }
 
 // ---------------------------------------------------------------------------
+// PersistenceHandle — owns the persistence worker and its channels
+// ---------------------------------------------------------------------------
+
+struct PersistenceHandle {
+    tx: mpsc::UnboundedSender<Traced<PersistenceCommand>>,
+    rx: mpsc::UnboundedReceiver<Traced<PersistenceEvent>>,
+    handle: Option<Handle<()>>,
+}
+
+impl PersistenceHandle {
+    fn spawn<E>(
+        context: E,
+        partition_prefix: String,
+        page_cache_config: PageCacheConfig,
+        validators: Vec<PublicKey>,
+        metrics: PersistenceMetrics,
+    ) -> Self
+    where
+        E: Clock + Spawner + Storage + Metrics + BufferPooler,
+    {
+        let (tx, cmd_rx) = mpsc::unbounded();
+        let (event_tx, rx) = mpsc::unbounded();
+        let handle = context.clone().spawn(move |mut wc| async move {
+            let worker = match PersistenceWorker::create(
+                &mut wc,
+                partition_prefix,
+                page_cache_config,
+                validators,
+                cmd_rx,
+                event_tx,
+                metrics,
+            )
+            .await
+            {
+                Ok(worker) => worker,
+                Err(err) => {
+                    error!(%err, "persistence worker initialization failed; aborting");
+                    std::process::abort();
+                }
+            };
+            worker.run(&mut wc).await;
+        });
+        Self {
+            tx,
+            rx,
+            handle: Some(handle),
+        }
+    }
+
+    async fn wait_for_ready(&mut self) -> Digest {
+        match self.rx.next().await {
+            Some(event) => {
+                let (event, _parent_span) = event.into_parts();
+                let PersistenceEvent::Ready { root } = event else {
+                    unreachable!("first persistence event must be Ready");
+                };
+                root
+            }
+            None => {
+                error!("persistence worker event channel closed before ready");
+                std::process::abort();
+            }
+        }
+    }
+
+    fn send(&self, command: PersistenceCommand) {
+        if self.tx.unbounded_send(Traced::capture(command)).is_err() {
+            error!("persistence worker channel closed; aborting");
+            std::process::abort();
+        }
+    }
+
+    fn enqueue(&self, payload: Digest, diffs: crate::execution::FinalizationDiffs) {
+        self.send(PersistenceCommand::Enqueue { payload, diffs });
+    }
+
+    async fn query<R, F>(&mut self, build: F) -> R
+    where
+        F: FnOnce(oneshot::Sender<R>) -> PersistenceCommand,
+    {
+        let (response, receiver) = oneshot::channel();
+        self.send(build(response));
+        match receiver.await {
+            Ok(value) => value,
+            Err(_) => {
+                error!("persistence worker dropped response; aborting");
+                std::process::abort();
+            }
+        }
+    }
+
+    async fn state_root(&mut self) -> Option<Digest> {
+        self.query(|response| PersistenceCommand::GetStateRoot { response })
+            .await
+    }
+
+    async fn persisted_anchors(&mut self) -> Vec<(Digest, Digest)> {
+        self.query(|response| PersistenceCommand::GetPersistedAnchors { response })
+            .await
+    }
+
+    async fn proof_for_object(
+        &mut self,
+        object: ObjectId,
+    ) -> Option<mailbox::ProofResponse> {
+        self.query(move |response| PersistenceCommand::GetProof { object, response })
+            .await
+    }
+
+    async fn finalization(
+        &mut self,
+        payload: Digest,
+    ) -> Option<mailbox::FinalizationResponse> {
+        self.query(move |response| PersistenceCommand::GetFinalization { payload, response })
+            .await
+    }
+
+    async fn payload(&mut self, payload: Digest) -> Option<Bytes> {
+        self.query(move |response| PersistenceCommand::GetPayload { payload, response })
+            .await
+    }
+
+    fn record_persisted_root(&self, payload: Digest, root: Digest) {
+        self.send(PersistenceCommand::RecordPersistedRoot { payload, root });
+    }
+
+    fn record_finalization(
+        &self,
+        payload: Digest,
+        finalization: mailbox::FinalizationResponse,
+    ) {
+        self.send(PersistenceCommand::RecordFinalization {
+            payload,
+            finalization,
+        });
+    }
+
+    fn record_payload(&self, payload: Digest, bytes: Bytes) {
+        self.send(PersistenceCommand::RecordPayload { payload, bytes });
+    }
+
+    async fn shutdown(&mut self) {
+        let (response, receiver) = oneshot::channel();
+        if let Err(err) = self
+            .tx
+            .unbounded_send(Traced::capture(PersistenceCommand::Shutdown { response }))
+        {
+            warn!(?err, "failed to signal persistence worker shutdown");
+        } else if let Err(err) = receiver.await {
+            warn!(?err, "persistence worker dropped shutdown response");
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Application actor — async driver over AppCore
 // ---------------------------------------------------------------------------
 
@@ -75,38 +233,16 @@ where
 
     core: AppCore,
 
-    /// Partition prefix for QMDB storage (unique per validator instance).
-    partition_prefix: String,
-
-    /// QMDB page cache tuning.
-    page_cache: PageCacheConfig,
-
-    /// Commands sent to the background persistence worker.
-    persistence_tx: mpsc::UnboundedSender<Traced<PersistenceCommand>>,
-
-    /// Events emitted by the background persistence worker.
-    persistence_rx: mpsc::UnboundedReceiver<Traced<PersistenceEvent>>,
-
-    /// Handle to the background persistence worker task.
-    persistence_handle: Option<Handle<()>>,
+    persistence: PersistenceHandle,
 
     /// Interval for maintenance ticks (dependency fetch retries + waiter expiry).
     maintenance_interval: Duration,
-
-    /// Sender consumed when spawning the maintenance ticker.
-    maintenance_tx: Option<mpsc::UnboundedSender<Traced<()>>>,
 
     /// Receiver fed by the maintenance ticker.
     maintenance_rx: mpsc::UnboundedReceiver<Traced<()>>,
 
     /// Handle to the maintenance ticker task.
     maintenance_handle: Option<Handle<()>>,
-
-    /// Receiver consumed when spawning the background persistence worker.
-    persistence_cmd_rx: Option<mpsc::UnboundedReceiver<Traced<PersistenceCommand>>>,
-
-    /// Sender consumed when spawning the background persistence worker.
-    persistence_event_tx: Option<mpsc::UnboundedSender<Traced<PersistenceEvent>>>,
 
     /// External events captured in `on_external` and replayed through
     /// `on_read_write` via `DrainExternalEvents`.
@@ -115,11 +251,12 @@ where
     /// Payload currently enqueued for persistence and awaiting acknowledgment.
     inflight_persistence: Option<Digest>,
 
-    app_metrics: ApplicationMetrics,
-    persistence_metrics: PersistenceMetrics,
+    /// Genesis QMDB root captured from the persistence worker's `Ready` event
+    /// during startup. Consumed by `seed_genesis_anchor_root` to avoid a
+    /// redundant round-trip to the worker.
+    startup_root: Digest,
 
-    #[cfg(test)]
-    persistence_failures_remaining: usize,
+    app_metrics: ApplicationMetrics,
 }
 
 impl<E, T> Application<E, T>
@@ -142,19 +279,19 @@ where
         validators: Vec<PublicKey>,
         partition_prefix: String,
     ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let page_cache = PageCacheConfig {
+        let page_cache_config = PageCacheConfig {
             size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
             count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
         };
         let (finalization_tx, finalization_rx) = mpsc::unbounded();
-        let app = Self::new_with_finalization_receiver(
+        let app = Self::new_inner(
             context,
             relay,
             me,
             validators,
             partition_prefix,
             finalization_rx,
-            page_cache,
+            page_cache_config,
             Self::DEFAULT_MAINTENANCE_INTERVAL,
             Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
         );
@@ -195,80 +332,33 @@ where
         maintenance_interval: Duration,
         verify_wait_timeout: Duration,
     ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let (mut app, finalization_tx) = Self::new_with_timing(
-            context,
-            relay,
-            me,
-            validators,
-            partition_prefix,
-            maintenance_interval,
-            verify_wait_timeout,
-        );
-        app.page_cache = PageCacheConfig {
+        let page_cache_config = PageCacheConfig {
             size: page_cache_size,
             count: page_cache_count,
         };
-        (app, finalization_tx)
-    }
-
-    fn new_with_timing(
-        context: E,
-        relay: std::sync::Arc<T>,
-        me: &PublicKey,
-        validators: Vec<PublicKey>,
-        partition_prefix: String,
-        maintenance_interval: Duration,
-        verify_wait_timeout: Duration,
-    ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let page_cache = PageCacheConfig {
-            size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
-            count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
-        };
         let (finalization_tx, finalization_rx) = mpsc::unbounded();
-        let app = Self::new_with_finalization_receiver(
+        let app = Self::new_inner(
             context,
             relay,
             me,
             validators,
             partition_prefix,
             finalization_rx,
-            page_cache,
+            page_cache_config,
             maintenance_interval,
             verify_wait_timeout,
         );
         (app, finalization_tx)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_persistence_failures(
-        context: E,
-        relay: std::sync::Arc<T>,
-        me: &PublicKey,
-        validators: Vec<PublicKey>,
-        partition_prefix: String,
-        persistence_failures_remaining: usize,
-    ) -> (Self, mpsc::UnboundedSender<Traced<FinalizationNotice>>) {
-        let (mut app, finalization_tx) = Self::new_with_timing(
-            context,
-            relay,
-            me,
-            validators,
-            partition_prefix,
-            Self::DEFAULT_MAINTENANCE_INTERVAL,
-            Self::DEFAULT_VERIFY_WAIT_TIMEOUT,
-        );
-        app.persistence_failures_remaining = persistence_failures_remaining;
-        (app, finalization_tx)
-    }
-
-    fn new_with_finalization_receiver(
+    fn new_inner(
         context: E,
         relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
         partition_prefix: String,
         finalization_rx: mpsc::UnboundedReceiver<Traced<FinalizationNotice>>,
-        page_cache: PageCacheConfig,
+        page_cache_config: PageCacheConfig,
         maintenance_interval: Duration,
         verify_wait_timeout: Duration,
     ) -> Self {
@@ -285,7 +375,7 @@ where
             PersistenceMetrics::register(&context.with_label("app_persistence"));
         let core = AppCore::new(
             me,
-            validators,
+            validators.clone(),
             my_index,
             coding_config,
             maintenance_interval
@@ -298,10 +388,16 @@ where
                 .unwrap_or(u64::MAX),
             strategy,
             core_metrics,
+            &context,
         );
-        let (persistence_tx, persistence_cmd_rx) = mpsc::unbounded();
-        let (persistence_event_tx, persistence_rx) = mpsc::unbounded();
-        let (maintenance_tx, maintenance_rx) = mpsc::unbounded();
+        let persistence = PersistenceHandle::spawn(
+            context.clone(),
+            partition_prefix,
+            page_cache_config,
+            validators,
+            persistence_metrics,
+        );
+        let (_, maintenance_rx) = mpsc::unbounded();
 
         Self {
             context: ContextCell::new(context),
@@ -309,23 +405,14 @@ where
             shard_rx,
             finalization_rx,
             core,
-            partition_prefix,
-            page_cache,
-            persistence_tx,
-            persistence_rx,
-            persistence_handle: None,
+            persistence,
             maintenance_interval,
-            maintenance_tx: Some(maintenance_tx),
             maintenance_rx,
             maintenance_handle: None,
             pending_external: VecDeque::new(),
             inflight_persistence: None,
+            startup_root: Digest::from([0u8; 32]),
             app_metrics,
-            persistence_metrics,
-            persistence_cmd_rx: Some(persistence_cmd_rx),
-            persistence_event_tx: Some(persistence_event_tx),
-            #[cfg(test)]
-            persistence_failures_remaining: 0,
         }
     }
 
@@ -398,43 +485,12 @@ where
         }
     }
 
-    fn start_persistence_worker(&mut self, context: &mut E) {
-        if self.persistence_handle.is_some() {
-            return;
-        }
-        let Some(command_rx) = self.persistence_cmd_rx.take() else {
-            warn!("persistence command receiver unavailable on startup");
-            return;
-        };
-        let Some(event_tx) = self.persistence_event_tx.take() else {
-            warn!("persistence event sender unavailable on startup");
-            return;
-        };
-
-        let worker = PersistenceWorker::new(
-            self.partition_prefix.clone(),
-            self.page_cache,
-            self.core.validators().to_vec(),
-            command_rx,
-            event_tx,
-            self.persistence_metrics.clone(),
-            #[cfg(test)]
-            self.persistence_failures_remaining,
-        );
-        let handle = context.clone().spawn(move |mut worker_context| async move {
-            worker.run(&mut worker_context).await;
-        });
-        self.persistence_handle = Some(handle);
-    }
-
     fn start_maintenance_worker(&mut self, context: &mut E) {
         if self.maintenance_handle.is_some() {
             return;
         }
-        let Some(tick_tx) = self.maintenance_tx.take() else {
-            warn!("maintenance ticker sender unavailable on startup");
-            return;
-        };
+        let (tick_tx, maintenance_rx) = mpsc::unbounded();
+        self.maintenance_rx = maintenance_rx;
         let interval = self.maintenance_interval;
         let handle = context.clone().spawn(move |worker_context| async move {
             loop {
@@ -454,27 +510,13 @@ where
         let Some((payload, diffs)) = self.core.next_unpersisted_finalization() else {
             return;
         };
-        let command = PersistenceCommand::Enqueue {
-            payload,
-            diffs: diffs.clone(),
-        };
-        match self.persistence_tx.unbounded_send(Traced::capture(command)) {
-            Ok(()) => {
-                self.inflight_persistence = Some(payload);
-                self.app_metrics.persistence_dispatch_total.inc();
-                self.app_metrics.inflight_persistence.set(1);
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    ?payload,
-                    "failed to enqueue finalized diffs for persistence"
-                );
-            }
-        }
+        self.persistence.enqueue(payload, diffs.clone());
+        self.inflight_persistence = Some(payload);
+        self.app_metrics.persistence_dispatch_total.inc();
+        self.app_metrics.inflight_persistence.set(1);
     }
 
-    fn on_persisted(&mut self, payload: Digest, root: Option<Digest>, now: u64) -> CoreEffects {
+    fn on_persisted(&mut self, payload: Digest, root: Digest, now: u64) -> CoreEffects {
         let _span = info_span!(
             "app.persistence_ack",
             payload = ?payload,
@@ -502,190 +544,31 @@ where
             self.inflight_persistence = None;
             self.app_metrics.inflight_persistence.set(0);
         }
-        let effects = if let Some(root) = root {
-            self.core.on_persisted_root(payload, root, now)
-        } else {
-            warn!(
-                ?payload,
-                "persistence ack did not include a state root; anchor index not updated"
-            );
-            CoreEffects::new()
-        };
+        let effects = self.core.on_persisted_root(payload, root, now);
         self.dispatch_next_persistence_if_idle();
         effects
     }
 
-    async fn query_worker<R, F>(&mut self, label: &'static str, build: F) -> Option<R>
-    where
-        F: FnOnce(oneshot::Sender<R>) -> PersistenceCommand,
-    {
-        let (response, receiver) = oneshot::channel();
-        if let Err(err) = self
-            .persistence_tx
-            .unbounded_send(Traced::capture(build(response)))
-        {
-            warn!(
-                ?err,
-                request = label,
-                "failed to enqueue persistence worker request"
-            );
-            return None;
-        }
-        match receiver.await {
-            Ok(value) => Some(value),
-            Err(err) => {
-                warn!(?err, request = label, "persistence worker dropped response");
-                None
-            }
-        }
-    }
-
-    async fn state_root_via_worker(&mut self) -> Option<Digest> {
-        self.query_worker::<Option<Digest>, _>("state_root", |response| {
-            PersistenceCommand::GetStateRoot { response }
-        })
-        .await?
-    }
-
-    async fn persisted_anchors_via_worker(&mut self) -> Vec<(Digest, Digest)> {
-        self.query_worker::<Vec<(Digest, Digest)>, _>("persisted_anchors", |response| {
-            PersistenceCommand::GetPersistedAnchors { response }
-        })
-        .await
-        .unwrap_or_default()
-    }
-
-    fn record_persisted_root_via_worker(&mut self, payload: Digest, root: Digest) {
-        if let Err(err) = self.persistence_tx.unbounded_send(Traced::capture(
-            PersistenceCommand::RecordPersistedRoot { payload, root },
-        )) {
-            warn!(?err, ?payload, "failed to persist anchor root metadata");
-        }
-    }
-
-    fn record_finalization_via_worker(
-        &mut self,
-        payload: Digest,
-        certificate_bytes: mailbox::FinalizationResponse,
-    ) {
-        if let Err(err) = self.persistence_tx.unbounded_send(Traced::capture(
-            PersistenceCommand::RecordFinalization {
-                payload,
-                finalization: certificate_bytes,
-            },
-        )) {
-            warn!(?err, ?payload, "failed to persist finalization certificate");
-        }
-    }
-
-    fn record_payload_via_worker(&mut self, payload: Digest, bytes: Bytes) {
-        if let Err(err) =
-            self.persistence_tx
-                .unbounded_send(Traced::capture(PersistenceCommand::RecordPayload {
-                    payload,
-                    bytes,
-                }))
-        {
-            warn!(?err, ?payload, "failed to persist payload bytes");
-        }
-    }
-
     fn drain_persistable_payloads_to_worker(&mut self) {
         for (payload, bytes) in self.core.drain_persistable_payloads() {
-            self.record_payload_via_worker(payload, bytes);
+            self.persistence.record_payload(payload, bytes);
         }
     }
 
     async fn hydrate_anchor_index_from_worker(&mut self) {
-        for (payload, root) in self.persisted_anchors_via_worker().await {
+        for (payload, root) in self.persistence.persisted_anchors().await {
             self.core.note_persisted_root(payload, root);
         }
     }
 
-    async fn finalization_via_worker(
-        &mut self,
-        payload: Digest,
-    ) -> Option<mailbox::FinalizationResponse> {
-        self.query_worker::<Option<mailbox::FinalizationResponse>, _>(
-            "finalization_certificate",
-            move |response| PersistenceCommand::GetFinalization { payload, response },
-        )
-        .await?
-    }
-
-    async fn proof_for_object_via_worker(
-        &mut self,
-        object: ObjectId,
-    ) -> Option<mailbox::ProofResponse> {
-        self.query_worker::<Option<mailbox::ProofResponse>, _>("proof", move |response| {
-            PersistenceCommand::GetProof { object, response }
-        })
-        .await?
-    }
-
-    async fn payload_via_worker(&mut self, payload: Digest) -> Option<Bytes> {
-        self.query_worker::<Option<Bytes>, _>("payload", move |response| {
-            PersistenceCommand::GetPayload { payload, response }
-        })
-        .await?
-    }
-
-    async fn wait_for_persistence_ready(&mut self) -> Option<Digest> {
-        loop {
-            match self.persistence_rx.next().await {
-                Some(event) => {
-                    let (event, parent_span) = event.into_parts();
-                    let _entered = parent_span.enter();
-                    if let PersistenceEvent::Ready { root } = event {
-                        return root;
-                    }
-                    self.pending_external
-                        .push_back(Traced::capture(ExternalEvent::Persistence(event)));
-                    self.app_metrics.external_events_total.inc();
-                    self.app_metrics
-                        .pending_external_events
-                        .set(i64::try_from(self.pending_external.len()).unwrap_or(i64::MAX));
-                }
-                None => {
-                    error!("persistence worker event channel closed before ready");
-                    std::process::abort();
-                }
-            }
-        }
-    }
-
-    async fn seed_genesis_anchor_root(&mut self, digest: Digest) {
+    fn seed_genesis_anchor_root(&mut self, digest: Digest) {
         if self.core.has_persisted_roots() {
             return;
         }
-        let Some(root) = self.state_root_via_worker().await else {
-            error!(
-                ?digest,
-                "unable to seed genesis anchor root from persistence worker; aborting"
-            );
-            std::process::abort();
-        };
+        let root = self.startup_root;
         self.core.note_persisted_root(digest, root);
-        self.record_persisted_root_via_worker(digest, root);
+        self.persistence.record_persisted_root(digest, root);
         self.app_metrics.genesis_anchor_seeded_total.inc();
-    }
-
-    async fn shutdown_persistence_worker(&mut self) {
-        let Some(handle) = self.persistence_handle.take() else {
-            return;
-        };
-
-        let (response, receiver) = oneshot::channel();
-        if let Err(err) = self
-            .persistence_tx
-            .unbounded_send(Traced::capture(PersistenceCommand::Shutdown { response }))
-        {
-            warn!(?err, "failed to signal persistence worker shutdown");
-        } else if let Err(err) = receiver.await {
-            warn!(?err, "persistence worker dropped shutdown response");
-        }
-
-        let _ = handle.await;
     }
 
     async fn shutdown_maintenance_worker(&mut self) {
@@ -729,7 +612,7 @@ where
                             if let WireShardMessage::FetchPayload { digest } = &message.body
                                 && self.core.payload_bytes(digest).is_none()
                             {
-                                if let Some(payload) = self.payload_via_worker(*digest).await {
+                                if let Some(payload) = self.persistence.payload(*digest).await {
                                     let sender = message.sender().clone();
                                     self.relay
                                         .send_to(
@@ -779,7 +662,7 @@ where
                                 self.core.on_finalized(payload, parent_payload)
                             };
                             if let Some(certificate_bytes) = certificate_bytes {
-                                self.record_finalization_via_worker(payload, certificate_bytes);
+                                self.persistence.record_finalization(payload, certificate_bytes);
                             }
                             let pending = self.core.unpersisted_finalization_count();
                             if pending > Self::MAX_PENDING_PERSISTENCE_QUEUE {
@@ -819,19 +702,17 @@ where
             }
             AppMailboxReadWriteMessage::Genesis { epoch, response } => {
                 let digest = self.core.genesis(epoch);
-                self.seed_genesis_anchor_root(digest).await;
+                self.seed_genesis_anchor_root(digest);
                 response.send_lossy(digest);
             }
             AppMailboxReadWriteMessage::GetStateRoot { response } => {
-                let _ = response.send(self.state_root_via_worker().await);
+                let _ = response.send(self.persistence.state_root().await);
             }
             AppMailboxReadWriteMessage::GetProof { object, response } => {
-                let proof = self.proof_for_object_via_worker(object).await;
-                let _ = response.send(proof);
+                let _ = response.send(self.persistence.proof_for_object(object).await);
             }
             AppMailboxReadWriteMessage::GetFinalization { payload, response } => {
-                let finalization = self.finalization_via_worker(payload).await;
-                let _ = response.send(finalization);
+                let _ = response.send(self.persistence.finalization(payload).await);
             }
             core_message => {
                 let now = context.current().epoch_millis();
@@ -869,15 +750,15 @@ where
     fn snapshot(&self, _args: &Self::Args) -> Self::Snapshot {}
 
     async fn on_startup(&mut self, context: &mut E, _args: &mut Self::Args) {
-        self.start_persistence_worker(context);
-        let _ = self.wait_for_persistence_ready().await;
+        self.startup_root = self.persistence.wait_for_ready().await;
         self.hydrate_anchor_index_from_worker().await;
         self.start_maintenance_worker(context);
     }
 
     async fn on_shutdown(&mut self, _context: &mut E, _args: &mut Self::Args) {
+        self.core.shutdown_shard_recoverer();
         self.shutdown_maintenance_worker().await;
-        self.shutdown_persistence_worker().await;
+        self.persistence.shutdown().await;
         debug!("application shutting down");
     }
 
@@ -932,7 +813,7 @@ where
                     }
                 }
             },
-            persistence = self.persistence_rx.next() => {
+            persistence = self.persistence.rx.next() => {
                 match persistence {
                     Some(event) => {
                         self.pending_external
@@ -991,7 +872,7 @@ mod tests {
     use hellas_types::{Context, PrivateKey, PublicKey};
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
-    use tokio::sync::oneshot::error::TryRecvError;
+
 
     /// Cap timestamp ranges to avoid saturating_add degeneracy near u64::MAX.
     const MAX_TIMESTAMP: u64 = u64::MAX - SYNCHRONY_BOUND - 10_001;
@@ -1044,7 +925,6 @@ mod tests {
         label: &str,
         key: &PublicKey,
         partition: &str,
-        persistence_failures: Option<usize>,
     ) -> (
         Handle<()>,
         AppMailbox,
@@ -1054,23 +934,13 @@ mod tests {
         relay.declare(key);
         relay.finalize_validators();
 
-        let (app, finalization_tx) = match persistence_failures {
-            Some(failures) => Application::new_with_persistence_failures(
-                context.with_label(label),
-                relay,
-                key,
-                vec![key.clone()],
-                partition.to_string(),
-                failures,
-            ),
-            None => Application::new(
-                context.with_label(label),
-                relay,
-                key,
-                vec![key.clone()],
-                partition.to_string(),
-            ),
-        };
+        let (app, finalization_tx) = Application::new(
+            context.with_label(label),
+            relay,
+            key,
+            vec![key.clone()],
+            partition.to_string(),
+        );
         let (handle, mailbox) = app.start();
         (handle, mailbox, finalization_tx)
     }
@@ -1080,26 +950,6 @@ mod tests {
         participants: &[PublicKey],
         label_prefix: &str,
         partition_prefix: &str,
-    ) -> (
-        Vec<Handle<()>>,
-        Vec<AppMailbox>,
-        Vec<mpsc::UnboundedSender<Traced<FinalizationNotice>>>,
-    ) {
-        start_validator_cluster_with_failures(
-            context,
-            participants,
-            label_prefix,
-            partition_prefix,
-            &[],
-        )
-    }
-
-    fn start_validator_cluster_with_failures(
-        context: &deterministic::Context,
-        participants: &[PublicKey],
-        label_prefix: &str,
-        partition_prefix: &str,
-        persistence_failures: &[usize],
     ) -> (
         Vec<Handle<()>>,
         Vec<AppMailbox>,
@@ -1116,24 +966,13 @@ mod tests {
         let mut finalization_txs = Vec::with_capacity(participants.len());
 
         for (idx, participant) in participants.iter().enumerate() {
-            let failures = persistence_failures.get(idx).copied();
-            let (app, finalization_tx) = match failures {
-                Some(failures) => Application::new_with_persistence_failures(
-                    context.with_label(&format!("{label_prefix}_{idx}")),
-                    relay.clone(),
-                    participant,
-                    participants.to_vec(),
-                    format!("{partition_prefix}_{idx}"),
-                    failures,
-                ),
-                None => Application::new(
-                    context.with_label(&format!("{label_prefix}_{idx}")),
-                    relay.clone(),
-                    participant,
-                    participants.to_vec(),
-                    format!("{partition_prefix}_{idx}"),
-                ),
-            };
+            let (app, finalization_tx) = Application::new(
+                context.with_label(&format!("{label_prefix}_{idx}")),
+                relay.clone(),
+                participant,
+                participants.to_vec(),
+                format!("{partition_prefix}_{idx}"),
+            );
             let (handle, mailbox) = app.start();
             handles.push(handle);
             mailboxes.push(mailbox);
@@ -1507,116 +1346,6 @@ mod tests {
     }
 
     #[test_log::test]
-    fn verify_completes_when_anchor_persistence_lags() {
-        let runner = deterministic::Runner::timed(Duration::from_secs(30));
-
-        runner.start(|context| async move {
-            let private_keys: Vec<PrivateKey> = (500u64..506).map(PrivateKey::from_seed).collect();
-            let participants: Vec<PublicKey> =
-                private_keys.iter().map(|key| key.public_key()).collect();
-            let sender = private_keys[0].clone();
-            let recipient = participants[1].clone();
-
-            let mut failures = vec![0usize; participants.len()];
-            failures[1] = 4;
-            let (_handles, mut mailboxes, finalization_txs) = start_validator_cluster_with_failures(
-                &context,
-                &participants,
-                "anchor_defer",
-                "anchor_defer_partition",
-                &failures,
-            );
-            let epoch = Epoch::new(1);
-            let genesis = initialize_cluster_genesis(&mut mailboxes, epoch).await;
-            let root_before = fetch_root(&mailboxes[0]).await;
-
-            let tx = Transaction::transfer(&sender, genesis_object_id(0), recipient, 1);
-            mailboxes[0].submit_tx(tx).await;
-
-            let context_a = Context {
-                round: Round::new(epoch, View::new(1)),
-                leader: participants[0].clone(),
-                parent: (View::zero(), genesis),
-            };
-            let payload_a = mailboxes[0]
-                .propose(context_a.clone())
-                .await
-                .await
-                .expect("proposal A should resolve");
-            mailboxes[0].broadcast(payload_a).await;
-            let verify_a_1 = mailboxes[1].verify(context_a.clone(), payload_a).await;
-            context.sleep(Duration::from_millis(10)).await;
-            let verify_a_2 = mailboxes[2].verify(context_a.clone(), payload_a).await;
-            assert!(
-                verify_a_2
-                    .await
-                    .expect("validator 2 should verify payload A")
-            );
-            assert!(
-                verify_a_1
-                    .await
-                    .expect("validator 1 should verify payload A")
-            );
-
-            for tx in &finalization_txs {
-                tx.unbounded_send(Traced::capture(FinalizationNotice {
-                    payload: payload_a,
-                    parent_payload: genesis,
-                    certificate_bytes: None,
-                }))
-                .expect("finalization A should enqueue");
-            }
-
-            for _ in 0..200 {
-                if fetch_root(&mailboxes[0]).await != root_before {
-                    break;
-                }
-                context.sleep(Duration::from_millis(10)).await;
-            }
-            assert_ne!(fetch_root(&mailboxes[0]).await, root_before);
-
-            let context_b = Context {
-                round: Round::new(epoch, View::new(2)),
-                leader: participants[0].clone(),
-                parent: (View::new(1), payload_a),
-            };
-            let payload_b = mailboxes[0]
-                .propose(context_b.clone())
-                .await
-                .await
-                .expect("proposal B should resolve");
-            mailboxes[0].broadcast(payload_b).await;
-
-            let mut verify_b = mailboxes[1].verify(context_b.clone(), payload_b).await;
-            let verify_b_2 = mailboxes[2].verify(context_b, payload_b).await;
-            assert!(
-                verify_b_2
-                    .await
-                    .expect("validator 2 should verify payload B")
-            );
-
-            let mut resolved = None;
-            for _ in 0..500 {
-                match verify_b.try_recv() {
-                    Ok(valid) => {
-                        resolved = Some(valid);
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => {
-                        context.sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(TryRecvError::Closed) => panic!("verify receiver closed unexpectedly"),
-                }
-            }
-            assert_eq!(
-                resolved,
-                Some(true),
-                "validator 1 should verify payload B after persistence catches up"
-            );
-        });
-    }
-
-    #[test_log::test]
     fn empty_qmdb_bootstraps_genesis_state() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1627,7 +1356,6 @@ mod tests {
                 "bootstrap_app",
                 &key,
                 "bootstrap_test_partition",
-                None,
             );
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
@@ -1654,7 +1382,7 @@ mod tests {
             let partition = "restart_test_partition";
 
             let (app_a_handle, mut mailbox_a, _finalization_tx_a) =
-                start_single_validator_app(&context, "restart_app_a", &key, partition, None);
+                start_single_validator_app(&context, "restart_app_a", &key, partition);
             let _ = mailbox_a.genesis(Epoch::new(1)).await;
 
             let genesis_object = genesis_object_id(0);
@@ -1669,7 +1397,7 @@ mod tests {
             let _ = app_a_handle.await;
 
             let (_app_b_handle, mailbox_b, _finalization_tx_b) =
-                start_single_validator_app(&context, "restart_app_b", &key, partition, None);
+                start_single_validator_app(&context, "restart_app_b", &key, partition);
             let (root_b, proof_b) = fetch_root_and_proof(&mailbox_b, genesis_object).await;
             assert_eq!(root_a, root_b);
             assert_coin_proof(genesis_object, expected_coin, &proof_b, root_b);
@@ -1686,7 +1414,7 @@ mod tests {
             let encoded_finalization = vec![0xde, 0xad, 0xbe, 0xef];
 
             let (_app_a_handle, mut mailbox_a, finalization_tx_a) =
-                start_single_validator_app(&context, "finalization_app_a", &key, &partition, None);
+                start_single_validator_app(&context, "finalization_app_a", &key, &partition);
             let epoch = Epoch::new(1);
             let genesis = mailbox_a.genesis(epoch).await;
             let proposal_context = Context {
@@ -1714,107 +1442,6 @@ mod tests {
     }
 
     #[test_log::test]
-    fn persistence_retry_worker_applies_finalized_diffs_without_new_finalizations() {
-        let runner = deterministic::Runner::timed(Duration::from_secs(30));
-
-        runner.start(|context| async move {
-            let sender = PrivateKey::from_seed(88);
-            let sender_pk = sender.public_key();
-            let recipient_pk = PrivateKey::from_seed(89).public_key();
-            let (_app_handle, mut mailbox, finalization_tx) = start_single_validator_app(
-                &context,
-                "retry_worker_app",
-                &sender_pk,
-                "retry_worker_partition",
-                Some(2),
-            );
-            let finalized = submit_transfer_and_finalize(
-                &mut mailbox,
-                &finalization_tx,
-                &sender,
-                &recipient_pk,
-            )
-            .await;
-
-            // Retries are timer-driven (50ms base with exponential backoff). No additional
-            // finalization events are sent here.
-            context.sleep(Duration::from_secs(1)).await;
-
-            let (root_after, proof) =
-                fetch_root_and_proof(&mailbox, finalized.recipient_output).await;
-            assert_ne!(finalized.root_before, root_after);
-            assert_coin_proof(
-                finalized.recipient_output,
-                Coin {
-                    owner: recipient_pk,
-                    value: 1,
-                },
-                &proof,
-                root_after,
-            );
-        });
-    }
-
-    #[test_log::test]
-    fn durable_queue_replays_unapplied_finalization_after_restart() {
-        let runner = deterministic::Runner::timed(Duration::from_secs(30));
-
-        runner.start(|context| async move {
-            let sender = PrivateKey::from_seed(188);
-            let sender_pk = sender.public_key();
-            let recipient_pk = PrivateKey::from_seed(189).public_key();
-            let partition = "durable_queue_restart_partition";
-
-            let (app_a_handle, mut mailbox_a, finalization_tx_a) = start_single_validator_app(
-                &context,
-                "durable_queue_app_a",
-                &sender_pk,
-                partition,
-                Some(100),
-            );
-            let finalized = submit_transfer_and_finalize(
-                &mut mailbox_a,
-                &finalization_tx_a,
-                &sender,
-                &recipient_pk,
-            )
-            .await;
-
-            context.sleep(Duration::from_millis(100)).await;
-            let root_during_failures = fetch_root(&mailbox_a).await;
-            assert_eq!(finalized.root_before, root_during_failures);
-
-            app_a_handle.abort();
-            let _ = app_a_handle.await;
-
-            let (_app_b_handle, mailbox_b, _finalization_tx_b) = start_single_validator_app(
-                &context,
-                "durable_queue_app_b",
-                &sender_pk,
-                partition,
-                None,
-            );
-
-            // No new finalization events are sent after restart. Recovery should come
-            // from the durable queue entry left by the first process.
-            context.sleep(Duration::from_secs(1)).await;
-
-            let (root_after, proof) =
-                fetch_root_and_proof(&mailbox_b, finalized.recipient_output).await;
-            assert_ne!(finalized.root_before, root_after);
-            assert_coin_proof(
-                finalized.recipient_output,
-                Coin {
-                    owner: recipient_pk,
-                    value: 1,
-                },
-                &proof,
-                root_after,
-            );
-        });
-    }
-
-    #[test_log::test]
     fn metrics_are_populated_after_propose_and_finalize() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1828,7 +1455,6 @@ mod tests {
                 "metrics_app",
                 &sender_pk,
                 "metrics_partition",
-                None,
             );
 
             submit_transfer_and_finalize(&mut mailbox, &finalization_tx, &sender, &recipient_pk)

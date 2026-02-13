@@ -10,6 +10,7 @@ use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
 use hellas_types::{Activity, PublicKey, Scheme};
+use prometheus_client::metrics::counter::Counter;
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
 
@@ -17,16 +18,25 @@ use std::sync::Arc;
 struct AppReporter<R> {
     finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
     inner: R,
+    notarize_total: Counter,
 }
 
 impl<R> AppReporter<R> {
     fn new(
+        context: &impl Metrics,
         finalization: futures::channel::mpsc::UnboundedSender<Traced<FinalizationNotice>>,
         inner: R,
     ) -> Self {
+        let notarize_total = Counter::default();
+        context.register(
+            "notarize_total",
+            "total notarize votes observed",
+            notarize_total.clone(),
+        );
         Self {
             finalization,
             inner,
+            notarize_total,
         }
     }
 }
@@ -38,6 +48,9 @@ where
     type Activity = Activity;
 
     async fn report(&mut self, activity: Self::Activity) {
+        if let Activity::Notarize(_) = &activity {
+            self.notarize_total.inc();
+        }
         if let Activity::Finalization(finalization) = &activity
             && let Err(err) =
                 self.finalization
@@ -112,7 +125,7 @@ where
         );
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();
-        let reporter = AppReporter::new(finalization_tx, reporter);
+        let reporter = AppReporter::new(&context.with_label("chain"), finalization_tx, reporter);
 
         let cfg = config.into_minimmit(&context, scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);

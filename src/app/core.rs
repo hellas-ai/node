@@ -19,6 +19,7 @@ use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Rayon;
+use commonware_runtime::Spawner;
 use commonware_utils::channel::oneshot;
 use hellas_types::{Context, PublicKey};
 use indexmap::{IndexMap, IndexSet};
@@ -97,7 +98,7 @@ pub(super) struct AppCore {
     verify_wait_timeout_ms: u64,
     validators: Vec<PublicKey>,
     strategy: Rayon,
-    shard_recoverer: ShardRecoverer,
+    shard_recoverer: ShardRecoverer<Rayon>,
     metrics: CoreMetrics,
 }
 
@@ -121,6 +122,7 @@ impl AppCore {
         verify_wait_timeout_ms: u64,
         strategy: Rayon,
         metrics: CoreMetrics,
+        context: &(impl Spawner + Clone),
     ) -> Self {
         validators.sort();
         validators.dedup();
@@ -146,7 +148,7 @@ impl AppCore {
             verify_wait_timeout_ms: verify_wait_timeout_ms.max(1),
             validators,
             strategy: strategy.clone(),
-            shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy),
+            shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy, context),
             metrics,
         };
         core.metrics.waiter_keys.set(0);
@@ -772,9 +774,20 @@ impl AppCore {
     }
 
     fn on_maintenance_tick(&mut self, now: u64, effects: &mut CoreEffects) {
+        self.drain_coding_events(now, effects);
         self.expire_waiters(now, effects);
         self.retry_dependency_fetches(now, effects);
         self.retry_pending_finalizations(now, effects);
+    }
+
+    pub(super) fn shutdown_shard_recoverer(&mut self) {
+        self.shard_recoverer.shutdown();
+    }
+
+    fn drain_coding_events(&mut self, now: u64, effects: &mut CoreEffects) {
+        for effect in self.shard_recoverer.drain_coding_events() {
+            self.apply_shard_effect(effect, now, effects);
+        }
     }
 
     fn expire_waiters(&mut self, now: u64, effects: &mut CoreEffects) {
@@ -1090,6 +1103,7 @@ impl AppCore {
         for effect in shard_effects {
             self.apply_shard_effect(effect, now, effects);
         }
+        self.drain_coding_events(now, effects);
     }
 
     fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
@@ -1202,6 +1216,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_prune"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1258,6 +1273,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_proposal_anchor"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1298,6 +1314,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_defer_proposer"),
+                &context,
             );
             let mut verifier = AppCore::new(
                 &participants[1],
@@ -1308,6 +1325,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_defer_verifier"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1370,6 +1388,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_mismatch_proposer"),
+                &context,
             );
             let mut verifier = AppCore::new(
                 &participants[1],
@@ -1380,6 +1399,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_mismatch_verifier"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1436,6 +1456,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_fetch_timeout"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1498,6 +1519,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_fetch_repair"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1562,6 +1584,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_missing_ancestor_fetch"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1642,6 +1665,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_finalization_ancestor_fetch"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1709,6 +1733,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_propose_missing_parent_fetch"),
+                &context,
             );
 
             let epoch = Epoch::new(1);
@@ -1833,6 +1858,7 @@ mod tests {
                     10_000,
                     strategy,
                     test_metrics(&context, "core_eventual_repair_proptest"),
+                    &context,
                 );
 
                 let epoch = Epoch::new(1);
@@ -1984,6 +2010,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_finalization_retry"),
+                &context,
             );
 
             let epoch = Epoch::new(1);

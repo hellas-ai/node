@@ -1,12 +1,16 @@
 use super::codec::WireShardMessage;
+use super::scheduler;
 use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
 use super::recovery::{
     ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
 };
+use crate::trace::Traced;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
-use commonware_parallel::Rayon;
+use commonware_parallel::Strategy;
+use commonware_runtime::{Handle, Spawner};
+use futures::channel::mpsc;
 use hellas_types::PublicKey;
 use std::collections::{HashMap, VecDeque};
 
@@ -24,15 +28,20 @@ struct IncomingReShare {
     reshard: <CodingImpl as CodingScheme>::ReShard,
 }
 
-pub(crate) struct ShardRecoverer {
+pub(crate) struct ShardRecoverer<S: Strategy> {
     me: PublicKey,
     my_index: u16,
     coding_config: CodingConfig,
-    strategy: Rayon,
+    strategy: S,
     machine: RecoveryMachine,
+    coding_tx: mpsc::UnboundedSender<Traced<scheduler::Command>>,
+    coding_event_rx: mpsc::UnboundedReceiver<Traced<scheduler::Event>>,
+    /// Held for RAII: dropping the handle aborts the scheduler task.
+    #[allow(dead_code)]
+    scheduler_handle: Handle<()>,
 }
 
-impl ShardRecoverer {
+impl<S: Strategy> ShardRecoverer<S> {
     const MAX_RECOVERY_ENTRIES: usize = 64;
     const MAX_BUFFERED_RESHARDS: usize = 32;
     const MAX_PRE_LEADER_MESSAGES: usize = 64;
@@ -43,8 +52,20 @@ impl ShardRecoverer {
         me: &PublicKey,
         my_index: u16,
         coding_config: CodingConfig,
-        strategy: Rayon,
+        strategy: S,
+        context: &(impl Spawner + Clone),
     ) -> Self {
+        let (coding_tx, coding_cmd_rx) = mpsc::unbounded();
+        let (coding_event_tx, coding_event_rx) = mpsc::unbounded();
+        let scheduler = scheduler::Scheduler::new(
+            coding_cmd_rx,
+            coding_event_tx,
+            coding_config,
+            strategy.clone(),
+        );
+        let scheduler_handle = context.clone().spawn(move |_| async move {
+            scheduler.run().await;
+        });
         Self {
             me: me.clone(),
             my_index,
@@ -57,7 +78,14 @@ impl ShardRecoverer {
                 max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
                 max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
             }),
+            coding_tx,
+            coding_event_rx,
+            scheduler_handle,
         }
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.coding_tx.close_channel();
     }
 
     pub(crate) const fn me(&self) -> &PublicKey {
@@ -67,6 +95,170 @@ impl ShardRecoverer {
     pub(crate) const fn coding_config(&self) -> &CodingConfig {
         &self.coding_config
     }
+
+    // ---- Drain coding scheduler events (non-blocking) ----
+
+    pub(crate) fn drain_coding_events(&mut self) -> VecDeque<ShardEffect> {
+        let mut effects = VecDeque::new();
+        while let Ok(Some(traced)) = self.coding_event_rx.try_next() {
+            let (event, _span) = traced.into_parts();
+            self.apply_coding_event(event, &mut effects);
+        }
+        effects
+    }
+
+    fn apply_coding_event(&mut self, event: scheduler::Event, effects: &mut VecDeque<ShardEffect>) {
+        match event {
+            scheduler::Event::ReshardDone {
+                key,
+                commitment,
+                shard_index,
+                shard_hash,
+                result,
+            } => {
+                self.apply_reshard_result(
+                    key,
+                    commitment,
+                    shard_index,
+                    shard_hash,
+                    result,
+                    effects,
+                );
+            }
+            scheduler::Event::CheckDone {
+                key,
+                shard_index,
+                shard_hash,
+                result,
+            } => {
+                self.apply_check_result(key, shard_index, shard_hash, result, effects);
+            }
+        }
+    }
+
+    fn apply_reshard_result(
+        &mut self,
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        result: Result<
+            (
+                <CodingImpl as CodingScheme>::CheckingData,
+                <CodingImpl as CodingScheme>::CheckedShard,
+                <CodingImpl as CodingScheme>::ReShard,
+            ),
+            (),
+        >,
+        effects: &mut VecDeque<ShardEffect>,
+    ) {
+        let Ok((checking_data, checked_shard, reshard)) = result else {
+            // Crypto failure already logged by the scheduler.
+            return;
+        };
+
+        for output in self.machine.step(RecoveryInput::ApplyInitialValidated {
+            key,
+            commitment,
+            shard_index,
+            shard_hash,
+            checking_data,
+            checked_shard,
+        }) {
+            match output {
+                RecoveryOutput::ReadyToCheck(task) => self.dispatch_check(task),
+                other => self.push_machine_effect(other, key, effects),
+            }
+        }
+
+        effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
+            &self.me,
+            key,
+            commitment,
+            self.my_index,
+            reshard,
+        ))));
+        if let Some(effect) = self.try_recover(key) {
+            effects.push_back(effect);
+        }
+    }
+
+    fn apply_check_result(
+        &mut self,
+        key: BlockKey,
+        shard_index: u16,
+        shard_hash: Digest,
+        result: Result<<CodingImpl as CodingScheme>::CheckedShard, ()>,
+        effects: &mut VecDeque<ShardEffect>,
+    ) {
+        let Ok(checked_shard) = result else {
+            // Crypto failure already logged by the scheduler.
+            return;
+        };
+
+        for output in self.machine.step(RecoveryInput::ApplyCheckedReShare {
+            key,
+            shard_index,
+            shard_hash,
+            checked_shard,
+        }) {
+            self.push_machine_effect(output, key, effects);
+        }
+        if let Some(effect) = self.try_recover(key) {
+            effects.push_back(effect);
+        }
+    }
+
+    // ---- Dispatch commands to the coding scheduler ----
+
+    fn dispatch_reshard(
+        &self,
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        shard: <CodingImpl as CodingScheme>::Shard,
+    ) {
+        if let Err(err) = self
+            .coding_tx
+            .unbounded_send(Traced::capture(scheduler::Command::Reshard {
+                key,
+                commitment,
+                shard_index,
+                shard_hash,
+                shard,
+            }))
+        {
+            warn!(?err, "coding scheduler command channel closed");
+        }
+    }
+
+    fn dispatch_check(&self, task: ReadyToCheckTask) {
+        if let Err(err) = self
+            .coding_tx
+            .unbounded_send(Traced::capture(scheduler::Command::Check {
+                key: task.key,
+                commitment: task.commitment,
+                checking_data: task.checking_data,
+                shard_index: task.shard_index,
+                shard_hash: task.shard_hash,
+                reshard: task.reshard,
+            }))
+        {
+            warn!(?err, "coding scheduler command channel closed");
+        }
+    }
+
+    fn dispatch_cancel(&self, key: BlockKey) {
+        if let Err(err) = self
+            .coding_tx
+            .unbounded_send(Traced::capture(scheduler::Command::Cancel { key }))
+        {
+            warn!(?err, "coding scheduler command channel closed");
+        }
+    }
+
+    // ---- Message handling ----
 
     pub(crate) fn note_known_key(
         &mut self,
@@ -198,41 +390,10 @@ impl ShardRecoverer {
             return effects;
         }
 
-        let (checking_data, checked_shard, reshard) =
-            match CodingImpl::reshard(&self.coding_config, &commitment, shard_index, shard) {
-                Ok(tuple) => tuple,
-                Err(_) => return effects,
-            };
-
-        let mut pending_checks: Vec<ReadyToCheckTask> = Vec::new();
-        for output in self.machine.step(RecoveryInput::ApplyInitialValidated {
-            key,
-            commitment,
-            shard_index,
-            shard_hash,
-            checking_data,
-            checked_shard,
-        }) {
-            match output {
-                RecoveryOutput::ReadyToCheck(task) => pending_checks.push(task),
-                other => self.push_machine_effect(other, key, &mut effects),
-            }
-        }
-
-        for task in pending_checks {
-            let _checked = self.process_ready_to_check(task, &mut effects);
-        }
-
-        effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
-            &self.me,
-            key,
-            commitment,
-            self.my_index,
-            reshard,
-        ))));
-        if let Some(effect) = self.try_recover(key) {
-            effects.push_back(effect);
-        }
+        // Dispatch reshard to the coding scheduler (async).
+        // Results arrive via drain_coding_events → apply_reshard_result,
+        // which handles ApplyInitialValidated, broadcast, and try_recover.
+        self.dispatch_reshard(key, commitment, shard_index, shard_hash, shard);
         effects
     }
 
@@ -262,7 +423,6 @@ impl ShardRecoverer {
 
         let shard_hash = hash_encoded(&reshard);
         let mut effects = VecDeque::new();
-        let mut pending_checks: Vec<ReadyToCheckTask> = Vec::new();
         for output in self.machine.step(RecoveryInput::ObserveReShare {
             key,
             sender: sender.clone(),
@@ -273,47 +433,13 @@ impl ShardRecoverer {
             leader: expected_leader,
         }) {
             match output {
-                RecoveryOutput::ReadyToCheck(task) => pending_checks.push(task),
+                RecoveryOutput::ReadyToCheck(task) => self.dispatch_check(task),
                 RecoveryOutput::ReShareBuffered => {}
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
 
-        let mut recorded_checked = false;
-        for task in pending_checks {
-            recorded_checked |= self.process_ready_to_check(task, &mut effects);
-        }
-        if recorded_checked && let Some(effect) = self.try_recover(key) {
-            effects.push_back(effect);
-        }
         effects
-    }
-
-    fn process_ready_to_check(
-        &mut self,
-        task: ReadyToCheckTask,
-        effects: &mut VecDeque<ShardEffect>,
-    ) -> bool {
-        let checked = match CodingImpl::check(
-            &self.coding_config,
-            &task.commitment,
-            &task.checking_data,
-            task.shard_index,
-            task.reshard,
-        ) {
-            Ok(checked) => checked,
-            Err(_) => return false,
-        };
-
-        for output in self.machine.step(RecoveryInput::ApplyCheckedReShare {
-            key: task.key,
-            shard_index: task.shard_index,
-            shard_hash: task.shard_hash,
-            checked_shard: checked,
-        }) {
-            self.push_machine_effect(output, task.key, effects);
-        }
-        true
     }
 
     fn try_recover(&mut self, key: BlockKey) -> Option<ShardEffect> {
@@ -341,10 +467,23 @@ impl ShardRecoverer {
             &self.strategy,
         ) {
             Ok(decoded) => decoded,
-            Err(_) => return Some(ShardEffect::Failed { key }),
+            Err(err) => {
+                warn!(
+                    digest = ?key.digest,
+                    round = ?key.round,
+                    ?err,
+                    "shard decode failed"
+                );
+                return Some(ShardEffect::Failed { key });
+            }
         };
 
         if Sha256::hash(reconstructed.as_slice()) != key.digest {
+            warn!(
+                digest = ?key.digest,
+                round = ?key.round,
+                "decoded payload digest mismatch"
+            );
             return Some(ShardEffect::Failed { key });
         }
 
@@ -378,6 +517,7 @@ impl ShardRecoverer {
                     max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
                     "evicting oldest recovery entry to admit new recovery"
                 );
+                self.dispatch_cancel(key);
                 Some(ShardEffect::Failed { key })
             }
             RecoveryOutput::KnownKeysOverflow {
@@ -443,6 +583,8 @@ mod tests {
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::{Signer, ed25519};
     use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner, deterministic};
+    use std::time::Duration;
 
     struct BlockArtifacts {
         key: BlockKey,
@@ -456,11 +598,11 @@ mod tests {
         index_by_validator: HashMap<PublicKey, u16>,
         leader: PublicKey,
         my_index: u16,
-        recoverer: ShardRecoverer,
+        recoverer: ShardRecoverer<commonware_parallel::Rayon>,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        fn new(context: &(impl Spawner + Clone)) -> Self {
             let mut validators: Vec<_> = (0u64..6u64)
                 .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
                 .collect();
@@ -469,7 +611,8 @@ mod tests {
             let me = validators[usize::from(my_index)].clone();
             let leader = validators[0].clone();
             let strategy = crate::coding_strategy();
-            let recoverer = ShardRecoverer::new(&me, my_index, coding_config(6), strategy);
+            let recoverer =
+                ShardRecoverer::new(&me, my_index, coding_config(6), strategy, context);
             let mut index_by_validator = HashMap::new();
             for (idx, validator) in validators.iter().enumerate() {
                 let validator_index = u16::try_from(idx).expect("index should fit into u16");
@@ -529,106 +672,115 @@ mod tests {
 
     #[test_log::test]
     fn pre_leader_reshare_is_drained_after_note_known_key() {
-        let mut fixture = Fixture::new();
-        let artifacts = fixture.make_artifacts(1, b"buffer-then-recover");
-        let sender = fixture.validators[2].clone();
-        let shard_index = 2u16;
-        let reshare = artifacts.reshares[usize::from(shard_index)].clone();
+        let runner = deterministic::Runner::timed(Duration::from_secs(5));
+        runner.start(|context| async move {
+            let mut fixture = Fixture::new(&context);
+            let artifacts = fixture.make_artifacts(1, b"buffer-then-recover");
+            let sender = fixture.validators[2].clone();
+            let shard_index = 2u16;
+            let reshare = artifacts.reshares[usize::from(shard_index)].clone();
 
-        let seen = HashMap::<Digest, Bytes>::new();
-        let buffered = fixture.handle_message(
-            ShardMessage::reshare(
-                &sender,
-                artifacts.key,
-                artifacts.commitment,
-                shard_index,
-                reshare,
-            ),
-            &seen,
-        );
-        assert!(buffered.is_empty());
-        assert!(fixture.recoverer.machine.inspect(
-            |_recovery, _known_leaders, pre_leader_buffer| {
-                pre_leader_buffer.contains_key(&artifacts.key)
+            let seen = HashMap::<Digest, Bytes>::new();
+            let buffered = fixture.handle_message(
+                ShardMessage::reshare(
+                    &sender,
+                    artifacts.key,
+                    artifacts.commitment,
+                    shard_index,
+                    reshare,
+                ),
+                &seen,
+            );
+            assert!(buffered.is_empty());
+            assert!(fixture.recoverer.machine.inspect(
+                |_recovery, _known_leaders, pre_leader_buffer| {
+                    pre_leader_buffer.contains_key(&artifacts.key)
+                }
+            ));
+
+            let drained = fixture.note_known_key(artifacts.key);
+            assert_eq!(drained.len(), 1);
+
+            for msg in drained {
+                let effects = fixture.handle_message(msg, &seen);
+                assert!(effects.is_empty());
             }
-        ));
-
-        let drained = fixture.note_known_key(artifacts.key);
-        assert_eq!(drained.len(), 1);
-
-        for msg in drained {
-            let effects = fixture.handle_message(msg, &seen);
-            assert!(effects.is_empty());
-        }
-        assert!(!fixture.recoverer.machine.inspect(
-            |_recovery, _known_leaders, pre_leader_buffer| {
-                pre_leader_buffer.contains_key(&artifacts.key)
-            }
-        ));
-        let buffered_reshards_len =
-            fixture
-                .recoverer
-                .machine
-                .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery
-                        .get(&artifacts.key)
-                        .map(|recovery| recovery.buffered_reshards_len())
-                });
-        assert_eq!(
-            buffered_reshards_len,
-            Some(1),
-            "drained reshare should start recovery state"
-        );
+            assert!(!fixture.recoverer.machine.inspect(
+                |_recovery, _known_leaders, pre_leader_buffer| {
+                    pre_leader_buffer.contains_key(&artifacts.key)
+                }
+            ));
+            let buffered_reshards_len =
+                fixture
+                    .recoverer
+                    .machine
+                    .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
+                        recovery
+                            .get(&artifacts.key)
+                            .map(|recovery| recovery.buffered_reshards_len())
+                    });
+            assert_eq!(
+                buffered_reshards_len,
+                Some(1),
+                "drained reshare should start recovery state"
+            );
+        });
     }
 
     #[test_log::test]
     fn wrong_sender_initial_does_not_poison_commitment() {
-        let mut fixture = Fixture::new();
-        let good = fixture.make_artifacts(2, b"good-payload");
-        let bad = fixture.make_artifacts(2, b"bad-payload");
-        let attacker = fixture.validators[3].clone();
+        let runner = deterministic::Runner::timed(Duration::from_secs(5));
+        runner.start(|context| async move {
+            let mut fixture = Fixture::new(&context);
+            let good = fixture.make_artifacts(2, b"good-payload");
+            let bad = fixture.make_artifacts(2, b"bad-payload");
+            let attacker = fixture.validators[3].clone();
 
-        let _ = fixture.note_known_key(good.key);
-        let seen = HashMap::<Digest, Bytes>::new();
+            let _ = fixture.note_known_key(good.key);
+            let seen = HashMap::<Digest, Bytes>::new();
 
-        let malicious = fixture.handle_message(
-            ShardMessage::initial(
-                &attacker,
-                good.key,
-                bad.commitment,
-                bad.shards[usize::from(fixture.my_index)].clone(),
-                fixture.my_index,
-            ),
-            &seen,
-        );
-        assert!(malicious.is_empty());
-        assert!(!fixture.recoverer.machine.inspect(
-            |recovery, _known_leaders, _pre_leader_buffer| { recovery.contains_key(&good.key) }
-        ));
+            let malicious = fixture.handle_message(
+                ShardMessage::initial(
+                    &attacker,
+                    good.key,
+                    bad.commitment,
+                    bad.shards[usize::from(fixture.my_index)].clone(),
+                    fixture.my_index,
+                ),
+                &seen,
+            );
+            assert!(malicious.is_empty());
+            assert!(!fixture.recoverer.machine.inspect(
+                |recovery, _known_leaders, _pre_leader_buffer| {
+                    recovery.contains_key(&good.key)
+                }
+            ));
 
-        let _ = fixture.handle_message(
-            ShardMessage::initial(
-                &fixture.leader,
-                good.key,
-                good.commitment,
-                good.shards[usize::from(fixture.my_index)].clone(),
-                fixture.my_index,
-            ),
-            &seen,
-        );
-        let commitment =
-            fixture
-                .recoverer
-                .machine
-                .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery
-                        .get(&good.key)
-                        .map(|recovery| recovery.commitment())
-                });
-        let Some(commitment) = commitment else {
-            panic!("leader initial should create recovery state");
-        };
-        assert_eq!(commitment, good.commitment);
-        assert_ne!(commitment, bad.commitment);
+            let _ = fixture.handle_message(
+                ShardMessage::initial(
+                    &fixture.leader,
+                    good.key,
+                    good.commitment,
+                    good.shards[usize::from(fixture.my_index)].clone(),
+                    fixture.my_index,
+                ),
+                &seen,
+            );
+            let commitment =
+                fixture
+                    .recoverer
+                    .machine
+                    .inspect(|recovery, _known_leaders, _pre_leader_buffer| {
+                        recovery
+                            .get(&good.key)
+                            .map(|recovery| recovery.commitment())
+                    });
+            let Some(commitment) = commitment else {
+                panic!("leader initial should create recovery state");
+            };
+            assert_eq!(commitment, good.commitment);
+            assert_ne!(commitment, bad.commitment);
+        });
     }
+
 }

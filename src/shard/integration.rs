@@ -42,7 +42,7 @@ where
     public_key: PublicKey,
     relay: Arc<AuthenticatedShardTransport<S, R>>,
     shard_rx: mpsc::UnboundedReceiver<Traced<ShardMessage>>,
-    recoverer: ShardRecoverer,
+    recoverer: ShardRecoverer<commonware_parallel::Rayon>,
     seen: HashMap<Digest, Bytes>,
 }
 
@@ -110,6 +110,7 @@ where
                 my_index,
                 coding_config(validator_count),
                 crate::coding_strategy(),
+                &context,
             );
             nodes.push(ShardNode {
                 public_key: validator.clone(),
@@ -216,6 +217,29 @@ where
             }
 
             context.sleep(TICK_SLEEP).await;
+
+            // Drain coding scheduler events (reshard/check results).
+            for node_idx in 0..self.nodes.len() {
+                let coding_effects = self.nodes[node_idx].recoverer.drain_coding_events();
+                for effect in coding_effects {
+                    match effect {
+                        ShardEffect::Broadcast(message) => {
+                            let (relay, me) = {
+                                let node = &self.nodes[node_idx];
+                                (node.relay.clone(), node.public_key.clone())
+                            };
+                            relay.broadcast_except(&me, *message).await;
+                        }
+                        ShardEffect::Recovered { key, contents } => {
+                            self.nodes[node_idx]
+                                .seen
+                                .insert(key.digest, contents.clone());
+                            recovered.insert((node_idx, key.digest), contents);
+                        }
+                        ShardEffect::Failed { .. } => {}
+                    }
+                }
+            }
         }
 
         recovered

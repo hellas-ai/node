@@ -6,7 +6,6 @@ use crate::trace::Traced;
 use bytes::{Buf, Bytes};
 use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
 use commonware_cryptography::{Sha256, sha256::Digest};
-use commonware_macros::select;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef,
 };
@@ -15,16 +14,18 @@ use commonware_storage::{
     metadata::{Config as MetadataConfig, Metadata},
     queue::{Config as QueueConfig, Queue},
 };
-use commonware_utils::{SystemTimeExt, channel::oneshot, sequence::U64};
+use commonware_utils::{channel::oneshot, sequence::U64};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::PublicKey;
 use indexmap::IndexMap;
 use std::{
     collections::VecDeque,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
-    time::Duration,
 };
-use tracing::Instrument;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct Fatal(String);
 
 pub(super) enum PersistenceCommand {
     Enqueue {
@@ -69,11 +70,11 @@ pub(super) enum PersistenceCommand {
 #[derive(Clone, Copy)]
 pub(super) enum PersistenceEvent {
     Ready {
-        root: Option<Digest>,
+        root: Digest,
     },
     Persisted {
         payload: Digest,
-        root: Option<Digest>,
+        root: Digest,
     },
 }
 
@@ -99,35 +100,24 @@ pub(super) struct PersistenceWorker<E>
 where
     E: Clock + Spawner + Storage + Metrics + BufferPooler,
 {
-    partition_prefix: String,
-    page_cache: PageCacheConfig,
-    validators: Vec<PublicKey>,
     command_rx: mpsc::UnboundedReceiver<Traced<PersistenceCommand>>,
     event_tx: mpsc::UnboundedSender<Traced<PersistenceEvent>>,
     metrics: PersistenceMetrics,
-    pending: Option<(Digest, FinalizationDiffs)>,
-    retry_delay: Duration,
-    next_retry_at_ms: Option<u64>,
-    db: Option<UtxoDb<E>>,
-    queue: Option<PersistenceQueue<E>>,
-    anchor_index: Option<AnchorIndex<E>>,
+    db: UtxoDb<E>,
+    queue: PersistenceQueue<E>,
+    anchor_index: AnchorIndex<E>,
     anchor_history: VecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
-    finalization_index: Option<FinalizationIndex<E>>,
+    finalization_index: FinalizationIndex<E>,
     volatile_finalizations: IndexMap<Digest, mailbox::FinalizationResponse>,
-    payload_index: Option<PayloadIndex<E>>,
+    payload_index: PayloadIndex<E>,
     volatile_payloads: IndexMap<Digest, Bytes>,
-    #[cfg(test)]
-    persistence_failures_remaining: usize,
 }
 
 impl<E> PersistenceWorker<E>
 where
     E: Clock + Spawner + Storage + Metrics + BufferPooler,
 {
-    const RETRY_BASE: Duration = Duration::from_millis(50);
-    const RETRY_MAX: Duration = Duration::from_secs(5);
-    const IDLE_SLEEP: Duration = Duration::from_secs(3600);
     const QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NonZeroU64::new(256).unwrap();
     const QUEUE_WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
     const MAX_QUEUE_ITEM_BYTES: usize = 1 << 20;
@@ -139,51 +129,49 @@ where
     const MAX_PAYLOAD_RECORD_BYTES: usize = 1 << 20;
     const MAX_VOLATILE_PAYLOADS: usize = 4096;
 
-    pub(super) fn new(
+    pub(super) async fn create(
+        context: &mut E,
         partition_prefix: String,
-        page_cache: PageCacheConfig,
+        page_cache_config: PageCacheConfig,
         validators: Vec<PublicKey>,
         command_rx: mpsc::UnboundedReceiver<Traced<PersistenceCommand>>,
         event_tx: mpsc::UnboundedSender<Traced<PersistenceEvent>>,
         metrics: PersistenceMetrics,
-        #[cfg(test)] persistence_failures_remaining: usize,
-    ) -> Self {
-        Self {
-            partition_prefix,
-            page_cache,
-            validators,
+    ) -> Result<Self, Fatal> {
+        let queue = Self::initialize_queue(context, &partition_prefix, page_cache_config).await?;
+        let mut db = Self::initialize_db(context, &partition_prefix, page_cache_config).await?;
+        let (anchor_index, anchor_history, next_anchor_sequence) =
+            Self::initialize_anchor_index(context, &partition_prefix).await?;
+        let finalization_index =
+            Self::initialize_finalization_index(context, &partition_prefix).await?;
+        let payload_index = Self::initialize_payload_index(context, &partition_prefix).await?;
+
+        if db.is_empty() {
+            db = Self::bootstrap_genesis(db, &validators).await?;
+        }
+
+        Ok(Self {
             command_rx,
             event_tx,
             metrics,
-            pending: None,
-            retry_delay: Self::RETRY_BASE,
-            next_retry_at_ms: None,
-            db: None,
-            queue: None,
-            anchor_index: None,
-            anchor_history: VecDeque::new(),
-            next_anchor_sequence: 0,
-            finalization_index: None,
+            db,
+            queue,
+            anchor_index,
+            anchor_history,
+            next_anchor_sequence,
+            finalization_index,
             volatile_finalizations: IndexMap::new(),
-            payload_index: None,
+            payload_index,
             volatile_payloads: IndexMap::new(),
-            #[cfg(test)]
-            persistence_failures_remaining,
-        }
+        })
     }
 
-    pub(super) async fn run(mut self, context: &mut E) {
-        self.initialize_queue(context).await;
-        self.initialize_db(context).await;
-        self.initialize_anchor_index(context).await;
-        self.initialize_finalization_index(context).await;
-        self.initialize_payload_index(context).await;
+    pub(super) async fn run(mut self, _context: &mut E) {
         self.metrics.worker_ready_total.inc();
+        let root = self.state_root();
         if let Err(err) = self
             .event_tx
-            .unbounded_send(Traced::capture(PersistenceEvent::Ready {
-                root: self.state_root(),
-            }))
+            .unbounded_send(Traced::capture(PersistenceEvent::Ready { root }))
         {
             warn!(
                 ?err,
@@ -192,232 +180,183 @@ where
             return;
         }
         loop {
-            if !self.drain_ready_commands().await {
-                break;
-            }
-
-            let now_ms = context.current().epoch_millis();
-            if self.should_attempt_persist(now_ms).await {
-                self.persist_next_pending(context, now_ms).await;
-            }
-
-            let sleep_duration = self.persistence_sleep_duration(context.current().epoch_millis()).await;
-            select! {
-                command = self.command_rx.next() => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    if !self.process_traced_command(command).await {
-                        break;
+            // Drain any buffered commands before attempting persistence.
+            loop {
+                match self.command_rx.try_next() {
+                    Ok(Some(command)) => match self.process_command(command).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.sync_or_abort().await;
+                            return;
+                        }
+                        Err(err) => Self::abort(err),
+                    },
+                    Ok(None) => {
+                        self.sync_or_abort().await;
+                        return;
                     }
-                },
-                _ = context.sleep(sleep_duration) => {},
-            }
-        }
-
-        self.sync_db_on_shutdown().await;
-    }
-
-    async fn drain_ready_commands(&mut self) -> bool {
-        loop {
-            match self.command_rx.try_next() {
-                Ok(Some(command)) => {
-                    if !self.process_traced_command(command).await {
-                        return false;
-                    }
+                    Err(_) => break,
                 }
-                Ok(None) => return false,
-                Err(_) => return true,
             }
+
+            // Persist any pending work from the durable queue.
+            if self.has_pending_work().await {
+                self = match self.persist_next_pending().await {
+                    Ok(s) => s,
+                    Err(err) => Self::abort(err),
+                };
+                continue;
+            }
+
+            // No work; block until a command arrives.
+            let Some(command) = self.command_rx.next().await else {
+                break;
+            };
+            match self.process_command(command).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) => Self::abort(err),
+            }
+        }
+
+        self.sync_or_abort().await;
+    }
+
+    fn abort(err: Fatal) -> ! {
+        error!(%err, "irrecoverable persistence error; aborting");
+        std::process::abort()
+    }
+
+    async fn sync_or_abort(&mut self) {
+        if let Err(err) = self.sync_on_shutdown().await {
+            Self::abort(err);
         }
     }
 
-    async fn process_traced_command(&mut self, command: Traced<PersistenceCommand>) -> bool {
+    async fn process_command(
+        &mut self,
+        command: Traced<PersistenceCommand>,
+    ) -> Result<bool, Fatal> {
         let (command, parent_span) = command.into_parts();
         let _entered = parent_span.enter();
         self.handle_command(command).await
     }
 
-    async fn should_attempt_persist(&self, now_ms: u64) -> bool {
-        if self.pending.is_none() && self.queue_is_empty().await {
-            return false;
-        }
-        match self.next_retry_at_ms {
-            None => true,
-            Some(deadline_ms) => now_ms >= deadline_ms,
-        }
-    }
-
-    async fn persistence_sleep_duration(&self, now_ms: u64) -> Duration {
-        if self.pending.is_none() && self.queue_is_empty().await {
-            return Self::IDLE_SLEEP;
-        }
-        let Some(deadline_ms) = self.next_retry_at_ms else {
-            return Duration::from_millis(0);
-        };
-        Duration::from_millis(deadline_ms.saturating_sub(now_ms))
-    }
-
-    async fn queue_is_empty(&self) -> bool {
-        match self.queue.as_ref() {
-            Some(queue) => queue.is_empty().await,
-            None => true,
-        }
-    }
-
-    fn schedule_retry(&mut self, now_ms: u64) {
-        let delay_ms = u64::try_from(self.retry_delay.as_millis()).unwrap_or(u64::MAX);
-        self.next_retry_at_ms = Some(now_ms.saturating_add(delay_ms));
-        self.retry_delay = (self.retry_delay * 2).min(Self::RETRY_MAX);
-    }
-
-    fn clear_retry(&mut self) {
-        self.next_retry_at_ms = None;
-        self.retry_delay = Self::RETRY_BASE;
+    async fn has_pending_work(&self) -> bool {
+        !self.queue.is_empty().await
     }
 
     #[tracing::instrument(
         name = "app.persistence.persist_next_pending",
         level = "info",
         skip_all,
-        fields(now_ms = now_ms)
     )]
-    async fn persist_next_pending(&mut self, context: &mut E, now_ms: u64) {
-        if let Some((payload, diffs)) = self.pending.take() {
-            self.metrics.staged_pending.set(0);
-            if !self.enqueue_pending_intent(payload, &diffs).await {
-                self.pending = Some((payload, diffs));
-                self.metrics.staged_pending.set(1);
-                self.metrics.persist_failure_total.inc();
-                self.schedule_retry(now_ms);
-                return;
+    async fn persist_next_pending(mut self) -> Result<Self, Fatal> {
+        let (position, encoded) = match self.queue.dequeue().await {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(self),
+            Err(err) => {
+                return Err(Fatal(format!(
+                    "failed to dequeue persistence intent: {err:?}"
+                )))
             }
-        }
-
-        let dequeued = {
-            let Some(queue) = self.queue.as_mut() else {
-                warn!("persistence queue unavailable; cannot drain finalized diffs");
-                self.schedule_retry(now_ms);
-                return;
-            };
-            match queue.dequeue().await {
-                Ok(item) => item,
-                Err(err) => {
-                    error!(?err, "failed to dequeue persistence intent");
-                    self.schedule_retry(now_ms);
-                    return;
-                }
-            }
-        };
-
-        let Some((position, encoded)) = dequeued else {
-            self.clear_retry();
-            return;
         };
 
         let Some((payload, diffs)) = Self::decode_queue_item(encoded.as_slice()) else {
-            error!(
-                position,
-                "invalid persistence queue item; entering fail-stop"
-            );
-            std::process::abort();
+            return Err(Fatal(format!(
+                "invalid persistence queue item at position {position}"
+            )));
         };
-        async {
-            self.metrics.persist_attempt_total.inc();
 
-            #[cfg(test)]
-            if self.persistence_failures_remaining > 0 {
-                self.persistence_failures_remaining -= 1;
-                warn!(
-                    remaining = self.persistence_failures_remaining,
-                    "injecting persistence failure for retry-path test"
-                );
-                self.metrics.persist_failure_total.inc();
-                if let Some(queue) = self.queue.as_mut() {
-                    queue.reset();
-                }
-                self.schedule_retry(now_ms);
-                return;
-            }
-
-            if !self.apply_diffs_to_db(context, &diffs).await {
-                warn!(?payload, "failed to persist finalized state");
-                self.metrics.persist_failure_total.inc();
-                if let Some(queue) = self.queue.as_mut() {
-                    queue.reset();
-                }
-                self.schedule_retry(now_ms);
-                return;
-            }
-
-            let ack_result = {
-                let Some(queue) = self.queue.as_mut() else {
-                    warn!("persistence queue unavailable during ack");
-                    self.schedule_retry(now_ms);
-                    return;
-                };
-                if let Err(err) = queue.ack(position).await {
-                    error!(?err, position, ?payload, "failed to ack persistence intent");
-                    queue.reset();
-                    self.metrics.persist_failure_total.inc();
-                    self.schedule_retry(now_ms);
-                    return;
-                }
-                queue.sync().await
-            };
-            if let Err(err) = ack_result {
-                error!(?err, position, ?payload, "failed to sync persistence queue");
-                if let Some(queue) = self.queue.as_mut() {
-                    queue.reset();
-                }
-                self.metrics.persist_failure_total.inc();
-                self.schedule_retry(now_ms);
-                return;
-            }
-
-            self.clear_retry();
-            self.metrics.persist_success_total.inc();
-            let root = self.state_root();
-            if let Some(root) = root {
-                self.record_persisted_anchor(payload, root).await;
-            }
-            if let Err(err) =
-                self.event_tx
-                    .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
-                        payload,
-                        root,
-                    }))
-            {
-                warn!(
-                    ?err,
-                    ?payload,
-                    "failed to notify application of persisted finalization"
-                );
-            }
-        }
-        .instrument(info_span!(
-            "app.persistence.persist_intent",
-            payload = ?payload,
+        info!(
+            ?payload,
             queue_position = position,
             created = diffs.created.len(),
-            deleted = diffs.deleted.len()
-        ))
-        .await;
+            deleted = diffs.deleted.len(),
+            "persisting finalization diffs"
+        );
+
+        self.metrics.persist_attempt_total.inc();
+
+        // Apply diffs to QMDB via the type-state transition:
+        // merkleized → mutable → committed → merkleized.
+        let db = self.db;
+
+        let batch: Vec<_> = diffs
+            .deleted
+            .iter()
+            .map(|id| (*id, None))
+            .chain(
+                diffs
+                    .created
+                    .iter()
+                    .map(|(id, coin)| (*id, Some(coin.clone()))),
+            )
+            .collect();
+
+        let mut db = db.into_mutable();
+
+        db.write_batch(batch).await.map_err(|err| {
+            Fatal(format!("QMDB write_batch failed for {payload:?}: {err:?}"))
+        })?;
+
+        let (db, _range) = db.commit(None).await.map_err(|err| {
+            Fatal(format!("QMDB commit failed for {payload:?}: {err:?}"))
+        })?;
+
+        self.db = db.into_merkleized().await.map_err(|err| {
+            Fatal(format!(
+                "QMDB merkleize failed for {payload:?}: {err:?}"
+            ))
+        })?;
+
+        // Ack the queue item so it won't be replayed on restart.
+        self.queue.ack(position).await.map_err(|err| {
+            Fatal(format!(
+                "failed to ack persistence intent at position {position} for {payload:?}: {err:?}"
+            ))
+        })?;
+        self.queue.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync persistence queue after ack for {payload:?}: {err:?}"
+            ))
+        })?;
+
+        self.metrics.persist_success_total.inc();
+        let root = self.state_root();
+        self.record_persisted_anchor(payload, root).await?;
+        if let Err(err) = self
+            .event_tx
+            .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
+                payload,
+                root,
+            }))
+        {
+            warn!(
+                ?err,
+                ?payload,
+                "failed to notify application of persisted finalization"
+            );
+        }
+
+        Ok(self)
     }
 
-    async fn enqueue_pending_intent(&mut self, payload: Digest, diffs: &FinalizationDiffs) -> bool {
-        let Some(queue) = self.queue.as_mut() else {
-            warn!("persistence queue unavailable; cannot enqueue finalized diffs");
-            return false;
-        };
-        let encoded = Self::encode_queue_item(payload, diffs);
-        match queue.enqueue(encoded).await {
-            Ok(_) => true,
-            Err(err) => {
-                error!(?err, ?payload, "failed to enqueue persistence intent");
-                false
-            }
-        }
+    async fn enqueue_pending(
+        &mut self,
+        payload: &Digest,
+        diffs: &FinalizationDiffs,
+    ) -> Result<(), Fatal> {
+        let encoded = Self::encode_queue_item(*payload, diffs);
+        self.queue
+            .enqueue(encoded)
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                Fatal(format!(
+                    "failed to enqueue persistence intent for {payload:?}: {err:?}"
+                ))
+            })
     }
 
     fn encode_queue_item(payload: Digest, diffs: &FinalizationDiffs) -> Vec<u8> {
@@ -459,176 +398,103 @@ where
         Some((payload, root))
     }
 
-    async fn handle_command(&mut self, command: PersistenceCommand) -> bool {
+    async fn handle_command(&mut self, command: PersistenceCommand) -> Result<bool, Fatal> {
         match command {
             PersistenceCommand::Enqueue { payload, diffs } => {
                 self.metrics.enqueue_commands_total.inc();
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(candidate, _)| *candidate == payload)
-                {
-                    return true;
-                }
-                if let Some((existing_payload, _)) = self.pending.as_ref() {
-                    error!(
-                        existing = ?existing_payload,
-                        incoming = ?payload,
-                        "received enqueue while a staged persistence intent is still pending; entering fail-stop"
-                    );
-                    std::process::abort();
-                }
-                self.pending = Some((payload, diffs));
-                self.metrics.staged_pending.set(1);
-                self.clear_retry();
-                true
+                self.enqueue_pending(&payload, &diffs).await?;
+                Ok(true)
             }
             PersistenceCommand::GetStateRoot { response } => {
-                let _ = response.send(self.state_root());
-                true
+                let _ = response.send(Some(self.state_root()));
+                Ok(true)
             }
             PersistenceCommand::GetProof { object, response } => {
                 let proof = self.proof_for_object(object).await;
                 let _ = response.send(proof);
-                true
+                Ok(true)
             }
             PersistenceCommand::GetPayload { payload, response } => {
                 let _ = response.send(self.payload(payload));
-                true
+                Ok(true)
             }
             PersistenceCommand::GetPersistedAnchors { response } => {
                 let _ = response.send(self.persisted_anchor_history());
-                true
+                Ok(true)
             }
             PersistenceCommand::RecordPersistedRoot { payload, root } => {
-                self.record_persisted_anchor(payload, root).await;
-                true
+                self.record_persisted_anchor(payload, root).await?;
+                Ok(true)
             }
             PersistenceCommand::GetFinalization { payload, response } => {
                 let _ = response.send(self.finalization(payload));
-                true
+                Ok(true)
             }
             PersistenceCommand::RecordFinalization {
                 payload,
                 finalization,
             } => {
-                self.record_finalization(payload, finalization).await;
-                true
+                self.record_finalization(payload, finalization).await?;
+                Ok(true)
             }
             PersistenceCommand::RecordPayload { payload, bytes } => {
-                self.record_payload(payload, bytes).await;
-                true
+                self.record_payload(payload, bytes).await?;
+                Ok(true)
             }
             PersistenceCommand::Shutdown { response } => {
                 let _ = response.send(());
-                false
+                Ok(false)
             }
         }
     }
 
-    #[tracing::instrument(
-        name = "app.persistence.apply_diffs_to_db",
-        level = "debug",
-        skip_all,
-        fields(
-            created = diffs.created.len(),
-            deleted = diffs.deleted.len(),
-        )
-    )]
-    async fn apply_diffs_to_db(&mut self, context: &mut E, diffs: &FinalizationDiffs) -> bool {
-        let Some(db) = self.db.take() else {
-            warn!("QMDB unavailable; skipping persistence update");
-            return false;
-        };
-        let mut db = db.into_mutable();
-
-        let batch: Vec<_> = diffs
+    /// Bootstrap genesis UTXO state into a fresh QMDB via the type-state
+    /// transition: merkleized → mutable → committed → merkleized.
+    async fn bootstrap_genesis(
+        db: UtxoDb<E>,
+        validators: &[PublicKey],
+    ) -> Result<UtxoDb<E>, Fatal> {
+        let genesis = genesis_state(validators);
+        let batch: Vec<_> = genesis
             .deleted
             .iter()
             .map(|id| (*id, None))
             .chain(
-                diffs
+                genesis
                     .created
                     .iter()
                     .map(|(id, coin)| (*id, Some(coin.clone()))),
             )
             .collect();
 
-        if let Err(err) = db.write_batch(batch).await {
-            error!(?err, "QMDB write_batch failed");
-            self.reopen_db_after_failure(context, "write_batch").await;
-            return false;
-        }
+        let mut db = db.into_mutable();
 
-        let (db, _range) = match db.commit(None).await {
-            Ok(result) => result,
-            Err(err) => {
-                error!(?err, "QMDB commit failed");
-                self.reopen_db_after_failure(context, "commit").await;
-                return false;
-            }
-        };
-        let db = match db.into_merkleized().await {
-            Ok(db) => db,
-            Err(err) => {
-                error!(?err, "QMDB merkleize failed");
-                self.reopen_db_after_failure(context, "merkleize").await;
-                return false;
-            }
-        };
-        self.db = Some(db);
-        true
+        db.write_batch(batch).await.map_err(|err| {
+            Fatal(format!(
+                "QMDB write_batch failed during genesis bootstrap: {err:?}"
+            ))
+        })?;
+
+        let (db, _range) = db.commit(None).await.map_err(|err| {
+            Fatal(format!(
+                "QMDB commit failed during genesis bootstrap: {err:?}"
+            ))
+        })?;
+
+        db.into_merkleized().await.map_err(|err| {
+            Fatal(format!(
+                "QMDB merkleize failed during genesis bootstrap: {err:?}"
+            ))
+        })
     }
 
-    async fn reopen_db_after_failure(&mut self, context: &mut E, stage: &'static str) {
-        let config = utxo_db_config(
-            context,
-            &self.partition_prefix,
-            self.page_cache.size,
-            self.page_cache.count,
-        );
-        match UtxoDb::init(context.with_label("utxo_db_recover"), config).await {
-            Ok(db) => {
-                self.db = Some(db);
-                warn!(
-                    stage,
-                    "re-opened QMDB after persistence failure; pending finalizations can be retried"
-                );
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    stage, "failed to re-open QMDB after persistence failure"
-                );
-            }
-        }
-    }
-
-    async fn bootstrap_genesis_state_if_empty(&mut self, context: &mut E) {
-        let Some(db) = self.db.as_ref() else {
-            return;
-        };
-        if !db.is_empty() {
-            return;
-        }
-
-        let genesis_execution = genesis_state(&self.validators);
-        let diffs = FinalizationDiffs {
-            created: genesis_execution.created,
-            deleted: genesis_execution.deleted,
-        };
-        let _ = self.apply_diffs_to_db(context, &diffs).await;
-    }
-
-    fn state_root(&self) -> Option<Digest> {
-        let db = self.db.as_ref()?;
-        if db.is_empty() { None } else { Some(db.root()) }
+    fn state_root(&self) -> Digest {
+        self.db.root()
     }
 
     async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
-        let db = self.db.as_ref()?;
         let mut hasher = Sha256::default();
-        db.key_value_proof(&mut hasher, object).await.ok()
+        self.db.key_value_proof(&mut hasher, object).await.ok()
     }
 
     fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
@@ -637,8 +503,8 @@ where
         }
         let stored = self
             .finalization_index
-            .as_ref()
-            .and_then(|index| index.get(&payload).cloned())
+            .get(&payload)
+            .cloned()
             .map(mailbox::FinalizationResponse::from);
         if let Some(ref finalization) = stored {
             self.cache_finalization(payload, finalization.clone());
@@ -664,8 +530,8 @@ where
         }
         let stored = self
             .payload_index
-            .as_ref()
-            .and_then(|index| index.get(&payload).cloned())
+            .get(&payload)
+            .cloned()
             .map(Bytes::from);
         if let Some(ref bytes) = stored {
             self.cache_payload(payload, bytes.clone());
@@ -689,29 +555,30 @@ where
             .collect()
     }
 
-    async fn record_persisted_anchor(&mut self, payload: Digest, root: Digest) {
+    async fn record_persisted_anchor(
+        &mut self,
+        payload: Digest,
+        root: Digest,
+    ) -> Result<(), Fatal> {
         if let Some(existing) = self
             .anchor_history
             .iter()
             .find(|entry| entry.payload == payload)
         {
             if existing.root != root {
-                error!(
-                    ?payload,
-                    existing_root = ?existing.root,
-                    new_root = ?root,
-                    "detected conflicting persisted roots for payload; entering fail-stop"
-                );
-                std::process::abort();
+                return Err(Fatal(format!(
+                    "conflicting persisted roots for {payload:?}: existing={:?}, new={root:?}",
+                    existing.root
+                )));
             }
-            return;
+            return Ok(());
         }
 
         let sequence = self.next_anchor_sequence;
-        self.next_anchor_sequence = self.next_anchor_sequence.checked_add(1).unwrap_or_else(|| {
-            error!("anchor sequence counter overflowed");
-            std::process::abort();
-        });
+        self.next_anchor_sequence =
+            self.next_anchor_sequence
+                .checked_add(1)
+                .ok_or_else(|| Fatal("anchor sequence counter overflowed".into()))?;
 
         self.anchor_history.push_back(AnchorEntry {
             sequence,
@@ -719,135 +586,126 @@ where
             root,
         });
 
-        if let Some(index) = self.anchor_index.as_mut() {
-            index.put(
-                U64::new(sequence),
-                Self::encode_anchor_record(payload, root),
-            );
-            while self.anchor_history.len() > Self::MAX_ANCHOR_HISTORY {
-                let Some(oldest) = self.anchor_history.pop_front() else {
-                    break;
-                };
-                index.remove(&U64::new(oldest.sequence));
-            }
-            if let Err(err) = index.sync().await {
-                warn!(?err, ?payload, "failed to sync persisted anchor index");
-            }
-        } else {
-            while self.anchor_history.len() > Self::MAX_ANCHOR_HISTORY {
-                self.anchor_history.pop_front();
-            }
+        self.anchor_index.put(
+            U64::new(sequence),
+            Self::encode_anchor_record(payload, root),
+        );
+        while self.anchor_history.len() > Self::MAX_ANCHOR_HISTORY {
+            let Some(oldest) = self.anchor_history.pop_front() else {
+                break;
+            };
+            self.anchor_index.remove(&U64::new(oldest.sequence));
         }
+        self.anchor_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync persisted anchor index for {payload:?}: {err:?}"
+            ))
+        })
     }
 
     async fn record_finalization(
         &mut self,
         payload: Digest,
         finalization: mailbox::FinalizationResponse,
-    ) {
+    ) -> Result<(), Fatal> {
         if let Some(existing) = self.volatile_finalizations.get(&payload) {
             if existing != &finalization {
-                error!(
-                    ?payload,
-                    "detected conflicting finalization certificates for payload; entering fail-stop"
-                );
-                std::process::abort();
+                return Err(Fatal(format!(
+                    "conflicting finalization certificates for {payload:?}"
+                )));
             }
-            return;
+            return Ok(());
         }
 
-        if let Some(index) = self.finalization_index.as_mut() {
-            if let Some(existing) = index.get(&payload) {
-                if existing.as_slice() != finalization.as_slice() {
-                    error!(
-                        ?payload,
-                        "detected conflicting stored finalization certificate for payload; entering fail-stop"
-                    );
-                    std::process::abort();
-                }
-                self.cache_finalization(payload, finalization);
-                return;
+        if let Some(existing) = self.finalization_index.get(&payload) {
+            if existing.as_slice() != finalization.as_slice() {
+                return Err(Fatal(format!(
+                    "conflicting stored finalization certificate for {payload:?}"
+                )));
             }
-            index.put(payload, finalization.as_slice().to_vec());
-            if let Err(err) = index.sync().await {
-                warn!(
-                    ?err,
-                    ?payload,
-                    "failed to sync finalization certificate index"
-                );
-            }
+            self.cache_finalization(payload, finalization);
+            return Ok(());
         }
+        self.finalization_index
+            .put(payload, finalization.as_slice().to_vec());
+        self.finalization_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync finalization certificate index for {payload:?}: {err:?}"
+            ))
+        })?;
 
         self.cache_finalization(payload, finalization);
+        Ok(())
     }
 
-    async fn record_payload(&mut self, payload: Digest, bytes: Bytes) {
+    async fn record_payload(&mut self, payload: Digest, bytes: Bytes) -> Result<(), Fatal> {
         if let Some(existing) = self.volatile_payloads.get(&payload) {
             if existing != &bytes {
-                error!(
-                    ?payload,
-                    "detected conflicting payload bytes for digest; entering fail-stop"
-                );
-                std::process::abort();
+                return Err(Fatal(format!(
+                    "conflicting payload bytes for {payload:?}"
+                )));
             }
-            return;
+            return Ok(());
         }
 
-        if let Some(index) = self.payload_index.as_mut() {
-            if let Some(existing) = index.get(&payload) {
-                if existing.as_slice() != bytes.as_ref() {
-                    error!(
-                        ?payload,
-                        "detected conflicting stored payload bytes for digest; entering fail-stop"
-                    );
-                    std::process::abort();
-                }
-                self.cache_payload(payload, bytes);
-                return;
+        if let Some(existing) = self.payload_index.get(&payload) {
+            if existing.as_slice() != bytes.as_ref() {
+                return Err(Fatal(format!(
+                    "conflicting stored payload bytes for {payload:?}"
+                )));
             }
-            index.put(payload, bytes.as_ref().to_vec());
-            if let Err(err) = index.sync().await {
-                warn!(?err, ?payload, "failed to sync payload index");
-            }
+            self.cache_payload(payload, bytes);
+            return Ok(());
         }
+        self.payload_index.put(payload, bytes.as_ref().to_vec());
+        self.payload_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync payload index for {payload:?}: {err:?}"
+            ))
+        })?;
 
         self.cache_payload(payload, bytes);
+        Ok(())
     }
 
-    fn anchor_metadata_config(&self) -> MetadataConfig<(RangeCfg<usize>, ())> {
+    fn anchor_metadata_config(
+        partition_prefix: &str,
+    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
         MetadataConfig {
-            partition: format!("{prefix}_anchor_roots", prefix = self.partition_prefix),
+            partition: format!("{partition_prefix}_anchor_roots"),
             codec_config: ((0..=Self::MAX_ANCHOR_RECORD_BYTES).into(), ()),
         }
     }
 
-    fn finalization_metadata_config(&self) -> MetadataConfig<(RangeCfg<usize>, ())> {
+    fn finalization_metadata_config(
+        partition_prefix: &str,
+    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
         MetadataConfig {
-            partition: format!(
-                "{prefix}_finalizations_by_payload",
-                prefix = self.partition_prefix
-            ),
+            partition: format!("{partition_prefix}_finalizations_by_payload"),
             codec_config: ((0..=Self::MAX_FINALIZATION_RECORD_BYTES).into(), ()),
         }
     }
 
-    fn payload_metadata_config(&self) -> MetadataConfig<(RangeCfg<usize>, ())> {
+    fn payload_metadata_config(
+        partition_prefix: &str,
+    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
         MetadataConfig {
-            partition: format!(
-                "{prefix}_payloads_by_digest",
-                prefix = self.partition_prefix
-            ),
+            partition: format!("{partition_prefix}_payloads_by_digest"),
             codec_config: ((0..=Self::MAX_PAYLOAD_RECORD_BYTES).into(), ()),
         }
     }
 
-    fn queue_config(&self, context: &E) -> QueueConfig<(RangeCfg<usize>, ())> {
-        let page_cache_size = NonZeroU16::new(self.page_cache.size)
+    fn queue_config(
+        context: &E,
+        partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+    ) -> QueueConfig<(RangeCfg<usize>, ())> {
+        let page_cache_size = NonZeroU16::new(page_cache_config.size)
             .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
-        let page_cache_count = NonZeroUsize::new(self.page_cache.count)
+        let page_cache_count = NonZeroUsize::new(page_cache_config.count)
             .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_COUNT);
         QueueConfig {
-            partition: format!("{prefix}_persistence_queue", prefix = self.partition_prefix),
+            partition: format!("{partition_prefix}_persistence_queue"),
             items_per_section: Self::QUEUE_ITEMS_PER_SECTION,
             compression: None,
             codec_config: ((0..=Self::MAX_QUEUE_ITEM_BYTES).into(), ()),
@@ -856,148 +714,130 @@ where
         }
     }
 
-    async fn initialize_anchor_index(&mut self, context: &mut E) {
-        let config = self.anchor_metadata_config();
-        match AnchorIndex::init(context.with_label("anchor_index"), config).await {
-            Ok(mut index) => {
-                let mut recovered = VecDeque::new();
-                let mut keys: Vec<U64> = index.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    let sequence = u64::from(&key);
-                    let Some(encoded) = index.get(&key).cloned() else {
-                        continue;
-                    };
-                    let Some((payload, root)) = Self::decode_anchor_record(encoded.as_slice())
-                    else {
-                        warn!(sequence, "invalid anchor index entry; removing");
-                        index.remove(&key);
-                        continue;
-                    };
-                    recovered.push_back(AnchorEntry {
-                        sequence,
-                        payload,
-                        root,
-                    });
-                }
+    async fn initialize_anchor_index(
+        context: &mut E,
+        partition_prefix: &str,
+    ) -> Result<(AnchorIndex<E>, VecDeque<AnchorEntry>, u64), Fatal> {
+        let config = Self::anchor_metadata_config(partition_prefix);
+        let mut index = AnchorIndex::init(context.with_label("anchor_index"), config)
+            .await
+            .map_err(|err| Fatal(format!("anchor index initialization failed: {err:?}")))?;
 
-                while recovered.len() > Self::MAX_ANCHOR_HISTORY {
-                    let Some(oldest) = recovered.pop_front() else {
-                        break;
-                    };
-                    index.remove(&U64::new(oldest.sequence));
-                }
-
-                self.next_anchor_sequence = recovered
-                    .back()
-                    .map(|entry| entry.sequence.saturating_add(1))
-                    .unwrap_or(0);
-                self.anchor_history = recovered;
-                if let Err(err) = index.sync().await {
-                    warn!(?err, "failed to sync recovered anchor index");
-                }
-                self.anchor_index = Some(index);
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "anchor index initialization failed; restart-time anchor recovery disabled"
-                );
-            }
+        let mut recovered = VecDeque::new();
+        let mut keys: Vec<U64> = index.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let sequence = u64::from(&key);
+            let Some(encoded) = index.get(&key).cloned() else {
+                continue;
+            };
+            let Some((payload, root)) = Self::decode_anchor_record(encoded.as_slice()) else {
+                warn!(sequence, "invalid anchor index entry; removing");
+                index.remove(&key);
+                continue;
+            };
+            recovered.push_back(AnchorEntry {
+                sequence,
+                payload,
+                root,
+            });
         }
+
+        while recovered.len() > Self::MAX_ANCHOR_HISTORY {
+            let Some(oldest) = recovered.pop_front() else {
+                break;
+            };
+            index.remove(&U64::new(oldest.sequence));
+        }
+
+        let next_sequence = recovered
+            .back()
+            .map(|entry| entry.sequence.saturating_add(1))
+            .unwrap_or(0);
+        index.sync().await.map_err(|err| {
+            Fatal(format!("failed to sync recovered anchor index: {err:?}"))
+        })?;
+        Ok((index, recovered, next_sequence))
     }
 
-    async fn initialize_finalization_index(&mut self, context: &mut E) {
-        let config = self.finalization_metadata_config();
-        match FinalizationIndex::init(context.with_label("finalization_index"), config).await {
-            Ok(index) => {
-                self.finalization_index = Some(index);
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "finalization index initialization failed; certificate recovery disabled"
-                );
-            }
-        }
+    async fn initialize_finalization_index(
+        context: &mut E,
+        partition_prefix: &str,
+    ) -> Result<FinalizationIndex<E>, Fatal> {
+        let config = Self::finalization_metadata_config(partition_prefix);
+        FinalizationIndex::init(context.with_label("finalization_index"), config)
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "finalization index initialization failed: {err:?}"
+                ))
+            })
     }
 
-    async fn initialize_payload_index(&mut self, context: &mut E) {
-        let config = self.payload_metadata_config();
-        match PayloadIndex::init(context.with_label("payload_index"), config).await {
-            Ok(index) => {
-                self.payload_index = Some(index);
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "payload index initialization failed; payload fetch fallback disabled"
-                );
-            }
-        }
+    async fn initialize_payload_index(
+        context: &mut E,
+        partition_prefix: &str,
+    ) -> Result<PayloadIndex<E>, Fatal> {
+        let config = Self::payload_metadata_config(partition_prefix);
+        PayloadIndex::init(context.with_label("payload_index"), config)
+            .await
+            .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
     }
 
-    async fn initialize_queue(&mut self, context: &mut E) {
-        let config = self.queue_config(context);
-        match PersistenceQueue::init(context.with_label("persistence_queue"), config).await {
-            Ok(queue) => {
-                self.queue = Some(queue);
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "persistence queue initialization failed; finalized diffs cannot be durably buffered"
-                );
-            }
-        }
+    async fn initialize_queue(
+        context: &mut E,
+        partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+    ) -> Result<PersistenceQueue<E>, Fatal> {
+        let config = Self::queue_config(context, partition_prefix, page_cache_config);
+        PersistenceQueue::init(context.with_label("persistence_queue"), config)
+            .await
+            .map_err(|err| {
+                Fatal(format!(
+                    "persistence queue initialization failed: {err:?}"
+                ))
+            })
     }
 
-    async fn initialize_db(&mut self, context: &mut E) {
+    async fn initialize_db(
+        context: &mut E,
+        partition_prefix: &str,
+        page_cache_config: PageCacheConfig,
+    ) -> Result<UtxoDb<E>, Fatal> {
         let config = utxo_db_config(
             context,
-            &self.partition_prefix,
-            self.page_cache.size,
-            self.page_cache.count,
+            partition_prefix,
+            page_cache_config.size,
+            page_cache_config.count,
         );
-        match UtxoDb::init(context.with_label("utxo_db"), config).await {
-            Ok(db) => {
-                self.db = Some(db);
-                self.bootstrap_genesis_state_if_empty(context).await;
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "QMDB initialization failed; running without persistence"
-                );
-            }
-        }
+        UtxoDb::init(context.with_label("utxo_db"), config)
+            .await
+            .map_err(|err| Fatal(format!("QMDB initialization failed: {err:?}")))
     }
 
-    async fn sync_db_on_shutdown(&mut self) {
-        if let Some(queue) = self.queue.as_mut()
-            && let Err(err) = queue.sync().await
-        {
-            warn!(?err, "persistence queue sync on shutdown failed");
-        }
-        if let Some(mut db) = self.db.take()
-            && let Err(err) = db.sync().await
-        {
-            warn!(?err, "QMDB sync on shutdown failed");
-        }
-        if let Some(index) = self.anchor_index.as_mut()
-            && let Err(err) = index.sync().await
-        {
-            warn!(?err, "anchor index sync on shutdown failed");
-        }
-        if let Some(index) = self.finalization_index.as_mut()
-            && let Err(err) = index.sync().await
-        {
-            warn!(?err, "finalization index sync on shutdown failed");
-        }
-        if let Some(index) = self.payload_index.as_mut()
-            && let Err(err) = index.sync().await
-        {
-            warn!(?err, "payload index sync on shutdown failed");
-        }
+    async fn sync_on_shutdown(&mut self) -> Result<(), Fatal> {
+        self.queue.sync().await.map_err(|err| {
+            Fatal(format!(
+                "persistence queue sync on shutdown failed: {err:?}"
+            ))
+        })?;
+        self.db.sync().await.map_err(|err| {
+            Fatal(format!("QMDB sync on shutdown failed: {err:?}"))
+        })?;
+        self.anchor_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "anchor index sync on shutdown failed: {err:?}"
+            ))
+        })?;
+        self.finalization_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "finalization index sync on shutdown failed: {err:?}"
+            ))
+        })?;
+        self.payload_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "payload index sync on shutdown failed: {err:?}"
+            ))
+        })
     }
 }
