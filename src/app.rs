@@ -599,6 +599,14 @@ where
             }
         }
         self.drain_persistable_payloads_to_worker();
+
+        // Run maintenance after every mailbox message (replaces the old periodic
+        // ticker).  Called here rather than inside core.on_message so it gets its
+        // own stack frame and doesn't compound with the primary handler's stack.
+        let now = context.current().epoch_millis();
+        let mut maintenance_effects = core::CoreEffects::new();
+        self.core.run_maintenance(now, &mut maintenance_effects);
+        self.apply_core_effects(maintenance_effects).await;
     }
 
     pub(crate) fn start(mut self) -> (Handle<()>, AppMailbox) {

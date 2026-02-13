@@ -217,12 +217,18 @@ impl AppCore {
                 );
             }
         }
-        // Inline maintenance: run after every message instead of on a timer.
-        self.drain_coding_events(now, &mut effects);
-        self.expire_waiters(now, &mut effects);
-        self.retry_dependency_fetches(&mut effects);
-        self.retry_pending_finalizations(&mut effects);
         effects
+    }
+
+    /// Run periodic maintenance (waiter expiry, dependency fetches, finalization
+    /// retries).  Called by the Application actor after every mailbox message
+    /// instead of on a timer, keeping the application purely event-driven while
+    /// maintaining a separate stack frame from the primary message handler.
+    pub(super) fn run_maintenance(&mut self, now: u64, effects: &mut CoreEffects) {
+        self.drain_coding_events(now, effects);
+        self.expire_waiters(now, effects);
+        self.retry_dependency_fetches(effects);
+        self.retry_pending_finalizations(effects);
     }
 
     pub(super) fn on_shard_message<F>(
