@@ -10,7 +10,7 @@ use commonware_parallel::Strategy;
 use futures::{StreamExt, channel::mpsc};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
-use tracing::Span;
+use tracing::{Span, info};
 
 pub(super) enum Command {
     Reshard {
@@ -99,7 +99,7 @@ impl<S: Strategy> Scheduler<S> {
     }
 
     pub(super) async fn run(mut self) {
-        debug!(
+        info!(
             minimum_shards = self.coding_config.minimum_shards,
             extra_shards = self.coding_config.extra_shards,
             "coding scheduler started"
@@ -170,6 +170,7 @@ impl<S: Strategy> Scheduler<S> {
                 .scheduler_batch_duration_ns
                 .set(start.elapsed().as_nanos() as i64);
 
+            info!(task_count, "coding scheduler batch completed");
             // Send results back, preserving the caller's span.
             for (event, parent_span) in results {
                 if self

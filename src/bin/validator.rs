@@ -406,6 +406,14 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
     let me = private_key.public_key();
     let validator_pubkey = hex::encode(me.encode());
     let tracer_provider = init_tracing(&validator_pubkey, log_json.as_deref())?;
+
+    let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
+    info!(
+        git_rev,
+        version = env!("CARGO_PKG_VERSION"),
+        "hellas validator starting",
+    );
+
     let participants = node_config.participants()?;
     let peer_map = node_config.peer_address_map()?;
 

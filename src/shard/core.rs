@@ -14,7 +14,7 @@ use commonware_runtime::{Handle, Metrics, Spawner};
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
 use std::collections::{HashMap, VecDeque};
-use tracing::{debug, info_span, warn};
+use tracing::{info, info_span, warn};
 
 #[derive(Clone)]
 pub(crate) enum ShardEffect {
@@ -124,7 +124,7 @@ impl<S: Strategy> ShardRecoverer<S> {
             drained += 1;
         }
         if drained > 0 {
-            debug!(
+            info!(
                 drained,
                 recoveries = effects.iter().filter(|e| matches!(e, ShardEffect::Recovered { .. })).count(),
                 "drained coding events"
@@ -408,7 +408,9 @@ impl<S: Strategy> ShardRecoverer<S> {
                         | WireShardMessage::PayloadResponse { .. } => {}
                     }
                 }
-                RecoveryOutput::BufferedPreLeader => {}
+                RecoveryOutput::BufferedPreLeader => {
+                    info!(payload = ?key.digest, "shard message buffered pre-leader");
+                }
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
@@ -425,8 +427,20 @@ impl<S: Strategy> ShardRecoverer<S> {
         shard_index: u16,
     ) -> VecDeque<ShardEffect> {
         if sender != expected_leader || shard_index != self.my_index {
+            info!(
+                payload = ?key.digest,
+                shard_index,
+                my_index = self.my_index,
+                sender_is_leader = (sender == expected_leader),
+                "handle_initial: rejecting initial shard"
+            );
             return VecDeque::new();
         }
+        info!(
+            payload = ?key.digest,
+            shard_index,
+            "handle_initial: accepted initial shard, dispatching reshard"
+        );
 
         let shard_hash = hash_encoded(&shard);
         let mut effects = VecDeque::new();
