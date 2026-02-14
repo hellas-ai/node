@@ -4,8 +4,10 @@ use super::protocol::{
     ZodaCommitment, ZodaReShard, ZodaShard, hash_encoded,
 };
 use super::recovery::{
-    ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
+    ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine,
+    RecoveryOutput,
 };
+use crate::gauged::GaugedBinaryHeap;
 use crate::trace::Traced;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
@@ -14,8 +16,9 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Metrics, Spawner};
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use prometheus_client::metrics::gauge::Gauge;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use tracing::{Span, info, info_span, warn};
 
@@ -106,15 +109,15 @@ enum CodingResult {
 // ---------------------------------------------------------------------------
 
 struct SharedQueue {
-    inner: Mutex<BinaryHeap<CodingTask>>,
+    inner: Mutex<GaugedBinaryHeap<CodingTask>>,
     not_empty: Condvar,
     closed: AtomicBool,
 }
 
 impl SharedQueue {
-    fn new() -> Self {
+    fn new(gauge: Gauge<i64, AtomicI64>) -> Self {
         Self {
-            inner: Mutex::new(BinaryHeap::new()),
+            inner: Mutex::new(GaugedBinaryHeap::new(gauge)),
             not_empty: Condvar::new(),
             closed: AtomicBool::new(false),
         }
@@ -143,10 +146,6 @@ impl SharedQueue {
     fn close(&self) {
         self.closed.store(true, AtomicOrdering::Release);
         self.not_empty.notify_all();
-    }
-
-    fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
     }
 }
 
@@ -266,11 +265,11 @@ impl<S: Strategy> Drop for ShardRecoverer<S> {
 }
 
 impl<S: Strategy> ShardRecoverer<S> {
-    const MAX_RECOVERY_ENTRIES: usize = 8192;
+    const MAX_BUFFERED_KEYS: usize = 256;
+    const MAX_ANNOUNCED_KEYS: usize = 4096;
+    const MAX_RECOVERING: usize = 8192;
     const MAX_BUFFERED_RESHARDS: usize = 128;
-    const MAX_PRE_LEADER_MESSAGES: usize = 128;
-    const MAX_PRE_LEADER_KEYS: usize = 256;
-    const MAX_KNOWN_KEYS: usize = 4096;
+    const MAX_BUFFERED_MESSAGES: usize = 128;
 
     pub(crate) fn new(
         me: &PublicKey,
@@ -280,7 +279,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         context: &(impl Spawner + Metrics + Clone),
     ) -> Self {
         let metrics = ShardMetrics::register(&context.with_label("shard"));
-        let queue = Arc::new(SharedQueue::new());
+        let queue = Arc::new(SharedQueue::new(metrics.scheduler_queue_depth.clone()));
         let (event_tx, coding_event_rx) = mpsc::unbounded();
         let num_workers = strategy.parallelism_hint();
         let workers =
@@ -291,13 +290,18 @@ impl<S: Strategy> ShardRecoverer<S> {
             my_index,
             coding_config,
             strategy,
-            machine: RecoveryMachine::new(RecoveryLimits {
-                max_known_keys: Self::MAX_KNOWN_KEYS,
-                max_recovery_entries: Self::MAX_RECOVERY_ENTRIES,
-                max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
-                max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
-                max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
-            }),
+            machine: RecoveryMachine::new(
+                RecoveryLimits {
+                    max_buffered_keys: Self::MAX_BUFFERED_KEYS,
+                    max_announced_keys: Self::MAX_ANNOUNCED_KEYS,
+                    max_recovering: Self::MAX_RECOVERING,
+                    max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
+                    max_buffered_messages: Self::MAX_BUFFERED_MESSAGES,
+                },
+                metrics.pre_leader_keys.clone(),
+                metrics.known_keys.clone(),
+                metrics.active_recoveries.clone(),
+            ),
             metrics,
             queue,
             coding_event_rx,
@@ -333,9 +337,6 @@ impl<S: Strategy> ShardRecoverer<S> {
             drained += 1;
         }
         if drained > 0 {
-            self.metrics
-                .scheduler_queue_depth
-                .set(self.queue.len() as i64);
             info!(
                 drained,
                 recoveries = effects.iter().filter(|e| matches!(e, ShardEffect::Recovered { .. })).count(),
@@ -415,7 +416,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, effects),
             }
         }
-        self.sync_machine_gauges();
+
 
         effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
             &self.me,
@@ -457,7 +458,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         }) {
             self.push_machine_effect(output, key, effects);
         }
-        self.sync_machine_gauges();
+
         if let Some(effect) = self.try_recover(key) {
             effects.push_back(effect);
         }
@@ -484,9 +485,6 @@ impl<S: Strategy> ShardRecoverer<S> {
             },
         });
         self.metrics.coding_tasks_dispatched_total.inc();
-        self.metrics
-            .scheduler_queue_depth
-            .set(self.queue.len() as i64);
     }
 
     fn dispatch_check(&self, task: ReadyToCheckTask) {
@@ -502,50 +500,48 @@ impl<S: Strategy> ShardRecoverer<S> {
             },
         });
         self.metrics.coding_tasks_dispatched_total.inc();
-        self.metrics
-            .scheduler_queue_depth
-            .set(self.queue.len() as i64);
     }
 
     // ---- Message handling ----
 
-    pub(crate) fn note_known_key(
+    pub(crate) fn announce_leader(
         &mut self,
         key: BlockKey,
         leader: &PublicKey,
     ) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
         let mut drained = Vec::new();
         let mut effects = VecDeque::new();
-        for output in self.machine.step(RecoveryInput::NoteKnownKey {
+        for output in self.machine.step(RecoveryInput::AnnounceLeader {
             key,
             leader: leader.clone(),
         }) {
             match output {
-                RecoveryOutput::DrainedPreLeader(messages) => drained.extend(messages),
-                RecoveryOutput::KnownKeyEvicted { key: evicted } => {
+                RecoveryOutput::Drained(messages) => drained.extend(messages),
+                RecoveryOutput::Evicted { key: evicted } => {
                     self.metrics.recovery_evictions_total.inc();
                     effects.push_back(ShardEffect::Failed { key: evicted });
                 }
                 _ => {}
             }
         }
-        self.sync_machine_gauges();
+
         (drained, effects)
     }
 
-    pub(crate) fn handle_message<F>(
+    pub(crate) fn handle_message<H, F>(
         &mut self,
         message: ShardMessage,
-        seen: &HashMap<Digest, Bytes>,
+        has_payload: H,
         validator_index: F,
     ) -> VecDeque<ShardEffect>
     where
+        H: Fn(&Digest) -> bool,
         F: Fn(&PublicKey) -> Option<u16>,
     {
         let Some(key) = message.key() else {
             return VecDeque::new();
         };
-        if seen.contains_key(&key.digest) {
+        if has_payload(&key.digest) {
             return VecDeque::new();
         }
         let span = info_span!(
@@ -573,7 +569,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         let outputs = self.machine.step(RecoveryInput::IngressMessage {
             message: Box::new(message),
         });
-        self.sync_machine_gauges();
+
 
         for output in outputs {
             match output {
@@ -616,7 +612,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                         | WireShardMessage::PayloadResponse { .. } => {}
                     }
                 }
-                RecoveryOutput::BufferedPreLeader => {
+                RecoveryOutput::Buffered => {
                     info!(payload = ?key.digest, "shard message buffered pre-leader");
                 }
                 other => self.push_machine_effect(other, key, &mut effects),
@@ -666,7 +662,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
-        self.sync_machine_gauges();
+
         if !accepted {
             return effects;
         }
@@ -719,7 +715,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
-        self.sync_machine_gauges();
+
 
         effects
     }
@@ -745,7 +741,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 }
             }
         }
-        self.sync_machine_gauges();
+
         let decode_candidate = decode_candidate?;
 
         let reconstructed = match CodingImpl::decode(
@@ -796,13 +792,6 @@ impl<S: Strategy> ShardRecoverer<S> {
         }
     }
 
-    /// Update recovery machine gauges. Called after machine.step() calls that
-    /// may add or remove entries.
-    fn sync_machine_gauges(&self) {
-        self.metrics.active_recoveries.set(self.machine.active_count() as i64);
-        self.metrics.known_keys.set(self.machine.known_keys_count() as i64);
-        self.metrics.pre_leader_keys.set(self.machine.pre_leader_keys_count() as i64);
-    }
 
     fn machine_output_to_effect(
         &self,
@@ -814,16 +803,10 @@ impl<S: Strategy> ShardRecoverer<S> {
                 warn!(
                     evicted = ?key,
                     incoming = ?incoming,
-                    max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
-                    "evicting oldest recovery entry to admit new recovery"
+                    "evicting oldest entry to admit new entry"
                 );
                 self.metrics.recovery_evictions_total.inc();
                 Some(ShardEffect::Failed { key })
-            }
-            RecoveryOutput::KnownKeyEvicted { key } => {
-                // Handled directly in note_known_key; should not reach here.
-                warn!(evicted = ?key, "unexpected KnownKeyEvicted in machine_output_to_effect");
-                None
             }
             RecoveryOutput::CommitmentMismatch {
                 key,
@@ -859,8 +842,8 @@ impl<S: Strategy> ShardRecoverer<S> {
                 None
             }
             RecoveryOutput::DuplicateShard
-            | RecoveryOutput::BufferedPreLeader
-            | RecoveryOutput::DrainedPreLeader(_)
+            | RecoveryOutput::Buffered
+            | RecoveryOutput::Drained(_)
             | RecoveryOutput::IngressReady { .. }
             | RecoveryOutput::InitialAccepted
             | RecoveryOutput::ReShareBuffered
@@ -878,6 +861,7 @@ mod tests {
     use commonware_cryptography::{Signer, ed25519};
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner, Spawner, deterministic};
+    use std::collections::HashMap;
     use std::time::Duration;
 
     struct BlockArtifacts {
@@ -923,15 +907,15 @@ mod tests {
         fn handle_message(
             &mut self,
             message: ShardMessage,
-            seen: &HashMap<Digest, Bytes>,
+            has_payload: impl Fn(&Digest) -> bool,
         ) -> VecDeque<ShardEffect> {
             let index_by_validator = &self.index_by_validator;
             self.recoverer
-                .handle_message(message, seen, |pk| index_by_validator.get(pk).copied())
+                .handle_message(message, has_payload, |pk| index_by_validator.get(pk).copied())
         }
 
-        fn note_known_key(&mut self, key: BlockKey) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
-            self.recoverer.note_known_key(key, &self.leader)
+        fn announce_leader(&mut self, key: BlockKey) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
+            self.recoverer.announce_leader(key, &self.leader)
         }
 
         fn make_artifacts(&self, view: u64, payload: &[u8]) -> BlockArtifacts {
@@ -964,7 +948,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn pre_leader_reshare_is_drained_after_note_known_key() {
+    fn pre_leader_reshare_is_drained_after_announce_leader() {
         let runner = deterministic::Runner::timed(Duration::from_secs(5));
         runner.start(|context| async move {
             let mut fixture = Fixture::new(&context);
@@ -973,7 +957,7 @@ mod tests {
             let shard_index = 2u16;
             let reshare = artifacts.reshares[usize::from(shard_index)].clone();
 
-            let seen = HashMap::<Digest, Bytes>::new();
+            let no_payload = |_: &Digest| false;
             let buffered = fixture.handle_message(
                 ShardMessage::reshare(
                     &sender,
@@ -982,30 +966,30 @@ mod tests {
                     shard_index,
                     reshare,
                 ),
-                &seen,
+                &no_payload,
             );
             assert!(buffered.is_empty());
             assert!(fixture.recoverer.machine.inspect(
-                |_recovery, _known_leaders, pre_leader_buffer| {
-                    pre_leader_buffer.contains_key(&artifacts.key)
+                |_recovering, _announced, buffered| {
+                    buffered.contains_key(&artifacts.key)
                 }
             ));
 
-            let (drained, _eviction_effects) = fixture.note_known_key(artifacts.key);
+            let (drained, _eviction_effects) = fixture.announce_leader(artifacts.key);
             assert_eq!(drained.len(), 1);
 
             for msg in drained {
-                let effects = fixture.handle_message(msg, &seen);
+                let effects = fixture.handle_message(msg, &no_payload);
                 assert!(effects.is_empty());
             }
             assert!(!fixture.recoverer.machine.inspect(
-                |_recovery, _known_leaders, pre_leader_buffer| {
-                    pre_leader_buffer.contains_key(&artifacts.key)
+                |_recovering, _announced, buffered| {
+                    buffered.contains_key(&artifacts.key)
                 }
             ));
             let buffered_reshards_len = fixture.recoverer.machine.inspect(
-                |recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery
+                |recovering, _announced, _buffered| {
+                    recovering
                         .get(&artifacts.key)
                         .map(|recovery| recovery.buffered_reshards_len())
                 },
@@ -1027,8 +1011,8 @@ mod tests {
             let bad = fixture.make_artifacts(2, b"bad-payload");
             let attacker = fixture.validators[3].clone();
 
-            let _ = fixture.note_known_key(good.key);
-            let seen = HashMap::<Digest, Bytes>::new();
+            let _ = fixture.announce_leader(good.key);
+            let no_payload = |_: &Digest| false;
 
             let malicious = fixture.handle_message(
                 ShardMessage::initial(
@@ -1038,11 +1022,11 @@ mod tests {
                     bad.shards[usize::from(fixture.my_index)].clone(),
                     fixture.my_index,
                 ),
-                &seen,
+                &no_payload,
             );
             assert!(malicious.is_empty());
             assert!(!fixture.recoverer.machine.inspect(
-                |recovery, _known_leaders, _pre_leader_buffer| { recovery.contains_key(&good.key) }
+                |recovering, _announced, _buffered| { recovering.contains_key(&good.key) }
             ));
 
             let _ = fixture.handle_message(
@@ -1053,11 +1037,11 @@ mod tests {
                     good.shards[usize::from(fixture.my_index)].clone(),
                     fixture.my_index,
                 ),
-                &seen,
+                &no_payload,
             );
             let commitment = fixture.recoverer.machine.inspect(
-                |recovery, _known_leaders, _pre_leader_buffer| {
-                    recovery
+                |recovering, _announced, _buffered| {
+                    recovering
                         .get(&good.key)
                         .map(|recovery| recovery.commitment())
                 },

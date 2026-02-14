@@ -1,10 +1,12 @@
 use super::protocol::{
     BlockKey, ShardMessage, ZodaCheckedShard, ZodaCheckingData, ZodaCommitment, ZodaReShard,
 };
+use crate::gauged::GaugedIndexMap;
 use commonware_cryptography::sha256::Digest;
 use hellas_types::PublicKey;
-use indexmap::IndexMap;
+use prometheus_client::metrics::gauge::Gauge;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicI64;
 
 #[derive(Clone)]
 struct BufferedReShare {
@@ -81,6 +83,10 @@ impl RecoveryState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
 pub(super) struct ReadyToCheckTask {
     pub(super) key: BlockKey,
     pub(super) commitment: ZodaCommitment,
@@ -96,17 +102,19 @@ pub(super) struct DecodeCandidate {
     pub(super) checked_shards: Vec<ZodaCheckedShard>,
 }
 
+/// Per-tier capacity limits. Each tier evicts independently so one tier
+/// cannot starve another under adversarial or high-latency conditions.
 #[derive(Clone, Copy)]
 pub(super) struct RecoveryLimits {
-    pub(super) max_known_keys: usize,
-    pub(super) max_recovery_entries: usize,
+    pub(super) max_buffered_keys: usize,
+    pub(super) max_announced_keys: usize,
+    pub(super) max_recovering: usize,
     pub(super) max_buffered_reshards: usize,
-    pub(super) max_pre_leader_messages: usize,
-    pub(super) max_pre_leader_keys: usize,
+    pub(super) max_buffered_messages: usize,
 }
 
 pub(super) enum RecoveryInput {
-    NoteKnownKey {
+    AnnounceLeader {
         key: BlockKey,
         leader: PublicKey,
     },
@@ -155,12 +163,9 @@ pub(super) enum RecoveryOutput {
         message: Box<ShardMessage>,
         expected_leader: PublicKey,
     },
-    BufferedPreLeader,
-    DrainedPreLeader(Vec<ShardMessage>),
+    Buffered,
+    Drained(Vec<ShardMessage>),
     Evicted {
-        key: BlockKey,
-    },
-    KnownKeyEvicted {
         key: BlockKey,
     },
     InitialAccepted,
@@ -182,34 +187,55 @@ pub(super) enum RecoveryOutput {
     },
 }
 
+// ---------------------------------------------------------------------------
+// RecoveryMachine — three maps, one key per map, independent eviction
+// ---------------------------------------------------------------------------
+
 pub(super) struct RecoveryMachine {
-    recovery: IndexMap<BlockKey, RecoveryState>,
-    known_leaders: IndexMap<BlockKey, PublicKey>,
-    pre_leader_buffer: IndexMap<BlockKey, VecDeque<ShardMessage>>,
+    /// Shard messages that arrived before the leader was announced.
+    buffered: GaugedIndexMap<BlockKey, VecDeque<ShardMessage>>,
+    /// Leader announced by consensus; no shard processing started.
+    announced: GaugedIndexMap<BlockKey, PublicKey>,
+    /// Active shard reconstruction.
+    recovering: GaugedIndexMap<BlockKey, RecoveryState>,
     limits: RecoveryLimits,
 }
 
 impl RecoveryMachine {
-    pub(super) fn new(limits: RecoveryLimits) -> Self {
+    pub(super) fn new(
+        limits: RecoveryLimits,
+        buffered_gauge: Gauge<i64, AtomicI64>,
+        announced_gauge: Gauge<i64, AtomicI64>,
+        recovering_gauge: Gauge<i64, AtomicI64>,
+    ) -> Self {
         Self {
-            recovery: IndexMap::new(),
-            known_leaders: IndexMap::new(),
-            pre_leader_buffer: IndexMap::new(),
+            buffered: GaugedIndexMap::new(buffered_gauge),
+            announced: GaugedIndexMap::new(announced_gauge),
+            recovering: GaugedIndexMap::new(recovering_gauge),
             limits,
         }
     }
 
     pub(super) fn step(&mut self, input: RecoveryInput) -> Vec<RecoveryOutput> {
         match input {
-            RecoveryInput::NoteKnownKey { key, leader } => {
-                self.known_leaders.insert(key, leader);
+            RecoveryInput::AnnounceLeader { key, leader } => {
                 let mut outputs = Vec::new();
-                if let Some(drained) = self.pre_leader_buffer.shift_remove(&key) {
-                    outputs.push(RecoveryOutput::DrainedPreLeader(
-                        drained.into_iter().collect(),
-                    ));
+
+                if self.recovering.contains_key(&key) {
+                    return outputs;
                 }
-                outputs.extend(self.evict_known_keys());
+
+                if let Some(messages) = self.buffered.shift_remove(&key) {
+                    self.announced.insert(key, leader);
+                    outputs.push(RecoveryOutput::Drained(messages.into_iter().collect()));
+                } else if !self.announced.contains_key(&key) {
+                    self.announced.insert(key, leader);
+                }
+
+                for (oldest, _) in self.announced.enforce_capacity(self.limits.max_announced_keys) {
+                    outputs.push(RecoveryOutput::Evicted { key: oldest });
+                }
+
                 outputs
             }
             RecoveryInput::IngressMessage { message } => {
@@ -217,20 +243,31 @@ impl RecoveryMachine {
                 let Some(key) = message.key() else {
                     return Vec::new();
                 };
-                if !self.has_known_or_recovery(&key) {
-                    self.buffer_pre_leader_message(key, message);
-                    return vec![RecoveryOutput::BufferedPreLeader];
+
+                // Check announced and recovering for expected leader.
+                if let Some(leader) = self.announced.get(&key).cloned() {
+                    return vec![RecoveryOutput::IngressReady {
+                        message: Box::new(message),
+                        expected_leader: leader,
+                    }];
+                }
+                if let Some(recovery) = self.recovering.get(&key) {
+                    return vec![RecoveryOutput::IngressReady {
+                        message: Box::new(message),
+                        expected_leader: recovery.leader.clone(),
+                    }];
                 }
 
-                let Some(expected_leader) = self.expected_leader(key) else {
-                    self.buffer_pre_leader_message(key, message);
-                    return vec![RecoveryOutput::BufferedPreLeader];
-                };
+                // No leader known — buffer.
+                let queue = self.buffered.entry(key).or_default();
+                if queue.len() >= self.limits.max_buffered_messages {
+                    queue.pop_front();
+                }
+                queue.push_back(message);
 
-                vec![RecoveryOutput::IngressReady {
-                    message: Box::new(message),
-                    expected_leader,
-                }]
+                self.buffered.enforce_capacity(self.limits.max_buffered_keys);
+
+                vec![RecoveryOutput::Buffered]
             }
             RecoveryInput::ObserveInitial {
                 key,
@@ -240,15 +277,12 @@ impl RecoveryMachine {
                 shard_hash,
                 leader,
             } => {
-                let mut outputs = self.ensure_recovery_state(key, commitment, leader);
-                let Some(recovery) = self.recovery.get_mut(&key) else {
+                let mut outputs = self.ensure_recovering(key, commitment, leader);
+                let Some(recovery) = self.recovering.get_mut(&key) else {
                     return outputs;
                 };
 
                 if recovery.commitment != commitment {
-                    // Initial shard may arrive after a re-share path seeded this entry with a
-                    // commitment but before any checking data exists. Allow replacing that
-                    // provisional commitment until validation has materially progressed.
                     if recovery.checking_data.is_none() && recovery.checked_shards.is_empty() {
                         recovery.commitment = commitment;
                     } else {
@@ -283,7 +317,7 @@ impl RecoveryMachine {
                 checking_data,
                 checked_shard,
             } => {
-                let Some(recovery) = self.recovery.get_mut(&key) else {
+                let Some(recovery) = self.recovering.get_mut(&key) else {
                     return Vec::new();
                 };
 
@@ -338,8 +372,8 @@ impl RecoveryMachine {
                 reshard,
                 leader,
             } => {
-                let mut outputs = self.ensure_recovery_state(key, commitment, leader);
-                let Some(recovery) = self.recovery.get_mut(&key) else {
+                let mut outputs = self.ensure_recovering(key, commitment, leader);
+                let Some(recovery) = self.recovering.get_mut(&key) else {
                     return outputs;
                 };
 
@@ -396,7 +430,7 @@ impl RecoveryMachine {
                 shard_hash,
                 checked_shard,
             } => {
-                let Some(recovery) = self.recovery.get_mut(&key) else {
+                let Some(recovery) = self.recovering.get_mut(&key) else {
                     return Vec::new();
                 };
                 if matches!(
@@ -412,23 +446,21 @@ impl RecoveryMachine {
                 key,
                 minimum_shards,
             } => {
-                let decode_ready = self.recovery.get(&key).is_some_and(|recovery| {
+                let decode_ready = self.recovering.get(&key).is_some_and(|recovery| {
                     recovery.has_minimum_shards(minimum_shards) && recovery.checking_data.is_some()
                 });
                 if !decode_ready {
                     return Vec::new();
                 }
 
-                let Some(mut recovery) = self.recovery.shift_remove(&key) else {
+                let Some(mut recovery) = self.recovering.shift_remove(&key) else {
                     return Vec::new();
                 };
                 let Some(checking_data) = recovery.checking_data.take() else {
-                    self.recovery.insert(key, recovery);
+                    self.recovering.insert(key, recovery);
                     return Vec::new();
                 };
 
-                self.pre_leader_buffer.shift_remove(&key);
-                self.known_leaders.shift_remove(&key);
                 vec![RecoveryOutput::ReadyToDecode(DecodeCandidate {
                     commitment: recovery.commitment,
                     checking_data,
@@ -438,100 +470,53 @@ impl RecoveryMachine {
         }
     }
 
-    fn has_known_or_recovery(&self, key: &BlockKey) -> bool {
-        self.known_leaders.contains_key(key) || self.recovery.contains_key(key)
-    }
+    // ---- Helpers ----
 
-    fn expected_leader(&self, key: BlockKey) -> Option<PublicKey> {
-        self.known_leaders.get(&key).cloned().or_else(|| {
-            self.recovery
-                .get(&key)
-                .map(|recovery| recovery.leader.clone())
-        })
-    }
-
-    fn ensure_recovery_state(
+    /// Ensure a `recovering` entry exists for `key`. Promotes from
+    /// `announced` if present. Evicts oldest recovering entry if at
+    /// capacity.
+    fn ensure_recovering(
         &mut self,
         key: BlockKey,
         commitment: ZodaCommitment,
         leader: PublicKey,
     ) -> Vec<RecoveryOutput> {
-        if self.recovery.contains_key(&key) {
+        if self.recovering.contains_key(&key) {
             return Vec::new();
         }
 
-        let mut outputs = Vec::new();
+        // Promote: remove from announced or buffered (key lives in one map).
+        self.announced.shift_remove(&key);
+        self.buffered.shift_remove(&key);
 
-        // Capacity-based FIFO eviction. The effective staleness window
-        // self-tunes: it equals max_recovery_entries / view_rate.
-        while self.recovery.len() >= self.limits.max_recovery_entries {
-            let Some((oldest, _state)) = self.recovery.shift_remove_index(0) else {
-                break;
-            };
-            self.pre_leader_buffer.shift_remove(&oldest);
-            self.known_leaders.shift_remove(&oldest);
+        // Insert then evict so the new entry survives (it's at the tail).
+        self.recovering
+            .insert(key, RecoveryState::new(commitment, leader));
+        let mut outputs = Vec::new();
+        for (oldest, _) in self.recovering.enforce_capacity(self.limits.max_recovering) {
             outputs.push(RecoveryOutput::Evicted { key: oldest });
         }
-
-        self.recovery
-            .insert(key, RecoveryState::new(commitment, leader));
-        outputs
-    }
-
-    fn buffer_pre_leader_message(&mut self, key: BlockKey, message: ShardMessage) {
-        let queue = self.pre_leader_buffer.entry(key).or_default();
-        if queue.len() >= self.limits.max_pre_leader_messages {
-            queue.pop_front();
-        }
-        queue.push_back(message);
-
-        while self.pre_leader_buffer.len() > self.limits.max_pre_leader_keys {
-            let Some((_oldest, _queue)) = self.pre_leader_buffer.shift_remove_index(0) else {
-                break;
-            };
-        }
-    }
-
-    fn evict_known_keys(&mut self) -> Vec<RecoveryOutput> {
-        let mut outputs = Vec::new();
-        while self.known_leaders.len() > self.limits.max_known_keys {
-            let Some((oldest, _leader)) = self.known_leaders.shift_remove_index(0) else {
-                break;
-            };
-            self.pre_leader_buffer.shift_remove(&oldest);
-            if self.recovery.shift_remove(&oldest).is_some() {
-                outputs.push(RecoveryOutput::KnownKeyEvicted { key: oldest });
-            }
-        }
         outputs
     }
 }
 
-impl RecoveryMachine {
-    pub(crate) fn active_count(&self) -> usize {
-        self.recovery.len()
-    }
-
-    pub(crate) fn known_keys_count(&self) -> usize {
-        self.known_leaders.len()
-    }
-
-    pub(crate) fn pre_leader_keys_count(&self) -> usize {
-        self.pre_leader_buffer.len()
-    }
-}
+// ---- Test support ----
 
 #[cfg(test)]
 impl RecoveryMachine {
+    pub(super) fn with_limits(limits: RecoveryLimits) -> Self {
+        Self::new(limits, Default::default(), Default::default(), Default::default())
+    }
+
     pub(super) fn inspect<R>(
         &self,
         f: impl FnOnce(
-            &IndexMap<BlockKey, RecoveryState>,
-            &IndexMap<BlockKey, PublicKey>,
-            &IndexMap<BlockKey, VecDeque<ShardMessage>>,
+            &indexmap::IndexMap<BlockKey, RecoveryState>,
+            &indexmap::IndexMap<BlockKey, PublicKey>,
+            &indexmap::IndexMap<BlockKey, VecDeque<ShardMessage>>,
         ) -> R,
     ) -> R {
-        f(&self.recovery, &self.known_leaders, &self.pre_leader_buffer)
+        f(&*self.recovering, &*self.announced, &*self.buffered)
     }
 }
 
@@ -585,18 +570,18 @@ mod tests {
         fn recovery_machine_step_preserves_bounds(
             events in prop::collection::vec((0u8..3u8, any::<u16>(), any::<u64>(), 0u16..6u16), 1..120)
         ) {
-            const MAX_PRE_LEADER_MESSAGES: usize = 4;
-            const MAX_PRE_LEADER_KEYS: usize = 6;
-            const MAX_KNOWN_KEYS: usize = 8;
-            const MAX_RECOVERY_ENTRIES: usize = 5;
+            const MAX_BUFFERED_MESSAGES: usize = 4;
+            const MAX_BUFFERED_KEYS: usize = 6;
+            const MAX_ANNOUNCED_KEYS: usize = 8;
+            const MAX_RECOVERING: usize = 5;
             const MAX_BUFFERED_RESHARDS: usize = 3;
 
-            let mut machine = RecoveryMachine::new(RecoveryLimits {
-                max_known_keys: MAX_KNOWN_KEYS,
-                max_recovery_entries: MAX_RECOVERY_ENTRIES,
-                max_buffered_reshards: MAX_BUFFERED_RESHARDS,
-                max_pre_leader_messages: MAX_PRE_LEADER_MESSAGES,
-                max_pre_leader_keys: MAX_PRE_LEADER_KEYS,
+            let mut machine = RecoveryMachine::with_limits(RecoveryLimits {
+                    max_buffered_keys: MAX_BUFFERED_KEYS,
+                    max_announced_keys: MAX_ANNOUNCED_KEYS,
+                    max_recovering: MAX_RECOVERING,
+                    max_buffered_reshards: MAX_BUFFERED_RESHARDS,
+                    max_buffered_messages: MAX_BUFFERED_MESSAGES,
             });
             let leader = ed25519::PrivateKey::from_seed(42).public_key();
 
@@ -619,7 +604,7 @@ mod tests {
                         });
                     }
                     1 => {
-                        let _ = machine.step(RecoveryInput::NoteKnownKey {
+                        let _ = machine.step(RecoveryInput::AnnounceLeader {
                             key,
                             leader: leader.clone(),
                         });
@@ -638,41 +623,34 @@ mod tests {
                 }
 
                 let (
-                    pre_leader_key_len,
-                    pre_leader_max_messages,
-                    recovery_len,
-                    max_buffered_reshards,
-                    known_len,
-                    known_non_recovery_count,
-                ) = machine.inspect(|recovery, known_leaders, pre_leader_buffer| {
+                    buffered_key_len,
+                    buffered_max_messages,
+                    recovering_len,
+                    max_reshards,
+                    announced_len,
+                ) = machine.inspect(|recovering, announced, buffered| {
                     (
-                        pre_leader_buffer.len(),
-                        pre_leader_buffer
+                        buffered.len(),
+                        buffered
                             .values()
                             .map(VecDeque::len)
                             .max()
                             .unwrap_or(0),
-                        recovery.len(),
-                        recovery
+                        recovering.len(),
+                        recovering
                             .values()
-                            .map(|recovery| recovery.buffered_reshards.len())
+                            .map(|r| r.buffered_reshards.len())
                             .max()
                             .unwrap_or(0),
-                        known_leaders.len(),
-                        known_leaders
-                            .iter()
-                            .filter(|(key, _)| !recovery.contains_key(*key))
-                            .count(),
+                        announced.len(),
                     )
                 });
 
-                prop_assert!(pre_leader_key_len <= MAX_PRE_LEADER_KEYS);
-                prop_assert!(pre_leader_max_messages <= MAX_PRE_LEADER_MESSAGES);
-                prop_assert!(recovery_len <= MAX_RECOVERY_ENTRIES);
-                prop_assert!(max_buffered_reshards <= MAX_BUFFERED_RESHARDS);
-                if known_len > MAX_KNOWN_KEYS {
-                    prop_assert_eq!(known_non_recovery_count, 0);
-                }
+                prop_assert!(buffered_key_len <= MAX_BUFFERED_KEYS);
+                prop_assert!(buffered_max_messages <= MAX_BUFFERED_MESSAGES);
+                prop_assert!(recovering_len <= MAX_RECOVERING);
+                prop_assert!(announced_len <= MAX_ANNOUNCED_KEYS);
+                prop_assert!(max_reshards <= MAX_BUFFERED_RESHARDS);
             }
         }
 
@@ -733,12 +711,12 @@ mod tests {
         let my_index = 1u16;
         let helper_index = 2u16;
 
-        let mut machine = RecoveryMachine::new(RecoveryLimits {
-            max_known_keys: 1024,
-            max_recovery_entries: 64,
+        let mut machine = RecoveryMachine::with_limits(RecoveryLimits {
+            max_buffered_keys: 256,
+            max_announced_keys: 1024,
+            max_recovering: 64,
             max_buffered_reshards: 32,
-            max_pre_leader_messages: 64,
-            max_pre_leader_keys: 256,
+            max_buffered_messages: 64,
         });
         let initial_hash = hash_encoded(&shards[usize::from(my_index)]);
         let outputs = machine.step(RecoveryInput::ObserveInitial {

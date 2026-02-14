@@ -1,5 +1,6 @@
-use super::{mailbox, metrics::{PersistenceMetrics, gauge_set_len}};
+use super::{mailbox, metrics::PersistenceMetrics};
 use crate::execution::store::{UtxoDb, utxo_db_config};
+use crate::gauged::{GaugedIndexMap, GaugedVecDeque};
 use crate::execution::{FinalizationDiffs, genesis_state};
 use hellas_types::{Coin, ObjectId};
 use crate::trace::Traced;
@@ -22,7 +23,6 @@ use commonware_utils::{channel::oneshot, sequence::U64};
 use futures::{StreamExt, channel::mpsc};
 use tracing::Instrument;
 use hellas_types::PublicKey;
-use indexmap::IndexMap;
 use std::{
     collections::{HashMap, VecDeque},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
@@ -316,14 +316,14 @@ where
     store: UtxoStore<E>,
     queue: PersistenceQueue<E>,
     anchor_index: AnchorIndex<E>,
-    anchor_history: VecDeque<AnchorEntry>,
+    anchor_history: GaugedVecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
     finalization_index: Option<FinalizationIndex<E>>,
     finalization_cursors: HashMap<Digest, FreezerCursor>,
-    volatile_finalizations: IndexMap<Digest, mailbox::FinalizationResponse>,
+    volatile_finalizations: GaugedIndexMap<Digest, mailbox::FinalizationResponse>,
     payload_index: Option<PayloadIndex<E>>,
     payload_cursors: HashMap<Digest, FreezerCursor>,
-    volatile_payloads: IndexMap<Digest, Bytes>,
+    volatile_payloads: GaugedIndexMap<Digest, Bytes>,
 }
 
 impl<E> PersistenceWorker<E>
@@ -379,21 +379,24 @@ where
             store.apply_diffs(batch, None, "genesis bootstrap").await?;
         }
 
+        let mut anchor_history_gauged = GaugedVecDeque::new(metrics.anchor_history_entries.clone());
+        anchor_history_gauged.replace(anchor_history);
+
         Ok(Self {
             command_rx,
             event_tx,
-            metrics,
             store,
             queue,
             anchor_index,
-            anchor_history,
+            anchor_history: anchor_history_gauged,
             next_anchor_sequence,
             finalization_index: Some(finalization_index),
             finalization_cursors: HashMap::new(),
-            volatile_finalizations: IndexMap::new(),
+            volatile_finalizations: GaugedIndexMap::new(metrics.finalization_cache_entries.clone()),
             payload_index: Some(payload_index),
             payload_cursors: HashMap::new(),
-            volatile_payloads: IndexMap::new(),
+            volatile_payloads: GaugedIndexMap::new(metrics.payload_cache_entries.clone()),
+            metrics,
         })
     }
 
@@ -402,7 +405,6 @@ where
         if let Some(pos) = self.store.last_committed_position {
             self.metrics.utxo_committed_position.set(pos as i64);
         }
-        gauge_set_len(&self.metrics.anchor_history_entries, self.anchor_history.len());
         self.update_queue_depth().await;
         let root = self.store.root();
         if let Err(err) = self
@@ -725,13 +727,9 @@ where
 
     fn cache_finalization(&mut self, payload: Digest, finalization: mailbox::FinalizationResponse) {
         self.volatile_finalizations.insert(payload, finalization);
-        while self.volatile_finalizations.len() > Self::MAX_VOLATILE_FINALIZATIONS {
-            let Some((_oldest, _)) = self.volatile_finalizations.shift_remove_index(0) else {
-                break;
-            };
+        for _ in self.volatile_finalizations.enforce_capacity(Self::MAX_VOLATILE_FINALIZATIONS) {
             self.metrics.finalization_cache_evictions_total.inc();
         }
-        gauge_set_len(&self.metrics.finalization_cache_entries, self.volatile_finalizations.len());
     }
 
     async fn payload(&mut self, payload: Digest) -> Option<Bytes> {
@@ -759,13 +757,9 @@ where
 
     fn cache_payload(&mut self, payload: Digest, bytes: Bytes) {
         self.volatile_payloads.insert(payload, bytes);
-        while self.volatile_payloads.len() > Self::MAX_VOLATILE_PAYLOADS {
-            let Some((_oldest, _)) = self.volatile_payloads.shift_remove_index(0) else {
-                break;
-            };
+        for _ in self.volatile_payloads.enforce_capacity(Self::MAX_VOLATILE_PAYLOADS) {
             self.metrics.payload_cache_evictions_total.inc();
         }
-        gauge_set_len(&self.metrics.payload_cache_entries, self.volatile_payloads.len());
     }
 
     fn persisted_anchor_history(&self) -> Vec<(Digest, Digest)> {
@@ -810,14 +804,10 @@ where
             U64::new(sequence),
             Self::encode_anchor_record(payload, root),
         );
-        while self.anchor_history.len() > Self::MAX_ANCHOR_HISTORY {
-            let Some(oldest) = self.anchor_history.pop_front() else {
-                break;
-            };
+        for oldest in self.anchor_history.enforce_capacity(Self::MAX_ANCHOR_HISTORY) {
             self.anchor_index.remove(&U64::new(oldest.sequence));
             self.metrics.anchor_history_evictions_total.inc();
         }
-        gauge_set_len(&self.metrics.anchor_history_entries, self.anchor_history.len());
         self.anchor_index.sync().await.map_err(|err| {
             Fatal(format!(
                 "failed to sync persisted anchor index for {payload:?}: {err:?}"

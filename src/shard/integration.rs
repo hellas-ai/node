@@ -139,7 +139,7 @@ where
         let index_by_validator = self.index_by_validator.clone();
         let effects = {
             let node = &mut self.nodes[node_idx];
-            node.recoverer.handle_message(message, &node.seen, |pk| {
+            node.recoverer.handle_message(message, |d| node.seen.contains_key(d), |pk| {
                 index_by_validator.get(pk).copied()
             })
         };
@@ -178,7 +178,7 @@ where
             for node_idx in 0..self.nodes.len() {
                 let (drained, _effects) = self.nodes[node_idx]
                     .recoverer
-                    .note_known_key(distribution.key, &leader);
+                    .announce_leader(distribution.key, &leader);
                 for message in drained {
                     self.handle_message(node_idx, message, &mut recovered).await;
                 }

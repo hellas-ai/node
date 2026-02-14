@@ -217,7 +217,7 @@ fn bench_single_node_recovery(c: &mut Criterion) {
 fn bench_full_sync(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_sync");
     group.sample_size(10);
-    let target_views = 1000usize;
+    let target_views = 100usize;
     group.throughput(Throughput::Elements(target_views as u64));
     group.bench_function(
         BenchmarkId::from_parameter(format!("{N}v_{target_views}views")),
@@ -234,7 +234,7 @@ fn bench_full_sync(c: &mut Criterion) {
 fn bench_sustained_finalization(c: &mut Criterion) {
     let mut group = c.benchmark_group("sustained_finalization");
     group.sample_size(10);
-    for &target_views in &[5_000usize, 10_000] {
+    for &target_views in &[500usize, 1_000] {
         group.throughput(Throughput::Elements(target_views as u64));
         group.bench_function(
             BenchmarkId::from_parameter(format!("{N}v_{target_views}views")),

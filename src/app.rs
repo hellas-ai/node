@@ -415,12 +415,67 @@ where
         }
     }
 
-    async fn apply_core_effects(&mut self, effects: CoreEffects) {
-        for effect in effects.replies {
-            Self::apply_reply_effect(effect);
+    async fn apply_core_effects(&mut self, mut effects: CoreEffects, now: u64) {
+        let mut local_resolved_total = 0u64;
+        loop {
+            for effect in effects.replies {
+                Self::apply_reply_effect(effect);
+            }
+
+            let mut resolved_any = false;
+            let mut resolve_effects = core::CoreEffects::new();
+            for effect in effects.network {
+                // Before broadcasting a FetchPayload to the network, check whether
+                // the payload already exists in local persistence (Freezer).  After
+                // an unclean restart the `seen` map is empty but the Freezer still
+                // has every payload that was persisted before the crash.  Resolving
+                // locally avoids an expensive network round trip per ancestor.
+                if let NetworkEffect::BroadcastShard(ref message) = effect
+                    && let WireShardMessage::FetchPayload { digest } = &message.body
+                {
+                    if let Some(payload) = self.persistence.payload(*digest).await {
+                        self.core
+                            .resolve_payload_locally(*digest, payload, now, &mut resolve_effects);
+                        resolved_any = true;
+                        local_resolved_total += 1;
+                        continue;
+                    }
+                }
+                self.apply_network_effect(effect).await;
+            }
+
+            // Dispatch any reply effects produced by waiter retries during
+            // local resolution (e.g. verify responses for deferred verifications).
+            for effect in resolve_effects.replies {
+                Self::apply_reply_effect(effect);
+            }
+            for effect in resolve_effects.network {
+                self.apply_network_effect(effect).await;
+            }
+
+            if !resolved_any {
+                break;
+            }
+
+            if local_resolved_total % 1000 == 0 {
+                info!(
+                    local_resolved_total,
+                    "resolving payload dependencies from local persistence"
+                );
+            }
+
+            // Re-run maintenance so the core discovers the next missing ancestor
+            // and emits further FetchPayload effects that we can again try to
+            // resolve locally.  This chains through the entire ancestor history
+            // without returning to the event loop.
+            effects = core::CoreEffects::new();
+            self.core.run_maintenance(now, &mut effects);
         }
-        for effect in effects.network {
-            self.apply_network_effect(effect).await;
+        if local_resolved_total > 0 {
+            info!(
+                local_resolved_total,
+                "completed local persistence resolution for payload dependencies"
+            );
         }
     }
 
@@ -535,7 +590,7 @@ where
                 let effects =
                     self.core
                         .on_shard_message(message, now, &|sender| relay.validator_index(sender));
-                self.apply_core_effects(effects).await;
+                self.apply_core_effects(effects, now).await;
             }
             AppMailboxReadWriteMessage::FinalizationEvent { notice } => {
                 self.app_metrics.external_events_total.inc();
@@ -569,13 +624,13 @@ where
                     std::process::abort();
                 }
                 self.dispatch_next_persistence_if_idle();
-                self.apply_core_effects(effects).await;
+                self.apply_core_effects(effects, now).await;
             }
             AppMailboxReadWriteMessage::Persisted { payload, root } => {
                 self.app_metrics.external_events_total.inc();
                 let now = context.current().epoch_millis();
                 let effects = self.on_persisted(payload, root, now);
-                self.apply_core_effects(effects).await;
+                self.apply_core_effects(effects, now).await;
             }
             AppMailboxReadWriteMessage::Genesis { epoch, response } => {
                 let digest = self.core.genesis(epoch);
@@ -597,7 +652,7 @@ where
                 let effects = self
                     .core
                     .on_message(core_message, now, &|sender| relay.validator_index(sender));
-                self.apply_core_effects(effects).await;
+                self.apply_core_effects(effects, now).await;
             }
         }
         self.drain_persistable_payloads_to_worker();
@@ -608,7 +663,7 @@ where
         let now = context.current().epoch_millis();
         let mut maintenance_effects = core::CoreEffects::new();
         self.core.run_maintenance(now, &mut maintenance_effects);
-        self.apply_core_effects(maintenance_effects).await;
+        self.apply_core_effects(maintenance_effects, now).await;
     }
 
     pub(crate) fn start(mut self) -> (Handle<()>, AppMailbox) {
@@ -695,8 +750,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::payload::{
-        PayloadValidationError, SYNCHRONY_BOUND, decode_timestamp, encode_payload, genesis_payload,
-        payload_digest, validate_payload,
+        PayloadValidationError, SYNCHRONY_BOUND, SeenBlock, encode_payload, genesis_payload,
+        payload_digest,
     };
     use super::*;
     use crate::execution::store::UtxoDb;
@@ -726,10 +781,6 @@ mod tests {
         bytes
     }
 
-    fn default_parent_contents() -> Bytes {
-        genesis_payload(Epoch::new(0))
-    }
-
     fn build_payload_case(
         epoch: u16,
         view: u16,
@@ -745,18 +796,6 @@ mod tests {
         let contents = encode_payload(round, parent, timestamp, anchor_payload, anchor_root, &[]);
         let payload = payload_digest(&contents);
         (round, parent, contents, payload)
-    }
-
-    fn parent_payload_contents(epoch: u16, view: u16, timestamp: u64) -> Bytes {
-        let parent_round = make_round(epoch, view.wrapping_sub(1));
-        encode_payload(
-            parent_round,
-            Digest::from([0u8; 32]),
-            timestamp,
-            Digest::from([0u8; 32]),
-            Digest::from([0u8; 32]),
-            &[],
-        )
     }
 
     fn start_single_validator_app(
@@ -928,13 +967,16 @@ mod tests {
                 anchor_payload,
                 anchor_root,
             );
-            let parent_contents = default_parent_contents();
             let now = timestamp.saturating_add(age);
-
-            prop_assert!(matches!(
-                validate_payload(round, parent, payload, &contents, now, &parent_contents),
-                Ok(txs) if txs.is_empty()
-            ));
+            let block = SeenBlock::decode(contents).expect("valid encoding");
+            prop_assert!(block.into_validated(
+                round,
+                parent,
+                payload,
+                now,
+                0, // parent timestamp (genesis = 0)
+                Digest::from(anchor_root),
+            ).is_ok());
         }
 
         #[test]
@@ -957,61 +999,50 @@ mod tests {
                 anchor_payload,
                 anchor_root,
             );
-            let parent_contents = default_parent_contents();
+            let ar = Digest::from(anchor_root);
             let now = timestamp.saturating_add(SYNCHRONY_BOUND);
 
+            // Digest mismatch: mutated bytes still decode, but digest won't match
             let mutated = Bytes::from(mutate_byte(contents.to_vec(), index));
-            assert!(matches!(
-                validate_payload(round, parent, payload, &mutated, now, &parent_contents),
-                Err(PayloadValidationError::DigestMismatch { .. })
-            ));
+            if let Some(block) = SeenBlock::decode(mutated) {
+                assert!(matches!(
+                    block.into_validated(round, parent, payload, now, 0, ar),
+                    Err(PayloadValidationError::DigestMismatch { .. })
+                ));
+            }
+            // (if decode fails, that's also a valid rejection)
 
+            // Round mismatch
+            let block = SeenBlock::decode(contents.clone()).expect("valid encoding");
             let wrong_round = make_round(epoch.wrapping_add(1), view);
             assert!(matches!(
-                validate_payload(
-                    wrong_round,
-                    parent,
-                    payload,
-                    &contents,
-                    now,
-                    &parent_contents,
-                ),
+                block.into_validated(wrong_round, parent, payload, now, 0, ar),
                 Err(PayloadValidationError::RoundMismatch { .. })
             ));
 
+            // Parent mismatch
+            let block = SeenBlock::decode(contents.clone()).expect("valid encoding");
             let mut wrong_parent = parent.0;
             wrong_parent[0] ^= 0x01;
             assert!(matches!(
-                validate_payload(
-                    round,
-                    Digest::from(wrong_parent),
-                    payload,
-                    &contents,
-                    now,
-                    &parent_contents,
-                ),
+                block.into_validated(round, Digest::from(wrong_parent), payload, now, 0, ar),
                 Err(PayloadValidationError::ParentMismatch { .. })
             ));
 
+            // Future timestamp
             let future_timestamp = timestamp.saturating_add(future_delta);
             let future_contents = encode_payload(
                 round,
                 parent,
                 future_timestamp,
                 Digest::from(anchor_payload),
-                Digest::from(anchor_root),
+                ar,
                 &[],
             );
             let future_payload = payload_digest(&future_contents);
+            let block = SeenBlock::decode(future_contents).expect("valid encoding");
             assert!(matches!(
-                validate_payload(
-                    round,
-                    parent,
-                    future_payload,
-                    &future_contents,
-                    timestamp,
-                    &parent_contents,
-                ),
+                block.into_validated(round, parent, future_payload, timestamp, 0, ar),
                 Err(PayloadValidationError::FutureTimestamp { .. })
             ));
         }
@@ -1034,7 +1065,6 @@ mod tests {
             let parent_digest = Digest::from(parent_digest);
             let anchor_payload = Digest::from(anchor_payload);
             let anchor_root = Digest::from(anchor_root);
-            let parent_contents = parent_payload_contents(epoch, view, parent_ts);
 
             let regressed_ts = parent_ts - regression;
             let regressed_contents = encode_payload(
@@ -1046,14 +1076,15 @@ mod tests {
                 &[],
             );
             let regressed_payload = payload_digest(&regressed_contents);
+            let block = SeenBlock::decode(regressed_contents).expect("valid encoding");
             assert!(matches!(
-                validate_payload(
+                block.into_validated(
                     round,
                     parent_digest,
                     regressed_payload,
-                    &regressed_contents,
                     parent_ts.saturating_add(SYNCHRONY_BOUND),
-                    &parent_contents,
+                    parent_ts,
+                    anchor_root,
                 ),
                 Err(PayloadValidationError::TimestampRegression { .. })
             ));
@@ -1068,60 +1099,30 @@ mod tests {
                 &[],
             );
             let payload = payload_digest(&contents);
-            prop_assert!(matches!(
-                validate_payload(
-                    round,
-                    parent_digest,
-                    payload,
-                    &contents,
-                    child_ts.saturating_add(SYNCHRONY_BOUND),
-                    &parent_contents,
-                ),
-                Ok(txs) if txs.is_empty()
-            ));
+            let block = SeenBlock::decode(contents).expect("valid encoding");
+            prop_assert!(block.into_validated(
+                round,
+                parent_digest,
+                payload,
+                child_ts.saturating_add(SYNCHRONY_BOUND),
+                parent_ts,
+                anchor_root,
+            ).is_ok());
         }
     }
 
     #[test_log::test]
     fn invalid_encoding_is_rejected() {
-        let round = Round::new(Epoch::new(1), View::new(1));
-        let parent = Digest::from([7; 32]);
         let contents = Bytes::from_static(b"not-a-valid-payload");
-        let payload = payload_digest(&contents);
-        let parent_contents = default_parent_contents();
-
-        assert!(matches!(
-            validate_payload(round, parent, payload, &contents, 0, &parent_contents),
-            Err(PayloadValidationError::InvalidEncoding)
-        ));
-    }
-
-    #[test_log::test]
-    fn invalid_parent_encoding_is_rejected() {
-        let round = Round::new(Epoch::new(1), View::new(1));
-        let parent = Digest::from([7; 32]);
-        let contents = encode_payload(
-            round,
-            parent,
-            10,
-            Digest::from([0u8; 32]),
-            Digest::from([0u8; 32]),
-            &[],
-        );
-        let payload = payload_digest(&contents);
-        let bad_parent_contents = Bytes::from_static(b"bad-parent");
-
-        assert!(matches!(
-            validate_payload(round, parent, payload, &contents, 10, &bad_parent_contents),
-            Err(PayloadValidationError::InvalidParentEncoding)
-        ));
+        assert!(SeenBlock::decode(contents).is_none());
     }
 
     #[test_log::test]
     fn genesis_has_zero_timestamp() {
         let epoch = Epoch::new(1);
         let payload = genesis_payload(epoch);
-        assert_eq!(decode_timestamp(&payload), Some(0));
+        let block = SeenBlock::decode(payload).expect("genesis should decode");
+        assert_eq!(block.data().timestamp, 0);
     }
 
     #[test_log::test]

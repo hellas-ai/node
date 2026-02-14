@@ -1,14 +1,14 @@
 use super::mailbox::AppMailboxReadWriteMessage;
 use super::metrics::{CoreMetrics, gauge_set_len};
 use super::payload::{
-    decode_anchor, decode_execution_payload, encode_payload,
-    first_missing_execution_dependency, genesis_digest, genesis_payload,
-    missing_dependency_or_execution, payload_digest, validate_payload,
+    SeenBlock, encode_payload, first_missing_execution_dependency, genesis_digest, genesis_payload,
+    missing_dependency_or_execution, payload_digest,
 };
 use crate::execution::{
     ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
     execute_block, execute_transaction, genesis_state,
 };
+use crate::gauged::{GaugedIndexMap, GaugedIndexSet, GaugedVecDeque};
 use hellas_types::{Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction};
 use crate::shard::WireShardMessage;
 use crate::shard::core::{ShardEffect, ShardRecoverer};
@@ -21,7 +21,7 @@ use commonware_parallel::Rayon;
 use commonware_runtime::{Metrics, Spawner};
 use commonware_utils::channel::oneshot;
 use hellas_types::{Context, PublicKey};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,17 +81,17 @@ impl CoreEffects {
 }
 
 pub(super) struct AppCore {
-    seen: HashMap<Digest, Bytes>,
+    seen: HashMap<Digest, SeenBlock>,
     persistable_payloads: IndexMap<Digest, Bytes>,
     pending_finalizations: IndexMap<Digest, Digest>,
-    pending: IndexSet<Digest>,
+    pending: GaugedIndexSet<Digest>,
     pending_shards: HashMap<Digest, (BlockKey, ZodaCommitment, Vec<ZodaShard>)>,
     waiters: IndexMap<Digest, Vec<DeferredVerify>>,
     pending_fetches: HashMap<Digest, u64>,
-    mempool: VecDeque<Transaction>,
+    mempool: GaugedVecDeque<Transaction>,
     speculative_store: SpeculativeExecutionStore,
     finalized: FinalizationTracker,
-    persisted_roots: IndexMap<Digest, Digest>,
+    persisted_roots: GaugedIndexMap<Digest, Digest>,
     latest_anchor: Option<(Digest, Digest)>,
     verify_wait_timeout_ms: u64,
     validators: Vec<PublicKey>,
@@ -128,18 +128,21 @@ impl AppCore {
             validators.push(me.clone());
         }
 
+        let pending = GaugedIndexSet::new(metrics.pending_payloads.clone());
+        let mempool = GaugedVecDeque::new(metrics.mempool_size.clone());
+        let persisted_roots = GaugedIndexMap::new(metrics.persisted_roots.clone());
         let core = Self {
             seen: HashMap::new(),
             persistable_payloads: IndexMap::new(),
             pending_finalizations: IndexMap::new(),
-            pending: IndexSet::new(),
+            pending,
             pending_shards: HashMap::new(),
             waiters: IndexMap::new(),
             pending_fetches: HashMap::new(),
-            mempool: VecDeque::new(),
+            mempool,
             speculative_store: SpeculativeExecutionStore::new(),
             finalized: FinalizationTracker::new(Self::MAX_FINALIZED_EXECUTIONS),
-            persisted_roots: IndexMap::new(),
+            persisted_roots,
             latest_anchor: None,
             verify_wait_timeout_ms: verify_wait_timeout_ms.max(1),
             validators,
@@ -149,9 +152,6 @@ impl AppCore {
         };
         core.metrics.waiter_keys.set(0);
         core.metrics.waiter_total.set(0);
-        core.metrics.mempool_size.set(0);
-        core.metrics.pending_payloads.set(0);
-        core.metrics.persisted_roots.set(0);
         core.metrics.unpersisted_finalizations.set(0);
         core
     }
@@ -186,7 +186,7 @@ impl AppCore {
                 let key = BlockKey::new(context.round, payload);
                 self.process_verify_request(&context, payload, response, now, &mut effects);
                 let (drained_msgs, shard_effects) =
-                    self.shard_recoverer.note_known_key(key, &context.leader);
+                    self.shard_recoverer.announce_leader(key, &context.leader);
                 for effect in shard_effects {
                     self.apply_shard_effect(effect, now, &mut effects);
                 }
@@ -200,7 +200,6 @@ impl AppCore {
             AppMailboxReadWriteMessage::SubmitTx { tx } => {
                 if self.mempool.len() < Self::MAX_MEMPOOL_SIZE {
                     self.mempool.push_back(tx);
-                    gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
                 }
             }
             AppMailboxReadWriteMessage::GetCoin {
@@ -277,13 +276,8 @@ impl AppCore {
 
     pub(super) fn note_persisted_root(&mut self, payload: Digest, root: Digest) {
         self.persisted_roots.insert(payload, root);
-        while self.persisted_roots.len() > Self::MAX_PERSISTED_ROOTS {
-            let Some((_oldest, _)) = self.persisted_roots.shift_remove_index(0) else {
-                break;
-            };
-        }
+        self.persisted_roots.enforce_capacity(Self::MAX_PERSISTED_ROOTS);
         self.latest_anchor = Some((payload, root));
-        gauge_set_len(&self.metrics.persisted_roots, self.persisted_roots.len());
     }
 
     pub(super) fn has_persisted_roots(&self) -> bool {
@@ -297,7 +291,7 @@ impl AppCore {
     }
 
     pub(super) fn payload_bytes(&self, digest: &Digest) -> Option<Bytes> {
-        self.seen.get(digest).cloned()
+        self.seen.get(digest).map(|b| b.bytes().clone())
     }
 
     pub(super) fn on_persisted_root(
@@ -378,8 +372,7 @@ impl AppCore {
                     }
                 }
             }
-            self.mempool = retained;
-            gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
+            self.mempool.replace(retained);
 
             // Re-execute via execute_block to obtain diffs.
             if txs.is_empty() {
@@ -408,7 +401,6 @@ impl AppCore {
                         for tx in txs.into_iter().rev() {
                             self.mempool.push_front(tx);
                         }
-                        gauge_set_len(&self.metrics.mempool_size, self.mempool.len());
                         return self.propose_empty(context, now);
                     }
                 }
@@ -503,7 +495,6 @@ impl AppCore {
             }
         }
         self.enforce_pending_capacity();
-        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         self.note_payload_seen(digest, payload);
         match (resulting_state, resulting_diffs) {
             (Some(state), Some(diffs)) => {
@@ -528,9 +519,6 @@ impl AppCore {
         &mut self,
         context: &Context,
         payload: Digest,
-        contents: &Bytes,
-        anchor_payload: Digest,
-        anchor_root: Digest,
         local_anchor_root: Digest,
         now: u64,
     ) -> bool {
@@ -540,7 +528,6 @@ impl AppCore {
             round = ?context.round,
             parent = ?parent,
             payload = ?payload,
-            anchor_payload = ?anchor_payload,
             now_ms = now
         )
         .entered();
@@ -551,12 +538,15 @@ impl AppCore {
             );
             return false;
         }
-        let Some(parent_bytes) = self.seen.get(&parent) else {
-            warn!(
-                parent = ?parent,
-                "parent bytes missing during verify despite dependency check"
-            );
-            return false;
+        let parent_timestamp = match self.seen.get(&parent) {
+            Some(parent_block) => parent_block.data().timestamp,
+            None => {
+                warn!(
+                    parent = ?parent,
+                    "parent block missing during verify despite dependency check"
+                );
+                return false;
+            }
         };
         let Some(parent_state) = self.speculative_store.execution(parent).cloned() else {
             warn!(
@@ -565,34 +555,49 @@ impl AppCore {
             );
             return false;
         };
-        if local_anchor_root != anchor_root {
-            self.metrics.anchor_mismatch_total.inc();
-            error!(
-                payload = ?payload,
-                anchor_payload = ?anchor_payload,
-                claimed_anchor_root = ?anchor_root,
-                local_anchor_root = ?local_anchor_root,
-                "anchor root mismatch for known anchor payload; possible Byzantine proposal or local state divergence"
-            );
+
+        // Remove from seen so we can consume via into_validated.
+        let Some(block) = self.seen.remove(&payload) else {
+            warn!(payload = ?payload, "payload missing from seen during verify");
             return false;
-        }
-        match validate_payload(context.round, parent, payload, contents, now, parent_bytes) {
-            Ok(txs) => match execute_block(&parent_state, &txs) {
-                Ok(exec) => {
-                    let diffs = FinalizationDiffs {
-                        created: exec.created,
-                        deleted: exec.deleted,
-                    };
-                    self.speculative_store
-                        .insert_state_with_diffs(payload, parent, exec.state, diffs);
-                    true
+        };
+        match block.into_validated(
+            context.round,
+            parent,
+            payload,
+            now,
+            parent_timestamp,
+            local_anchor_root,
+        ) {
+            Ok(validated) => {
+                let data = validated.data();
+                self.metrics
+                    .validation_timestamp_drift
+                    .set((now as i64).wrapping_sub(data.timestamp as i64));
+                match execute_block(&parent_state, &data.txs) {
+                    Ok(exec) => {
+                        let diffs = FinalizationDiffs {
+                            created: exec.created,
+                            deleted: exec.deleted,
+                        };
+                        self.speculative_store
+                            .insert_state_with_diffs(payload, parent, exec.state, diffs);
+                        self.seen.insert(payload, validated);
+                        true
+                    }
+                    Err(err) => {
+                        warn!(?err, payload = ?payload, "payload execution failed");
+                        // Re-insert as validated since the block itself was valid,
+                        // only execution failed.
+                        self.seen.insert(payload, validated);
+                        false
+                    }
                 }
-                Err(err) => {
-                    warn!(?err, payload = ?payload, "payload execution failed");
-                    false
-                }
-            },
+            }
             Err(err) => {
+                if matches!(err, super::payload::PayloadValidationError::AnchorRootMismatch { .. }) {
+                    self.metrics.anchor_mismatch_total.inc();
+                }
                 warn!(%err, payload = ?payload, "payload validation failed");
                 false
             }
@@ -645,10 +650,10 @@ impl AppCore {
             );
             return;
         }
-        let Some(contents) = self.seen.get(&payload).cloned() else {
+        let Some(block) = self.seen.get(&payload) else {
             warn!(
                 payload = ?payload,
-                "payload bytes missing during verify despite dependency check"
+                "payload missing during verify despite dependency check"
             );
             self.metrics.verify_invalid_total.inc();
             effects.replies.push_back(CoreEffect::Verify {
@@ -657,15 +662,7 @@ impl AppCore {
             });
             return;
         };
-        let Some((anchor_payload, anchor_root)) = decode_anchor(&contents) else {
-            warn!(payload = ?payload, "payload missing anchor fields");
-            self.metrics.verify_invalid_total.inc();
-            effects.replies.push_back(CoreEffect::Verify {
-                response,
-                valid: false,
-            });
-            return;
-        };
+        let anchor_payload = block.data().anchor_payload;
         let Some(local_anchor_root) = self.persisted_root(anchor_payload) else {
             self.metrics.verify_deferred_anchor_total.inc();
             debug!(
@@ -689,9 +686,6 @@ impl AppCore {
         let valid = self.verify_payload(
             context,
             payload,
-            &contents,
-            anchor_payload,
-            anchor_root,
             local_anchor_root,
             now,
         );
@@ -845,11 +839,13 @@ impl AppCore {
                 continue;
             }
 
-            if let Some((parent, _txs)) = decode_execution_payload(&self.seen, payload)
-                && let Some(missing) =
+            if let Some(block) = self.seen.get(&payload) {
+                let parent = block.data().parent;
+                if let Some(missing) =
                     first_missing_execution_dependency(&self.seen, &self.speculative_store, parent)
-            {
-                self.schedule_dependency_fetch(missing, now, effects);
+                {
+                    self.schedule_dependency_fetch(missing, now, effects);
+                }
             }
         }
     }
@@ -874,10 +870,7 @@ impl AppCore {
 
     // Pending payload retention -----------------------------------------------
     fn enforce_pending_capacity(&mut self) {
-        while self.pending.len() > Self::MAX_PENDING_DIGESTS {
-            let Some(oldest) = self.pending.shift_remove_index(0) else {
-                break;
-            };
+        for oldest in self.pending.enforce_capacity(Self::MAX_PENDING_DIGESTS) {
             self.pending_shards.remove(&oldest);
             warn!(
                 ?oldest,
@@ -885,7 +878,6 @@ impl AppCore {
                 "evicting oldest pending payload before broadcast"
             );
         }
-        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
     }
 
     // Finalization pruning ----------------------------------------------------
@@ -941,6 +933,12 @@ impl AppCore {
             );
         }
         self.finalized.observe_finalized(payload, diffs);
+        if let Some(block) = self.seen.get(&payload) {
+            let block_ts = block.data().timestamp;
+            self.metrics
+                .finalization_timestamp_drift
+                .set((now as i64).wrapping_sub(block_ts as i64));
+        }
         self.metrics.unpersisted_finalizations.set(
             i64::try_from(self.finalized.unpersisted_finalization_count()).unwrap_or(i64::MAX),
         );
@@ -966,7 +964,6 @@ impl AppCore {
         self.pending.shift_remove(&digest);
         self.pending_shards.remove(&digest);
         let removed = self.waiters.shift_remove(&digest).unwrap_or_default();
-        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         self.update_waiter_metrics();
         removed
     }
@@ -995,7 +992,6 @@ impl AppCore {
                 self.note_payload_seen(key.digest, contents);
                 self.pending.shift_remove(&key.digest);
                 self.pending_shards.remove(&key.digest);
-                gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(key.digest, now, effects);
                 self.retry_pending_finalizations(now, effects);
             }
@@ -1031,13 +1027,13 @@ impl AppCore {
 
         match &message.body {
             WireShardMessage::FetchPayload { digest } => {
-                if let Some(payload) = self.seen.get(digest).cloned() {
+                if let Some(block) = self.seen.get(digest) {
                     effects.network.push_back(NetworkEffect::SendShard {
                         recipient: sender,
                         message: Box::new(ShardMessage::payload_response(
                             self.me(),
                             *digest,
-                            payload,
+                            block.bytes().clone(),
                         )),
                     });
                 }
@@ -1055,7 +1051,6 @@ impl AppCore {
                 self.note_payload_seen(*digest, payload.clone());
                 self.pending.shift_remove(digest);
                 self.pending_shards.remove(digest);
-                gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
                 self.retry_waiters(*digest, now, effects);
                 self.retry_pending_finalizations(now, effects);
                 return;
@@ -1065,7 +1060,7 @@ impl AppCore {
 
         let shard_effects =
             self.shard_recoverer
-                .handle_message(message, &self.seen, validator_index);
+                .handle_message(message, |d| self.seen.contains_key(d), validator_index);
         for effect in shard_effects {
             self.apply_shard_effect(effect, now, effects);
         }
@@ -1075,7 +1070,6 @@ impl AppCore {
     fn enqueue_broadcast(&mut self, digest: Digest, effects: &mut CoreEffects) {
         let _span = info_span!("app.core.enqueue_broadcast", payload = ?digest).entered();
         self.pending.shift_remove(&digest);
-        gauge_set_len(&self.metrics.pending_payloads, self.pending.len());
         let Some((key, commitment, shards)) = self.pending_shards.remove(&digest) else {
             warn!(?digest, "broadcast requested for unknown pending shards");
             return;
@@ -1102,13 +1096,30 @@ impl AppCore {
     fn ensure_execution_materialized(&mut self, digest: Digest) -> bool {
         self.speculative_store
             .ensure_execution_for_payload(digest, &|candidate| {
-                decode_execution_payload(&self.seen, candidate)
+                let block = self.seen.get(&candidate)?;
+                let data = block.data();
+                Some((data.parent, data.txs.clone()))
             })
     }
 
-    fn note_payload_seen(&mut self, digest: Digest, payload: Bytes) {
+    /// Like `note_payload_seen` but also retries deferred verify waiters
+    /// for the resolved digest.  Used by the local persistence resolution
+    /// path in `apply_core_effects` to unblock deferred verifications after
+    /// recovering payload bytes from the Freezer.
+    pub(super) fn resolve_payload_locally(
+        &mut self,
+        digest: Digest,
+        payload: Bytes,
+        now: u64,
+        effects: &mut CoreEffects,
+    ) {
+        self.note_payload_seen(digest, payload);
+        self.retry_waiters(digest, now, effects);
+    }
+
+    pub(super) fn note_payload_seen(&mut self, digest: Digest, payload: Bytes) {
         if let Some(existing) = self.seen.get(&digest) {
-            if existing != &payload {
+            if existing.bytes() != &payload {
                 error!(
                     ?digest,
                     "digest collision detected for payload bytes; entering fail-stop"
@@ -1118,7 +1129,11 @@ impl AppCore {
             return;
         }
 
-        self.seen.insert(digest, payload.clone());
+        let Some(block) = SeenBlock::decode(payload.clone()) else {
+            warn!(?digest, "ignoring malformed payload bytes");
+            return;
+        };
+        self.seen.insert(digest, block);
         self.pending_fetches.remove(&digest);
         self.persistable_payloads.insert(digest, payload);
         while self.persistable_payloads.len() > Self::MAX_PERSISTABLE_PAYLOADS {
@@ -1137,7 +1152,6 @@ impl AppCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::payload::decode_anchor;
     use crate::shard::protocol::coding_config;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
     use commonware_consensus::types::{Epoch, Round, View};
@@ -1250,11 +1264,13 @@ mod tests {
             };
             let mut propose_effects = CoreEffects::new();
             let payload = core.propose_with_effects(&context, 100, &mut propose_effects);
-            let contents = core
+            let block = core
                 .seen
                 .get(&payload)
-                .expect("payload bytes should be cached");
-            assert_eq!(decode_anchor(contents), Some((genesis, genesis_root)));
+                .expect("payload should be cached");
+            let data = block.data();
+            assert_eq!(data.anchor_payload, genesis);
+            assert_eq!(data.anchor_root, genesis_root);
         });
     }
 
@@ -1379,22 +1395,19 @@ mod tests {
             let mut propose_effects = CoreEffects::new();
             let payload =
                 proposer.propose_with_effects(&proposal_context, 200, &mut propose_effects);
-            let payload_contents = proposer
+            let proposed_block = proposer
                 .seen
                 .get(&payload)
                 .expect("proposed payload must exist")
                 .clone();
-            let (anchor_payload, anchor_root) =
-                decode_anchor(&payload_contents).expect("payload should include anchors");
+            let anchor_payload = proposed_block.data().anchor_payload;
+            verifier.seen.insert(payload, proposed_block);
             let local_anchor_root = verifier
                 .persisted_root(anchor_payload)
                 .expect("verifier should have anchor root");
             assert!(!verifier.verify_payload(
                 &proposal_context,
                 payload,
-                &payload_contents,
-                anchor_payload,
-                anchor_root,
                 local_anchor_root,
                 200
             ));
@@ -2124,6 +2137,139 @@ mod tests {
             assert!(
                 core.pending_fetches.is_empty(),
                 "pending_fetches should be empty after delivery"
+            );
+        });
+    }
+
+    /// Simulates an unclean restart: a fresh AppCore (empty `seen` and
+    /// `speculative_store`) receives a finalization for a chain tip whose
+    /// ancestor bytes are missing.  Payload bytes are then drip-fed one at a
+    /// time — mimicking the local persistence resolution loop in
+    /// `apply_core_effects` — and the test verifies that the deferred
+    /// finalization eventually materializes.
+    #[test_log::test]
+    fn restart_with_empty_seen_resolves_via_drip_feed() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-restart-drip-feed-test", 6);
+            let strategy = crate::coding_strategy();
+
+            let mut core = AppCore::new(
+                &participants[1],
+                participants.clone(),
+                1,
+                coding_config(6),
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_restart_drip"),
+                &context,
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            let anchor_root = Digest::from([11u8; 32]);
+            core.note_persisted_root(genesis, anchor_root);
+
+            // ── Phase 1: Manually construct a 3-block chain ───────────────────
+            // genesis → A → B → C  (payload bytes constructed by hand)
+            let bytes_a = encode_payload(
+                Round::new(epoch, View::new(1)),
+                genesis,
+                100,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let block_a = payload_digest(&bytes_a);
+
+            let bytes_b = encode_payload(
+                Round::new(epoch, View::new(2)),
+                block_a,
+                101,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let block_b = payload_digest(&bytes_b);
+
+            let bytes_c = encode_payload(
+                Round::new(epoch, View::new(3)),
+                block_b,
+                102,
+                genesis,
+                anchor_root,
+                &[],
+            );
+            let block_c = payload_digest(&bytes_c);
+
+            // `seen` is empty for blocks A, B, C — simulates post-restart state.
+            assert!(!core.seen.contains_key(&block_a));
+            assert!(!core.seen.contains_key(&block_b));
+            assert!(!core.seen.contains_key(&block_c));
+
+            // ── Phase 2: Finalize C — should defer ────────────────────────────
+            let deferred = core.on_finalized(block_c, block_b, 200);
+            assert!(deferred.replies.is_empty());
+            assert!(deferred.network.is_empty());
+            assert!(
+                !core.finalized.is_finalized(block_c),
+                "finalization must defer with empty seen"
+            );
+
+            // ── Phase 3: Drip-feed payload bytes one at a time ────────────────
+            // Retry emits FetchPayload for block_c (not in seen yet).
+            let mut retry1 = CoreEffects::new();
+            core.retry_pending_finalizations(300, &mut retry1);
+            assert_eq!(
+                count_fetch_broadcasts(&retry1),
+                1,
+                "should request block_c"
+            );
+
+            // Simulate local persistence resolution: feed block_c bytes.
+            core.note_payload_seen(block_c, bytes_c);
+
+            // Now retry discovers block_b is missing (parent of C).
+            let mut retry2 = CoreEffects::new();
+            core.retry_pending_finalizations(400, &mut retry2);
+            assert_eq!(
+                count_fetch_broadcasts(&retry2),
+                1,
+                "should request block_b"
+            );
+
+            core.note_payload_seen(block_b, bytes_b);
+
+            // Now retry discovers block_a is missing (parent of B).
+            let mut retry3 = CoreEffects::new();
+            core.retry_pending_finalizations(500, &mut retry3);
+            assert_eq!(
+                count_fetch_broadcasts(&retry3),
+                1,
+                "should request block_a"
+            );
+
+            core.note_payload_seen(block_a, bytes_a);
+
+            // ── Phase 4: Final retry — execution materializes, finalization
+            // completes ──
+            let mut retry4 = CoreEffects::new();
+            core.retry_pending_finalizations(600, &mut retry4);
+            assert_eq!(count_fetch_broadcasts(&retry4), 0, "no more fetches needed");
+
+            assert!(
+                core.finalized.is_finalized(block_c),
+                "block_c must be finalized after all ancestors hydrated"
+            );
+            assert!(
+                core.pending_finalizations.is_empty(),
+                "no pending finalizations should remain"
+            );
+            assert!(
+                core.next_unpersisted_finalization().is_some(),
+                "finalization diffs should be queued for persistence"
             );
         });
     }

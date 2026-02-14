@@ -838,3 +838,224 @@ fn node_recovers_after_disconnect() {
         );
     });
 }
+
+#[test_log::test]
+fn cluster_resumes_after_unclean_restart() {
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
+    let config = Config::test();
+
+    let runner = deterministic::Runner::timed(Duration::from_secs(120));
+
+    runner.start(|mut context| async move {
+        let (network, oracle) = Network::new(
+            context.with_label("network"),
+            NetworkConfig {
+                max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: None,
+            },
+        );
+        network.start();
+
+        let Fixture {
+            participants,
+            schemes,
+            ..
+        }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+
+        let quota = Quota::per_second(NonZeroU32::MAX);
+
+        // Add links between all peers.
+        for v1 in participants.iter() {
+            for v2 in participants.iter() {
+                if v1 != v2 {
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        // ── Phase 1: Start initial cluster (gen1) and run until finalization
+        let mut handles_gen1 = Vec::new();
+        let mut tracking_gen1: Vec<(Finalizations, Faults, Nullifications)> = Vec::new();
+        {
+            let mut registrations = HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.unwrap();
+                let certificate = control.register(1, quota).await.unwrap();
+                let resolver = control.register(2, quota).await.unwrap();
+                let shard = control.register(3, quota).await.unwrap();
+                registrations.insert(validator.clone(), (vote, certificate, resolver, shard));
+            }
+
+            for (idx, validator) in participants.iter().enumerate() {
+                let ctx = context.with_label(&format!("v{idx}_gen1"));
+                let blocker = oracle.control(validator.clone());
+
+                let reporter = MockReporter::new(
+                    context.clone(),
+                    ReporterConfig {
+                        participants: schemes[idx].participants().clone(),
+                        scheme: schemes[idx].clone(),
+                        elector: RoundRobin::<Sha256>::default(),
+                    },
+                );
+                tracking_gen1.push((
+                    reporter.finalizations.clone(),
+                    reporter.faults.clone(),
+                    reporter.nullifications.clone(),
+                ));
+
+                let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                let relay = Arc::new(AuthenticatedShardTransport::new(
+                    validator,
+                    shard_sender,
+                    shard_receiver,
+                ));
+                for participant in participants.iter() {
+                    relay.declare(participant);
+                }
+                relay.finalize_validators();
+
+                let (engine, _tx_mailbox) = Engine::new(
+                    ctx,
+                    config,
+                    schemes[idx].clone(),
+                    blocker,
+                    relay.clone(),
+                    validator,
+                    reporter,
+                );
+                let _shard_transport = relay.start(context.clone());
+                handles_gen1.push(engine.start(vote, certificate, resolver));
+            }
+        }
+
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase1_counts: Vec<usize> = tracking_gen1
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        println!("restart phase 1 (baseline): finalizations={phase1_counts:?}");
+        for (i, count) in phase1_counts.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "restart phase 1: validator {i} has no finalizations"
+            );
+        }
+
+        // ── Phase 2: Abort all engines (simulating unclean crash) ─────────
+        for handle in handles_gen1 {
+            handle.abort();
+        }
+        // Let aborted tasks settle and resources release.
+        context.sleep(Duration::from_secs(1)).await;
+
+        // ── Phase 3: Restart all engines (gen2) with fresh network channels
+        // Remove and re-add links to get fresh channel pairs.
+        for v1 in participants.iter() {
+            for v2 in participants.iter() {
+                if v1 != v2 {
+                    let _ = oracle.remove_link(v1.clone(), v2.clone()).await;
+                }
+            }
+        }
+        for v1 in participants.iter() {
+            for v2 in participants.iter() {
+                if v1 != v2 {
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        let mut tracking_gen2: Vec<(Finalizations, Faults, Nullifications)> = Vec::new();
+        {
+            let mut registrations = HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.unwrap();
+                let certificate = control.register(1, quota).await.unwrap();
+                let resolver = control.register(2, quota).await.unwrap();
+                let shard = control.register(3, quota).await.unwrap();
+                registrations.insert(validator.clone(), (vote, certificate, resolver, shard));
+            }
+
+            for (idx, validator) in participants.iter().enumerate() {
+                let ctx = context.with_label(&format!("v{idx}_gen2"));
+                let blocker = oracle.control(validator.clone());
+
+                let reporter = MockReporter::new(
+                    context.clone(),
+                    ReporterConfig {
+                        participants: schemes[idx].participants().clone(),
+                        scheme: schemes[idx].clone(),
+                        elector: RoundRobin::<Sha256>::default(),
+                    },
+                );
+                tracking_gen2.push((
+                    reporter.finalizations.clone(),
+                    reporter.faults.clone(),
+                    reporter.nullifications.clone(),
+                ));
+
+                let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                let relay = Arc::new(AuthenticatedShardTransport::new(
+                    validator,
+                    shard_sender,
+                    shard_receiver,
+                ));
+                for participant in participants.iter() {
+                    relay.declare(participant);
+                }
+                relay.finalize_validators();
+
+                let (engine, _tx_mailbox) = Engine::new(
+                    ctx,
+                    config,
+                    schemes[idx].clone(),
+                    blocker,
+                    relay.clone(),
+                    validator,
+                    reporter,
+                );
+                let _shard_transport = relay.start(context.clone());
+                engine.start(vote, certificate, resolver);
+            }
+        }
+
+        // ── Phase 4: Verify cluster resumes finalizing ────────────────────
+        context.sleep(Duration::from_secs(15)).await;
+
+        let phase4_counts: Vec<usize> = tracking_gen2
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let total_gen2: usize = phase4_counts.iter().sum();
+        println!("restart phase 4 (after restart): finalizations={phase4_counts:?}, total={total_gen2}");
+
+        let validators_with_progress = phase4_counts.iter().filter(|c| **c > 0).count();
+        assert!(
+            validators_with_progress >= 5,
+            "restart phase 4: expected at least 5 validators to finalize after restart, got {validators_with_progress} (counts={phase4_counts:?})"
+        );
+        assert!(
+            total_gen2 >= 20,
+            "restart phase 4: expected at least 20 total finalizations after restart, got {total_gen2} (counts={phase4_counts:?})"
+        );
+    });
+}

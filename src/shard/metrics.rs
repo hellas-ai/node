@@ -36,12 +36,12 @@ impl ShardMetrics {
         );
         context.register(
             "known_keys",
-            "current number of known block keys in recovery machine",
+            "current number of leader-announced block keys awaiting shard data",
             metrics.known_keys.clone(),
         );
         context.register(
             "pre_leader_keys",
-            "current number of pre-leader buffered block keys",
+            "current number of block keys with buffered shards awaiting leader announcement",
             metrics.pre_leader_keys.clone(),
         );
         context.register(
