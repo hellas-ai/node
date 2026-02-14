@@ -71,14 +71,6 @@ where
         removed
     }
 
-    pub(crate) fn shift_remove_index(&mut self, index: usize) -> Option<(K, V)> {
-        let removed = self.inner.shift_remove_index(index);
-        if removed.is_some() {
-            set_gauge(&self.gauge, self.inner.len());
-        }
-        removed
-    }
-
     /// Evict the oldest entries until `len() <= max`. Returns evicted pairs.
     pub(crate) fn enforce_capacity(&mut self, max: usize) -> Vec<(K, V)> {
         let mut evicted = Vec::new();
@@ -111,20 +103,6 @@ pub(crate) struct GaugedEntry<'a, K, V> {
     entry: IndexMapEntry<'a, K, V>,
     gauge: &'a Gauge<i64, AtomicI64>,
     prev_len: usize,
-}
-
-impl<'a, K, V> GaugedEntry<'a, K, V>
-where
-    K: Hash + Eq,
-{
-    pub(crate) fn or_insert(self, default: V) -> &'a mut V {
-        let was_vacant = matches!(self.entry, IndexMapEntry::Vacant(_));
-        let value = self.entry.or_insert(default);
-        if was_vacant {
-            set_gauge(self.gauge, self.prev_len + 1);
-        }
-        value
-    }
 }
 
 impl<'a, K, V> GaugedEntry<'a, K, V>
@@ -190,14 +168,6 @@ where
     pub(crate) fn shift_remove(&mut self, value: &T) -> bool {
         let removed = self.inner.shift_remove(value);
         if removed {
-            set_gauge(&self.gauge, self.inner.len());
-        }
-        removed
-    }
-
-    pub(crate) fn shift_remove_index(&mut self, index: usize) -> Option<T> {
-        let removed = self.inner.shift_remove_index(index);
-        if removed.is_some() {
             set_gauge(&self.gauge, self.inner.len());
         }
         removed
@@ -269,19 +239,6 @@ impl<T> GaugedVecDeque<T> {
             set_gauge(&self.gauge, self.inner.len());
         }
         value
-    }
-
-    pub(crate) fn pop_back(&mut self) -> Option<T> {
-        let value = self.inner.pop_back();
-        if value.is_some() {
-            set_gauge(&self.gauge, self.inner.len());
-        }
-        value
-    }
-
-    pub(crate) fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, T> {
-        set_gauge(&self.gauge, 0);
-        self.inner.drain(..)
     }
 
     pub(crate) fn replace(&mut self, new: VecDeque<T>) {
@@ -386,7 +343,7 @@ mod tests {
         assert_eq!(g.get(), 1);
         m.shift_remove(&"z"); // nonexistent
         assert_eq!(g.get(), 1);
-        m.shift_remove_index(0);
+        m.shift_remove(&"b");
         assert_eq!(g.get(), 0);
     }
 
@@ -439,7 +396,7 @@ mod tests {
         assert_eq!(g.get(), 1);
         assert!(!s.shift_remove(&99)); // nonexistent
         assert_eq!(g.get(), 1);
-        assert_eq!(s.shift_remove_index(0), Some(2));
+        assert!(s.shift_remove(&2));
         assert_eq!(g.get(), 0);
     }
 
@@ -469,23 +426,9 @@ mod tests {
         assert_eq!(g.get(), 2);
         assert_eq!(d.pop_front(), Some("b"));
         assert_eq!(g.get(), 1);
-        assert_eq!(d.pop_back(), Some("a"));
+        assert_eq!(d.pop_front(), Some("a"));
         assert_eq!(g.get(), 0);
         assert_eq!(d.pop_front(), None); // empty
-        assert_eq!(g.get(), 0);
-    }
-
-    #[test]
-    fn deque_drain() {
-        let g = gauge();
-        let mut d = GaugedVecDeque::<i32>::new(g.clone());
-        d.push_back(1);
-        d.push_back(2);
-        d.push_back(3);
-        assert_eq!(g.get(), 3);
-
-        let drained: Vec<_> = d.drain().collect();
-        assert_eq!(drained, vec![1, 2, 3]);
         assert_eq!(g.get(), 0);
     }
 

@@ -265,12 +265,6 @@ impl<S: Strategy> Drop for ShardRecoverer<S> {
 }
 
 impl<S: Strategy> ShardRecoverer<S> {
-    const MAX_BUFFERED_KEYS: usize = 256;
-    const MAX_ANNOUNCED_KEYS: usize = 4096;
-    const MAX_RECOVERING: usize = 8192;
-    const MAX_BUFFERED_RESHARDS: usize = 128;
-    const MAX_BUFFERED_MESSAGES: usize = 128;
-
     pub(crate) fn new(
         me: &PublicKey,
         my_index: u16,
@@ -291,13 +285,7 @@ impl<S: Strategy> ShardRecoverer<S> {
             coding_config,
             strategy,
             machine: RecoveryMachine::new(
-                RecoveryLimits {
-                    max_buffered_keys: Self::MAX_BUFFERED_KEYS,
-                    max_announced_keys: Self::MAX_ANNOUNCED_KEYS,
-                    max_recovering: Self::MAX_RECOVERING,
-                    max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
-                    max_buffered_messages: Self::MAX_BUFFERED_MESSAGES,
-                },
+                RecoveryLimits::default(),
                 metrics.pre_leader_keys.clone(),
                 metrics.known_keys.clone(),
                 metrics.active_recoveries.clone(),
@@ -311,10 +299,6 @@ impl<S: Strategy> ShardRecoverer<S> {
 
     pub(crate) fn shutdown(&mut self) {
         self.queue.close();
-    }
-
-    pub(crate) const fn me(&self) -> &PublicKey {
-        &self.me
     }
 
     pub(crate) const fn coding_config(&self) -> &CodingConfig {

@@ -81,6 +81,7 @@ impl CoreEffects {
 }
 
 pub(super) struct AppCore {
+    me: PublicKey,
     seen: HashMap<Digest, SeenBlock>,
     persistable_payloads: IndexMap<Digest, Bytes>,
     pending_finalizations: IndexMap<Digest, Digest>,
@@ -132,6 +133,7 @@ impl AppCore {
         let mempool = GaugedVecDeque::new(metrics.mempool_size.clone());
         let persisted_roots = GaugedIndexMap::new(metrics.persisted_roots.clone());
         let core = Self {
+            me: me.clone(),
             seen: HashMap::new(),
             persistable_payloads: IndexMap::new(),
             pending_finalizations: IndexMap::new(),
@@ -157,7 +159,7 @@ impl AppCore {
     }
 
     pub(super) const fn me(&self) -> &PublicKey {
-        self.shard_recoverer.me()
+        &self.me
     }
 
     // Driver entry points -----------------------------------------------------

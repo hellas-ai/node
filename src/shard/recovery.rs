@@ -113,6 +113,18 @@ pub(super) struct RecoveryLimits {
     pub(super) max_buffered_messages: usize,
 }
 
+impl Default for RecoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_buffered_keys: 256,
+            max_announced_keys: 4096,
+            max_recovering: 8192,
+            max_buffered_reshards: 128,
+            max_buffered_messages: 128,
+        }
+    }
+}
+
 pub(super) enum RecoveryInput {
     AnnounceLeader {
         key: BlockKey,
