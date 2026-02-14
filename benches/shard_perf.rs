@@ -231,9 +231,27 @@ fn bench_full_sync(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sustained_finalization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sustained_finalization");
+    group.sample_size(10);
+    for &target_views in &[5_000usize, 10_000] {
+        group.throughput(Throughput::Elements(target_views as u64));
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{N}v_{target_views}views")),
+            |b| {
+                b.iter(|| {
+                    let finalizations = run_full_sync(black_box(target_views));
+                    black_box(finalizations);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = shard_perf;
     config = Criterion::default().measurement_time(Duration::from_secs(10));
-    targets = bench_encode_shards, bench_wire_roundtrip, bench_single_node_recovery, bench_full_sync
+    targets = bench_encode_shards, bench_wire_roundtrip, bench_single_node_recovery, bench_full_sync, bench_sustained_finalization
 );
 criterion_main!(shard_perf);

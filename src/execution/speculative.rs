@@ -60,44 +60,51 @@ impl SpeculativeExecutionStore {
     where
         F: Fn(Digest) -> Option<(Digest, Vec<Transaction>)>,
     {
-        self.ensure_execution_for_payload_inner(payload, decode_payload, &mut HashSet::new())
-    }
-
-    fn ensure_execution_for_payload_inner<F>(
-        &mut self,
-        payload: Digest,
-        decode_payload: &F,
-        stack: &mut HashSet<Digest>,
-    ) -> bool
-    where
-        F: Fn(Digest) -> Option<(Digest, Vec<Transaction>)>,
-    {
         if self.executions.contains_key(&payload) {
             return true;
         }
-        if !stack.insert(payload) {
-            return false;
+
+        // Walk backward iteratively to collect the chain of payloads that need
+        // execution, stopping when we reach one that is already materialized.
+        // This avoids the unbounded recursion that previously caused stack
+        // overflows on long chains (e.g. after a restart).
+        let mut chain: Vec<(Digest, Digest, Vec<Transaction>)> = Vec::new();
+        let mut visited = HashSet::new();
+        let mut cursor = payload;
+
+        loop {
+            if self.executions.contains_key(&cursor) {
+                break;
+            }
+            if !visited.insert(cursor) {
+                return false; // cycle detected
+            }
+            let Some((parent_payload, txs)) = decode_payload(cursor) else {
+                return false;
+            };
+            chain.push((cursor, parent_payload, txs));
+            cursor = parent_payload;
         }
 
-        let materialized = (|| {
-            let (parent_payload, txs) = decode_payload(payload)?;
-            if !self.ensure_execution_for_payload_inner(parent_payload, decode_payload, stack) {
-                return None;
-            }
-            let parent_state = self.executions.get(&parent_payload).cloned()?;
-            let exec = execute_block(&parent_state, &txs).ok()?;
+        // Execute forward (the last element in `chain` is closest to the
+        // already-materialized ancestor).
+        for (digest, parent_payload, txs) in chain.into_iter().rev() {
+            let Some(parent_state) = self.executions.get(&parent_payload).cloned() else {
+                return false;
+            };
+            let Ok(exec) = execute_block(&parent_state, &txs) else {
+                return false;
+            };
             let diffs = FinalizationDiffs {
                 created: exec.created,
                 deleted: exec.deleted,
             };
-            self.executions.insert(payload, exec.state);
-            self.parent_by_digest.insert(payload, parent_payload);
-            self.diffs.insert(payload, diffs);
-            Some(())
-        })();
+            self.executions.insert(digest, exec.state);
+            self.parent_by_digest.insert(digest, parent_payload);
+            self.diffs.insert(digest, diffs);
+        }
 
-        stack.remove(&payload);
-        materialized.is_some()
+        true
     }
 
     pub(crate) fn prune_non_descendants<F>(&mut self, ancestor: Digest, keep: F) -> Vec<Digest>
@@ -221,5 +228,45 @@ mod tests {
         assert!(!store.contains_execution(genesis));
         assert!(store.contains_execution(canonical));
         assert!(store.contains_execution(fork));
+    }
+
+    #[test_log::test]
+    fn materializes_deep_chain_without_stack_overflow() {
+        let mut store = SpeculativeExecutionStore::new();
+        let genesis = Digest::from([0; 32]);
+        store.executions.insert(genesis, sample_state());
+        store
+            .parent_by_digest
+            .insert(genesis, Digest::from([255; 32]));
+
+        // Build a chain of 10_000 empty blocks -- deep enough that a naive
+        // recursive implementation would overflow the default thread stack.
+        const DEPTH: usize = 10_000;
+        let digests: Vec<Digest> = (1..=DEPTH)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                Digest::from(bytes)
+            })
+            .collect();
+
+        let chain: HashMap<Digest, Digest> = digests
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let parent = if i == 0 { genesis } else { digests[i - 1] };
+                (*d, parent)
+            })
+            .collect();
+
+        let decode = |digest: Digest| -> Option<(Digest, Vec<Transaction>)> {
+            chain.get(&digest).map(|parent| (*parent, vec![]))
+        };
+
+        let tip = *digests.last().unwrap();
+        assert!(store.ensure_execution_for_payload(tip, &decode));
+        for d in &digests {
+            assert!(store.contains_execution(*d));
+        }
     }
 }
