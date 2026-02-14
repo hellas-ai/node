@@ -205,8 +205,12 @@ pub(super) struct PersistenceMetrics {
     pub(crate) staged_pending: Gauge<i64, AtomicI64>,
     pub(crate) finalization_cache_entries: Gauge<i64, AtomicI64>,
     pub(crate) finalization_cache_evictions_total: Counter,
+    pub(crate) payload_cache_entries: Gauge<i64, AtomicI64>,
     pub(crate) payload_cache_evictions_total: Counter,
+    pub(crate) anchor_history_entries: Gauge<i64, AtomicI64>,
     pub(crate) anchor_history_evictions_total: Counter,
+    pub(crate) queue_depth: Gauge<i64, AtomicI64>,
+    pub(crate) utxo_committed_position: Gauge<i64, AtomicI64>,
 }
 
 impl PersistenceMetrics {
@@ -220,8 +224,12 @@ impl PersistenceMetrics {
             staged_pending: Gauge::default(),
             finalization_cache_entries: Gauge::default(),
             finalization_cache_evictions_total: Counter::default(),
+            payload_cache_entries: Gauge::default(),
             payload_cache_evictions_total: Counter::default(),
+            anchor_history_entries: Gauge::default(),
             anchor_history_evictions_total: Counter::default(),
+            queue_depth: Gauge::default(),
+            utxo_committed_position: Gauge::default(),
         };
 
         context.register(
@@ -266,18 +274,42 @@ impl PersistenceMetrics {
             metrics.finalization_cache_evictions_total.clone(),
         );
         context.register(
+            "payload_cache_entries",
+            "current number of volatile payload cache entries",
+            metrics.payload_cache_entries.clone(),
+        );
+        context.register(
             "payload_cache_evictions_total",
             "volatile payload cache evictions due to capacity",
             metrics.payload_cache_evictions_total.clone(),
+        );
+        context.register(
+            "anchor_history_entries",
+            "current number of persisted anchor history entries",
+            metrics.anchor_history_entries.clone(),
         );
         context.register(
             "anchor_history_evictions_total",
             "anchor history evictions due to capacity",
             metrics.anchor_history_evictions_total.clone(),
         );
+        context.register(
+            "queue_depth",
+            "number of pending items in the persistence queue",
+            metrics.queue_depth.clone(),
+        );
+        context.register(
+            "utxo_committed_position",
+            "queue position of the last committed UTXO state transition",
+            metrics.utxo_committed_position.clone(),
+        );
 
         metrics.staged_pending.set(0);
         metrics.finalization_cache_entries.set(0);
+        metrics.payload_cache_entries.set(0);
+        metrics.anchor_history_entries.set(0);
+        metrics.queue_depth.set(0);
+        metrics.utxo_committed_position.set(0);
         metrics
     }
 }

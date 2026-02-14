@@ -168,6 +168,7 @@ fn setup(
         private_key: encode_private_key(my_key),
         listen_port: start_port + node as u16,
         metrics_port: Some(9090 + node as u16),
+        rpc_port: None,
         peers,
     };
 
@@ -512,7 +513,23 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
             &me,
             TraceReporter,
         );
-        let _light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
+        let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
+
+        // Start light-client gRPC server (if configured)
+        if let Some(rpc_port) = node_config.rpc_port {
+            let addr: SocketAddr = format!("0.0.0.0:{rpc_port}")
+                .parse()
+                .expect("rpc address should be valid");
+            let svc = hellas_rpc::server::LightClientGrpcServer::new(light_client)
+                .into_service();
+            ::tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(svc)
+                    .serve(addr),
+            );
+            info!(rpc_port, "light client gRPC server started");
+        }
+
         let shard_transport_handle = relay.start(context.clone());
 
         // Start networking only after the app + shard transport are initialized.

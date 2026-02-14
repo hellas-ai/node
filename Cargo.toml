@@ -29,6 +29,7 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
+hellas-rpc = { workspace = true, features = ["server"] }
 hellas-types = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
@@ -43,6 +44,7 @@ rand_core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tonic = { version = "0.14", features = ["server"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
@@ -51,7 +53,7 @@ tracing-opentelemetry = { workspace = true }
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["fuzz", "mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-criterion = "0.8"
+criterion = "0.7"
 proptest = "1.6"
 test-log = { version = "0.2", features = ["trace"] }
 

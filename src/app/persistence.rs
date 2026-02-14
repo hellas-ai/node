@@ -395,6 +395,11 @@ where
 
     pub(super) async fn run(mut self, _context: &mut E) {
         self.metrics.worker_ready_total.inc();
+        if let Some(pos) = self.store.last_committed_position {
+            self.metrics.utxo_committed_position.set(pos as i64);
+        }
+        gauge_set_len(&self.metrics.anchor_history_entries, self.anchor_history.len());
+        self.update_queue_depth().await;
         let root = self.store.root();
         if let Err(err) = self
             .event_tx
@@ -476,6 +481,11 @@ where
         !self.queue.is_empty().await
     }
 
+    async fn update_queue_depth(&self) {
+        let depth = self.queue.size().await.saturating_sub(self.queue.ack_floor());
+        self.metrics.queue_depth.set(depth as i64);
+    }
+
     #[tracing::instrument(
         name = "app.persistence.persist_next_pending",
         level = "info",
@@ -517,6 +527,7 @@ where
             let root = self.store.root();
             self.record_persisted_anchor(payload, root).await?;
             self.metrics.persist_success_total.inc();
+            self.update_queue_depth().await;
             let _ = self.event_tx.unbounded_send(
                 Traced::capture(PersistenceEvent::Persisted { payload, root }),
             );
@@ -536,6 +547,7 @@ where
         let batch = UtxoStore::<E>::diffs_to_batch(&diffs.created, &diffs.deleted);
         let label = format!("{payload:?}");
         let root = self.store.apply_diffs(batch, Some(position), &label).await?;
+        self.metrics.utxo_committed_position.set(position as i64);
 
         // Ack the queue item so it won't be replayed on restart.
         self.queue.ack(position).await.map_err(|err| {
@@ -550,6 +562,7 @@ where
         })?;
 
         self.metrics.persist_success_total.inc();
+        self.update_queue_depth().await;
         self.record_persisted_anchor(payload, root).await?;
         if let Err(err) = self
             .event_tx
@@ -582,7 +595,9 @@ where
                 Fatal(format!(
                     "failed to enqueue persistence intent for {payload:?}: {err:?}"
                 ))
-            })
+            })?;
+        self.update_queue_depth().await;
+        Ok(())
     }
 
     fn encode_queue_item(payload: Digest, diffs: &FinalizationDiffs) -> Vec<u8> {
@@ -738,6 +753,7 @@ where
             };
             self.metrics.payload_cache_evictions_total.inc();
         }
+        gauge_set_len(&self.metrics.payload_cache_entries, self.volatile_payloads.len());
     }
 
     fn persisted_anchor_history(&self) -> Vec<(Digest, Digest)> {
@@ -789,6 +805,7 @@ where
             self.anchor_index.remove(&U64::new(oldest.sequence));
             self.metrics.anchor_history_evictions_total.inc();
         }
+        gauge_set_len(&self.metrics.anchor_history_entries, self.anchor_history.len());
         self.anchor_index.sync().await.map_err(|err| {
             Fatal(format!(
                 "failed to sync persisted anchor index for {payload:?}: {err:?}"
