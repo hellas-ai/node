@@ -4,7 +4,7 @@ mod metrics;
 mod payload;
 mod persistence;
 
-pub use mailbox::AppMailbox;
+pub use mailbox::{AppMailbox, FinalizationResponse, ProofResponse};
 
 use hellas_types::ObjectId;
 use crate::shard::WireShardMessage;

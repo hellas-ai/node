@@ -5,11 +5,12 @@ mod app;
 pub mod config;
 pub mod engine;
 mod execution;
+pub mod rpc;
 
 pub mod shard;
 mod trace;
 
-pub use app::{AppMailbox, TraceReporter};
+pub use app::{AppMailbox, FinalizationResponse, ProofResponse, TraceReporter};
 
 use commonware_parallel::Rayon;
 use std::num::NonZeroUsize;

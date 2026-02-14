@@ -160,9 +160,8 @@ pub(super) enum RecoveryOutput {
     Evicted {
         key: BlockKey,
     },
-    KnownKeysOverflow {
-        known_keys: usize,
-        max_known_keys: usize,
+    KnownKeyEvicted {
+        key: BlockKey,
     },
     InitialAccepted,
     ReShareBuffered,
@@ -210,13 +209,7 @@ impl RecoveryMachine {
                         drained.into_iter().collect(),
                     ));
                 }
-                self.evict_known_keys();
-                if self.known_leaders.len() > self.limits.max_known_keys {
-                    outputs.push(RecoveryOutput::KnownKeysOverflow {
-                        known_keys: self.known_leaders.len(),
-                        max_known_keys: self.limits.max_known_keys,
-                    });
-                }
+                outputs.extend(self.evict_known_keys());
                 outputs
             }
             RecoveryInput::IngressMessage { message } => {
@@ -499,21 +492,18 @@ impl RecoveryMachine {
         }
     }
 
-    fn evict_known_keys(&mut self) {
+    fn evict_known_keys(&mut self) -> Vec<RecoveryOutput> {
+        let mut outputs = Vec::new();
         while self.known_leaders.len() > self.limits.max_known_keys {
-            let eviction_index = self
-                .known_leaders
-                .iter()
-                .position(|(candidate, _)| !self.recovery.contains_key(candidate));
-            let Some(eviction_index) = eviction_index else {
-                break;
-            };
-            let Some((oldest, _leader)) = self.known_leaders.shift_remove_index(eviction_index)
-            else {
+            let Some((oldest, _leader)) = self.known_leaders.shift_remove_index(0) else {
                 break;
             };
             self.pre_leader_buffer.shift_remove(&oldest);
+            if self.recovery.shift_remove(&oldest).is_some() {
+                outputs.push(RecoveryOutput::KnownKeyEvicted { key: oldest });
+            }
         }
+        outputs
     }
 }
 
