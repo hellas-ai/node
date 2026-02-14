@@ -11,6 +11,7 @@ use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
+use prometheus_client::metrics::gauge::Gauge;
 use opentelemetry_otlp::{ExporterBuildError, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
@@ -18,7 +19,8 @@ use opentelemetry_sdk::{
 };
 use rand::RngCore;
 use std::io;
-use std::time::Duration;
+use std::sync::atomic::AtomicI64;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -238,8 +240,12 @@ fn build_otlp_tracer(
         .build()?;
     let batch_processor = BatchSpanProcessor::builder(exporter).build();
 
-    let mut attributes = Vec::with_capacity(4);
+    let mut attributes = Vec::with_capacity(5);
     attributes.push(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")));
+    attributes.push(KeyValue::new(
+        "service.git_rev",
+        option_env!("GIT_REV").unwrap_or("unknown"),
+    ));
     attributes.push(KeyValue::new(
         "hellas.validator.public_key",
         validator_pubkey.to_string(),
@@ -434,7 +440,9 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
     let storage_dir_utf8 = storage_dir
         .to_str()
         .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
-    let runtime_cfg = tokio::Config::new().with_storage_directory(storage_dir_utf8);
+    let runtime_cfg = tokio::Config::new()
+        .with_storage_directory(storage_dir_utf8)
+        .with_tcp_nodelay(Some(true));
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -466,6 +474,22 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
             );
             info!(metrics_port, "prometheus metrics server started");
         }
+
+        // Publish process uptime as a prometheus gauge, updated every second.
+        let uptime_gauge: Gauge<i64, AtomicI64> = Gauge::default();
+        context.with_label("process").register(
+            "uptime_seconds",
+            "seconds since the validator process started",
+            uptime_gauge.clone(),
+        );
+        let boot = Instant::now();
+        ::tokio::spawn(async move {
+            let mut tick = ::tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                uptime_gauge.set(boot.elapsed().as_secs() as i64);
+            }
+        });
 
         let relay = Arc::new(AuthenticatedShardTransport::new(
             &me,
