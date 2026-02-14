@@ -503,7 +503,7 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
 
         // Create engine first so the application can subscribe to shard ingress
         // before the transport starts dispatching inbound shard messages.
-        let (engine, _tx_mailbox) = Engine::new(
+        let (engine, tx_mailbox) = Engine::new(
             context.clone(),
             Config::mainnet(),
             scheme,
@@ -512,6 +512,7 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
             &me,
             TraceReporter,
         );
+        let _light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
         let shard_transport_handle = relay.start(context.clone());
 
         // Start networking only after the app + shard transport are initialized.

@@ -176,7 +176,7 @@ where
 
         for distribution in distributions {
             for node_idx in 0..self.nodes.len() {
-                let drained = self.nodes[node_idx]
+                let (drained, _effects) = self.nodes[node_idx]
                     .recoverer
                     .note_known_key(distribution.key, &leader);
                 for message in drained {

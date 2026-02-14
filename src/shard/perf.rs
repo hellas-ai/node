@@ -1,52 +1,10 @@
 use super::codec::WireShardMessage;
-use super::core::{ShardEffect, ShardRecoverer};
-use super::protocol::{
-    BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard, coding_config,
-};
-use bytes::Bytes;
+use super::protocol::{CodingImpl, coding_config};
 use commonware_codec::Encode;
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::{Epoch, Round, View};
-use commonware_cryptography::{Hasher, Sha256, Signer, ed25519, sha256::Digest};
+use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
-use hellas_types::PublicKey;
-use std::collections::HashMap;
-
-struct EncodedArtifacts {
-    key: BlockKey,
-    commitment: ZodaCommitment,
-    shards: Vec<ZodaShard>,
-}
-
-fn validator_keys(count: usize) -> Vec<PublicKey> {
-    let mut validators: Vec<_> = (0..count)
-        .map(|seed| {
-            ed25519::PrivateKey::from_seed(u64::try_from(seed).expect("seed should fit u64"))
-                .public_key()
-        })
-        .collect();
-    validators.sort();
-    validators
-}
-
-fn encode_artifacts(validators: u16, view: u64, payload: &[u8]) -> EncodedArtifacts {
-    let config = coding_config(validators);
-    let (commitment, shards) =
-        CodingImpl::encode(&config, payload, &Sequential).expect("encode should succeed");
-    let key = BlockKey::new(
-        Round::new(Epoch::new(1), View::new(view)),
-        Sha256::hash(payload),
-    );
-    EncodedArtifacts {
-        key,
-        commitment,
-        shards,
-    }
-}
-
-fn is_recovered_for_key(effect: &ShardEffect, key: BlockKey) -> bool {
-    matches!(effect, ShardEffect::Recovered { key: recovered, .. } if *recovered == key)
-}
 
 pub fn encode_shards_once(validators: u16, payload: &[u8]) -> usize {
     let config = coding_config(validators);
@@ -60,20 +18,26 @@ pub fn wire_roundtrip_once(validators: u16, payload: &[u8]) -> bool {
         validators >= 3,
         "wire_roundtrip_once requires at least 3 validators"
     );
-    let artifacts = encode_artifacts(validators, 1, payload);
+    let config = coding_config(validators);
+    let (commitment, shards) =
+        CodingImpl::encode(&config, payload, &Sequential).expect("encode should succeed");
+    let key = super::protocol::BlockKey::new(
+        Round::new(Epoch::new(1), View::new(1)),
+        Sha256::hash(payload),
+    );
     let helper_index = 2u16;
     let (_, _, helper_reshare) = CodingImpl::reshard(
-        &coding_config(validators),
-        &artifacts.commitment,
+        &config,
+        &commitment,
         helper_index,
-        artifacts.shards[usize::from(helper_index)].clone(),
+        shards[usize::from(helper_index)].clone(),
     )
     .expect("reshard should succeed");
 
     let initial = WireShardMessage::Initial {
-        key: artifacts.key,
-        commitment: artifacts.commitment,
-        shard: artifacts.shards[0].clone(),
+        key,
+        commitment,
+        shard: shards[0].clone(),
         shard_index: 0,
     };
     let initial_encoded = initial.encode();
@@ -85,8 +49,8 @@ pub fn wire_roundtrip_once(validators: u16, payload: &[u8]) -> bool {
     }
 
     let reshare = WireShardMessage::ReShare {
-        key: artifacts.key,
-        commitment: artifacts.commitment,
+        key,
+        commitment,
         shard_index: helper_index,
         reshard: helper_reshare,
     };
@@ -97,76 +61,147 @@ pub fn wire_roundtrip_once(validators: u16, payload: &[u8]) -> bool {
     reshare_decoded.encode() == reshare_encoded
 }
 
+/// Exercises a single-block recovery with one helper using direct crypto calls.
+///
+/// Steps: encode → reshard (self) → reshard (helper) → check (helper's reshare) → decode.
 pub fn recover_with_one_helper_once(validators: u16, payload: &[u8]) -> bool {
     assert!(
         validators >= 3,
         "recover_with_one_helper_once requires at least 3 validators"
     );
-    let validator_count = usize::from(validators);
-    let validator_list = validator_keys(validator_count);
-    let index_by_validator: HashMap<_, _> = validator_list
-        .iter()
-        .enumerate()
-        .map(|(idx, key)| {
-            (
-                key.clone(),
-                u16::try_from(idx).expect("validator index should fit u16"),
-            )
-        })
-        .collect();
+    let config = coding_config(validators);
+    let (commitment, shards) =
+        CodingImpl::encode(&config, payload, &Sequential).expect("encode should succeed");
 
-    let leader = validator_list[0].clone();
     let my_index = 1u16;
-    let me = validator_list[usize::from(my_index)].clone();
-    let helper = validator_list[2].clone();
-    let helper_index = *index_by_validator
-        .get(&helper)
-        .expect("helper index should exist");
+    let helper_index = 2u16;
 
-    let artifacts = encode_artifacts(validators, 2, payload);
-    let (_, _, helper_reshare) = CodingImpl::reshard(
-        &coding_config(validators),
-        &artifacts.commitment,
+    // Reshard our own shard (as if received from the leader).
+    let (checking_data, my_checked, _my_reshard) =
+        CodingImpl::reshard(&config, &commitment, my_index, shards[usize::from(my_index)].clone())
+            .expect("reshard should succeed");
+
+    // Helper reshards their shard and sends us their reshard.
+    let (_, _, helper_reshard) = CodingImpl::reshard(
+        &config,
+        &commitment,
         helper_index,
-        artifacts.shards[usize::from(helper_index)].clone(),
+        shards[usize::from(helper_index)].clone(),
     )
-    .expect("reshard should succeed");
+    .expect("helper reshard should succeed");
 
-    let mut recoverer = ShardRecoverer::new(
-        &me,
-        my_index,
-        coding_config(validators),
-        crate::coding_strategy(),
-    );
-    let _drained = recoverer.note_known_key(artifacts.key, &leader);
-    let seen = HashMap::<Digest, Bytes>::new();
+    // We check the helper's reshard.
+    let helper_checked =
+        CodingImpl::check(&config, &commitment, &checking_data, helper_index, helper_reshard)
+            .expect("check should succeed");
 
-    let initial = ShardMessage::initial(
-        &leader,
-        artifacts.key,
-        artifacts.commitment,
-        artifacts.shards[usize::from(my_index)].clone(),
-        my_index,
+    // Decode with our checked shard + helper's checked shard.
+    let reconstructed = CodingImpl::decode(
+        &config,
+        &commitment,
+        checking_data,
+        &[my_checked, helper_checked],
+        &Sequential,
+    )
+    .expect("decode should succeed");
+
+    Sha256::hash(&reconstructed) == Sha256::hash(payload)
+}
+
+/// Simulates the full multi-validator shard recovery pipeline for N blocks.
+///
+/// For each block, every non-leader validator:
+/// 1. Receives their shard from the leader and reshards it
+/// 2. Checks reshares from `minimum_shards - 1` other validators
+/// 3. Decodes the original payload
+///
+/// Returns the number of successful recoveries (should be `blocks * (validators - 1)`).
+pub fn recover_pipeline_once(validators: u16, blocks: usize, payload: &[u8]) -> usize {
+    assert!(
+        validators >= 3,
+        "recover_pipeline_once requires at least 3 validators"
     );
-    let effects =
-        recoverer.handle_message(initial, &seen, |key| index_by_validator.get(key).copied());
-    if effects
-        .into_iter()
-        .any(|effect| is_recovered_for_key(&effect, artifacts.key))
-    {
-        return true;
+    let config = coding_config(validators);
+    let leader_index = 0u16;
+    let mut recovered = 0usize;
+
+    for block_idx in 0..blocks {
+        // Build a unique payload per block to avoid caching effects.
+        let mut block_payload = payload.to_vec();
+        let tag = (block_idx as u32).to_le_bytes();
+        let len = tag.len().min(block_payload.len());
+        block_payload[..len].copy_from_slice(&tag[..len]);
+        let block_digest = Sha256::hash(&block_payload);
+
+        // Leader encodes.
+        let (commitment, shards) =
+            CodingImpl::encode(&config, block_payload.as_slice(), &Sequential).expect("encode");
+
+        // Each validator reshards their shard to produce (checking_data, reshard).
+        // We keep reshards for cross-checking.
+        let mut reshards = Vec::with_capacity(usize::from(validators));
+        for shard_idx in 0..validators {
+            let (_, _, reshard) = CodingImpl::reshard(
+                &config,
+                &commitment,
+                shard_idx,
+                shards[usize::from(shard_idx)].clone(),
+            )
+            .expect("reshard");
+            reshards.push(reshard);
+        }
+
+        // Each non-leader validator: reshard own shard, check reshares from
+        // others until minimum_shards are collected, then decode.
+        let min = usize::from(config.minimum_shards);
+        for my_idx in 0..validators {
+            if my_idx == leader_index {
+                continue;
+            }
+            let my = usize::from(my_idx);
+
+            // Reshard own shard to get checking_data and first checked shard.
+            let (checking_data, my_checked, _) = CodingImpl::reshard(
+                &config,
+                &commitment,
+                my_idx,
+                shards[my].clone(),
+            )
+            .expect("reshard");
+
+            let mut checked = vec![my_checked];
+            for other_idx in 0..validators {
+                if other_idx == my_idx {
+                    continue;
+                }
+                if checked.len() >= min {
+                    break;
+                }
+                let other_checked = CodingImpl::check(
+                    &config,
+                    &commitment,
+                    &checking_data,
+                    other_idx,
+                    reshards[usize::from(other_idx)].clone(),
+                )
+                .expect("check");
+                checked.push(other_checked);
+            }
+
+            // Decode.
+            let reconstructed = CodingImpl::decode(
+                &config,
+                &commitment,
+                checking_data,
+                &checked,
+                &Sequential,
+            )
+            .expect("decode");
+            if Sha256::hash(&reconstructed) == block_digest {
+                recovered += 1;
+            }
+        }
     }
 
-    let reshare = ShardMessage::reshare(
-        &helper,
-        artifacts.key,
-        artifacts.commitment,
-        helper_index,
-        helper_reshare,
-    );
-    let effects =
-        recoverer.handle_message(reshare, &seen, |key| index_by_validator.get(key).copied());
-    effects
-        .into_iter()
-        .any(|effect| is_recovered_for_key(&effect, artifacts.key))
+    recovered
 }

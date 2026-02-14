@@ -295,29 +295,25 @@ impl<S: Strategy> ShardRecoverer<S> {
         &mut self,
         key: BlockKey,
         leader: &PublicKey,
-    ) -> Vec<ShardMessage> {
+    ) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
         let mut drained = Vec::new();
+        let mut effects = VecDeque::new();
         for output in self.machine.step(RecoveryInput::NoteKnownKey {
             key,
             leader: leader.clone(),
         }) {
             match output {
                 RecoveryOutput::DrainedPreLeader(messages) => drained.extend(messages),
-                RecoveryOutput::KnownKeysOverflow {
-                    known_keys,
-                    max_known_keys,
-                } => {
-                    warn!(
-                        known_keys,
-                        max_known_keys,
-                        "unable to evict known keys because all candidates are active recoveries"
-                    );
+                RecoveryOutput::KnownKeyEvicted { key: evicted } => {
+                    self.metrics.recovery_evictions_total.inc();
+                    self.dispatch_cancel(evicted);
+                    effects.push_back(ShardEffect::Failed { key: evicted });
                 }
                 _ => {}
             }
         }
         self.sync_machine_gauges();
-        drained
+        (drained, effects)
     }
 
     pub(crate) fn handle_message<F>(
@@ -608,15 +604,9 @@ impl<S: Strategy> ShardRecoverer<S> {
                 self.dispatch_cancel(key);
                 Some(ShardEffect::Failed { key })
             }
-            RecoveryOutput::KnownKeysOverflow {
-                known_keys,
-                max_known_keys,
-            } => {
-                warn!(
-                    known_keys,
-                    max_known_keys,
-                    "unable to evict known keys because all candidates are active recoveries"
-                );
+            RecoveryOutput::KnownKeyEvicted { key } => {
+                // Handled directly in note_known_key; should not reach here.
+                warn!(evicted = ?key, "unexpected KnownKeyEvicted in machine_output_to_effect");
                 None
             }
             RecoveryOutput::CommitmentMismatch {
@@ -724,7 +714,7 @@ mod tests {
                 .handle_message(message, seen, |pk| index_by_validator.get(pk).copied())
         }
 
-        fn note_known_key(&mut self, key: BlockKey) -> Vec<ShardMessage> {
+        fn note_known_key(&mut self, key: BlockKey) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
             self.recoverer.note_known_key(key, &self.leader)
         }
 
@@ -785,7 +775,7 @@ mod tests {
                 }
             ));
 
-            let drained = fixture.note_known_key(artifacts.key);
+            let (drained, _eviction_effects) = fixture.note_known_key(artifacts.key);
             assert_eq!(drained.len(), 1);
 
             for msg in drained {

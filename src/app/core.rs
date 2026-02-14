@@ -185,7 +185,12 @@ impl AppCore {
             } => {
                 let key = BlockKey::new(context.round, payload);
                 self.process_verify_request(&context, payload, response, now, &mut effects);
-                for msg in self.shard_recoverer.note_known_key(key, &context.leader) {
+                let (drained_msgs, shard_effects) =
+                    self.shard_recoverer.note_known_key(key, &context.leader);
+                for effect in shard_effects {
+                    self.apply_shard_effect(effect, now, &mut effects);
+                }
+                for msg in drained_msgs {
                     self.handle_shard_message(msg, now, validator_index, &mut effects);
                 }
             }

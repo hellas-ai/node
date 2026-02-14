@@ -1713,4 +1713,58 @@ mod tests {
             );
         });
     }
+
+    #[test_log::test]
+    fn local_light_client_returns_genesis_proof() {
+        use crate::rpc::{self, LocalLightClient};
+        use hellas_types::rpc::LightClient;
+
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|context| async move {
+            let key = PrivateKey::from_seed(42).public_key();
+            let (_handle, mut mailbox) = start_single_validator_app(
+                &context,
+                "lc_app",
+                &key,
+                "lc_partition",
+            );
+            let _ = mailbox.genesis(Epoch::new(1)).await;
+
+            let lc = LocalLightClient::new(mailbox);
+
+            // State root should be available after genesis.
+            let root = lc
+                .get_state_root()
+                .await
+                .expect("query should succeed")
+                .expect("root should exist");
+            assert_ne!(root, Digest::from([0u8; 32]));
+
+            // Proof for genesis coin should round-trip through encode/decode.
+            let genesis_object = genesis_object_id(0);
+            let proof_bytes = lc
+                .get_proof(genesis_object)
+                .await
+                .expect("query should succeed")
+                .expect("proof should exist");
+
+            let proof = rpc::decode_proof(&proof_bytes)
+                .expect("proof should decode");
+
+            let mut hasher = Sha256::default();
+            assert!(
+                UtxoDb::<ContextCell<deterministic::Context>>::verify_key_value_proof(
+                    &mut hasher,
+                    genesis_object,
+                    Coin {
+                        owner: key,
+                        value: GENESIS_BALANCE,
+                    },
+                    &proof,
+                    &root,
+                )
+            );
+        });
+    }
 }

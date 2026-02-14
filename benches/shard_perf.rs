@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hellas_chain::shard::perf::{
-    encode_shards_once, recover_with_one_helper_once, wire_roundtrip_once,
+    encode_shards_once, recover_pipeline_once, recover_with_one_helper_once, wire_roundtrip_once,
 };
 use std::time::Duration;
 
@@ -70,9 +70,30 @@ fn bench_single_node_recovery(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_recover_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recover_pipeline");
+    group.sample_size(10);
+    for (validators, size, blocks) in [(6u16, 1_024, 100), (6, 16 * 1_024, 100), (6, 64 * 1_024, 50)] {
+        let payload = payload_of_size(size);
+        group.throughput(Throughput::Elements(blocks as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{validators}v_{size}B_{blocks}blk")),
+            &(validators, blocks, &payload),
+            |b, &(v, blk, ref p)| {
+                b.iter(|| {
+                    let recovered =
+                        recover_pipeline_once(black_box(v), black_box(blk), black_box(p.as_slice()));
+                    black_box(recovered);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = shard_perf;
     config = Criterion::default().measurement_time(Duration::from_secs(10));
-    targets = bench_encode_shards, bench_wire_roundtrip, bench_single_node_recovery
+    targets = bench_encode_shards, bench_wire_roundtrip, bench_single_node_recovery, bench_recover_pipeline
 );
 criterion_main!(shard_perf);
