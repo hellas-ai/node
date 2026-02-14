@@ -514,6 +514,20 @@ impl RecoveryMachine {
     }
 }
 
+impl RecoveryMachine {
+    pub(crate) fn active_count(&self) -> usize {
+        self.recovery.len()
+    }
+
+    pub(crate) fn known_keys_count(&self) -> usize {
+        self.known_leaders.len()
+    }
+
+    pub(crate) fn pre_leader_keys_count(&self) -> usize {
+        self.pre_leader_buffer.len()
+    }
+}
+
 #[cfg(test)]
 impl RecoveryMachine {
     pub(super) fn inspect<R>(

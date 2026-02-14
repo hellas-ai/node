@@ -497,6 +497,7 @@ where
         match message {
             AppMailboxReadWriteMessage::ShardEvent { message } => {
                 self.app_metrics.external_events_total.inc();
+                self.app_metrics.shard_messages_received_total.inc();
                 let now = context.current().epoch_millis();
                 if let WireShardMessage::FetchPayload { digest } = &message.body
                     && self.core.payload_bytes(digest).is_none()

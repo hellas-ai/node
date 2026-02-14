@@ -69,7 +69,7 @@ where
         mut registrations: HashMap<PublicKey, (S, R)>,
     ) -> Self
     where
-        E: Spawner + Clone,
+        E: Spawner + Metrics + Clone,
     {
         let validator_count = u16::try_from(validators.len()).expect("validator count fits u16");
         let mut sorted = validators.clone();
@@ -105,12 +105,13 @@ where
             let my_index = *index_by_validator
                 .get(validator)
                 .expect("validator index must exist");
+            let node_ctx = context.with_label(&format!("node_{my_index}"));
             let recoverer = ShardRecoverer::new(
                 validator,
                 my_index,
                 coding_config(validator_count),
                 crate::coding_strategy(),
-                &context,
+                &node_ctx,
             );
             nodes.push(ShardNode {
                 public_key: validator.clone(),

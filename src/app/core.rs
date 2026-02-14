@@ -18,7 +18,7 @@ use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Rayon;
-use commonware_runtime::Spawner;
+use commonware_runtime::{Metrics, Spawner};
 use commonware_utils::channel::oneshot;
 use hellas_types::{Context, PublicKey};
 use indexmap::{IndexMap, IndexSet};
@@ -119,7 +119,7 @@ impl AppCore {
         verify_wait_timeout_ms: u64,
         strategy: Rayon,
         metrics: CoreMetrics,
-        context: &(impl Spawner + Clone),
+        context: &(impl Spawner + Metrics + Clone),
     ) -> Self {
         validators.sort();
         validators.dedup();
@@ -1261,6 +1261,8 @@ mod tests {
                 minimmit_ed25519::fixture(&mut context, b"core-anchor-defer-test", 6);
 
             let strategy = crate::coding_strategy();
+            let proposer_ctx = context.with_label("core_defer_proposer");
+            let verifier_ctx = context.with_label("core_defer_verifier");
             let mut proposer = AppCore::new(
                 &participants[0],
                 participants.clone(),
@@ -1269,7 +1271,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_defer_proposer"),
-                &context,
+                &proposer_ctx,
             );
             let mut verifier = AppCore::new(
                 &participants[1],
@@ -1279,7 +1281,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_defer_verifier"),
-                &context,
+                &verifier_ctx,
             );
 
             let epoch = Epoch::new(1);
@@ -1333,6 +1335,8 @@ mod tests {
                 minimmit_ed25519::fixture(&mut context, b"core-anchor-mismatch-test", 6);
 
             let strategy = crate::coding_strategy();
+            let proposer_ctx = context.with_label("core_mismatch_proposer");
+            let verifier_ctx = context.with_label("core_mismatch_verifier");
             let mut proposer = AppCore::new(
                 &participants[0],
                 participants.clone(),
@@ -1341,7 +1345,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy.clone(),
                 test_metrics(&context, "core_mismatch_proposer"),
-                &context,
+                &proposer_ctx,
             );
             let mut verifier = AppCore::new(
                 &participants[1],
@@ -1351,7 +1355,7 @@ mod tests {
                 TEST_WAIT_TIMEOUT_MS,
                 strategy,
                 test_metrics(&context, "core_mismatch_verifier"),
-                &context,
+                &verifier_ctx,
             );
 
             let epoch = Epoch::new(1);

@@ -2,6 +2,7 @@ mod codec;
 pub(crate) mod core;
 #[cfg(test)]
 mod integration;
+pub(crate) mod metrics;
 #[cfg(any(test))]
 pub(crate) mod mock;
 mod p2p;

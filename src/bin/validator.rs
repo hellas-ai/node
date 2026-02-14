@@ -27,6 +27,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
+const SHARD_CHANNEL_BACKLOG: usize = 4096;
 const DEFAULT_OTLP_SERVICE_NAME: &str = "hellas-validator";
 const DEFAULT_OTLP_SAMPLE_RATE: f64 = 1.0;
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
@@ -266,7 +267,7 @@ fn build_otlp_tracer(
 fn init_tracing(validator_pubkey: &str) -> Result<Option<SdkTracerProvider>, ValidatorError> {
     let log_directive = "info".parse()?;
     let env_filter = EnvFilter::from_default_env().add_directive(log_directive);
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
 
     if let Some(otlp_cfg) = otlp_config_from_env() {
         let endpoint = otlp_cfg.endpoint.clone();
@@ -420,7 +421,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let vote = network.register(0, quota, CHANNEL_BACKLOG);
         let certificate = network.register(1, quota, CHANNEL_BACKLOG);
         let resolver = network.register(2, quota, CHANNEL_BACKLOG);
-        let (shard_sender, shard_receiver) = network.register(3, quota, CHANNEL_BACKLOG);
+        let (shard_sender, shard_receiver) = network.register(3, quota, SHARD_CHANNEL_BACKLOG);
 
         // Start metrics server (if configured)
         if let Some(metrics_port) = node_config.metrics_port {

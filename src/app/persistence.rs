@@ -706,6 +706,7 @@ where
             let Some((_oldest, _)) = self.volatile_finalizations.shift_remove_index(0) else {
                 break;
             };
+            self.metrics.finalization_cache_evictions_total.inc();
         }
         gauge_set_len(&self.metrics.finalization_cache_entries, self.volatile_finalizations.len());
     }
@@ -735,6 +736,7 @@ where
             let Some((_oldest, _)) = self.volatile_payloads.shift_remove_index(0) else {
                 break;
             };
+            self.metrics.payload_cache_evictions_total.inc();
         }
     }
 
@@ -785,6 +787,7 @@ where
                 break;
             };
             self.anchor_index.remove(&U64::new(oldest.sequence));
+            self.metrics.anchor_history_evictions_total.inc();
         }
         self.anchor_index.sync().await.map_err(|err| {
             Fatal(format!(

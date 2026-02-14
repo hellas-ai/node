@@ -10,6 +10,7 @@ pub(super) fn gauge_set_len(gauge: &Gauge<i64, AtomicI64>, len: usize) {
 pub(super) struct ApplicationMetrics {
     pub(crate) external_events_total: Counter,
     pub(crate) finalization_notices_total: Counter,
+    pub(crate) shard_messages_received_total: Counter,
     pub(crate) persistence_dispatch_total: Counter,
     pub(crate) persistence_ack_total: Counter,
     pub(crate) persistence_ack_unexpected_total: Counter,
@@ -22,6 +23,7 @@ impl ApplicationMetrics {
         let metrics = Self {
             external_events_total: Counter::default(),
             finalization_notices_total: Counter::default(),
+            shard_messages_received_total: Counter::default(),
             persistence_dispatch_total: Counter::default(),
             persistence_ack_total: Counter::default(),
             persistence_ack_unexpected_total: Counter::default(),
@@ -38,6 +40,11 @@ impl ApplicationMetrics {
             "finalization_notices_total",
             "finalization notices received by app actor",
             metrics.finalization_notices_total.clone(),
+        );
+        context.register(
+            "shard_messages_received_total",
+            "shard messages received by app actor mailbox",
+            metrics.shard_messages_received_total.clone(),
         );
         context.register(
             "persistence_dispatch_total",
@@ -197,6 +204,9 @@ pub(super) struct PersistenceMetrics {
     pub(crate) persist_failure_total: Counter,
     pub(crate) staged_pending: Gauge<i64, AtomicI64>,
     pub(crate) finalization_cache_entries: Gauge<i64, AtomicI64>,
+    pub(crate) finalization_cache_evictions_total: Counter,
+    pub(crate) payload_cache_evictions_total: Counter,
+    pub(crate) anchor_history_evictions_total: Counter,
 }
 
 impl PersistenceMetrics {
@@ -209,6 +219,9 @@ impl PersistenceMetrics {
             persist_failure_total: Counter::default(),
             staged_pending: Gauge::default(),
             finalization_cache_entries: Gauge::default(),
+            finalization_cache_evictions_total: Counter::default(),
+            payload_cache_evictions_total: Counter::default(),
+            anchor_history_evictions_total: Counter::default(),
         };
 
         context.register(
@@ -245,6 +258,22 @@ impl PersistenceMetrics {
             "finalization_cache_entries",
             "current number of volatile finalization cache entries",
             metrics.finalization_cache_entries.clone(),
+        );
+
+        context.register(
+            "finalization_cache_evictions_total",
+            "volatile finalization cache evictions due to capacity",
+            metrics.finalization_cache_evictions_total.clone(),
+        );
+        context.register(
+            "payload_cache_evictions_total",
+            "volatile payload cache evictions due to capacity",
+            metrics.payload_cache_evictions_total.clone(),
+        );
+        context.register(
+            "anchor_history_evictions_total",
+            "anchor history evictions due to capacity",
+            metrics.anchor_history_evictions_total.clone(),
         );
 
         metrics.staged_pending.set(0);

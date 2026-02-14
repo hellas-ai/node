@@ -1,4 +1,5 @@
 use super::codec::WireShardMessage;
+use super::metrics::ShardMetrics;
 use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
 use super::recovery::{
     ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
@@ -9,11 +10,11 @@ use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Handle, Spawner};
+use commonware_runtime::{Handle, Metrics, Spawner};
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
 use std::collections::{HashMap, VecDeque};
-use tracing::{debug, debug_span, info_span, warn};
+use tracing::{debug, info_span, warn};
 
 #[derive(Clone)]
 pub(crate) enum ShardEffect {
@@ -35,6 +36,7 @@ pub(crate) struct ShardRecoverer<S: Strategy> {
     coding_config: CodingConfig,
     strategy: S,
     machine: RecoveryMachine,
+    metrics: ShardMetrics,
     coding_tx: mpsc::UnboundedSender<Traced<scheduler::Command>>,
     coding_event_rx: mpsc::UnboundedReceiver<Traced<scheduler::Event>>,
     /// Held for RAII: dropping the handle aborts the scheduler task.
@@ -43,19 +45,20 @@ pub(crate) struct ShardRecoverer<S: Strategy> {
 }
 
 impl<S: Strategy> ShardRecoverer<S> {
-    const MAX_RECOVERY_ENTRIES: usize = 256;
+    const MAX_RECOVERY_ENTRIES: usize = 1024;
     const MAX_BUFFERED_RESHARDS: usize = 128;
     const MAX_PRE_LEADER_MESSAGES: usize = 128;
     const MAX_PRE_LEADER_KEYS: usize = 256;
-    const MAX_KNOWN_KEYS: usize = 1024;
+    const MAX_KNOWN_KEYS: usize = 4096;
 
     pub(crate) fn new(
         me: &PublicKey,
         my_index: u16,
         coding_config: CodingConfig,
         strategy: S,
-        context: &(impl Spawner + Clone),
+        context: &(impl Spawner + Metrics + Clone),
     ) -> Self {
+        let metrics = ShardMetrics::register(&context.with_label("shard"));
         let (coding_tx, coding_cmd_rx) = mpsc::unbounded();
         let (coding_event_tx, coding_event_rx) = mpsc::unbounded();
         let scheduler = scheduler::Scheduler::new(
@@ -79,6 +82,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
                 max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
             }),
+            metrics,
             coding_tx,
             coding_event_rx,
             scheduler_handle,
@@ -124,6 +128,7 @@ impl<S: Strategy> ShardRecoverer<S> {
     }
 
     fn apply_coding_event(&mut self, event: scheduler::Event, effects: &mut VecDeque<ShardEffect>) {
+        self.metrics.coding_tasks_completed_total.inc();
         match event {
             scheduler::Event::ReshardDone {
                 key,
@@ -168,7 +173,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         >,
         effects: &mut VecDeque<ShardEffect>,
     ) {
-        let _span = debug_span!(
+        let _span = info_span!(
             "shard.apply_reshard_result",
             payload = ?key.digest,
             round = ?key.round,
@@ -193,6 +198,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, effects),
             }
         }
+        self.sync_machine_gauges();
 
         effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
             &self.me,
@@ -214,7 +220,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         result: Result<<CodingImpl as CodingScheme>::CheckedShard, ()>,
         effects: &mut VecDeque<ShardEffect>,
     ) {
-        let _span = debug_span!(
+        let _span = info_span!(
             "shard.apply_check_result",
             payload = ?key.digest,
             round = ?key.round,
@@ -234,6 +240,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         }) {
             self.push_machine_effect(output, key, effects);
         }
+        self.sync_machine_gauges();
         if let Some(effect) = self.try_recover(key) {
             effects.push_back(effect);
         }
@@ -244,6 +251,8 @@ impl<S: Strategy> ShardRecoverer<S> {
     fn dispatch_coding_command(&self, cmd: scheduler::Command) {
         if let Err(err) = self.coding_tx.unbounded_send(Traced::capture(cmd)) {
             warn!(?err, "coding scheduler command channel closed");
+        } else {
+            self.metrics.coding_tasks_dispatched_total.inc();
         }
     }
 
@@ -306,6 +315,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 _ => {}
             }
         }
+        self.sync_machine_gauges();
         drained
     }
 
@@ -324,7 +334,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         if seen.contains_key(&key.digest) {
             return VecDeque::new();
         }
-        let span = debug_span!(
+        let span = info_span!(
             "shard.handle_message",
             payload = ?key.digest,
             round = ?key.round,
@@ -349,6 +359,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         let outputs = self.machine.step(RecoveryInput::IngressMessage {
             message: Box::new(message),
         });
+        self.sync_machine_gauges();
 
         for output in outputs {
             match output {
@@ -427,6 +438,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
+        self.sync_machine_gauges();
         if !accepted {
             return effects;
         }
@@ -479,6 +491,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, &mut effects),
             }
         }
+        self.sync_machine_gauges();
 
         effects
     }
@@ -504,6 +517,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 }
             }
         }
+        self.sync_machine_gauges();
         let decode_candidate = decode_candidate?;
 
         let reconstructed = match CodingImpl::decode(
@@ -521,6 +535,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                     ?err,
                     "shard decode failed"
                 );
+                self.metrics.recovery_failed_total.inc();
                 return Some(ShardEffect::Failed { key });
             }
         };
@@ -531,9 +546,11 @@ impl<S: Strategy> ShardRecoverer<S> {
                 round = ?key.round,
                 "decoded payload digest mismatch"
             );
+            self.metrics.recovery_failed_total.inc();
             return Some(ShardEffect::Failed { key });
         }
 
+        self.metrics.recovery_success_total.inc();
         Some(ShardEffect::Recovered {
             key,
             contents: Bytes::from(reconstructed),
@@ -551,6 +568,14 @@ impl<S: Strategy> ShardRecoverer<S> {
         }
     }
 
+    /// Update recovery machine gauges. Called after machine.step() calls that
+    /// may add or remove entries.
+    fn sync_machine_gauges(&self) {
+        self.metrics.active_recoveries.set(self.machine.active_count() as i64);
+        self.metrics.known_keys.set(self.machine.known_keys_count() as i64);
+        self.metrics.pre_leader_keys.set(self.machine.pre_leader_keys_count() as i64);
+    }
+
     fn machine_output_to_effect(
         &self,
         output: RecoveryOutput,
@@ -564,6 +589,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                     max_recovery_entries = Self::MAX_RECOVERY_ENTRIES,
                     "evicting oldest recovery entry to admit new recovery"
                 );
+                self.metrics.recovery_evictions_total.inc();
                 self.dispatch_cancel(key);
                 Some(ShardEffect::Failed { key })
             }
@@ -649,7 +675,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(context: &(impl Spawner + Clone)) -> Self {
+        fn new(context: &(impl Spawner + Metrics + Clone)) -> Self {
             let mut validators: Vec<_> = (0u64..6u64)
                 .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
                 .collect();
