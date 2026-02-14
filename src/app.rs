@@ -1767,4 +1767,96 @@ mod tests {
             );
         });
     }
+
+    #[test_log::test]
+    fn grpc_light_client_round_trip() {
+        use crate::rpc::{self, LocalLightClient};
+        use commonware_runtime::tokio as cw_tokio;
+        use hellas_rpc::client::RemoteLightClient;
+        use hellas_rpc::server::LightClientGrpcServer;
+        use hellas_types::rpc::LightClient;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "hellas_grpc_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let runtime_cfg =
+            cw_tokio::Config::new().with_storage_directory(tmp_dir.to_str().unwrap());
+        let runner = cw_tokio::Runner::new(runtime_cfg);
+
+        runner.start(|context| async move {
+            let key = PrivateKey::from_seed(99).public_key();
+            let relay = Arc::new(MockShardTransport::new());
+            relay.declare(&key);
+            relay.finalize_validators();
+
+            let app = Application::new(
+                context.with_label("grpc_app"),
+                relay,
+                &key,
+                vec![key.clone()],
+                "grpc_partition".to_string(),
+                ApplicationConfig::default(),
+            );
+            let (_handle, mut mailbox) = app.start();
+            let _ = mailbox.genesis(Epoch::new(1)).await;
+
+            let light_client = LocalLightClient::new(mailbox);
+
+            // Start gRPC server on a random port.
+            let svc = LightClientGrpcServer::new(light_client).into_service();
+            let incoming = tonic::transport::server::TcpIncoming::bind(
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .expect("failed to bind");
+            let addr = incoming.local_addr().expect("should have local addr");
+
+            ::tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(svc)
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            // Connect RemoteLightClient and assert through gRPC.
+            let client = RemoteLightClient::connect(format!("http://{addr}"))
+                .await
+                .expect("failed to connect to grpc server");
+
+            let root = client
+                .get_state_root()
+                .await
+                .expect("get_state_root should succeed")
+                .expect("root should exist");
+            assert_ne!(root, Digest::from([0u8; 32]));
+
+            let genesis_object = genesis_object_id(0);
+            let proof_bytes = client
+                .get_proof(genesis_object)
+                .await
+                .expect("get_proof should succeed")
+                .expect("proof should exist");
+
+            let proof =
+                rpc::decode_proof(&proof_bytes).expect("proof should decode");
+            let mut hasher = Sha256::default();
+            assert!(
+                UtxoDb::<ContextCell<cw_tokio::Context>>::verify_key_value_proof(
+                    &mut hasher,
+                    genesis_object,
+                    Coin {
+                        owner: key,
+                        value: GENESIS_BALANCE,
+                    },
+                    &proof,
+                    &root,
+                )
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

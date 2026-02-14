@@ -12,7 +12,7 @@ use commonware_runtime::{
 use commonware_storage::{
     Persistable,
     freezer::{
-        Checkpoint as FreezerCheckpoint, Config as FreezerConfig, Freezer,
+        Checkpoint as FreezerCheckpoint, Config as FreezerConfig, Cursor as FreezerCursor, Freezer,
         Identifier as FreezerIdentifier,
     },
     metadata::{Config as MetadataConfig, Metadata},
@@ -24,7 +24,7 @@ use tracing::Instrument;
 use hellas_types::PublicKey;
 use indexmap::IndexMap;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::LazyLock,
 };
@@ -319,8 +319,10 @@ where
     anchor_history: VecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
     finalization_index: Option<FinalizationIndex<E>>,
+    finalization_cursors: HashMap<Digest, FreezerCursor>,
     volatile_finalizations: IndexMap<Digest, mailbox::FinalizationResponse>,
     payload_index: Option<PayloadIndex<E>>,
+    payload_cursors: HashMap<Digest, FreezerCursor>,
     volatile_payloads: IndexMap<Digest, Bytes>,
 }
 
@@ -387,8 +389,10 @@ where
             anchor_history,
             next_anchor_sequence,
             finalization_index: Some(finalization_index),
+            finalization_cursors: HashMap::new(),
             volatile_finalizations: IndexMap::new(),
             payload_index: Some(payload_index),
+            payload_cursors: HashMap::new(),
             volatile_payloads: IndexMap::new(),
         })
     }
@@ -700,11 +704,15 @@ where
         if let Some(finalization) = self.volatile_finalizations.get(&payload) {
             return Some(finalization.clone());
         }
+        let identifier = match self.finalization_cursors.get(&payload) {
+            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
+            None => FreezerIdentifier::Key(&payload),
+        };
         let stored = self
             .finalization_index
             .as_ref()
             .expect("not shut down")
-            .get(FreezerIdentifier::Key(&payload))
+            .get(identifier)
             .await
             .ok()
             .flatten()
@@ -730,11 +738,15 @@ where
         if let Some(bytes) = self.volatile_payloads.get(&payload) {
             return Some(bytes.clone());
         }
+        let identifier = match self.payload_cursors.get(&payload) {
+            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
+            None => FreezerIdentifier::Key(&payload),
+        };
         let stored = self
             .payload_index
             .as_ref()
             .expect("not shut down")
-            .get(FreezerIdentifier::Key(&payload))
+            .get(identifier)
             .await
             .ok()
             .flatten()
@@ -827,11 +839,15 @@ where
             return Ok(());
         }
 
+        let fin_identifier = match self.finalization_cursors.get(&payload) {
+            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
+            None => FreezerIdentifier::Key(&payload),
+        };
         let fin = self
             .finalization_index
             .as_ref()
             .expect("not shut down")
-            .get(FreezerIdentifier::Key(&payload))
+            .get(fin_identifier)
             .await
             .map_err(|err| {
                 Fatal(format!(
@@ -847,7 +863,8 @@ where
             self.cache_finalization(payload, finalization);
             return Ok(());
         }
-        self.finalization_index
+        let cursor = self
+            .finalization_index
             .as_mut()
             .expect("not shut down")
             .put(payload, finalization.as_slice().to_vec())
@@ -857,6 +874,7 @@ where
                     "failed to put finalization certificate for {payload:?}: {err:?}"
                 ))
             })?;
+        self.finalization_cursors.insert(payload, cursor);
         let cp = self
             .finalization_index
             .as_mut()
@@ -889,11 +907,15 @@ where
             return Ok(());
         }
 
+        let pay_identifier = match self.payload_cursors.get(&payload) {
+            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
+            None => FreezerIdentifier::Key(&payload),
+        };
         let existing = self
             .payload_index
             .as_ref()
             .expect("not shut down")
-            .get(FreezerIdentifier::Key(&payload))
+            .get(pay_identifier)
             .await
             .map_err(|err| {
                 Fatal(format!(
@@ -909,7 +931,8 @@ where
             self.cache_payload(payload, bytes);
             return Ok(());
         }
-        self.payload_index
+        let cursor = self
+            .payload_index
             .as_mut()
             .expect("not shut down")
             .put(payload, bytes.as_ref().to_vec())
@@ -919,6 +942,7 @@ where
                     "failed to put payload for {payload:?}: {err:?}"
                 ))
             })?;
+        self.payload_cursors.insert(payload, cursor);
         let cp = self
             .payload_index
             .as_mut()
@@ -968,8 +992,8 @@ where
             value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
             value_target_size: 100 * 1024 * 1024,
             table_partition: format!("{partition_prefix}_fin_tbl"),
-            table_initial_size: 1024,
-            table_resize_frequency: 4,
+            table_initial_size: 65536,
+            table_resize_frequency: 2,
             table_resize_chunk_size: 4096,
             table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
             codec_config: ((0..=Self::MAX_FINALIZATION_RECORD_BYTES).into(), ()),
@@ -994,8 +1018,8 @@ where
             value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
             value_target_size: 100 * 1024 * 1024,
             table_partition: format!("{partition_prefix}_pay_tbl"),
-            table_initial_size: 1024,
-            table_resize_frequency: 4,
+            table_initial_size: 65536,
+            table_resize_frequency: 2,
             table_resize_chunk_size: 4096,
             table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
             codec_config: ((0..=Self::MAX_PAYLOAD_RECORD_BYTES).into(), ()),

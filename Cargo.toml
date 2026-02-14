@@ -54,8 +54,10 @@ tracing-opentelemetry = { workspace = true }
 commonware-consensus = { workspace = true, features = ["fuzz", "mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 criterion = "0.7"
+hellas-rpc = { workspace = true, features = ["client", "server"] }
 proptest = "1.6"
 test-log = { version = "0.2", features = ["trace"] }
+tonic = { version = "0.14", features = ["server", "channel", "router"] }
 
 [[bench]]
 name = "shard_perf"

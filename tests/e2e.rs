@@ -507,3 +507,334 @@ fn submitted_transfer_network_finalizes() {
         min_validators,
     );
 }
+
+#[test_log::test]
+fn node_recovers_after_disconnect() {
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
+    let config = Config::test();
+    let target = 0usize;
+
+    let runner = deterministic::Runner::timed(Duration::from_secs(120));
+
+    runner.start(|mut context| async move {
+        let (network, oracle) = Network::new(
+            context.with_label("network"),
+            NetworkConfig {
+                max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: None,
+            },
+        );
+        network.start();
+
+        let Fixture {
+            participants,
+            schemes,
+            ..
+        }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+
+        let quota = Quota::per_second(NonZeroU32::MAX);
+        let mut registrations = HashMap::new();
+        for validator in participants.iter() {
+            let control = oracle.control(validator.clone());
+            let vote = control.register(0, quota).await.unwrap();
+            let certificate = control.register(1, quota).await.unwrap();
+            let resolver = control.register(2, quota).await.unwrap();
+            let shard = control.register(3, quota).await.unwrap();
+            registrations.insert(validator.clone(), (vote, certificate, resolver, shard));
+        }
+
+        for v1 in participants.iter() {
+            for v2 in participants.iter() {
+                if v1 != v2 {
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        let mut handles: Vec<(Finalizations, Faults, Nullifications)> = Vec::new();
+        for (idx, validator) in participants.iter().enumerate() {
+            let ctx = context.with_label(&format!("validator_{idx}"));
+            let blocker = oracle.control(validator.clone());
+
+            let reporter = MockReporter::new(
+                context.clone(),
+                ReporterConfig {
+                    participants: schemes[idx].participants().clone(),
+                    scheme: schemes[idx].clone(),
+                    elector: RoundRobin::<Sha256>::default(),
+                },
+            );
+            handles.push((
+                reporter.finalizations.clone(),
+                reporter.faults.clone(),
+                reporter.nullifications.clone(),
+            ));
+
+            let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+                .remove(validator)
+                .expect("validator should be registered");
+            let relay = Arc::new(AuthenticatedShardTransport::new(
+                validator,
+                shard_sender,
+                shard_receiver,
+            ));
+            for participant in participants.iter() {
+                relay.declare(participant);
+            }
+            relay.finalize_validators();
+
+            let (engine, _tx_mailbox) = Engine::new(
+                ctx,
+                config,
+                schemes[idx].clone(),
+                blocker,
+                relay.clone(),
+                validator,
+                reporter,
+            );
+            let _shard_transport = relay.start(context.clone());
+            engine.start(vote, certificate, resolver);
+        }
+
+        // ── Phase 1: Baseline ──────────────────────────────────────────
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase1_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        println!("recovery phase 1 (baseline): finalizations={phase1_counts:?}");
+        for (i, count) in phase1_counts.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "recovery phase 1: validator {i} has no finalizations"
+            );
+        }
+
+        // ── Phase 2: Disconnect target node ────────────────────────────
+        for (i, peer) in participants.iter().enumerate() {
+            if i != target {
+                oracle
+                    .remove_link(participants[target].clone(), peer.clone())
+                    .await
+                    .unwrap();
+                oracle
+                    .remove_link(peer.clone(), participants[target].clone())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let pre_disconnect_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase2_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let phase2_gains: Vec<usize> = phase2_counts
+            .iter()
+            .zip(pre_disconnect_counts.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        println!(
+            "recovery phase 2 (node {target} offline): finalizations={phase2_counts:?}, gains={phase2_gains:?}"
+        );
+
+        // Connected nodes (all except target) should have gained new finalizations.
+        let connected_with_progress = phase2_gains
+            .iter()
+            .enumerate()
+            .filter(|(i, gain)| *i != target && **gain > 0)
+            .count();
+        assert!(
+            connected_with_progress >= 4,
+            "recovery phase 2: expected at least 4 connected nodes to progress, got {connected_with_progress} (gains={phase2_gains:?})"
+        );
+
+        // ── Phase 3: Disconnect second node (should halt finalization) ─
+        // With 2 of 6 offline, only 4 remain — below the supermajority
+        // threshold, so no new views should finalize.
+        let target2 = 3usize;
+        for (i, peer) in participants.iter().enumerate() {
+            // Skip self and skip target (its links were already removed in phase 2).
+            if i == target2 || i == target {
+                continue;
+            }
+            oracle
+                .remove_link(participants[target2].clone(), peer.clone())
+                .await
+                .unwrap();
+            oracle
+                .remove_link(peer.clone(), participants[target2].clone())
+                .await
+                .unwrap();
+        }
+
+        let pre_halt_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase3_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let phase3_gains: Vec<usize> = phase3_counts
+            .iter()
+            .zip(pre_halt_counts.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        let phase3_total_gain: usize = phase3_gains.iter().sum();
+        println!(
+            "recovery phase 3 (2 nodes offline, expect halt): finalizations={phase3_counts:?}, gains={phase3_gains:?}, total_gain={phase3_total_gain}"
+        );
+
+        // With only 4/6 online, finalization should have stopped (or nearly).
+        // Allow a small tolerance for in-flight messages at the moment of disconnect.
+        assert!(
+            phase3_total_gain <= 6,
+            "recovery phase 3: expected finalization to halt with 2 nodes offline, but total gain was {phase3_total_gain} (gains={phase3_gains:?})"
+        );
+
+        // ── Phase 4: Reconnect first target (restore 5/6 → resume) ────
+        // Re-add bidirectional links between target and all online peers.
+        // Skip target2 which is still offline.
+        for (i, peer) in participants.iter().enumerate() {
+            if i == target || i == target2 {
+                continue;
+            }
+            oracle
+                .add_link(participants[target].clone(), peer.clone(), link.clone())
+                .await
+                .unwrap();
+            oracle
+                .add_link(peer.clone(), participants[target].clone(), link.clone())
+                .await
+                .unwrap();
+        }
+
+        let pre_resume_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+
+        context.sleep(Duration::from_secs(8)).await;
+
+        let phase4_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let phase4_gains: Vec<usize> = phase4_counts
+            .iter()
+            .zip(pre_resume_counts.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        println!(
+            "recovery phase 4 (5/6 restored): finalizations={phase4_counts:?}, gains={phase4_gains:?}"
+        );
+
+        // The reconnected first target should have caught up.
+        assert!(
+            phase4_gains[target] > 0,
+            "recovery phase 4: node {target} did not recover after reconnect (gain=0, total={})",
+            phase4_counts[target]
+        );
+
+        // At least 4 of the 5 online nodes should have gained new finalizations.
+        let online_with_progress = phase4_gains
+            .iter()
+            .enumerate()
+            .filter(|(i, gain)| *i != target2 && **gain > 0)
+            .count();
+        assert!(
+            online_with_progress >= 4,
+            "recovery phase 4: expected at least 4 online nodes to resume progress, got {online_with_progress} (gains={phase4_gains:?})"
+        );
+
+        // ── Phase 5: Reconnect second target, all 6 progress together ──
+        // Bring all 6 nodes back online and verify they all gain
+        // finalizations at the same rate (proving full sync recovery).
+        // Total counts won't converge because missed views are not
+        // retroactively reported, but the *rate* of new finalizations
+        // should be equal across all nodes.
+        for (i, peer) in participants.iter().enumerate() {
+            if i == target2 || i == target {
+                continue;
+            }
+            oracle
+                .add_link(participants[target2].clone(), peer.clone(), link.clone())
+                .await
+                .unwrap();
+            oracle
+                .add_link(peer.clone(), participants[target2].clone(), link.clone())
+                .await
+                .unwrap();
+        }
+        // Also restore the link between the two previously-offline nodes.
+        oracle
+            .add_link(participants[target].clone(), participants[target2].clone(), link.clone())
+            .await
+            .unwrap();
+        oracle
+            .add_link(participants[target2].clone(), participants[target].clone(), link.clone())
+            .await
+            .unwrap();
+
+        // Let all nodes settle and start progressing together.
+        context.sleep(Duration::from_secs(3)).await;
+
+        // Snapshot, wait, then check that all 6 gained equally.
+        let pre_phase5: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase5_counts: Vec<usize> = handles
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let phase5_gains: Vec<usize> = phase5_counts
+            .iter()
+            .zip(pre_phase5.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        let min_gain = *phase5_gains.iter().min().unwrap();
+        let max_gain = *phase5_gains.iter().max().unwrap();
+        println!(
+            "recovery phase 5 (all 6 back): finalizations={phase5_counts:?}, gains={phase5_gains:?}, spread={}",
+            max_gain - min_gain
+        );
+
+        // Every node should have gained new finalizations.
+        for (i, gain) in phase5_gains.iter().enumerate() {
+            assert!(
+                *gain > 0,
+                "recovery phase 5: node {i} made no progress (gains={phase5_gains:?})"
+            );
+        }
+
+        // All nodes should be progressing at the same rate (spread ≤ 1).
+        assert!(
+            max_gain - min_gain <= 1,
+            "recovery phase 5: nodes progressing at different rates, spread={} (gains={phase5_gains:?})",
+            max_gain - min_gain
+        );
+    });
+}
