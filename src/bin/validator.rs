@@ -65,6 +65,8 @@ enum ValidatorError {
     Scheme(String),
     #[error("storage directory is not valid UTF-8: {0}")]
     NonUtf8StorageDirectory(PathBuf),
+    #[error("failed to create log file: {0}")]
+    LogFile(io::Error),
 }
 
 #[derive(Parser)]
@@ -96,6 +98,9 @@ enum Command {
         /// Path to the TOML config file
         #[arg(long)]
         config: PathBuf,
+        /// Write structured JSON logs (with span context) to this file
+        #[arg(long)]
+        log_json: Option<PathBuf>,
     },
 }
 
@@ -108,7 +113,7 @@ fn main() {
             start_port,
             seed,
         } => setup(validators, node, start_port, seed),
-        Command::Run { config } => run(config),
+        Command::Run { config, log_json } => run(config, log_json),
     };
 
     if let Err(err) = result {
@@ -264,10 +269,27 @@ fn build_otlp_tracer(
     Ok((tracer, tracer_provider))
 }
 
-fn init_tracing(validator_pubkey: &str) -> Result<Option<SdkTracerProvider>, ValidatorError> {
+fn init_tracing(
+    validator_pubkey: &str,
+    log_json: Option<&std::path::Path>,
+) -> Result<Option<SdkTracerProvider>, ValidatorError> {
     let log_directive = "info".parse()?;
     let env_filter = EnvFilter::from_default_env().add_directive(log_directive);
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
+
+    let file_layer = match log_json {
+        Some(path) => {
+            let file = std::fs::File::create(path).map_err(ValidatorError::LogFile)?;
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_span_list(true)
+                    .with_current_span(true)
+                    .with_writer(Arc::new(file)),
+            )
+        }
+        None => None,
+    };
 
     if let Some(otlp_cfg) = otlp_config_from_env() {
         let endpoint = otlp_cfg.endpoint.clone();
@@ -279,6 +301,7 @@ fn init_tracing(validator_pubkey: &str) -> Result<Option<SdkTracerProvider>, Val
         tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt_layer)
+            .with(file_layer)
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .init();
         info!(
@@ -293,6 +316,7 @@ fn init_tracing(validator_pubkey: &str) -> Result<Option<SdkTracerProvider>, Val
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
+        .with(file_layer)
         .init();
     Ok(None)
 }
@@ -374,14 +398,14 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
+fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let node_config: NodeConfig = toml::from_str(&config_str)?;
 
     let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
     let validator_pubkey = hex::encode(me.encode());
-    let tracer_provider = init_tracing(&validator_pubkey)?;
+    let tracer_provider = init_tracing(&validator_pubkey, log_json.as_deref())?;
     let participants = node_config.participants()?;
     let peer_map = node_config.peer_address_map()?;
 
