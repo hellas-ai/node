@@ -1,5 +1,4 @@
-use super::codec::WireShardMessage;
-use super::protocol::{CodingImpl, coding_config};
+use super::protocol::{CodingImpl, WireShardMessage, coding_config};
 use commonware_codec::Encode;
 use commonware_coding::Scheme as CodingScheme;
 use commonware_consensus::types::{Epoch, Round, View};

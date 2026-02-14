@@ -1,20 +1,27 @@
-use super::codec::WireShardMessage;
 use super::metrics::ShardMetrics;
-use super::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, hash_encoded};
+use super::protocol::{
+    BlockKey, CodingImpl, ShardMessage, WireShardMessage, ZodaCheckedShard, ZodaCheckingData,
+    ZodaCommitment, ZodaReShard, ZodaShard, hash_encoded,
+};
 use super::recovery::{
     ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
 };
-use super::scheduler;
 use crate::trace::Traced;
 use bytes::Bytes;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Handle, Metrics, Spawner};
+use commonware_runtime::{Metrics, Spawner};
 use futures::channel::mpsc;
 use hellas_types::PublicKey;
-use std::collections::{HashMap, VecDeque};
-use tracing::{info, info_span, warn};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
+use tracing::{Span, info, info_span, warn};
+
+// ---------------------------------------------------------------------------
+// Public effect type
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) enum ShardEffect {
@@ -23,12 +30,222 @@ pub(crate) enum ShardEffect {
     Failed { key: BlockKey },
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 struct IncomingReShare {
     key: BlockKey,
     commitment: ZodaCommitment,
     shard_index: u16,
     reshard: <CodingImpl as CodingScheme>::ReShard,
 }
+
+// ---------------------------------------------------------------------------
+// Coding task types (replaces scheduler module)
+// ---------------------------------------------------------------------------
+
+enum CodingTaskKind {
+    Reshard {
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        shard: ZodaShard,
+    },
+    Check {
+        commitment: ZodaCommitment,
+        checking_data: ZodaCheckingData,
+        shard_index: u16,
+        shard_hash: Digest,
+        reshard: ZodaReShard,
+    },
+}
+
+struct CodingTask {
+    key: BlockKey,
+    span: Span,
+    kind: CodingTaskKind,
+}
+
+// Order by BlockKey so BinaryHeap (max-heap) processes newest views first.
+impl Eq for CodingTask {}
+impl PartialEq for CodingTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl PartialOrd for CodingTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CodingTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+enum CodingResult {
+    ReshardDone {
+        key: BlockKey,
+        commitment: ZodaCommitment,
+        shard_index: u16,
+        shard_hash: Digest,
+        result: Result<(ZodaCheckingData, ZodaCheckedShard, ZodaReShard), ()>,
+    },
+    CheckDone {
+        key: BlockKey,
+        shard_index: u16,
+        shard_hash: Digest,
+        result: Result<ZodaCheckedShard, ()>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Shared priority queue — workers pull highest-priority tasks
+// ---------------------------------------------------------------------------
+
+struct SharedQueue {
+    inner: Mutex<BinaryHeap<CodingTask>>,
+    not_empty: Condvar,
+    closed: AtomicBool,
+}
+
+impl SharedQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(BinaryHeap::new()),
+            not_empty: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, task: CodingTask) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.push(task);
+        self.not_empty.notify_one();
+    }
+
+    /// Block until a task is available or the queue is closed.
+    fn pop(&self) -> Option<CodingTask> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if self.closed.load(AtomicOrdering::Acquire) {
+                return None;
+            }
+            if let Some(task) = inner.pop() {
+                return Some(task);
+            }
+            inner = self.not_empty.wait(inner).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, AtomicOrdering::Release);
+        self.not_empty.notify_all();
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task execution (runs on worker threads)
+// ---------------------------------------------------------------------------
+
+fn execute_coding_task(config: CodingConfig, task: CodingTask) -> Traced<CodingResult> {
+    let CodingTask { key, span, kind } = task;
+    let result = {
+        let _entered = span.enter();
+        match kind {
+            CodingTaskKind::Reshard {
+                commitment,
+                shard_index,
+                shard_hash,
+                shard,
+            } => {
+                let result = CodingImpl::reshard(&config, &commitment, shard_index, shard)
+                    .map_err(|err| {
+                        warn!(
+                            digest = ?key.digest,
+                            round = ?key.round,
+                            shard_index,
+                            ?err,
+                            "reshard failed"
+                        );
+                    });
+                CodingResult::ReshardDone {
+                    key,
+                    commitment,
+                    shard_index,
+                    shard_hash,
+                    result,
+                }
+            }
+            CodingTaskKind::Check {
+                commitment,
+                checking_data,
+                shard_index,
+                shard_hash,
+                reshard,
+            } => {
+                let result = CodingImpl::check(
+                    &config,
+                    &commitment,
+                    &checking_data,
+                    shard_index,
+                    reshard,
+                )
+                .map_err(|err| {
+                    warn!(
+                        digest = ?key.digest,
+                        round = ?key.round,
+                        shard_index,
+                        ?err,
+                        "check failed"
+                    );
+                });
+                CodingResult::CheckDone {
+                    key,
+                    shard_index,
+                    shard_hash,
+                    result,
+                }
+            }
+        }
+    };
+    Traced::with_span(result, span)
+}
+
+fn spawn_coding_workers(
+    num_workers: usize,
+    queue: Arc<SharedQueue>,
+    config: CodingConfig,
+    event_tx: mpsc::UnboundedSender<Traced<CodingResult>>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    (0..num_workers)
+        .map(|i| {
+            let queue = queue.clone();
+            let event_tx = event_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("coding-worker-{i}"))
+                .spawn(move || {
+                    while let Some(task) = queue.pop() {
+                        let traced_result = execute_coding_task(config, task);
+                        if event_tx.unbounded_send(traced_result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("failed to spawn coding worker thread")
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ShardRecoverer
+// ---------------------------------------------------------------------------
 
 pub(crate) struct ShardRecoverer<S: Strategy> {
     me: PublicKey,
@@ -37,11 +254,15 @@ pub(crate) struct ShardRecoverer<S: Strategy> {
     strategy: S,
     machine: RecoveryMachine,
     metrics: ShardMetrics,
-    coding_tx: mpsc::UnboundedSender<Traced<scheduler::Command>>,
-    coding_event_rx: mpsc::UnboundedReceiver<Traced<scheduler::Event>>,
-    /// Held for RAII: dropping the handle aborts the scheduler task.
-    #[allow(dead_code)]
-    scheduler_handle: Handle<()>,
+    queue: Arc<SharedQueue>,
+    coding_event_rx: mpsc::UnboundedReceiver<Traced<CodingResult>>,
+    _workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl<S: Strategy> Drop for ShardRecoverer<S> {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 impl<S: Strategy> ShardRecoverer<S> {
@@ -59,18 +280,12 @@ impl<S: Strategy> ShardRecoverer<S> {
         context: &(impl Spawner + Metrics + Clone),
     ) -> Self {
         let metrics = ShardMetrics::register(&context.with_label("shard"));
-        let (coding_tx, coding_cmd_rx) = mpsc::unbounded();
-        let (coding_event_tx, coding_event_rx) = mpsc::unbounded();
-        let scheduler = scheduler::Scheduler::new(
-            coding_cmd_rx,
-            coding_event_tx,
-            coding_config,
-            strategy.clone(),
-            metrics.clone(),
-        );
-        let scheduler_handle = context.clone().spawn(move |_| async move {
-            scheduler.run().await;
-        });
+        let queue = Arc::new(SharedQueue::new());
+        let (event_tx, coding_event_rx) = mpsc::unbounded();
+        let num_workers = strategy.parallelism_hint();
+        let workers =
+            spawn_coding_workers(num_workers, queue.clone(), coding_config, event_tx);
+        info!(num_workers, "coding workers started (streaming priority queue)");
         Self {
             me: me.clone(),
             my_index,
@@ -84,14 +299,14 @@ impl<S: Strategy> ShardRecoverer<S> {
                 max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
             }),
             metrics,
-            coding_tx,
+            queue,
             coding_event_rx,
-            scheduler_handle,
+            _workers: workers,
         }
     }
 
     pub(crate) fn shutdown(&mut self) {
-        self.coding_tx.close_channel();
+        self.queue.close();
     }
 
     pub(crate) const fn me(&self) -> &PublicKey {
@@ -102,23 +317,25 @@ impl<S: Strategy> ShardRecoverer<S> {
         &self.coding_config
     }
 
-    // ---- Drain coding scheduler events (non-blocking) ----
+    // ---- Drain coding results (non-blocking) ----
 
     pub(crate) fn drain_coding_events(&mut self) -> VecDeque<ShardEffect> {
         let mut effects = VecDeque::new();
         let mut drained = 0u32;
         while let Ok(Some(traced)) = self.coding_event_rx.try_next() {
-            let (event, parent_span) = traced.into_parts();
+            let (result, parent_span) = traced.into_parts();
             // Re-enter the caller's span so that downstream work
             // (apply_reshard_result, try_recover, etc.) appears as children
             // of the original handle_message span.  This is synchronous code,
-            // so .enter() is safe and cannot cause the "enormous spans"
-            // problem that occurs with .enter() across .await points.
+            // so .enter() is safe.
             let _entered = parent_span.enter();
-            self.apply_coding_event(event, &mut effects);
+            self.apply_coding_result(result, &mut effects);
             drained += 1;
         }
         if drained > 0 {
+            self.metrics
+                .scheduler_queue_depth
+                .set(self.queue.len() as i64);
             info!(
                 drained,
                 recoveries = effects.iter().filter(|e| matches!(e, ShardEffect::Recovered { .. })).count(),
@@ -128,10 +345,14 @@ impl<S: Strategy> ShardRecoverer<S> {
         effects
     }
 
-    fn apply_coding_event(&mut self, event: scheduler::Event, effects: &mut VecDeque<ShardEffect>) {
+    fn apply_coding_result(
+        &mut self,
+        result: CodingResult,
+        effects: &mut VecDeque<ShardEffect>,
+    ) {
         self.metrics.coding_tasks_completed_total.inc();
-        match event {
-            scheduler::Event::ReshardDone {
+        match result {
+            CodingResult::ReshardDone {
                 key,
                 commitment,
                 shard_index,
@@ -139,15 +360,10 @@ impl<S: Strategy> ShardRecoverer<S> {
                 result,
             } => {
                 self.apply_reshard_result(
-                    key,
-                    commitment,
-                    shard_index,
-                    shard_hash,
-                    result,
-                    effects,
+                    key, commitment, shard_index, shard_hash, result, effects,
                 );
             }
-            scheduler::Event::CheckDone {
+            CodingResult::CheckDone {
                 key,
                 shard_index,
                 shard_hash,
@@ -182,7 +398,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         )
         .entered();
         let Ok((checking_data, checked_shard, reshard)) = result else {
-            // Crypto failure already logged by the scheduler.
+            // Crypto failure already logged by the worker.
             return;
         };
 
@@ -229,7 +445,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         )
         .entered();
         let Ok(checked_shard) = result else {
-            // Crypto failure already logged by the scheduler.
+            // Crypto failure already logged by the worker.
             return;
         };
 
@@ -247,15 +463,7 @@ impl<S: Strategy> ShardRecoverer<S> {
         }
     }
 
-    // ---- Dispatch commands to the coding scheduler ----
-
-    fn dispatch_coding_command(&self, cmd: scheduler::Command) {
-        if let Err(err) = self.coding_tx.unbounded_send(Traced::capture(cmd)) {
-            warn!(?err, "coding scheduler command channel closed");
-        } else {
-            self.metrics.coding_tasks_dispatched_total.inc();
-        }
-    }
+    // ---- Dispatch tasks to coding worker pool ----
 
     fn dispatch_reshard(
         &self,
@@ -265,28 +473,38 @@ impl<S: Strategy> ShardRecoverer<S> {
         shard_hash: Digest,
         shard: <CodingImpl as CodingScheme>::Shard,
     ) {
-        self.dispatch_coding_command(scheduler::Command::Reshard {
+        self.queue.push(CodingTask {
             key,
-            commitment,
-            shard_index,
-            shard_hash,
-            shard,
+            span: Span::current(),
+            kind: CodingTaskKind::Reshard {
+                commitment,
+                shard_index,
+                shard_hash,
+                shard,
+            },
         });
+        self.metrics.coding_tasks_dispatched_total.inc();
+        self.metrics
+            .scheduler_queue_depth
+            .set(self.queue.len() as i64);
     }
 
     fn dispatch_check(&self, task: ReadyToCheckTask) {
-        self.dispatch_coding_command(scheduler::Command::Check {
+        self.queue.push(CodingTask {
             key: task.key,
-            commitment: task.commitment,
-            checking_data: task.checking_data,
-            shard_index: task.shard_index,
-            shard_hash: task.shard_hash,
-            reshard: task.reshard,
+            span: Span::current(),
+            kind: CodingTaskKind::Check {
+                commitment: task.commitment,
+                checking_data: task.checking_data,
+                shard_index: task.shard_index,
+                shard_hash: task.shard_hash,
+                reshard: task.reshard,
+            },
         });
-    }
-
-    fn dispatch_cancel(&self, key: BlockKey) {
-        self.dispatch_coding_command(scheduler::Command::Cancel { key });
+        self.metrics.coding_tasks_dispatched_total.inc();
+        self.metrics
+            .scheduler_queue_depth
+            .set(self.queue.len() as i64);
     }
 
     // ---- Message handling ----
@@ -306,7 +524,6 @@ impl<S: Strategy> ShardRecoverer<S> {
                 RecoveryOutput::DrainedPreLeader(messages) => drained.extend(messages),
                 RecoveryOutput::KnownKeyEvicted { key: evicted } => {
                     self.metrics.recovery_evictions_total.inc();
-                    self.dispatch_cancel(evicted);
                     effects.push_back(ShardEffect::Failed { key: evicted });
                 }
                 _ => {}
@@ -454,7 +671,7 @@ impl<S: Strategy> ShardRecoverer<S> {
             return effects;
         }
 
-        // Dispatch reshard to the coding scheduler (async).
+        // Dispatch reshard to a coding worker thread.
         // Results arrive via drain_coding_events → apply_reshard_result,
         // which handles ApplyInitialValidated, broadcast, and try_recover.
         self.dispatch_reshard(key, commitment, shard_index, shard_hash, shard);
@@ -601,7 +818,6 @@ impl<S: Strategy> ShardRecoverer<S> {
                     "evicting oldest recovery entry to admit new recovery"
                 );
                 self.metrics.recovery_evictions_total.inc();
-                self.dispatch_cancel(key);
                 Some(ShardEffect::Failed { key })
             }
             RecoveryOutput::KnownKeyEvicted { key } => {
@@ -661,7 +877,7 @@ mod tests {
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::{Signer, ed25519};
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Runner, deterministic};
+    use commonware_runtime::{Runner, Spawner, deterministic};
     use std::time::Duration;
 
     struct BlockArtifacts {

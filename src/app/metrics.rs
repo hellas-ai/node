@@ -93,6 +93,8 @@ pub(super) struct CoreMetrics {
     pub(crate) pending_payloads: Gauge<i64, AtomicI64>,
     pub(crate) persisted_roots: Gauge<i64, AtomicI64>,
     pub(crate) unpersisted_finalizations: Gauge<i64, AtomicI64>,
+    pub(crate) finalization_timestamp_drift: Gauge<i64, AtomicI64>,
+    pub(crate) validation_timestamp_drift: Gauge<i64, AtomicI64>,
 }
 
 impl CoreMetrics {
@@ -112,6 +114,8 @@ impl CoreMetrics {
             pending_payloads: Gauge::default(),
             persisted_roots: Gauge::default(),
             unpersisted_finalizations: Gauge::default(),
+            finalization_timestamp_drift: Gauge::default(),
+            validation_timestamp_drift: Gauge::default(),
         };
 
         context.register(
@@ -184,6 +188,16 @@ impl CoreMetrics {
             "current number of finalized payloads awaiting persistence",
             metrics.unpersisted_finalizations.clone(),
         );
+        context.register(
+            "finalization_timestamp_drift",
+            "signed ms drift between wall clock and finalized block timestamp (now - block_ts)",
+            metrics.finalization_timestamp_drift.clone(),
+        );
+        context.register(
+            "validation_timestamp_drift",
+            "signed ms drift between wall clock and validated block timestamp (now - block_ts)",
+            metrics.validation_timestamp_drift.clone(),
+        );
 
         metrics.waiter_keys.set(0);
         metrics.waiter_total.set(0);
@@ -191,6 +205,8 @@ impl CoreMetrics {
         metrics.pending_payloads.set(0);
         metrics.persisted_roots.set(0);
         metrics.unpersisted_finalizations.set(0);
+        metrics.finalization_timestamp_drift.set(0);
+        metrics.validation_timestamp_drift.set(0);
         metrics
     }
 }

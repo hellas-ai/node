@@ -1,4 +1,3 @@
-mod codec;
 pub(crate) mod core;
 #[cfg(test)]
 mod integration;
@@ -12,7 +11,6 @@ pub(crate) mod protocol;
 mod recovery;
 pub(crate) mod transport;
 mod validators;
-mod scheduler;
 
-pub(crate) use codec::WireShardMessage;
+pub(crate) use protocol::WireShardMessage;
 pub use p2p::AuthenticatedShardTransport;

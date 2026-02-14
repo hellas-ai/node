@@ -1,9 +1,9 @@
 use super::mailbox::AppMailboxReadWriteMessage;
 use super::metrics::{CoreMetrics, gauge_set_len};
 use super::payload::{
-    decode_anchor, decode_execution_payload, encode_payload, first_missing_execution_dependency,
-    genesis_digest, genesis_payload, missing_dependency_or_execution, payload_digest,
-    validate_payload,
+    decode_anchor, decode_execution_payload, encode_payload,
+    first_missing_execution_dependency, genesis_digest, genesis_payload,
+    missing_dependency_or_execution, payload_digest, validate_payload,
 };
 use crate::execution::{
     ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
@@ -253,9 +253,9 @@ impl AppCore {
         effects
     }
 
-    pub(super) fn on_finalized(&mut self, payload: Digest, parent_payload: Digest) -> CoreEffects {
+    pub(super) fn on_finalized(&mut self, payload: Digest, parent_payload: Digest, now: u64) -> CoreEffects {
         let mut effects = CoreEffects::new();
-        self.handle_finalized(payload, parent_payload, &mut effects);
+        self.handle_finalized(payload, parent_payload, now, &mut effects);
         effects
     }
 
@@ -836,7 +836,7 @@ impl AppCore {
         for (payload, parent_payload) in pending {
             if self.ensure_execution_materialized(payload) {
                 self.pending_finalizations.shift_remove(&payload);
-                self.handle_finalized(payload, parent_payload, effects);
+                self.handle_finalized(payload, parent_payload, now, effects);
                 continue;
             }
 
@@ -893,6 +893,7 @@ impl AppCore {
         &mut self,
         payload: Digest,
         parent_payload: Digest,
+        now: u64,
         effects: &mut CoreEffects,
     ) {
         let _span = info_span!(
@@ -1205,7 +1206,7 @@ mod tests {
             assert!(core.speculative_store.contains_execution(canonical));
             assert!(core.speculative_store.contains_execution(fork));
 
-            let effects = core.on_finalized(canonical, genesis);
+            let effects = core.on_finalized(canonical, genesis, 0);
             assert!(effects.replies.is_empty());
             assert!(effects.network.is_empty());
 
@@ -1660,7 +1661,7 @@ mod tests {
             let payload = payload_digest(&payload_contents);
             core.note_payload_seen(payload, payload_contents);
 
-            let deferred = core.on_finalized(payload, parent_payload);
+            let deferred = core.on_finalized(payload, parent_payload, 0);
             assert!(deferred.replies.is_empty());
             assert!(deferred.network.is_empty());
 
@@ -1892,7 +1893,7 @@ mod tests {
                     "initial verify should fetch first missing ancestor"
                 );
 
-                let initial_finalized = core.on_finalized(tip, tip_parent);
+                let initial_finalized = core.on_finalized(tip, tip_parent, 0);
                 assert!(initial_finalized.replies.is_empty());
                 assert!(initial_finalized.network.is_empty());
                 assert!(!core.finalized.is_finalized(tip));
@@ -1987,7 +1988,7 @@ mod tests {
                 encode_payload(context.round, genesis, 101, genesis, anchor_root, &[]);
             let payload = payload_digest(&payload_contents);
 
-            let deferred = core.on_finalized(payload, genesis);
+            let deferred = core.on_finalized(payload, genesis, 0);
             assert!(deferred.replies.is_empty());
             assert!(deferred.network.is_empty());
             assert!(!core.finalized.is_finalized(payload));

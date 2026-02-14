@@ -1,5 +1,4 @@
-use super::codec::WireShardMessage;
-use super::protocol::{BlockKey, ShardMessage, ZodaCommitment, ZodaShard};
+use super::protocol::{BlockKey, ShardMessage, WireShardMessage, ZodaCommitment, ZodaShard};
 use super::transport::ShardTransport;
 use super::validators::{DistributionError, ValidatorSet};
 use crate::trace::Traced;

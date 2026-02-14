@@ -540,6 +540,7 @@ where
             AppMailboxReadWriteMessage::FinalizationEvent { notice } => {
                 self.app_metrics.external_events_total.inc();
                 self.app_metrics.finalization_notices_total.inc();
+                let now = context.current().epoch_millis();
                 let FinalizationNotice {
                     payload,
                     parent_payload,
@@ -553,7 +554,7 @@ where
                         has_certificate = certificate_bytes.is_some()
                     )
                     .entered();
-                    self.core.on_finalized(payload, parent_payload)
+                    self.core.on_finalized(payload, parent_payload, now)
                 };
                 if let Some(certificate_bytes) = certificate_bytes {
                     self.persistence.record_finalization(payload, certificate_bytes);

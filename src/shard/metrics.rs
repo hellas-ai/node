@@ -13,7 +13,6 @@ pub(crate) struct ShardMetrics {
     pub(crate) coding_tasks_dispatched_total: Counter,
     pub(crate) coding_tasks_completed_total: Counter,
     pub(crate) scheduler_queue_depth: Gauge<i64, AtomicI64>,
-    pub(crate) scheduler_batch_duration_ns: Gauge<i64, AtomicI64>,
 }
 
 impl ShardMetrics {
@@ -28,7 +27,6 @@ impl ShardMetrics {
             coding_tasks_dispatched_total: Counter::default(),
             coding_tasks_completed_total: Counter::default(),
             scheduler_queue_depth: Gauge::default(),
-            scheduler_batch_duration_ns: Gauge::default(),
         };
 
         context.register(
@@ -63,30 +61,24 @@ impl ShardMetrics {
         );
         context.register(
             "coding_tasks_dispatched_total",
-            "coding scheduler tasks dispatched (reshard + check)",
+            "coding tasks dispatched (reshard + check)",
             metrics.coding_tasks_dispatched_total.clone(),
         );
         context.register(
             "coding_tasks_completed_total",
-            "coding scheduler tasks completed",
+            "coding tasks completed",
             metrics.coding_tasks_completed_total.clone(),
         );
         context.register(
             "scheduler_queue_depth",
-            "current number of tasks pending in coding scheduler queue",
+            "current number of tasks waiting in coding priority queue",
             metrics.scheduler_queue_depth.clone(),
-        );
-        context.register(
-            "scheduler_batch_duration_ns",
-            "duration of last coding scheduler batch in nanoseconds",
-            metrics.scheduler_batch_duration_ns.clone(),
         );
 
         metrics.active_recoveries.set(0);
         metrics.known_keys.set(0);
         metrics.pre_leader_keys.set(0);
         metrics.scheduler_queue_depth.set(0);
-        metrics.scheduler_batch_duration_ns.set(0);
         metrics
     }
 
@@ -103,7 +95,6 @@ impl ShardMetrics {
             coding_tasks_dispatched_total: Counter::default(),
             coding_tasks_completed_total: Counter::default(),
             scheduler_queue_depth: Gauge::default(),
-            scheduler_batch_duration_ns: Gauge::default(),
         }
     }
 }
