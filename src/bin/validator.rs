@@ -94,6 +94,10 @@ enum Command {
         /// Deterministic seed for key generation (required for multi-node local setup)
         #[arg(long)]
         seed: Option<u64>,
+        /// Comma-separated list of addresses for each validator (one per validator,
+        /// in index order). When omitted, all peers default to 127.0.0.1.
+        #[arg(long, value_delimiter = ',')]
+        addresses: Option<Vec<String>>,
     },
     /// Run a validator node
     Run {
@@ -114,7 +118,8 @@ fn main() {
             node,
             start_port,
             seed,
-        } => setup(validators, node, start_port, seed),
+            addresses,
+        } => setup(validators, node, start_port, seed, addresses),
         Command::Run { config, log_json } => run(config, log_json),
     };
 
@@ -129,6 +134,7 @@ fn setup(
     node: u32,
     start_port: u16,
     seed: Option<u64>,
+    addresses: Option<Vec<String>>,
 ) -> Result<(), ValidatorError> {
     if validators == 0 {
         return Err(ValidatorError::InvalidSetup(
@@ -139,6 +145,14 @@ fn setup(
         return Err(ValidatorError::InvalidSetup(
             "node index must be less than validators".to_string(),
         ));
+    }
+    if let Some(ref addrs) = addresses {
+        if addrs.len() != validators as usize {
+            return Err(ValidatorError::InvalidSetup(format!(
+                "--addresses must have exactly {validators} entries (one per validator), got {}",
+                addrs.len(),
+            )));
+        }
     }
 
     if seed.is_none() {
@@ -158,9 +172,15 @@ fn setup(
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != node as usize)
-        .map(|(i, k)| PeerEntry {
-            public_key: hex::encode(k.public_key().encode()),
-            address: format!("127.0.0.1:{}", start_port + i as u16),
+        .map(|(i, k)| {
+            let host = addresses
+                .as_ref()
+                .map(|a| a[i].as_str())
+                .unwrap_or("127.0.0.1");
+            PeerEntry {
+                public_key: hex::encode(k.public_key().encode()),
+                address: format!("{}:{}", host, start_port + i as u16),
+            }
         })
         .collect();
 
