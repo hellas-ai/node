@@ -2,12 +2,14 @@ use super::protocol::{
     BlockKey, CodingImpl, ZodaCheckedShard, ZodaCheckingData, ZodaCommitment, ZodaReShard,
     ZodaShard,
 };
+use super::metrics::ShardMetrics;
 use crate::trace::Traced;
 use commonware_coding::{Config as CodingConfig, Scheme as CodingScheme};
 use commonware_cryptography::sha256::Digest;
 use commonware_parallel::Strategy;
 use futures::{StreamExt, channel::mpsc};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
 use tracing::Span;
 
 pub(super) enum Command {
@@ -67,12 +69,15 @@ enum Task {
     },
 }
 
+const MAX_BATCH_SIZE: usize = 64;
+
 pub(super) struct Scheduler<S: Strategy> {
     command_rx: mpsc::UnboundedReceiver<Traced<Command>>,
     event_tx: mpsc::UnboundedSender<Traced<Event>>,
     queue: BTreeMap<BlockKey, VecDeque<Task>>,
     coding_config: CodingConfig,
     strategy: S,
+    metrics: ShardMetrics,
 }
 
 impl<S: Strategy> Scheduler<S> {
@@ -81,6 +86,7 @@ impl<S: Strategy> Scheduler<S> {
         event_tx: mpsc::UnboundedSender<Traced<Event>>,
         coding_config: CodingConfig,
         strategy: S,
+        metrics: ShardMetrics,
     ) -> Self {
         Self {
             command_rx,
@@ -88,6 +94,7 @@ impl<S: Strategy> Scheduler<S> {
             queue: BTreeMap::new(),
             coding_config,
             strategy,
+            metrics,
         }
     }
 
@@ -114,13 +121,33 @@ impl<S: Strategy> Scheduler<S> {
                 self.enqueue(cmd, parent_span);
             }
 
-            // Flatten tasks from queue in BTreeMap key order (earliest first).
-            let tasks: Vec<Task> = self
-                .queue
-                .values_mut()
-                .flat_map(|deque| deque.drain(..))
-                .collect();
-            self.queue.clear();
+            // Update queue depth metric.
+            let queue_depth: usize = self.queue.values().map(|d| d.len()).sum();
+            self.metrics.scheduler_queue_depth.set(queue_depth as i64);
+
+            // Take up to MAX_BATCH_SIZE tasks, newest views first.
+            // Reverse iteration on BTreeMap gives descending key order
+            // (newest rounds first), which prioritizes recent work that
+            // is most likely to still have active recovery entries.
+            let mut tasks = Vec::with_capacity(MAX_BATCH_SIZE);
+            let mut empty_keys = Vec::new();
+            for (key, deque) in self.queue.iter_mut().rev() {
+                while let Some(task) = deque.pop_front() {
+                    tasks.push(task);
+                    if tasks.len() >= MAX_BATCH_SIZE {
+                        break;
+                    }
+                }
+                if deque.is_empty() {
+                    empty_keys.push(*key);
+                }
+                if tasks.len() >= MAX_BATCH_SIZE {
+                    break;
+                }
+            }
+            for key in empty_keys {
+                self.queue.remove(&key);
+            }
 
             if tasks.is_empty() {
                 continue;
@@ -128,16 +155,20 @@ impl<S: Strategy> Scheduler<S> {
 
             let task_count = tasks.len();
             let _span = debug_span!("coding_worker.batch", task_count).entered();
-            trace!(task_count, "processing coding batch");
+            trace!(task_count, queue_depth, "processing coding batch");
 
-            // Process all tasks in parallel via strategy.  Each task enters
+            // Process batch in parallel via strategy.  Each task enters
             // its caller's span during execution (synchronous — .enter() is
             // safe) and returns it alongside the result so the event can be
             // sent with the original span rather than the scheduler's.
             let config = self.coding_config;
+            let start = Instant::now();
             let results: Vec<(Event, Span)> =
                 self.strategy
                     .map_collect_vec(tasks, move |task| execute_task(config, task));
+            self.metrics
+                .scheduler_batch_duration_ns
+                .set(start.elapsed().as_nanos() as i64);
 
             // Send results back, preserving the caller's span.
             for (event, parent_span) in results {
@@ -327,7 +358,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         let (_, commitment, shards) = sample_artifacts(b"test-payload", 6);
@@ -372,7 +403,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         let (_, commitment, shards) = sample_artifacts(b"check-payload", 6);
@@ -427,7 +458,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         let (_, commitment, shards) = sample_artifacts(b"cancel-test", 6);
@@ -457,11 +488,11 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn earlier_keys_are_processed_first() {
+    async fn later_keys_are_processed_first() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         let (_, commitment_a, shards_a) = sample_artifacts(b"early-payload", 6);
@@ -472,16 +503,7 @@ mod tests {
         let shard_b = shards_b[1].clone();
         let shard_a = shards_a[1].clone();
 
-        // Send later key first, then earlier key.
-        cmd_tx
-            .unbounded_send(Traced::capture(Command::Reshard {
-                key: key_late,
-                commitment: commitment_b,
-                shard_index: 1,
-                shard_hash: hash_encoded(&shard_b),
-                shard: shard_b,
-            }))
-            .unwrap();
+        // Send earlier key first, then later key.
         cmd_tx
             .unbounded_send(Traced::capture(Command::Reshard {
                 key: key_early,
@@ -491,10 +513,20 @@ mod tests {
                 shard: shard_a,
             }))
             .unwrap();
+        cmd_tx
+            .unbounded_send(Traced::capture(Command::Reshard {
+                key: key_late,
+                commitment: commitment_b,
+                shard_index: 1,
+                shard_hash: hash_encoded(&shard_b),
+                shard: shard_b,
+            }))
+            .unwrap();
         drop(cmd_tx);
 
-        // With Sequential strategy, tasks are processed in order. The BTreeMap
-        // orders by key, so key_early (view 1) should come before key_late (view 5).
+        // With Sequential strategy and reverse iteration, the BTreeMap is
+        // traversed newest-first so key_late (view 5) should come before
+        // key_early (view 1).
         let first = event_rx.next().await.expect("first event");
         let (first, _) = first.into_parts();
         let first_key = match &first {
@@ -509,8 +541,8 @@ mod tests {
             _ => panic!("expected ReshardDone"),
         };
 
-        assert_eq!(first_key, key_early);
-        assert_eq!(second_key, key_late);
+        assert_eq!(first_key, key_late);
+        assert_eq!(second_key, key_early);
 
         handle.await.unwrap();
     }
@@ -520,7 +552,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         drop(cmd_tx);
@@ -532,7 +564,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let config = coding_config(6);
-        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential);
+        let worker = Scheduler::new(cmd_rx, event_tx, config, Sequential, ShardMetrics::test_default());
         let handle = tokio::spawn(worker.run());
 
         let (_, commitment_a, _) = sample_artifacts(b"payload-a", 6);

@@ -66,6 +66,7 @@ impl<S: Strategy> ShardRecoverer<S> {
             coding_event_tx,
             coding_config,
             strategy.clone(),
+            metrics.clone(),
         );
         let scheduler_handle = context.clone().spawn(move |_| async move {
             scheduler.run().await;
