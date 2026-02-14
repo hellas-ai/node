@@ -149,7 +149,14 @@ pub struct NodeConfig {
     pub metrics_port: Option<u16>,
     #[serde(default)]
     pub ws_bind: Option<String>,
+    #[serde(default)]
+    pub relay: Option<RelayConfig>,
     pub peers: Vec<PeerEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RelayConfig {
+    pub bind: String,
 }
 
 #[derive(Serialize, Deserialize)]

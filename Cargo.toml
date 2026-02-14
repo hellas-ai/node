@@ -30,7 +30,7 @@ commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 hellas-rpc = { workspace = true, features = ["client", "server"] }
-hellas-types = { workspace = true }
+hellas-types = { workspace = true, features = ["consensus"] }
 hex = { workspace = true }
 indexmap = { workspace = true }
 loom = { version = "0.7", optional = true }

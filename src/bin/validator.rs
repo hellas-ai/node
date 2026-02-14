@@ -110,6 +110,9 @@ enum Command {
         /// WebSocket gRPC bind address (e.g. [::]:31130)
         #[arg(long)]
         ws_bind: Option<String>,
+        /// Plain WebSocket event relay bind address (default 0.0.0.0:31331)
+        #[arg(long)]
+        bind_relay: Option<String>,
     },
     /// Query a running validator via RPC
     Query {
@@ -175,7 +178,7 @@ fn main() {
             seed,
             addresses,
         } => setup(validators, node, start_port, seed, addresses),
-        Command::Run { config, log_json, ws_bind } => run(config, log_json, ws_bind),
+        Command::Run { config, log_json, ws_bind, bind_relay } => run(config, log_json, ws_bind, bind_relay),
         Command::Query { rpc, query } => do_query(rpc, query),
     };
 
@@ -245,6 +248,7 @@ fn setup(
         listen_port: start_port + node as u16,
         metrics_port: Some(9090 + node as u16),
         ws_bind: None,
+        relay: None,
         peers,
     };
 
@@ -601,11 +605,14 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>) -> Result<(), ValidatorError> {
+fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>, bind_relay: Option<String>) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut node_config: NodeConfig = toml::from_str(&config_str)?;
     if ws_bind.is_some() {
         node_config.ws_bind = ws_bind;
+    }
+    if let Some(addr) = bind_relay {
+        node_config.relay = Some(hellas_chain::config::RelayConfig { bind: addr });
     }
 
     let private_key = node_config.decode_private_key()?;
@@ -713,6 +720,19 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>)
             TraceReporter,
         );
         let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
+
+        // Start plain WebSocket event stream (if configured)
+        if let Some(relay) = &node_config.relay {
+            let addr: SocketAddr = relay.bind
+                .parse()
+                .expect("relay.bind address should be valid");
+            let listener = ::tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("failed to bind event WebSocket listener");
+            let atx = activity_tx.clone();
+            ::tokio::spawn(hellas_rpc::event_stream::serve_event_stream(listener, atx));
+            info!(%addr, "event WebSocket stream started");
+        }
 
         // Start light-client gRPC server over WebSocket (if configured)
         if let Some(ws_bind) = &node_config.ws_bind {
