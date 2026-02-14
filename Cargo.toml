@@ -29,7 +29,7 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-hellas-rpc = { workspace = true, features = ["server"] }
+hellas-rpc = { workspace = true, features = ["client", "server"] }
 hellas-types = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
@@ -44,7 +44,7 @@ rand_core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tonic = { version = "0.14", features = ["server"] }
+tonic = { version = "0.14", features = ["server", "channel"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }

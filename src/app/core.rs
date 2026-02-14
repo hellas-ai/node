@@ -218,6 +218,7 @@ impl AppCore {
             | AppMailboxReadWriteMessage::GetStateRoot { .. }
             | AppMailboxReadWriteMessage::GetProof { .. }
             | AppMailboxReadWriteMessage::GetFinalization { .. }
+            | AppMailboxReadWriteMessage::GetLatestBlock { .. }
             | AppMailboxReadWriteMessage::ShardEvent { .. }
             | AppMailboxReadWriteMessage::FinalizationEvent { .. }
             | AppMailboxReadWriteMessage::Persisted { .. } => {

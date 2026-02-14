@@ -32,7 +32,7 @@ use std::{convert::Infallible, num::NonZeroUsize, time::Duration};
 pub(crate) struct FinalizationNotice {
     pub payload: Digest,
     pub parent_payload: Digest,
-    pub certificate_bytes: Option<mailbox::FinalizationResponse>,
+    pub certificate_bytes: mailbox::FinalizationResponse,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +189,11 @@ impl PersistenceHandle {
         payload: Digest,
     ) -> Option<mailbox::FinalizationResponse> {
         self.query(move |response| PersistenceCommand::GetFinalization { payload, response })
+            .await
+    }
+
+    async fn latest_block(&mut self) -> Option<(u64, Digest, Digest)> {
+        self.query(|response| PersistenceCommand::GetLatestBlock { response })
             .await
     }
 
@@ -610,14 +615,11 @@ where
                         "app.finalization_notice",
                         payload = ?payload,
                         parent_payload = ?parent_payload,
-                        has_certificate = certificate_bytes.is_some()
                     )
                     .entered();
                     self.core.on_finalized(payload, parent_payload, now)
                 };
-                if let Some(certificate_bytes) = certificate_bytes {
-                    self.persistence.record_finalization(payload, certificate_bytes);
-                }
+                self.persistence.record_finalization(payload, certificate_bytes);
                 let pending = self.core.unpersisted_finalization_count();
                 if pending > Self::MAX_PENDING_PERSISTENCE_QUEUE {
                     error!(
@@ -649,6 +651,18 @@ where
             }
             AppMailboxReadWriteMessage::GetFinalization { payload, response } => {
                 let _ = response.send(self.persistence.finalization(payload).await);
+            }
+            AppMailboxReadWriteMessage::GetLatestBlock { response } => {
+                let block = self.persistence.latest_block().await.map(
+                    |(height, payload, state_root)| {
+                        hellas_types::rpc::LatestBlock {
+                            height,
+                            payload,
+                            state_root,
+                        }
+                    },
+                );
+                let _ = response.send(block);
             }
             core_message => {
                 let now = context.current().epoch_millis();
@@ -961,7 +975,7 @@ mod tests {
             .finalize(FinalizationNotice {
                 payload,
                 parent_payload: genesis,
-                certificate_bytes: None,
+                certificate_bytes: vec![0u8; 0].into(),
             })
             .await;
     }
@@ -1269,7 +1283,7 @@ mod tests {
                 .finalize(FinalizationNotice {
                     payload,
                     parent_payload: genesis,
-                    certificate_bytes: Some(encoded_finalization.clone().into()),
+                    certificate_bytes: encoded_finalization.clone().into(),
                 })
                 .await;
             context.sleep(Duration::from_millis(50)).await;

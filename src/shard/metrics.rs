@@ -81,20 +81,4 @@ impl ShardMetrics {
         metrics.scheduler_queue_depth.set(0);
         metrics
     }
-
-    /// Create unregistered metrics for tests.
-    #[cfg(test)]
-    pub(crate) fn test_default() -> Self {
-        Self {
-            active_recoveries: Gauge::default(),
-            known_keys: Gauge::default(),
-            pre_leader_keys: Gauge::default(),
-            recovery_success_total: Counter::default(),
-            recovery_failed_total: Counter::default(),
-            recovery_evictions_total: Counter::default(),
-            coding_tasks_dispatched_total: Counter::default(),
-            coding_tasks_completed_total: Counter::default(),
-            scheduler_queue_depth: Gauge::default(),
-        }
-    }
 }

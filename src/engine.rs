@@ -51,7 +51,7 @@ where
                 .finalize(FinalizationNotice {
                     payload: finalization.proposal.payload,
                     parent_payload: finalization.proposal.parent_payload,
-                    certificate_bytes: Some(finalization.encode().to_vec().into()),
+                    certificate_bytes: finalization.encode().to_vec().into(),
                 })
                 .await;
         }

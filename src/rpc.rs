@@ -10,8 +10,8 @@ use commonware_codec::{Read as _, ReadExt as _, Write as _};
 use commonware_cryptography::sha256::Digest;
 use commonware_storage::mmr::{Location, Proof};
 use commonware_storage::qmdb::current::proof::{OperationProof, RangeProof};
-use hellas_types::ObjectId;
-use hellas_types::rpc::{LightClient, QueryError};
+use hellas_types::{ObjectId, Transaction};
+use hellas_types::rpc::{LatestBlock, LightClient, QueryError};
 
 /// Encode an [`OperationProof`] to opaque bytes by writing each public field
 /// using its existing commonware-codec `Write` impl.
@@ -86,5 +86,17 @@ impl LightClient for LocalLightClient {
             .await
             .map_err(|_| QueryError::ChannelClosed)?;
         Ok(cert.map(Vec::from))
+    }
+
+    async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
+        self.mailbox
+            .get_latest_block()
+            .await
+            .map_err(|_| QueryError::ChannelClosed)
+    }
+
+    async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
+        self.mailbox.submit_tx(tx).await;
+        Ok(())
     }
 }

@@ -60,6 +60,9 @@ pub(super) enum PersistenceCommand {
         payload: Digest,
         response: oneshot::Sender<Option<mailbox::FinalizationResponse>>,
     },
+    GetLatestBlock {
+        response: oneshot::Sender<Option<(u64, Digest, Digest)>>,
+    },
     RecordFinalization {
         payload: Digest,
         finalization: mailbox::FinalizationResponse,
@@ -129,7 +132,7 @@ static PAYLOAD_CHECKPOINT_KEY: LazyLock<Digest> = LazyLock::new(|| {
 /// would pollute the Merkle root).  On restart, [`was_committed`] lets
 /// callers skip queue items that were already applied before a crash.
 struct UtxoStore<E: Clock + Spawner + Storage + Metrics + BufferPooler> {
-    db: Option<UtxoDb<E>>,
+    db: UtxoDb<E>,
     cursor_index: Metadata<E, Digest, Vec<u8>>,
     last_committed_position: Option<u64>,
 }
@@ -170,7 +173,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             });
 
         Ok(Self {
-            db: Some(db),
+            db,
             cursor_index,
             last_committed_position,
         })
@@ -205,11 +208,11 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
     }
 
     async fn apply_diffs(
-        &mut self,
+        mut self,
         batch: Vec<(ObjectId, Option<Coin>)>,
         queue_position: Option<u64>,
         label: &str,
-    ) -> Result<Digest, Fatal> {
+    ) -> Result<Self, Fatal> {
         // QMDB advances an internal sequence on every commit, changing the
         // Merkle root even when the batch is empty.  Skip the commit entirely
         // when there are no state changes to preserve root determinism across
@@ -225,15 +228,10 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
                 })?;
                 self.last_committed_position = Some(pos);
             }
-            return Ok(self.root());
+            return Ok(self);
         }
 
-        let db = self
-            .db
-            .take()
-            .expect("db is always present outside apply_diffs");
-
-        let mut db = db.into_mutable();
+        let mut db = self.db.into_mutable();
 
         db.write_batch(batch).await.map_err(|err| {
             Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
@@ -247,8 +245,6 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             Fatal(format!("QMDB merkleize failed for {label}: {err:?}"))
         })?;
 
-        let root = db.root();
-
         if let Some(pos) = queue_position {
             self.cursor_index.put(
                 *QUEUE_CURSOR_KEY,
@@ -259,22 +255,16 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             })?;
             self.last_committed_position = Some(pos);
         }
-        self.db = Some(db);
-        Ok(root)
+        self.db = db;
+        Ok(self)
     }
 
     fn root(&self) -> Digest {
-        self.db
-            .as_ref()
-            .expect("db is always present outside apply_diffs")
-            .root()
+        self.db.root()
     }
 
     fn is_empty(&self) -> bool {
-        self.db
-            .as_ref()
-            .expect("db is always present outside apply_diffs")
-            .is_empty()
+        self.db.is_empty()
     }
 
     async fn key_value_proof(
@@ -283,8 +273,6 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         object: ObjectId,
     ) -> Option<mailbox::ProofResponse> {
         self.db
-            .as_ref()
-            .expect("db is always present outside apply_diffs")
             .key_value_proof(hasher, object)
             .await
             .ok()
@@ -292,8 +280,6 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
 
     async fn sync(&mut self) -> Result<(), Fatal> {
         self.db
-            .as_mut()
-            .expect("db is always present outside apply_diffs")
             .sync()
             .await
             .map_err(|err| Fatal(format!("QMDB sync failed: {err:?}")))
@@ -319,10 +305,10 @@ where
     anchor_index: AnchorIndex<E>,
     anchor_history: GaugedVecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
-    finalization_index: Option<FinalizationIndex<E>>,
+    finalization_index: FinalizationIndex<E>,
     finalization_cursors: HashMap<Digest, FreezerCursor>,
     volatile_finalizations: GaugedIndexMap<Digest, mailbox::FinalizationResponse>,
-    payload_index: Option<PayloadIndex<E>>,
+    payload_index: PayloadIndex<E>,
     payload_cursors: HashMap<Digest, FreezerCursor>,
     volatile_payloads: GaugedIndexMap<Digest, Bytes>,
 }
@@ -377,7 +363,7 @@ where
         if store.is_empty() {
             let genesis = genesis_state(&validators);
             let batch = UtxoStore::<E>::diffs_to_batch(&genesis.created, &genesis.deleted);
-            store.apply_diffs(batch, None, "genesis bootstrap").await?;
+            store = store.apply_diffs(batch, None, "genesis bootstrap").await?;
         }
 
         let mut anchor_history_gauged = GaugedVecDeque::new(metrics.anchor_history_entries.clone());
@@ -391,10 +377,10 @@ where
             anchor_index,
             anchor_history: anchor_history_gauged,
             next_anchor_sequence,
-            finalization_index: Some(finalization_index),
+            finalization_index,
             finalization_cursors: HashMap::new(),
             volatile_finalizations: GaugedIndexMap::new(metrics.finalization_cache_entries.clone()),
-            payload_index: Some(payload_index),
+            payload_index,
             payload_cursors: HashMap::new(),
             volatile_payloads: GaugedIndexMap::new(metrics.payload_cache_entries.clone()),
             metrics,
@@ -421,23 +407,17 @@ where
             );
             return;
         }
-        loop {
+        'outer: loop {
             // Drain any buffered commands before attempting persistence.
             loop {
                 match self.command_rx.try_next() {
                     Ok(Some(command)) => match self.process_command(command).await {
                         Ok(true) => {}
-                        Ok(false) => {
-                            self.sync_or_abort().await;
-                            return;
-                        }
+                        Ok(false) => break 'outer,
                         Err(err) => Self::abort(err),
                     },
-                    Ok(None) => {
-                        self.sync_or_abort().await;
-                        return;
-                    }
-                    Err(_) => break,
+                    Ok(None) => break 'outer,
+                    Err(_) => break, // channel empty; fall through to persist or block
                 }
             }
 
@@ -461,7 +441,9 @@ where
             }
         }
 
-        self.sync_or_abort().await;
+        if let Err(err) = Box::pin(self.shutdown()).await {
+            Self::abort(err);
+        }
     }
 
     fn abort(err: Fatal) -> ! {
@@ -469,12 +451,6 @@ where
         std::process::abort()
     }
 
-    async fn sync_or_abort(&mut self) {
-        // Box::pin to keep the Freezer close() futures off the run() stack.
-        if let Err(err) = Box::pin(self.sync_on_shutdown()).await {
-            Self::abort(err);
-        }
-    }
 
     async fn process_command(
         &mut self,
@@ -556,7 +532,8 @@ where
 
         let batch = UtxoStore::<E>::diffs_to_batch(&diffs.created, &diffs.deleted);
         let label = format!("{payload:?}");
-        let root = self.store.apply_diffs(batch, Some(position), &label).await?;
+        self.store = self.store.apply_diffs(batch, Some(position), &label).await?;
+        let root = self.store.root();
         self.metrics.utxo_committed_position.set(position as i64);
 
         // Ack the queue item so it won't be replayed on restart.
@@ -681,6 +658,14 @@ where
                 let _ = response.send(self.finalization(payload).await);
                 Ok(true)
             }
+            PersistenceCommand::GetLatestBlock { response } => {
+                let result = self
+                    .anchor_history
+                    .back()
+                    .map(|entry| (entry.sequence, entry.payload, entry.root));
+                let _ = response.send(result);
+                Ok(true)
+            }
             PersistenceCommand::RecordFinalization {
                 payload,
                 finalization,
@@ -716,8 +701,6 @@ where
         };
         let stored = self
             .finalization_index
-            .as_ref()
-            .expect("not shut down")
             .get(identifier)
             .await
             .ok()
@@ -746,8 +729,6 @@ where
         };
         let stored = self
             .payload_index
-            .as_ref()
-            .expect("not shut down")
             .get(identifier)
             .await
             .ok()
@@ -839,8 +820,6 @@ where
         };
         let fin = self
             .finalization_index
-            .as_ref()
-            .expect("not shut down")
             .get(fin_identifier)
             .await
             .map_err(|err| {
@@ -859,8 +838,6 @@ where
         }
         let cursor = self
             .finalization_index
-            .as_mut()
-            .expect("not shut down")
             .put(payload, finalization.as_slice().to_vec())
             .await
             .map_err(|err| {
@@ -871,8 +848,6 @@ where
         self.finalization_cursors.insert(payload, cursor);
         let cp = self
             .finalization_index
-            .as_mut()
-            .expect("not shut down")
             .sync()
             .await
             .map_err(|err| {
@@ -907,8 +882,6 @@ where
         };
         let existing = self
             .payload_index
-            .as_ref()
-            .expect("not shut down")
             .get(pay_identifier)
             .await
             .map_err(|err| {
@@ -927,8 +900,6 @@ where
         }
         let cursor = self
             .payload_index
-            .as_mut()
-            .expect("not shut down")
             .put(payload, bytes.as_ref().to_vec())
             .await
             .map_err(|err| {
@@ -939,8 +910,6 @@ where
         self.payload_cursors.insert(payload, cursor);
         let cp = self
             .payload_index
-            .as_mut()
-            .expect("not shut down")
             .sync()
             .await
             .map_err(|err| {
@@ -1181,7 +1150,7 @@ where
         chain
     }
 
-    async fn sync_on_shutdown(&mut self) -> Result<(), Fatal> {
+    async fn shutdown(mut self) -> Result<(), Fatal> {
         self.queue.sync().await.map_err(|err| {
             Fatal(format!(
                 "persistence queue sync on shutdown failed: {err:?}"
@@ -1196,8 +1165,6 @@ where
 
         let fin_cp = self
             .finalization_index
-            .take()
-            .expect("not shut down")
             .close()
             .await
             .map_err(|err| {
@@ -1207,8 +1174,6 @@ where
             })?;
         let pay_cp = self
             .payload_index
-            .take()
-            .expect("not shut down")
             .close()
             .await
             .map_err(|err| {

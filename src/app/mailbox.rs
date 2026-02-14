@@ -1,6 +1,7 @@
 #![allow(private_interfaces)]
 
 use hellas_types::{Coin, ObjectId, Transaction};
+use hellas_types::rpc::LatestBlock;
 use crate::shard::protocol::ShardMessage;
 
 use super::FinalizationNotice;
@@ -73,6 +74,7 @@ ingress! {
     pub ask read_write GetStateRoot -> Option<Digest>;
     pub ask read_write GetProof { object: ObjectId } -> Option<ProofResponse>;
     pub ask read_write GetFinalization { payload: Digest } -> Option<FinalizationResponse>;
+    pub ask read_write GetLatestBlock -> Option<LatestBlock>;
 }
 
 impl AppMailboxReadWriteMessage {
@@ -90,6 +92,7 @@ impl AppMailboxReadWriteMessage {
             Self::GetStateRoot { .. } => "get_state_root",
             Self::GetProof { .. } => "get_proof",
             Self::GetFinalization { .. } => "get_finalization",
+            Self::GetLatestBlock { .. } => "get_latest_block",
         }
     }
 }

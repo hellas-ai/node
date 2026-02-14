@@ -108,6 +108,58 @@ enum Command {
         #[arg(long)]
         log_json: Option<PathBuf>,
     },
+    /// Query a running validator via RPC
+    Query {
+        /// RPC endpoint (e.g. http://127.0.0.1:9000)
+        #[arg(long)]
+        rpc: String,
+        #[command(subcommand)]
+        query: QueryCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueryCommand {
+    /// Get the latest finalized block
+    LatestBlock,
+    /// Get the current state root
+    StateRoot,
+    /// Get a Merkle inclusion proof for an object
+    Proof {
+        /// Hex-encoded 32-byte object ID
+        #[arg(long)]
+        object_id: String,
+    },
+    /// Get the finalization certificate for a payload
+    Finalization {
+        /// Hex-encoded 32-byte payload digest
+        #[arg(long)]
+        payload: String,
+    },
+    /// Submit a transfer transaction
+    Transfer {
+        /// Hex-encoded 32-byte ed25519 private key (sender)
+        #[arg(long)]
+        key: String,
+        /// Hex-encoded 32-byte object ID of the input coin
+        #[arg(long)]
+        input: String,
+        /// Hex-encoded ed25519 public key of the recipient
+        #[arg(long)]
+        recipient: String,
+        /// Amount to transfer
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Submit a merge-coin transaction
+    MergeCoin {
+        /// Hex-encoded 32-byte ed25519 private key (owner)
+        #[arg(long)]
+        key: String,
+        /// Comma-separated hex-encoded 32-byte object IDs to merge
+        #[arg(long, value_delimiter = ',')]
+        inputs: Vec<String>,
+    },
 }
 
 fn main() {
@@ -121,6 +173,7 @@ fn main() {
             addresses,
         } => setup(validators, node, start_port, seed, addresses),
         Command::Run { config, log_json } => run(config, log_json),
+        Command::Query { rpc, query } => do_query(rpc, query),
     };
 
     if let Err(err) = result {
@@ -195,6 +248,126 @@ fn setup(
     let rendered = toml::to_string_pretty(&config)?;
     println!("{rendered}");
     Ok(())
+}
+
+fn parse_hex_digest(
+    hex_str: &str,
+    field: &str,
+) -> Result<commonware_cryptography::sha256::Digest, ValidatorError> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for {field}: {e}")))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ValidatorError::InvalidSetup(format!("{field} must be 32 bytes")))?;
+    Ok(commonware_cryptography::sha256::Digest::from(arr))
+}
+
+fn parse_hex_private_key(hex_str: &str) -> Result<ed25519::PrivateKey, ValidatorError> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for key: {e}")))?;
+    ed25519::PrivateKey::decode(bytes.as_slice())
+        .map_err(|_| ValidatorError::InvalidSetup("key must be a valid ed25519 private key".into()))
+}
+
+fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
+    let rt = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ValidatorError::InvalidSetup(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let client = hellas_rpc::client::RemoteLightClient::connect(rpc)
+            .await
+            .map_err(|e| ValidatorError::InvalidSetup(format!("failed to connect: {e}")))?;
+
+        use hellas_types::rpc::LightClient;
+        match query {
+            QueryCommand::LatestBlock => {
+                let block = client
+                    .get_latest_block()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                match block {
+                    Some(b) => {
+                        println!("height:     {}", b.height);
+                        println!("payload:    {}", hex::encode(b.payload));
+                        println!("state_root: {}", hex::encode(b.state_root));
+                    }
+                    None => println!("no block persisted yet"),
+                }
+            }
+            QueryCommand::StateRoot => {
+                let root = client
+                    .get_state_root()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                match root {
+                    Some(r) => println!("{}", hex::encode(r)),
+                    None => println!("no state root available"),
+                }
+            }
+            QueryCommand::Proof { object_id } => {
+                let digest = parse_hex_digest(&object_id, "object_id")?;
+                let proof = client
+                    .get_proof(digest)
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                match proof {
+                    Some(p) => println!("{}", hex::encode(p)),
+                    None => println!("no proof found"),
+                }
+            }
+            QueryCommand::Finalization { payload } => {
+                let digest = parse_hex_digest(&payload, "payload")?;
+                let cert = client
+                    .get_finalization(digest)
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                match cert {
+                    Some(c) => println!("{}", hex::encode(c)),
+                    None => println!("no finalization certificate found"),
+                }
+            }
+            QueryCommand::Transfer {
+                key,
+                input,
+                recipient,
+                amount,
+            } => {
+                let private_key = parse_hex_private_key(&key)?;
+                let input_digest = parse_hex_digest(&input, "input")?;
+                let recipient_bytes = hex::decode(&recipient)
+                    .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for recipient: {e}")))?;
+                let recipient_key = ed25519::PublicKey::decode(recipient_bytes.as_slice())
+                    .map_err(|_| ValidatorError::InvalidSetup("recipient must be a valid ed25519 public key".into()))?;
+                let tx = hellas_types::Transaction::transfer(
+                    &private_key,
+                    input_digest,
+                    recipient_key,
+                    amount,
+                );
+                client
+                    .submit_tx(tx)
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                println!("transaction submitted");
+            }
+            QueryCommand::MergeCoin { key, inputs } => {
+                let private_key = parse_hex_private_key(&key)?;
+                let input_digests: Vec<commonware_cryptography::sha256::Digest> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hex_str)| parse_hex_digest(hex_str, &format!("inputs[{i}]")))
+                    .collect::<Result<_, _>>()?;
+                let tx = hellas_types::Transaction::merge(&private_key, input_digests);
+                client
+                    .submit_tx(tx)
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                println!("transaction submitted");
+            }
+        }
+        Ok(())
+    })
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
