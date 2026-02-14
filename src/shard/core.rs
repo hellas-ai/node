@@ -50,6 +50,10 @@ impl<S: Strategy> ShardRecoverer<S> {
     const MAX_PRE_LEADER_MESSAGES: usize = 128;
     const MAX_PRE_LEADER_KEYS: usize = 256;
     const MAX_KNOWN_KEYS: usize = 4096;
+    /// Expire recovery entries whose view is more than this many views behind
+    /// the newest incoming shard.  Prevents stale zombie entries from occupying
+    /// the recovery table indefinitely.
+    const STALENESS_THRESHOLD: u64 = 200;
 
     pub(crate) fn new(
         me: &PublicKey,
@@ -82,6 +86,7 @@ impl<S: Strategy> ShardRecoverer<S> {
                 max_buffered_reshards: Self::MAX_BUFFERED_RESHARDS,
                 max_pre_leader_messages: Self::MAX_PRE_LEADER_MESSAGES,
                 max_pre_leader_keys: Self::MAX_PRE_LEADER_KEYS,
+                staleness_threshold: Self::STALENESS_THRESHOLD,
             }),
             metrics,
             coding_tx,
