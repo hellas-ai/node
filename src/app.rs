@@ -1840,13 +1840,14 @@ mod tests {
 
             let light_client = LocalLightClient::new(mailbox);
 
-            // Start gRPC server on a random port.
-            let svc = LightClientGrpcServer::new(light_client).into_service();
-            let incoming = tonic::transport::server::TcpIncoming::bind(
-                "127.0.0.1:0".parse().unwrap(),
-            )
-            .expect("failed to bind");
-            let addr = incoming.local_addr().expect("should have local addr");
+            // Start gRPC server on a random port (WebSocket transport).
+            let (activity_tx, _) = tokio::sync::broadcast::channel::<hellas_types::rpc::ConsensusActivity>(16);
+            let svc = LightClientGrpcServer::new(light_client, activity_tx).into_service();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("failed to bind");
+            let addr = listener.local_addr().expect("should have local addr");
+            let incoming = hellas_rpc::ws::ws_incoming(listener);
 
             ::tokio::spawn(async move {
                 tonic::transport::Server::builder()

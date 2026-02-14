@@ -148,7 +148,7 @@ pub struct NodeConfig {
     #[serde(default)]
     pub metrics_port: Option<u16>,
     #[serde(default)]
-    pub rpc_port: Option<u16>,
+    pub ws_bind: Option<String>,
     pub peers: Vec<PeerEntry>,
 }
 

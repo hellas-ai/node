@@ -107,6 +107,9 @@ enum Command {
         /// Write structured JSON logs (with span context) to this file
         #[arg(long)]
         log_json: Option<PathBuf>,
+        /// WebSocket gRPC bind address (e.g. [::]:31130)
+        #[arg(long)]
+        ws_bind: Option<String>,
     },
     /// Query a running validator via RPC
     Query {
@@ -172,7 +175,7 @@ fn main() {
             seed,
             addresses,
         } => setup(validators, node, start_port, seed, addresses),
-        Command::Run { config, log_json } => run(config, log_json),
+        Command::Run { config, log_json, ws_bind } => run(config, log_json, ws_bind),
         Command::Query { rpc, query } => do_query(rpc, query),
     };
 
@@ -241,7 +244,7 @@ fn setup(
         private_key: encode_private_key(my_key),
         listen_port: start_port + node as u16,
         metrics_port: Some(9090 + node as u16),
-        rpc_port: None,
+        ws_bind: None,
         peers,
     };
 
@@ -598,9 +601,12 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorError> {
+fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
-    let node_config: NodeConfig = toml::from_str(&config_str)?;
+    let mut node_config: NodeConfig = toml::from_str(&config_str)?;
+    if ws_bind.is_some() {
+        node_config.ws_bind = ws_bind;
+    }
 
     let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
@@ -697,7 +703,7 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
 
         // Create engine first so the application can subscribe to shard ingress
         // before the transport starts dispatching inbound shard messages.
-        let (engine, tx_mailbox) = Engine::new(
+        let (engine, tx_mailbox, activity_tx) = Engine::new(
             context.clone(),
             Config::mainnet(),
             scheme,
@@ -708,19 +714,25 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>) -> Result<(), ValidatorE
         );
         let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
 
-        // Start light-client gRPC server (if configured)
-        if let Some(rpc_port) = node_config.rpc_port {
-            let addr: SocketAddr = format!("0.0.0.0:{rpc_port}")
+        // Start light-client gRPC server over WebSocket (if configured)
+        if let Some(ws_bind) = &node_config.ws_bind {
+            let addr: SocketAddr = ws_bind
                 .parse()
-                .expect("rpc address should be valid");
-            let svc = hellas_rpc::server::LightClientGrpcServer::new(light_client)
+                .expect("ws_bind address should be valid");
+            let svc = hellas_rpc::server::LightClientGrpcServer::new(light_client, activity_tx)
                 .into_service();
-            ::tokio::spawn(
+            let listener = ::tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("failed to bind WebSocket listener");
+            let incoming = hellas_rpc::ws::ws_incoming(listener);
+            ::tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(svc)
-                    .serve(addr),
-            );
-            info!(rpc_port, "light client gRPC server started");
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+            info!(%addr, "light client WebSocket gRPC server started");
         }
 
         let shard_transport_handle = relay.start(context.clone());

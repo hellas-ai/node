@@ -190,7 +190,7 @@ fn run_network(
             }
             relay.finalize_validators();
 
-            let (engine, tx_mailbox) = Engine::new(
+            let (engine, tx_mailbox, _activity_tx) = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
@@ -591,7 +591,7 @@ fn node_recovers_after_disconnect() {
             }
             relay.finalize_validators();
 
-            let (engine, _tx_mailbox) = Engine::new(
+            let (engine, _tx_mailbox, _activity_tx) = Engine::new(
                 ctx,
                 config,
                 schemes[idx].clone(),
@@ -926,7 +926,7 @@ fn cluster_resumes_after_unclean_restart() {
                 }
                 relay.finalize_validators();
 
-                let (engine, _tx_mailbox) = Engine::new(
+                let (engine, _tx_mailbox, _activity_tx) = Engine::new(
                     ctx,
                     config,
                     schemes[idx].clone(),
@@ -1024,7 +1024,7 @@ fn cluster_resumes_after_unclean_restart() {
                 }
                 relay.finalize_validators();
 
-                let (engine, _tx_mailbox) = Engine::new(
+                let (engine, _tx_mailbox, _activity_tx) = Engine::new(
                     ctx,
                     config,
                     schemes[idx].clone(),

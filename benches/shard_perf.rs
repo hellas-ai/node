@@ -109,7 +109,7 @@ fn run_full_sync(target_views: usize) -> usize {
             }
             relay.finalize_validators();
 
-            let (engine, _tx_mailbox) = Engine::new(
+            let (engine, _tx_mailbox, _activity_tx) = Engine::new(
                 ctx,
                 Config::test(),
                 schemes[idx].clone(),

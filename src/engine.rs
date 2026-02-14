@@ -9,19 +9,81 @@ use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
 use hellas_types::{Activity, PublicKey, Scheme};
+use hellas_types::rpc::{ConsensusActivity, NotarizeInfo, ProposalInfo};
 use prometheus_client::metrics::counter::Counter;
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+fn proposal_info(p: &commonware_consensus::minimmit::types::Proposal<Digest>) -> ProposalInfo {
+    ProposalInfo {
+        epoch: p.round.epoch().get(),
+        view: p.round.view().get(),
+        parent_view: p.parent.get(),
+        parent_payload: p.parent_payload,
+        payload: p.payload,
+    }
+}
+
+fn notarize_info(n: &commonware_consensus::minimmit::types::Notarize<Scheme, Digest>) -> NotarizeInfo {
+    NotarizeInfo {
+        proposal: proposal_info(&n.proposal),
+        signer: n.attestation.signer.get(),
+        signature: n.attestation.signature.encode().to_vec(),
+    }
+}
+
+fn convert_activity(activity: &Activity) -> ConsensusActivity {
+    match activity {
+        Activity::Notarize(n) => ConsensusActivity::Notarize {
+            proposal: proposal_info(&n.proposal),
+            signer: n.attestation.signer.get(),
+            signature: n.attestation.signature.encode().to_vec(),
+        },
+        Activity::MNotarization(m) => ConsensusActivity::MNotarization {
+            proposal: proposal_info(&m.proposal),
+            signers: m.certificate.signers.iter().map(|p| p.get()).collect(),
+            certificate: m.certificate.encode().to_vec(),
+        },
+        Activity::Nullify(n) => ConsensusActivity::Nullify {
+            epoch: n.round.epoch().get(),
+            view: n.round.view().get(),
+            signer: n.attestation.signer.get(),
+            signature: n.attestation.signature.encode().to_vec(),
+        },
+        Activity::Nullification(n) => ConsensusActivity::Nullification {
+            epoch: n.round.epoch().get(),
+            view: n.round.view().get(),
+            signers: n.certificate.signers.iter().map(|p| p.get()).collect(),
+            certificate: n.certificate.encode().to_vec(),
+        },
+        Activity::Finalization(f) => ConsensusActivity::Finalization {
+            proposal: proposal_info(&f.proposal),
+            signers: f.certificate.signers.iter().map(|p| p.get()).collect(),
+            certificate: f.certificate.encode().to_vec(),
+        },
+        Activity::ConflictingNotarize(c) => ConsensusActivity::ConflictingNotarize {
+            first: notarize_info(&c.first),
+            second: notarize_info(&c.second),
+        },
+    }
+}
 
 #[derive(Clone)]
 struct AppReporter<R> {
     mailbox: AppMailbox,
     inner: R,
     notarize_total: Counter,
+    activity_tx: broadcast::Sender<ConsensusActivity>,
 }
 
 impl<R> AppReporter<R> {
-    fn new(context: &impl Metrics, mailbox: AppMailbox, inner: R) -> Self {
+    fn new(
+        context: &impl Metrics,
+        mailbox: AppMailbox,
+        inner: R,
+        activity_tx: broadcast::Sender<ConsensusActivity>,
+    ) -> Self {
         let notarize_total = Counter::default();
         context.register(
             "notarize_total",
@@ -32,6 +94,7 @@ impl<R> AppReporter<R> {
             mailbox,
             inner,
             notarize_total,
+            activity_tx,
         }
     }
 }
@@ -55,6 +118,7 @@ where
                 })
                 .await;
         }
+        let _ = self.activity_tx.send(convert_activity(&activity));
         self.inner.report(activity).await;
     }
 }
@@ -94,7 +158,7 @@ where
         relay: Arc<AuthenticatedShardTransport<S, N>>,
         me: &PublicKey,
         reporter: R,
-    ) -> (Self, AppMailbox)
+    ) -> (Self, AppMailbox, broadcast::Sender<ConsensusActivity>)
     where
         S: Sender<PublicKey = PublicKey>,
         N: Receiver<PublicKey = PublicKey>,
@@ -115,12 +179,13 @@ where
         );
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();
-        let reporter = AppReporter::new(&context.with_label("chain"), mailbox.clone(), reporter);
+        let (activity_tx, _) = broadcast::channel(1024);
+        let reporter = AppReporter::new(&context.with_label("chain"), mailbox.clone(), reporter, activity_tx.clone());
 
         let cfg = config.into_minimmit(&context, scheme, blocker, mailbox.clone(), mailbox, reporter, me);
         let inner = minimmit::Engine::new(context, cfg);
 
-        (Self { inner, app_handle }, tx_mailbox)
+        (Self { inner, app_handle }, tx_mailbox, activity_tx)
     }
 
     pub fn start(
