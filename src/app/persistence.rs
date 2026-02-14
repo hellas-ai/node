@@ -73,10 +73,11 @@ pub(super) enum PersistenceCommand {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum PersistenceEvent {
     Ready {
         root: Digest,
+        recovered_payloads: Vec<(Digest, Bytes)>,
     },
     Persisted {
         payload: Digest,
@@ -407,10 +408,13 @@ where
         }
         self.update_queue_depth().await;
         let root = self.store.root();
-        if let Err(err) = self
-            .event_tx
-            .unbounded_send(Traced::capture(PersistenceEvent::Ready { root }))
-        {
+        let recovered_payloads = self.recover_payload_chain().await;
+        if let Err(err) = self.event_tx.unbounded_send(Traced::capture(
+            PersistenceEvent::Ready {
+                root,
+                recovered_payloads,
+            },
+        )) {
             warn!(
                 ?err,
                 "failed to notify application that persistence worker is ready"
@@ -1131,6 +1135,50 @@ where
                     "persistence queue initialization failed: {err:?}"
                 ))
             })
+    }
+
+    /// Walk backward from the latest anchor through the payload Freezer,
+    /// collecting all `(digest, bytes)` pairs in chain order (oldest first).
+    /// Used at startup to proactively hydrate `AppCore.seen` before consensus
+    /// begins, avoiding per-ancestor network round trips after an unclean
+    /// restart.
+    async fn recover_payload_chain(&mut self) -> Vec<(Digest, Bytes)> {
+        let Some(tip) = self.anchor_history.back() else {
+            return Vec::new();
+        };
+        let zero_digest = Digest::from([0u8; 32]);
+        let mut chain = Vec::new();
+        let mut current = tip.payload;
+        loop {
+            let Some(bytes) = self.payload(current).await else {
+                warn!(
+                    ?current,
+                    recovered = chain.len(),
+                    "payload chain walk stopped: missing payload in Freezer"
+                );
+                break;
+            };
+            let Some(block) = super::payload::SeenBlock::decode(bytes.clone()) else {
+                warn!(
+                    ?current,
+                    recovered = chain.len(),
+                    "payload chain walk stopped: malformed payload bytes"
+                );
+                break;
+            };
+            let parent = block.data().parent;
+            chain.push((current, bytes));
+            if parent == zero_digest {
+                break;
+            }
+            current = parent;
+        }
+        chain.reverse();
+        info!(
+            payloads = chain.len(),
+            "recovered payload chain from local persistence"
+        );
+        chain
     }
 
     async fn sync_on_shutdown(&mut self) -> Result<(), Fatal> {

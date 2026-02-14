@@ -120,14 +120,18 @@ impl PersistenceHandle {
         }
     }
 
-    async fn wait_for_ready(&mut self) -> Digest {
+    async fn wait_for_ready(&mut self) -> (Digest, Vec<(Digest, Bytes)>) {
         match self.rx.next().await {
             Some(event) => {
                 let (event, _parent_span) = event.into_parts();
-                let PersistenceEvent::Ready { root } = event else {
+                let PersistenceEvent::Ready {
+                    root,
+                    recovered_payloads,
+                } = event
+                else {
                     unreachable!("first persistence event must be Ready");
                 };
-                root
+                (root, recovered_payloads)
             }
             None => {
                 error!("persistence worker event channel closed before ready");
@@ -425,11 +429,11 @@ where
             let mut resolved_any = false;
             let mut resolve_effects = core::CoreEffects::new();
             for effect in effects.network {
-                // Before broadcasting a FetchPayload to the network, check whether
-                // the payload already exists in local persistence (Freezer).  After
-                // an unclean restart the `seen` map is empty but the Freezer still
-                // has every payload that was persisted before the crash.  Resolving
-                // locally avoids an expensive network round trip per ancestor.
+                // Fallback: before broadcasting a FetchPayload to the network,
+                // check local persistence (Freezer).  Most payloads are hydrated
+                // proactively at startup via `recover_payload_chain`, but payloads
+                // finalized after the latest anchor (not yet QMDB-committed) may
+                // still need this path.
                 if let NetworkEffect::BroadcastShard(ref message) = effect
                     && let WireShardMessage::FetchPayload { digest } = &message.body
                 {
@@ -691,8 +695,23 @@ where
 
     async fn on_startup(&mut self, context: &mut E, args: &mut AppMailbox) {
         // Wait for persistence ready (reads from the event channel before bridge takes over).
-        self.startup_root = self.persistence.wait_for_ready().await;
+        let (root, recovered_payloads) = self.persistence.wait_for_ready().await;
+        self.startup_root = root;
         self.hydrate_anchor_index_from_worker().await;
+
+        // Hydrate seen from recovered payloads (proactive startup resolution).
+        // The PersistenceWorker walks backward from the latest anchor through the
+        // Freezer and bundles all payload bytes into the Ready event.  This avoids
+        // per-ancestor network round trips after an unclean restart.
+        if !recovered_payloads.is_empty() {
+            info!(
+                count = recovered_payloads.len(),
+                "hydrating seen from recovered payloads"
+            );
+            for (digest, bytes) in recovered_payloads {
+                self.core.note_payload_seen(digest, bytes);
+            }
+        }
 
         // Spawn persistence bridge: persistence.rx → mailbox.
         let persistence_rx = self.persistence.take_event_rx();
