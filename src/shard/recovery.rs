@@ -103,9 +103,6 @@ pub(super) struct RecoveryLimits {
     pub(super) max_buffered_reshards: usize,
     pub(super) max_pre_leader_messages: usize,
     pub(super) max_pre_leader_keys: usize,
-    /// Remove entries whose view is more than this many views behind the
-    /// newest incoming key.  Set to 0 to disable staleness-based expiry.
-    pub(super) staleness_threshold: u64,
 }
 
 pub(super) enum RecoveryInput {
@@ -472,31 +469,8 @@ impl RecoveryMachine {
 
         let mut outputs = Vec::new();
 
-        // Proactively expire entries whose view is too far behind the
-        // incoming key.  These entries will almost certainly never receive
-        // enough shards to complete recovery since validators have moved on.
-        if self.limits.staleness_threshold > 0 {
-            let cutoff = key
-                .round
-                .view()
-                .get()
-                .saturating_sub(self.limits.staleness_threshold);
-            let stale_keys: Vec<BlockKey> = self
-                .recovery
-                .keys()
-                .filter(|k| k.round.view().get() < cutoff)
-                .copied()
-                .collect();
-            for stale in stale_keys {
-                if self.recovery.shift_remove(&stale).is_some() {
-                    self.pre_leader_buffer.shift_remove(&stale);
-                    self.known_leaders.shift_remove(&stale);
-                    outputs.push(RecoveryOutput::Evicted { key: stale });
-                }
-            }
-        }
-
-        // Standard capacity-based eviction.
+        // Capacity-based FIFO eviction. The effective staleness window
+        // self-tunes: it equals max_recovery_entries / view_rate.
         while self.recovery.len() >= self.limits.max_recovery_entries {
             let Some((oldest, _state)) = self.recovery.shift_remove_index(0) else {
                 break;
@@ -633,7 +607,6 @@ mod tests {
                 max_buffered_reshards: MAX_BUFFERED_RESHARDS,
                 max_pre_leader_messages: MAX_PRE_LEADER_MESSAGES,
                 max_pre_leader_keys: MAX_PRE_LEADER_KEYS,
-                staleness_threshold: 0,
             });
             let leader = ed25519::PrivateKey::from_seed(42).public_key();
 
@@ -776,7 +749,6 @@ mod tests {
             max_buffered_reshards: 32,
             max_pre_leader_messages: 64,
             max_pre_leader_keys: 256,
-            staleness_threshold: 0,
         });
         let initial_hash = hash_encoded(&shards[usize::from(my_index)]);
         let outputs = machine.step(RecoveryInput::ObserveInitial {

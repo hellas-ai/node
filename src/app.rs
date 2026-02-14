@@ -66,7 +66,7 @@ impl Reporter for TraceReporter {
     type Activity = Activity;
 
     async fn report(&mut self, activity: Self::Activity) {
-        info!(activity = ?activity);
+        debug!(activity = ?activity);
     }
 }
 
