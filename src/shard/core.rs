@@ -53,7 +53,7 @@ impl<S: Strategy> ShardRecoverer<S> {
     /// Expire recovery entries whose view is more than this many views behind
     /// the newest incoming shard.  Prevents stale zombie entries from occupying
     /// the recovery table indefinitely.
-    const STALENESS_THRESHOLD: u64 = 200;
+    const STALENESS_THRESHOLD: u64 = 1000;
 
     pub(crate) fn new(
         me: &PublicKey,
