@@ -719,6 +719,9 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
             &me,
             TraceReporter,
         );
+        // Clone mailbox before consuming it into LocalLightClient so the
+        // event stream relay can also submit transactions to the mempool.
+        let relay_mailbox = tx_mailbox.clone();
         let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
 
         // Start plain WebSocket event stream (if configured)
@@ -730,7 +733,14 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
                 .await
                 .expect("failed to bind event WebSocket listener");
             let atx = activity_tx.clone();
-            ::tokio::spawn(hellas_rpc::event_stream::serve_event_stream(listener, atx));
+            let (relay_tx_sink, mut relay_tx_recv) = ::tokio::sync::mpsc::unbounded_channel();
+            ::tokio::spawn(hellas_rpc::event_stream::serve_event_stream(listener, atx, relay_tx_sink));
+            let mb = relay_mailbox.clone();
+            ::tokio::spawn(async move {
+                while let Some(tx) = relay_tx_recv.recv().await {
+                    mb.submit_tx(tx).await;
+                }
+            });
             info!(%addr, "event WebSocket stream started");
         }
 
