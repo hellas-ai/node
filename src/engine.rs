@@ -175,6 +175,7 @@ where
                 page_cache_size: config.page_cache_size,
                 page_cache_count: config.page_cache_count,
                 verify_wait_timeout: config.fetch_timeout,
+                min_propose_delay: config.min_propose_delay,
             },
         );
         let (app_handle, mailbox) = app.start();

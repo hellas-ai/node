@@ -410,14 +410,14 @@ where
         'outer: loop {
             // Drain any buffered commands before attempting persistence.
             loop {
-                match self.command_rx.try_next() {
-                    Ok(Some(command)) => match self.process_command(command).await {
+                match self.command_rx.try_recv() {
+                    Ok(command) => match self.process_command(command).await {
                         Ok(true) => {}
                         Ok(false) => break 'outer,
                         Err(err) => Self::abort(err),
                     },
-                    Ok(None) => break 'outer,
-                    Err(_) => break, // channel empty; fall through to persist or block
+                    Err(mpsc::TryRecvError::Closed) => break 'outer,
+                    Err(mpsc::TryRecvError::Empty) => break, // channel empty; fall through to persist or block
                 }
             }
 
@@ -1127,7 +1127,7 @@ where
                 );
                 break;
             };
-            let Some(block) = super::payload::SeenBlock::decode(bytes.clone()) else {
+            let Some(block) = super::payload::SeenBlock::decode(bytes.clone(), 0) else {
                 warn!(
                     ?current,
                     recovered = chain.len(),

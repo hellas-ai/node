@@ -46,6 +46,7 @@ pub struct Config {
     pub skip_timeout: u64,
     pub fetch_timeout: Duration,
     pub fetch_concurrent: usize,
+    pub min_propose_delay: Duration,
 }
 
 impl Config {
@@ -63,6 +64,7 @@ impl Config {
             skip_timeout: 5,
             fetch_timeout: Duration::from_secs(5),
             fetch_concurrent: 3,
+            min_propose_delay: Duration::ZERO,
         }
     }
 
@@ -80,6 +82,7 @@ impl Config {
             skip_timeout: 5,
             fetch_timeout: Duration::from_millis(500),
             fetch_concurrent: 3,
+            min_propose_delay: Duration::ZERO,
         }
     }
 
@@ -149,14 +152,15 @@ pub struct NodeConfig {
     pub metrics_port: Option<u16>,
     #[serde(default)]
     pub ws_bind: Option<String>,
+    /// WebSocket URL of the explorer DO to push events and serve queries to.
+    /// When set, the validator initiates two connections to the DO.
     #[serde(default)]
-    pub relay: Option<RelayConfig>,
+    pub explorer_url: Option<String>,
+    /// Minimum time (in milliseconds) the leader waits before emitting a
+    /// proposal.  Useful for throttling a local cluster during development.
+    #[serde(default)]
+    pub min_propose_ms: Option<u64>,
     pub peers: Vec<PeerEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct RelayConfig {
-    pub bind: String,
 }
 
 #[derive(Serialize, Deserialize)]

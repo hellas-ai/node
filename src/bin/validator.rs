@@ -3,7 +3,7 @@ use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{AddressableManager, authenticated::lookup};
-use commonware_runtime::{Metrics, Quota, Runner, Spawner, tokio};
+use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, tokio};
 use futures::FutureExt;
 use hellas_chain::TraceReporter;
 use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_private_key};
@@ -81,12 +81,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Generate a TOML config for a single validator node
-    Setup {
+    Config {
         /// Total number of validators in the network
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         validators: u32,
         /// This node's index (0-based)
-        #[arg(long)]
+        #[arg(short = 'i', long, default_value = "0")]
         node: u32,
         /// Starting port number (node i listens on start_port + i)
         #[arg(long, default_value = "3000")]
@@ -98,6 +98,12 @@ enum Command {
         /// in index order). When omitted, all peers default to 127.0.0.1.
         #[arg(long, value_delimiter = ',')]
         addresses: Option<Vec<String>>,
+        /// Explorer WebSocket URL for pushing activity events and serving queries
+        #[arg(long)]
+        ws_push: Option<String>,
+        /// Minimum time (ms) the leader waits before emitting a proposal
+        #[arg(long)]
+        min_propose_ms: Option<u64>,
     },
     /// Run a validator node
     Run {
@@ -110,9 +116,9 @@ enum Command {
         /// WebSocket gRPC bind address (e.g. [::]:31130)
         #[arg(long)]
         ws_bind: Option<String>,
-        /// Plain WebSocket event relay bind address (default 0.0.0.0:31331)
+        /// Explorer WebSocket URL for pushing activity events and serving queries
         #[arg(long)]
-        bind_relay: Option<String>,
+        ws_push: Option<String>,
     },
     /// Query a running validator via RPC
     Query {
@@ -122,6 +128,19 @@ enum Command {
         #[command(subcommand)]
         query: QueryCommand,
     },
+    /// Manage wallet keys
+    Wallet {
+        #[command(subcommand)]
+        wallet: WalletCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WalletCommand {
+    /// Generate a new keypair and save to disk
+    Create,
+    /// Display the address for the stored key
+    View,
 }
 
 #[derive(Subcommand)]
@@ -142,6 +161,12 @@ enum QueryCommand {
         #[arg(long)]
         payload: String,
     },
+    /// Look up a coin by object ID in the latest finalized state
+    Coin {
+        /// Hex-encoded 32-byte object ID
+        #[arg(long)]
+        object_id: String,
+    },
     /// Submit a transfer transaction
     Transfer {
         /// Hex-encoded 32-byte ed25519 private key (sender)
@@ -150,7 +175,7 @@ enum QueryCommand {
         /// Hex-encoded 32-byte object ID of the input coin
         #[arg(long)]
         input: String,
-        /// Hex-encoded ed25519 public key of the recipient
+        /// Base58-encoded ed25519 public key of the recipient
         #[arg(long)]
         recipient: String,
         /// Amount to transfer
@@ -166,25 +191,78 @@ enum QueryCommand {
         #[arg(long, value_delimiter = ',')]
         inputs: Vec<String>,
     },
+    /// Subscribe to consensus activity events
+    Activity,
+    /// List all known validators
+    Validators,
 }
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Setup {
+        Command::Config {
             validators,
             node,
             start_port,
             seed,
             addresses,
-        } => setup(validators, node, start_port, seed, addresses),
-        Command::Run { config, log_json, ws_bind, bind_relay } => run(config, log_json, ws_bind, bind_relay),
+            ws_push,
+            min_propose_ms,
+        } => setup(validators, node, start_port, seed, addresses, ws_push, min_propose_ms),
+        Command::Run { config, log_json, ws_bind, ws_push } => run(config, log_json, ws_bind, ws_push),
         Command::Query { rpc, query } => do_query(rpc, query),
+        Command::Wallet { wallet } => do_wallet(wallet),
     };
 
     if let Err(err) = result {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+fn wallet_key_path() -> Result<PathBuf, ValidatorError> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| ValidatorError::InvalidSetup("cannot determine data directory".into()))?;
+    Ok(base.join("hellas").join("wallet.key"))
+}
+
+fn do_wallet(cmd: WalletCommand) -> Result<(), ValidatorError> {
+    let path = wallet_key_path()?;
+    match cmd {
+        WalletCommand::Create => {
+            if path.exists() {
+                return Err(ValidatorError::InvalidSetup(format!(
+                    "wallet already exists at {}; remove it first to create a new one",
+                    path.display()
+                )));
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ValidatorError::InvalidSetup(format!("failed to create directory: {e}"))
+                })?;
+            }
+            let key = random_private_key();
+            let addr = hellas_types::Address::from(key.public_key());
+            let hex_key = hex::encode(key.encode());
+            std::fs::write(&path, &hex_key).map_err(|e| {
+                ValidatorError::InvalidSetup(format!("failed to write wallet key: {e}"))
+            })?;
+            println!("address: {addr}");
+            println!("saved to: {}", path.display());
+            Ok(())
+        }
+        WalletCommand::View => {
+            let hex_key = std::fs::read_to_string(&path).map_err(|e| {
+                ValidatorError::InvalidSetup(format!(
+                    "failed to read wallet key from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let key = parse_hex_private_key(hex_key.trim())?;
+            let addr = hellas_types::Address::from(key.public_key());
+            println!("address: {addr}");
+            Ok(())
+        }
     }
 }
 
@@ -194,6 +272,8 @@ fn setup(
     start_port: u16,
     seed: Option<u64>,
     addresses: Option<Vec<String>>,
+    ws_push: Option<String>,
+    min_propose_ms: Option<u64>,
 ) -> Result<(), ValidatorError> {
     if validators == 0 {
         return Err(ValidatorError::InvalidSetup(
@@ -248,7 +328,8 @@ fn setup(
         listen_port: start_port + node as u16,
         metrics_port: Some(9090 + node as u16),
         ws_bind: None,
-        relay: None,
+        explorer_url: ws_push,
+        min_propose_ms,
         peers,
     };
 
@@ -334,6 +415,28 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                     None => println!("no finalization certificate found"),
                 }
             }
+            QueryCommand::Coin { object_id } => {
+                let digest = parse_hex_digest(&object_id, "object_id")?;
+                let block = client
+                    .get_latest_block()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                let Some(block) = block else {
+                    println!("no block finalized yet");
+                    return Ok(());
+                };
+                let coin = client
+                    .get_coin(block.payload, digest)
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                match coin {
+                    Some(c) => {
+                        println!("owner: {}", c.owner);
+                        println!("value: {}", c.value);
+                    }
+                    None => println!("coin not found"),
+                }
+            }
             QueryCommand::Transfer {
                 key,
                 input,
@@ -342,14 +445,12 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
             } => {
                 let private_key = parse_hex_private_key(&key)?;
                 let input_digest = parse_hex_digest(&input, "input")?;
-                let recipient_bytes = hex::decode(&recipient)
-                    .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for recipient: {e}")))?;
-                let recipient_key = ed25519::PublicKey::decode(recipient_bytes.as_slice())
-                    .map_err(|_| ValidatorError::InvalidSetup("recipient must be a valid ed25519 public key".into()))?;
+                let recipient_addr: hellas_types::Address = recipient.parse()
+                    .map_err(|e: hellas_types::AddressError| ValidatorError::InvalidSetup(format!("bad recipient: {e}")))?;
                 let tx = hellas_types::Transaction::transfer(
                     &private_key,
                     input_digest,
-                    recipient_key,
+                    recipient_addr,
                     amount,
                 );
                 client
@@ -371,6 +472,73 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                     .await
                     .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
                 println!("transaction submitted");
+            }
+            QueryCommand::Validators => {
+                let validators = client
+                    .get_validators()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                for v in &validators {
+                    println!("{v}");
+                }
+            }
+            QueryCommand::Activity => {
+                use hellas_rpc::pb::hellas::{ActivityEvent, activity_event::Event};
+                let mut stream = client
+                    .subscribe_activity()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
+                while let Some(event) = stream
+                    .message::<ActivityEvent>()
+                    .await
+                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?
+                {
+                    let Some(inner) = event.event else { continue };
+                    match inner {
+                        Event::Notarize(e) => {
+                            let p = e.proposal.unwrap_or_default();
+                            println!(
+                                "notarize: epoch={} view={} signer={}",
+                                p.epoch, p.view, e.signer
+                            );
+                        }
+                        Event::MNotarization(e) => {
+                            let p = e.proposal.unwrap_or_default();
+                            println!(
+                                "m-notarization: epoch={} view={} signers={:?}",
+                                p.epoch, p.view, e.signers
+                            );
+                        }
+                        Event::Nullify(e) => {
+                            println!(
+                                "nullify: epoch={} view={} signer={}",
+                                e.epoch, e.view, e.signer
+                            );
+                        }
+                        Event::Nullification(e) => {
+                            println!(
+                                "nullification: epoch={} view={} signers={:?}",
+                                e.epoch, e.view, e.signers
+                            );
+                        }
+                        Event::Finalization(e) => {
+                            let p = e.proposal.unwrap_or_default();
+                            println!(
+                                "finalization: epoch={} view={} signers={:?}",
+                                p.epoch, p.view, e.signers
+                            );
+                        }
+                        Event::ConflictingNotarize(e) => {
+                            let f = e.first.and_then(|n| n.proposal).unwrap_or_default();
+                            let s = e.second.and_then(|n| n.proposal).unwrap_or_default();
+                            println!(
+                                "conflicting-notarize: first=(epoch={} view={}) second=(epoch={} view={})",
+                                f.epoch, f.view, s.epoch, s.view
+                            );
+                        }
+                    }
+                }
+                println!("activity stream ended");
             }
         }
         Ok(())
@@ -605,14 +773,33 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>, bind_relay: Option<String>) -> Result<(), ValidatorError> {
+/// Open a WebSocket to `url` and serve LightClient RPCs via ws-mux.
+///
+/// The relay DO acts as ws-mux client and calls the validator's LightClient
+/// RPCs (including `subscribe_activity` for the event stream).
+async fn serve_relay(
+    url: &str,
+    svc: impl ws_mux::ServiceDispatch + Clone,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use futures::StreamExt;
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+    let (write, read) = ws_stream.split();
+    let sink = ws_mux::NativeWsSink::new(write);
+    let recv = ws_mux::NativeWsRecv::new(read);
+
+    ws_mux::serve(svc, recv, sink).await?;
+    Ok(())
+}
+
+fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>, ws_push: Option<String>) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut node_config: NodeConfig = toml::from_str(&config_str)?;
     if ws_bind.is_some() {
         node_config.ws_bind = ws_bind;
     }
-    if let Some(addr) = bind_relay {
-        node_config.relay = Some(hellas_chain::config::RelayConfig { bind: addr });
+    if ws_push.is_some() {
+        node_config.explorer_url = ws_push;
     }
 
     let private_key = node_config.decode_private_key()?;
@@ -708,54 +895,45 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
         }
         relay.finalize_validators();
 
+        // Extract validator names before scheme is moved into the engine.
+        let validators: Vec<String> = scheme.participants()
+            .iter()
+            .map(|pk| hex::encode(&pk.encode()[..8]))
+            .collect();
+
         // Create engine first so the application can subscribe to shard ingress
         // before the transport starts dispatching inbound shard messages.
+        let mut chain_config = Config::mainnet();
+        if let Some(ms) = node_config.min_propose_ms {
+            chain_config.min_propose_delay = Duration::from_millis(ms);
+            info!(min_propose_ms = ms, "proposal throttle enabled");
+        }
         let (engine, tx_mailbox, activity_tx) = Engine::new(
             context.clone(),
-            Config::mainnet(),
+            chain_config,
             scheme,
             oracle,
             relay.clone(),
             &me,
             TraceReporter,
         );
-        // Clone mailbox before consuming it into LocalLightClient so the
-        // event stream relay can also submit transactions to the mempool.
-        let relay_mailbox = tx_mailbox.clone();
-        let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox);
-
-        // Start plain WebSocket event stream (if configured)
-        if let Some(relay) = &node_config.relay {
-            let addr: SocketAddr = relay.bind
-                .parse()
-                .expect("relay.bind address should be valid");
-            let listener = ::tokio::net::TcpListener::bind(addr)
-                .await
-                .expect("failed to bind event WebSocket listener");
-            let atx = activity_tx.clone();
-            let (relay_tx_sink, mut relay_tx_recv) = ::tokio::sync::mpsc::unbounded_channel();
-            ::tokio::spawn(hellas_rpc::event_stream::serve_event_stream(listener, atx, relay_tx_sink));
-            let mb = relay_mailbox.clone();
-            ::tokio::spawn(async move {
-                while let Some(tx) = relay_tx_recv.recv().await {
-                    mb.submit_tx(tx).await;
-                }
-            });
-            info!(%addr, "event WebSocket stream started");
-        }
+        let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox, validators);
 
         // Start light-client gRPC server over WebSocket (if configured)
         if let Some(ws_bind) = &node_config.ws_bind {
             let addr: SocketAddr = ws_bind
                 .parse()
                 .expect("ws_bind address should be valid");
-            let svc = hellas_rpc::server::LightClientGrpcServer::new(light_client, activity_tx)
-                .into_service();
+            let svc = hellas_chain::rpc::LightClientGrpcServer::new(
+                light_client.clone(),
+                activity_tx.clone(),
+            )
+            .into_service();
             let listener = ::tokio::net::TcpListener::bind(addr)
                 .await
                 .expect("failed to bind WebSocket listener");
             let incoming = hellas_rpc::ws::ws_incoming(listener);
-            ::tokio::spawn(async move {
+            context.clone().spawn(|_| async move {
                 tonic::transport::Server::builder()
                     .add_service(svc)
                     .serve_with_incoming(incoming)
@@ -763,6 +941,29 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
                     .unwrap();
             });
             info!(%addr, "light client WebSocket gRPC server started");
+        }
+
+        // Connect to explorer relay DO (if configured).
+        // Single outbound WebSocket: the validator serves LightClient RPCs
+        // (including subscribe_activity) and the relay DO acts as ws-mux client.
+        if let Some(explorer_url) = &node_config.explorer_url {
+            let validator_name = hex::encode(&me.encode()[..8]);
+            let relay_url = format!("{explorer_url}/relay/{validator_name}");
+            let relay_svc = hellas_rpc::mux::MuxServiceDispatch::new(
+                hellas_chain::rpc::LightClientGrpcServer::new(light_client, activity_tx)
+                    .into_service(),
+            );
+            context.clone().spawn(|ctx| async move {
+                loop {
+                    match serve_relay(&relay_url, relay_svc.clone()).await {
+                        Ok(()) => info!("relay connection closed normally"),
+                        Err(e) => warn!(%e, "relay connection failed"),
+                    }
+                    ctx.sleep(Duration::from_secs(5)).await;
+                }
+            });
+
+            info!(%explorer_url, "relay connection started");
         }
 
         let shard_transport_handle = relay.start(context.clone());

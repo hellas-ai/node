@@ -1,6 +1,21 @@
 use commonware_runtime::Metrics;
-use prometheus_client::metrics::{counter::Counter, gauge::Gauge};
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::{counter::Counter, family::Family, gauge::Gauge};
 use std::sync::atomic::AtomicI64;
+
+/// Label set for per-leader latency metrics (base58 address).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub(crate) struct LeaderLabel {
+    pub leader: String,
+}
+
+impl LeaderLabel {
+    pub fn new(pk: &hellas_types::PublicKey) -> Self {
+        Self {
+            leader: hellas_types::Address::from(pk.clone()).to_string(),
+        }
+    }
+}
 
 pub(super) fn gauge_set_len(gauge: &Gauge<i64, AtomicI64>, len: usize) {
     gauge.set(i64::try_from(len).unwrap_or(i64::MAX));
@@ -15,6 +30,7 @@ pub(super) struct ApplicationMetrics {
     pub(crate) persistence_ack_total: Counter,
     pub(crate) persistence_ack_unexpected_total: Counter,
     pub(crate) genesis_anchor_seeded_total: Counter,
+    pub(crate) propose_throttled_total: Counter,
     pub(crate) inflight_persistence: Gauge<i64, AtomicI64>,
 }
 
@@ -28,6 +44,7 @@ impl ApplicationMetrics {
             persistence_ack_total: Counter::default(),
             persistence_ack_unexpected_total: Counter::default(),
             genesis_anchor_seeded_total: Counter::default(),
+            propose_throttled_total: Counter::default(),
             inflight_persistence: Gauge::default(),
         };
 
@@ -67,6 +84,11 @@ impl ApplicationMetrics {
             metrics.genesis_anchor_seeded_total.clone(),
         );
         context.register(
+            "propose_throttled_total",
+            "proposals delayed by min_propose_ms throttle",
+            metrics.propose_throttled_total.clone(),
+        );
+        context.register(
             "inflight_persistence",
             "whether a persistence intent is currently inflight (0/1)",
             metrics.inflight_persistence.clone(),
@@ -95,6 +117,8 @@ pub(super) struct CoreMetrics {
     pub(crate) unpersisted_finalizations: Gauge<i64, AtomicI64>,
     pub(crate) finalization_timestamp_drift: Gauge<i64, AtomicI64>,
     pub(crate) validation_timestamp_drift: Gauge<i64, AtomicI64>,
+    pub(crate) per_leader_arrival_drift: Family<LeaderLabel, Gauge<i64, AtomicI64>>,
+    pub(crate) per_leader_min_drift: Family<LeaderLabel, Gauge<i64, AtomicI64>>,
 }
 
 impl CoreMetrics {
@@ -116,6 +140,8 @@ impl CoreMetrics {
             unpersisted_finalizations: Gauge::default(),
             finalization_timestamp_drift: Gauge::default(),
             validation_timestamp_drift: Gauge::default(),
+            per_leader_arrival_drift: Family::default(),
+            per_leader_min_drift: Family::default(),
         };
 
         context.register(
@@ -197,6 +223,16 @@ impl CoreMetrics {
             "validation_timestamp_drift",
             "signed ms drift between wall clock and validated block timestamp (now - block_ts)",
             metrics.validation_timestamp_drift.clone(),
+        );
+        context.register(
+            "per_leader_arrival_drift",
+            "ms drift between local arrival and block timestamp, labeled by leader (received_at - block_ts)",
+            metrics.per_leader_arrival_drift.clone(),
+        );
+        context.register(
+            "per_leader_min_drift",
+            "minimum observed drift per leader, approximates clock skew baseline",
+            metrics.per_leader_min_drift.clone(),
         );
 
         metrics.waiter_keys.set(0);

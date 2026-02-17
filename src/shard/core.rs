@@ -310,7 +310,7 @@ impl<S: Strategy> ShardRecoverer<S> {
     pub(crate) fn drain_coding_events(&mut self) -> VecDeque<ShardEffect> {
         let mut effects = VecDeque::new();
         let mut drained = 0u32;
-        while let Ok(Some(traced)) = self.coding_event_rx.try_next() {
+        while let Ok(traced) = self.coding_event_rx.try_recv() {
             let (result, parent_span) = traced.into_parts();
             // Re-enter the caller's span so that downstream work
             // (apply_reshard_result, try_recover, etc.) appears as children

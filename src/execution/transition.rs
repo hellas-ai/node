@@ -1,5 +1,5 @@
 use hellas_types::{
-    Coin, GENESIS_BALANCE, ObjectId, Transaction, genesis_object_id, output_object_id,
+    Address, Coin, GENESIS_BALANCE, ObjectId, Transaction, genesis_object_id, output_object_id,
 };
 use commonware_codec::Encode;
 use commonware_cryptography::{Hasher, Sha256};
@@ -53,7 +53,7 @@ pub fn genesis_state(validators: &[PublicKey]) -> BlockExecution {
         };
         let id = genesis_object_id(validator_index);
         let coin = Coin {
-            owner: validator.clone(),
+            owner: Address::from(validator.clone()),
             value: GENESIS_BALANCE,
         };
         state.insert(id, coin.clone());
@@ -177,7 +177,7 @@ fn execute_transaction_with_tracking(
                 }
             }
 
-            let mut owner: Option<PublicKey> = None;
+            let mut owner: Option<Address> = None;
             let mut total = 0u64;
             for input in inputs {
                 let coin = state
@@ -241,6 +241,10 @@ mod tests {
             .collect()
     }
 
+    fn addr(key: &PrivateKey) -> Address {
+        Address::from(key.public_key())
+    }
+
     fn sorted_public_keys(n: usize) -> Vec<PublicKey> {
         let mut pks: Vec<_> = keys(n).into_iter().map(|k| k.public_key()).collect();
         pks.sort();
@@ -257,7 +261,7 @@ mod tests {
         for (idx, pk) in validators.iter().enumerate() {
             let id = genesis_object_id(u16::try_from(idx).unwrap());
             let coin = exec.state.get(&id).expect("genesis coin");
-            assert_eq!(coin.owner, *pk);
+            assert_eq!(coin.owner, Address::from(pk.clone()));
             assert_eq!(coin.value, GENESIS_BALANCE);
         }
     }
@@ -273,8 +277,8 @@ mod tests {
     #[test_log::test]
     fn transfer_debits_and_credits() {
         let keys = keys(2);
-        let sender = keys[0].public_key();
-        let recipient = keys[1].public_key();
+        let sender = addr(&keys[0]);
+        let recipient = addr(&keys[1]);
         let input = Digest::from([1; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
@@ -301,8 +305,8 @@ mod tests {
     #[test_log::test]
     fn transfer_exact_amount_has_no_change() {
         let keys = keys(2);
-        let sender = keys[0].public_key();
-        let recipient = keys[1].public_key();
+        let sender = addr(&keys[0]);
+        let recipient = addr(&keys[1]);
         let input = Digest::from([2; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
@@ -322,7 +326,7 @@ mod tests {
     #[test_log::test]
     fn transfer_self_splits_coin() {
         let keys = keys(1);
-        let owner = keys[0].public_key();
+        let owner = addr(&keys[0]);
         let input = Digest::from([3; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
@@ -346,11 +350,11 @@ mod tests {
         parent.insert(
             input,
             Coin {
-                owner: keys[0].public_key(),
+                owner: addr(&keys[0]),
                 value: 10,
             },
         );
-        let tx = Transaction::transfer(&keys[0], input, keys[1].public_key(), 11);
+        let tx = Transaction::transfer(&keys[0], input, addr(&keys[1]), 11);
         assert!(matches!(
             execute_block(&parent, std::slice::from_ref(&tx)),
             Err(ExecutionError::InsufficientBalance { .. })
@@ -365,11 +369,11 @@ mod tests {
         parent.insert(
             input,
             Coin {
-                owner: keys[0].public_key(),
+                owner: addr(&keys[0]),
                 value: 10,
             },
         );
-        let tx = Transaction::transfer(&keys[0], input, keys[1].public_key(), 0);
+        let tx = Transaction::transfer(&keys[0], input, addr(&keys[1]), 0);
         assert!(matches!(
             execute_block(&parent, std::slice::from_ref(&tx)),
             Err(ExecutionError::ZeroAmount)
@@ -384,11 +388,11 @@ mod tests {
         parent.insert(
             input,
             Coin {
-                owner: keys[0].public_key(),
+                owner: addr(&keys[0]),
                 value: 10,
             },
         );
-        let tx = Transaction::transfer(&keys[1], input, keys[1].public_key(), 1);
+        let tx = Transaction::transfer(&keys[1], input, addr(&keys[1]), 1);
         assert!(matches!(
             execute_block(&parent, std::slice::from_ref(&tx)),
             Err(ExecutionError::InvalidSignature)
@@ -398,7 +402,7 @@ mod tests {
     #[test_log::test]
     fn nonexistent_input_rejected() {
         let keys = keys(2);
-        let tx = Transaction::transfer(&keys[0], Digest::from([7; 32]), keys[1].public_key(), 1);
+        let tx = Transaction::transfer(&keys[0], Digest::from([7; 32]), addr(&keys[1]), 1);
         assert!(matches!(
             execute_block(&ObjectState::new(), std::slice::from_ref(&tx)),
             Err(ExecutionError::ObjectNotFound { .. })
@@ -408,7 +412,7 @@ mod tests {
     #[test_log::test]
     fn merge_combines_values() {
         let keys = keys(1);
-        let owner = keys[0].public_key();
+        let owner = addr(&keys[0]);
         let input_a = Digest::from([8; 32]);
         let input_b = Digest::from([9; 32]);
         let mut parent = ObjectState::new();
@@ -444,14 +448,14 @@ mod tests {
         parent.insert(
             input_a,
             Coin {
-                owner: keys[0].public_key(),
+                owner: addr(&keys[0]),
                 value: 7,
             },
         );
         parent.insert(
             input_b,
             Coin {
-                owner: keys[1].public_key(),
+                owner: addr(&keys[1]),
                 value: 13,
             },
         );
@@ -476,7 +480,7 @@ mod tests {
     #[test_log::test]
     fn duplicate_input_rejected() {
         let keys = keys(1);
-        let owner = keys[0].public_key();
+        let owner = addr(&keys[0]);
         let input = Digest::from([13; 32]);
         let mut parent = ObjectState::new();
         parent.insert(input, Coin { owner, value: 5 });
@@ -496,7 +500,7 @@ mod tests {
     #[test_log::test]
     fn merge_overflow_rejected() {
         let keys = keys(1);
-        let owner = keys[0].public_key();
+        let owner = addr(&keys[0]);
         let input_a = Digest::from([14; 32]);
         let input_b = Digest::from([15; 32]);
         let mut parent = ObjectState::new();
@@ -518,8 +522,8 @@ mod tests {
     #[test_log::test]
     fn output_collision_is_checked() {
         let keys = keys(2);
-        let sender = keys[0].public_key();
-        let recipient = keys[1].public_key();
+        let sender = addr(&keys[0]);
+        let recipient = addr(&keys[1]);
         let input = Digest::from([16; 32]);
         let tx = Transaction::transfer(&keys[0], input, recipient, 10);
         let collision_id = output_object_id(&Sha256::hash(&tx.encode()), 0);
@@ -535,7 +539,7 @@ mod tests {
         parent.insert(
             collision_id,
             Coin {
-                owner: keys[1].public_key(),
+                owner: addr(&keys[1]),
                 value: 1,
             },
         );
@@ -548,7 +552,7 @@ mod tests {
     #[test_log::test]
     fn non_canonical_merge_inputs_rejected() {
         let keys = keys(1);
-        let owner = keys[0].public_key();
+        let owner = addr(&keys[0]);
         let input_a = Digest::from([17; 32]);
         let input_b = Digest::from([18; 32]);
         let mut parent = ObjectState::new();

@@ -2,7 +2,7 @@ use super::FinalizationDiffs;
 use super::transition::{ObjectState, execute_block};
 use hellas_types::Transaction;
 use commonware_cryptography::sha256::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Materialized speculative execution state keyed by payload digest.
 pub(crate) struct SpeculativeExecutionStore {
@@ -107,45 +107,45 @@ impl SpeculativeExecutionStore {
         true
     }
 
-    pub(crate) fn prune_non_descendants<F>(&mut self, ancestor: Digest, keep: F) -> Vec<Digest>
+    pub(crate) fn prune_non_descendants<F>(
+        &mut self,
+        ancestor: Digest,
+        keep: F,
+    ) -> (Vec<Digest>, HashSet<Digest>)
     where
         F: Fn(Digest) -> bool,
     {
-        // O(n * depth) worst-case: we run an ancestor walk per execution entry.
-        // In practice this stays bounded by AppCore retention caps and chain depth.
+        let mut children_by_parent: HashMap<Digest, Vec<Digest>> = HashMap::new();
+        for (digest, parent) in &self.parent_by_digest {
+            children_by_parent.entry(*parent).or_default().push(*digest);
+        }
+
+        let mut reachable = HashSet::new();
+        let mut queue = VecDeque::new();
+        reachable.insert(ancestor);
+        queue.push_back(ancestor);
+        while let Some(current) = queue.pop_front() {
+            if let Some(children) = children_by_parent.get(&current) {
+                for child in children {
+                    if reachable.insert(*child) {
+                        queue.push_back(*child);
+                    }
+                }
+            }
+        }
+
         let pruned: Vec<_> = self
             .executions
             .keys()
             .copied()
-            .filter(|digest| !self.descends_from(*digest, ancestor) && !keep(*digest))
+            .filter(|digest| !reachable.contains(digest) && !keep(*digest))
             .collect();
         for digest in &pruned {
             self.executions.remove(digest);
             self.parent_by_digest.remove(digest);
             self.diffs.remove(digest);
         }
-        pruned
-    }
-
-    fn descends_from(&self, mut digest: Digest, ancestor: Digest) -> bool {
-        if digest == ancestor {
-            return true;
-        }
-        // We walk at most parent_by_digest.len() + 1 steps to avoid looping forever
-        // on malformed parent links. A cycle must repeat within that bound.
-        for _ in 0..=self.parent_by_digest.len() {
-            let Some(parent) = self.parent_by_digest.get(&digest).copied() else {
-                return false;
-            };
-            if parent == ancestor {
-                return true;
-            }
-            if parent == digest {
-                return false;
-            }
-            digest = parent;
-        }
-        false
+        (pruned, reachable)
     }
 }
 
@@ -159,7 +159,7 @@ mod tests {
     use hellas_types::PrivateKey;
 
     fn sample_state() -> ObjectState {
-        let owner = PrivateKey::from_seed(1).public_key();
+        let owner = hellas_types::Address::from(PrivateKey::from_seed(1).public_key());
         let id = Digest::from([7; 32]);
         let mut state = ObjectState::new();
         state.insert(
@@ -222,9 +222,12 @@ mod tests {
         assert!(store.ensure_execution_for_payload(canonical, &decode));
         assert!(store.ensure_execution_for_payload(fork, &decode));
 
-        let pruned = store.prune_non_descendants(canonical, |digest| digest == fork);
+        let (pruned, reachable) =
+            store.prune_non_descendants(canonical, |digest| digest == fork);
         assert!(pruned.contains(&genesis));
         assert!(!pruned.contains(&fork));
+        assert!(reachable.contains(&canonical));
+        assert!(!reachable.contains(&fork));
         assert!(!store.contains_execution(genesis));
         assert!(store.contains_execution(canonical));
         assert!(store.contains_execution(fork));

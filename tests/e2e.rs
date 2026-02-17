@@ -11,14 +11,14 @@ use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
+use commonware_runtime::{Clock, Handle, Metrics, Quota, Runner, deterministic};
 use commonware_storage::{
     qmdb::current::unordered::fixed::Db as FixedUtxoDb, translator::EightCap,
 };
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
 use hellas_types::{
-    Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id,
+    Address, Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id,
 };
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::{Activity, PrivateKey, PublicKey, Scheme};
@@ -217,7 +217,7 @@ fn run_network(
             let input =
                 genesis_object_id(u16::try_from(sender_index).expect("sender index in u16"));
             let tx =
-                Transaction::transfer(&sender_key, input, recipient_pk.clone(), transfer.amount);
+                Transaction::transfer(&sender_key, input, Address::from(recipient_pk.clone()), transfer.amount);
             let tx_digest = Sha256::hash(&tx.encode());
             let recipient_output = output_object_id(&tx_digest, 0);
             let change_output = output_object_id(&tx_digest, 1);
@@ -249,7 +249,7 @@ fn run_network(
                 let Some(coin) = mailbox.get_coin(payload, recipient_output).await else {
                     continue;
                 };
-                if coin.owner == recipient_pk && coin.value == transfer.amount {
+                if coin.owner == Address::from(recipient_pk.clone()) && coin.value == transfer.amount {
                     matched_payload = Some(payload);
                     break;
                 }
@@ -259,11 +259,11 @@ fn run_network(
                 .expect("submitted transfer was not observed in any finalized payload state");
 
             let expected_recipient = Coin {
-                owner: recipient_pk.clone(),
+                owner: Address::from(recipient_pk.clone()),
                 value: transfer.amount,
             };
             let expected_change = Coin {
-                owner: sender_pk.clone(),
+                owner: Address::from(sender_pk.clone()),
                 value: GENESIS_BALANCE - transfer.amount,
             };
 
@@ -1057,5 +1057,323 @@ fn cluster_resumes_after_unclean_restart() {
             total_gen2 >= 20,
             "restart phase 4: expected at least 20 total finalizations after restart, got {total_gen2} (counts={phase4_counts:?})"
         );
+    });
+}
+
+/// Stops a single node while the rest of the cluster continues, then
+/// restarts it.  Verifies the restarted node catches up AND can propose
+/// blocks that get finalized (i.e. it doesn't just notarize others' blocks
+/// but actively leads rounds).
+#[test_log::test]
+fn single_node_restarts_and_proposes() {
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
+    let config = Config::test();
+    let target = 0usize;
+
+    let runner = deterministic::Runner::timed(Duration::from_secs(120));
+
+    runner.start(|mut context| async move {
+        let (network, oracle) = Network::new(
+            context.with_label("network"),
+            NetworkConfig {
+                max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: None,
+            },
+        );
+        network.start();
+
+        let Fixture {
+            participants,
+            schemes,
+            ..
+        }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+
+        let quota = Quota::per_second(NonZeroU32::MAX);
+
+        // Add links between all peers.
+        for v1 in participants.iter() {
+            for v2 in participants.iter() {
+                if v1 != v2 {
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        // ── Phase 1: Start cluster (gen1) and run until finalization
+        let mut engine_handles: Vec<Handle<()>> = Vec::new();
+        let mut tracking: Vec<(Finalizations, Faults, Nullifications)> = Vec::new();
+        {
+            let mut registrations = HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.unwrap();
+                let certificate = control.register(1, quota).await.unwrap();
+                let resolver = control.register(2, quota).await.unwrap();
+                let shard = control.register(3, quota).await.unwrap();
+                registrations.insert(validator.clone(), (vote, certificate, resolver, shard));
+            }
+
+            for (idx, validator) in participants.iter().enumerate() {
+                let ctx = context.with_label(&format!("v{idx}_gen1"));
+                let blocker = oracle.control(validator.clone());
+
+                let reporter = MockReporter::new(
+                    context.clone(),
+                    ReporterConfig {
+                        participants: schemes[idx].participants().clone(),
+                        scheme: schemes[idx].clone(),
+                        elector: RoundRobin::<Sha256>::default(),
+                    },
+                );
+                tracking.push((
+                    reporter.finalizations.clone(),
+                    reporter.faults.clone(),
+                    reporter.nullifications.clone(),
+                ));
+
+                let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                let relay = Arc::new(AuthenticatedShardTransport::new(
+                    validator,
+                    shard_sender,
+                    shard_receiver,
+                ));
+                for participant in participants.iter() {
+                    relay.declare(participant);
+                }
+                relay.finalize_validators();
+
+                let (engine, _tx_mailbox, _activity_tx) = Engine::new(
+                    ctx,
+                    config,
+                    schemes[idx].clone(),
+                    blocker,
+                    relay.clone(),
+                    validator,
+                    reporter,
+                );
+                let _shard_transport = relay.start(context.clone());
+                engine_handles.push(engine.start(vote, certificate, resolver));
+            }
+        }
+
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase1_counts: Vec<usize> = tracking
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        println!("single-restart phase 1 (baseline): finalizations={phase1_counts:?}");
+        for (i, count) in phase1_counts.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "single-restart phase 1: validator {i} has no finalizations"
+            );
+        }
+
+        // ── Phase 2: Abort target node (simulating unclean crash) ─────
+        engine_handles[target].abort();
+
+        // Remove target's links so the old channels become inert.
+        for (i, peer) in participants.iter().enumerate() {
+            if i != target {
+                let _ = oracle
+                    .remove_link(participants[target].clone(), peer.clone())
+                    .await;
+                let _ = oracle
+                    .remove_link(peer.clone(), participants[target].clone())
+                    .await;
+            }
+        }
+
+        // Let remaining 5 nodes continue for several rounds.
+        context.sleep(Duration::from_secs(5)).await;
+
+        let phase2_counts: Vec<usize> = tracking
+            .iter()
+            .map(|(f, _, _)| f.lock().unwrap().len())
+            .collect();
+        let phase2_gains: Vec<usize> = phase2_counts
+            .iter()
+            .zip(phase1_counts.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        println!(
+            "single-restart phase 2 (target {target} offline): finalizations={phase2_counts:?}, gains={phase2_gains:?}"
+        );
+
+        // Connected nodes should progress (target may still observe some in-flight).
+        let connected_with_progress = phase2_gains
+            .iter()
+            .enumerate()
+            .filter(|(i, gain)| *i != target && **gain > 0)
+            .count();
+        assert!(
+            connected_with_progress >= 4,
+            "single-restart phase 2: expected at least 4 connected nodes to progress, got {connected_with_progress}"
+        );
+
+        // ── Phase 3: Restart target with fresh network channels ────────
+        // Re-add links from target to all other peers.
+        for (i, peer) in participants.iter().enumerate() {
+            if i != target {
+                oracle
+                    .add_link(participants[target].clone(), peer.clone(), link.clone())
+                    .await
+                    .unwrap();
+                oracle
+                    .add_link(peer.clone(), participants[target].clone(), link.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut registrations = HashMap::new();
+        {
+            let control = oracle.control(participants[target].clone());
+            let vote = control.register(0, quota).await.unwrap();
+            let certificate = control.register(1, quota).await.unwrap();
+            let resolver = control.register(2, quota).await.unwrap();
+            let shard = control.register(3, quota).await.unwrap();
+            registrations.insert(
+                participants[target].clone(),
+                (vote, certificate, resolver, shard),
+            );
+        }
+
+        // Create a fresh reporter for the restarted node.
+        let reporter_gen2 = MockReporter::new(
+            context.clone(),
+            ReporterConfig {
+                participants: schemes[target].participants().clone(),
+                scheme: schemes[target].clone(),
+                elector: RoundRobin::<Sha256>::default(),
+            },
+        );
+        let gen2_finalizations = reporter_gen2.finalizations.clone();
+        let gen2_nullifications = reporter_gen2.nullifications.clone();
+
+        let (vote, certificate, resolver, (shard_sender, shard_receiver)) = registrations
+            .remove(&participants[target])
+            .expect("target should be registered");
+        let relay = Arc::new(AuthenticatedShardTransport::new(
+            &participants[target],
+            shard_sender,
+            shard_receiver,
+        ));
+        for participant in participants.iter() {
+            relay.declare(participant);
+        }
+        relay.finalize_validators();
+
+        let (engine_gen2, _tx_mailbox, _activity_tx) = Engine::new(
+            context.with_label(&format!("v{target}_gen2")),
+            config,
+            schemes[target].clone(),
+            oracle.control(participants[target].clone()),
+            relay.clone(),
+            &participants[target],
+            reporter_gen2,
+        );
+        let _shard_transport = relay.start(context.clone());
+        let _engine_handle_gen2 = engine_gen2.start(vote, certificate, resolver);
+
+        // ── Phase 4: Let cluster settle with restarted node ───────────
+        context.sleep(Duration::from_secs(10)).await;
+
+        let gen2_count = gen2_finalizations.lock().unwrap().len();
+        println!(
+            "single-restart phase 4 (after restart): gen2 finalizations={gen2_count}"
+        );
+        assert!(
+            gen2_count > 0,
+            "single-restart phase 4: restarted node has no finalizations"
+        );
+
+        // ── Phase 5: Check that the restarted node can LEAD rounds ────
+        // Snapshot, wait, and verify all nodes progress at equal rates.
+        // If the target can't propose, its leader slots will be nullified,
+        // producing a lower finalization rate than peers.
+        let pre_phase5: Vec<usize> = tracking
+            .iter()
+            .enumerate()
+            .map(|(i, (f, _, _))| {
+                if i == target {
+                    gen2_finalizations.lock().unwrap().len()
+                } else {
+                    f.lock().unwrap().len()
+                }
+            })
+            .collect();
+
+        context.sleep(Duration::from_secs(8)).await;
+
+        let phase5_counts: Vec<usize> = tracking
+            .iter()
+            .enumerate()
+            .map(|(i, (f, _, _))| {
+                if i == target {
+                    gen2_finalizations.lock().unwrap().len()
+                } else {
+                    f.lock().unwrap().len()
+                }
+            })
+            .collect();
+        let phase5_gains: Vec<usize> = phase5_counts
+            .iter()
+            .zip(pre_phase5.iter())
+            .map(|(now, before)| now.saturating_sub(*before))
+            .collect();
+        let min_gain = *phase5_gains.iter().min().unwrap();
+        let max_gain = *phase5_gains.iter().max().unwrap();
+        println!(
+            "single-restart phase 5 (equal rate check): gains={phase5_gains:?}, spread={}",
+            max_gain - min_gain
+        );
+
+        // Every node should have gained new finalizations.
+        for (i, gain) in phase5_gains.iter().enumerate() {
+            assert!(
+                *gain > 0,
+                "single-restart phase 5: node {i} made no progress (gains={phase5_gains:?})"
+            );
+        }
+
+        // All nodes should progress at the same rate.  A spread >1 means
+        // some leader slots are being nullified — probably the restarted
+        // node failing to propose verifiable blocks.
+        assert!(
+            max_gain - min_gain <= 1,
+            "single-restart phase 5: nodes progressing at different rates, spread={} (gains={phase5_gains:?})",
+            max_gain - min_gain
+        );
+
+        // The restarted node should not have an unusual number of
+        // nullifications (which would indicate its proposals are being
+        // rejected).
+        let gen2_nullification_count = gen2_nullifications.lock().unwrap().len();
+        let total_gen2_views = gen2_count + gen2_nullification_count;
+        if total_gen2_views > 0 {
+            let nullification_ratio =
+                gen2_nullification_count as f64 / total_gen2_views as f64;
+            println!(
+                "single-restart: gen2 nullification ratio={nullification_ratio:.2} ({gen2_nullification_count}/{total_gen2_views})"
+            );
+            // After catching up, nullification ratio should be low.
+            // Allow up to 30% for the initial catch-up period.
+            assert!(
+                nullification_ratio < 0.30,
+                "single-restart: restarted node has excessive nullifications ({nullification_ratio:.2})"
+            );
+        }
     });
 }

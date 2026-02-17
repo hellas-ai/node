@@ -43,6 +43,7 @@ pub(crate) struct ApplicationConfig {
     pub page_cache_size: u16,
     pub page_cache_count: usize,
     pub verify_wait_timeout: Duration,
+    pub min_propose_delay: Duration,
 }
 
 impl Default for ApplicationConfig {
@@ -51,6 +52,7 @@ impl Default for ApplicationConfig {
             page_cache_size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
             page_cache_count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
             verify_wait_timeout: Duration::from_millis(500),
+            min_propose_delay: Duration::ZERO,
         }
     }
 }
@@ -275,6 +277,9 @@ where
     /// redundant round-trip to the worker.
     startup_root: Digest,
 
+    /// Optional delay applied before emitting a proposal (development throttle).
+    min_propose_delay: Duration,
+
     app_metrics: ApplicationMetrics,
 }
 
@@ -306,6 +311,7 @@ where
             partition_prefix,
             page_cache_config,
             config.verify_wait_timeout,
+            config.min_propose_delay,
         )
     }
 
@@ -317,6 +323,7 @@ where
         partition_prefix: String,
         page_cache_config: PageCacheConfig,
         verify_wait_timeout: Duration,
+        min_propose_delay: Duration,
     ) -> Self {
         let shard_rx = relay.register(me);
         let my_index = relay.validator_index(me).unwrap_or_else(|| {
@@ -360,6 +367,7 @@ where
             persistence_bridge_handle: None,
             inflight_persistence: None,
             startup_root: Digest::from([0u8; 32]),
+            min_propose_delay,
             app_metrics,
         }
     }
@@ -664,6 +672,16 @@ where
                 );
                 let _ = response.send(block);
             }
+            message @ AppMailboxReadWriteMessage::Propose { .. } if !self.min_propose_delay.is_zero() => {
+                self.app_metrics.propose_throttled_total.inc();
+                context.sleep(self.min_propose_delay).await;
+                let now = context.current().epoch_millis();
+                let relay = &self.relay;
+                let effects = self
+                    .core
+                    .on_message(message, now, &|sender| relay.validator_index(sender));
+                self.apply_core_effects(effects, now).await;
+            }
             core_message => {
                 let now = context.current().epoch_millis();
                 let relay = &self.relay;
@@ -723,7 +741,7 @@ where
                 "hydrating seen from recovered payloads"
             );
             for (digest, bytes) in recovered_payloads {
-                self.core.note_payload_seen(digest, bytes);
+                self.core.note_payload_seen(digest, bytes, 0);
             }
         }
 
@@ -788,7 +806,7 @@ mod tests {
     };
     use super::*;
     use crate::execution::store::UtxoDb;
-    use hellas_types::{Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
+    use hellas_types::{Address, Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
     use crate::shard::mock::MockShardTransport;
     use bytes::Bytes;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
@@ -956,7 +974,7 @@ mod tests {
         let epoch = Epoch::new(1);
         let genesis = mailbox.genesis(epoch).await;
 
-        let tx = Transaction::transfer(sender, genesis_object_id(0), recipient_pk.clone(), 1);
+        let tx = Transaction::transfer(sender, genesis_object_id(0), hellas_types::Address::from(recipient_pk.clone()), 1);
         mailbox.submit_tx(tx).await;
 
         let sender_pk = sender.public_key();
@@ -1001,7 +1019,7 @@ mod tests {
                 anchor_root,
             );
             let now = timestamp.saturating_add(age);
-            let block = SeenBlock::decode(contents).expect("valid encoding");
+            let block = SeenBlock::decode(contents, 0).expect("valid encoding");
             prop_assert!(block.into_validated(
                 round,
                 parent,
@@ -1037,7 +1055,7 @@ mod tests {
 
             // Digest mismatch: mutated bytes still decode, but digest won't match
             let mutated = Bytes::from(mutate_byte(contents.to_vec(), index));
-            if let Some(block) = SeenBlock::decode(mutated) {
+            if let Some(block) = SeenBlock::decode(mutated, 0) {
                 assert!(matches!(
                     block.into_validated(round, parent, payload, now, 0, ar),
                     Err(PayloadValidationError::DigestMismatch { .. })
@@ -1046,7 +1064,7 @@ mod tests {
             // (if decode fails, that's also a valid rejection)
 
             // Round mismatch
-            let block = SeenBlock::decode(contents.clone()).expect("valid encoding");
+            let block = SeenBlock::decode(contents.clone(), 0).expect("valid encoding");
             let wrong_round = make_round(epoch.wrapping_add(1), view);
             assert!(matches!(
                 block.into_validated(wrong_round, parent, payload, now, 0, ar),
@@ -1054,7 +1072,7 @@ mod tests {
             ));
 
             // Parent mismatch
-            let block = SeenBlock::decode(contents.clone()).expect("valid encoding");
+            let block = SeenBlock::decode(contents.clone(), 0).expect("valid encoding");
             let mut wrong_parent = parent.0;
             wrong_parent[0] ^= 0x01;
             assert!(matches!(
@@ -1073,7 +1091,7 @@ mod tests {
                 &[],
             );
             let future_payload = payload_digest(&future_contents);
-            let block = SeenBlock::decode(future_contents).expect("valid encoding");
+            let block = SeenBlock::decode(future_contents, 0).expect("valid encoding");
             assert!(matches!(
                 block.into_validated(round, parent, future_payload, timestamp, 0, ar),
                 Err(PayloadValidationError::FutureTimestamp { .. })
@@ -1109,7 +1127,7 @@ mod tests {
                 &[],
             );
             let regressed_payload = payload_digest(&regressed_contents);
-            let block = SeenBlock::decode(regressed_contents).expect("valid encoding");
+            let block = SeenBlock::decode(regressed_contents, 0).expect("valid encoding");
             assert!(matches!(
                 block.into_validated(
                     round,
@@ -1132,7 +1150,7 @@ mod tests {
                 &[],
             );
             let payload = payload_digest(&contents);
-            let block = SeenBlock::decode(contents).expect("valid encoding");
+            let block = SeenBlock::decode(contents, 0).expect("valid encoding");
             prop_assert!(block.into_validated(
                 round,
                 parent_digest,
@@ -1147,14 +1165,14 @@ mod tests {
     #[test_log::test]
     fn invalid_encoding_is_rejected() {
         let contents = Bytes::from_static(b"not-a-valid-payload");
-        assert!(SeenBlock::decode(contents).is_none());
+        assert!(SeenBlock::decode(contents, 0).is_none());
     }
 
     #[test_log::test]
     fn genesis_has_zero_timestamp() {
         let epoch = Epoch::new(1);
         let payload = genesis_payload(epoch);
-        let block = SeenBlock::decode(payload).expect("genesis should decode");
+        let block = SeenBlock::decode(payload, 0).expect("genesis should decode");
         assert_eq!(block.data().timestamp, 0);
     }
 
@@ -1215,7 +1233,7 @@ mod tests {
             assert_coin_proof(
                 genesis_object,
                 Coin {
-                    owner: key,
+                    owner: Address::from(key),
                     value: GENESIS_BALANCE,
                 },
                 &proof,
@@ -1239,7 +1257,7 @@ mod tests {
             let genesis_object = genesis_object_id(0);
             let (root_a, proof_a) = fetch_root_and_proof(&mailbox_a, genesis_object).await;
             let expected_coin = Coin {
-                owner: key.clone(),
+                owner: Address::from(key.clone()),
                 value: GENESIS_BALANCE,
             };
             assert_coin_proof(genesis_object, expected_coin.clone(), &proof_a, root_a);
@@ -1426,7 +1444,7 @@ mod tests {
                 let delete_id = genesis_object_id(round - 1);
                 let create_id = genesis_object_id(round + 100);
                 let coin = Coin {
-                    owner: validators[0].clone(),
+                    owner: Address::from(validators[0].clone()),
                     value: GENESIS_BALANCE + u64::from(round),
                 };
                 let batch = vec![(delete_id, None), (create_id, Some(coin))];
@@ -1490,7 +1508,7 @@ mod tests {
 
             // db_a commits with metadata, db_b commits without.
             let meta = Some(Coin {
-                owner: validators[0].clone(),
+                owner: Address::from(validators[0].clone()),
                 value: 42,
             });
 
@@ -1716,7 +1734,7 @@ mod tests {
             let delete_id = genesis_object_id(0);
             let create_id = genesis_object_id(200);
             let coin = Coin {
-                owner: validators[1].clone(),
+                owner: Address::from(validators[1].clone()),
                 value: 42,
             };
             let batch = vec![(delete_id, None), (create_id, Some(coin))];
@@ -1766,7 +1784,7 @@ mod tests {
             );
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
-            let lc = LocalLightClient::new(mailbox);
+            let lc = LocalLightClient::new(mailbox, vec![]);
 
             // State root should be available after genesis.
             let root = lc
@@ -1793,7 +1811,7 @@ mod tests {
                     &mut hasher,
                     genesis_object,
                     Coin {
-                        owner: key,
+                        owner: Address::from(key),
                         value: GENESIS_BALANCE,
                     },
                     &proof,
@@ -1808,7 +1826,6 @@ mod tests {
         use crate::rpc::{self, LocalLightClient};
         use commonware_runtime::tokio as cw_tokio;
         use hellas_rpc::client::RemoteLightClient;
-        use hellas_rpc::server::LightClientGrpcServer;
         use hellas_types::rpc::LightClient;
 
         let tmp_dir = std::env::temp_dir().join(format!(
@@ -1838,29 +1855,33 @@ mod tests {
             let (_handle, mut mailbox) = app.start();
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
-            let light_client = LocalLightClient::new(mailbox);
+            let light_client = LocalLightClient::new(mailbox, vec![]);
 
-            // Start gRPC server on a random port (WebSocket transport).
+            // Start ws-mux server on a random port.
             let (activity_tx, _) = tokio::sync::broadcast::channel::<hellas_types::rpc::ConsensusActivity>(16);
-            let svc = LightClientGrpcServer::new(light_client, activity_tx).into_service();
+            let svc = hellas_rpc::mux::MuxServiceDispatch::new(
+                crate::rpc::LightClientGrpcServer::new(light_client, activity_tx)
+                    .into_service(),
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("failed to bind");
             let addr = listener.local_addr().expect("should have local addr");
-            let incoming = hellas_rpc::ws::ws_incoming(listener);
 
             ::tokio::spawn(async move {
-                tonic::transport::Server::builder()
-                    .add_service(svc)
-                    .serve_with_incoming(incoming)
-                    .await
-                    .unwrap();
+                use futures::StreamExt;
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = tokio_tungstenite::accept_async(tcp).await.expect("ws handshake");
+                let (write, read) = ws.split();
+                let sink = ws_mux::NativeWsSink::new(write);
+                let recv = ws_mux::NativeWsRecv::new(read);
+                ws_mux::serve(svc, recv, sink).await.expect("serve");
             });
 
-            // Connect RemoteLightClient and assert through gRPC.
-            let client = RemoteLightClient::connect(format!("http://{addr}"))
+            // Connect RemoteLightClient via ws-mux.
+            let client = RemoteLightClient::connect(format!("ws://{addr}"))
                 .await
-                .expect("failed to connect to grpc server");
+                .expect("failed to connect to ws-mux server");
 
             let root = client
                 .get_state_root()
@@ -1884,7 +1905,7 @@ mod tests {
                     &mut hasher,
                     genesis_object,
                     Coin {
-                        owner: key,
+                        owner: Address::from(key),
                         value: GENESIS_BALANCE,
                     },
                     &proof,

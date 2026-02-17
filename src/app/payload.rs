@@ -5,7 +5,7 @@ use commonware_codec::{ReadExt, ReadRangeExt, Write};
 use commonware_consensus::types::{Epoch, Round, View};
 use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use hellas_types::Context;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use thiserror::Error;
 
 /// Milliseconds in the future to allow for block timestamps.
@@ -37,6 +37,7 @@ pub(super) struct BlockData {
     pub round: Round,
     pub parent: Digest,
     pub timestamp: u64,
+    pub received_at_ms: u64,
     pub anchor_payload: Digest,
     pub anchor_root: Digest,
     pub txs: Vec<Transaction>,
@@ -52,7 +53,7 @@ pub(super) enum SeenBlock {
 
 impl SeenBlock {
     /// Decode raw payload bytes. Returns `None` if the bytes are malformed.
-    pub fn decode(bytes: Bytes) -> Option<Self> {
+    pub fn decode(bytes: Bytes, received_at_ms: u64) -> Option<Self> {
         let mut reader = bytes.clone();
         let round = Round::read(&mut reader).ok()?;
         let parent = Digest::read(&mut reader).ok()?;
@@ -68,6 +69,7 @@ impl SeenBlock {
             round,
             parent,
             timestamp,
+            received_at_ms,
             anchor_payload,
             anchor_root,
             txs,
@@ -185,7 +187,7 @@ pub(super) fn payload_digest(contents: &Bytes) -> Digest {
 }
 
 pub(super) fn missing_dependency_or_execution(
-    seen: &HashMap<Digest, SeenBlock>,
+    seen: &IndexMap<Digest, SeenBlock>,
     speculative_store: &SpeculativeExecutionStore,
     context: &Context,
     payload: Digest,
@@ -197,7 +199,7 @@ pub(super) fn missing_dependency_or_execution(
 }
 
 pub(super) fn first_missing_execution_dependency(
-    seen: &HashMap<Digest, SeenBlock>,
+    seen: &IndexMap<Digest, SeenBlock>,
     speculative_store: &SpeculativeExecutionStore,
     mut current: Digest,
 ) -> Option<Digest> {

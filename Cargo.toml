@@ -20,7 +20,7 @@ commonware-actor = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-coding = { workspace = true }
 commonware-consensus = { workspace = true }
-commonware-cryptography = { workspace = true }
+commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-macros = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-parallel = { workspace = true }
@@ -29,9 +29,10 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-hellas-rpc = { workspace = true, features = ["client", "server"] }
+hellas-rpc = { workspace = true, features = ["server", "mux-client", "mux-server"] }
 hellas-types = { workspace = true, features = ["consensus"] }
 hex = { workspace = true }
+http = "1"
 indexmap = { workspace = true }
 loom = { version = "0.7", optional = true }
 opentelemetry = "0.31"
@@ -44,7 +45,10 @@ rand_core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.26"
 tonic = { version = "0.14", features = ["server", "channel"] }
+ws-mux = { path = "../../ws-mux", features = ["native-client", "server"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
@@ -54,7 +58,7 @@ tracing-opentelemetry = { workspace = true }
 commonware-consensus = { workspace = true, features = ["fuzz", "mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 criterion = "0.7"
-hellas-rpc = { workspace = true, features = ["client", "server"] }
+hellas-rpc = { workspace = true, features = ["server", "mux-client"] }
 proptest = "1.6"
 test-log = { version = "0.2", features = ["trace"] }
 tonic = { version = "0.14", features = ["server", "channel", "router"] }

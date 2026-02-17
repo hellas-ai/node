@@ -43,6 +43,10 @@ impl FinalizationTracker {
         self.finalized_payloads.contains(&payload)
     }
 
+    pub(crate) fn finalized_digests(&self) -> &IndexSet<Digest> {
+        &self.finalized_payloads
+    }
+
     pub(crate) fn next_unpersisted_finalization(&self) -> Option<(Digest, &FinalizationDiffs)> {
         self.finalized_payloads
             .iter()
@@ -88,7 +92,7 @@ mod tests {
             created: vec![(
                 Digest::from([seed; 32]),
                 Coin {
-                    owner: PrivateKey::from_seed(u64::from(seed)).public_key(),
+                    owner: hellas_types::Address::from(PrivateKey::from_seed(u64::from(seed)).public_key()),
                     value: u64::from(seed),
                 },
             )],
