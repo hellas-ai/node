@@ -45,7 +45,7 @@
         };
         auditable = false;
         buildInputs = with pkgs; [openssl];
-        nativeBuildInputs = with pkgs; [pkg-config protobuf];
+        nativeBuildInputs = with pkgs; [pkg-config protobuf llvmPackages.lld];
         checkInputs = with pkgs; [cargo-deny cargo-outdated];
         separateDebugInfo = true;
         meta.mainProgram = "hellas-cli";
@@ -238,6 +238,13 @@
           done
         '';
       });
+
+      e2eTest = pkgs.writeShellApplication {
+        name = "e2e-test";
+        runtimeInputs = [server pkgs.coreutils pkgs.gnugrep pkgs.gawk];
+        text = builtins.readFile ./tests/e2e.sh;
+      };
+
       catgradShells = catgrad.devShells.${system} or {};
       catgradCudaShell =
         if catgradShells ? cuda
@@ -251,12 +258,17 @@
         inherit cli server serverCuda;
         "server-cuda" = serverCuda;
         "dep-hygiene" = depHygiene;
+        "e2e-test" = e2eTest;
       };
 
       apps = {
         "dep-hygiene" = {
           type = "app";
           program = "${depHygiene}/bin/dep-hygiene";
+        };
+        "e2e" = {
+          type = "app";
+          program = "${e2eTest}/bin/e2e-test";
         };
       };
 
@@ -273,6 +285,7 @@
           cargo-watch
           gh
           depHygiene
+          llvmPackages.lld
         ];
       };
 
@@ -281,6 +294,7 @@
           self.devShells.${system}.default
           catgradCudaShell
         ];
+        LD_LIBRARY_PATH = "${catgradCudaEnv.runtimeLibraryPath}:${catgradCudaEnv.driverLink}/lib";
       };
     })
     // {
@@ -292,7 +306,13 @@
       }: let
         inherit (lib) mkEnableOption mkIf mkOption types concatStringsSep;
         cfg = config.services.hellas;
-        cliArgs = concatStringsSep " " (["serve"] ++ cfg.extraArgs);
+        cliArgs = concatStringsSep " " (
+          ["serve"]
+          ++ lib.optionals (cfg.port != null) ["--port" (toString cfg.port)]
+          ++ lib.optionals (cfg.downloadPolicy != null) ["--download-policy" cfg.downloadPolicy]
+          ++ lib.optionals (cfg.executePolicy != null) ["--execute-policy" cfg.executePolicy]
+          ++ cfg.extraArgs
+        );
       in {
         options.services.hellas = {
           enable = mkEnableOption "Hellas node server";
@@ -301,20 +321,35 @@
             default = self.packages.${pkgs.stdenv.hostPlatform.system}.server;
             description = "Package providing the hellas CLI (with serve feature).";
           };
-          discovery = mkOption {
-            type = types.bool;
-            default = true;
-            description = "Deprecated option: discovery is always enabled by `hellas-cli serve`.";
-          };
           openFirewall = mkOption {
             type = types.bool;
             default = false;
             description = "Open firewall port for the hellas node.";
           };
           port = mkOption {
-            type = types.port;
-            default = 31145;
-            description = "Port for the hellas node to listen on.";
+            type = types.nullOr types.port;
+            default = null;
+            description = "Port for the hellas node to listen on. Null (default) auto-selects.";
+          };
+          downloadPolicy = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = ''
+              Model download policy.
+              "eager" (default) downloads any requested model,
+              "skip" never downloads (cache-only),
+              "allow(pattern,...)" downloads only matching HF model patterns.
+            '';
+          };
+          executePolicy = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = ''
+              Graph execution policy.
+              "eager" (default) executes any graph,
+              "skip" refuses all executions,
+              "allow(hf/pattern,...,graph/pattern,...)" executes only matching.
+            '';
           };
           extraArgs = mkOption {
             type = types.listOf types.str;
@@ -341,7 +376,7 @@
             };
           };
 
-          networking.firewall = mkIf cfg.openFirewall {
+          networking.firewall = mkIf (cfg.openFirewall && cfg.port != null) {
             allowedUDPPorts = [cfg.port];
           };
         };

@@ -37,6 +37,12 @@ cargo run -- execute run -p hey bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916
 Hello! How can I help you today?<|im_end|>%
 ```
 
+Monitor discovery and peer health:
+
+```bash
+cargo run -- monitor --timeout-secs 30
+```
+
 ## Dependency hygiene (CI + local)
 
 Run the shared maintenance checks from flake:

@@ -332,8 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_and_execute() {
-        let handle =
-            Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
+        let handle = Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
 
         // Get quote
         let quote = handle
@@ -357,8 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_with_invalid_quote_fails() {
-        let handle =
-            Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
+        let handle = Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
 
         let result = handle
             .execute(ExecuteRequest {

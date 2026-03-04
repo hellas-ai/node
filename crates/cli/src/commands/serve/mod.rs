@@ -5,6 +5,7 @@ use tokio::time::{timeout, Duration};
 use tracing::warn;
 
 mod node;
+mod peer_tracker;
 
 pub async fn run(
     port: Option<u16>,
