@@ -4,7 +4,7 @@
 //! [`LightClient`] trait from `hellas_types::rpc`. Proof and finalization
 //! responses are encoded to opaque bytes before returning.
 
-use crate::app::{ProofResponse, AppMailbox};
+use crate::app::{AppMailbox, ProofResponse};
 use bytes::BytesMut;
 use commonware_codec::{Read as _, ReadExt as _, Write as _};
 use commonware_cryptography::sha256::Digest;
@@ -17,6 +17,7 @@ use hellas_types::rpc::{
     QueryError,
 };
 use hellas_types::{Coin, DecodeExt, Encode, ObjectId, PublicKey, Signature, Transaction};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -61,7 +62,10 @@ pub struct LocalLightClient {
 impl LocalLightClient {
     /// Wraps an existing [`AppMailbox`] as a light-client query handle.
     pub fn new(mailbox: AppMailbox, validators: Vec<String>) -> Self {
-        Self { mailbox, validators }
+        Self {
+            mailbox,
+            validators,
+        }
     }
 }
 
@@ -73,10 +77,7 @@ impl LightClient for LocalLightClient {
             .map_err(|_| QueryError::ChannelClosed)
     }
 
-    async fn get_proof(
-        &self,
-        object_id: ObjectId,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    async fn get_proof(&self, object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
         let proof = self
             .mailbox
             .get_proof(object_id)
@@ -93,10 +94,7 @@ impl LightClient for LocalLightClient {
         Ok(self.mailbox.get_coin(payload, object_id).await)
     }
 
-    async fn get_finalization(
-        &self,
-        payload: Digest,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
         let cert = self
             .mailbox
             .get_finalization(payload)
@@ -270,6 +268,9 @@ fn notarize_info_to_proto(n: NotarizeInfo) -> NotarizeEvent {
 }
 
 pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
+    let validator_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u64, |d| d.as_millis() as u64);
     let event = match activity {
         ConsensusActivity::Notarize {
             proposal,
@@ -327,7 +328,10 @@ pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent
             })
         }
     };
-    ActivityEvent { event: Some(event) }
+    ActivityEvent {
+        event: Some(event),
+        relay_timestamps: vec![validator_ts],
+    }
 }
 
 fn parse_digest(bytes: &[u8], field: &str) -> Result<Digest, tonic::Status> {
