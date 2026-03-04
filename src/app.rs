@@ -377,6 +377,9 @@ where
             CoreEffect::Coin { response, coin } => {
                 let _ = response.send(coin);
             }
+            CoreEffect::CoinsByOwner { response, coins } => {
+                let _ = response.send(coins);
+            }
         }
     }
 

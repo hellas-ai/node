@@ -5,8 +5,8 @@ use super::payload::{
     missing_dependency_or_execution, payload_digest,
 };
 use crate::execution::{
-    ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState, SpeculativeExecutionStore,
-    execute_block, execute_transaction, genesis_state,
+    CoinIndex, ExecutionError, FinalizationDiffs, FinalizationTracker, ObjectState,
+    SpeculativeExecutionStore, execute_block, execute_transaction, genesis_state,
 };
 use crate::gauged::{GaugedIndexMap, GaugedIndexSet, GaugedVecDeque};
 use crate::shard::WireShardMessage;
@@ -57,6 +57,10 @@ pub(super) enum CoreEffect {
         response: oneshot::Sender<Option<Coin>>,
         coin: Option<Coin>,
     },
+    CoinsByOwner {
+        response: oneshot::Sender<Vec<(ObjectId, u64)>>,
+        coins: Vec<(ObjectId, u64)>,
+    },
 }
 
 pub(super) enum NetworkEffect {
@@ -105,6 +109,7 @@ pub(super) struct AppCore {
     strategy: Rayon,
     shard_recoverer: ShardRecoverer<Rayon>,
     min_drift_per_leader: HashMap<PublicKey, i64>,
+    coin_index: CoinIndex,
     metrics: CoreMetrics,
 }
 
@@ -160,6 +165,7 @@ impl AppCore {
             strategy: strategy.clone(),
             shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy, context),
             min_drift_per_leader: HashMap::new(),
+            coin_index: CoinIndex::new(),
             metrics,
         };
         core.metrics.waiter_keys.set(0);
@@ -223,6 +229,12 @@ impl AppCore {
                 effects
                     .replies
                     .push_back(CoreEffect::Coin { response, coin });
+            }
+            AppMailboxReadWriteMessage::GetCoinsByOwner { owner, response } => {
+                let coins = self.coins_by_owner(&owner);
+                effects
+                    .replies
+                    .push_back(CoreEffect::CoinsByOwner { response, coins });
             }
             AppMailboxReadWriteMessage::Genesis { .. }
             | AppMailboxReadWriteMessage::GetStateRoot { .. }
@@ -334,6 +346,7 @@ impl AppCore {
             created: genesis_execution.created,
             deleted: genesis_execution.deleted,
         };
+        self.coin_index.apply_diffs(&diffs);
         self.speculative_store.insert_state_with_diffs(
             digest,
             Digest::from([0u8; 32]),
@@ -1046,6 +1059,9 @@ impl AppCore {
                 "finalized payload had no execution diffs; persistence queue will skip it"
             );
         }
+        if let Some(ref diffs) = diffs {
+            self.coin_index.apply_diffs(diffs);
+        }
         self.finalized.observe_finalized(payload, diffs);
 
         if let Some(block) = self.seen.get(&payload) {
@@ -1225,6 +1241,10 @@ impl AppCore {
         self.speculative_store
             .execution(payload)
             .and_then(|state| state.get(&object).cloned())
+    }
+
+    pub(super) fn coins_by_owner(&self, owner: &Address) -> Vec<(ObjectId, u64)> {
+        self.coin_index.coins_by_owner(owner)
     }
 
     fn persisted_root(&self, payload: Digest) -> Option<Digest> {

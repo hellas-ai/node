@@ -122,6 +122,13 @@ impl LightClient for LocalLightClient {
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
         Ok(self.validators.clone())
     }
+
+    async fn get_coins_by_owner(
+        &self,
+        owner: hellas_types::Address,
+    ) -> Result<Vec<(ObjectId, u64)>, QueryError> {
+        Ok(self.mailbox.get_coins_by_owner(owner).await)
+    }
 }
 
 /// gRPC server that wraps a local [`LightClient`] implementation.
@@ -250,6 +257,25 @@ impl<L: LightClient> light_client_server::LightClient for LightClientGrpcServer<
     ) -> Result<tonic::Response<GetValidatorsResponse>, tonic::Status> {
         let validators = self.inner.get_validators().await?;
         Ok(tonic::Response::new(GetValidatorsResponse { validators }))
+    }
+
+    async fn get_coins_by_owner(
+        &self,
+        request: tonic::Request<GetCoinsByOwnerRequest>,
+    ) -> Result<tonic::Response<GetCoinsByOwnerResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let address = parse_address(&req.owner, "owner")?;
+        let coins = self.inner.get_coins_by_owner(address).await?;
+        let entries = coins
+            .into_iter()
+            .map(|(object_id, value)| CoinEntry {
+                object_id: object_id.to_vec(),
+                value,
+            })
+            .collect();
+        Ok(tonic::Response::new(GetCoinsByOwnerResponse {
+            coins: entries,
+        }))
     }
 }
 

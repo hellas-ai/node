@@ -1,6 +1,6 @@
 #![allow(private_interfaces)]
 
-use hellas_types::{Coin, ObjectId, Transaction};
+use hellas_types::{Address, Coin, ObjectId, Transaction};
 use hellas_types::rpc::LatestBlock;
 use crate::shard::protocol::ShardMessage;
 
@@ -71,6 +71,9 @@ ingress! {
         payload: Digest,
         object: ObjectId,
     } -> Option<Coin>;
+    ask read_write GetCoinsByOwner {
+        owner: Address,
+    } -> Vec<(ObjectId, u64)>;
     pub ask read_write GetStateRoot -> Option<Digest>;
     pub ask read_write GetProof { object: ObjectId } -> Option<ProofResponse>;
     pub ask read_write GetFinalization { payload: Digest } -> Option<FinalizationResponse>;
@@ -89,6 +92,7 @@ impl AppMailboxReadWriteMessage {
             Self::FinalizationEvent { .. } => "finalization_event",
             Self::Persisted { .. } => "persisted",
             Self::GetCoin { .. } => "get_coin",
+            Self::GetCoinsByOwner { .. } => "get_coins_by_owner",
             Self::GetStateRoot { .. } => "get_state_root",
             Self::GetProof { .. } => "get_proof",
             Self::GetFinalization { .. } => "get_finalization",
@@ -122,6 +126,13 @@ impl AppMailbox {
             .ask(GetCoin { payload, object })
             .await
             .unwrap_or(None)
+    }
+
+    pub async fn get_coins_by_owner(&self, owner: Address) -> Vec<(ObjectId, u64)> {
+        self.0
+            .ask(GetCoinsByOwner { owner })
+            .await
+            .unwrap_or_default()
     }
 }
 
