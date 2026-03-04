@@ -251,8 +251,14 @@ mod tests {
 
     #[test]
     fn glob_middle_star() {
-        assert!(glob_matches("meta-llama/Llama*8B", "meta-llama/Llama-3.1-8B"));
-        assert!(!glob_matches("meta-llama/Llama*8B", "meta-llama/Llama-3.1-70B"));
+        assert!(glob_matches(
+            "meta-llama/Llama*8B",
+            "meta-llama/Llama-3.1-8B"
+        ));
+        assert!(!glob_matches(
+            "meta-llama/Llama*8B",
+            "meta-llama/Llama-3.1-70B"
+        ));
     }
 
     #[test]

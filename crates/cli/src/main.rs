@@ -63,6 +63,15 @@ enum Commands {
         #[arg(long = "backup-quotes", default_value_t = 2)]
         backup_quotes: usize,
     },
+    /// Discover peers and log network events
+    Monitor {
+        /// Stop monitoring after N seconds (default: run until Ctrl+C)
+        #[arg(long = "timeout-secs")]
+        timeout_secs: Option<u64>,
+        /// Disable peer interrogation RPCs (health + known peers)
+        #[arg(long = "no-interrogate", default_value_t = false)]
+        no_interrogate: bool,
+    },
 }
 
 #[tokio::main]
@@ -93,6 +102,10 @@ async fn main() {
             retries,
             backup_quotes,
         } => commands::execute::run(node_id, model, prompt, max_seq, retries, backup_quotes).await,
+        Commands::Monitor {
+            timeout_secs,
+            no_interrogate,
+        } => commands::monitor::run(timeout_secs, !no_interrogate).await,
     };
 
     if let Err(err) = result {

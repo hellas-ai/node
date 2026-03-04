@@ -347,9 +347,7 @@ fn ensure_default_ready_disposition(
         ));
     }
 
-    state
-        .entries
-        .insert(model_id.clone(), Entry::default());
+    state.entries.insert(model_id.clone(), Entry::default());
     state.queue.push_back(model_id.clone());
     maybe_start_next(state, job_tx.clone());
     EnsureDisposition::Queued
