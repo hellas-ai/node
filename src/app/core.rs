@@ -435,15 +435,31 @@ impl AppCore {
             );
         }
 
-        let digest =
-            self.propose_with_txs(context, now, parent, &txs, resulting_state, resulting_diffs);
+        let proposal_timestamp = self.proposal_timestamp(parent, now);
+        let digest = self.propose_with_txs(
+            context,
+            proposal_timestamp,
+            parent,
+            &txs,
+            resulting_state,
+            resulting_diffs,
+        );
         tracing::Span::current().record("payload", tracing::field::debug(&digest));
         digest
     }
 
     // Proposal assembly -------------------------------------------------------
     fn propose_empty(&mut self, context: &Context, now: u64) -> Digest {
-        self.propose_with_txs(context, now, context.parent.1, &[], None, None)
+        let parent = context.parent.1;
+        let timestamp = self.proposal_timestamp(parent, now);
+        self.propose_with_txs(context, timestamp, parent, &[], None, None)
+    }
+
+    /// Ensure locally proposed payload timestamps never regress behind a known
+    /// parent timestamp, even if this leader's wall clock is behind.
+    fn proposal_timestamp(&self, parent: Digest, now: u64) -> u64 {
+        let parent_timestamp = self.seen.get(&parent).map(|block| block.data().timestamp);
+        parent_timestamp.map_or(now, |timestamp| now.max(timestamp))
     }
 
     fn propose_with_txs(
@@ -1407,6 +1423,67 @@ mod tests {
             let data = block.data();
             assert_eq!(data.anchor_payload, genesis);
             assert_eq!(data.anchor_root, genesis_root);
+        });
+    }
+
+    #[test_log::test]
+    fn proposal_timestamp_is_clamped_to_parent_timestamp() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+
+        runner.start(|mut context| async move {
+            let Fixture { participants, .. }: Fixture<hellas_types::Scheme> =
+                minimmit_ed25519::fixture(&mut context, b"core-proposal-ts-clamp", 6);
+
+            let me = participants[0].clone();
+            let strategy = crate::coding_strategy();
+            let mut core = AppCore::new(
+                &me,
+                participants.clone(),
+                Vec::new(),
+                0,
+                coding_config(6),
+                TEST_WAIT_TIMEOUT_MS,
+                strategy,
+                test_metrics(&context, "core_proposal_ts_clamp"),
+                &context,
+            );
+
+            let epoch = Epoch::new(1);
+            let genesis = core.genesis(epoch);
+            core.note_persisted_root(genesis, Digest::from([13u8; 32]));
+
+            let first_context = Context {
+                round: Round::new(epoch, View::new(1)),
+                leader: participants[0].clone(),
+                parent: (View::zero(), genesis),
+            };
+            let mut first_effects = CoreEffects::new();
+            let first_payload =
+                core.propose_with_effects(&first_context, 1_000, &mut first_effects);
+            let first_timestamp = core
+                .seen
+                .get(&first_payload)
+                .expect("first payload should exist")
+                .data()
+                .timestamp;
+            assert_eq!(first_timestamp, 1_000);
+
+            let second_context = Context {
+                round: Round::new(epoch, View::new(2)),
+                leader: participants[1].clone(),
+                parent: (View::new(1), first_payload),
+            };
+            let mut second_effects = CoreEffects::new();
+            let second_payload =
+                core.propose_with_effects(&second_context, 900, &mut second_effects);
+            let second_timestamp = core
+                .seen
+                .get(&second_payload)
+                .expect("second payload should exist")
+                .data()
+                .timestamp;
+
+            assert_eq!(second_timestamp, first_timestamp);
         });
     }
 

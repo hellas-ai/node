@@ -335,6 +335,7 @@ pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent
     ActivityEvent {
         event: Some(event),
         relay_timestamps: vec![validator_ts],
+        edge_colo: String::new(),
     }
 }
 
