@@ -10,13 +10,7 @@ use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_pr
 use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
-use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 use prometheus_client::metrics::gauge::Gauge;
-use opentelemetry_otlp::{ExporterBuildError, SpanExporter, WithExportConfig};
-use opentelemetry_sdk::{
-    Resource,
-    trace::{BatchSpanProcessor, Sampler, SdkTracerProvider, Tracer},
-};
 use rand::RngCore;
 use std::io;
 use std::sync::atomic::AtomicI64;
@@ -24,7 +18,6 @@ use std::time::{Duration, Instant};
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
 use thiserror::Error;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
@@ -35,7 +28,6 @@ const DEFAULT_OTLP_SAMPLE_RATE: f64 = 1.0;
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const OTLP_SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
 const OTLP_SAMPLE_RATE_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
-const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
@@ -51,14 +43,10 @@ enum ValidatorError {
     InvalidSetup(String),
     #[error("failed to serialize config")]
     SerializeConfig(#[from] toml::ser::Error),
-    #[error("failed to parse log directive")]
-    InvalidLogDirective(#[from] tracing_subscriber::filter::ParseError),
     #[error("failed to read config file")]
     ReadConfig(#[from] io::Error),
     #[error("failed to parse config file")]
     ParseConfig(#[from] toml::de::Error),
-    #[error("failed to initialize OTLP trace exporter: {0}")]
-    TraceExport(String),
     #[error("invalid node configuration")]
     Config(#[from] ConfigError),
     #[error("invalid listen address")]
@@ -67,8 +55,6 @@ enum ValidatorError {
     Scheme(String),
     #[error("storage directory is not valid UTF-8: {0}")]
     NonUtf8StorageDirectory(PathBuf),
-    #[error("failed to create log file: {0}")]
-    LogFile(io::Error),
 }
 
 #[derive(Parser)]
@@ -110,7 +96,9 @@ enum Command {
         /// Path to the TOML config file
         #[arg(long)]
         config: PathBuf,
-        /// Write structured JSON logs (with span context) to this file
+        /// Enable structured JSON logs on stderr.
+        ///
+        /// A value is accepted for backward CLI compatibility but not used.
         #[arg(long)]
         log_json: Option<PathBuf>,
         /// WebSocket gRPC bind address (e.g. [::]:31130)
@@ -208,8 +196,21 @@ fn main() {
             addresses,
             ws_push,
             min_propose_ms,
-        } => setup(validators, node, start_port, seed, addresses, ws_push, min_propose_ms),
-        Command::Run { config, log_json, ws_bind, ws_push } => run(config, log_json, ws_bind, ws_push),
+        } => setup(
+            validators,
+            node,
+            start_port,
+            seed,
+            addresses,
+            ws_push,
+            min_propose_ms,
+        ),
+        Command::Run {
+            config,
+            log_json,
+            ws_bind,
+            ws_push,
+        } => run(config, log_json, ws_bind, ws_push),
         Command::Query { rpc, query } => do_query(rpc, query),
         Command::Wallet { wallet } => do_wallet(wallet),
     };
@@ -583,119 +584,6 @@ fn otlp_config_from_env() -> Option<tokio::tracing::Config> {
     })
 }
 
-fn local_hostname() -> Option<String> {
-    env_non_empty("HOSTNAME").or_else(|| {
-        std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .and_then(|value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-    })
-}
-
-fn build_otlp_tracer(
-    cfg: tokio::tracing::Config,
-    validator_pubkey: &str,
-) -> Result<(Tracer, SdkTracerProvider), ExporterBuildError> {
-    let exporter = SpanExporter::builder()
-        .with_http()
-        .with_endpoint(cfg.endpoint.clone())
-        .with_timeout(OTLP_EXPORT_TIMEOUT)
-        .build()?;
-    let batch_processor = BatchSpanProcessor::builder(exporter).build();
-
-    let mut attributes = Vec::with_capacity(5);
-    attributes.push(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")));
-    attributes.push(KeyValue::new(
-        "service.git_rev",
-        option_env!("GIT_REV").unwrap_or("unknown"),
-    ));
-    attributes.push(KeyValue::new(
-        "hellas.validator.public_key",
-        validator_pubkey.to_string(),
-    ));
-    attributes.push(KeyValue::new(
-        "service.instance.id",
-        format!(
-            "validator-{}",
-            &validator_pubkey[..validator_pubkey.len().min(16)]
-        ),
-    ));
-    if let Some(hostname) = local_hostname() {
-        attributes.push(KeyValue::new("host.name", hostname));
-    }
-
-    let resource = Resource::builder_empty()
-        .with_service_name(cfg.name.clone())
-        .with_attributes(attributes)
-        .build();
-
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_span_processor(batch_processor)
-        .with_resource(resource)
-        .with_sampler(Sampler::TraceIdRatioBased(cfg.rate))
-        .build();
-    let tracer = tracer_provider.tracer(cfg.name);
-    Ok((tracer, tracer_provider))
-}
-
-fn init_tracing(
-    validator_pubkey: &str,
-    log_json: Option<&std::path::Path>,
-) -> Result<Option<SdkTracerProvider>, ValidatorError> {
-    let log_directive = "info".parse()?;
-    let env_filter = EnvFilter::from_default_env().add_directive(log_directive);
-    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
-
-    let file_layer = match log_json {
-        Some(path) => {
-            let file = std::fs::File::create(path).map_err(ValidatorError::LogFile)?;
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_span_list(true)
-                    .with_current_span(true)
-                    .with_writer(Arc::new(file)),
-            )
-        }
-        None => None,
-    };
-
-    if let Some(otlp_cfg) = otlp_config_from_env() {
-        let endpoint = otlp_cfg.endpoint.clone();
-        let service_name = otlp_cfg.name.clone();
-        let sample_rate = otlp_cfg.rate;
-        let (tracer, tracer_provider) = build_otlp_tracer(otlp_cfg, validator_pubkey)
-            .map_err(|err| ValidatorError::TraceExport(err.to_string()))?;
-        global::set_tracer_provider(tracer_provider.clone());
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(file_layer)
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .init();
-        info!(
-            otlp_endpoint = %endpoint,
-            otlp_service_name = %service_name,
-            otlp_sample_rate = sample_rate,
-            "OTLP trace export enabled",
-        );
-        return Ok(Some(tracer_provider));
-    }
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .with(file_layer)
-        .init();
-    Ok(None)
-}
-
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
@@ -792,7 +680,12 @@ async fn serve_relay(
     Ok(())
 }
 
-fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>, ws_push: Option<String>) -> Result<(), ValidatorError> {
+fn run(
+    config_path: PathBuf,
+    log_json: Option<PathBuf>,
+    ws_bind: Option<String>,
+    ws_push: Option<String>,
+) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut node_config: NodeConfig = toml::from_str(&config_str)?;
     if ws_bind.is_some() {
@@ -804,15 +697,19 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
 
     let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
-    let validator_pubkey = hex::encode(me.encode());
-    let tracer_provider = init_tracing(&validator_pubkey, log_json.as_deref())?;
+    if let Some(path) = log_json.as_ref() {
+        eprintln!(
+            "warning: --log-json file output ({}) is ignored by commonware_runtime::tokio::telemetry::init; enabling JSON logs on stderr instead",
+            path.display(),
+        );
+    }
+    let telemetry_json = log_json.is_some();
+    let telemetry_traces = otlp_config_from_env();
+    let otlp_info = telemetry_traces
+        .as_ref()
+        .map(|cfg| (cfg.endpoint.clone(), cfg.name.clone(), cfg.rate));
 
     let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
-    info!(
-        git_rev,
-        version = env!("CARGO_PKG_VERSION"),
-        "hellas validator starting",
-    );
 
     let participants = node_config.participants()?;
     let peer_map = node_config.peer_address_map()?;
@@ -834,12 +731,42 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
     let storage_dir_utf8 = storage_dir
         .to_str()
         .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
+    let metrics_addr = node_config
+        .metrics_port
+        .map(|metrics_port| format!("0.0.0.0:{metrics_port}").parse())
+        .transpose()?;
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)
         .with_tcp_nodelay(Some(true));
     let runner = tokio::Runner::new(runtime_cfg);
 
-    runner.start(|context| async move {
+    runner.start(move |context| async move {
+        commonware_runtime::tokio::telemetry::init(
+            context.with_label("telemetry"),
+            commonware_runtime::tokio::telemetry::Logging {
+                level: tracing::Level::INFO,
+                json: telemetry_json,
+            },
+            metrics_addr,
+            telemetry_traces,
+        );
+        info!(
+            git_rev,
+            version = env!("CARGO_PKG_VERSION"),
+            "hellas validator starting",
+        );
+        if let Some(metrics_port) = node_config.metrics_port {
+            info!(metrics_port, "prometheus metrics server started");
+        }
+        if let Some((endpoint, service_name, sample_rate)) = otlp_info.as_ref() {
+            info!(
+                otlp_endpoint = %endpoint,
+                otlp_service_name = %service_name,
+                otlp_sample_rate = sample_rate,
+                "OTLP trace export enabled",
+            );
+        }
+
         // Create lookup-based p2p network
         let p2p_cfg = lookup::Config::local(private_key, NAMESPACE, listen_addr, MAX_MESSAGE_SIZE);
         let (mut network, mut oracle) =
@@ -856,18 +783,6 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
         let certificate = network.register(1, quota, CHANNEL_BACKLOG);
         let resolver = network.register(2, quota, CHANNEL_BACKLOG);
         let (shard_sender, shard_receiver) = network.register(3, quota, SHARD_CHANNEL_BACKLOG);
-
-        // Start metrics server (if configured)
-        if let Some(metrics_port) = node_config.metrics_port {
-            let metrics_addr: SocketAddr = format!("0.0.0.0:{metrics_port}")
-                .parse()
-                .expect("metrics address should be valid");
-            commonware_runtime::tokio::telemetry::serve_metrics(
-                context.with_label("metrics"),
-                metrics_addr,
-            );
-            info!(metrics_port, "prometheus metrics server started");
-        }
 
         // Publish process uptime as a prometheus gauge, updated every second.
         let uptime_gauge: Gauge<i64, AtomicI64> = Gauge::default();
@@ -896,7 +811,8 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
         relay.finalize_validators();
 
         // Extract validator names before scheme is moved into the engine.
-        let validators: Vec<String> = scheme.participants()
+        let validators: Vec<String> = scheme
+            .participants()
             .iter()
             .map(|pk| hex::encode(&pk.encode()[..8]))
             .collect();
@@ -921,9 +837,7 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
 
         // Start light-client gRPC server over WebSocket (if configured)
         if let Some(ws_bind) = &node_config.ws_bind {
-            let addr: SocketAddr = ws_bind
-                .parse()
-                .expect("ws_bind address should be valid");
+            let addr: SocketAddr = ws_bind.parse().expect("ws_bind address should be valid");
             let svc = hellas_chain::rpc::LightClientGrpcServer::new(
                 light_client.clone(),
                 activity_tx.clone(),
@@ -1010,10 +924,5 @@ fn run(config_path: PathBuf, log_json: Option<PathBuf>, ws_bind: Option<String>,
 
         graceful_stop(context, monitor_second_signal).await;
     });
-    if let Some(provider) = tracer_provider
-        && let Err(err) = provider.shutdown()
-    {
-        eprintln!("failed to flush OTLP traces on shutdown: {err:?}");
-    }
     Ok(())
 }
