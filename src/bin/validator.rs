@@ -153,6 +153,9 @@ enum Command {
         /// Minimum time (ms) the leader waits before emitting a proposal
         #[arg(long)]
         min_propose_ms: Option<u64>,
+        /// Prometheus metrics port (defaults to 9090 + node index)
+        #[arg(long)]
+        metrics_port: Option<u16>,
     },
     /// Run a validator node
     Run {
@@ -265,6 +268,7 @@ fn main() {
             addresses,
             ws_push,
             min_propose_ms,
+            metrics_port,
         } => setup(
             validators,
             node,
@@ -273,6 +277,7 @@ fn main() {
             addresses,
             ws_push,
             min_propose_ms,
+            metrics_port,
         ),
         Command::Run {
             config,
@@ -344,6 +349,7 @@ fn setup(
     addresses: Option<Vec<String>>,
     ws_push: Option<String>,
     min_propose_ms: Option<u64>,
+    metrics_port: Option<u16>,
 ) -> Result<(), ValidatorError> {
     if validators == 0 {
         return Err(ValidatorError::InvalidSetup(
@@ -396,7 +402,7 @@ fn setup(
     let config = NodeConfig {
         private_key: encode_private_key(my_key),
         listen_port: start_port + node as u16,
-        metrics_port: Some(9090 + node as u16),
+        metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
         ws_bind: None,
         explorer_url: ws_push,
         min_propose_ms,
