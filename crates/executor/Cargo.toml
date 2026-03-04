@@ -25,3 +25,4 @@ catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
 hf-hub = "0.4"
 tokenizers = "0.21"
+blake3 = "1"

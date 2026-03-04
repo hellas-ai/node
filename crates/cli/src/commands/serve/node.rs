@@ -1,46 +1,22 @@
+use crate::commands::common::{shared_pkarr_client, GRPC_MESSAGE_LIMIT};
 use anyhow::Context;
-use hellas_executor::{ExecuteServer, Executor};
+use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
 };
-use pkarr::Client as PkarrClient;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
-use tonic_iroh_transport::iroh::address_lookup::pkarr::{
-    N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
-};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::DhtBackend;
 use tonic_iroh_transport::TransportBuilder;
 
-const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
 const DEFAULT_PORT: u16 = 31145;
-
-fn n0_pkarr_relay() -> &'static str {
-    if std::env::var_os("IROH_FORCE_STAGING_RELAYS").is_some() {
-        N0_DNS_PKARR_RELAY_STAGING
-    } else {
-        N0_DNS_PKARR_RELAY_PROD
-    }
-}
-
-fn shared_pkarr_client() -> anyhow::Result<PkarrClient> {
-    let mut builder = PkarrClient::builder();
-    builder.no_default_network();
-    builder.dht(|dht| dht);
-    builder
-        .relays(&[n0_pkarr_relay()])
-        .map_err(|err| anyhow::anyhow!("failed to configure pkarr relay: {err}"))?;
-    let client = builder
-        .build()
-        .map_err(|err| anyhow::anyhow!("failed to build pkarr client: {err}"))?;
-    Ok(client)
-}
+const MAX_PORT_RETRIES: u16 = 100;
 
 struct NodeService {
     start_time: Instant,
@@ -88,7 +64,11 @@ impl NodeHandle {
     }
 }
 
-pub(super) async fn spawn_node() -> anyhow::Result<NodeHandle> {
+pub(super) async fn spawn_node(
+    port: Option<u16>,
+    download_policy: DownloadPolicy,
+    execute_policy: ExecutePolicy,
+) -> anyhow::Result<NodeHandle> {
     let shared_pkarr = shared_pkarr_client().context("failed to initialize shared pkarr client")?;
     let shared_dht = Arc::new(
         shared_pkarr
@@ -96,27 +76,69 @@ pub(super) async fn spawn_node() -> anyhow::Result<NodeHandle> {
             .ok_or_else(|| anyhow::anyhow!("shared pkarr client has no DHT handle"))?,
     );
 
-    let builder = Endpoint::builder()
-        .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))?
-        .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, DEFAULT_PORT, 0, 0))?
-        .address_lookup(MdnsAddressLookup::builder().service_name("hellas"))
-        .address_lookup(
-            DhtAddressLookup::builder()
-                .client(shared_pkarr)
-                .n0_dns_pkarr_relay(),
-        );
-
-    let endpoint = builder
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
+    let endpoint = if let Some(port) = port {
+        // Explicit port: fail if it can't bind.
+        Endpoint::builder()
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?
+            .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))?
+            .address_lookup(MdnsAddressLookup::builder().service_name("hellas"))
+            .address_lookup(
+                DhtAddressLookup::builder()
+                    .client(shared_pkarr.clone())
+                    .n0_dns_pkarr_relay(),
+            )
+            .bind()
+            .await
+            .with_context(|| format!("failed to bind on port {port}"))?
+    } else {
+        // Auto port: try DEFAULT_PORT, then increment until one works.
+        let mut endpoint = None;
+        for offset in 0..MAX_PORT_RETRIES {
+            let p = DEFAULT_PORT.wrapping_add(offset);
+            match Endpoint::builder()
+                .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))
+                .and_then(|b| b.bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0)))
+            {
+                Ok(builder) => {
+                    let builder = builder
+                        .address_lookup(MdnsAddressLookup::builder().service_name("hellas"))
+                        .address_lookup(
+                            DhtAddressLookup::builder()
+                                .client(shared_pkarr.clone())
+                                .n0_dns_pkarr_relay(),
+                        );
+                    match builder.bind().await {
+                        Ok(ep) => {
+                            if offset > 0 {
+                                info!("port {DEFAULT_PORT} in use, bound to port {p}");
+                            }
+                            endpoint = Some(ep);
+                            break;
+                        }
+                        Err(e) => {
+                            debug!("port {p} unavailable: {e:#}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("port {p} unavailable: {e:#}");
+                }
+            }
+        }
+        endpoint.ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to bind on any port in range {DEFAULT_PORT}..{}",
+                DEFAULT_PORT + MAX_PORT_RETRIES
+            )
+        })?
+    };
 
     let node_service = NodeService {
         start_time: Instant::now(),
         node_id: endpoint.id().to_string(),
     };
 
-    let executor = Executor::spawn();
+    let executor = Executor::spawn(download_policy, execute_policy);
     let execute_service = ExecuteServer::new(executor)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);

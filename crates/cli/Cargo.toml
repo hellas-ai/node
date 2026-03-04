@@ -9,7 +9,7 @@ documentation.workspace = true
 
 [features]
 default = ["client", "discovery"]
-client = ["hellas-rpc/client", "dep:tonic-iroh-transport", "tonic-iroh-transport/client"]
+client = ["hellas-rpc/client", "dep:tonic-iroh-transport", "dep:tonic", "tonic-iroh-transport/client"]
 discovery = ["client", "dep:tonic", "tonic-iroh-transport/discovery", "dep:pkarr"]
 serve = ["discovery", "hellas-rpc/server", "dep:hellas-executor", "dep:tonic", "tonic-iroh-transport/server"]
 cuda = ["serve", "hellas-executor/candle-cuda"]
@@ -27,6 +27,7 @@ hellas-executor = { workspace = true, optional = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 tonic = { workspace = true, optional = true }
 tokio-stream = { workspace = true }
+futures = "0.3"
 pkarr = { version = "5", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

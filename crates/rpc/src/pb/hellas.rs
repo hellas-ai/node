@@ -163,8 +163,8 @@ impl ::prost::Name for ExecuteStatusRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStatusResponse {
-    #[prost(string, tag = "1")]
-    pub status: ::prost::alloc::string::String,
+    #[prost(enumeration = "ExecutionStatus", tag = "1")]
+    pub status: i32,
     #[prost(uint64, tag = "2")]
     pub progress: u64,
     #[prost(bytes = "vec", tag = "3")]
@@ -184,8 +184,8 @@ impl ::prost::Name for ExecuteStatusResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteProgress {
-    #[prost(string, tag = "1")]
-    pub status: ::prost::alloc::string::String,
+    #[prost(enumeration = "ExecutionStatus", tag = "1")]
+    pub status: i32,
     #[prost(uint64, tag = "2")]
     pub progress: u64,
     #[prost(bytes = "vec", tag = "3")]
@@ -233,6 +233,41 @@ impl ::prost::Name for ExecuteResultResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/hellas.ExecuteResultResponse".into()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ExecutionStatus {
+    Unspecified = 0,
+    Pending = 1,
+    Running = 2,
+    Completed = 3,
+    Failed = 4,
+}
+impl ExecutionStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "UNSPECIFIED",
+            Self::Pending => "PENDING",
+            Self::Running => "RUNNING",
+            Self::Completed => "COMPLETED",
+            Self::Failed => "FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNSPECIFIED" => Some(Self::Unspecified),
+            "PENDING" => Some(Self::Pending),
+            "RUNNING" => Some(Self::Running),
+            "COMPLETED" => Some(Self::Completed),
+            "FAILED" => Some(Self::Failed),
+            _ => None,
+        }
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

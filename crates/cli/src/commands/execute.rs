@@ -1,64 +1,39 @@
+#[cfg(feature = "discovery")]
+use crate::commands::common::shared_pkarr_client;
+use crate::commands::common::GRPC_MESSAGE_LIMIT;
 use crate::commands::CliResult;
 use anyhow::Context;
 use hellas_rpc::pb::hellas::execute_client::ExecuteClient;
 use hellas_rpc::pb::hellas::{
-    get_quote_request, ExecuteRequest, ExecuteStatusRequest, GetQuoteRequest, LlmQuoteRequest,
+    get_quote_request, ExecuteRequest, ExecuteStatusRequest, ExecutionStatus, GetQuoteRequest,
+    GetQuoteResponse, LlmQuoteRequest,
 };
 use hellas_rpc::service::ExecuteService;
-#[cfg(feature = "discovery")]
-use pkarr::Client as PkarrClient;
 use std::io::{self, Write};
 #[cfg(feature = "discovery")]
 use std::sync::Arc;
 #[cfg(feature = "discovery")]
 use tokio::time::Duration;
-#[cfg(feature = "discovery")]
-use tonic::Code;
+use tonic::transport::Channel;
 #[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 #[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
-#[cfg(feature = "discovery")]
-use tonic_iroh_transport::iroh::address_lookup::pkarr::{
-    N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
-};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 #[cfg(feature = "discovery")]
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::IrohConnect;
 
-const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
 #[cfg(feature = "discovery")]
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[cfg(feature = "discovery")]
-fn n0_pkarr_relay() -> &'static str {
-    if std::env::var_os("IROH_FORCE_STAGING_RELAYS").is_some() {
-        N0_DNS_PKARR_RELAY_STAGING
-    } else {
-        N0_DNS_PKARR_RELAY_PROD
-    }
-}
-
-#[cfg(feature = "discovery")]
-fn shared_pkarr_client() -> CliResult<PkarrClient> {
-    let mut builder = PkarrClient::builder();
-    builder.no_default_network();
-    builder.dht(|dht| dht);
-    builder
-        .relays(&[n0_pkarr_relay()])
-        .map_err(|err| anyhow::anyhow!("failed to configure pkarr relay: {err}"))?;
-    let client = builder
-        .build()
-        .map_err(|err| anyhow::anyhow!("failed to build pkarr client: {err}"))?;
-    Ok(client)
-}
 
 pub async fn run(
     node_id: Option<EndpointId>,
     model: String,
     prompt: String,
     max_seq: u32,
+    retries: usize,
+    backup_quotes: usize,
 ) -> CliResult<()> {
     let endpoint = Endpoint::builder()
         .bind()
@@ -74,7 +49,8 @@ pub async fn run(
     };
     info!("Getting quote... {quote_req:?}");
 
-    let (mut client, quote) = match node_id {
+    match node_id {
+        // ── Direct node path: no retry, no discovery ──
         Some(id) => {
             let channel = ExecuteService::connect(&endpoint, id.into())
                 .await
@@ -83,15 +59,20 @@ pub async fn run(
                 .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
                 .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
             let quote = client
-                .get_quote(quote_req.clone())
+                .get_quote(quote_req)
                 .await
-                .context("GetQuote RPC failed")?
+                .with_context(|| format!("node {id} declined quote"))?
                 .into_inner();
-            (client, quote)
+            execute_and_stream(&mut client, &quote).await
         }
+
+        // ── Discovery path: parallel quoting + execution failover ──
         None => {
             #[cfg(feature = "discovery")]
             {
+                use crate::commands::quote_stream::{QuoteError, QuoteStreamBuilder};
+                use futures::StreamExt;
+
                 // Set up mDNS for local-network discovery (client-only, no advertise).
                 let mdns = MdnsAddressLookup::builder()
                     .advertise(false)
@@ -122,78 +103,60 @@ pub async fn run(
                 registry.add(MdnsBackend::new(mdns));
                 registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
 
-                let mut locator = registry
+                let locator = registry
                     .find::<ExecuteService>()
                     .timeout(DISCOVERY_TIMEOUT)
                     .start();
 
-                let mut ready_client_quote = None;
-                let mut not_ready_count = 0usize;
-                let mut discovery_errors = 0usize;
-                let mut quote_errors = 0usize;
+                let mut quotes = QuoteStreamBuilder::new(quote_req)
+                    .backup_quotes(backup_quotes)
+                    .start(locator);
 
-                while let Some(next_channel) = tokio_stream::StreamExt::next(&mut locator).await {
-                    let channel = match next_channel {
-                        Ok(channel) => channel,
-                        Err(err) => {
-                            discovery_errors += 1;
-                            debug!("discovered candidate failed to connect: {err:#}");
-                            continue;
-                        }
-                    };
-
-                    let mut candidate = ExecuteClient::new(channel)
-                        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-                        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-
-                    match candidate.get_quote(quote_req.clone()).await {
-                        Ok(resp) => {
-                            ready_client_quote = Some((candidate, resp.into_inner()));
-                            break;
-                        }
-                        Err(status) => {
-                            let is_weights_not_ready = status.code() == Code::FailedPrecondition;
-                            if is_weights_not_ready {
-                                not_ready_count += 1;
-                                info!(
-                                    model = %model,
-                                    "discovered executor missing requested weights, trying next provider"
-                                );
-                                continue;
+                let mut attempts = 0;
+                while let Some(result) = quotes.next().await {
+                    match result {
+                        Ok((mut client, quote)) => {
+                            attempts += 1;
+                            if attempts > retries + 1 {
+                                anyhow::bail!("max retries ({retries}) exceeded");
                             }
-
-                            quote_errors += 1;
-                            debug!("discovered executor rejected quote: {status}");
+                            match execute_and_stream(&mut client, &quote).await {
+                                Ok(()) => return Ok(()),
+                                Err(err) => {
+                                    warn!(
+                                        attempt = attempts,
+                                        "execution failed, trying next provider: {err:#}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(QuoteError::Declined(status)) => {
+                            info!("provider declined quote: {status}");
+                        }
+                        Err(QuoteError::ConnectFailed(e)) => {
+                            debug!("candidate connect error: {e:#}");
                         }
                     }
                 }
-
-                match ready_client_quote {
-                    Some((client, quote)) => (client, quote),
-                    None => {
-                        if not_ready_count > 0 {
-                            anyhow::bail!(
-                                "no discovered executor had weights ready for model {model} (not_ready={not_ready_count}, discovery_errors={discovery_errors}, quote_errors={quote_errors})"
-                            );
-                        }
-                        anyhow::bail!(
-                            "failed to discover an executor that can serve the request (discovery_errors={discovery_errors}, quote_errors={quote_errors})"
-                        );
-                    }
-                }
+                anyhow::bail!("no provider could serve the request");
             }
             #[cfg(not(feature = "discovery"))]
             {
+                let _ = (retries, backup_quotes);
                 anyhow::bail!(
                     "node_id is required when CLI is built without the `discovery` feature"
                 );
             }
         }
-    };
+    }
+}
 
+async fn execute_and_stream(
+    client: &mut ExecuteClient<Channel>,
+    quote: &GetQuoteResponse,
+) -> anyhow::Result<()> {
     info!("Got quote: {quote:?}");
 
-    // 2. Execute
     let req = ExecuteRequest {
         quote_id: quote.quote_id.clone(),
     };
@@ -205,7 +168,6 @@ pub async fn run(
         .into_inner();
     info!("Executing: {exec:?}");
 
-    // 3. Stream status until completed
     let req = ExecuteStatusRequest {
         execution_id: exec.execution_id.clone(),
     };
@@ -218,27 +180,27 @@ pub async fn run(
 
     while let Some(progress) = tokio_stream::StreamExt::next(&mut stream).await {
         let progress = progress.context("ExecuteStream RPC progress failed")?;
+        let status =
+            ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified);
+        let status_label = status.as_str_name();
         if let Some(decoded) = progress.decoded.as_deref() {
             debug!(
                 "Status: {} | Progress: {} | Decoded chunk: {}",
-                progress.status, progress.progress, decoded
+                status_label, progress.progress, decoded
             );
             print!("{}", decoded);
             io::stdout().flush()?;
         } else if progress.chunk.is_empty() {
-            debug!(
-                "Status: {} | Progress: {}",
-                progress.status, progress.progress
-            );
+            debug!("Status: {} | Progress: {}", status_label, progress.progress);
         } else {
             debug!(
                 "Status: {} | Progress: {} | Chunk bytes: {}",
-                progress.status,
+                status_label,
                 progress.progress,
                 progress.chunk.len()
             );
         }
-        if progress.status == "completed" || progress.status == "failed" {
+        if matches!(status, ExecutionStatus::Completed | ExecutionStatus::Failed) {
             break;
         }
     }

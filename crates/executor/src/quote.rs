@@ -20,13 +20,21 @@ impl Executor {
         let payload = request.payload.ok_or(ExecutorError::MissingPayload)?;
 
         let (graph, input, weights_hint, max_seq, kind) = match payload {
-            get_quote_request::Payload::Graph(graph) => (
-                graph,
-                String::new(),
-                None,
-                DEFAULT_MAX_SEQ,
-                QuoteKind::Graph,
-            ),
+            get_quote_request::Payload::Graph(ref graph) => {
+                let graph_id = blake3::hash(graph).to_hex().to_string();
+                if !self.execute_policy.allows_execute(&graph_id, None) {
+                    return Err(ExecutorError::PolicyDenied(format!(
+                        "execute policy denied graph {graph_id}"
+                    )));
+                }
+                (
+                    graph.clone(),
+                    String::new(),
+                    None,
+                    DEFAULT_MAX_SEQ,
+                    QuoteKind::Graph,
+                )
+            }
             get_quote_request::Payload::LlmPrompt(llm) => {
                 let max_seq = if llm.max_seq == 0 {
                     DEFAULT_MAX_SEQ
@@ -35,6 +43,12 @@ impl Executor {
                 };
 
                 let model_id = llm.huggingface_model_id.clone();
+                if !self.execute_policy.allows_execute("", Some(&model_id)) {
+                    return Err(ExecutorError::PolicyDenied(format!(
+                        "execute policy denied model {model_id}"
+                    )));
+                }
+
                 let model_id_typed = ModelId(model_id.clone());
                 let disposition = self
                     .weights
@@ -94,7 +108,7 @@ impl Executor {
             input: input.clone(),
             max_seq,
         };
-        let graph_id = format!("{:x}", simple_hash(&graph));
+        let graph_id = blake3::hash(&graph).to_hex().to_string();
         let amount = 1000; // stub
         let quote_id = self.state.create_quote(graph_id.clone(), plan);
 
@@ -126,12 +140,4 @@ impl Executor {
             }),
         })
     }
-}
-
-fn simple_hash(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        hash = hash.wrapping_add((byte as u64).wrapping_mul(31_u64.wrapping_pow(i as u32)));
-    }
-    hash
 }

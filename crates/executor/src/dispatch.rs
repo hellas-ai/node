@@ -13,10 +13,6 @@ impl Executor {
         let quote_id = request.quote_id;
         let plan = self.state.get_quote(&quote_id)?.plan.clone();
 
-        if self.execute_worker.is_busy() {
-            return Err(ExecutorError::Busy);
-        }
-
         let bundle = match plan.weights_hint.clone() {
             Some(key) => Some(self.weights.bundle(&key).await.map_err(|e| match e {
                 WeightsError::NotReady => ExecutorError::WeightsNotReady(key.model_id.0.clone()),
