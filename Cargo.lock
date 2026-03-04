@@ -2101,6 +2101,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "hellas-executor",
  "hellas-rpc",
  "pkarr",
@@ -2116,6 +2117,7 @@ dependencies = [
 name = "hellas-executor"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "catgrad",
  "catgrad-llm",
  "hellas-rpc",

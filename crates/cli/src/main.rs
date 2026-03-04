@@ -19,7 +19,21 @@ struct Cli {
 enum Commands {
     #[cfg(feature = "serve")]
     /// Run the RPC server
-    Serve,
+    Serve {
+        /// Port to listen on (auto-selects if not specified or if in use)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Download policy: 'eager' (default, download freely),
+        /// 'skip' (cache-only, never download),
+        /// or 'allow(pattern,...)' (download only matching HF models)
+        #[arg(long = "download-policy", default_value = "eager")]
+        download_policy: hellas_executor::DownloadPolicy,
+        /// Execute policy: 'eager' (default, execute any graph),
+        /// 'skip' (refuse all executions),
+        /// or 'allow(hf/pattern,...,graph/pattern,...)' (execute only matching)
+        #[arg(long = "execute-policy", default_value = "eager")]
+        execute_policy: hellas_executor::ExecutePolicy,
+    },
     /// Check health of a remote node
     Health {
         /// Node ID to check
@@ -42,12 +56,19 @@ enum Commands {
         /// Maximum number of new tokens to generate
         #[arg(long = "max-seq", default_value_t = 16)]
         max_seq: u32,
+        /// Max execution retries on failure (discovery path only)
+        #[arg(long = "retries", default_value_t = 2)]
+        retries: usize,
+        /// Number of accepted backup quotes to pre-fetch
+        #[arg(long = "backup-quotes", default_value_t = 2)]
+        backup_quotes: usize,
     },
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
@@ -58,14 +79,20 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         #[cfg(feature = "serve")]
-        Commands::Serve => commands::serve::run().await,
+        Commands::Serve {
+            port,
+            download_policy,
+            execute_policy,
+        } => commands::serve::run(port, download_policy, execute_policy).await,
         Commands::Health { node_id } => commands::health::run(node_id).await,
         Commands::Execute {
             node_id,
             model,
             prompt,
             max_seq,
-        } => commands::execute::run(node_id, model, prompt, max_seq).await,
+            retries,
+            backup_quotes,
+        } => commands::execute::run(node_id, model, prompt, max_seq, retries, backup_quotes).await,
     };
 
     if let Err(err) = result {

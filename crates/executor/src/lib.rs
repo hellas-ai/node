@@ -6,6 +6,7 @@ pub mod catgrad_support;
 mod dispatch;
 mod error;
 mod execute_worker;
+pub mod policy;
 mod progress;
 mod quote;
 mod state;
@@ -13,6 +14,7 @@ mod weights;
 
 pub use error::ExecutorError;
 pub use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
+pub use policy::{DownloadPolicy, ExecutePolicy};
 
 use execute_worker::ExecuteWorker;
 use state::{ExecutionStatus, ExecutorState, StateError};
@@ -70,7 +72,7 @@ enum ExecutorMessage {
         execution_id: String,
         result: Option<Vec<u8>>,
         decoded: Option<String>,
-        success: bool,
+        status: ExecutionStatus,
     },
 }
 
@@ -80,13 +82,17 @@ pub struct Executor {
     watchers: HashMap<String, Vec<mpsc::UnboundedSender<ExecuteProgress>>>,
     weights: WeightsManager,
     execute_worker: ExecuteWorker,
+    execute_policy: policy::ExecutePolicy,
 }
 
 impl Executor {
-    pub fn spawn() -> ExecutorHandle {
+    pub fn spawn(
+        download_policy: policy::DownloadPolicy,
+        execute_policy: policy::ExecutePolicy,
+    ) -> ExecutorHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = crate::backend::create_backend();
-        let weights = WeightsManager::spawn();
+        let weights = WeightsManager::spawn(download_policy);
         let execute_worker = ExecuteWorker::spawn(tx.clone());
         let executor = Self {
             rx,
@@ -94,6 +100,7 @@ impl Executor {
             watchers: HashMap::new(),
             weights,
             execute_worker,
+            execute_policy,
         };
         tokio::spawn(executor.run());
         ExecutorHandle { tx }
@@ -147,9 +154,9 @@ impl Executor {
                     execution_id,
                     result,
                     decoded,
-                    success,
+                    status,
                 } => {
-                    self.handle_complete(execution_id, result, decoded, success);
+                    self.handle_complete(execution_id, result, decoded, status);
                 }
             }
         }
@@ -180,7 +187,7 @@ impl Executor {
             .get_decoded(&request.execution_id)?
             .map(|s| s.to_string());
         Ok(ExecuteStatusResponse {
-            status: status.as_str().to_string(),
+            status: *status as i32,
             progress,
             result: result_bytes,
             decoded,
@@ -321,11 +328,12 @@ impl Execute for ExecutorHandle {
 mod tests {
     use super::*;
     use crate::state::ExecutionPlan;
-    use hellas_rpc::pb::hellas::get_quote_request;
+    use hellas_rpc::pb::hellas::{get_quote_request, ExecutionStatus as RpcExecutionStatus};
 
     #[tokio::test]
     async fn quote_and_execute() {
-        let handle = Executor::spawn();
+        let handle =
+            Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
 
         // Get quote
         let quote = handle
@@ -349,7 +357,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_with_invalid_quote_fails() {
-        let handle = Executor::spawn();
+        let handle =
+            Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
 
         let result = handle
             .execute(ExecuteRequest {
@@ -367,8 +376,9 @@ mod tests {
             rx,
             state: ExecutorState::new(),
             watchers: HashMap::new(),
-            weights: WeightsManager::spawn(),
+            weights: WeightsManager::spawn(DownloadPolicy::default()),
             execute_worker: ExecuteWorker::spawn(tx2),
+            execute_policy: ExecutePolicy::default(),
         };
 
         let quote_id = executor.state.create_quote(
@@ -393,14 +403,14 @@ mod tests {
             .handle_subscribe(execution_id.clone())
             .expect("subscribe should succeed");
 
-        assert_eq!(initial.status, "running");
+        assert_eq!(initial.status, RpcExecutionStatus::Running as i32);
         assert_eq!(initial.progress, 0);
         assert!(initial.chunk.is_empty());
         assert!(initial.decoded.is_none());
 
         executor.send_status(&execution_id, ExecutionStatus::Completed);
         let completed = updates.recv().await.expect("should receive completion");
-        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.status, RpcExecutionStatus::Completed as i32);
         assert_eq!(completed.progress, 0);
         assert!(completed.chunk.is_empty());
         assert!(completed.decoded.is_none());

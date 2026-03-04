@@ -1,12 +1,17 @@
 use crate::commands::CliResult;
 use anyhow::Context;
+use hellas_executor::{DownloadPolicy, ExecutePolicy};
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
 mod node;
 
-pub async fn run() -> CliResult<()> {
-    let node = node::spawn_node()
+pub async fn run(
+    port: Option<u16>,
+    download_policy: DownloadPolicy,
+    execute_policy: ExecutePolicy,
+) -> CliResult<()> {
+    let node = node::spawn_node(port, download_policy, execute_policy)
         .await
         .context("failed to start node server")?;
 

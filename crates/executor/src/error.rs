@@ -29,6 +29,8 @@ pub enum ExecutorError {
     WeightsNotReady(String),
     #[error("weights error: {0}")]
     WeightsError(String),
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error("no output from graph")]
     NoOutput,
     #[error("unexpected output value")]
@@ -51,6 +53,7 @@ impl From<ExecutorError> for Status {
             ExecutorError::MissingWeightsHint => Status::invalid_argument(err.to_string()),
             ExecutorError::WeightsNotReady(_) => Status::failed_precondition(err.to_string()),
             ExecutorError::WeightsError(_) => Status::internal(err.to_string()),
+            ExecutorError::PolicyDenied(_) => Status::permission_denied(err.to_string()),
             ExecutorError::NoOutput => Status::internal(err.to_string()),
             ExecutorError::UnexpectedOutput => Status::internal(err.to_string()),
             ExecutorError::State(StateError::QuoteNotFound(_)) => {

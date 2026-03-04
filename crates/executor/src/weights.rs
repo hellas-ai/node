@@ -1,4 +1,5 @@
 use crate::backend::{create_backend, ExecBackend};
+use crate::policy::DownloadPolicy;
 use crate::ExecutorError;
 use catgrad::interpreter::{self};
 use catgrad::typecheck;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
 const DEFAULT_REF: &str = "main";
@@ -86,6 +87,10 @@ enum Command {
         model_id: ModelId,
         reply: oneshot::Sender<EnsureDisposition>,
     },
+    WaitDefaultReady {
+        model_id: ModelId,
+        reply: oneshot::Sender<Result<ResolvedWeightKey, WeightsError>>,
+    },
     Bundle {
         key: ResolvedWeightKey,
         reply: oneshot::Sender<Result<Arc<ModelBundle>, WeightsError>>,
@@ -129,10 +134,12 @@ struct ManagerState {
     entries: HashMap<ModelId, Entry>,
     active: Option<ModelId>,
     queue: VecDeque<ModelId>,
+    waiters: HashMap<ModelId, Vec<oneshot::Sender<Result<ResolvedWeightKey, WeightsError>>>>,
+    download_policy: DownloadPolicy,
 }
 
 impl WeightsManager {
-    pub fn spawn() -> Self {
+    pub fn spawn(download_policy: DownloadPolicy) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let (job_tx, mut job_rx) = mpsc::unbounded_channel::<JobEvent>();
 
@@ -141,6 +148,8 @@ impl WeightsManager {
                 entries: HashMap::new(),
                 active: None,
                 queue: VecDeque::new(),
+                waiters: HashMap::new(),
+                download_policy,
             };
 
             loop {
@@ -181,19 +190,20 @@ impl WeightsManager {
     pub async fn ensure_default_ready_wait(
         &self,
         model_id: ModelId,
-        timeout: Duration,
+        wait_timeout: Duration,
     ) -> Result<ResolvedWeightKey, WeightsError> {
-        let start = Instant::now();
-        loop {
-            match self.ensure_default_ready(model_id.clone()).await {
-                EnsureDisposition::Ready(key) => return Ok(key),
-                EnsureDisposition::Failed(err) => return Err(WeightsError::Failed(err)),
-                EnsureDisposition::Queued | EnsureDisposition::InFlight => {}
-            }
-            if start.elapsed() >= timeout {
-                return Err(WeightsError::NotReady);
-            }
-            sleep(Duration::from_millis(25)).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::WaitDefaultReady {
+                model_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| WeightsError::ManagerClosed)?;
+
+        match timeout(wait_timeout, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(WeightsError::ManagerClosed),
+            Err(_) => Err(WeightsError::NotReady),
         }
     }
 
@@ -230,44 +240,24 @@ pub fn default_ref_cached(model_id: &str) -> bool {
 fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::UnboundedSender<JobEvent>) {
     match cmd {
         Command::EnsureDefaultReady { model_id, reply } => {
-            let entry = state
-                .entries
-                .entry(model_id.clone())
-                .or_insert_with(|| Entry {
-                    status: WeightsStatus::Queued,
-                    bundle: None,
-                });
-
-            let disposition = match &entry.status {
-                WeightsStatus::Ready { revision } => EnsureDisposition::Ready(ResolvedWeightKey {
-                    model_id: model_id.clone(),
-                    revision: revision.clone(),
-                }),
-                WeightsStatus::Failed { error } => {
-                    if !state.queue.contains(&model_id) && state.active.as_ref() != Some(&model_id)
-                    {
-                        entry.status = WeightsStatus::Queued;
-                        state.queue.push_back(model_id.clone());
-                        maybe_start_next(state, job_tx);
-                        EnsureDisposition::Queued
-                    } else {
-                        EnsureDisposition::Failed(error.clone())
-                    }
-                }
-                WeightsStatus::Queued
-                | WeightsStatus::Resolving
-                | WeightsStatus::Downloading { .. } => {
-                    if !state.queue.contains(&model_id) && state.active.as_ref() != Some(&model_id)
-                    {
-                        state.queue.push_back(model_id.clone());
-                        maybe_start_next(state, job_tx);
-                        EnsureDisposition::Queued
-                    } else {
-                        EnsureDisposition::InFlight
-                    }
-                }
-            };
+            let disposition = ensure_default_ready_disposition(state, &model_id, &job_tx);
             let _ = reply.send(disposition);
+        }
+        Command::WaitDefaultReady { model_id, reply } => {
+            let disposition = ensure_default_ready_disposition(state, &model_id, &job_tx);
+            match disposition {
+                EnsureDisposition::Ready(key) => {
+                    let _ = reply.send(Ok(key));
+                }
+                EnsureDisposition::Failed(error) => {
+                    let _ = reply.send(Err(WeightsError::Failed(error)));
+                }
+                EnsureDisposition::Queued | EnsureDisposition::InFlight => {
+                    let waiters = state.waiters.entry(model_id).or_default();
+                    waiters.retain(|waiter| !waiter.is_closed());
+                    waiters.push(reply);
+                }
+            }
         }
         Command::Bundle { key, reply } => {
             let entry = state.entries.get(&key.model_id);
@@ -301,6 +291,87 @@ fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::Unbounde
     }
 }
 
+fn ensure_default_ready_disposition(
+    state: &mut ManagerState,
+    model_id: &ModelId,
+    job_tx: &mpsc::UnboundedSender<JobEvent>,
+) -> EnsureDisposition {
+    // If the model already has an entry, follow existing logic — it has
+    // already been admitted.
+    if let Some(entry) = state.entries.get(model_id) {
+        return match &entry.status {
+            WeightsStatus::Ready { revision } => EnsureDisposition::Ready(ResolvedWeightKey {
+                model_id: model_id.clone(),
+                revision: revision.clone(),
+            }),
+            WeightsStatus::Failed { error } => {
+                if !state.queue.contains(model_id) && state.active.as_ref() != Some(model_id) {
+                    // Re-check policy before re-queuing a previously failed model.
+                    if !default_ref_cached(&model_id.0)
+                        && !state.download_policy.allows_download(&model_id.0)
+                    {
+                        return EnsureDisposition::Failed(format!(
+                            "download policy '{}' denied download for model '{}'",
+                            state.download_policy, model_id.0
+                        ));
+                    }
+                    let entry = state.entries.get_mut(model_id).unwrap();
+                    entry.status = WeightsStatus::Queued;
+                    state.queue.push_back(model_id.clone());
+                    maybe_start_next(state, job_tx.clone());
+                    EnsureDisposition::Queued
+                } else {
+                    EnsureDisposition::Failed(error.clone())
+                }
+            }
+            WeightsStatus::Queued
+            | WeightsStatus::Resolving
+            | WeightsStatus::Downloading { .. } => {
+                if !state.queue.contains(model_id) && state.active.as_ref() != Some(model_id) {
+                    state.queue.push_back(model_id.clone());
+                    maybe_start_next(state, job_tx.clone());
+                    EnsureDisposition::Queued
+                } else {
+                    EnsureDisposition::InFlight
+                }
+            }
+        };
+    }
+
+    // New model: check download policy before admitting. Locally cached models
+    // always bypass the policy — they don't require a network download.
+    if !default_ref_cached(&model_id.0) && !state.download_policy.allows_download(&model_id.0) {
+        return EnsureDisposition::Failed(format!(
+            "download policy '{}' denied download for model '{}'",
+            state.download_policy, model_id.0
+        ));
+    }
+
+    state
+        .entries
+        .insert(model_id.clone(), Entry::default());
+    state.queue.push_back(model_id.clone());
+    maybe_start_next(state, job_tx.clone());
+    EnsureDisposition::Queued
+}
+
+fn notify_waiters(
+    state: &mut ManagerState,
+    model_id: &ModelId,
+    result: Result<ResolvedWeightKey, WeightsError>,
+) {
+    let Some(waiters) = state.waiters.remove(model_id) else {
+        return;
+    };
+
+    for waiter in waiters {
+        if waiter.is_closed() {
+            continue;
+        }
+        let _ = waiter.send(result.clone());
+    }
+}
+
 fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
     match evt {
         JobEvent::Resolved { model_id, revision } => {
@@ -327,6 +398,11 @@ fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
             entry.bundle = Some(bundle);
             state.active = None;
             info!(model = model_id.0, revision = revision.0, "weights ready");
+            let key = ResolvedWeightKey {
+                model_id: model_id.clone(),
+                revision: revision.clone(),
+            };
+            notify_waiters(state, &model_id, Ok(key));
         }
         JobEvent::Failed { model_id, error } => {
             let entry = state
@@ -339,6 +415,7 @@ fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
             entry.bundle = None;
             state.active = None;
             warn!(model = model_id.0, error, "weights failed");
+            notify_waiters(state, &model_id, Err(WeightsError::Failed(error.clone())));
         }
     }
 }
@@ -474,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_is_available_without_network() {
-        let weights = WeightsManager::spawn();
+        let weights = WeightsManager::spawn(DownloadPolicy::default());
         let snap = weights.snapshot().await.unwrap();
         assert!(snap.per_model.is_empty());
         assert!(snap.active.is_none());

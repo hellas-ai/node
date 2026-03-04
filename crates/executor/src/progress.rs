@@ -22,7 +22,7 @@ impl Executor {
 
         Ok((
             ExecuteProgress {
-                status: status.as_str().to_string(),
+                status: status as i32,
                 progress,
                 chunk: Vec::new(),
                 decoded: None,
@@ -36,13 +36,9 @@ impl Executor {
         execution_id: String,
         result: Option<Vec<u8>>,
         decoded: Option<String>,
-        success: bool,
+        status: ExecutionStatus,
     ) {
-        let status = if success {
-            ExecutionStatus::Completed
-        } else {
-            ExecutionStatus::Failed
-        };
+        let success = matches!(status, ExecutionStatus::Completed);
         info!(
             %execution_id,
             success,
@@ -56,6 +52,12 @@ impl Executor {
         if let Some(result) = result {
             if let Err(e) = self.state.set_result(&execution_id, result, decoded) {
                 warn!("failed to set result for {execution_id}: {e}");
+            }
+        } else if success && self.state.get_result(&execution_id).is_err() {
+            // Ensure terminal success has a readable (possibly empty) result even when
+            // streaming emitted no chunks (e.g. max_seq=0).
+            if let Err(e) = self.state.set_result(&execution_id, Vec::new(), decoded) {
+                warn!("failed to set default result for {execution_id}: {e}");
             }
         }
         self.send_status(&execution_id, status);
@@ -72,7 +74,7 @@ impl Executor {
         if let Some(watchers) = self.watchers.get_mut(execution_id) {
             watchers.retain(|tx| {
                 tx.send(ExecuteProgress {
-                    status: status.as_str().to_string(),
+                    status: status as i32,
                     progress,
                     chunk: chunk.clone(),
                     decoded: decoded.clone(),
