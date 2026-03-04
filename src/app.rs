@@ -6,7 +6,6 @@ mod persistence;
 
 pub use mailbox::{AppMailbox, FinalizationResponse, ProofResponse};
 
-use hellas_types::ObjectId;
 use crate::shard::WireShardMessage;
 use crate::shard::protocol::{ShardMessage, coding_config};
 use crate::shard::transport::ShardTransport;
@@ -22,7 +21,8 @@ use commonware_utils::{
 };
 use core::{AppCore, CoreEffect, CoreEffects, NetworkEffect};
 use futures::{StreamExt, channel::mpsc};
-use hellas_types::{Activity, PublicKey};
+use hellas_types::ObjectId;
+use hellas_types::{Activity, Address, PublicKey};
 use mailbox::{AppMailboxMessage, AppMailboxReadWriteMessage};
 use metrics::{ApplicationMetrics, CoreMetrics, PersistenceMetrics};
 use persistence::{PageCacheConfig, PersistenceCommand, PersistenceEvent, PersistenceWorker};
@@ -87,7 +87,7 @@ impl PersistenceHandle {
         context: E,
         partition_prefix: String,
         page_cache_config: PageCacheConfig,
-        validators: Vec<PublicKey>,
+        genesis_allocations: Vec<(Address, u64)>,
         metrics: PersistenceMetrics,
     ) -> Self
     where
@@ -100,7 +100,7 @@ impl PersistenceHandle {
                 &mut wc,
                 partition_prefix,
                 page_cache_config,
-                validators,
+                genesis_allocations,
                 cmd_rx,
                 event_tx,
                 metrics,
@@ -178,18 +178,12 @@ impl PersistenceHandle {
             .await
     }
 
-    async fn proof_for_object(
-        &mut self,
-        object: ObjectId,
-    ) -> Option<mailbox::ProofResponse> {
+    async fn proof_for_object(&mut self, object: ObjectId) -> Option<mailbox::ProofResponse> {
         self.query(move |response| PersistenceCommand::GetProof { object, response })
             .await
     }
 
-    async fn finalization(
-        &mut self,
-        payload: Digest,
-    ) -> Option<mailbox::FinalizationResponse> {
+    async fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
         self.query(move |response| PersistenceCommand::GetFinalization { payload, response })
             .await
     }
@@ -208,11 +202,7 @@ impl PersistenceHandle {
         self.send(PersistenceCommand::RecordPersistedRoot { payload, root });
     }
 
-    fn record_finalization(
-        &self,
-        payload: Digest,
-        finalization: mailbox::FinalizationResponse,
-    ) {
+    fn record_finalization(&self, payload: Digest, finalization: mailbox::FinalizationResponse) {
         self.send(PersistenceCommand::RecordFinalization {
             payload,
             finalization,
@@ -296,6 +286,7 @@ where
         relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
+        genesis_allocations: Vec<(Address, u64)>,
         partition_prefix: String,
         config: ApplicationConfig,
     ) -> Self {
@@ -308,6 +299,7 @@ where
             relay,
             me,
             validators,
+            genesis_allocations,
             partition_prefix,
             page_cache_config,
             config.verify_wait_timeout,
@@ -320,6 +312,7 @@ where
         relay: std::sync::Arc<T>,
         me: &PublicKey,
         validators: Vec<PublicKey>,
+        genesis_allocations: Vec<(Address, u64)>,
         partition_prefix: String,
         page_cache_config: PageCacheConfig,
         verify_wait_timeout: Duration,
@@ -339,6 +332,7 @@ where
         let core = AppCore::new(
             me,
             validators.clone(),
+            genesis_allocations.clone(),
             my_index,
             coding_config,
             verify_wait_timeout
@@ -353,7 +347,7 @@ where
             context.clone(),
             partition_prefix,
             page_cache_config,
-            validators,
+            genesis_allocations,
             persistence_metrics,
         );
 
@@ -451,8 +445,12 @@ where
                     && let WireShardMessage::FetchPayload { digest } = &message.body
                 {
                     if let Some(payload) = self.persistence.payload(*digest).await {
-                        self.core
-                            .resolve_payload_locally(*digest, payload, now, &mut resolve_effects);
+                        self.core.resolve_payload_locally(
+                            *digest,
+                            payload,
+                            now,
+                            &mut resolve_effects,
+                        );
                         resolved_any = true;
                         local_resolved_total += 1;
                         continue;
@@ -579,11 +577,7 @@ where
                         self.relay
                             .send_to(
                                 &sender,
-                                ShardMessage::payload_response(
-                                    self.core.me(),
-                                    *digest,
-                                    payload,
-                                ),
+                                ShardMessage::payload_response(self.core.me(), *digest, payload),
                             )
                             .await;
                     }
@@ -604,9 +598,9 @@ where
                     );
                 }
                 let relay = &self.relay;
-                let effects =
-                    self.core
-                        .on_shard_message(message, now, &|sender| relay.validator_index(sender));
+                let effects = self
+                    .core
+                    .on_shard_message(message, now, &|sender| relay.validator_index(sender));
                 self.apply_core_effects(effects, now).await;
             }
             AppMailboxReadWriteMessage::FinalizationEvent { notice } => {
@@ -627,7 +621,8 @@ where
                     .entered();
                     self.core.on_finalized(payload, parent_payload, now)
                 };
-                self.persistence.record_finalization(payload, certificate_bytes);
+                self.persistence
+                    .record_finalization(payload, certificate_bytes);
                 let pending = self.core.unpersisted_finalization_count();
                 if pending > Self::MAX_PENDING_PERSISTENCE_QUEUE {
                     error!(
@@ -661,18 +656,22 @@ where
                 let _ = response.send(self.persistence.finalization(payload).await);
             }
             AppMailboxReadWriteMessage::GetLatestBlock { response } => {
-                let block = self.persistence.latest_block().await.map(
-                    |(height, payload, state_root)| {
-                        hellas_types::rpc::LatestBlock {
-                            height,
-                            payload,
-                            state_root,
-                        }
-                    },
-                );
+                let block =
+                    self.persistence
+                        .latest_block()
+                        .await
+                        .map(
+                            |(height, payload, state_root)| hellas_types::rpc::LatestBlock {
+                                height,
+                                payload,
+                                state_root,
+                            },
+                        );
                 let _ = response.send(block);
             }
-            message @ AppMailboxReadWriteMessage::Propose { .. } if !self.min_propose_delay.is_zero() => {
+            message @ AppMailboxReadWriteMessage::Propose { .. }
+                if !self.min_propose_delay.is_zero() =>
+            {
                 self.app_metrics.propose_throttled_total.inc();
                 context.sleep(self.min_propose_delay).await;
                 let now = context.current().epoch_millis();
@@ -776,7 +775,6 @@ where
                 }
             }));
         }
-
     }
 
     async fn on_shutdown(&mut self, _context: &mut E, _args: &mut AppMailbox) {
@@ -806,7 +804,6 @@ mod tests {
     };
     use super::*;
     use crate::execution::store::UtxoDb;
-    use hellas_types::{Address, Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
     use crate::shard::mock::MockShardTransport;
     use bytes::Bytes;
     use commonware_consensus::minimmit::scheme::ed25519 as minimmit_ed25519;
@@ -815,6 +812,7 @@ mod tests {
     use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_cryptography::{Sha256, Signer};
     use commonware_runtime::{Clock, ContextCell, Metrics, Runner, deterministic};
+    use hellas_types::{Address, Coin, GENESIS_BALANCE, Transaction, genesis_object_id};
     use hellas_types::{Context, PrivateKey, PublicKey};
     use proptest::prelude::*;
     use std::{sync::Arc, time::Duration};
@@ -849,6 +847,14 @@ mod tests {
         (round, parent, contents, payload)
     }
 
+    fn genesis_allocations(validators: &[PublicKey]) -> Vec<(Address, u64)> {
+        validators
+            .iter()
+            .cloned()
+            .map(|validator| (Address::from(validator), GENESIS_BALANCE))
+            .collect()
+    }
+
     fn start_single_validator_app(
         context: &deterministic::Context,
         label: &str,
@@ -864,6 +870,7 @@ mod tests {
             relay,
             key,
             vec![key.clone()],
+            vec![(Address::from(key.clone()), GENESIS_BALANCE)],
             partition.to_string(),
             ApplicationConfig::default(),
         );
@@ -885,6 +892,7 @@ mod tests {
 
         let mut handles = Vec::with_capacity(participants.len());
         let mut mailboxes = Vec::with_capacity(participants.len());
+        let allocations = genesis_allocations(participants);
 
         for (idx, participant) in participants.iter().enumerate() {
             let app = Application::new(
@@ -892,6 +900,7 @@ mod tests {
                 relay.clone(),
                 participant,
                 participants.to_vec(),
+                allocations.clone(),
                 format!("{partition_prefix}_{idx}"),
                 ApplicationConfig::default(),
             );
@@ -974,7 +983,12 @@ mod tests {
         let epoch = Epoch::new(1);
         let genesis = mailbox.genesis(epoch).await;
 
-        let tx = Transaction::transfer(sender, genesis_object_id(0), hellas_types::Address::from(recipient_pk.clone()), 1);
+        let tx = Transaction::transfer(
+            sender,
+            genesis_object_id(0),
+            hellas_types::Address::from(recipient_pk.clone()),
+            1,
+        );
         mailbox.submit_tx(tx).await;
 
         let sender_pk = sender.public_key();
@@ -1384,8 +1398,10 @@ mod tests {
     /// merkleization, or any other commit-time side effect.
     #[test_log::test]
     fn two_qmdb_instances_agree_on_roots() {
-        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
         use crate::execution::genesis_state;
+        use crate::execution::store::{
+            DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE, utxo_db_config,
+        };
 
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1393,6 +1409,7 @@ mod tests {
             let validators: Vec<PublicKey> = (0..6)
                 .map(|seed| PrivateKey::from_seed(seed).public_key())
                 .collect();
+            let allocations = genesis_allocations(&validators);
 
             // Create two completely independent DBs.
             let cfg_a = utxo_db_config(
@@ -1415,7 +1432,7 @@ mod tests {
                 .expect("db_b init");
 
             // --- Round 0: genesis bootstrap ---
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&allocations);
             let batch: Vec<(ObjectId, Option<Coin>)> = genesis
                 .created
                 .iter()
@@ -1453,10 +1470,7 @@ mod tests {
                 let (db, root_b) = apply(db_b, batch).await;
                 db_a = da;
                 db_b = db;
-                assert_eq!(
-                    root_a, root_b,
-                    "roots must match after round {round}"
-                );
+                assert_eq!(root_a, root_b, "roots must match after round {round}");
             }
         });
     }
@@ -1470,8 +1484,10 @@ mod tests {
     /// validators.  The persistence layer must always use `commit(None)`.
     #[test_log::test]
     fn commit_metadata_affects_root() {
-        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
         use crate::execution::genesis_state;
+        use crate::execution::store::{
+            DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE, utxo_db_config,
+        };
 
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1479,6 +1495,7 @@ mod tests {
             let validators: Vec<PublicKey> = (0..6)
                 .map(|seed| PrivateKey::from_seed(seed).public_key())
                 .collect();
+            let allocations = genesis_allocations(&validators);
 
             let cfg_a = utxo_db_config(
                 &context,
@@ -1499,7 +1516,7 @@ mod tests {
                 .await
                 .expect("db_b init");
 
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&allocations);
             let batch: Vec<(ObjectId, Option<Coin>)> = genesis
                 .created
                 .iter()
@@ -1542,8 +1559,10 @@ mod tests {
     /// the diff batch is empty**, preserving root determinism.
     #[test_log::test]
     fn empty_commit_changes_root() {
-        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
         use crate::execution::genesis_state;
+        use crate::execution::store::{
+            DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE, utxo_db_config,
+        };
 
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1551,6 +1570,7 @@ mod tests {
             let validators: Vec<PublicKey> = (0..6)
                 .map(|seed| PrivateKey::from_seed(seed).public_key())
                 .collect();
+            let allocations = genesis_allocations(&validators);
 
             let cfg = utxo_db_config(
                 &context,
@@ -1563,7 +1583,7 @@ mod tests {
                 .expect("db init");
 
             // Bootstrap genesis.
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&allocations);
             let batch: Vec<(ObjectId, Option<Coin>)> = genesis
                 .created
                 .iter()
@@ -1577,7 +1597,9 @@ mod tests {
 
             // Empty commit — no writes, no metadata.
             let mut m = db.into_mutable();
-            m.write_batch(Vec::<(ObjectId, Option<Coin>)>::new()).await.unwrap();
+            m.write_batch(Vec::<(ObjectId, Option<Coin>)>::new())
+                .await
+                .unwrap();
             let (d, _) = m.commit(None).await.unwrap();
             db = d.into_merkleized().await.unwrap();
             let root_after = db.root();
@@ -1636,14 +1658,17 @@ mod tests {
     /// journal-replay non-determinism without any Application-level machinery.
     #[test_log::test]
     fn qmdb_root_survives_sync_and_reopen() {
-        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
         use crate::execution::genesis_state;
+        use crate::execution::store::{
+            DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE, utxo_db_config,
+        };
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
         runner.start(|context| async move {
             let validators: Vec<PublicKey> = (0..6)
                 .map(|seed| PrivateKey::from_seed(seed).public_key())
                 .collect();
+            let allocations = genesis_allocations(&validators);
             let partition = "reopen_determinism";
 
             let cfg = utxo_db_config(
@@ -1657,7 +1682,7 @@ mod tests {
                 .expect("init");
 
             // Bootstrap genesis.
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&allocations);
             let batch: Vec<(ObjectId, Option<Coin>)> = genesis
                 .created
                 .iter()
@@ -1697,8 +1722,10 @@ mod tests {
     /// may lag, requiring replay on reopen.
     #[test_log::test]
     fn qmdb_root_survives_crash_and_reopen() {
-        use crate::execution::store::{utxo_db_config, DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE};
         use crate::execution::genesis_state;
+        use crate::execution::store::{
+            DEFAULT_PAGE_CACHE_COUNT, DEFAULT_PAGE_CACHE_SIZE, utxo_db_config,
+        };
 
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
 
@@ -1706,6 +1733,7 @@ mod tests {
             let validators: Vec<PublicKey> = (0..6)
                 .map(|seed| PrivateKey::from_seed(seed).public_key())
                 .collect();
+            let allocations = genesis_allocations(&validators);
             let partition = "crash_determinism";
 
             let cfg = utxo_db_config(
@@ -1719,7 +1747,7 @@ mod tests {
                 .expect("init");
 
             // Bootstrap genesis.
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&allocations);
             let batch: Vec<(ObjectId, Option<Coin>)> = genesis
                 .created
                 .iter()
@@ -1776,12 +1804,8 @@ mod tests {
 
         runner.start(|context| async move {
             let key = PrivateKey::from_seed(42).public_key();
-            let (_handle, mut mailbox) = start_single_validator_app(
-                &context,
-                "lc_app",
-                &key,
-                "lc_partition",
-            );
+            let (_handle, mut mailbox) =
+                start_single_validator_app(&context, "lc_app", &key, "lc_partition");
             let _ = mailbox.genesis(Epoch::new(1)).await;
 
             let lc = LocalLightClient::new(mailbox, vec![]);
@@ -1802,8 +1826,7 @@ mod tests {
                 .expect("query should succeed")
                 .expect("proof should exist");
 
-            let proof = rpc::decode_proof(&proof_bytes)
-                .expect("proof should decode");
+            let proof = rpc::decode_proof(&proof_bytes).expect("proof should decode");
 
             let mut hasher = Sha256::default();
             assert!(
@@ -1828,14 +1851,10 @@ mod tests {
         use hellas_rpc::client::RemoteLightClient;
         use hellas_types::rpc::LightClient;
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "hellas_grpc_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("hellas_grpc_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
-        let runtime_cfg =
-            cw_tokio::Config::new().with_storage_directory(tmp_dir.to_str().unwrap());
+        let runtime_cfg = cw_tokio::Config::new().with_storage_directory(tmp_dir.to_str().unwrap());
         let runner = cw_tokio::Runner::new(runtime_cfg);
 
         runner.start(|context| async move {
@@ -1849,6 +1868,7 @@ mod tests {
                 relay,
                 &key,
                 vec![key.clone()],
+                vec![(Address::from(key.clone()), GENESIS_BALANCE)],
                 "grpc_partition".to_string(),
                 ApplicationConfig::default(),
             );
@@ -1858,10 +1878,10 @@ mod tests {
             let light_client = LocalLightClient::new(mailbox, vec![]);
 
             // Start ws-mux server on a random port.
-            let (activity_tx, _) = tokio::sync::broadcast::channel::<hellas_types::rpc::ConsensusActivity>(16);
+            let (activity_tx, _) =
+                tokio::sync::broadcast::channel::<hellas_types::rpc::ConsensusActivity>(16);
             let svc = hellas_rpc::mux::MuxServiceDispatch::new(
-                crate::rpc::LightClientGrpcServer::new(light_client, activity_tx)
-                    .into_service(),
+                crate::rpc::LightClientGrpcServer::new(light_client, activity_tx).into_service(),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1871,7 +1891,9 @@ mod tests {
             ::tokio::spawn(async move {
                 use futures::StreamExt;
                 let (tcp, _) = listener.accept().await.expect("accept");
-                let ws = tokio_tungstenite::accept_async(tcp).await.expect("ws handshake");
+                let ws = tokio_tungstenite::accept_async(tcp)
+                    .await
+                    .expect("ws handshake");
                 let (write, read) = ws.split();
                 let sink = ws_mux::NativeWsSink::new(write);
                 let recv = ws_mux::NativeWsRecv::new(read);
@@ -1897,8 +1919,7 @@ mod tests {
                 .expect("get_proof should succeed")
                 .expect("proof should exist");
 
-            let proof =
-                rpc::decode_proof(&proof_bytes).expect("proof should decode");
+            let proof = rpc::decode_proof(&proof_bytes).expect("proof should decode");
             let mut hasher = Sha256::default();
             assert!(
                 UtxoDb::<ContextCell<cw_tokio::Context>>::verify_key_value_proof(

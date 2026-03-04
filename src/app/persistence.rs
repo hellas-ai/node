@@ -1,15 +1,12 @@
 use super::{mailbox, metrics::PersistenceMetrics};
 use crate::execution::store::{UtxoDb, utxo_db_config};
-use crate::gauged::{GaugedIndexMap, GaugedVecDeque};
 use crate::execution::{FinalizationDiffs, genesis_state};
-use hellas_types::{Coin, ObjectId};
+use crate::gauged::{GaugedIndexMap, GaugedVecDeque};
 use crate::trace::Traced;
 use bytes::{Buf, Bytes};
 use commonware_codec::{FixedSize, RangeCfg, Read as CodecRead, ReadExt, ReadRangeExt, Write};
 use commonware_cryptography::{Sha256, sha256::Digest};
-use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef,
-};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef};
 use commonware_storage::{
     Persistable,
     freezer::{
@@ -21,13 +18,13 @@ use commonware_storage::{
 };
 use commonware_utils::{channel::oneshot, sequence::U64};
 use futures::{StreamExt, channel::mpsc};
-use tracing::Instrument;
-use hellas_types::PublicKey;
+use hellas_types::{Address, Coin, ObjectId};
 use std::{
     collections::{HashMap, VecDeque},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::LazyLock,
 };
+use tracing::Instrument;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -163,9 +160,8 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         .await
         .map_err(|err| Fatal(format!("queue cursor init failed: {err:?}")))?;
 
-        let last_committed_position = cursor_index
-            .get(&*QUEUE_CURSOR_KEY)
-            .map(|bytes: &Vec<u8>| {
+        let last_committed_position =
+            cursor_index.get(&*QUEUE_CURSOR_KEY).map(|bytes: &Vec<u8>| {
                 let arr: [u8; 8] = bytes[..8]
                     .try_into()
                     .expect("queue cursor value is 8 bytes");
@@ -180,9 +176,9 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
     }
 
     fn load_checkpoint(&self, key: &Digest) -> Option<FreezerCheckpoint> {
-        self.cursor_index.get(key).and_then(|bytes| {
-            FreezerCheckpoint::read_cfg(&mut bytes.as_slice(), &()).ok()
-        })
+        self.cursor_index
+            .get(key)
+            .and_then(|bytes| FreezerCheckpoint::read_cfg(&mut bytes.as_slice(), &()).ok())
     }
 
     fn save_checkpoint(&mut self, key: Digest, cp: FreezerCheckpoint) {
@@ -219,10 +215,8 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         // validators with different persistence queue depths.
         if batch.is_empty() {
             if let Some(pos) = queue_position {
-                self.cursor_index.put(
-                    *QUEUE_CURSOR_KEY,
-                    pos.to_le_bytes().to_vec(),
-                );
+                self.cursor_index
+                    .put(*QUEUE_CURSOR_KEY, pos.to_le_bytes().to_vec());
                 self.cursor_index.sync().await.map_err(|err| {
                     Fatal(format!("queue cursor sync failed for {label}: {err:?}"))
                 })?;
@@ -233,26 +227,27 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
 
         let mut db = self.db.into_mutable();
 
-        db.write_batch(batch).await.map_err(|err| {
-            Fatal(format!("QMDB write_batch failed for {label}: {err:?}"))
-        })?;
+        db.write_batch(batch)
+            .await
+            .map_err(|err| Fatal(format!("QMDB write_batch failed for {label}: {err:?}")))?;
 
-        let (db, _range) = db.commit(None).await.map_err(|err| {
-            Fatal(format!("QMDB commit failed for {label}: {err:?}"))
-        })?;
+        let (db, _range) = db
+            .commit(None)
+            .await
+            .map_err(|err| Fatal(format!("QMDB commit failed for {label}: {err:?}")))?;
 
-        let db = db.into_merkleized().await.map_err(|err| {
-            Fatal(format!("QMDB merkleize failed for {label}: {err:?}"))
-        })?;
+        let db = db
+            .into_merkleized()
+            .await
+            .map_err(|err| Fatal(format!("QMDB merkleize failed for {label}: {err:?}")))?;
 
         if let Some(pos) = queue_position {
-            self.cursor_index.put(
-                *QUEUE_CURSOR_KEY,
-                pos.to_le_bytes().to_vec(),
-            );
-            self.cursor_index.sync().await.map_err(|err| {
-                Fatal(format!("queue cursor sync failed for {label}: {err:?}"))
-            })?;
+            self.cursor_index
+                .put(*QUEUE_CURSOR_KEY, pos.to_le_bytes().to_vec());
+            self.cursor_index
+                .sync()
+                .await
+                .map_err(|err| Fatal(format!("queue cursor sync failed for {label}: {err:?}")))?;
             self.last_committed_position = Some(pos);
         }
         self.db = db;
@@ -272,10 +267,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         hasher: &mut Sha256,
         object: ObjectId,
     ) -> Option<mailbox::ProofResponse> {
-        self.db
-            .key_value_proof(hasher, object)
-            .await
-            .ok()
+        self.db.key_value_proof(hasher, object).await.ok()
     }
 
     async fn sync(&mut self) -> Result<(), Fatal> {
@@ -332,7 +324,7 @@ where
         context: &mut E,
         partition_prefix: String,
         page_cache_config: PageCacheConfig,
-        validators: Vec<PublicKey>,
+        genesis_allocations: Vec<(Address, u64)>,
         command_rx: mpsc::UnboundedReceiver<Traced<PersistenceCommand>>,
         event_tx: mpsc::UnboundedSender<Traced<PersistenceEvent>>,
         metrics: PersistenceMetrics,
@@ -361,7 +353,7 @@ where
         .await?;
 
         if store.is_empty() {
-            let genesis = genesis_state(&validators);
+            let genesis = genesis_state(&genesis_allocations);
             let batch = UtxoStore::<E>::diffs_to_batch(&genesis.created, &genesis.deleted);
             store = store.apply_diffs(batch, None, "genesis bootstrap").await?;
         }
@@ -395,12 +387,13 @@ where
         self.update_queue_depth().await;
         let root = self.store.root();
         let recovered_payloads = self.recover_payload_chain().await;
-        if let Err(err) = self.event_tx.unbounded_send(Traced::capture(
-            PersistenceEvent::Ready {
+        if let Err(err) = self
+            .event_tx
+            .unbounded_send(Traced::capture(PersistenceEvent::Ready {
                 root,
                 recovered_payloads,
-            },
-        )) {
+            }))
+        {
             warn!(
                 ?err,
                 "failed to notify application that persistence worker is ready"
@@ -451,7 +444,6 @@ where
         std::process::abort()
     }
 
-
     async fn process_command(
         &mut self,
         command: Traced<PersistenceCommand>,
@@ -468,14 +460,18 @@ where
     }
 
     async fn update_queue_depth(&self) {
-        let depth = self.queue.size().await.saturating_sub(self.queue.ack_floor());
+        let depth = self
+            .queue
+            .size()
+            .await
+            .saturating_sub(self.queue.ack_floor());
         self.metrics.queue_depth.set(depth as i64);
     }
 
     #[tracing::instrument(
         name = "app.persistence.persist_next_pending",
         level = "info",
-        skip_all,
+        skip_all
     )]
     async fn persist_next_pending(mut self) -> Result<Self, Fatal> {
         let (position, encoded) = match self.queue.dequeue().await {
@@ -484,7 +480,7 @@ where
             Err(err) => {
                 return Err(Fatal(format!(
                     "failed to dequeue persistence intent: {err:?}"
-                )))
+                )));
             }
         };
 
@@ -514,9 +510,12 @@ where
             self.record_persisted_anchor(payload, root).await?;
             self.metrics.persist_success_total.inc();
             self.update_queue_depth().await;
-            let _ = self.event_tx.unbounded_send(
-                Traced::capture(PersistenceEvent::Persisted { payload, root }),
-            );
+            let _ = self
+                .event_tx
+                .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
+                    payload,
+                    root,
+                }));
             return Ok(self);
         }
 
@@ -532,7 +531,10 @@ where
 
         let batch = UtxoStore::<E>::diffs_to_batch(&diffs.created, &diffs.deleted);
         let label = format!("{payload:?}");
-        self.store = self.store.apply_diffs(batch, Some(position), &label).await?;
+        self.store = self
+            .store
+            .apply_diffs(batch, Some(position), &label)
+            .await?;
         let root = self.store.root();
         self.metrics.utxo_committed_position.set(position as i64);
 
@@ -551,12 +553,12 @@ where
         self.metrics.persist_success_total.inc();
         self.update_queue_depth().await;
         self.record_persisted_anchor(payload, root).await?;
-        if let Err(err) = self
-            .event_tx
-            .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
-                payload,
-                root,
-            }))
+        if let Err(err) =
+            self.event_tx
+                .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
+                    payload,
+                    root,
+                }))
         {
             warn!(
                 ?err,
@@ -684,8 +686,6 @@ where
         }
     }
 
-
-
     async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
         let mut hasher = Sha256::default();
         self.store.key_value_proof(&mut hasher, object).await
@@ -714,7 +714,10 @@ where
 
     fn cache_finalization(&mut self, payload: Digest, finalization: mailbox::FinalizationResponse) {
         self.volatile_finalizations.insert(payload, finalization);
-        for _ in self.volatile_finalizations.enforce_capacity(Self::MAX_VOLATILE_FINALIZATIONS) {
+        for _ in self
+            .volatile_finalizations
+            .enforce_capacity(Self::MAX_VOLATILE_FINALIZATIONS)
+        {
             self.metrics.finalization_cache_evictions_total.inc();
         }
     }
@@ -742,7 +745,10 @@ where
 
     fn cache_payload(&mut self, payload: Digest, bytes: Bytes) {
         self.volatile_payloads.insert(payload, bytes);
-        for _ in self.volatile_payloads.enforce_capacity(Self::MAX_VOLATILE_PAYLOADS) {
+        for _ in self
+            .volatile_payloads
+            .enforce_capacity(Self::MAX_VOLATILE_PAYLOADS)
+        {
             self.metrics.payload_cache_evictions_total.inc();
         }
     }
@@ -774,10 +780,10 @@ where
         }
 
         let sequence = self.next_anchor_sequence;
-        self.next_anchor_sequence =
-            self.next_anchor_sequence
-                .checked_add(1)
-                .ok_or_else(|| Fatal("anchor sequence counter overflowed".into()))?;
+        self.next_anchor_sequence = self
+            .next_anchor_sequence
+            .checked_add(1)
+            .ok_or_else(|| Fatal("anchor sequence counter overflowed".into()))?;
 
         self.anchor_history.push_back(AnchorEntry {
             sequence,
@@ -789,7 +795,10 @@ where
             U64::new(sequence),
             Self::encode_anchor_record(payload, root),
         );
-        for oldest in self.anchor_history.enforce_capacity(Self::MAX_ANCHOR_HISTORY) {
+        for oldest in self
+            .anchor_history
+            .enforce_capacity(Self::MAX_ANCHOR_HISTORY)
+        {
             self.anchor_index.remove(&U64::new(oldest.sequence));
             self.metrics.anchor_history_evictions_total.inc();
         }
@@ -846,15 +855,11 @@ where
                 ))
             })?;
         self.finalization_cursors.insert(payload, cursor);
-        let cp = self
-            .finalization_index
-            .sync()
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to sync finalization certificate index for {payload:?}: {err:?}"
-                ))
-            })?;
+        let cp = self.finalization_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync finalization certificate index for {payload:?}: {err:?}"
+            ))
+        })?;
         self.store.save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, cp);
         self.store.cursor_index.sync().await.map_err(|err| {
             Fatal(format!(
@@ -869,9 +874,7 @@ where
     async fn record_payload(&mut self, payload: Digest, bytes: Bytes) -> Result<(), Fatal> {
         if let Some(existing) = self.volatile_payloads.get(&payload) {
             if existing != &bytes {
-                return Err(Fatal(format!(
-                    "conflicting payload bytes for {payload:?}"
-                )));
+                return Err(Fatal(format!("conflicting payload bytes for {payload:?}")));
             }
             return Ok(());
         }
@@ -902,21 +905,13 @@ where
             .payload_index
             .put(payload, bytes.as_ref().to_vec())
             .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to put payload for {payload:?}: {err:?}"
-                ))
-            })?;
+            .map_err(|err| Fatal(format!("failed to put payload for {payload:?}: {err:?}")))?;
         self.payload_cursors.insert(payload, cursor);
-        let cp = self
-            .payload_index
-            .sync()
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to sync payload index for {payload:?}: {err:?}"
-                ))
-            })?;
+        let cp = self.payload_index.sync().await.map_err(|err| {
+            Fatal(format!(
+                "failed to sync payload index for {payload:?}: {err:?}"
+            ))
+        })?;
         self.store.save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, cp);
         self.store.cursor_index.sync().await.map_err(|err| {
             Fatal(format!(
@@ -928,9 +923,7 @@ where
         Ok(())
     }
 
-    fn anchor_metadata_config(
-        partition_prefix: &str,
-    ) -> MetadataConfig<(RangeCfg<usize>, ())> {
+    fn anchor_metadata_config(partition_prefix: &str) -> MetadataConfig<(RangeCfg<usize>, ())> {
         MetadataConfig {
             partition: format!("{partition_prefix}_anchor_roots"),
             codec_config: ((0..=Self::MAX_ANCHOR_RECORD_BYTES).into(), ()),
@@ -1048,9 +1041,10 @@ where
             .back()
             .map(|entry| entry.sequence.saturating_add(1))
             .unwrap_or(0);
-        index.sync().await.map_err(|err| {
-            Fatal(format!("failed to sync recovered anchor index: {err:?}"))
-        })?;
+        index
+            .sync()
+            .await
+            .map_err(|err| Fatal(format!("failed to sync recovered anchor index: {err:?}")))?;
         Ok((index, recovered, next_sequence))
     }
 
@@ -1062,17 +1056,9 @@ where
     ) -> Result<FinalizationIndex<E>, Fatal> {
         let config =
             Self::finalization_freezer_config(context, partition_prefix, page_cache_config);
-        Freezer::init_with_checkpoint(
-            context.with_label("finalization_index"),
-            config,
-            checkpoint,
-        )
-        .await
-        .map_err(|err| {
-            Fatal(format!(
-                "finalization index initialization failed: {err:?}"
-            ))
-        })
+        Freezer::init_with_checkpoint(context.with_label("finalization_index"), config, checkpoint)
+            .await
+            .map_err(|err| Fatal(format!("finalization index initialization failed: {err:?}")))
     }
 
     async fn initialize_payload_index(
@@ -1082,13 +1068,9 @@ where
         checkpoint: Option<FreezerCheckpoint>,
     ) -> Result<PayloadIndex<E>, Fatal> {
         let config = Self::payload_freezer_config(context, partition_prefix, page_cache_config);
-        Freezer::init_with_checkpoint(
-            context.with_label("payload_index"),
-            config,
-            checkpoint,
-        )
-        .await
-        .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
+        Freezer::init_with_checkpoint(context.with_label("payload_index"), config, checkpoint)
+            .await
+            .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
     }
 
     async fn initialize_queue(
@@ -1099,11 +1081,7 @@ where
         let config = Self::queue_config(context, partition_prefix, page_cache_config);
         PersistenceQueue::init(context.with_label("persistence_queue"), config)
             .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "persistence queue initialization failed: {err:?}"
-                ))
-            })
+            .map_err(|err| Fatal(format!("persistence queue initialization failed: {err:?}")))
     }
 
     /// Walk backward from the latest anchor through the payload Freezer,
@@ -1157,39 +1135,29 @@ where
             ))
         })?;
         self.store.sync().await?;
-        self.anchor_index.sync().await.map_err(|err| {
+        self.anchor_index
+            .sync()
+            .await
+            .map_err(|err| Fatal(format!("anchor index sync on shutdown failed: {err:?}")))?;
+
+        let fin_cp = self.finalization_index.close().await.map_err(|err| {
             Fatal(format!(
-                "anchor index sync on shutdown failed: {err:?}"
+                "finalization index close on shutdown failed: {err:?}"
             ))
         })?;
-
-        let fin_cp = self
-            .finalization_index
-            .close()
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "finalization index close on shutdown failed: {err:?}"
-                ))
-            })?;
         let pay_cp = self
             .payload_index
             .close()
             .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "payload index close on shutdown failed: {err:?}"
-                ))
-            })?;
+            .map_err(|err| Fatal(format!("payload index close on shutdown failed: {err:?}")))?;
 
         self.store
             .save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, fin_cp);
+        self.store.save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, pay_cp);
         self.store
-            .save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, pay_cp);
-        self.store.cursor_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "cursor index sync on shutdown failed: {err:?}"
-            ))
-        })
+            .cursor_index
+            .sync()
+            .await
+            .map_err(|err| Fatal(format!("cursor index sync on shutdown failed: {err:?}")))
     }
 }

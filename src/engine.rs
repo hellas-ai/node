@@ -8,8 +8,8 @@ use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
-use hellas_types::{Activity, PublicKey, Scheme};
 use hellas_types::rpc::{ConsensusActivity, NotarizeInfo, ProposalInfo};
+use hellas_types::{Activity, Address, PublicKey, Scheme};
 use prometheus_client::metrics::counter::Counter;
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
@@ -25,7 +25,9 @@ fn proposal_info(p: &commonware_consensus::minimmit::types::Proposal<Digest>) ->
     }
 }
 
-fn notarize_info(n: &commonware_consensus::minimmit::types::Notarize<Scheme, Digest>) -> NotarizeInfo {
+fn notarize_info(
+    n: &commonware_consensus::minimmit::types::Notarize<Scheme, Digest>,
+) -> NotarizeInfo {
     NotarizeInfo {
         proposal: proposal_info(&n.proposal),
         signer: n.attestation.signer.get(),
@@ -157,6 +159,7 @@ where
         blocker: B,
         relay: Arc<AuthenticatedShardTransport<S, N>>,
         me: &PublicKey,
+        genesis_allocations: Vec<(Address, u64)>,
         reporter: R,
     ) -> (Self, AppMailbox, broadcast::Sender<ConsensusActivity>)
     where
@@ -170,6 +173,7 @@ where
             relay.clone(),
             me,
             validators,
+            genesis_allocations,
             partition_prefix,
             ApplicationConfig {
                 page_cache_size: config.page_cache_size,
@@ -181,9 +185,22 @@ where
         let (app_handle, mailbox) = app.start();
         let tx_mailbox = mailbox.clone();
         let (activity_tx, _) = broadcast::channel(1024);
-        let reporter = AppReporter::new(&context.with_label("chain"), mailbox.clone(), reporter, activity_tx.clone());
+        let reporter = AppReporter::new(
+            &context.with_label("chain"),
+            mailbox.clone(),
+            reporter,
+            activity_tx.clone(),
+        );
 
-        let cfg = config.into_minimmit(&context, scheme, blocker, mailbox.clone(), mailbox, reporter, me);
+        let cfg = config.into_minimmit(
+            &context,
+            scheme,
+            blocker,
+            mailbox.clone(),
+            mailbox,
+            reporter,
+            me,
+        );
         let inner = minimmit::Engine::new(context, cfg);
 
         (Self { inner, app_handle }, tx_mailbox, activity_tx)

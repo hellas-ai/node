@@ -1,3 +1,4 @@
+use commonware_codec::Encode;
 use commonware_runtime::Metrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::{counter::Counter, family::Family, gauge::Gauge};
@@ -12,7 +13,7 @@ pub(crate) struct LeaderLabel {
 impl LeaderLabel {
     pub fn new(pk: &hellas_types::PublicKey) -> Self {
         Self {
-            leader: hellas_types::Address::from(pk.clone()).to_string(),
+            leader: hex::encode(pk.encode()),
         }
     }
 }

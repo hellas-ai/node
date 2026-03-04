@@ -2,11 +2,11 @@ use crate::app::AppMailbox;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewDelta};
 use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
-use commonware_p2p::{Address, Blocker};
+use commonware_p2p::{Address as P2pAddress, Blocker};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-use hellas_types::{Activity, EPOCH, PublicKey, Scheme};
+use hellas_types::{Activity, Address as UserAddress, EPOCH, PublicKey, Scheme};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -30,6 +30,10 @@ pub enum ConfigError {
     InvalidAddress(#[from] std::net::AddrParseError),
     #[error("duplicate keys in peer address map")]
     DuplicatePeerAddressKeys,
+    #[error("invalid genesis address: {0}")]
+    InvalidGenesisAddress(#[from] hellas_types::AddressError),
+    #[error("duplicate addresses in genesis allocations")]
+    DuplicateGenesisAddresses,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +164,8 @@ pub struct NodeConfig {
     /// proposal.  Useful for throttling a local cluster during development.
     #[serde(default)]
     pub min_propose_ms: Option<u64>,
+    #[serde(default)]
+    pub genesis_allocations: Vec<GenesisEntry>,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -167,6 +173,12 @@ pub struct NodeConfig {
 pub struct PeerEntry {
     pub public_key: String,
     pub address: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GenesisEntry {
+    pub address: String,
+    pub balance: u64,
 }
 
 impl NodeConfig {
@@ -203,25 +215,41 @@ impl NodeConfig {
         }
     }
 
-    pub fn peer_address_map(&self) -> Result<Map<PublicKey, Address>, ConfigError> {
+    pub fn peer_address_map(&self) -> Result<Map<PublicKey, P2pAddress>, ConfigError> {
         let me = self.public_key()?;
         let listen: SocketAddr = format!("0.0.0.0:{}", self.listen_port).parse()?;
 
-        let mut entries: Vec<(PublicKey, Address)> = self
+        let mut entries: Vec<(PublicKey, P2pAddress)> = self
             .peers
             .iter()
-            .map(|p| -> Result<(PublicKey, Address), ConfigError> {
+            .map(|p| -> Result<(PublicKey, P2pAddress), ConfigError> {
                 let bytes = hex::decode(&p.public_key)?;
                 let key: PublicKey = PublicKey::decode(bytes.as_slice())?;
                 let addr: SocketAddr = p.address.parse()?;
-                Ok((key, Address::Symmetric(addr)))
+                Ok((key, P2pAddress::Symmetric(addr)))
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
-        entries.push((me, Address::Symmetric(listen)));
+        entries.push((me, P2pAddress::Symmetric(listen)));
         match Map::try_from(entries) {
             Ok(map) => Ok(map),
             Err(_) => Err(ConfigError::DuplicatePeerAddressKeys),
         }
+    }
+
+    pub fn genesis_allocations(&self) -> Result<Vec<(UserAddress, u64)>, ConfigError> {
+        let mut allocations: Vec<(UserAddress, u64)> = self
+            .genesis_allocations
+            .iter()
+            .map(|entry| -> Result<(UserAddress, u64), ConfigError> {
+                let address: UserAddress = entry.address.parse()?;
+                Ok((address, entry.balance))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        if allocations.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ConfigError::DuplicateGenesisAddresses);
+        }
+        Ok(allocations)
     }
 }
 

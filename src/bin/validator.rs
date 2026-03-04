@@ -1,3 +1,4 @@
+use base64ct::{Base64UrlUnpadded, Encoding};
 use clap::{Parser, Subcommand};
 use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::certificate::Scheme as _;
@@ -10,8 +11,11 @@ use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_pr
 use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
+use p256::ecdsa::SigningKey as UserSigningKey;
+use p256::ecdsa::signature::Signer as _;
 use prometheus_client::metrics::gauge::Gauge;
 use rand::RngCore;
+use sha2::{Digest as _, Sha256 as Sha2};
 use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
@@ -35,6 +39,65 @@ fn random_private_key() -> ed25519::PrivateKey {
     rand::rngs::OsRng.fill_bytes(&mut raw);
     ed25519::PrivateKey::decode(raw.as_slice())
         .expect("decoding 32 random bytes as an ed25519 private key should always succeed")
+}
+
+fn random_user_private_key() -> UserSigningKey {
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    UserSigningKey::from_slice(&raw)
+        .expect("decoding 32 random bytes as a secp256r1 private key should succeed")
+}
+
+fn wallet_address_from_signing_key(key: &UserSigningKey) -> hellas_types::Address {
+    hellas_types::Address::from(hellas_types::UserPublicKey::from(
+        key.verifying_key().to_owned(),
+    ))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha2::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn mock_webauthn_sign(
+    key: &UserSigningKey,
+    challenge: &commonware_cryptography::sha256::Digest,
+    origin: &str,
+) -> Result<hellas_types::WebAuthnSignature, ValidatorError> {
+    let challenge_b64 = Base64UrlUnpadded::encode_string(&challenge.to_vec());
+    let client_data_json = format!(
+        r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+        hellas_types::WEBAUTHN_TYPE_GET,
+        challenge_b64,
+        origin
+    )
+    .into_bytes();
+
+    let rp_id_hash = hellas_types::rp_id_hash_from_origin(origin).ok_or_else(|| {
+        ValidatorError::InvalidSetup(format!("invalid WebAuthn origin for signing: {origin}"))
+    })?;
+
+    let mut authenticator_data = Vec::with_capacity(hellas_types::MIN_AUTHENTICATOR_DATA_LEN);
+    authenticator_data.extend_from_slice(&rp_id_hash);
+    authenticator_data.push(0x05); // UP | UV
+    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
+
+    let client_hash = sha256_bytes(&client_data_json);
+    let mut msg = Vec::with_capacity(authenticator_data.len() + client_hash.len());
+    msg.extend_from_slice(&authenticator_data);
+    msg.extend_from_slice(&client_hash);
+
+    let signed: p256::ecdsa::Signature = key.sign(&msg);
+    let normalized = signed.normalize_s().unwrap_or(signed);
+    let signature = hellas_types::UserSignature::decode(normalized.to_bytes().as_ref())
+        .map_err(|e| ValidatorError::InvalidSetup(format!("invalid signature bytes: {e}")))?;
+
+    Ok(hellas_types::WebAuthnSignature {
+        signature,
+        authenticator_data,
+        client_data_json,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -157,27 +220,33 @@ enum QueryCommand {
     },
     /// Submit a transfer transaction
     Transfer {
-        /// Hex-encoded 32-byte ed25519 private key (sender)
+        /// Hex-encoded 32-byte secp256r1 private key (sender)
         #[arg(long)]
         key: String,
         /// Hex-encoded 32-byte object ID of the input coin
         #[arg(long)]
         input: String,
-        /// Base58-encoded ed25519 public key of the recipient
+        /// Base58-encoded secp256r1 public key of the recipient
         #[arg(long)]
         recipient: String,
         /// Amount to transfer
         #[arg(long)]
         amount: u64,
+        /// WebAuthn origin embedded in clientDataJSON
+        #[arg(long, default_value = "https://wallet.hellas.ai")]
+        origin: String,
     },
     /// Submit a merge-coin transaction
     MergeCoin {
-        /// Hex-encoded 32-byte ed25519 private key (owner)
+        /// Hex-encoded 32-byte secp256r1 private key (owner)
         #[arg(long)]
         key: String,
         /// Comma-separated hex-encoded 32-byte object IDs to merge
         #[arg(long, value_delimiter = ',')]
         inputs: Vec<String>,
+        /// WebAuthn origin embedded in clientDataJSON
+        #[arg(long, default_value = "https://wallet.hellas.ai")]
+        origin: String,
     },
     /// Subscribe to consensus activity events
     Activity,
@@ -242,9 +311,9 @@ fn do_wallet(cmd: WalletCommand) -> Result<(), ValidatorError> {
                     ValidatorError::InvalidSetup(format!("failed to create directory: {e}"))
                 })?;
             }
-            let key = random_private_key();
-            let addr = hellas_types::Address::from(key.public_key());
-            let hex_key = hex::encode(key.encode());
+            let key = random_user_private_key();
+            let addr = wallet_address_from_signing_key(&key);
+            let hex_key = hex::encode(key.to_bytes());
             std::fs::write(&path, &hex_key).map_err(|e| {
                 ValidatorError::InvalidSetup(format!("failed to write wallet key: {e}"))
             })?;
@@ -260,7 +329,7 @@ fn do_wallet(cmd: WalletCommand) -> Result<(), ValidatorError> {
                 ))
             })?;
             let key = parse_hex_private_key(hex_key.trim())?;
-            let addr = hellas_types::Address::from(key.public_key());
+            let addr = wallet_address_from_signing_key(&key);
             println!("address: {addr}");
             Ok(())
         }
@@ -331,6 +400,7 @@ fn setup(
         ws_bind: None,
         explorer_url: ws_push,
         min_propose_ms,
+        genesis_allocations: Vec::new(),
         peers,
     };
 
@@ -351,11 +421,12 @@ fn parse_hex_digest(
     Ok(commonware_cryptography::sha256::Digest::from(arr))
 }
 
-fn parse_hex_private_key(hex_str: &str) -> Result<ed25519::PrivateKey, ValidatorError> {
+fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for key: {e}")))?;
-    ed25519::PrivateKey::decode(bytes.as_slice())
-        .map_err(|_| ValidatorError::InvalidSetup("key must be a valid ed25519 private key".into()))
+    UserSigningKey::from_slice(bytes.as_slice()).map_err(|_| {
+        ValidatorError::InvalidSetup("key must be a valid secp256r1 private key".into())
+    })
 }
 
 fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
@@ -443,31 +514,40 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                 input,
                 recipient,
                 amount,
+                origin,
             } => {
                 let private_key = parse_hex_private_key(&key)?;
                 let input_digest = parse_hex_digest(&input, "input")?;
                 let recipient_addr: hellas_types::Address = recipient.parse()
                     .map_err(|e: hellas_types::AddressError| ValidatorError::InvalidSetup(format!("bad recipient: {e}")))?;
-                let tx = hellas_types::Transaction::transfer(
-                    &private_key,
-                    input_digest,
-                    recipient_addr,
+                let challenge = hellas_types::transfer_challenge(&input_digest, &recipient_addr, amount);
+                let signature = mock_webauthn_sign(&private_key, &challenge, &origin)?;
+                let tx = hellas_types::Transaction::Transfer {
+                    input: input_digest,
+                    recipient: recipient_addr,
                     amount,
-                );
+                    signature,
+                };
                 client
                     .submit_tx(tx)
                     .await
                     .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
                 println!("transaction submitted");
             }
-            QueryCommand::MergeCoin { key, inputs } => {
+            QueryCommand::MergeCoin { key, inputs, origin } => {
                 let private_key = parse_hex_private_key(&key)?;
-                let input_digests: Vec<commonware_cryptography::sha256::Digest> = inputs
+                let mut input_digests: Vec<commonware_cryptography::sha256::Digest> = inputs
                     .iter()
                     .enumerate()
                     .map(|(i, hex_str)| parse_hex_digest(hex_str, &format!("inputs[{i}]")))
                     .collect::<Result<_, _>>()?;
-                let tx = hellas_types::Transaction::merge(&private_key, input_digests);
+                input_digests.sort();
+                let challenge = hellas_types::merge_challenge(&input_digests);
+                let signature = mock_webauthn_sign(&private_key, &challenge, &origin)?;
+                let tx = hellas_types::Transaction::MergeCoin {
+                    inputs: input_digests,
+                    signature,
+                };
                 client
                     .submit_tx(tx)
                     .await
@@ -697,6 +777,7 @@ fn run(
 
     let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
+    let genesis_allocations = node_config.genesis_allocations()?;
     if let Some(path) = log_json.as_ref() {
         eprintln!(
             "warning: --log-json file output ({}) is ignored by commonware_runtime::tokio::telemetry::init; enabling JSON logs on stderr instead",
@@ -831,6 +912,7 @@ fn run(
             oracle,
             relay.clone(),
             &me,
+            genesis_allocations.clone(),
             TraceReporter,
         );
         let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox, validators);

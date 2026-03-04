@@ -17,11 +17,11 @@ use commonware_storage::{
 };
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
+use hellas_chain::shard::AuthenticatedShardTransport;
+use hellas_types::{Activity, PrivateKey, PublicKey, Scheme};
 use hellas_types::{
     Address, Coin, GENESIS_BALANCE, Transaction, genesis_object_id, output_object_id,
 };
-use hellas_chain::shard::AuthenticatedShardTransport;
-use hellas_types::{Activity, PrivateKey, PublicKey, Scheme};
 use rand::rngs::OsRng;
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
@@ -60,6 +60,14 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(default)
+}
+
+fn genesis_allocations(validators: &[PublicKey]) -> Vec<(Address, u64)> {
+    validators
+        .iter()
+        .cloned()
+        .map(|validator| (Address::from(validator), GENESIS_BALANCE))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +143,7 @@ fn run_network(
             private_keys,
             ..
         }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+        let genesis_allocations = genesis_allocations(&participants);
 
         let quota = Quota::per_second(NonZeroU32::MAX);
         let mut registrations = HashMap::new();
@@ -197,6 +206,7 @@ fn run_network(
                 blocker,
                 relay.clone(),
                 validator,
+                genesis_allocations.clone(),
                 reporter,
             );
             let _shard_transport = relay.start(context.clone());
@@ -216,8 +226,12 @@ fn run_network(
                 .expect("sender must exist in validator set");
             let input =
                 genesis_object_id(u16::try_from(sender_index).expect("sender index in u16"));
-            let tx =
-                Transaction::transfer(&sender_key, input, Address::from(recipient_pk.clone()), transfer.amount);
+            let tx = Transaction::transfer(
+                &sender_key,
+                input,
+                Address::from(recipient_pk.clone()),
+                transfer.amount,
+            );
             let tx_digest = Sha256::hash(&tx.encode());
             let recipient_output = output_object_id(&tx_digest, 0);
             let change_output = output_object_id(&tx_digest, 1);
@@ -249,7 +263,9 @@ fn run_network(
                 let Some(coin) = mailbox.get_coin(payload, recipient_output).await else {
                     continue;
                 };
-                if coin.owner == Address::from(recipient_pk.clone()) && coin.value == transfer.amount {
+                if coin.owner == Address::from(recipient_pk.clone())
+                    && coin.value == transfer.amount
+                {
                     matched_payload = Some(payload);
                     break;
                 }
@@ -536,6 +552,7 @@ fn node_recovers_after_disconnect() {
             schemes,
             ..
         }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+        let genesis_allocations = genesis_allocations(&participants);
 
         let quota = Quota::per_second(NonZeroU32::MAX);
         let mut registrations = HashMap::new();
@@ -598,6 +615,7 @@ fn node_recovers_after_disconnect() {
                 blocker,
                 relay.clone(),
                 validator,
+                genesis_allocations.clone(),
                 reporter,
             );
             let _shard_transport = relay.start(context.clone());
@@ -866,6 +884,7 @@ fn cluster_resumes_after_unclean_restart() {
             schemes,
             ..
         }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+        let genesis_allocations = genesis_allocations(&participants);
 
         let quota = Quota::per_second(NonZeroU32::MAX);
 
@@ -933,6 +952,7 @@ fn cluster_resumes_after_unclean_restart() {
                     blocker,
                     relay.clone(),
                     validator,
+                    genesis_allocations.clone(),
                     reporter,
                 );
                 let _shard_transport = relay.start(context.clone());
@@ -1031,6 +1051,7 @@ fn cluster_resumes_after_unclean_restart() {
                     blocker,
                     relay.clone(),
                     validator,
+                    genesis_allocations.clone(),
                     reporter,
                 );
                 let _shard_transport = relay.start(context.clone());
@@ -1092,6 +1113,7 @@ fn single_node_restarts_and_proposes() {
             schemes,
             ..
         }: Fixture<Scheme> = minimmit_ed25519::fixture(&mut context, NAMESPACE, N);
+        let genesis_allocations = genesis_allocations(&participants);
 
         let quota = Quota::per_second(NonZeroU32::MAX);
 
@@ -1159,6 +1181,7 @@ fn single_node_restarts_and_proposes() {
                     blocker,
                     relay.clone(),
                     validator,
+                    genesis_allocations.clone(),
                     reporter,
                 );
                 let _shard_transport = relay.start(context.clone());
@@ -1282,6 +1305,7 @@ fn single_node_restarts_and_proposes() {
             oracle.control(participants[target].clone()),
             relay.clone(),
             &participants[target],
+            genesis_allocations.clone(),
             reporter_gen2,
         );
         let _shard_transport = relay.start(context.clone());

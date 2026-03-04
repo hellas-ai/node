@@ -16,7 +16,11 @@ use hellas_types::rpc::{
     ConsensusActivity, LatestBlock, LightClient, NotarizeInfo, ProposalInfo as TypesProposalInfo,
     QueryError,
 };
-use hellas_types::{Coin, DecodeExt, Encode, ObjectId, PublicKey, Signature, Transaction};
+use hellas_types::{
+    Coin, DecodeExt, Encode, MAX_AUTHENTICATOR_DATA_LEN, MAX_CLIENT_DATA_JSON_LEN,
+    MAX_MERGE_INPUTS, MIN_AUTHENTICATOR_DATA_LEN, ObjectId, Transaction, UserPublicKey,
+    UserSignature, WebAuthnSignature,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -342,15 +346,57 @@ fn parse_digest(bytes: &[u8], field: &str) -> Result<Digest, tonic::Status> {
 }
 
 fn parse_address(bytes: &[u8], field: &str) -> Result<hellas_types::Address, tonic::Status> {
-    let pk = PublicKey::decode(bytes).map_err(|_| {
-        tonic::Status::invalid_argument(format!("{field} must be a valid ed25519 public key"))
+    let pk = UserPublicKey::decode(bytes).map_err(|_| {
+        tonic::Status::invalid_argument(format!("{field} must be a valid secp256r1 public key"))
     })?;
     Ok(hellas_types::Address::from(pk))
 }
 
-fn parse_signature(bytes: &[u8], field: &str) -> Result<Signature, tonic::Status> {
-    Signature::decode(bytes)
-        .map_err(|_| tonic::Status::invalid_argument(format!("{field} must be 64 bytes")))
+fn parse_webauthn_signature(
+    sig: Option<hellas_rpc::pb::hellas::WebAuthnSignature>,
+    field: &str,
+) -> Result<WebAuthnSignature, tonic::Status> {
+    const MAX_DER_SIGNATURE_LEN: usize = 80;
+
+    let sig = sig.ok_or_else(|| tonic::Status::invalid_argument(format!("{field} is required")))?;
+
+    if sig.ecdsa_signature.is_empty() || sig.ecdsa_signature.len() > MAX_DER_SIGNATURE_LEN {
+        return Err(tonic::Status::invalid_argument(format!(
+            "{field}.ecdsa_signature must be DER-encoded and at most {MAX_DER_SIGNATURE_LEN} bytes"
+        )));
+    }
+
+    if sig.authenticator_data.len() < MIN_AUTHENTICATOR_DATA_LEN
+        || sig.authenticator_data.len() > MAX_AUTHENTICATOR_DATA_LEN
+    {
+        return Err(tonic::Status::invalid_argument(format!(
+            "{field}.authenticator_data must be between {MIN_AUTHENTICATOR_DATA_LEN} and {MAX_AUTHENTICATOR_DATA_LEN} bytes"
+        )));
+    }
+
+    if sig.client_data_json.is_empty() || sig.client_data_json.len() > MAX_CLIENT_DATA_JSON_LEN {
+        return Err(tonic::Status::invalid_argument(format!(
+            "{field}.client_data_json must be between 1 and {MAX_CLIENT_DATA_JSON_LEN} bytes"
+        )));
+    }
+
+    let parsed = p256::ecdsa::Signature::from_der(&sig.ecdsa_signature).map_err(|_| {
+        tonic::Status::invalid_argument(format!(
+            "{field}.ecdsa_signature must be a valid DER-encoded ECDSA signature"
+        ))
+    })?;
+    let normalized = parsed.normalize_s().unwrap_or(parsed);
+    let canonical = UserSignature::decode(normalized.to_bytes().as_ref()).map_err(|_| {
+        tonic::Status::invalid_argument(format!(
+            "{field}.ecdsa_signature is not a valid canonical secp256r1 signature"
+        ))
+    })?;
+
+    Ok(WebAuthnSignature {
+        signature: canonical,
+        authenticator_data: sig.authenticator_data,
+        client_data_json: sig.client_data_json,
+    })
 }
 
 pub fn parse_transaction(req: SubmitTxRequest) -> Result<Transaction, tonic::Status> {
@@ -361,7 +407,7 @@ pub fn parse_transaction(req: SubmitTxRequest) -> Result<Transaction, tonic::Sta
         submit_tx_request::Tx::Transfer(t) => {
             let input = parse_digest(&t.input, "input")?;
             let recipient = parse_address(&t.recipient, "recipient")?;
-            let signature = parse_signature(&t.signature, "signature")?;
+            let signature = parse_webauthn_signature(t.signature, "signature")?;
             Ok(Transaction::Transfer {
                 input,
                 recipient,
@@ -370,13 +416,18 @@ pub fn parse_transaction(req: SubmitTxRequest) -> Result<Transaction, tonic::Sta
             })
         }
         submit_tx_request::Tx::MergeCoin(m) => {
+            if m.inputs.len() > MAX_MERGE_INPUTS {
+                return Err(tonic::Status::invalid_argument(format!(
+                    "inputs must contain at most {MAX_MERGE_INPUTS} entries"
+                )));
+            }
             let inputs = m
                 .inputs
                 .iter()
                 .enumerate()
                 .map(|(i, b)| parse_digest(b, &format!("inputs[{i}]")))
                 .collect::<Result<Vec<_>, _>>()?;
-            let signature = parse_signature(&m.signature, "signature")?;
+            let signature = parse_webauthn_signature(m.signature, "signature")?;
             Ok(Transaction::MergeCoin { inputs, signature })
         }
     }

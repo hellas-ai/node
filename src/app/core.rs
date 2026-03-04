@@ -9,7 +9,6 @@ use crate::execution::{
     execute_block, execute_transaction, genesis_state,
 };
 use crate::gauged::{GaugedIndexMap, GaugedIndexSet, GaugedVecDeque};
-use hellas_types::{Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction};
 use crate::shard::WireShardMessage;
 use crate::shard::core::{ShardEffect, ShardRecoverer};
 use crate::shard::protocol::{BlockKey, CodingImpl, ShardMessage, ZodaCommitment, ZodaShard};
@@ -20,6 +19,7 @@ use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
 use commonware_parallel::Rayon;
 use commonware_runtime::{Metrics, Spawner};
 use commonware_utils::channel::oneshot;
+use hellas_types::{Address, Coin, MAX_TXS_PER_BLOCK, ObjectId, Transaction};
 use hellas_types::{Context, PublicKey};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -101,7 +101,7 @@ pub(super) struct AppCore {
     persisted_roots: GaugedIndexMap<Digest, Digest>,
     latest_anchor: Option<(Digest, Digest)>,
     verify_wait_timeout_ms: u64,
-    validators: Vec<PublicKey>,
+    genesis_allocations: Vec<(Address, u64)>,
     strategy: Rayon,
     shard_recoverer: ShardRecoverer<Rayon>,
     min_drift_per_leader: HashMap<PublicKey, i64>,
@@ -123,6 +123,7 @@ impl AppCore {
     pub(super) fn new(
         me: &PublicKey,
         mut validators: Vec<PublicKey>,
+        genesis_allocations: Vec<(Address, u64)>,
         my_index: u16,
         coding_config: commonware_coding::Config,
         verify_wait_timeout_ms: u64,
@@ -155,7 +156,7 @@ impl AppCore {
             persisted_roots,
             latest_anchor: None,
             verify_wait_timeout_ms: verify_wait_timeout_ms.max(1),
-            validators,
+            genesis_allocations,
             strategy: strategy.clone(),
             shard_recoverer: ShardRecoverer::new(me, my_index, coding_config, strategy, context),
             min_drift_per_leader: HashMap::new(),
@@ -263,7 +264,12 @@ impl AppCore {
         effects
     }
 
-    pub(super) fn on_finalized(&mut self, payload: Digest, parent_payload: Digest, now: u64) -> CoreEffects {
+    pub(super) fn on_finalized(
+        &mut self,
+        payload: Digest,
+        parent_payload: Digest,
+        now: u64,
+    ) -> CoreEffects {
         let mut effects = CoreEffects::new();
         self.handle_finalized(payload, parent_payload, now, &mut effects);
         effects
@@ -287,7 +293,8 @@ impl AppCore {
 
     pub(super) fn note_persisted_root(&mut self, payload: Digest, root: Digest) {
         self.persisted_roots.insert(payload, root);
-        self.persisted_roots.enforce_capacity(Self::MAX_PERSISTED_ROOTS);
+        self.persisted_roots
+            .enforce_capacity(Self::MAX_PERSISTED_ROOTS);
         self.latest_anchor = Some((payload, root));
     }
 
@@ -322,7 +329,7 @@ impl AppCore {
         let payload = genesis_payload(epoch);
         let digest = genesis_digest(epoch);
         self.note_payload_seen(digest, payload, 0);
-        let genesis_execution = genesis_state(&self.validators);
+        let genesis_execution = genesis_state(&self.genesis_allocations);
         let diffs = FinalizationDiffs {
             created: genesis_execution.created,
             deleted: genesis_execution.deleted,
@@ -617,7 +624,10 @@ impl AppCore {
                 }
             }
             Err(err) => {
-                if matches!(err, super::payload::PayloadValidationError::AnchorRootMismatch { .. }) {
+                if matches!(
+                    err,
+                    super::payload::PayloadValidationError::AnchorRootMismatch { .. }
+                ) {
                     self.metrics.anchor_mismatch_total.inc();
                 }
                 warn!(%err, payload = ?payload, "payload validation failed");
@@ -724,12 +734,7 @@ impl AppCore {
             );
             return;
         };
-        let valid = self.verify_payload(
-            context,
-            payload,
-            local_anchor_root,
-            now,
-        );
+        let valid = self.verify_payload(context, payload, local_anchor_root, now);
         effects
             .replies
             .push_back(CoreEffect::Verify { response, valid });
@@ -1174,9 +1179,11 @@ impl AppCore {
             WireShardMessage::Initial { .. } | WireShardMessage::ReShare { .. } => {}
         }
 
-        let shard_effects =
-            self.shard_recoverer
-                .handle_message(message, |d| self.seen.contains_key(d), validator_index);
+        let shard_effects = self.shard_recoverer.handle_message(
+            message,
+            |d| self.seen.contains_key(d),
+            validator_index,
+        );
         for effect in shard_effects {
             self.apply_shard_effect(effect, now, effects);
         }
@@ -1318,6 +1325,7 @@ mod tests {
             let mut core = AppCore::new(
                 &me,
                 participants.clone(),
+                Vec::new(),
                 0,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1374,6 +1382,7 @@ mod tests {
             let mut core = AppCore::new(
                 &me,
                 participants.clone(),
+                Vec::new(),
                 0,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1394,10 +1403,7 @@ mod tests {
             };
             let mut propose_effects = CoreEffects::new();
             let payload = core.propose_with_effects(&context, 100, &mut propose_effects);
-            let block = core
-                .seen
-                .get(&payload)
-                .expect("payload should be cached");
+            let block = core.seen.get(&payload).expect("payload should be cached");
             let data = block.data();
             assert_eq!(data.anchor_payload, genesis);
             assert_eq!(data.anchor_root, genesis_root);
@@ -1418,6 +1424,7 @@ mod tests {
             let mut proposer = AppCore::new(
                 &participants[0],
                 participants.clone(),
+                Vec::new(),
                 0,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1428,6 +1435,7 @@ mod tests {
             let mut verifier = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1492,6 +1500,7 @@ mod tests {
             let mut proposer = AppCore::new(
                 &participants[0],
                 participants.clone(),
+                Vec::new(),
                 0,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1502,6 +1511,7 @@ mod tests {
             let mut verifier = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1535,12 +1545,7 @@ mod tests {
             let local_anchor_root = verifier
                 .persisted_root(anchor_payload)
                 .expect("verifier should have anchor root");
-            assert!(!verifier.verify_payload(
-                &proposal_context,
-                payload,
-                local_anchor_root,
-                200
-            ));
+            assert!(!verifier.verify_payload(&proposal_context, payload, local_anchor_root, 200));
         });
     }
 
@@ -1555,6 +1560,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1620,6 +1626,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1684,6 +1691,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1768,6 +1776,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1834,6 +1843,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -1958,6 +1968,7 @@ mod tests {
                 let mut core = AppCore::new(
                     &participants[1],
                     participants.clone(),
+                Vec::new(),
                     1,
                     coding_config(6),
                     10_000,
@@ -2103,6 +2114,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -2170,6 +2182,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -2213,7 +2226,10 @@ mod tests {
             // ── Phase 1: First verify defers, emits exactly 1 fetch ──────────
             let (msg1, _rx1) = make_verify(1);
             let e1 = core.on_message(msg1, 100, &|_| Some(0));
-            assert!(e1.replies.is_empty(), "verify should defer (payload missing)");
+            assert!(
+                e1.replies.is_empty(),
+                "verify should defer (payload missing)"
+            );
             assert_eq!(count_fetch_broadcasts(&e1), 1, "first verify: 1 fetch");
 
             // ── Phase 2: Second verify for same payload — deduped ─────────────
@@ -2222,22 +2238,38 @@ mod tests {
             let (msg2, _rx2) = make_verify(1);
             let e2 = core.on_message(msg2, 101, &|_| Some(0));
             assert!(e2.replies.is_empty(), "second verify should also defer");
-            assert_eq!(count_fetch_broadcasts(&e2), 0, "dedup: no fetch within retry window");
+            assert_eq!(
+                count_fetch_broadcasts(&e2),
+                0,
+                "dedup: no fetch within retry window"
+            );
 
             // ── Phase 3: Maintenance within retry window — no re-request ──────
             let mut me1 = CoreEffects::new();
             core.run_maintenance(102, &mut me1);
-            assert_eq!(count_fetch_broadcasts(&me1), 0, "maintenance within retry window: no fetch");
+            assert_eq!(
+                count_fetch_broadcasts(&me1),
+                0,
+                "maintenance within retry window: no fetch"
+            );
 
             // ── Phase 4: Maintenance after retry window — re-requests ─────────
             let mut me2 = CoreEffects::new();
             core.run_maintenance(100 + AppCore::FETCH_RETRY_MS + 1, &mut me2);
-            assert_eq!(count_fetch_broadcasts(&me2), 1, "maintenance after retry window: 1 retry fetch");
+            assert_eq!(
+                count_fetch_broadcasts(&me2),
+                1,
+                "maintenance after retry window: 1 retry fetch"
+            );
 
             // ── Phase 5: Another verify still deduped (maintenance just sent) ─
             let (msg3, _rx3) = make_verify(1);
             let e3 = core.on_message(msg3, 100 + AppCore::FETCH_RETRY_MS + 2, &|_| Some(0));
-            assert_eq!(count_fetch_broadcasts(&e3), 0, "dedup: maintenance already sent fetch");
+            assert_eq!(
+                count_fetch_broadcasts(&e3),
+                0,
+                "dedup: maintenance already sent fetch"
+            );
 
             // ── Phase 6: Payload arrives via shard → resolves all 3 waiters ───
             let repaired = core.on_shard_message(
@@ -2255,7 +2287,11 @@ mod tests {
             // ── Phase 7: Maintenance after resolution — no fetches ────────────
             let mut me3 = CoreEffects::new();
             core.run_maintenance(100 + AppCore::FETCH_RETRY_MS + 20, &mut me3);
-            assert_eq!(count_fetch_broadcasts(&me3), 0, "no fetches after payload delivered");
+            assert_eq!(
+                count_fetch_broadcasts(&me3),
+                0,
+                "no fetches after payload delivered"
+            );
 
             // Verify the pending_fetches map is clean.
             assert!(
@@ -2283,6 +2319,7 @@ mod tests {
             let mut core = AppCore::new(
                 &participants[1],
                 participants.clone(),
+                Vec::new(),
                 1,
                 coding_config(6),
                 TEST_WAIT_TIMEOUT_MS,
@@ -2358,22 +2395,14 @@ mod tests {
             // Now retry discovers block_b is missing (parent of C).
             let mut retry2 = CoreEffects::new();
             core.retry_pending_finalizations(400, &mut retry2);
-            assert_eq!(
-                count_fetch_broadcasts(&retry2),
-                1,
-                "should request block_b"
-            );
+            assert_eq!(count_fetch_broadcasts(&retry2), 1, "should request block_b");
 
             core.note_payload_seen(block_b, bytes_b, 0);
 
             // Now retry discovers block_a is missing (parent of B).
             let mut retry3 = CoreEffects::new();
             core.retry_pending_finalizations(500, &mut retry3);
-            assert_eq!(
-                count_fetch_broadcasts(&retry3),
-                1,
-                "should request block_a"
-            );
+            assert_eq!(count_fetch_broadcasts(&retry3), 1, "should request block_a");
 
             core.note_payload_seen(block_a, bytes_a, 0);
 
