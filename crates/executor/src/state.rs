@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::weights::ResolvedWeightKey;
+pub use hellas_rpc::pb::hellas::ExecutionStatus;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -28,25 +29,6 @@ pub struct Execution {
     pub progress: u64,
     pub result: Option<Vec<u8>>,
     pub decoded: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-pub enum ExecutionStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
-impl ExecutionStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
 }
 
 pub struct ExecutorState {

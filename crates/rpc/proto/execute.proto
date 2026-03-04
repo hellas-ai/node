@@ -38,14 +38,22 @@ message ExecuteResponse {
 }
 
 message ExecuteStatusRequest { string execution_id = 1; }
+enum ExecutionStatus {
+  UNSPECIFIED = 0;
+  PENDING = 1;
+  RUNNING = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+}
+
 message ExecuteStatusResponse {
-  string status = 1;
+  ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes result = 3;
   optional string decoded = 4;
 }
 message ExecuteProgress {
-  string status = 1;
+  ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes chunk = 3;
   optional string decoded = 4;
