@@ -24,7 +24,10 @@
         inherit system overlays;
         config.allowUnfree = true;
       };
-      catgradCudaEnv = catgrad.lib.${system}.cudaEnv;
+      # Override catgrad's CUDA defaults (RunPod drivers don't support CUDA 13 yet)
+      catgradCudaEnv = catgrad.lib.${system}.mkCudaEnv {
+        cudaPackages = pkgs.cudaPackages_12_6;
+      };
 
       rust-toolchain = pkgs.buildPackages.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       rustPlatform = pkgs.makeRustPlatform {
@@ -36,12 +39,11 @@
         pname = "hellas";
         version = "0.1.0";
         src = ./.;
+        postPatch = ''
+          ln -sfn ${catgrad} ../catgrad
+        '';
         cargoLock = {
           lockFile = ./Cargo.lock;
-          outputHashes = {
-            "catgrad-0.2.1" = "sha256-mwscSjIfVBtBxvv//gZEM9rkZrkNjnSD3HqbgOTOIhM=";
-            "catgrad-llm-0.2.1" = "sha256-mwscSjIfVBtBxvv//gZEM9rkZrkNjnSD3HqbgOTOIhM=";
-          };
         };
         auditable = false;
         buildInputs = with pkgs; [openssl];
@@ -239,6 +241,278 @@
         '';
       });
 
+      runtimeCoreLibs = with pkgs; [
+        stdenv.cc.cc.lib
+        openssl
+        glibc
+      ];
+
+      mkServerRuntime = {
+        name,
+        pkg,
+        sourceBin,
+      }:
+        pkgs.runCommand name {
+          nativeBuildInputs = [pkgs.removeReferencesTo];
+        } ''
+          mkdir -p "$out/bin"
+          cp "${pkg}/bin/${sourceBin}" "$out/bin/hellas-cli"
+          chmod u+w "$out/bin/hellas-cli"
+
+          # Rust std source paths can keep a rust toolchain reference alive in the runtime closure.
+          remove-references-to -t ${rust-toolchain} "$out/bin/hellas-cli"
+
+          chmod 0555 "$out/bin/hellas-cli"
+        '';
+
+      serverRuntime = mkServerRuntime {
+        name = "hellas-server-runtime";
+        pkg = server;
+        sourceBin = "hellas-cli";
+      };
+
+      serverCudaRuntime = mkServerRuntime {
+        name = "hellas-server-cuda-runtime";
+        pkg = serverCuda;
+        sourceBin = ".hellas-cli-wrapped";
+      };
+
+      mkServerImage = {
+        imageName,
+        runtimePkg,
+        extraRuntimeContents ? [],
+        cuda ? false,
+      }:
+        pkgs.dockerTools.buildLayeredImage {
+          name = imageName;
+          tag = "latest";
+          contents = [
+            runtimePkg
+            pkgs.cacert
+            pkgs.iana-etc
+          ] ++ runtimeCoreLibs ++ extraRuntimeContents;
+          config = {
+            Entrypoint = ["${runtimePkg}/bin/hellas-cli" "serve"];
+            WorkingDir = "/var/lib/hellas";
+            Volumes = {"/var/lib/hellas" = {};};
+            ExposedPorts = {"31145/udp" = {};};
+            Env =
+              [
+                "HOME=/home/hellas"
+                "HF_HOME=/home/hellas/.cache/huggingface"
+                "HF_HUB_CACHE=/home/hellas/.cache/huggingface/hub"
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+                "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ]
+              ++ pkgs.lib.optionals cuda [
+                "NVIDIA_VISIBLE_DEVICES=all"
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+                "LD_LIBRARY_PATH=${catgradCudaEnv.runtimeLibraryPath}:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/local/nvidia/lib64"
+              ];
+          };
+        };
+
+      serverImage = mkServerImage {
+        imageName = "hellas-server";
+        runtimePkg = serverRuntime;
+      };
+
+      serverCudaImage = mkServerImage {
+        imageName = "hellas-server-cuda";
+        runtimePkg = serverCudaRuntime;
+        extraRuntimeContents = catgradCudaEnv.buildInputs;
+        cuda = true;
+      };
+
+      dockerRunServer = pkgs.writeShellApplication {
+        name = "hellas-docker-run-server";
+        runtimeInputs = [pkgs.docker pkgs.coreutils];
+        text = ''
+          set -euo pipefail
+
+          usage() {
+            cat <<'USAGE'
+          Usage: hellas-docker-run-server [--config <path>]
+
+          Config file format: shell env assignments, e.g.
+            HELLAS_PORT=31145
+            HELLAS_CONTAINER_NAME=hellas-server
+            HELLAS_HF_CACHE_DIR=$HOME/.cache/huggingface
+            HELLAS_DATA_DIR=$HOME/.local/share/hellas
+            HELLAS_DOCKER_USER=1000:100
+            HELLAS_DOWNLOAD_POLICY=eager
+            HELLAS_EXECUTE_POLICY=eager
+            HELLAS_LOG=info
+          USAGE
+          }
+
+          config_file="''${HELLAS_CONFIG_FILE:-}"
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --config)
+                [ "$#" -ge 2 ] || { echo "--config requires a path" >&2; exit 2; }
+                config_file="$2"
+                shift 2
+                ;;
+              -h|--help)
+                usage
+                exit 0
+                ;;
+              --)
+                shift
+                break
+                ;;
+              *)
+                echo "unknown argument: $1" >&2
+                usage
+                exit 2
+                ;;
+            esac
+          done
+
+          if [ -n "$config_file" ]; then
+            [ -f "$config_file" ] || { echo "config file not found: $config_file" >&2; exit 1; }
+            set -a
+            # shellcheck disable=SC1090
+            . "$config_file"
+            set +a
+          fi
+
+          image_tar="${serverImage}"
+          image_ref="hellas-server:latest"
+          name="''${HELLAS_CONTAINER_NAME:-hellas-server}"
+          port="''${HELLAS_PORT:-31145}"
+          hf_cache="''${HELLAS_HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+          data_dir="''${HELLAS_DATA_DIR:-$HOME/.local/share/hellas}"
+          run_user="''${HELLAS_DOCKER_USER:-$(id -u):$(id -g)}"
+          download_policy="''${HELLAS_DOWNLOAD_POLICY:-}"
+          execute_policy="''${HELLAS_EXECUTE_POLICY:-}"
+          log_level="''${HELLAS_LOG:-warn}"
+
+          mkdir -p "$hf_cache" "$data_dir"
+          docker load < "$image_tar" >/dev/null
+          docker rm -f "$name" >/dev/null 2>&1 || true
+
+          server_args=(--port "$port")
+          if [ -n "$download_policy" ]; then
+            server_args+=(--download-policy "$download_policy")
+          fi
+          if [ -n "$execute_policy" ]; then
+            server_args+=(--execute-policy "$execute_policy")
+          fi
+
+          docker run -d \
+            --name "$name" \
+            --restart unless-stopped \
+            --user "$run_user" \
+            -e HOME=/home/hellas \
+            -e HF_HOME=/home/hellas/.cache/huggingface \
+            -e HF_HUB_CACHE=/home/hellas/.cache/huggingface/hub \
+            -e RUST_LOG="$log_level" \
+            -v "$hf_cache":/home/hellas/.cache/huggingface \
+            -v "$data_dir":/var/lib/hellas \
+            -p "$port":"$port"/udp \
+            "$image_ref" "''${server_args[@]}"
+
+          docker ps --filter "name=$name" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        '';
+      };
+
+      dockerRunServerCuda = pkgs.writeShellApplication {
+        name = "hellas-docker-run-server-cuda";
+        runtimeInputs = [pkgs.docker pkgs.coreutils];
+        text = ''
+          set -euo pipefail
+
+          usage() {
+            cat <<'USAGE'
+          Usage: hellas-docker-run-server-cuda [--config <path>]
+
+          Config file format: shell env assignments, e.g.
+            HELLAS_PORT=31145
+            HELLAS_CONTAINER_NAME=hellas-server-cuda
+            HELLAS_HF_CACHE_DIR=$HOME/.cache/huggingface
+            HELLAS_DATA_DIR=$HOME/.local/share/hellas
+            HELLAS_DOCKER_USER=1000:100
+            HELLAS_DOWNLOAD_POLICY=eager
+            HELLAS_EXECUTE_POLICY=eager
+            HELLAS_LOG=info
+          USAGE
+          }
+
+          config_file="''${HELLAS_CONFIG_FILE:-}"
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --config)
+                [ "$#" -ge 2 ] || { echo "--config requires a path" >&2; exit 2; }
+                config_file="$2"
+                shift 2
+                ;;
+              -h|--help)
+                usage
+                exit 0
+                ;;
+              --)
+                shift
+                break
+                ;;
+              *)
+                echo "unknown argument: $1" >&2
+                usage
+                exit 2
+                ;;
+            esac
+          done
+
+          if [ -n "$config_file" ]; then
+            [ -f "$config_file" ] || { echo "config file not found: $config_file" >&2; exit 1; }
+            set -a
+            # shellcheck disable=SC1090
+            . "$config_file"
+            set +a
+          fi
+
+          image_tar="${serverCudaImage}"
+          image_ref="hellas-server-cuda:latest"
+          name="''${HELLAS_CONTAINER_NAME:-hellas-server-cuda}"
+          port="''${HELLAS_PORT:-31145}"
+          hf_cache="''${HELLAS_HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+          data_dir="''${HELLAS_DATA_DIR:-$HOME/.local/share/hellas}"
+          run_user="''${HELLAS_DOCKER_USER:-$(id -u):$(id -g)}"
+          download_policy="''${HELLAS_DOWNLOAD_POLICY:-}"
+          execute_policy="''${HELLAS_EXECUTE_POLICY:-}"
+          log_level="''${HELLAS_LOG:-warn}"
+
+          mkdir -p "$hf_cache" "$data_dir"
+          docker load < "$image_tar" >/dev/null
+          docker rm -f "$name" >/dev/null 2>&1 || true
+
+          server_args=(--port "$port")
+          if [ -n "$download_policy" ]; then
+            server_args+=(--download-policy "$download_policy")
+          fi
+          if [ -n "$execute_policy" ]; then
+            server_args+=(--execute-policy "$execute_policy")
+          fi
+
+          docker run -d \
+            --name "$name" \
+            --restart unless-stopped \
+            --device=nvidia.com/gpu=all \
+            --user "$run_user" \
+            -e HOME=/home/hellas \
+            -e HF_HOME=/home/hellas/.cache/huggingface \
+            -e HF_HUB_CACHE=/home/hellas/.cache/huggingface/hub \
+            -e RUST_LOG="$log_level" \
+            -v "$hf_cache":/home/hellas/.cache/huggingface \
+            -v "$data_dir":/var/lib/hellas \
+            -p "$port":"$port"/udp \
+            "$image_ref" "''${server_args[@]}"
+
+          docker ps --filter "name=$name" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        '';
+      };
+
       e2eTest = pkgs.writeShellApplication {
         name = "e2e-test";
         runtimeInputs = [server pkgs.coreutils pkgs.gnugrep pkgs.gawk];
@@ -255,8 +529,24 @@
     in {
       packages = {
         default = cli;
-        inherit cli server serverCuda;
+        inherit
+          cli
+          server
+          serverCuda
+          serverRuntime
+          serverCudaRuntime
+          serverImage
+          serverCudaImage
+          dockerRunServer
+          dockerRunServerCuda
+          ;
         "server-cuda" = serverCuda;
+        "server-runtime" = serverRuntime;
+        "server-cuda-runtime" = serverCudaRuntime;
+        "docker-server" = serverImage;
+        "docker-server-cuda" = serverCudaImage;
+        "docker-run-server" = dockerRunServer;
+        "docker-run-server-cuda" = dockerRunServerCuda;
         "dep-hygiene" = depHygiene;
         "e2e-test" = e2eTest;
       };
@@ -270,6 +560,14 @@
           type = "app";
           program = "${e2eTest}/bin/e2e-test";
         };
+        "docker-run-server" = {
+          type = "app";
+          program = "${dockerRunServer}/bin/hellas-docker-run-server";
+        };
+        "docker-run-server-cuda" = {
+          type = "app";
+          program = "${dockerRunServerCuda}/bin/hellas-docker-run-server-cuda";
+        };
       };
 
       overlays.default = final: _prev: {
@@ -277,24 +575,33 @@
         hellas-serve = self.packages.${final.system}.server;
       };
 
-      devShells.default = pkgs.mkShell {
-        inputsFrom = [self.packages.${system}.default];
-        buildInputs = with pkgs; [
-          pre-commit
-          protobuf-language-server
-          cargo-watch
-          gh
-          depHygiene
-          llvmPackages.lld
-        ];
-      };
+      devShells = rec {
+        default = pkgs.mkShell {
+          inputsFrom = [self.packages.${system}.default];
+          buildInputs = with pkgs; [
+            pre-commit
+            protobuf-language-server
+            cargo-watch
+            gh
+            depHygiene
+            llvmPackages.lld
+            skopeo
+          ];
+        };
 
-      devShells.cuda = pkgs.mkShell {
-        inputsFrom = [
-          self.devShells.${system}.default
-          catgradCudaShell
-        ];
-        LD_LIBRARY_PATH = "${catgradCudaEnv.runtimeLibraryPath}:${catgradCudaEnv.driverLink}/lib";
+        # Explicit shell aliases so users can `nix develop .#server` / `.#server-cuda`
+        # and still get a full development environment (not a package build env).
+        server = default;
+
+        cuda = pkgs.mkShell {
+          inputsFrom = [
+            default
+            catgradCudaShell
+          ];
+          LD_LIBRARY_PATH = "${catgradCudaEnv.runtimeLibraryPath}:${catgradCudaEnv.driverLink}/lib";
+        };
+
+        "server-cuda" = cuda;
       };
     })
     // {
@@ -336,8 +643,8 @@
             default = null;
             description = ''
               Model download policy.
-              "eager" (default) downloads any requested model,
-              "skip" never downloads (cache-only),
+              "skip" (CLI default) never downloads (cache-only),
+              "eager" downloads any requested model,
               "allow(pattern,...)" downloads only matching HF model patterns.
             '';
           };
@@ -346,8 +653,8 @@
             default = null;
             description = ''
               Graph execution policy.
-              "eager" (default) executes any graph,
-              "skip" refuses all executions,
+              "skip" (CLI default) refuses all executions,
+              "eager" executes any graph,
               "allow(hf/pattern,...,graph/pattern,...)" executes only matching.
             '';
           };
