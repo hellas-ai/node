@@ -1,46 +1,28 @@
 use crate::commands::CliResult;
 
-#[cfg(feature = "discovery")]
-use crate::commands::common::{shared_pkarr_client, GRPC_MESSAGE_LIMIT};
-#[cfg(feature = "discovery")]
 use anyhow::Context;
-#[cfg(feature = "discovery")]
 use futures::StreamExt;
-#[cfg(feature = "discovery")]
+use hellas_rpc::discovery::shared_pkarr_client;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
-#[cfg(feature = "discovery")]
 use hellas_rpc::pb::hellas::{GetKnownPeersRequest, HealthCheckRequest, HealthCheckResponse};
-#[cfg(feature = "discovery")]
 use hellas_rpc::service::{ExecuteService, NodeService};
-#[cfg(feature = "discovery")]
+use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::collections::HashSet;
-#[cfg(feature = "discovery")]
 use std::future;
-#[cfg(feature = "discovery")]
 use std::sync::Arc;
-#[cfg(feature = "discovery")]
 use tokio::task::JoinSet;
-#[cfg(feature = "discovery")]
 use tokio::time::{timeout, Duration};
-#[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
-#[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
-#[cfg(feature = "discovery")]
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-#[cfg(feature = "discovery")]
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };
-#[cfg(feature = "discovery")]
 use tonic_iroh_transport::IrohConnect;
 
-#[cfg(feature = "discovery")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(feature = "discovery")]
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[cfg(feature = "discovery")]
 struct PeerInterrogationOutcome {
     health: HealthCheckResponse,
     known_peers: Vec<EndpointId>,
@@ -48,7 +30,6 @@ struct PeerInterrogationOutcome {
     known_peers_error: Option<String>,
 }
 
-#[cfg(feature = "discovery")]
 pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> {
     let endpoint = Endpoint::builder()
         .bind()
@@ -246,7 +227,6 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
     Ok(())
 }
 
-#[cfg(feature = "discovery")]
 fn handle_discovery_event(
     service: &str,
     endpoint: &Endpoint,
@@ -264,12 +244,12 @@ fn handle_discovery_event(
 
     unique_peers.insert(peer_id);
     println!(
-        "event=discovered service={} peer={} source={} trust={} peer_trust={} source_trust={}",
+        "event=discovered service={} peer={} source={} trust={} remote_trust={} source_trust={}",
         service,
         peer_id,
         peer.source(),
         peer.trust(),
-        peer.peer_trust(),
+        peer.remote_trust(),
         peer.source_trust()
     );
 
@@ -283,7 +263,6 @@ fn handle_discovery_event(
     }
 }
 
-#[cfg(feature = "discovery")]
 async fn interrogate_peer(
     endpoint: Endpoint,
     peer_id: EndpointId,
@@ -345,16 +324,10 @@ async fn interrogate_peer(
     })
 }
 
-#[cfg(feature = "discovery")]
 fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {
     let bytes: [u8; 32] = raw_id
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid endpoint id length: {}", raw_id.len()))?;
     EndpointId::from_bytes(&bytes)
         .map_err(|err| anyhow::anyhow!("invalid endpoint id bytes: {err}"))
-}
-
-#[cfg(not(feature = "discovery"))]
-pub async fn run(_timeout_secs: Option<u64>, _interrogate: bool) -> CliResult<()> {
-    anyhow::bail!("monitor requires the `discovery` feature")
 }

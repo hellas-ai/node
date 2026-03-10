@@ -57,7 +57,8 @@ impl ExecuteReservation {
 pub struct ExecuteJob {
     pub execution_id: String,
     pub plan: ExecutionPlan,
-    pub bundle: Option<Arc<ModelBundle>>,
+    pub bundle: Arc<ModelBundle>,
+    pub stream_batch_size: u32,
 }
 
 impl ExecuteWorker {
@@ -109,7 +110,6 @@ fn worker_loop(
                 let _ = executor_tx.send(ExecutorMessage::Complete {
                     execution_id: exec_id,
                     result: None,
-                    decoded: None,
                     status: crate::state::ExecutionStatus::Failed,
                 });
             }
@@ -118,7 +118,6 @@ fn worker_loop(
                 let _ = executor_tx.send(ExecutorMessage::Complete {
                     execution_id: exec_id,
                     result: None,
-                    decoded: None,
                     status: crate::state::ExecutionStatus::Failed,
                 });
             }
@@ -131,11 +130,16 @@ fn run_job(
     tx: tokio::sync::mpsc::UnboundedSender<ExecutorMessage>,
 ) -> Result<(), ExecutorError> {
     let execution_id = job.execution_id;
-    execute_plan_sync(&execution_id, job.plan, job.bundle.as_deref(), &tx)?;
+    execute_plan_sync(
+        &execution_id,
+        job.plan,
+        job.bundle.as_ref(),
+        job.stream_batch_size,
+        &tx,
+    )?;
     let _ = tx.send(ExecutorMessage::Complete {
         execution_id,
         result: None,
-        decoded: None,
         status: crate::state::ExecutionStatus::Completed,
     });
     Ok(())
@@ -144,33 +148,28 @@ fn run_job(
 fn execute_plan_sync(
     execution_id: &str,
     plan: ExecutionPlan,
-    bundle: Option<&ModelBundle>,
+    bundle: &ModelBundle,
+    stream_batch_size: u32,
     tx: &tokio::sync::mpsc::UnboundedSender<ExecutorMessage>,
 ) -> Result<(), ExecutorError> {
     let term: TypedTerm =
         serde_json::from_slice(&plan.graph).map_err(ExecutorError::InvalidGraph)?;
 
-    let prompt = plan.input.clone();
-
-    let Some(key) = plan.weights_hint.clone() else {
-        return Err(ExecutorError::MissingWeightsHint);
-    };
-    let Some(bundle) = bundle else {
-        return Err(ExecutorError::WeightsNotReady(key.model_id.0));
-    };
-
     info!(execution_id, "execute worker running plan");
 
     catgrad_support::run_graph_streaming(
         bundle,
-        &prompt,
+        &plan.model_config_json,
+        &plan.input,
         &term,
-        plan.max_seq,
-        |progress, chunk, decoded_chunk, _done| {
+        plan.prompt_tokens,
+        plan.max_new_tokens,
+        &plan.stop_token_ids,
+        stream_batch_size,
+        |progress, chunk| {
             let _ = tx.send(ExecutorMessage::Progress {
                 execution_id: execution_id.to_string(),
                 chunk: chunk.to_vec(),
-                decoded_chunk: decoded_chunk.map(|s| s.to_string()),
                 progress,
             });
         },

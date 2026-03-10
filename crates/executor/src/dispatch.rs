@@ -11,16 +11,14 @@ impl Executor {
         request: ExecuteRequest,
     ) -> Result<ExecuteResponse, ExecutorError> {
         let quote_id = request.quote_id;
+        let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         let plan = self.state.get_quote(&quote_id)?.plan.clone();
-
-        let bundle = match plan.weights_hint.clone() {
-            Some(key) => Some(self.weights.bundle(&key).await.map_err(|e| match e {
-                WeightsError::NotReady => ExecutorError::WeightsNotReady(key.model_id.0.clone()),
-                WeightsError::Failed(msg) => ExecutorError::WeightsError(msg),
-                other => ExecutorError::WeightsError(other.to_string()),
-            })?),
-            None => None,
-        };
+        let key = plan.weights_key.clone();
+        let bundle = self.weights.bundle(&key).await.map_err(|e| match e {
+            WeightsError::NotReady => ExecutorError::WeightsNotReady(key.to_string()),
+            WeightsError::Failed(msg) => ExecutorError::WeightsError(msg),
+            other => ExecutorError::WeightsError(other.to_string()),
+        })?;
 
         let reservation = self.execute_worker.reserve().map_err(|e| match e {
             ExecuteWorkerError::Busy => ExecutorError::Busy,
@@ -35,6 +33,7 @@ impl Executor {
             %execution_id,
             %quote_id,
             input_len = plan.input.len(),
+            stream_batch_size,
             "starting execution"
         );
 
@@ -43,6 +42,7 @@ impl Executor {
                 execution_id: execution_id.clone(),
                 plan,
                 bundle,
+                stream_batch_size,
             })
             .map_err(|e| match e {
                 ExecuteWorkerError::Busy => ExecutorError::Busy,

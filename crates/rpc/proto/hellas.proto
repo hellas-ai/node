@@ -12,7 +12,6 @@ service Node {
 
 service Execute {
   rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
-  rpc GetGraph(GetGraphRequest) returns (GetGraphResponse);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
   rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteProgress);

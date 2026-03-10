@@ -2,36 +2,26 @@ syntax = "proto3";
 
 package hellas;
 
-message WeightsHint {
-  string huggingface_model_id = 1;
-  string revision = 2;
-}
-
-message LlmQuoteRequest {
-  string huggingface_model_id = 1;
-  string prompt = 2;
-  // Optional; default to 16 when unset/zero
-  uint32 max_seq = 3;
-}
-
 message GetQuoteRequest {
-  oneof payload {
-    bytes graph = 1;
-    LlmQuoteRequest llm_prompt = 2;
-  }
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  bytes model_config_json = 3;
+  bytes graph = 4;
+  bytes input = 5;
+  uint32 prompt_tokens = 6;
+  uint32 max_new_tokens = 7;
+  repeated uint32 stop_token_ids = 8;
 }
+
 message GetQuoteResponse {
   string quote_id = 1;
-  string graph_id = 2;
-  uint64 amount = 3;
-  string input = 4;
-  WeightsHint resolved_weights = 5;
+  uint64 amount = 2;
 }
 
-message GetGraphRequest { string graph_id = 1; }
-message GetGraphResponse { bytes graph = 1; }
-
-message ExecuteRequest { string quote_id = 1; }
+message ExecuteRequest {
+  string quote_id = 1;
+  optional uint32 stream_batch_size = 2;
+}
 message ExecuteResponse {
   string execution_id = 1;
   string quote_id = 2;
@@ -50,17 +40,12 @@ message ExecuteStatusResponse {
   ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes result = 3;
-  optional string decoded = 4;
 }
 message ExecuteProgress {
   ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes chunk = 3;
-  optional string decoded = 4;
 }
 
 message ExecuteResultRequest { string execution_id = 1; }
-message ExecuteResultResponse {
-  bytes result = 1;
-  string decoded = 2;
-}
+message ExecuteResultResponse { bytes result = 1; }

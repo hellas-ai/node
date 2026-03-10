@@ -1,11 +1,12 @@
 use super::peer_tracker::{PeerTracker, RequestKind, MAX_SERVICE_ALPN_LEN};
-use crate::commands::common::{shared_pkarr_client, GRPC_MESSAGE_LIMIT};
 use anyhow::Context;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
+use hellas_rpc::discovery::shared_pkarr_client;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
 };
+use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
