@@ -12,11 +12,31 @@ pub async fn run(
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
 ) -> CliResult<()> {
-    let node = node::spawn_node(port, download_policy, execute_policy)
+    let node = node::spawn_node(port, download_policy.clone(), execute_policy.clone())
         .await
         .context("failed to start node server")?;
 
-    println!("Node Address: {}", node.node_id());
+    eprintln!("Node Address: {}", node.node_id());
+    println!(
+        "Policies: download={} execute={}",
+        download_policy, execute_policy
+    );
+    if matches!(download_policy, DownloadPolicy::Skip)
+        && matches!(execute_policy, ExecutePolicy::Skip)
+    {
+        println!(
+            "Node is running in deny-by-default mode. Pass explicit policies to allow remote downloads or execution."
+        );
+    } else {
+        warn!(
+            %download_policy,
+            %execute_policy,
+            "node is permitting remote downloads and/or execution; only run this on trusted networks"
+        );
+        eprintln!(
+            "warning: current policies allow remote peers to trigger downloads and/or execution"
+        );
+    }
 
     println!("RPC server running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c()

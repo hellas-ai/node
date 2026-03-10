@@ -10,8 +10,8 @@
         ]
       },
       "locked": {
-        "lastModified": 1772264349,
-        "narHash": "sha256-cYWy4n/plYTe7oEijlYyzYom+VDsIo9rD/lTd7HBgGs=",
+        "lastModified": 1772785376,
+        "narHash": "sha256-NBmOIjXf6AMU0dLDQhJoOyuxehUPsuTnzw7MOBLLTUg=",
         "path": "/home/grw/src/catgrad",
         "type": "path"
       },
