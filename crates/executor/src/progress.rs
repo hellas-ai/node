@@ -9,9 +9,12 @@ impl Executor {
         &mut self,
         execution_id: String,
     ) -> Result<(ExecuteProgress, mpsc::UnboundedReceiver<ExecuteProgress>), ExecutorError> {
-        // Validate existence and grab current snapshot
-        let status = *self.state.get_status(&execution_id)?;
-        let progress = self.state.get_progress(&execution_id).unwrap_or(0);
+        // New subscribers receive the full buffered output so they can catch up
+        // even if execution progress raced ahead before the stream was attached.
+        let execution = self.state.get_execution(&execution_id)?;
+        let status = execution.status;
+        let progress = execution.progress;
+        let chunk = execution.result.clone().unwrap_or_default();
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -24,8 +27,7 @@ impl Executor {
             ExecuteProgress {
                 status: status as i32,
                 progress,
-                chunk: Vec::new(),
-                decoded: None,
+                chunk,
             },
             rx,
         ))
@@ -35,14 +37,12 @@ impl Executor {
         &mut self,
         execution_id: String,
         result: Option<Vec<u8>>,
-        decoded: Option<String>,
         status: ExecutionStatus,
     ) {
         let success = matches!(status, ExecutionStatus::Completed);
         info!(
             %execution_id,
             success,
-            decoded_len = decoded.as_ref().map(|s| s.len()).unwrap_or(0),
             "execution finished"
         );
         if let Err(e) = self.state.set_status(&execution_id, status) {
@@ -50,13 +50,11 @@ impl Executor {
             return;
         }
         if let Some(result) = result {
-            if let Err(e) = self.state.set_result(&execution_id, result, decoded) {
+            if let Err(e) = self.state.set_result(&execution_id, result) {
                 warn!("failed to set result for {execution_id}: {e}");
             }
         } else if success && self.state.get_result(&execution_id).is_err() {
-            // Ensure terminal success has a readable (possibly empty) result even when
-            // streaming emitted no chunks (e.g. max_seq=0).
-            if let Err(e) = self.state.set_result(&execution_id, Vec::new(), decoded) {
+            if let Err(e) = self.state.set_result(&execution_id, Vec::new()) {
                 warn!("failed to set default result for {execution_id}: {e}");
             }
         }
@@ -69,7 +67,6 @@ impl Executor {
         status: ExecutionStatus,
         progress: u64,
         chunk: Vec<u8>,
-        decoded: Option<String>,
     ) {
         if let Some(watchers) = self.watchers.get_mut(execution_id) {
             watchers.retain(|tx| {
@@ -77,7 +74,6 @@ impl Executor {
                     status: status as i32,
                     progress,
                     chunk: chunk.clone(),
-                    decoded: decoded.clone(),
                 })
                 .is_ok()
             });
@@ -90,6 +86,6 @@ impl Executor {
 
     pub(super) fn send_status(&mut self, execution_id: &str, status: ExecutionStatus) {
         let progress = self.state.get_progress(execution_id).unwrap_or(0);
-        self.send_progress(execution_id, status, progress, Vec::new(), None);
+        self.send_progress(execution_id, status, progress, Vec::new());
     }
 }

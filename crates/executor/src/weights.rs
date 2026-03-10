@@ -3,18 +3,17 @@ use crate::policy::DownloadPolicy;
 use crate::ExecutorError;
 use catgrad::interpreter::{self};
 use catgrad::typecheck;
-use catgrad_llm::utils::{get_model_chat_template, get_model_files, load_model};
-use hf_hub::Cache;
+use catgrad_llm::utils::{get_model_files, load_model_weights};
+use hf_hub::{Cache, Repo, RepoType};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
-use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
-const DEFAULT_REF: &str = "main";
+pub(crate) const DEFAULT_REF: &str = "main";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ModelId(pub String);
@@ -23,24 +22,26 @@ pub struct ModelId(pub String);
 pub struct ModelRevision(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ResolvedWeightKey {
+pub struct WeightsLocator {
     pub model_id: ModelId,
     pub revision: ModelRevision,
 }
 
+impl std::fmt::Display for WeightsLocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.model_id.0, self.revision.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelBundle {
-    pub key: ResolvedWeightKey,
-    pub config: serde_json::Value,
-    pub tokenizer: Tokenizer,
-    pub chat_template: Option<String>,
     pub parameter_values: interpreter::Parameters<ExecBackend>,
     pub parameter_types: typecheck::Parameters,
 }
 
 #[derive(Clone, Debug)]
 pub enum EnsureDisposition {
-    Ready(ResolvedWeightKey),
+    Ready,
     Queued,
     InFlight,
     Failed(String),
@@ -63,17 +64,23 @@ pub enum WeightsError {
 pub enum WeightsStatus {
     Queued,
     Resolving,
-    Downloading { revision: Option<ModelRevision> },
-    Ready { revision: ModelRevision },
-    Failed { error: String },
+    Downloading {
+        resolved_revision: Option<ModelRevision>,
+    },
+    Ready {
+        resolved_revision: ModelRevision,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct WeightsSnapshot {
-    pub per_model: HashMap<ModelId, WeightsStatus>,
-    pub active: Option<ModelId>,
-    pub queue: Vec<ModelId>,
+    pub per_locator: HashMap<WeightsLocator, WeightsStatus>,
+    pub active: Option<WeightsLocator>,
+    pub queue: Vec<WeightsLocator>,
 }
 
 #[derive(Clone)]
@@ -83,16 +90,16 @@ pub struct WeightsManager {
 
 #[allow(dead_code)]
 enum Command {
-    EnsureDefaultReady {
-        model_id: ModelId,
+    EnsureReady {
+        locator: WeightsLocator,
         reply: oneshot::Sender<EnsureDisposition>,
     },
-    WaitDefaultReady {
-        model_id: ModelId,
-        reply: oneshot::Sender<Result<ResolvedWeightKey, WeightsError>>,
+    WaitReady {
+        locator: WeightsLocator,
+        reply: oneshot::Sender<Result<(), WeightsError>>,
     },
     Bundle {
-        key: ResolvedWeightKey,
+        locator: WeightsLocator,
         reply: oneshot::Sender<Result<Arc<ModelBundle>, WeightsError>>,
     },
     Snapshot {
@@ -102,16 +109,16 @@ enum Command {
 
 enum JobEvent {
     Resolved {
-        model_id: ModelId,
-        revision: ModelRevision,
+        locator: WeightsLocator,
+        resolved_revision: ModelRevision,
     },
     Completed {
-        model_id: ModelId,
-        revision: ModelRevision,
+        locator: WeightsLocator,
+        resolved_revision: ModelRevision,
         bundle: Arc<ModelBundle>,
     },
     Failed {
-        model_id: ModelId,
+        locator: WeightsLocator,
         error: String,
     },
 }
@@ -131,10 +138,10 @@ impl Default for Entry {
 }
 
 struct ManagerState {
-    entries: HashMap<ModelId, Entry>,
-    active: Option<ModelId>,
-    queue: VecDeque<ModelId>,
-    waiters: HashMap<ModelId, Vec<oneshot::Sender<Result<ResolvedWeightKey, WeightsError>>>>,
+    entries: HashMap<WeightsLocator, Entry>,
+    active: Option<WeightsLocator>,
+    queue: VecDeque<WeightsLocator>,
+    waiters: HashMap<WeightsLocator, Vec<oneshot::Sender<Result<(), WeightsError>>>>,
     download_policy: DownloadPolicy,
 }
 
@@ -170,12 +177,12 @@ impl WeightsManager {
         Self { tx }
     }
 
-    pub async fn ensure_default_ready(&self, model_id: ModelId) -> EnsureDisposition {
+    pub async fn ensure_ready(&self, locator: WeightsLocator) -> EnsureDisposition {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
-            .send(Command::EnsureDefaultReady {
-                model_id,
+            .send(Command::EnsureReady {
+                locator,
                 reply: reply_tx,
             })
             .is_err()
@@ -187,15 +194,15 @@ impl WeightsManager {
             .unwrap_or_else(|_| EnsureDisposition::Failed("weights manager closed".to_string()))
     }
 
-    pub async fn ensure_default_ready_wait(
+    pub async fn ensure_ready_wait(
         &self,
-        model_id: ModelId,
+        locator: WeightsLocator,
         wait_timeout: Duration,
-    ) -> Result<ResolvedWeightKey, WeightsError> {
+    ) -> Result<(), WeightsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Command::WaitDefaultReady {
-                model_id,
+            .send(Command::WaitReady {
+                locator,
                 reply: reply_tx,
             })
             .map_err(|_| WeightsError::ManagerClosed)?;
@@ -207,11 +214,11 @@ impl WeightsManager {
         }
     }
 
-    pub async fn bundle(&self, key: &ResolvedWeightKey) -> Result<Arc<ModelBundle>, WeightsError> {
+    pub async fn bundle(&self, locator: &WeightsLocator) -> Result<Arc<ModelBundle>, WeightsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Command::Bundle {
-                key: key.clone(),
+                locator: locator.clone(),
                 reply: reply_tx,
             })
             .map_err(|_| WeightsError::ManagerClosed)?;
@@ -228,45 +235,44 @@ impl WeightsManager {
     }
 }
 
-pub fn default_ref_cached(model_id: &str) -> bool {
-    let repo = Cache::default().model(model_id.to_string());
+pub fn weights_cached(locator: &WeightsLocator) -> bool {
+    let repo = Cache::default().repo(Repo::with_revision(
+        locator.model_id.0.clone(),
+        RepoType::Model,
+        locator.revision.0.clone(),
+    ));
     let has_config = repo.get("config.json").is_some();
-    let has_tokenizer = repo.get("tokenizer.json").is_some();
     let has_weights = repo.get("model.safetensors").is_some()
         || repo.get("model.safetensors.index.json").is_some();
-    has_config && has_tokenizer && has_weights
+    has_config && has_weights
 }
 
 fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::UnboundedSender<JobEvent>) {
     match cmd {
-        Command::EnsureDefaultReady { model_id, reply } => {
-            let disposition = ensure_default_ready_disposition(state, &model_id, &job_tx);
+        Command::EnsureReady { locator, reply } => {
+            let disposition = ensure_ready_disposition(state, &locator, &job_tx);
             let _ = reply.send(disposition);
         }
-        Command::WaitDefaultReady { model_id, reply } => {
-            let disposition = ensure_default_ready_disposition(state, &model_id, &job_tx);
+        Command::WaitReady { locator, reply } => {
+            let disposition = ensure_ready_disposition(state, &locator, &job_tx);
             match disposition {
-                EnsureDisposition::Ready(key) => {
-                    let _ = reply.send(Ok(key));
+                EnsureDisposition::Ready => {
+                    let _ = reply.send(Ok(()));
                 }
                 EnsureDisposition::Failed(error) => {
                     let _ = reply.send(Err(WeightsError::Failed(error)));
                 }
                 EnsureDisposition::Queued | EnsureDisposition::InFlight => {
-                    let waiters = state.waiters.entry(model_id).or_default();
+                    let waiters = state.waiters.entry(locator).or_default();
                     waiters.retain(|waiter| !waiter.is_closed());
                     waiters.push(reply);
                 }
             }
         }
-        Command::Bundle { key, reply } => {
-            let entry = state.entries.get(&key.model_id);
+        Command::Bundle { locator, reply } => {
+            let entry = state.entries.get(&locator);
             let result = match entry.map(|e| (&e.status, &e.bundle)) {
-                Some((WeightsStatus::Ready { revision }, Some(bundle)))
-                    if *revision == key.revision =>
-                {
-                    Ok(bundle.clone())
-                }
+                Some((WeightsStatus::Ready { .. }, Some(bundle))) => Ok(bundle.clone()),
                 Some((WeightsStatus::Ready { .. }, _)) => Err(WeightsError::UnknownKey),
                 Some((WeightsStatus::Failed { error }, _)) => {
                     Err(WeightsError::Failed(error.clone()))
@@ -278,7 +284,7 @@ fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::Unbounde
         }
         Command::Snapshot { reply } => {
             let snapshot = WeightsSnapshot {
-                per_model: state
+                per_locator: state
                     .entries
                     .iter()
                     .map(|(k, v)| (k.clone(), v.status.clone()))
@@ -291,33 +297,30 @@ fn handle_command(state: &mut ManagerState, cmd: Command, job_tx: mpsc::Unbounde
     }
 }
 
-fn ensure_default_ready_disposition(
+fn ensure_ready_disposition(
     state: &mut ManagerState,
-    model_id: &ModelId,
+    locator: &WeightsLocator,
     job_tx: &mpsc::UnboundedSender<JobEvent>,
 ) -> EnsureDisposition {
-    // If the model already has an entry, follow existing logic — it has
+    // If the locator already has an entry, follow existing logic — it has
     // already been admitted.
-    if let Some(entry) = state.entries.get(model_id) {
+    if let Some(entry) = state.entries.get(locator) {
         return match &entry.status {
-            WeightsStatus::Ready { revision } => EnsureDisposition::Ready(ResolvedWeightKey {
-                model_id: model_id.clone(),
-                revision: revision.clone(),
-            }),
+            WeightsStatus::Ready { .. } => EnsureDisposition::Ready,
             WeightsStatus::Failed { error } => {
-                if !state.queue.contains(model_id) && state.active.as_ref() != Some(model_id) {
-                    // Re-check policy before re-queuing a previously failed model.
-                    if !default_ref_cached(&model_id.0)
-                        && !state.download_policy.allows_download(&model_id.0)
+                if !state.queue.contains(locator) && state.active.as_ref() != Some(locator) {
+                    // Re-check policy before re-queuing a previously failed locator.
+                    if !weights_cached(locator)
+                        && !state.download_policy.allows_download(&locator.model_id.0)
                     {
                         return EnsureDisposition::Failed(format!(
-                            "download policy '{}' denied download for model '{}'",
-                            state.download_policy, model_id.0
+                            "download policy '{}' denied download for weights '{}'",
+                            state.download_policy, locator
                         ));
                     }
-                    let entry = state.entries.get_mut(model_id).unwrap();
+                    let entry = state.entries.get_mut(locator).unwrap();
                     entry.status = WeightsStatus::Queued;
-                    state.queue.push_back(model_id.clone());
+                    state.queue.push_back(locator.clone());
                     maybe_start_next(state, job_tx.clone());
                     EnsureDisposition::Queued
                 } else {
@@ -327,8 +330,8 @@ fn ensure_default_ready_disposition(
             WeightsStatus::Queued
             | WeightsStatus::Resolving
             | WeightsStatus::Downloading { .. } => {
-                if !state.queue.contains(model_id) && state.active.as_ref() != Some(model_id) {
-                    state.queue.push_back(model_id.clone());
+                if !state.queue.contains(locator) && state.active.as_ref() != Some(locator) {
+                    state.queue.push_back(locator.clone());
                     maybe_start_next(state, job_tx.clone());
                     EnsureDisposition::Queued
                 } else {
@@ -338,27 +341,27 @@ fn ensure_default_ready_disposition(
         };
     }
 
-    // New model: check download policy before admitting. Locally cached models
+    // New locator: check download policy before admitting. Locally cached weights
     // always bypass the policy — they don't require a network download.
-    if !default_ref_cached(&model_id.0) && !state.download_policy.allows_download(&model_id.0) {
+    if !weights_cached(locator) && !state.download_policy.allows_download(&locator.model_id.0) {
         return EnsureDisposition::Failed(format!(
-            "download policy '{}' denied download for model '{}'",
-            state.download_policy, model_id.0
+            "download policy '{}' denied download for weights '{}'",
+            state.download_policy, locator
         ));
     }
 
-    state.entries.insert(model_id.clone(), Entry::default());
-    state.queue.push_back(model_id.clone());
+    state.entries.insert(locator.clone(), Entry::default());
+    state.queue.push_back(locator.clone());
     maybe_start_next(state, job_tx.clone());
     EnsureDisposition::Queued
 }
 
 fn notify_waiters(
     state: &mut ManagerState,
-    model_id: &ModelId,
-    result: Result<ResolvedWeightKey, WeightsError>,
+    locator: &WeightsLocator,
+    result: Result<(), WeightsError>,
 ) {
-    let Some(waiters) = state.waiters.remove(model_id) else {
+    let Some(waiters) = state.waiters.remove(locator) else {
         return;
     };
 
@@ -372,48 +375,57 @@ fn notify_waiters(
 
 fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
     match evt {
-        JobEvent::Resolved { model_id, revision } => {
+        JobEvent::Resolved {
+            locator,
+            resolved_revision,
+        } => {
             let entry = state
                 .entries
-                .entry(model_id.clone())
+                .entry(locator.clone())
                 .or_insert_with(Entry::default);
             entry.status = WeightsStatus::Downloading {
-                revision: Some(revision),
+                resolved_revision: Some(resolved_revision),
             };
         }
         JobEvent::Completed {
-            model_id,
-            revision,
+            locator,
+            resolved_revision,
             bundle,
         } => {
             let entry = state
                 .entries
-                .entry(model_id.clone())
+                .entry(locator.clone())
                 .or_insert_with(Entry::default);
             entry.status = WeightsStatus::Ready {
-                revision: revision.clone(),
+                resolved_revision: resolved_revision.clone(),
             };
             entry.bundle = Some(bundle);
             state.active = None;
-            info!(model = model_id.0, revision = revision.0, "weights ready");
-            let key = ResolvedWeightKey {
-                model_id: model_id.clone(),
-                revision: revision.clone(),
-            };
-            notify_waiters(state, &model_id, Ok(key));
+            info!(
+                model = locator.model_id.0,
+                requested_revision = locator.revision.0,
+                resolved_revision = resolved_revision.0,
+                "weights ready"
+            );
+            notify_waiters(state, &locator, Ok(()));
         }
-        JobEvent::Failed { model_id, error } => {
+        JobEvent::Failed { locator, error } => {
             let entry = state
                 .entries
-                .entry(model_id.clone())
+                .entry(locator.clone())
                 .or_insert_with(Entry::default);
             entry.status = WeightsStatus::Failed {
                 error: error.clone(),
             };
             entry.bundle = None;
             state.active = None;
-            warn!(model = model_id.0, error, "weights failed");
-            notify_waiters(state, &model_id, Err(WeightsError::Failed(error.clone())));
+            warn!(
+                model = locator.model_id.0,
+                requested_revision = locator.revision.0,
+                error,
+                "weights failed"
+            );
+            notify_waiters(state, &locator, Err(WeightsError::Failed(error.clone())));
         }
     }
 }
@@ -423,20 +435,24 @@ fn maybe_start_next(state: &mut ManagerState, job_tx: mpsc::UnboundedSender<JobE
         return;
     }
 
-    let Some(model_id) = state.queue.pop_front() else {
+    let Some(locator) = state.queue.pop_front() else {
         return;
     };
 
-    state.active = Some(model_id.clone());
-    if let Some(entry) = state.entries.get_mut(&model_id) {
+    state.active = Some(locator.clone());
+    if let Some(entry) = state.entries.get_mut(&locator) {
         entry.status = WeightsStatus::Resolving;
     }
 
-    info!(model = model_id.0, "weights ensure started");
+    info!(
+        model = locator.model_id.0,
+        requested_revision = locator.revision.0,
+        "weights ensure started"
+    );
     tokio::spawn(async move {
-        let model_id2 = model_id.clone();
+        let locator2 = locator.clone();
         let job_tx2 = job_tx.clone();
-        let result = tokio::task::spawn_blocking(move || load_default_bundle(&model_id2, job_tx2))
+        let result = tokio::task::spawn_blocking(move || load_bundle(&locator2, job_tx2))
             .await
             .map_err(|e| format!("weights worker join error: {e}"))
             .and_then(|r| r.map_err(|e| e.to_string()));
@@ -444,66 +460,48 @@ fn maybe_start_next(state: &mut ManagerState, job_tx: mpsc::UnboundedSender<JobE
         match result {
             Ok(_) => {}
             Err(error) => {
-                let _ = job_tx.send(JobEvent::Failed { model_id, error });
+                let _ = job_tx.send(JobEvent::Failed { locator, error });
             }
         }
     });
 }
 
-fn load_default_bundle(
-    model_id: &ModelId,
+fn load_bundle(
+    locator: &WeightsLocator,
     job_tx: mpsc::UnboundedSender<JobEvent>,
 ) -> Result<(), ExecutorError> {
     let backend = create_backend();
 
     // Ensure at least config is present and derive the resolved snapshot SHA from its path.
-    let (_weights, config_path, _tokenizer_path, _tok_config) =
-        get_model_files(&model_id.0, DEFAULT_REF)?;
-    let revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
+    let (model_paths, config_path, _tokenizer_path, _tok_config) =
+        get_model_files(&locator.model_id.0, &locator.revision.0)?;
+    let resolved_revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
         ExecutorError::WeightsError(format!(
             "unexpected hf cache path (no snapshots/<sha>): {config_path:?}"
         ))
     })?;
 
     info!(
-        model = model_id.0,
-        revision = revision.0,
+        model = locator.model_id.0,
+        requested_revision = locator.revision.0,
+        resolved_revision = resolved_revision.0,
         "weights resolved"
     );
     let _ = job_tx.send(JobEvent::Resolved {
-        model_id: model_id.clone(),
-        revision: revision.clone(),
+        locator: locator.clone(),
+        resolved_revision: resolved_revision.clone(),
     });
 
-    // Load full model weights + tokenizer + config into memory.
-    let (parameter_values, parameter_types, config, tokenizer, _total_params) =
-        load_model(&model_id.0, DEFAULT_REF, &backend)?;
-
-    let chat_template = match get_model_chat_template(&model_id.0, DEFAULT_REF) {
-        Ok(t) if !t.trim().is_empty() => Some(t),
-        Ok(_) => None,
-        Err(err) => {
-            warn!(model = model_id.0, "failed to load chat template: {err}");
-            None
-        }
-    };
-
-    let key = ResolvedWeightKey {
-        model_id: model_id.clone(),
-        revision: revision.clone(),
-    };
+    let (parameter_values, parameter_types, _total_params) =
+        load_model_weights(model_paths, &backend)?;
     let bundle = Arc::new(ModelBundle {
-        key: key.clone(),
-        config,
-        tokenizer,
-        chat_template,
         parameter_values,
         parameter_types,
     });
 
     let _ = job_tx.send(JobEvent::Completed {
-        model_id: model_id.clone(),
-        revision,
+        locator: locator.clone(),
+        resolved_revision,
         bundle,
     });
     Ok(())
@@ -551,15 +549,15 @@ mod tests {
     async fn snapshot_is_available_without_network() {
         let weights = WeightsManager::spawn(DownloadPolicy::default());
         let snap = weights.snapshot().await.unwrap();
-        assert!(snap.per_model.is_empty());
+        assert!(snap.per_locator.is_empty());
         assert!(snap.active.is_none());
         assert!(snap.queue.is_empty());
 
         let status = WeightsStatus::Downloading {
-            revision: Some(ModelRevision("deadbeef".to_string())),
+            resolved_revision: Some(ModelRevision("deadbeef".to_string())),
         };
-        if let WeightsStatus::Downloading { revision } = status {
-            assert_eq!(revision.unwrap().0, "deadbeef");
+        if let WeightsStatus::Downloading { resolved_revision } = status {
+            assert_eq!(resolved_revision.unwrap().0, "deadbeef");
         }
     }
 }

@@ -17,14 +17,13 @@ pub use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
 pub use policy::{DownloadPolicy, ExecutePolicy};
 
 use execute_worker::ExecuteWorker;
-use state::{ExecutionStatus, ExecutorState, StateError};
+use state::{ExecutionStatus, ExecutorState};
 use weights::WeightsManager;
 
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
     ExecuteProgress, ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
-    ExecuteStatusRequest, ExecuteStatusResponse, GetGraphRequest, GetGraphResponse,
-    GetQuoteRequest, GetQuoteResponse,
+    ExecuteStatusRequest, ExecuteStatusResponse, GetQuoteRequest, GetQuoteResponse,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -39,10 +38,6 @@ enum ExecutorMessage {
     Quote {
         request: GetQuoteRequest,
         reply: oneshot::Sender<Result<GetQuoteResponse, ExecutorError>>,
-    },
-    Graph {
-        request: GetGraphRequest,
-        reply: oneshot::Sender<Result<GetGraphResponse, ExecutorError>>,
     },
     Subscribe {
         execution_id: String,
@@ -65,13 +60,11 @@ enum ExecutorMessage {
     Progress {
         execution_id: String,
         chunk: Vec<u8>,
-        decoded_chunk: Option<String>,
         progress: u64,
     },
     Complete {
         execution_id: String,
         result: Option<Vec<u8>>,
-        decoded: Option<String>,
         status: ExecutionStatus,
     },
 }
@@ -112,9 +105,6 @@ impl Executor {
                 ExecutorMessage::Quote { request, reply } => {
                     let _ = reply.send(self.handle_quote(request).await);
                 }
-                ExecutorMessage::Graph { request, reply } => {
-                    let _ = reply.send(self.handle_graph(request));
-                }
                 ExecutorMessage::Subscribe {
                     execution_id,
                     reply,
@@ -133,42 +123,22 @@ impl Executor {
                 ExecutorMessage::Progress {
                     execution_id,
                     chunk,
-                    decoded_chunk,
                     progress,
                 } => {
-                    let _ = self.state.append_output_chunk(
-                        &execution_id,
-                        &chunk,
-                        decoded_chunk.as_deref(),
-                        progress,
-                    );
-                    self.send_progress(
-                        &execution_id,
-                        ExecutionStatus::Running,
-                        progress,
-                        chunk,
-                        decoded_chunk,
-                    );
+                    let _ = self
+                        .state
+                        .append_output_chunk(&execution_id, &chunk, progress);
+                    self.send_progress(&execution_id, ExecutionStatus::Running, progress, chunk);
                 }
                 ExecutorMessage::Complete {
                     execution_id,
                     result,
-                    decoded,
                     status,
                 } => {
-                    self.handle_complete(execution_id, result, decoded, status);
+                    self.handle_complete(execution_id, result, status);
                 }
             }
         }
-    }
-
-    fn handle_graph(&self, request: GetGraphRequest) -> Result<GetGraphResponse, ExecutorError> {
-        let graph = self
-            .state
-            .get_graph(&request.graph_id)
-            .cloned()
-            .ok_or_else(|| ExecutorError::State(StateError::QuoteNotFound(request.graph_id)))?;
-        Ok(GetGraphResponse { graph })
     }
 
     fn handle_status(
@@ -182,15 +152,10 @@ impl Executor {
             .get_result(&request.execution_id)
             .map(|s| s.to_vec())
             .unwrap_or_default();
-        let decoded = self
-            .state
-            .get_decoded(&request.execution_id)?
-            .map(|s| s.to_string());
         Ok(ExecuteStatusResponse {
             status: *status as i32,
             progress,
             result: result_bytes,
-            decoded,
         })
     }
 
@@ -199,13 +164,8 @@ impl Executor {
         request: ExecuteResultRequest,
     ) -> Result<ExecuteResultResponse, ExecutorError> {
         let result = self.state.get_result(&request.execution_id)?;
-        let decoded = self
-            .state
-            .get_decoded(&request.execution_id)?
-            .unwrap_or_default();
         Ok(ExecuteResultResponse {
             result: result.to_vec(),
-            decoded: decoded.to_string(),
         })
     }
 }
@@ -229,11 +189,6 @@ impl ExecutorHandle {
 
     async fn quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::Quote { request, reply })
-            .await
-    }
-
-    async fn graph(&self, request: GetGraphRequest) -> Result<GetGraphResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Graph { request, reply })
             .await
     }
 
@@ -279,13 +234,6 @@ impl Execute for ExecutorHandle {
         Ok(Response::new(self.quote(request.into_inner()).await?))
     }
 
-    async fn get_graph(
-        &self,
-        request: Request<GetGraphRequest>,
-    ) -> Result<Response<GetGraphResponse>, Status> {
-        Ok(Response::new(self.graph(request.into_inner()).await?))
-    }
-
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
@@ -328,30 +276,38 @@ impl Execute for ExecutorHandle {
 mod tests {
     use super::*;
     use crate::state::ExecutionPlan;
-    use hellas_rpc::pb::hellas::{get_quote_request, ExecutionStatus as RpcExecutionStatus};
+    use crate::weights::{ModelId, ModelRevision, WeightsLocator};
+    use hellas_rpc::encode_token_ids;
+    use hellas_rpc::pb::hellas::ExecutionStatus as RpcExecutionStatus;
+
+    fn stub_execution_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            graph: Vec::new(),
+            model_config_json: b"{}".to_vec(),
+            weights_key: WeightsLocator {
+                model_id: ModelId("test-model".to_string()),
+                revision: ModelRevision("deadbeef".to_string()),
+            },
+            input: Vec::new(),
+            prompt_tokens: 0,
+            max_new_tokens: DEFAULT_MAX_SEQ,
+            stop_token_ids: Vec::new(),
+        }
+    }
 
     #[tokio::test]
-    async fn quote_and_execute() {
+    async fn quote_rejects_missing_model_id() {
         let handle = Executor::spawn(DownloadPolicy::default(), ExecutePolicy::default());
 
-        // Get quote
-        let quote = handle
+        let err = handle
             .quote(GetQuoteRequest {
-                payload: Some(get_quote_request::Payload::Graph(b"test-graph".to_vec())),
+                graph: b"test-graph".to_vec(),
+                model_config_json: b"{}".to_vec(),
+                ..Default::default()
             })
             .await
-            .expect("should return quote");
-        assert!(quote.quote_id.starts_with("quote-"));
-
-        // Execute with quote
-        let exec = handle
-            .execute(ExecuteRequest {
-                quote_id: quote.quote_id.clone(),
-            })
-            .await
-            .expect("should return execution");
-        assert!(exec.execution_id.starts_with("exec-"));
-        assert_eq!(exec.quote_id, quote.quote_id);
+            .expect_err("quote should fail");
+        assert!(matches!(err, ExecutorError::InvalidQuoteRequest(_)));
     }
 
     #[tokio::test]
@@ -361,6 +317,7 @@ mod tests {
         let result = handle
             .execute(ExecuteRequest {
                 quote_id: "invalid-quote".to_string(),
+                stream_batch_size: None,
             })
             .await;
         assert!(result.is_err());
@@ -379,15 +336,7 @@ mod tests {
             execute_policy: ExecutePolicy::default(),
         };
 
-        let quote_id = executor.state.create_quote(
-            "graph-0".to_string(),
-            ExecutionPlan {
-                graph: Vec::new(),
-                weights_hint: None,
-                input: String::new(),
-                max_seq: DEFAULT_MAX_SEQ,
-            },
-        );
+        let quote_id = executor.state.create_quote(stub_execution_plan());
         let execution_id = executor
             .state
             .create_execution(quote_id)
@@ -404,14 +353,99 @@ mod tests {
         assert_eq!(initial.status, RpcExecutionStatus::Running as i32);
         assert_eq!(initial.progress, 0);
         assert!(initial.chunk.is_empty());
-        assert!(initial.decoded.is_none());
 
         executor.send_status(&execution_id, ExecutionStatus::Completed);
         let completed = updates.recv().await.expect("should receive completion");
         assert_eq!(completed.status, RpcExecutionStatus::Completed as i32);
         assert_eq!(completed.progress, 0);
         assert!(completed.chunk.is_empty());
-        assert!(completed.decoded.is_none());
         assert!(updates.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_after_completion_receives_buffered_result() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx2 = tx.clone();
+        let mut executor = Executor {
+            rx,
+            state: ExecutorState::new(),
+            watchers: HashMap::new(),
+            weights: WeightsManager::spawn(DownloadPolicy::default()),
+            execute_worker: ExecuteWorker::spawn(tx2),
+            execute_policy: ExecutePolicy::default(),
+        };
+
+        let quote_id = executor.state.create_quote(stub_execution_plan());
+        let execution_id = executor
+            .state
+            .create_execution(quote_id)
+            .expect("execution should be created");
+        let chunk = encode_token_ids(&[42]);
+        executor
+            .state
+            .append_output_chunk(&execution_id, &chunk, 1)
+            .unwrap();
+        executor
+            .state
+            .set_status(&execution_id, ExecutionStatus::Completed)
+            .unwrap();
+
+        let (initial, mut updates) = executor
+            .handle_subscribe(execution_id)
+            .expect("subscribe should succeed");
+
+        assert_eq!(initial.status, RpcExecutionStatus::Completed as i32);
+        assert_eq!(initial.progress, 1);
+        assert_eq!(initial.chunk, chunk);
+        assert!(updates.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_midstream_receives_buffered_result_and_future_updates() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx2 = tx.clone();
+        let mut executor = Executor {
+            rx,
+            state: ExecutorState::new(),
+            watchers: HashMap::new(),
+            weights: WeightsManager::spawn(DownloadPolicy::default()),
+            execute_worker: ExecuteWorker::spawn(tx2),
+            execute_policy: ExecutePolicy::default(),
+        };
+
+        let quote_id = executor.state.create_quote(stub_execution_plan());
+        let execution_id = executor
+            .state
+            .create_execution(quote_id)
+            .expect("execution should be created");
+        let first_chunk = encode_token_ids(&[11]);
+        executor
+            .state
+            .append_output_chunk(&execution_id, &first_chunk, 1)
+            .unwrap();
+        executor
+            .state
+            .set_status(&execution_id, ExecutionStatus::Running)
+            .unwrap();
+
+        let (initial, mut updates) = executor
+            .handle_subscribe(execution_id.clone())
+            .expect("subscribe should succeed");
+
+        assert_eq!(initial.status, RpcExecutionStatus::Running as i32);
+        assert_eq!(initial.progress, 1);
+        assert_eq!(initial.chunk, first_chunk);
+
+        let second_chunk = encode_token_ids(&[22]);
+        executor.send_progress(
+            &execution_id,
+            ExecutionStatus::Running,
+            2,
+            second_chunk.clone(),
+        );
+        let update = updates.recv().await.expect("should receive progress");
+        assert_eq!(update.status, RpcExecutionStatus::Running as i32);
+        assert_eq!(update.progress, 2);
+        assert_eq!(update.chunk, second_chunk);
     }
 }

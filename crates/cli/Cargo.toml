@@ -8,10 +8,16 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["client", "discovery"]
-client = ["hellas-rpc/client", "dep:tonic-iroh-transport", "dep:tonic", "tonic-iroh-transport/client"]
-discovery = ["client", "dep:tonic", "tonic-iroh-transport/discovery", "dep:pkarr"]
-serve = ["discovery", "hellas-rpc/server", "dep:hellas-executor", "dep:tonic", "tonic-iroh-transport/server"]
+default = ["client"]
+client = [
+    "hellas-rpc/client",
+    "hellas-rpc/discovery",
+    "dep:tonic-iroh-transport",
+    "dep:tonic",
+    "tonic-iroh-transport/client",
+    "tonic-iroh-transport/discovery",
+]
+serve = ["client", "hellas-rpc/server", "dep:hellas-executor", "dep:tonic", "tonic-iroh-transport/server"]
 cuda = ["serve", "hellas-executor/candle-cuda"]
 metal = ["serve", "hellas-executor/candle-metal"]
 
@@ -19,6 +25,15 @@ metal = ["serve", "hellas-executor/candle-metal"]
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+reqwest.workspace = true
+catgrad.workspace = true
+catgrad-llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -28,7 +43,10 @@ tonic-iroh-transport = { workspace = true, default-features = false, optional = 
 tonic = { workspace = true, optional = true }
 tokio-stream = { workspace = true }
 futures = "0.3"
-pkarr = { version = "5", optional = true }
+axum = "0.8"
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+tokenizers = "0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }
