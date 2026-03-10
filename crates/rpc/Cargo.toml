@@ -10,6 +10,14 @@ documentation.workspace = true
 [features]
 default = []
 client = ["tonic/channel"]
+discovery = [
+    "client",
+    "dep:anyhow",
+    "dep:futures",
+    "dep:pkarr",
+    "dep:tonic-iroh-transport",
+    "tonic-iroh-transport/discovery",
+]
 server = ["tonic/server"]
 compile = ["dep:tonic-prost-build"]
 
@@ -17,6 +25,13 @@ compile = ["dep:tonic-prost-build"]
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
+anyhow = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+pkarr = { version = "5", optional = true }
+tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

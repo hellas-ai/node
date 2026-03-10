@@ -11,6 +11,8 @@ pub enum ExecutorError {
     ChannelClosed,
     #[error("executor is busy")]
     Busy,
+    #[error("invalid quote request: {0}")]
+    InvalidQuoteRequest(String),
     #[error("invalid catgrad graph: {0}")]
     InvalidGraph(#[from] serde_json::Error),
     #[error("LLM error: {0}")]
@@ -19,18 +21,14 @@ pub enum ExecutorError {
     Interpreter(#[from] InterpreterError),
     #[error("backend error: {0:?}")]
     Backend(BackendError),
-    #[error("failed to construct model term for {0}")]
-    ModelConstruction(String),
-    #[error("missing quote payload")]
-    MissingPayload,
-    #[error("missing weights hint model id")]
-    MissingWeightsHint,
-    #[error("weights not ready for model {0}")]
+    #[error("weights not ready for {0}")]
     WeightsNotReady(String),
     #[error("weights error: {0}")]
     WeightsError(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
+    #[error("invalid token payload: {0}")]
+    InvalidTokenPayload(String),
     #[error("no output from graph")]
     NoOutput,
     #[error("unexpected output value")]
@@ -44,16 +42,15 @@ impl From<ExecutorError> for Status {
         match &err {
             ExecutorError::ChannelClosed => Status::internal(err.to_string()),
             ExecutorError::Busy => Status::resource_exhausted(err.to_string()),
+            ExecutorError::InvalidQuoteRequest(_) => Status::invalid_argument(err.to_string()),
             ExecutorError::InvalidGraph(_) => Status::invalid_argument(err.to_string()),
             ExecutorError::Llm(_) => Status::internal(err.to_string()),
             ExecutorError::Interpreter(_) => Status::internal(err.to_string()),
             ExecutorError::Backend(_) => Status::internal(err.to_string()),
-            ExecutorError::ModelConstruction(_) => Status::internal(err.to_string()),
-            ExecutorError::MissingPayload => Status::invalid_argument(err.to_string()),
-            ExecutorError::MissingWeightsHint => Status::invalid_argument(err.to_string()),
             ExecutorError::WeightsNotReady(_) => Status::failed_precondition(err.to_string()),
             ExecutorError::WeightsError(_) => Status::internal(err.to_string()),
             ExecutorError::PolicyDenied(_) => Status::permission_denied(err.to_string()),
+            ExecutorError::InvalidTokenPayload(_) => Status::invalid_argument(err.to_string()),
             ExecutorError::NoOutput => Status::internal(err.to_string()),
             ExecutorError::UnexpectedOutput => Status::internal(err.to_string()),
             ExecutorError::State(StateError::QuoteNotFound(_)) => {
