@@ -52,7 +52,7 @@ pub fn utxo_db_config(
         log_journal_partition: format!("{partition_prefix}_utxo_log_journal"),
         log_items_per_blob: ITEMS_PER_BLOB,
         log_write_buffer: WRITE_BUFFER,
-        bitmap_metadata_partition: format!("{partition_prefix}_utxo_bitmap_metadata"),
+        grafted_mmr_metadata_partition: format!("{partition_prefix}_utxo_grafted_mmr_metadata"),
         translator: EightCap,
         thread_pool: None,
         page_cache: CacheRef::from_pooler(pooler, page_cache_size, page_cache_count),

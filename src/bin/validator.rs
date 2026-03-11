@@ -9,7 +9,6 @@ use futures::FutureExt;
 use hellas_chain::TraceReporter;
 use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_private_key};
 use hellas_chain::engine::Engine;
-use hellas_chain::shard::AuthenticatedShardTransport;
 use hellas_types::Scheme;
 use p256::ecdsa::SigningKey as UserSigningKey;
 use p256::ecdsa::signature::Signer as _;
@@ -19,14 +18,13 @@ use sha2::{Digest as _, Sha256 as Sha2};
 use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
 use thiserror::Error;
 use tracing::{info, warn};
 
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
-const SHARD_CHANNEL_BACKLOG: usize = 4096;
 const DEFAULT_OTLP_SERVICE_NAME: &str = "hellas-validator";
 const DEFAULT_OTLP_SAMPLE_RATE: f64 = 1.0;
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
@@ -718,7 +716,6 @@ async fn wait_for_shutdown_signal() -> &'static str {
 enum ShutdownTrigger {
     Signal(&'static str),
     NetworkExited,
-    ShardTransportExited,
     EngineExited,
 }
 
@@ -864,12 +861,13 @@ fn run(
         oracle.track(0, peer_map.clone()).await;
         oracle.overwrite(peer_map).await;
 
-        // Register consensus and shard channels.
+        // Register consensus, marshal resolver, and block broadcast channels.
         let quota = Quota::per_second(NonZeroU32::MAX);
         let vote = network.register(0, quota, CHANNEL_BACKLOG);
         let certificate = network.register(1, quota, CHANNEL_BACKLOG);
-        let resolver = network.register(2, quota, CHANNEL_BACKLOG);
-        let (shard_sender, shard_receiver) = network.register(3, quota, SHARD_CHANNEL_BACKLOG);
+        let consensus_resolver = network.register(2, quota, CHANNEL_BACKLOG);
+        let marshal_resolver = network.register(3, quota, CHANNEL_BACKLOG);
+        let broadcast_blocks = network.register(4, quota, CHANNEL_BACKLOG);
 
         // Publish process uptime as a prometheus gauge, updated every second.
         let uptime_gauge: Gauge<i64, AtomicI64> = Gauge::default();
@@ -887,16 +885,6 @@ fn run(
             }
         });
 
-        let relay = Arc::new(AuthenticatedShardTransport::new(
-            &me,
-            shard_sender,
-            shard_receiver,
-        ));
-        for participant in scheme.participants() {
-            relay.declare(participant);
-        }
-        relay.finalize_validators();
-
         // Extract validator names before scheme is moved into the engine.
         let validators: Vec<String> = scheme
             .participants()
@@ -904,28 +892,25 @@ fn run(
             .map(|pk| hex::encode(&pk.encode()[..8]))
             .collect();
 
-        // Create engine first so the application can subscribe to shard ingress
-        // before the transport starts dispatching inbound shard messages.
         let mut chain_config = Config::mainnet();
         if let Some(ms) = node_config.min_propose_ms {
             chain_config.min_propose_delay = Duration::from_millis(ms);
             info!(min_propose_ms = ms, "proposal throttle enabled");
         }
-        let (engine, tx_mailbox, activity_tx) = Engine::new(
+        let (engine, application, activity_tx) = Engine::new(
             context.clone(),
             chain_config,
             scheme,
+            oracle.clone(),
             oracle,
-            relay.clone(),
             &me,
             genesis_allocations.clone(),
             TraceReporter,
-        );
-        // Block startup until the application actor has finished persistence
-        // recovery and is servicing mailbox queries.
-        let startup_root = tx_mailbox.get_state_root().await;
+        )
+        .await;
+        let startup_root = application.get_state_root().await;
         info!(?startup_root, "application startup barrier passed");
-        let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox, validators);
+        let light_client = hellas_chain::rpc::LocalLightClient::new(application, validators);
 
         // Start light-client gRPC server over WebSocket (if configured)
         if let Some(ws_bind) = &node_config.ws_bind {
@@ -972,9 +957,13 @@ fn run(
             info!(%explorer_url, "relay connection started");
         }
 
-        let shard_transport_handle = relay.start(context.clone());
-
-        let engine_handle = engine.start(vote, certificate, resolver);
+        let engine_handle = engine.start(
+            vote,
+            certificate,
+            consensus_resolver,
+            marshal_resolver,
+            broadcast_blocks,
+        );
         // Start networking only after the app + consensus engine are initialized.
         let network_handle = network.start();
 
@@ -984,18 +973,10 @@ fn run(
         let network_waiter = network_handle
             .map(|_| ShutdownTrigger::NetworkExited)
             .boxed();
-        let shard_waiter = shard_transport_handle
-            .map(|_| ShutdownTrigger::ShardTransportExited)
-            .boxed();
         let engine_waiter = engine_handle.map(|_| ShutdownTrigger::EngineExited).boxed();
 
-        let (trigger, _, _) = futures::future::select_all(vec![
-            signal_waiter,
-            network_waiter,
-            shard_waiter,
-            engine_waiter,
-        ])
-        .await;
+        let (trigger, _, _) =
+            futures::future::select_all(vec![signal_waiter, network_waiter, engine_waiter]).await;
 
         let monitor_second_signal = matches!(trigger, ShutdownTrigger::Signal(_));
         match trigger {
@@ -1004,9 +985,6 @@ fn run(
             }
             ShutdownTrigger::NetworkExited => {
                 warn!("network task exited unexpectedly; triggering shutdown");
-            }
-            ShutdownTrigger::ShardTransportExited => {
-                warn!("shard transport task exited unexpectedly; triggering shutdown");
             }
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");

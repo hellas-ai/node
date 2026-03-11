@@ -1,12 +1,9 @@
-use crate::app::AppMailbox;
 use commonware_codec::{DecodeExt, Encode};
-use commonware_consensus::{Reporter, elector::RoundRobin, minimmit, types::ViewDelta};
-use commonware_cryptography::{Sha256, Signer, ed25519, sha256::Digest};
-use commonware_p2p::{Address as P2pAddress, Blocker};
-use commonware_parallel::Sequential;
+use commonware_cryptography::{Signer, ed25519};
+use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-use hellas_types::{Activity, Address as UserAddress, EPOCH, PublicKey, Scheme};
+use hellas_types::{Address as UserAddress, PublicKey};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -51,6 +48,8 @@ pub struct Config {
     pub fetch_timeout: Duration,
     pub fetch_concurrent: usize,
     pub min_propose_delay: Duration,
+    pub broadcast_cache_per_peer: usize,
+    pub max_repair: usize,
 }
 
 impl Config {
@@ -69,6 +68,8 @@ impl Config {
             fetch_timeout: Duration::from_secs(5),
             fetch_concurrent: 3,
             min_propose_delay: Duration::ZERO,
+            broadcast_cache_per_peer: 128,
+            max_repair: 16,
         }
     }
 
@@ -87,66 +88,18 @@ impl Config {
             fetch_timeout: Duration::from_millis(500),
             fetch_concurrent: 3,
             min_propose_delay: Duration::ZERO,
+            broadcast_cache_per_peer: 64,
+            max_repair: 8,
         }
     }
 
-    pub fn into_minimmit<B, R>(
-        self,
-        pooler: &impl BufferPooler,
-        scheme: Scheme,
-        blocker: B,
-        automaton: AppMailbox,
-        relay: AppMailbox,
-        reporter: R,
-        partition: &PublicKey,
-    ) -> minimmit::Config<
-        Scheme,
-        RoundRobin<Sha256>,
-        B,
-        Digest,
-        AppMailbox,
-        AppMailbox,
-        R,
-        Sequential,
-    >
-    where
-        B: Blocker<PublicKey = PublicKey>,
-        R: Reporter<Activity = Activity>,
-    {
-        let replay_buffer = NonZeroUsize::new(self.replay_buffer).unwrap_or(NonZeroUsize::MIN);
-        let write_buffer = NonZeroUsize::new(self.write_buffer).unwrap_or(NonZeroUsize::MIN);
+    pub fn page_cache(self, pooler: &impl BufferPooler) -> CacheRef {
         let page_cache_count =
             NonZeroUsize::new(self.page_cache_count).unwrap_or(NonZeroUsize::MIN);
         let page_cache_size = NonZeroU16::new(self.page_cache_size).unwrap_or(NonZeroU16::MIN);
-
-        minimmit::Config {
-            scheme,
-            elector: RoundRobin::<Sha256>::default(),
-            blocker,
-            automaton,
-            relay,
-            reporter,
-            strategy: Sequential,
-            partition: partition.to_string(),
-            mailbox_size: self.mailbox_size,
-            epoch: EPOCH,
-            replay_buffer,
-            write_buffer,
-            page_cache: CacheRef::from_pooler(pooler, page_cache_size, page_cache_count),
-            leader_timeout: self.leader_timeout,
-            notarization_timeout: self.notarization_timeout,
-            nullify_retry: self.nullify_retry,
-            activity_timeout: ViewDelta::new(self.activity_timeout),
-            skip_timeout: ViewDelta::new(self.skip_timeout),
-            fetch_timeout: self.fetch_timeout,
-            fetch_concurrent: self.fetch_concurrent,
-        }
+        CacheRef::from_pooler(pooler, page_cache_size, page_cache_count)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Node configuration (serialized to/from TOML)
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -156,12 +109,8 @@ pub struct NodeConfig {
     pub metrics_port: Option<u16>,
     #[serde(default)]
     pub ws_bind: Option<String>,
-    /// WebSocket URL of the explorer DO to push events and serve queries to.
-    /// When set, the validator initiates two connections to the DO.
     #[serde(default)]
     pub explorer_url: Option<String>,
-    /// Minimum time (in milliseconds) the leader waits before emitting a
-    /// proposal.  Useful for throttling a local cluster during development.
     #[serde(default)]
     pub min_propose_ms: Option<u64>,
     #[serde(default)]

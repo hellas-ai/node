@@ -10,16 +10,14 @@ path = "src/bin/validator.rs"
 
 [features]
 default = []
-perf-harness = []
 loom-tests = ["dep:loom"]
 
 [dependencies]
 bytes = { workspace = true }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
 clap = { workspace = true }
-commonware-actor = { workspace = true }
+commonware-broadcast = { workspace = true }
 commonware-codec = { workspace = true }
-commonware-coding = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-macros = { workspace = true }
@@ -58,16 +56,10 @@ tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
-commonware-consensus = { workspace = true, features = ["fuzz", "mocks"] }
+commonware-consensus = { workspace = true, features = [ "mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-criterion = "0.7"
 hellas-types = { workspace = true, features = ["consensus", "test-support"] }
 hellas-rpc = { workspace = true, features = ["server", "mux-client"] }
 proptest = "1.6"
 test-log = { version = "0.2", features = ["trace"] }
 tonic = { version = "0.14", features = ["server", "channel", "router"] }
-
-[[bench]]
-name = "shard_perf"
-harness = false
-required-features = ["perf-harness"]

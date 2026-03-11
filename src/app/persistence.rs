@@ -1,18 +1,14 @@
-use super::{mailbox, metrics::PersistenceMetrics};
+use super::{ProofResponse, metrics::PersistenceMetrics};
 use crate::execution::store::{UtxoDb, utxo_db_config};
-use crate::execution::{FinalizationDiffs, genesis_state};
-use crate::gauged::{GaugedIndexMap, GaugedVecDeque};
+use crate::execution::{StateDiff, genesis_state};
 use crate::trace::Traced;
-use bytes::{Buf, Bytes};
-use commonware_codec::{FixedSize, RangeCfg, Read as CodecRead, ReadExt, ReadRangeExt, Write};
+use bytes::Buf;
+use commonware_codec::{RangeCfg, ReadExt, ReadRangeExt, Write};
+use commonware_consensus::types::Height;
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef};
 use commonware_storage::{
     Persistable,
-    freezer::{
-        Checkpoint as FreezerCheckpoint, Config as FreezerConfig, Cursor as FreezerCursor, Freezer,
-        Identifier as FreezerIdentifier,
-    },
     metadata::{Config as MetadataConfig, Metadata},
     queue::{Config as QueueConfig, Queue},
 };
@@ -20,7 +16,7 @@ use commonware_utils::{channel::oneshot, sequence::U64};
 use futures::{StreamExt, channel::mpsc};
 use hellas_types::{Address, Coin, ObjectId};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::LazyLock,
 };
@@ -32,41 +28,22 @@ pub(super) struct Fatal(String);
 
 pub(super) enum PersistenceCommand {
     Enqueue {
+        height: Height,
         payload: Digest,
-        diffs: FinalizationDiffs,
+        diffs: StateDiff,
     },
     GetStateRoot {
         response: oneshot::Sender<Option<Digest>>,
     },
     GetProof {
         object: ObjectId,
-        response: oneshot::Sender<Option<mailbox::ProofResponse>>,
-    },
-    GetPayload {
-        payload: Digest,
-        response: oneshot::Sender<Option<Bytes>>,
+        response: oneshot::Sender<Option<ProofResponse>>,
     },
     GetPersistedAnchors {
-        response: oneshot::Sender<Vec<(Digest, Digest)>>,
-    },
-    RecordPersistedRoot {
-        payload: Digest,
-        root: Digest,
-    },
-    GetFinalization {
-        payload: Digest,
-        response: oneshot::Sender<Option<mailbox::FinalizationResponse>>,
+        response: oneshot::Sender<Vec<(Height, Digest, Digest)>>,
     },
     GetLatestBlock {
         response: oneshot::Sender<Option<(u64, Digest, Digest)>>,
-    },
-    RecordFinalization {
-        payload: Digest,
-        finalization: mailbox::FinalizationResponse,
-    },
-    RecordPayload {
-        payload: Digest,
-        bytes: Bytes,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -77,9 +54,9 @@ pub(super) enum PersistenceCommand {
 pub(super) enum PersistenceEvent {
     Ready {
         root: Digest,
-        recovered_payloads: Vec<(Digest, Bytes)>,
     },
     Persisted {
+        height: Height,
         payload: Digest,
         root: Digest,
     },
@@ -93,11 +70,7 @@ pub(super) struct PageCacheConfig {
 
 type PersistenceQueue<E> = Queue<E, Vec<u8>>;
 type AnchorIndex<E> = Metadata<E, U64, Vec<u8>>;
-type FinalizationIndex<E> = Freezer<E, Digest, Vec<u8>>;
-type PayloadIndex<E> = Freezer<E, Digest, Vec<u8>>;
 
-/// Well-known key used to store the queue cursor position in the
-/// dedicated metadata partition.
 static QUEUE_CURSOR_KEY: LazyLock<Digest> = LazyLock::new(|| {
     let mut bytes = [0u8; 32];
     bytes[0] = b'q';
@@ -105,29 +78,6 @@ static QUEUE_CURSOR_KEY: LazyLock<Digest> = LazyLock::new(|| {
     Digest::from(bytes)
 });
 
-/// Well-known key for the finalization Freezer checkpoint.
-static FINALIZATION_CHECKPOINT_KEY: LazyLock<Digest> = LazyLock::new(|| {
-    let mut bytes = [0u8; 32];
-    bytes[0] = b'f';
-    bytes[1] = b'c';
-    Digest::from(bytes)
-});
-
-/// Well-known key for the payload Freezer checkpoint.
-static PAYLOAD_CHECKPOINT_KEY: LazyLock<Digest> = LazyLock::new(|| {
-    let mut bytes = [0u8; 32];
-    bytes[0] = b'p';
-    bytes[1] = b'c';
-    Digest::from(bytes)
-});
-
-/// Safe wrapper around [`UtxoDb`] that encapsulates the QMDB type-state
-/// machine and provides crash-safe commit semantics.
-///
-/// The last successfully committed queue position is persisted in a
-/// separate [`Metadata`] partition (not in QMDB commit metadata, which
-/// would pollute the Merkle root).  On restart, [`was_committed`] lets
-/// callers skip queue items that were already applied before a crash.
 struct UtxoStore<E: Clock + Spawner + Storage + Metrics + BufferPooler> {
     db: UtxoDb<E>,
     cursor_index: Metadata<E, Digest, Vec<u8>>,
@@ -154,7 +104,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
             context.with_label("queue_cursor"),
             MetadataConfig {
                 partition: format!("{partition_prefix}_queue_cursor"),
-                codec_config: ((0..=FreezerCheckpoint::SIZE).into(), ()),
+                codec_config: ((0..=8).into(), ()),
             },
         )
         .await
@@ -175,18 +125,6 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         })
     }
 
-    fn load_checkpoint(&self, key: &Digest) -> Option<FreezerCheckpoint> {
-        self.cursor_index
-            .get(key)
-            .and_then(|bytes| FreezerCheckpoint::read_cfg(&mut bytes.as_slice(), &()).ok())
-    }
-
-    fn save_checkpoint(&mut self, key: Digest, cp: FreezerCheckpoint) {
-        let mut buf = Vec::with_capacity(FreezerCheckpoint::SIZE);
-        cp.write(&mut buf);
-        self.cursor_index.put(key, buf);
-    }
-
     fn was_committed(&self, queue_position: u64) -> bool {
         self.last_committed_position
             .is_some_and(|last| queue_position <= last)
@@ -204,15 +142,11 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
     }
 
     async fn apply_diffs(
-        mut self,
+        &mut self,
         batch: Vec<(ObjectId, Option<Coin>)>,
         queue_position: Option<u64>,
         label: &str,
-    ) -> Result<Self, Fatal> {
-        // QMDB advances an internal sequence on every commit, changing the
-        // Merkle root even when the batch is empty.  Skip the commit entirely
-        // when there are no state changes to preserve root determinism across
-        // validators with different persistence queue depths.
+    ) -> Result<(), Fatal> {
         if batch.is_empty() {
             if let Some(pos) = queue_position {
                 self.cursor_index
@@ -222,24 +156,26 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
                 })?;
                 self.last_committed_position = Some(pos);
             }
-            return Ok(self);
+            return Ok(());
         }
 
-        let mut db = self.db.into_mutable();
-
-        db.write_batch(batch)
+        let mut pending = self.db.new_batch();
+        for (object_id, coin) in batch {
+            pending = pending.write(object_id, coin);
+        }
+        let finalized = pending
+            .merkleize(None)
             .await
-            .map_err(|err| Fatal(format!("QMDB write_batch failed for {label}: {err:?}")))?;
-
-        let (db, _range) = db
-            .commit(None)
+            .map_err(|err| Fatal(format!("QMDB merkleize failed for {label}: {err:?}")))?
+            .finalize();
+        self.db
+            .apply_batch(finalized)
             .await
-            .map_err(|err| Fatal(format!("QMDB commit failed for {label}: {err:?}")))?;
-
-        let db = db
-            .into_merkleized()
+            .map_err(|err| Fatal(format!("QMDB apply_batch failed for {label}: {err:?}")))?;
+        self.db
+            .sync()
             .await
-            .map_err(|err| Fatal(format!("QMDB merkleize failed for {label}: {err:?}")))?;
+            .map_err(|err| Fatal(format!("QMDB sync failed for {label}: {err:?}")))?;
 
         if let Some(pos) = queue_position {
             self.cursor_index
@@ -250,8 +186,8 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
                 .map_err(|err| Fatal(format!("queue cursor sync failed for {label}: {err:?}")))?;
             self.last_committed_position = Some(pos);
         }
-        self.db = db;
-        Ok(self)
+
+        Ok(())
     }
 
     fn root(&self) -> Digest {
@@ -266,7 +202,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
         &self,
         hasher: &mut Sha256,
         object: ObjectId,
-    ) -> Option<mailbox::ProofResponse> {
+    ) -> Option<ProofResponse> {
         self.db.key_value_proof(hasher, object).await.ok()
     }
 
@@ -281,6 +217,7 @@ impl<E: Clock + Spawner + Storage + Metrics + BufferPooler> UtxoStore<E> {
 #[derive(Clone, Copy)]
 struct AnchorEntry {
     sequence: u64,
+    height: Height,
     payload: Digest,
     root: Digest,
 }
@@ -295,14 +232,8 @@ where
     store: UtxoStore<E>,
     queue: PersistenceQueue<E>,
     anchor_index: AnchorIndex<E>,
-    anchor_history: GaugedVecDeque<AnchorEntry>,
+    anchor_history: VecDeque<AnchorEntry>,
     next_anchor_sequence: u64,
-    finalization_index: FinalizationIndex<E>,
-    finalization_cursors: HashMap<Digest, FreezerCursor>,
-    volatile_finalizations: GaugedIndexMap<Digest, mailbox::FinalizationResponse>,
-    payload_index: PayloadIndex<E>,
-    payload_cursors: HashMap<Digest, FreezerCursor>,
-    volatile_payloads: GaugedIndexMap<Digest, Bytes>,
 }
 
 impl<E> PersistenceWorker<E>
@@ -313,12 +244,8 @@ where
     const QUEUE_WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
     const MAX_QUEUE_ITEM_BYTES: usize = 1 << 20;
     const MAX_QUEUE_DIFF_ENTRIES: usize = 32_768;
-    const MAX_ANCHOR_RECORD_BYTES: usize = 128;
+    const MAX_ANCHOR_RECORD_BYTES: usize = 160;
     const MAX_ANCHOR_HISTORY: usize = 2048;
-    const MAX_FINALIZATION_RECORD_BYTES: usize = 1 << 20;
-    const MAX_VOLATILE_FINALIZATIONS: usize = 4096;
-    const MAX_PAYLOAD_RECORD_BYTES: usize = 1 << 20;
-    const MAX_VOLATILE_PAYLOADS: usize = 4096;
 
     pub(super) async fn create(
         context: &mut E,
@@ -334,48 +261,21 @@ where
         let (anchor_index, anchor_history, next_anchor_sequence) =
             Self::initialize_anchor_index(context, &partition_prefix).await?;
 
-        let fin_checkpoint = store.load_checkpoint(&FINALIZATION_CHECKPOINT_KEY);
-        let pay_checkpoint = store.load_checkpoint(&PAYLOAD_CHECKPOINT_KEY);
-
-        let finalization_index = Self::initialize_finalization_index(
-            context,
-            &partition_prefix,
-            page_cache_config,
-            fin_checkpoint,
-        )
-        .await?;
-        let payload_index = Self::initialize_payload_index(
-            context,
-            &partition_prefix,
-            page_cache_config,
-            pay_checkpoint,
-        )
-        .await?;
-
         if store.is_empty() {
             let genesis = genesis_state(&genesis_allocations);
             let batch = UtxoStore::<E>::diffs_to_batch(&genesis.created, &genesis.deleted);
-            store = store.apply_diffs(batch, None, "genesis bootstrap").await?;
+            store.apply_diffs(batch, None, "genesis bootstrap").await?;
         }
-
-        let mut anchor_history_gauged = GaugedVecDeque::new(metrics.anchor_history_entries.clone());
-        anchor_history_gauged.replace(anchor_history);
 
         Ok(Self {
             command_rx,
             event_tx,
+            metrics,
             store,
             queue,
             anchor_index,
-            anchor_history: anchor_history_gauged,
+            anchor_history,
             next_anchor_sequence,
-            finalization_index,
-            finalization_cursors: HashMap::new(),
-            volatile_finalizations: GaugedIndexMap::new(metrics.finalization_cache_entries.clone()),
-            payload_index,
-            payload_cursors: HashMap::new(),
-            volatile_payloads: GaugedIndexMap::new(metrics.payload_cache_entries.clone()),
-            metrics,
         })
     }
 
@@ -384,14 +284,15 @@ where
         if let Some(pos) = self.store.last_committed_position {
             self.metrics.utxo_committed_position.set(pos as i64);
         }
+        self.metrics
+            .anchor_history_entries
+            .set(self.anchor_history.len() as i64);
         self.update_queue_depth().await;
-        let root = self.store.root();
-        let recovered_payloads = self.recover_payload_chain().await;
+
         if let Err(err) = self
             .event_tx
             .unbounded_send(Traced::capture(PersistenceEvent::Ready {
-                root,
-                recovered_payloads,
+                root: self.store.root(),
             }))
         {
             warn!(
@@ -400,8 +301,8 @@ where
             );
             return;
         }
+
         'outer: loop {
-            // Drain any buffered commands before attempting persistence.
             loop {
                 match self.command_rx.try_recv() {
                     Ok(command) => match self.process_command(command).await {
@@ -410,20 +311,18 @@ where
                         Err(err) => Self::abort(err),
                     },
                     Err(mpsc::TryRecvError::Closed) => break 'outer,
-                    Err(mpsc::TryRecvError::Empty) => break, // channel empty; fall through to persist or block
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
 
-            // Persist any pending work from the durable queue.
             if self.has_pending_work().await {
                 self = match self.persist_next_pending().await {
-                    Ok(s) => s,
+                    Ok(worker) => worker,
                     Err(err) => Self::abort(err),
                 };
                 continue;
             }
 
-            // No work; block until a command arrives.
             let Some(command) = self.command_rx.next().await else {
                 break;
             };
@@ -434,14 +333,14 @@ where
             }
         }
 
-        if let Err(err) = Box::pin(self.shutdown()).await {
+        if let Err(err) = self.shutdown().await {
             Self::abort(err);
         }
     }
 
     fn abort(err: Fatal) -> ! {
         error!(%err, "irrecoverable persistence error; aborting");
-        std::process::abort()
+        std::process::abort();
     }
 
     async fn process_command(
@@ -449,7 +348,6 @@ where
         command: Traced<PersistenceCommand>,
     ) -> Result<bool, Fatal> {
         let (command, parent_span) = command.into_parts();
-        // Box::pin to keep the Freezer get/put/sync futures off the run() stack.
         Box::pin(self.handle_command(command))
             .instrument(parent_span)
             .await
@@ -484,15 +382,14 @@ where
             }
         };
 
-        let Some((payload, diffs)) = Self::decode_queue_item(encoded.as_slice()) else {
+        let Some((height, payload, diffs)) = Self::decode_queue_item(encoded.as_slice()) else {
             return Err(Fatal(format!(
                 "invalid persistence queue item at position {position}"
             )));
         };
 
-        // Skip queue items already committed before a crash.
         if self.store.was_committed(position) {
-            info!(?payload, position, "skipping already-committed queue item");
+            info!(height = %height, ?payload, position, "skipping already-committed queue item");
             self.queue.ack(position).await.map_err(|err| {
                 Fatal(format!(
                     "failed to ack persistence intent at position {position} for {payload:?}: {err:?}"
@@ -503,42 +400,26 @@ where
                     "failed to sync persistence queue after ack for {payload:?}: {err:?}"
                 ))
             })?;
-            // Re-record anchor (may have been lost if crash was between
-            // commit and anchor sync). record_persisted_anchor is idempotent
-            // when payload+root match.
             let root = self.store.root();
-            self.record_persisted_anchor(payload, root).await?;
+            self.record_persisted_anchor(height, payload, root).await?;
             self.metrics.persist_success_total.inc();
             self.update_queue_depth().await;
             let _ = self
                 .event_tx
                 .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
+                    height,
                     payload,
                     root,
                 }));
             return Ok(self);
         }
 
-        info!(
-            ?payload,
-            queue_position = position,
-            created = diffs.created.len(),
-            deleted = diffs.deleted.len(),
-            "persisting finalization diffs"
-        );
-
         self.metrics.persist_attempt_total.inc();
-
         let batch = UtxoStore::<E>::diffs_to_batch(&diffs.created, &diffs.deleted);
-        let label = format!("{payload:?}");
-        self.store = self
-            .store
-            .apply_diffs(batch, Some(position), &label)
+        self.store
+            .apply_diffs(batch, Some(position), &format!("{payload:?}"))
             .await?;
-        let root = self.store.root();
-        self.metrics.utxo_committed_position.set(position as i64);
 
-        // Ack the queue item so it won't be replayed on restart.
         self.queue.ack(position).await.map_err(|err| {
             Fatal(format!(
                 "failed to ack persistence intent at position {position} for {payload:?}: {err:?}"
@@ -549,13 +430,16 @@ where
                 "failed to sync persistence queue after ack for {payload:?}: {err:?}"
             ))
         })?;
-
-        self.metrics.persist_success_total.inc();
         self.update_queue_depth().await;
-        self.record_persisted_anchor(payload, root).await?;
+
+        let root = self.store.root();
+        self.record_persisted_anchor(height, payload, root).await?;
+        self.metrics.persist_success_total.inc();
+
         if let Err(err) =
             self.event_tx
                 .unbounded_send(Traced::capture(PersistenceEvent::Persisted {
+                    height,
                     payload,
                     root,
                 }))
@@ -563,7 +447,7 @@ where
             warn!(
                 ?err,
                 ?payload,
-                "failed to notify application of persisted finalization"
+                "failed to notify application of persisted block"
             );
         }
 
@@ -572,10 +456,11 @@ where
 
     async fn enqueue_pending(
         &mut self,
-        payload: &Digest,
-        diffs: &FinalizationDiffs,
+        height: Height,
+        payload: Digest,
+        diffs: &StateDiff,
     ) -> Result<(), Fatal> {
-        let encoded = Self::encode_queue_item(*payload, diffs);
+        let encoded = Self::encode_queue_item(height, payload, diffs);
         self.queue
             .enqueue(encoded)
             .await
@@ -589,16 +474,18 @@ where
         Ok(())
     }
 
-    fn encode_queue_item(payload: Digest, diffs: &FinalizationDiffs) -> Vec<u8> {
+    fn encode_queue_item(height: Height, payload: Digest, diffs: &StateDiff) -> Vec<u8> {
         let mut encoded = Vec::new();
+        height.write(&mut encoded);
         payload.write(&mut encoded);
         diffs.created.write(&mut encoded);
         diffs.deleted.write(&mut encoded);
         encoded
     }
 
-    fn decode_queue_item(encoded: &[u8]) -> Option<(Digest, FinalizationDiffs)> {
+    fn decode_queue_item(encoded: &[u8]) -> Option<(Height, Digest, StateDiff)> {
         let mut reader = encoded;
+        let height = Height::read(&mut reader).ok()?;
         let payload = Digest::read(&mut reader).ok()?;
         let created =
             Vec::<(ObjectId, Coin)>::read_range(&mut reader, 0..=Self::MAX_QUEUE_DIFF_ENTRIES)
@@ -608,31 +495,37 @@ where
         if reader.has_remaining() {
             return None;
         }
-        Some((payload, FinalizationDiffs { created, deleted }))
+        Some((height, payload, StateDiff { created, deleted }))
     }
 
-    fn encode_anchor_record(payload: Digest, root: Digest) -> Vec<u8> {
+    fn encode_anchor_record(height: Height, payload: Digest, root: Digest) -> Vec<u8> {
         let mut encoded = Vec::new();
+        height.write(&mut encoded);
         payload.write(&mut encoded);
         root.write(&mut encoded);
         encoded
     }
 
-    fn decode_anchor_record(encoded: &[u8]) -> Option<(Digest, Digest)> {
+    fn decode_anchor_record(encoded: &[u8]) -> Option<(Height, Digest, Digest)> {
         let mut reader = encoded;
+        let height = Height::read(&mut reader).ok()?;
         let payload = Digest::read(&mut reader).ok()?;
         let root = Digest::read(&mut reader).ok()?;
         if reader.has_remaining() {
             return None;
         }
-        Some((payload, root))
+        Some((height, payload, root))
     }
 
     async fn handle_command(&mut self, command: PersistenceCommand) -> Result<bool, Fatal> {
         match command {
-            PersistenceCommand::Enqueue { payload, diffs } => {
+            PersistenceCommand::Enqueue {
+                height,
+                payload,
+                diffs,
+            } => {
                 self.metrics.enqueue_commands_total.inc();
-                self.enqueue_pending(&payload, &diffs).await?;
+                self.enqueue_pending(height, payload, &diffs).await?;
                 Ok(true)
             }
             PersistenceCommand::GetStateRoot { response } => {
@@ -640,43 +533,19 @@ where
                 Ok(true)
             }
             PersistenceCommand::GetProof { object, response } => {
-                let proof = self.proof_for_object(object).await;
-                let _ = response.send(proof);
-                Ok(true)
-            }
-            PersistenceCommand::GetPayload { payload, response } => {
-                let _ = response.send(self.payload(payload).await);
+                let _ = response.send(self.proof_for_object(object).await);
                 Ok(true)
             }
             PersistenceCommand::GetPersistedAnchors { response } => {
                 let _ = response.send(self.persisted_anchor_history());
                 Ok(true)
             }
-            PersistenceCommand::RecordPersistedRoot { payload, root } => {
-                self.record_persisted_anchor(payload, root).await?;
-                Ok(true)
-            }
-            PersistenceCommand::GetFinalization { payload, response } => {
-                let _ = response.send(self.finalization(payload).await);
-                Ok(true)
-            }
             PersistenceCommand::GetLatestBlock { response } => {
                 let result = self
                     .anchor_history
                     .back()
-                    .map(|entry| (entry.sequence, entry.payload, entry.root));
+                    .map(|entry| (entry.height.get(), entry.payload, entry.root));
                 let _ = response.send(result);
-                Ok(true)
-            }
-            PersistenceCommand::RecordFinalization {
-                payload,
-                finalization,
-            } => {
-                self.record_finalization(payload, finalization).await?;
-                Ok(true)
-            }
-            PersistenceCommand::RecordPayload { payload, bytes } => {
-                self.record_payload(payload, bytes).await?;
                 Ok(true)
             }
             PersistenceCommand::Shutdown { response } => {
@@ -686,82 +555,21 @@ where
         }
     }
 
-    async fn proof_for_object(&self, object: ObjectId) -> Option<mailbox::ProofResponse> {
+    async fn proof_for_object(&self, object: ObjectId) -> Option<ProofResponse> {
         let mut hasher = Sha256::default();
         self.store.key_value_proof(&mut hasher, object).await
     }
 
-    async fn finalization(&mut self, payload: Digest) -> Option<mailbox::FinalizationResponse> {
-        if let Some(finalization) = self.volatile_finalizations.get(&payload) {
-            return Some(finalization.clone());
-        }
-        let identifier = match self.finalization_cursors.get(&payload) {
-            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
-            None => FreezerIdentifier::Key(&payload),
-        };
-        let stored = self
-            .finalization_index
-            .get(identifier)
-            .await
-            .ok()
-            .flatten()
-            .map(mailbox::FinalizationResponse::from);
-        if let Some(ref finalization) = stored {
-            self.cache_finalization(payload, finalization.clone());
-        }
-        stored
-    }
-
-    fn cache_finalization(&mut self, payload: Digest, finalization: mailbox::FinalizationResponse) {
-        self.volatile_finalizations.insert(payload, finalization);
-        for _ in self
-            .volatile_finalizations
-            .enforce_capacity(Self::MAX_VOLATILE_FINALIZATIONS)
-        {
-            self.metrics.finalization_cache_evictions_total.inc();
-        }
-    }
-
-    async fn payload(&mut self, payload: Digest) -> Option<Bytes> {
-        if let Some(bytes) = self.volatile_payloads.get(&payload) {
-            return Some(bytes.clone());
-        }
-        let identifier = match self.payload_cursors.get(&payload) {
-            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
-            None => FreezerIdentifier::Key(&payload),
-        };
-        let stored = self
-            .payload_index
-            .get(identifier)
-            .await
-            .ok()
-            .flatten()
-            .map(Bytes::from);
-        if let Some(ref bytes) = stored {
-            self.cache_payload(payload, bytes.clone());
-        }
-        stored
-    }
-
-    fn cache_payload(&mut self, payload: Digest, bytes: Bytes) {
-        self.volatile_payloads.insert(payload, bytes);
-        for _ in self
-            .volatile_payloads
-            .enforce_capacity(Self::MAX_VOLATILE_PAYLOADS)
-        {
-            self.metrics.payload_cache_evictions_total.inc();
-        }
-    }
-
-    fn persisted_anchor_history(&self) -> Vec<(Digest, Digest)> {
+    fn persisted_anchor_history(&self) -> Vec<(Height, Digest, Digest)> {
         self.anchor_history
             .iter()
-            .map(|entry| (entry.payload, entry.root))
+            .map(|entry| (entry.height, entry.payload, entry.root))
             .collect()
     }
 
     async fn record_persisted_anchor(
         &mut self,
+        height: Height,
         payload: Digest,
         root: Digest,
     ) -> Result<(), Fatal> {
@@ -770,10 +578,10 @@ where
             .iter()
             .find(|entry| entry.payload == payload)
         {
-            if existing.root != root {
+            if existing.root != root || existing.height != height {
                 return Err(Fatal(format!(
-                    "conflicting persisted roots for {payload:?}: existing={:?}, new={root:?}",
-                    existing.root
+                    "conflicting persisted anchor for {payload:?}: existing=(height={}, root={:?}) new=(height={}, root={root:?})",
+                    existing.height, existing.root, height
                 )));
             }
             return Ok(());
@@ -787,139 +595,31 @@ where
 
         self.anchor_history.push_back(AnchorEntry {
             sequence,
+            height,
             payload,
             root,
         });
 
         self.anchor_index.put(
             U64::new(sequence),
-            Self::encode_anchor_record(payload, root),
+            Self::encode_anchor_record(height, payload, root),
         );
-        for oldest in self
-            .anchor_history
-            .enforce_capacity(Self::MAX_ANCHOR_HISTORY)
-        {
+        while self.anchor_history.len() > Self::MAX_ANCHOR_HISTORY {
+            let Some(oldest) = self.anchor_history.pop_front() else {
+                break;
+            };
             self.anchor_index.remove(&U64::new(oldest.sequence));
             self.metrics.anchor_history_evictions_total.inc();
         }
+
         self.anchor_index.sync().await.map_err(|err| {
             Fatal(format!(
                 "failed to sync persisted anchor index for {payload:?}: {err:?}"
             ))
-        })
-    }
-
-    async fn record_finalization(
-        &mut self,
-        payload: Digest,
-        finalization: mailbox::FinalizationResponse,
-    ) -> Result<(), Fatal> {
-        if let Some(existing) = self.volatile_finalizations.get(&payload) {
-            if existing != &finalization {
-                return Err(Fatal(format!(
-                    "conflicting finalization certificates for {payload:?}"
-                )));
-            }
-            return Ok(());
-        }
-
-        let fin_identifier = match self.finalization_cursors.get(&payload) {
-            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
-            None => FreezerIdentifier::Key(&payload),
-        };
-        let fin = self
-            .finalization_index
-            .get(fin_identifier)
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to read finalization index for {payload:?}: {err:?}"
-                ))
-            })?;
-        if let Some(existing) = fin {
-            if existing.as_slice() != finalization.as_slice() {
-                return Err(Fatal(format!(
-                    "conflicting stored finalization certificate for {payload:?}"
-                )));
-            }
-            self.cache_finalization(payload, finalization);
-            return Ok(());
-        }
-        let cursor = self
-            .finalization_index
-            .put(payload, finalization.as_slice().to_vec())
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to put finalization certificate for {payload:?}: {err:?}"
-                ))
-            })?;
-        self.finalization_cursors.insert(payload, cursor);
-        let cp = self.finalization_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "failed to sync finalization certificate index for {payload:?}: {err:?}"
-            ))
         })?;
-        self.store.save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, cp);
-        self.store.cursor_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "failed to sync cursor index after finalization checkpoint for {payload:?}: {err:?}"
-            ))
-        })?;
-
-        self.cache_finalization(payload, finalization);
-        Ok(())
-    }
-
-    async fn record_payload(&mut self, payload: Digest, bytes: Bytes) -> Result<(), Fatal> {
-        if let Some(existing) = self.volatile_payloads.get(&payload) {
-            if existing != &bytes {
-                return Err(Fatal(format!("conflicting payload bytes for {payload:?}")));
-            }
-            return Ok(());
-        }
-
-        let pay_identifier = match self.payload_cursors.get(&payload) {
-            Some(cursor) => FreezerIdentifier::Cursor(*cursor),
-            None => FreezerIdentifier::Key(&payload),
-        };
-        let existing = self
-            .payload_index
-            .get(pay_identifier)
-            .await
-            .map_err(|err| {
-                Fatal(format!(
-                    "failed to read payload index for {payload:?}: {err:?}"
-                ))
-            })?;
-        if let Some(existing) = existing {
-            if existing.as_slice() != bytes.as_ref() {
-                return Err(Fatal(format!(
-                    "conflicting stored payload bytes for {payload:?}"
-                )));
-            }
-            self.cache_payload(payload, bytes);
-            return Ok(());
-        }
-        let cursor = self
-            .payload_index
-            .put(payload, bytes.as_ref().to_vec())
-            .await
-            .map_err(|err| Fatal(format!("failed to put payload for {payload:?}: {err:?}")))?;
-        self.payload_cursors.insert(payload, cursor);
-        let cp = self.payload_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "failed to sync payload index for {payload:?}: {err:?}"
-            ))
-        })?;
-        self.store.save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, cp);
-        self.store.cursor_index.sync().await.map_err(|err| {
-            Fatal(format!(
-                "failed to sync cursor index after payload checkpoint for {payload:?}: {err:?}"
-            ))
-        })?;
-
-        self.cache_payload(payload, bytes);
+        self.metrics
+            .anchor_history_entries
+            .set(self.anchor_history.len() as i64);
         Ok(())
     }
 
@@ -927,58 +627,6 @@ where
         MetadataConfig {
             partition: format!("{partition_prefix}_anchor_roots"),
             codec_config: ((0..=Self::MAX_ANCHOR_RECORD_BYTES).into(), ()),
-        }
-    }
-
-    fn finalization_freezer_config(
-        context: &E,
-        partition_prefix: &str,
-        page_cache_config: PageCacheConfig,
-    ) -> FreezerConfig<(RangeCfg<usize>, ())> {
-        let page_cache_size = NonZeroU16::new(page_cache_config.size)
-            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
-        let page_cache_count = NonZeroUsize::new(page_cache_config.count)
-            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_COUNT);
-        FreezerConfig {
-            key_partition: format!("{partition_prefix}_fin_key"),
-            key_write_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
-            key_page_cache: CacheRef::from_pooler(context, page_cache_size, page_cache_count),
-            value_partition: format!("{partition_prefix}_fin_val"),
-            value_compression: Some(3),
-            value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
-            value_target_size: 100 * 1024 * 1024,
-            table_partition: format!("{partition_prefix}_fin_tbl"),
-            table_initial_size: 65536,
-            table_resize_frequency: 2,
-            table_resize_chunk_size: 4096,
-            table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
-            codec_config: ((0..=Self::MAX_FINALIZATION_RECORD_BYTES).into(), ()),
-        }
-    }
-
-    fn payload_freezer_config(
-        context: &E,
-        partition_prefix: &str,
-        page_cache_config: PageCacheConfig,
-    ) -> FreezerConfig<(RangeCfg<usize>, ())> {
-        let page_cache_size = NonZeroU16::new(page_cache_config.size)
-            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_SIZE);
-        let page_cache_count = NonZeroUsize::new(page_cache_config.count)
-            .unwrap_or(crate::execution::store::DEFAULT_PAGE_CACHE_COUNT);
-        FreezerConfig {
-            key_partition: format!("{partition_prefix}_pay_key"),
-            key_write_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
-            key_page_cache: CacheRef::from_pooler(context, page_cache_size, page_cache_count),
-            value_partition: format!("{partition_prefix}_pay_val"),
-            value_compression: Some(3),
-            value_write_buffer: NonZeroUsize::new(256 * 1024).unwrap(),
-            value_target_size: 100 * 1024 * 1024,
-            table_partition: format!("{partition_prefix}_pay_tbl"),
-            table_initial_size: 65536,
-            table_resize_frequency: 2,
-            table_resize_chunk_size: 4096,
-            table_replay_buffer: NonZeroUsize::new(64 * 1024).unwrap(),
-            codec_config: ((0..=Self::MAX_PAYLOAD_RECORD_BYTES).into(), ()),
         }
     }
 
@@ -1018,13 +666,15 @@ where
             let Some(encoded) = index.get(&key).cloned() else {
                 continue;
             };
-            let Some((payload, root)) = Self::decode_anchor_record(encoded.as_slice()) else {
+            let Some((height, payload, root)) = Self::decode_anchor_record(encoded.as_slice())
+            else {
                 warn!(sequence, "invalid anchor index entry; removing");
                 index.remove(&key);
                 continue;
             };
             recovered.push_back(AnchorEntry {
                 sequence,
+                height,
                 payload,
                 root,
             });
@@ -1048,31 +698,6 @@ where
         Ok((index, recovered, next_sequence))
     }
 
-    async fn initialize_finalization_index(
-        context: &mut E,
-        partition_prefix: &str,
-        page_cache_config: PageCacheConfig,
-        checkpoint: Option<FreezerCheckpoint>,
-    ) -> Result<FinalizationIndex<E>, Fatal> {
-        let config =
-            Self::finalization_freezer_config(context, partition_prefix, page_cache_config);
-        Freezer::init_with_checkpoint(context.with_label("finalization_index"), config, checkpoint)
-            .await
-            .map_err(|err| Fatal(format!("finalization index initialization failed: {err:?}")))
-    }
-
-    async fn initialize_payload_index(
-        context: &mut E,
-        partition_prefix: &str,
-        page_cache_config: PageCacheConfig,
-        checkpoint: Option<FreezerCheckpoint>,
-    ) -> Result<PayloadIndex<E>, Fatal> {
-        let config = Self::payload_freezer_config(context, partition_prefix, page_cache_config);
-        Freezer::init_with_checkpoint(context.with_label("payload_index"), config, checkpoint)
-            .await
-            .map_err(|err| Fatal(format!("payload index initialization failed: {err:?}")))
-    }
-
     async fn initialize_queue(
         context: &mut E,
         partition_prefix: &str,
@@ -1082,50 +707,6 @@ where
         PersistenceQueue::init(context.with_label("persistence_queue"), config)
             .await
             .map_err(|err| Fatal(format!("persistence queue initialization failed: {err:?}")))
-    }
-
-    /// Walk backward from the latest anchor through the payload Freezer,
-    /// collecting all `(digest, bytes)` pairs in chain order (oldest first).
-    /// Used at startup to proactively hydrate `AppCore.seen` before consensus
-    /// begins, avoiding per-ancestor network round trips after an unclean
-    /// restart.
-    async fn recover_payload_chain(&mut self) -> Vec<(Digest, Bytes)> {
-        let Some(tip) = self.anchor_history.back() else {
-            return Vec::new();
-        };
-        let zero_digest = Digest::from([0u8; 32]);
-        let mut chain = Vec::new();
-        let mut current = tip.payload;
-        loop {
-            let Some(bytes) = self.payload(current).await else {
-                warn!(
-                    ?current,
-                    recovered = chain.len(),
-                    "payload chain walk stopped: missing payload in Freezer"
-                );
-                break;
-            };
-            let Some(block) = super::payload::SeenBlock::decode(bytes.clone(), 0) else {
-                warn!(
-                    ?current,
-                    recovered = chain.len(),
-                    "payload chain walk stopped: malformed payload bytes"
-                );
-                break;
-            };
-            let parent = block.data().parent;
-            chain.push((current, bytes));
-            if parent == zero_digest {
-                break;
-            }
-            current = parent;
-        }
-        chain.reverse();
-        info!(
-            payloads = chain.len(),
-            "recovered payload chain from local persistence"
-        );
-        chain
     }
 
     async fn shutdown(mut self) -> Result<(), Fatal> {
@@ -1139,25 +720,6 @@ where
             .sync()
             .await
             .map_err(|err| Fatal(format!("anchor index sync on shutdown failed: {err:?}")))?;
-
-        let fin_cp = self.finalization_index.close().await.map_err(|err| {
-            Fatal(format!(
-                "finalization index close on shutdown failed: {err:?}"
-            ))
-        })?;
-        let pay_cp = self
-            .payload_index
-            .close()
-            .await
-            .map_err(|err| Fatal(format!("payload index close on shutdown failed: {err:?}")))?;
-
-        self.store
-            .save_checkpoint(*FINALIZATION_CHECKPOINT_KEY, fin_cp);
-        self.store.save_checkpoint(*PAYLOAD_CHECKPOINT_KEY, pay_cp);
-        self.store
-            .cursor_index
-            .sync()
-            .await
-            .map_err(|err| Fatal(format!("cursor index sync on shutdown failed: {err:?}")))
+        Ok(())
     }
 }

@@ -1,10 +1,10 @@
 //! Local implementation of the light-client query interface.
 //!
-//! [`LocalLightClient`] wraps an [`AppMailbox`] and implements the
-//! [`LightClient`] trait from `hellas_types::rpc`. Proof and finalization
-//! responses are encoded to opaque bytes before returning.
+//! [`LocalLightClient`] wraps the local application handle and implements the
+//! [`LightClient`] trait from `hellas_types::rpc`. Proof responses are encoded
+//! to opaque bytes before returning.
 
-use crate::app::{AppMailbox, ProofResponse};
+use crate::app::{Application, ProofResponse};
 use bytes::BytesMut;
 use commonware_codec::{Read as _, ReadExt as _, Write as _};
 use commonware_cryptography::sha256::Digest;
@@ -34,6 +34,7 @@ pub fn encode_proof(proof: &ProofResponse) -> Vec<u8> {
     proof.chunk.write(&mut buf);
     proof.range_proof.proof.write(&mut buf);
     proof.range_proof.partial_chunk_digest.write(&mut buf);
+    proof.range_proof.ops_root.write(&mut buf);
     buf.to_vec()
 }
 
@@ -46,28 +47,30 @@ pub fn decode_proof(data: &[u8]) -> Result<ProofResponse, commonware_codec::Erro
     // MAX_PROOF_DIGESTS_PER_ELEMENT (122) digests.
     let proof = Proof::<Digest>::read_cfg(&mut buf, &1)?;
     let partial_chunk_digest = Option::<Digest>::read(&mut buf)?;
+    let ops_root = Digest::read(&mut buf)?;
     Ok(OperationProof {
         loc,
         chunk,
         range_proof: RangeProof {
             proof,
             partial_chunk_digest,
+            ops_root,
         },
     })
 }
 
-/// In-process [`LightClient`] backed by the application actor mailbox.
+/// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]
 pub struct LocalLightClient {
-    mailbox: AppMailbox,
+    application: Application,
     validators: Vec<String>,
 }
 
 impl LocalLightClient {
-    /// Wraps an existing [`AppMailbox`] as a light-client query handle.
-    pub fn new(mailbox: AppMailbox, validators: Vec<String>) -> Self {
+    /// Wraps an existing [`Application`] as a light-client query handle.
+    pub fn new(application: Application, validators: Vec<String>) -> Self {
         Self {
-            mailbox,
+            application,
             validators,
         }
     }
@@ -75,18 +78,11 @@ impl LocalLightClient {
 
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
-        self.mailbox
-            .get_state_root()
-            .await
-            .map_err(|_| QueryError::ChannelClosed)
+        Ok(self.application.get_state_root().await)
     }
 
     async fn get_proof(&self, object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
-        let proof = self
-            .mailbox
-            .get_proof(object_id)
-            .await
-            .map_err(|_| QueryError::ChannelClosed)?;
+        let proof = self.application.get_proof(object_id).await;
         Ok(proof.map(|p| encode_proof(&p)))
     }
 
@@ -95,27 +91,19 @@ impl LightClient for LocalLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> Result<Option<Coin>, QueryError> {
-        Ok(self.mailbox.get_coin(payload, object_id).await)
+        self.application.get_coin(payload, object_id).await
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
-        let cert = self
-            .mailbox
-            .get_finalization(payload)
-            .await
-            .map_err(|_| QueryError::ChannelClosed)?;
-        Ok(cert.map(Vec::from))
+        Ok(self.application.get_finalization(payload).await)
     }
 
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
-        self.mailbox
-            .get_latest_block()
-            .await
-            .map_err(|_| QueryError::ChannelClosed)
+        Ok(self.application.get_latest_block().await)
     }
 
     async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
-        self.mailbox.submit_tx(tx).await;
+        self.application.submit_tx(tx).await;
         Ok(())
     }
 
@@ -127,7 +115,7 @@ impl LightClient for LocalLightClient {
         &self,
         owner: hellas_types::Address,
     ) -> Result<Vec<(ObjectId, u64)>, QueryError> {
-        Ok(self.mailbox.get_coins_by_owner(owner).await)
+        Ok(self.application.get_coins_by_owner(owner).await)
     }
 }
 

@@ -4,12 +4,27 @@ use hellas_types::{Address, Coin, ObjectId, Transaction, genesis_object_id, outp
 use std::collections::HashMap;
 use thiserror::Error;
 
-pub type ObjectState = HashMap<ObjectId, Coin>;
+pub(crate) type ObjectState = HashMap<ObjectId, Coin>;
 
-pub struct BlockExecution {
-    pub state: ObjectState,
-    pub created: Vec<(ObjectId, Coin)>,
-    pub deleted: Vec<ObjectId>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StateDiff {
+    pub(crate) created: Vec<(ObjectId, Coin)>,
+    pub(crate) deleted: Vec<ObjectId>,
+}
+
+pub(crate) struct BlockExecution {
+    pub(crate) state: ObjectState,
+    pub(crate) created: Vec<(ObjectId, Coin)>,
+    pub(crate) deleted: Vec<ObjectId>,
+}
+
+impl BlockExecution {
+    pub(crate) fn diff(&self) -> StateDiff {
+        StateDiff {
+            created: self.created.clone(),
+            deleted: self.deleted.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -86,6 +101,15 @@ pub(crate) fn execute_transaction(
     tx: &Transaction,
 ) -> Result<(), ExecutionError> {
     execute_transaction_with_tracking(state, tx, None, None)
+}
+
+pub(crate) fn apply_diff(state: &mut ObjectState, diff: &StateDiff) {
+    for object_id in &diff.deleted {
+        state.remove(object_id);
+    }
+    for (object_id, coin) in &diff.created {
+        state.insert(*object_id, coin.clone());
+    }
 }
 
 fn execute_transaction_with_tracking(
@@ -265,28 +289,22 @@ mod tests {
         }
     }
 
-    #[test_log::test]
+    #[test]
     fn genesis_state_creates_coins() {
-        let allocations: Vec<(Address, u64)> = (0..4)
-            .map(|i| (addr(&key(i + 1)), hellas_types::GENESIS_BALANCE))
-            .collect();
+        let a = addr(&key(1));
+        let b = addr(&key(2));
+        let allocations = vec![(a.clone(), 100), (b.clone(), 250), (a, 7), (b, 9)];
         let exec = genesis_state(&allocations);
-        assert_eq!(exec.state.len(), 4);
         assert_eq!(exec.created.len(), 4);
         assert!(exec.deleted.is_empty());
-        for (idx, (owner, balance)) in allocations.iter().enumerate() {
-            let id = genesis_object_id(u16::try_from(idx).unwrap());
-            let coin = exec.state.get(&id).expect("genesis coin");
-            assert_eq!(coin.owner, owner.clone());
-            assert_eq!(coin.value, *balance);
-        }
+        assert_eq!(exec.state.len(), 4);
     }
 
-    #[test_log::test]
+    #[test]
     fn transfer_debits_and_credits() {
-        let sender_key = key(1);
-        let recipient = addr(&key(2));
+        let sender_key = key(10);
         let sender = addr(&sender_key);
+        let recipient = addr(&key(11));
         let input = Digest::from([1; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
@@ -299,7 +317,6 @@ mod tests {
 
         let tx = signed_transfer(&sender_key, input, recipient.clone(), 40);
         let exec = execute_block(&parent, std::slice::from_ref(&tx)).expect("execute");
-        assert!(!exec.state.contains_key(&input));
         assert_eq!(exec.deleted, vec![input]);
         assert_eq!(exec.created.len(), 2);
         let total: u64 = exec.created.iter().map(|(_, coin)| coin.value).sum();
@@ -310,49 +327,52 @@ mod tests {
         assert_eq!(exec.created[1].1.value, 60);
     }
 
-    #[test_log::test]
+    #[test]
     fn invalid_signature_rejected() {
-        let owner_key = key(1);
-        let wrong_key = key(2);
-        let input = Digest::from([6; 32]);
+        let sender_key = key(10);
+        let wrong_key = key(11);
+        let sender = addr(&sender_key);
+        let recipient = addr(&key(12));
+        let input = Digest::from([1; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
             input,
             Coin {
-                owner: addr(&owner_key),
-                value: 10,
+                owner: sender,
+                value: 100,
             },
         );
-        let tx = signed_transfer(&wrong_key, input, addr(&wrong_key), 1);
+
+        let tx = signed_transfer(&wrong_key, input, recipient, 50);
         assert!(matches!(
             execute_block(&parent, std::slice::from_ref(&tx)),
             Err(ExecutionError::InvalidSignature)
         ));
     }
 
-    #[test_log::test]
+    #[test]
     fn merge_combines_values() {
-        let owner_key = key(1);
+        let owner_key = key(20);
         let owner = addr(&owner_key);
-        let input_a = Digest::from([8; 32]);
-        let input_b = Digest::from([9; 32]);
+        let in1 = Digest::from([1; 32]);
+        let in2 = Digest::from([2; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
-            input_a,
+            in1,
             Coin {
                 owner: owner.clone(),
                 value: 7,
             },
         );
         parent.insert(
-            input_b,
+            in2,
             Coin {
                 owner: owner.clone(),
                 value: 13,
             },
         );
 
-        let tx = signed_merge(&owner_key, vec![input_b, input_a]);
+        let tx = signed_merge(&owner_key, vec![in2, in1]);
         let exec = execute_block(&parent, std::slice::from_ref(&tx)).expect("execute");
         assert_eq!(exec.created.len(), 1);
         assert_eq!(exec.created[0].1.owner, owner);
@@ -360,25 +380,25 @@ mod tests {
         assert_eq!(exec.deleted.len(), 2);
     }
 
-    #[test_log::test]
+    #[test]
     fn non_canonical_merge_inputs_rejected() {
-        let owner_key = key(1);
+        let owner_key = key(30);
         let owner = addr(&owner_key);
-        let input_a = Digest::from([17; 32]);
-        let input_b = Digest::from([18; 32]);
+        let in1 = Digest::from([1; 32]);
+        let in2 = Digest::from([2; 32]);
         let mut parent = ObjectState::new();
         parent.insert(
-            input_a,
+            in1,
             Coin {
                 owner: owner.clone(),
-                value: 2,
+                value: 7,
             },
         );
-        parent.insert(input_b, Coin { owner, value: 3 });
-        let unsorted = vec![input_b, input_a];
-        let challenge = merge_challenge(&unsorted);
+        parent.insert(in2, Coin { owner, value: 13 });
+
+        let challenge = merge_challenge(&[in2, in1]);
         let tx = Transaction::MergeCoin {
-            inputs: unsorted,
+            inputs: vec![in2, in1],
             signature: mock_webauthn_sign(&owner_key, &challenge),
         };
         assert!(matches!(

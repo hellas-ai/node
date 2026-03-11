@@ -1,148 +1,48 @@
-use commonware_codec::Encode;
 use commonware_runtime::Metrics;
-use prometheus_client::encoding::EncodeLabelSet;
-use prometheus_client::metrics::{counter::Counter, family::Family, gauge::Gauge};
+use prometheus_client::metrics::{counter::Counter, gauge::Gauge};
 use std::sync::atomic::AtomicI64;
-
-/// Label set for per-leader latency metrics (base58 address).
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub(crate) struct LeaderLabel {
-    pub leader: String,
-}
-
-impl LeaderLabel {
-    pub fn new(pk: &hellas_types::PublicKey) -> Self {
-        Self {
-            leader: hex::encode(pk.encode()),
-        }
-    }
-}
-
-pub(super) fn gauge_set_len(gauge: &Gauge<i64, AtomicI64>, len: usize) {
-    gauge.set(i64::try_from(len).unwrap_or(i64::MAX));
-}
 
 #[derive(Clone)]
 pub(super) struct ApplicationMetrics {
-    pub(crate) external_events_total: Counter,
-    pub(crate) finalization_notices_total: Counter,
-    pub(crate) shard_messages_received_total: Counter,
+    pub(crate) propose_total: Counter,
+    pub(crate) propose_missing_anchor_total: Counter,
+    pub(crate) verify_requests_total: Counter,
+    pub(crate) verify_deferred_anchor_total: Counter,
+    pub(crate) verify_valid_total: Counter,
+    pub(crate) verify_invalid_total: Counter,
+    pub(crate) anchor_mismatch_total: Counter,
     pub(crate) persistence_dispatch_total: Counter,
     pub(crate) persistence_ack_total: Counter,
     pub(crate) persistence_ack_unexpected_total: Counter,
     pub(crate) genesis_anchor_seeded_total: Counter,
     pub(crate) propose_throttled_total: Counter,
+    pub(crate) mempool_size: Gauge<i64, AtomicI64>,
+    pub(crate) persisted_roots: Gauge<i64, AtomicI64>,
     pub(crate) inflight_persistence: Gauge<i64, AtomicI64>,
+    pub(crate) finalization_timestamp_drift: Gauge<i64, AtomicI64>,
+    pub(crate) validation_timestamp_drift: Gauge<i64, AtomicI64>,
 }
 
 impl ApplicationMetrics {
     pub(super) fn register<E: Metrics>(context: &E) -> Self {
         let metrics = Self {
-            external_events_total: Counter::default(),
-            finalization_notices_total: Counter::default(),
-            shard_messages_received_total: Counter::default(),
+            propose_total: Counter::default(),
+            propose_missing_anchor_total: Counter::default(),
+            verify_requests_total: Counter::default(),
+            verify_deferred_anchor_total: Counter::default(),
+            verify_valid_total: Counter::default(),
+            verify_invalid_total: Counter::default(),
+            anchor_mismatch_total: Counter::default(),
             persistence_dispatch_total: Counter::default(),
             persistence_ack_total: Counter::default(),
             persistence_ack_unexpected_total: Counter::default(),
             genesis_anchor_seeded_total: Counter::default(),
             propose_throttled_total: Counter::default(),
-            inflight_persistence: Gauge::default(),
-        };
-
-        context.register(
-            "external_events_total",
-            "external events processed by app actor",
-            metrics.external_events_total.clone(),
-        );
-        context.register(
-            "finalization_notices_total",
-            "finalization notices received by app actor",
-            metrics.finalization_notices_total.clone(),
-        );
-        context.register(
-            "shard_messages_received_total",
-            "shard messages received by app actor mailbox",
-            metrics.shard_messages_received_total.clone(),
-        );
-        context.register(
-            "persistence_dispatch_total",
-            "finalization persistence intents dispatched",
-            metrics.persistence_dispatch_total.clone(),
-        );
-        context.register(
-            "persistence_ack_total",
-            "persistence acknowledgements processed",
-            metrics.persistence_ack_total.clone(),
-        );
-        context.register(
-            "persistence_ack_unexpected_total",
-            "persistence acknowledgements for non-inflight payloads",
-            metrics.persistence_ack_unexpected_total.clone(),
-        );
-        context.register(
-            "genesis_anchor_seeded_total",
-            "genesis anchor roots successfully seeded",
-            metrics.genesis_anchor_seeded_total.clone(),
-        );
-        context.register(
-            "propose_throttled_total",
-            "proposals delayed by min_propose_ms throttle",
-            metrics.propose_throttled_total.clone(),
-        );
-        context.register(
-            "inflight_persistence",
-            "whether a persistence intent is currently inflight (0/1)",
-            metrics.inflight_persistence.clone(),
-        );
-
-        metrics.inflight_persistence.set(0);
-        metrics
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct CoreMetrics {
-    pub(crate) propose_total: Counter,
-    pub(crate) propose_missing_anchor_total: Counter,
-    pub(crate) verify_requests_total: Counter,
-    pub(crate) verify_deferred_dependency_total: Counter,
-    pub(crate) verify_deferred_anchor_total: Counter,
-    pub(crate) verify_valid_total: Counter,
-    pub(crate) verify_invalid_total: Counter,
-    pub(crate) anchor_mismatch_total: Counter,
-    pub(crate) waiter_keys: Gauge<i64, AtomicI64>,
-    pub(crate) waiter_total: Gauge<i64, AtomicI64>,
-    pub(crate) mempool_size: Gauge<i64, AtomicI64>,
-    pub(crate) pending_payloads: Gauge<i64, AtomicI64>,
-    pub(crate) persisted_roots: Gauge<i64, AtomicI64>,
-    pub(crate) unpersisted_finalizations: Gauge<i64, AtomicI64>,
-    pub(crate) finalization_timestamp_drift: Gauge<i64, AtomicI64>,
-    pub(crate) validation_timestamp_drift: Gauge<i64, AtomicI64>,
-    pub(crate) per_leader_arrival_drift: Family<LeaderLabel, Gauge<i64, AtomicI64>>,
-    pub(crate) per_leader_min_drift: Family<LeaderLabel, Gauge<i64, AtomicI64>>,
-}
-
-impl CoreMetrics {
-    pub(super) fn register<E: Metrics>(context: &E) -> Self {
-        let metrics = Self {
-            propose_total: Counter::default(),
-            propose_missing_anchor_total: Counter::default(),
-            verify_requests_total: Counter::default(),
-            verify_deferred_dependency_total: Counter::default(),
-            verify_deferred_anchor_total: Counter::default(),
-            verify_valid_total: Counter::default(),
-            verify_invalid_total: Counter::default(),
-            anchor_mismatch_total: Counter::default(),
-            waiter_keys: Gauge::default(),
-            waiter_total: Gauge::default(),
             mempool_size: Gauge::default(),
-            pending_payloads: Gauge::default(),
             persisted_roots: Gauge::default(),
-            unpersisted_finalizations: Gauge::default(),
+            inflight_persistence: Gauge::default(),
             finalization_timestamp_drift: Gauge::default(),
             validation_timestamp_drift: Gauge::default(),
-            per_leader_arrival_drift: Family::default(),
-            per_leader_min_drift: Family::default(),
         };
 
         context.register(
@@ -157,13 +57,8 @@ impl CoreMetrics {
         );
         context.register(
             "verify_requests_total",
-            "verify requests processed by core",
+            "verify requests processed by application",
             metrics.verify_requests_total.clone(),
-        );
-        context.register(
-            "verify_deferred_dependency_total",
-            "verify deferrals due to missing payload/parent execution dependency",
-            metrics.verify_deferred_dependency_total.clone(),
         );
         context.register(
             "verify_deferred_anchor_total",
@@ -186,24 +81,34 @@ impl CoreMetrics {
             metrics.anchor_mismatch_total.clone(),
         );
         context.register(
-            "waiter_keys",
-            "current number of waiter keys",
-            metrics.waiter_keys.clone(),
+            "persistence_dispatch_total",
+            "finalized blocks dispatched to persistence",
+            metrics.persistence_dispatch_total.clone(),
         );
         context.register(
-            "waiter_total",
-            "current number of deferred waiters",
-            metrics.waiter_total.clone(),
+            "persistence_ack_total",
+            "persistence acknowledgements processed",
+            metrics.persistence_ack_total.clone(),
+        );
+        context.register(
+            "persistence_ack_unexpected_total",
+            "persistence acknowledgements for unexpected blocks",
+            metrics.persistence_ack_unexpected_total.clone(),
+        );
+        context.register(
+            "genesis_anchor_seeded_total",
+            "genesis anchor roots successfully seeded",
+            metrics.genesis_anchor_seeded_total.clone(),
+        );
+        context.register(
+            "propose_throttled_total",
+            "proposals delayed by min_propose_ms throttle",
+            metrics.propose_throttled_total.clone(),
         );
         context.register(
             "mempool_size",
-            "current number of transactions in mempool",
+            "current number of transactions in the mempool",
             metrics.mempool_size.clone(),
-        );
-        context.register(
-            "pending_payloads",
-            "current number of pending proposal payloads",
-            metrics.pending_payloads.clone(),
         );
         context.register(
             "persisted_roots",
@@ -211,13 +116,13 @@ impl CoreMetrics {
             metrics.persisted_roots.clone(),
         );
         context.register(
-            "unpersisted_finalizations",
-            "current number of finalized payloads awaiting persistence",
-            metrics.unpersisted_finalizations.clone(),
+            "inflight_persistence",
+            "whether a finalized block is currently waiting on persistence (0/1)",
+            metrics.inflight_persistence.clone(),
         );
         context.register(
             "finalization_timestamp_drift",
-            "signed ms drift between wall clock and finalized block timestamp (now - block_ts)",
+            "signed ms drift between wall clock and persisted block timestamp (now - block_ts)",
             metrics.finalization_timestamp_drift.clone(),
         );
         context.register(
@@ -225,23 +130,10 @@ impl CoreMetrics {
             "signed ms drift between wall clock and validated block timestamp (now - block_ts)",
             metrics.validation_timestamp_drift.clone(),
         );
-        context.register(
-            "per_leader_arrival_drift",
-            "ms drift between local arrival and block timestamp, labeled by leader (received_at - block_ts)",
-            metrics.per_leader_arrival_drift.clone(),
-        );
-        context.register(
-            "per_leader_min_drift",
-            "minimum observed drift per leader, approximates clock skew baseline",
-            metrics.per_leader_min_drift.clone(),
-        );
 
-        metrics.waiter_keys.set(0);
-        metrics.waiter_total.set(0);
         metrics.mempool_size.set(0);
-        metrics.pending_payloads.set(0);
         metrics.persisted_roots.set(0);
-        metrics.unpersisted_finalizations.set(0);
+        metrics.inflight_persistence.set(0);
         metrics.finalization_timestamp_drift.set(0);
         metrics.validation_timestamp_drift.set(0);
         metrics
@@ -255,11 +147,6 @@ pub(super) struct PersistenceMetrics {
     pub(crate) persist_attempt_total: Counter,
     pub(crate) persist_success_total: Counter,
     pub(crate) persist_failure_total: Counter,
-    pub(crate) staged_pending: Gauge<i64, AtomicI64>,
-    pub(crate) finalization_cache_entries: Gauge<i64, AtomicI64>,
-    pub(crate) finalization_cache_evictions_total: Counter,
-    pub(crate) payload_cache_entries: Gauge<i64, AtomicI64>,
-    pub(crate) payload_cache_evictions_total: Counter,
     pub(crate) anchor_history_entries: Gauge<i64, AtomicI64>,
     pub(crate) anchor_history_evictions_total: Counter,
     pub(crate) queue_depth: Gauge<i64, AtomicI64>,
@@ -274,11 +161,6 @@ impl PersistenceMetrics {
             persist_attempt_total: Counter::default(),
             persist_success_total: Counter::default(),
             persist_failure_total: Counter::default(),
-            staged_pending: Gauge::default(),
-            finalization_cache_entries: Gauge::default(),
-            finalization_cache_evictions_total: Counter::default(),
-            payload_cache_entries: Gauge::default(),
-            payload_cache_evictions_total: Counter::default(),
             anchor_history_entries: Gauge::default(),
             anchor_history_evictions_total: Counter::default(),
             queue_depth: Gauge::default(),
@@ -311,58 +193,29 @@ impl PersistenceMetrics {
             metrics.persist_failure_total.clone(),
         );
         context.register(
-            "staged_pending",
-            "whether a persistence intent is staged pending queue flush (0/1)",
-            metrics.staged_pending.clone(),
-        );
-        context.register(
-            "finalization_cache_entries",
-            "current number of volatile finalization cache entries",
-            metrics.finalization_cache_entries.clone(),
-        );
-
-        context.register(
-            "finalization_cache_evictions_total",
-            "volatile finalization cache evictions due to capacity",
-            metrics.finalization_cache_evictions_total.clone(),
-        );
-        context.register(
-            "payload_cache_entries",
-            "current number of volatile payload cache entries",
-            metrics.payload_cache_entries.clone(),
-        );
-        context.register(
-            "payload_cache_evictions_total",
-            "volatile payload cache evictions due to capacity",
-            metrics.payload_cache_evictions_total.clone(),
-        );
-        context.register(
             "anchor_history_entries",
             "current number of persisted anchor history entries",
             metrics.anchor_history_entries.clone(),
         );
         context.register(
             "anchor_history_evictions_total",
-            "anchor history evictions due to capacity",
+            "evicted persisted anchor history entries",
             metrics.anchor_history_evictions_total.clone(),
         );
         context.register(
             "queue_depth",
-            "number of pending items in the persistence queue",
+            "durable persistence queue depth",
             metrics.queue_depth.clone(),
         );
         context.register(
             "utxo_committed_position",
-            "queue position of the last committed UTXO state transition",
+            "last committed persistence queue position",
             metrics.utxo_committed_position.clone(),
         );
 
-        metrics.staged_pending.set(0);
-        metrics.finalization_cache_entries.set(0);
-        metrics.payload_cache_entries.set(0);
         metrics.anchor_history_entries.set(0);
         metrics.queue_depth.set(0);
-        metrics.utxo_committed_position.set(0);
+        metrics.utxo_committed_position.set(-1);
         metrics
     }
 }
