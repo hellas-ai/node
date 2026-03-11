@@ -1,7 +1,7 @@
 use super::FinalizationDiffs;
 use super::transition::{ObjectState, execute_block};
-use hellas_types::Transaction;
 use commonware_cryptography::sha256::Digest;
+use hellas_types::Transaction;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Materialized speculative execution state keyed by payload digest.
@@ -153,10 +153,10 @@ impl SpeculativeExecutionStore {
 mod tests {
     use super::super::transition::ObjectState;
     use super::*;
-    use hellas_types::{Coin, GENESIS_BALANCE};
     use commonware_cryptography::Signer;
     use commonware_cryptography::sha256::Digest;
     use hellas_types::PrivateKey;
+    use hellas_types::{Coin, GENESIS_BALANCE};
 
     fn sample_state() -> ObjectState {
         let owner = hellas_types::Address::from(PrivateKey::from_seed(1).public_key());
@@ -222,8 +222,7 @@ mod tests {
         assert!(store.ensure_execution_for_payload(canonical, &decode));
         assert!(store.ensure_execution_for_payload(fork, &decode));
 
-        let (pruned, reachable) =
-            store.prune_non_descendants(canonical, |digest| digest == fork);
+        let (pruned, reachable) = store.prune_non_descendants(canonical, |digest| digest == fork);
         assert!(pruned.contains(&genesis));
         assert!(!pruned.contains(&fork));
         assert!(reachable.contains(&canonical));

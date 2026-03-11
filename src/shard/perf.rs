@@ -76,9 +76,13 @@ pub fn recover_with_one_helper_once(validators: u16, payload: &[u8]) -> bool {
     let helper_index = 2u16;
 
     // Reshard our own shard (as if received from the leader).
-    let (checking_data, my_checked, _my_reshard) =
-        CodingImpl::reshard(&config, &commitment, my_index, shards[usize::from(my_index)].clone())
-            .expect("reshard should succeed");
+    let (checking_data, my_checked, _my_reshard) = CodingImpl::reshard(
+        &config,
+        &commitment,
+        my_index,
+        shards[usize::from(my_index)].clone(),
+    )
+    .expect("reshard should succeed");
 
     // Helper reshards their shard and sends us their reshard.
     let (_, _, helper_reshard) = CodingImpl::reshard(
@@ -90,9 +94,14 @@ pub fn recover_with_one_helper_once(validators: u16, payload: &[u8]) -> bool {
     .expect("helper reshard should succeed");
 
     // We check the helper's reshard.
-    let helper_checked =
-        CodingImpl::check(&config, &commitment, &checking_data, helper_index, helper_reshard)
-            .expect("check should succeed");
+    let helper_checked = CodingImpl::check(
+        &config,
+        &commitment,
+        &checking_data,
+        helper_index,
+        helper_reshard,
+    )
+    .expect("check should succeed");
 
     // Decode with our checked shard + helper's checked shard.
     let reconstructed = CodingImpl::decode(

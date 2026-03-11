@@ -139,9 +139,11 @@ where
         let index_by_validator = self.index_by_validator.clone();
         let effects = {
             let node = &mut self.nodes[node_idx];
-            node.recoverer.handle_message(message, |d| node.seen.contains_key(d), |pk| {
-                index_by_validator.get(pk).copied()
-            })
+            node.recoverer.handle_message(
+                message,
+                |d| node.seen.contains_key(d),
+                |pk| index_by_validator.get(pk).copied(),
+            )
         };
 
         for effect in effects {

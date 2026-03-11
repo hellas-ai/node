@@ -921,6 +921,10 @@ fn run(
             genesis_allocations.clone(),
             TraceReporter,
         );
+        // Block startup until the application actor has finished persistence
+        // recovery and is servicing mailbox queries.
+        let startup_root = tx_mailbox.get_state_root().await;
+        info!(?startup_root, "application startup barrier passed");
         let light_client = hellas_chain::rpc::LocalLightClient::new(tx_mailbox, validators);
 
         // Start light-client gRPC server over WebSocket (if configured)
@@ -970,10 +974,9 @@ fn run(
 
         let shard_transport_handle = relay.start(context.clone());
 
-        // Start networking only after the app + shard transport are initialized.
-        let network_handle = network.start();
-
         let engine_handle = engine.start(vote, certificate, resolver);
+        // Start networking only after the app + consensus engine are initialized.
+        let network_handle = network.start();
 
         let signal_waiter = wait_for_shutdown_signal()
             .map(ShutdownTrigger::Signal)

@@ -35,11 +35,7 @@ impl<T> Traced<T> {
 ///
 /// This enables cross-node correlation in the tracing backend (Jaeger / Grafana
 /// Tempo) without propagating W3C trace context over the wire.
-pub(crate) fn set_block_trace_context(
-    span: &Span,
-    trace_id: [u8; 16],
-    span_id: [u8; 8],
-) {
+pub(crate) fn set_block_trace_context(span: &Span, trace_id: [u8; 16], span_id: [u8; 8]) {
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
@@ -53,7 +49,5 @@ pub(crate) fn set_block_trace_context(
         TraceState::default(),
     );
 
-    let _ = span.set_parent(
-        opentelemetry::Context::new().with_remote_span_context(remote_ctx),
-    );
+    let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(remote_ctx));
 }

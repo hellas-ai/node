@@ -1,5 +1,5 @@
-use std::hint::black_box;
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,22 +9,33 @@ use commonware_consensus::minimmit::{
     mocks::reporter::{Config as ReporterConfig, Reporter as MockReporter},
     scheme::ed25519 as minimmit_ed25519,
 };
-use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
 use commonware_cryptography::Sha256;
+use commonware_cryptography::certificate::{Scheme as _, mocks::Fixture};
 use commonware_p2p::simulated::{Config as NetworkConfig, Link, Network};
 use commonware_runtime::{Clock, Metrics, Quota, Runner, deterministic};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hellas_chain::config::Config;
 use hellas_chain::engine::Engine;
 use hellas_chain::shard::AuthenticatedShardTransport;
-use hellas_chain::shard::perf::{encode_shards_once, recover_with_one_helper_once, wire_roundtrip_once};
+use hellas_chain::shard::perf::{
+    encode_shards_once, recover_with_one_helper_once, wire_roundtrip_once,
+};
 use hellas_types::Scheme;
 
 const NAMESPACE: &[u8] = b"hellas-bench";
 const N: u32 = 6;
 
-type Finalizations =
-    Arc<std::sync::Mutex<HashMap<commonware_consensus::types::View, commonware_consensus::minimmit::types::Finalization<Scheme, commonware_cryptography::sha256::Digest>>>>;
+type Finalizations = Arc<
+    std::sync::Mutex<
+        HashMap<
+            commonware_consensus::types::View,
+            commonware_consensus::minimmit::types::Finalization<
+                Scheme,
+                commonware_cryptography::sha256::Digest,
+            >,
+        >,
+    >,
+>;
 
 /// Run a full deterministic network until at least one validator reaches
 /// `target_views` finalizations. Returns the max finalization count observed.

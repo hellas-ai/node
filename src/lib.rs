@@ -3,9 +3,9 @@ extern crate tracing;
 
 mod app;
 pub mod config;
-mod gauged;
 pub mod engine;
 mod execution;
+mod gauged;
 pub mod rpc;
 
 pub mod shard;

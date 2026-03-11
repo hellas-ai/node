@@ -1,8 +1,8 @@
 #![allow(private_interfaces)]
 
-use hellas_types::{Address, Coin, ObjectId, Transaction};
-use hellas_types::rpc::LatestBlock;
 use crate::shard::protocol::ShardMessage;
+use hellas_types::rpc::LatestBlock;
+use hellas_types::{Address, Coin, ObjectId, Transaction};
 
 use super::FinalizationNotice;
 use commonware_actor::ingress;

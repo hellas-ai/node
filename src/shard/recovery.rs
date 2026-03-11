@@ -244,7 +244,10 @@ impl RecoveryMachine {
                     self.announced.insert(key, leader);
                 }
 
-                for (oldest, _) in self.announced.enforce_capacity(self.limits.max_announced_keys) {
+                for (oldest, _) in self
+                    .announced
+                    .enforce_capacity(self.limits.max_announced_keys)
+                {
                     outputs.push(RecoveryOutput::Evicted { key: oldest });
                 }
 
@@ -277,7 +280,8 @@ impl RecoveryMachine {
                 }
                 queue.push_back(message);
 
-                self.buffered.enforce_capacity(self.limits.max_buffered_keys);
+                self.buffered
+                    .enforce_capacity(self.limits.max_buffered_keys);
 
                 vec![RecoveryOutput::Buffered]
             }
@@ -517,7 +521,12 @@ impl RecoveryMachine {
 #[cfg(test)]
 impl RecoveryMachine {
     pub(super) fn with_limits(limits: RecoveryLimits) -> Self {
-        Self::new(limits, Default::default(), Default::default(), Default::default())
+        Self::new(
+            limits,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
     }
 
     pub(super) fn inspect<R>(

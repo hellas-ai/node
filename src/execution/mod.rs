@@ -103,8 +103,20 @@ mod tests {
         let alice = test_addr(1);
         let diffs = FinalizationDiffs {
             created: vec![
-                (oid(1), Coin { owner: alice.clone(), value: 100 }),
-                (oid(2), Coin { owner: alice.clone(), value: 200 }),
+                (
+                    oid(1),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 100,
+                    },
+                ),
+                (
+                    oid(2),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 200,
+                    },
+                ),
             ],
             deleted: vec![],
         };
@@ -124,7 +136,13 @@ mod tests {
 
         // Genesis: Alice has one coin
         idx.apply_diffs(&FinalizationDiffs {
-            created: vec![(oid(1), Coin { owner: alice.clone(), value: 1000 })],
+            created: vec![(
+                oid(1),
+                Coin {
+                    owner: alice.clone(),
+                    value: 1000,
+                },
+            )],
             deleted: vec![],
         });
 
@@ -132,8 +150,20 @@ mod tests {
         idx.apply_diffs(&FinalizationDiffs {
             deleted: vec![oid(1)],
             created: vec![
-                (oid(2), Coin { owner: bob.clone(), value: 300 }),
-                (oid(3), Coin { owner: alice.clone(), value: 700 }),
+                (
+                    oid(2),
+                    Coin {
+                        owner: bob.clone(),
+                        value: 300,
+                    },
+                ),
+                (
+                    oid(3),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 700,
+                    },
+                ),
             ],
         });
 
@@ -154,9 +184,27 @@ mod tests {
         // Genesis: Alice has 3 coins
         idx.apply_diffs(&FinalizationDiffs {
             created: vec![
-                (oid(1), Coin { owner: alice.clone(), value: 100 }),
-                (oid(2), Coin { owner: alice.clone(), value: 200 }),
-                (oid(3), Coin { owner: alice.clone(), value: 300 }),
+                (
+                    oid(1),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 100,
+                    },
+                ),
+                (
+                    oid(2),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 200,
+                    },
+                ),
+                (
+                    oid(3),
+                    Coin {
+                        owner: alice.clone(),
+                        value: 300,
+                    },
+                ),
             ],
             deleted: vec![],
         });
@@ -165,7 +213,13 @@ mod tests {
         // Merge: 3 inputs → 1 output
         idx.apply_diffs(&FinalizationDiffs {
             deleted: vec![oid(1), oid(2), oid(3)],
-            created: vec![(oid(4), Coin { owner: alice.clone(), value: 600 })],
+            created: vec![(
+                oid(4),
+                Coin {
+                    owner: alice.clone(),
+                    value: 600,
+                },
+            )],
         });
 
         let coins = idx.coins_by_owner(&alice);
@@ -186,7 +240,13 @@ mod tests {
         let alice = test_addr(1);
 
         idx.apply_diffs(&FinalizationDiffs {
-            created: vec![(oid(1), Coin { owner: alice.clone(), value: 100 })],
+            created: vec![(
+                oid(1),
+                Coin {
+                    owner: alice.clone(),
+                    value: 100,
+                },
+            )],
             deleted: vec![],
         });
         assert_eq!(idx.coins_by_owner(&alice).len(), 1);

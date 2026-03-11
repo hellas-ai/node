@@ -82,9 +82,9 @@ impl FinalizationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_types::Coin;
     use commonware_cryptography::Signer;
     use commonware_cryptography::sha256::Digest;
+    use hellas_types::Coin;
     use hellas_types::PrivateKey;
 
     fn sample_diffs(seed: u8) -> FinalizationDiffs {
@@ -92,7 +92,9 @@ mod tests {
             created: vec![(
                 Digest::from([seed; 32]),
                 Coin {
-                    owner: hellas_types::Address::from(PrivateKey::from_seed(u64::from(seed)).public_key()),
+                    owner: hellas_types::Address::from(
+                        PrivateKey::from_seed(u64::from(seed)).public_key(),
+                    ),
                     value: u64::from(seed),
                 },
             )],

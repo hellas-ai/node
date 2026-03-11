@@ -4,8 +4,7 @@ use super::protocol::{
     ZodaCommitment, ZodaReShard, ZodaShard, hash_encoded,
 };
 use super::recovery::{
-    ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine,
-    RecoveryOutput,
+    ReadyToCheckTask, RecoveryInput, RecoveryLimits, RecoveryMachine, RecoveryOutput,
 };
 use crate::gauged::GaugedBinaryHeap;
 use crate::trace::Traced;
@@ -164,8 +163,8 @@ fn execute_coding_task(config: CodingConfig, task: CodingTask) -> Traced<CodingR
                 shard_hash,
                 shard,
             } => {
-                let result = CodingImpl::reshard(&config, &commitment, shard_index, shard)
-                    .map_err(|err| {
+                let result =
+                    CodingImpl::reshard(&config, &commitment, shard_index, shard).map_err(|err| {
                         warn!(
                             digest = ?key.digest,
                             round = ?key.round,
@@ -189,22 +188,17 @@ fn execute_coding_task(config: CodingConfig, task: CodingTask) -> Traced<CodingR
                 shard_hash,
                 reshard,
             } => {
-                let result = CodingImpl::check(
-                    &config,
-                    &commitment,
-                    &checking_data,
-                    shard_index,
-                    reshard,
-                )
-                .map_err(|err| {
-                    warn!(
-                        digest = ?key.digest,
-                        round = ?key.round,
-                        shard_index,
-                        ?err,
-                        "check failed"
-                    );
-                });
+                let result =
+                    CodingImpl::check(&config, &commitment, &checking_data, shard_index, reshard)
+                        .map_err(|err| {
+                            warn!(
+                                digest = ?key.digest,
+                                round = ?key.round,
+                                shard_index,
+                                ?err,
+                                "check failed"
+                            );
+                        });
                 CodingResult::CheckDone {
                     key,
                     shard_index,
@@ -276,9 +270,11 @@ impl<S: Strategy> ShardRecoverer<S> {
         let queue = Arc::new(SharedQueue::new(metrics.scheduler_queue_depth.clone()));
         let (event_tx, coding_event_rx) = mpsc::unbounded();
         let num_workers = strategy.parallelism_hint();
-        let workers =
-            spawn_coding_workers(num_workers, queue.clone(), coding_config, event_tx);
-        info!(num_workers, "coding workers started (streaming priority queue)");
+        let workers = spawn_coding_workers(num_workers, queue.clone(), coding_config, event_tx);
+        info!(
+            num_workers,
+            "coding workers started (streaming priority queue)"
+        );
         Self {
             me: me.clone(),
             my_index,
@@ -323,18 +319,17 @@ impl<S: Strategy> ShardRecoverer<S> {
         if drained > 0 {
             info!(
                 drained,
-                recoveries = effects.iter().filter(|e| matches!(e, ShardEffect::Recovered { .. })).count(),
+                recoveries = effects
+                    .iter()
+                    .filter(|e| matches!(e, ShardEffect::Recovered { .. }))
+                    .count(),
                 "drained coding events"
             );
         }
         effects
     }
 
-    fn apply_coding_result(
-        &mut self,
-        result: CodingResult,
-        effects: &mut VecDeque<ShardEffect>,
-    ) {
+    fn apply_coding_result(&mut self, result: CodingResult, effects: &mut VecDeque<ShardEffect>) {
         self.metrics.coding_tasks_completed_total.inc();
         match result {
             CodingResult::ReshardDone {
@@ -345,7 +340,12 @@ impl<S: Strategy> ShardRecoverer<S> {
                 result,
             } => {
                 self.apply_reshard_result(
-                    key, commitment, shard_index, shard_hash, result, effects,
+                    key,
+                    commitment,
+                    shard_index,
+                    shard_hash,
+                    result,
+                    effects,
                 );
             }
             CodingResult::CheckDone {
@@ -400,7 +400,6 @@ impl<S: Strategy> ShardRecoverer<S> {
                 other => self.push_machine_effect(other, key, effects),
             }
         }
-
 
         effects.push_back(ShardEffect::Broadcast(Box::new(ShardMessage::reshare(
             &self.me,
@@ -554,7 +553,6 @@ impl<S: Strategy> ShardRecoverer<S> {
             message: Box::new(message),
         });
 
-
         for output in outputs {
             match output {
                 RecoveryOutput::IngressReady {
@@ -700,7 +698,6 @@ impl<S: Strategy> ShardRecoverer<S> {
             }
         }
 
-
         effects
     }
 
@@ -775,7 +772,6 @@ impl<S: Strategy> ShardRecoverer<S> {
             effects.push_back(effect);
         }
     }
-
 
     fn machine_output_to_effect(
         &self,
@@ -894,8 +890,9 @@ mod tests {
             has_payload: impl Fn(&Digest) -> bool,
         ) -> VecDeque<ShardEffect> {
             let index_by_validator = &self.index_by_validator;
-            self.recoverer
-                .handle_message(message, has_payload, |pk| index_by_validator.get(pk).copied())
+            self.recoverer.handle_message(message, has_payload, |pk| {
+                index_by_validator.get(pk).copied()
+            })
         }
 
         fn announce_leader(&mut self, key: BlockKey) -> (Vec<ShardMessage>, VecDeque<ShardEffect>) {
@@ -953,11 +950,14 @@ mod tests {
                 &no_payload,
             );
             assert!(buffered.is_empty());
-            assert!(fixture.recoverer.machine.inspect(
-                |_recovering, _announced, buffered| {
-                    buffered.contains_key(&artifacts.key)
-                }
-            ));
+            assert!(
+                fixture
+                    .recoverer
+                    .machine
+                    .inspect(|_recovering, _announced, buffered| {
+                        buffered.contains_key(&artifacts.key)
+                    })
+            );
 
             let (drained, _eviction_effects) = fixture.announce_leader(artifacts.key);
             assert_eq!(drained.len(), 1);
@@ -966,18 +966,23 @@ mod tests {
                 let effects = fixture.handle_message(msg, &no_payload);
                 assert!(effects.is_empty());
             }
-            assert!(!fixture.recoverer.machine.inspect(
-                |_recovering, _announced, buffered| {
-                    buffered.contains_key(&artifacts.key)
-                }
-            ));
-            let buffered_reshards_len = fixture.recoverer.machine.inspect(
-                |recovering, _announced, _buffered| {
-                    recovering
-                        .get(&artifacts.key)
-                        .map(|recovery| recovery.buffered_reshards_len())
-                },
+            assert!(
+                !fixture
+                    .recoverer
+                    .machine
+                    .inspect(|_recovering, _announced, buffered| {
+                        buffered.contains_key(&artifacts.key)
+                    })
             );
+            let buffered_reshards_len =
+                fixture
+                    .recoverer
+                    .machine
+                    .inspect(|recovering, _announced, _buffered| {
+                        recovering
+                            .get(&artifacts.key)
+                            .map(|recovery| recovery.buffered_reshards_len())
+                    });
             assert_eq!(
                 buffered_reshards_len,
                 Some(1),
@@ -1009,9 +1014,14 @@ mod tests {
                 &no_payload,
             );
             assert!(malicious.is_empty());
-            assert!(!fixture.recoverer.machine.inspect(
-                |recovering, _announced, _buffered| { recovering.contains_key(&good.key) }
-            ));
+            assert!(
+                !fixture
+                    .recoverer
+                    .machine
+                    .inspect(|recovering, _announced, _buffered| {
+                        recovering.contains_key(&good.key)
+                    })
+            );
 
             let _ = fixture.handle_message(
                 ShardMessage::initial(
@@ -1023,13 +1033,15 @@ mod tests {
                 ),
                 &no_payload,
             );
-            let commitment = fixture.recoverer.machine.inspect(
-                |recovering, _announced, _buffered| {
-                    recovering
-                        .get(&good.key)
-                        .map(|recovery| recovery.commitment())
-                },
-            );
+            let commitment =
+                fixture
+                    .recoverer
+                    .machine
+                    .inspect(|recovering, _announced, _buffered| {
+                        recovering
+                            .get(&good.key)
+                            .map(|recovery| recovery.commitment())
+                    });
             let Some(commitment) = commitment else {
                 panic!("leader initial should create recovery state");
             };

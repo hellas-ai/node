@@ -51,7 +51,7 @@ tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tonic = { version = "0.14", features = ["server", "channel"] }
-ws-mux = { path = "../../ws-mux", features = ["native-client", "server"] }
+ws-mux = { workspace = true, features = ["native-client", "server"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }

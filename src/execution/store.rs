@@ -1,10 +1,10 @@
-use hellas_types::{Coin, ObjectId};
 use commonware_cryptography::Sha256;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{
     qmdb::current::{FixedConfig, unordered::fixed::Db as CurrentFixedDb},
     translator::EightCap,
 };
+use hellas_types::{Coin, ObjectId};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 /// Bitmap chunk size for the QMDB Merkle tree.
