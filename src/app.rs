@@ -701,6 +701,7 @@ impl Application {
     async fn collect_relevant_ancestry<A>(
         &self,
         ancestry: &mut AncestorStream<A, HellasBlock>,
+        minimum_blocks: usize,
     ) -> Vec<HellasBlock>
     where
         A: marshal::ancestry::BlockProvider<Block = HellasBlock>,
@@ -712,7 +713,7 @@ impl Application {
                 inner.has_execution(block.parent()) || block.height() <= Height::new(1)
             };
             blocks.push(block);
-            if stop {
+            if stop && blocks.len() >= minimum_blocks {
                 break;
             }
         }
@@ -748,7 +749,7 @@ where
             runtime.sleep(self.min_propose_delay).await;
         }
 
-        let recovered = self.collect_relevant_ancestry(&mut ancestry).await;
+        let recovered = self.collect_relevant_ancestry(&mut ancestry, 1).await;
         let Some(parent) = recovered.first().cloned() else {
             return None;
         };
@@ -780,7 +781,9 @@ where
         mut ancestry: AncestorStream<A, Self::Block>,
     ) -> bool {
         let (runtime, consensus_context) = context;
-        let recovered = self.collect_relevant_ancestry(&mut ancestry).await;
+        // Verification needs the candidate block and its parent before it can
+        // validate ancestry and execute against the parent state.
+        let recovered = self.collect_relevant_ancestry(&mut ancestry, 2).await;
         let Some(block) = recovered.first().cloned() else {
             return false;
         };
