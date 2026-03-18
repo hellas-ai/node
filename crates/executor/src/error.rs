@@ -1,3 +1,5 @@
+use crate::model::ModelAssetsError;
+use crate::backend::BackendInitError;
 use crate::state::StateError;
 use catgrad::abstract_interpreter::types::InterpreterError;
 use catgrad::interpreter::backend::BackendError;
@@ -9,10 +11,14 @@ use tonic::Status;
 pub enum ExecutorError {
     #[error("executor channel closed")]
     ChannelClosed,
-    #[error("executor is busy")]
-    Busy,
+    #[error("execution queue is full (capacity {capacity})")]
+    QueueFull { capacity: usize },
     #[error("invalid quote request: {0}")]
     InvalidQuoteRequest(String),
+    #[error(transparent)]
+    BackendInit(#[from] BackendInitError),
+    #[error(transparent)]
+    ModelAssets(#[from] ModelAssetsError),
     #[error("invalid catgrad graph: {0}")]
     InvalidGraph(#[from] serde_json::Error),
     #[error("LLM error: {0}")]
@@ -41,8 +47,21 @@ impl From<ExecutorError> for Status {
     fn from(err: ExecutorError) -> Self {
         match &err {
             ExecutorError::ChannelClosed => Status::internal(err.to_string()),
-            ExecutorError::Busy => Status::resource_exhausted(err.to_string()),
+            ExecutorError::QueueFull { .. } => Status::resource_exhausted(err.to_string()),
             ExecutorError::InvalidQuoteRequest(_) => Status::invalid_argument(err.to_string()),
+            ExecutorError::BackendInit(_) => Status::internal(err.to_string()),
+            ExecutorError::ModelAssets(model_err) => match model_err {
+                ModelAssetsError::EmptyModelId
+                | ModelAssetsError::EmptyModelRevision
+                | ModelAssetsError::ParseModelConfig { .. }
+                | ModelAssetsError::ConstructModelConfig { .. }
+                | ModelAssetsError::NegativePromptTokenId { .. }
+                | ModelAssetsError::NegativeStopTokenId { .. }
+                | ModelAssetsError::PromptTooLong { .. } => {
+                    Status::invalid_argument(err.to_string())
+                }
+                _ => Status::internal(err.to_string()),
+            },
             ExecutorError::InvalidGraph(_) => Status::invalid_argument(err.to_string()),
             ExecutorError::Llm(_) => Status::internal(err.to_string()),
             ExecutorError::Interpreter(_) => Status::internal(err.to_string()),
@@ -58,6 +77,9 @@ impl From<ExecutorError> for Status {
             }
             ExecutorError::State(StateError::ExecutionNotFound(_)) => {
                 Status::not_found(err.to_string())
+            }
+            ExecutorError::State(StateError::ResultNotAvailable(_)) => {
+                Status::failed_precondition(err.to_string())
             }
         }
     }

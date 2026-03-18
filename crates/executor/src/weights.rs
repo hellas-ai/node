@@ -16,20 +16,14 @@ use tracing::{info, warn};
 pub(crate) const DEFAULT_REF: &str = "main";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ModelId(pub String);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ModelRevision(pub String);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WeightsLocator {
-    pub model_id: ModelId,
-    pub revision: ModelRevision,
+    pub model_id: String,
+    pub revision: String,
 }
 
 impl std::fmt::Display for WeightsLocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.model_id.0, self.revision.0)
+        write!(f, "{}@{}", self.model_id, self.revision)
     }
 }
 
@@ -65,10 +59,10 @@ pub enum WeightsStatus {
     Queued,
     Resolving,
     Downloading {
-        resolved_revision: Option<ModelRevision>,
+        resolved_revision: Option<String>,
     },
     Ready {
-        resolved_revision: ModelRevision,
+        resolved_revision: String,
     },
     Failed {
         error: String,
@@ -110,11 +104,11 @@ enum Command {
 enum JobEvent {
     Resolved {
         locator: WeightsLocator,
-        resolved_revision: ModelRevision,
+        resolved_revision: String,
     },
     Completed {
         locator: WeightsLocator,
-        resolved_revision: ModelRevision,
+        resolved_revision: String,
         bundle: Arc<ModelBundle>,
     },
     Failed {
@@ -237,9 +231,9 @@ impl WeightsManager {
 
 pub fn weights_cached(locator: &WeightsLocator) -> bool {
     let repo = Cache::default().repo(Repo::with_revision(
-        locator.model_id.0.clone(),
+        locator.model_id.clone(),
         RepoType::Model,
-        locator.revision.0.clone(),
+        locator.revision.clone(),
     ));
     let has_config = repo.get("config.json").is_some();
     let has_weights = repo.get("model.safetensors").is_some()
@@ -311,7 +305,7 @@ fn ensure_ready_disposition(
                 if !state.queue.contains(locator) && state.active.as_ref() != Some(locator) {
                     // Re-check policy before re-queuing a previously failed locator.
                     if !weights_cached(locator)
-                        && !state.download_policy.allows_download(&locator.model_id.0)
+                        && !state.download_policy.allows_download(&locator.model_id)
                     {
                         return EnsureDisposition::Failed(format!(
                             "download policy '{}' denied download for weights '{}'",
@@ -343,7 +337,7 @@ fn ensure_ready_disposition(
 
     // New locator: check download policy before admitting. Locally cached weights
     // always bypass the policy — they don't require a network download.
-    if !weights_cached(locator) && !state.download_policy.allows_download(&locator.model_id.0) {
+    if !weights_cached(locator) && !state.download_policy.allows_download(&locator.model_id) {
         return EnsureDisposition::Failed(format!(
             "download policy '{}' denied download for weights '{}'",
             state.download_policy, locator
@@ -379,10 +373,7 @@ fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
             locator,
             resolved_revision,
         } => {
-            let entry = state
-                .entries
-                .entry(locator.clone())
-                .or_insert_with(Entry::default);
+            let entry = state.entries.entry(locator.clone()).or_default();
             entry.status = WeightsStatus::Downloading {
                 resolved_revision: Some(resolved_revision),
             };
@@ -392,36 +383,30 @@ fn handle_job_event(state: &mut ManagerState, evt: JobEvent) {
             resolved_revision,
             bundle,
         } => {
-            let entry = state
-                .entries
-                .entry(locator.clone())
-                .or_insert_with(Entry::default);
+            let entry = state.entries.entry(locator.clone()).or_default();
             entry.status = WeightsStatus::Ready {
                 resolved_revision: resolved_revision.clone(),
             };
             entry.bundle = Some(bundle);
             state.active = None;
             info!(
-                model = locator.model_id.0,
-                requested_revision = locator.revision.0,
-                resolved_revision = resolved_revision.0,
+                model = locator.model_id,
+                requested_revision = locator.revision,
+                %resolved_revision,
                 "weights ready"
             );
             notify_waiters(state, &locator, Ok(()));
         }
         JobEvent::Failed { locator, error } => {
-            let entry = state
-                .entries
-                .entry(locator.clone())
-                .or_insert_with(Entry::default);
+            let entry = state.entries.entry(locator.clone()).or_default();
             entry.status = WeightsStatus::Failed {
                 error: error.clone(),
             };
             entry.bundle = None;
             state.active = None;
             warn!(
-                model = locator.model_id.0,
-                requested_revision = locator.revision.0,
+                model = locator.model_id,
+                requested_revision = locator.revision,
                 error,
                 "weights failed"
             );
@@ -445,8 +430,8 @@ fn maybe_start_next(state: &mut ManagerState, job_tx: mpsc::UnboundedSender<JobE
     }
 
     info!(
-        model = locator.model_id.0,
-        requested_revision = locator.revision.0,
+        model = locator.model_id,
+        requested_revision = locator.revision,
         "weights ensure started"
     );
     tokio::spawn(async move {
@@ -470,11 +455,11 @@ fn load_bundle(
     locator: &WeightsLocator,
     job_tx: mpsc::UnboundedSender<JobEvent>,
 ) -> Result<(), ExecutorError> {
-    let backend = create_backend();
+    let backend = create_backend()?;
 
     // Ensure at least config is present and derive the resolved snapshot SHA from its path.
     let (model_paths, config_path, _tokenizer_path, _tok_config) =
-        get_model_files(&locator.model_id.0, &locator.revision.0)?;
+        get_model_files(&locator.model_id, &locator.revision)?;
     let resolved_revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
         ExecutorError::WeightsError(format!(
             "unexpected hf cache path (no snapshots/<sha>): {config_path:?}"
@@ -482,9 +467,9 @@ fn load_bundle(
     })?;
 
     info!(
-        model = locator.model_id.0,
-        requested_revision = locator.revision.0,
-        resolved_revision = resolved_revision.0,
+        model = locator.model_id,
+        requested_revision = locator.revision,
+        %resolved_revision,
         "weights resolved"
     );
     let _ = job_tx.send(JobEvent::Resolved {
@@ -507,14 +492,14 @@ fn load_bundle(
     Ok(())
 }
 
-fn extract_revision_from_snapshot_path(path: &Path) -> Option<ModelRevision> {
+fn extract_revision_from_snapshot_path(path: &Path) -> Option<String> {
     let mut components = path.components().map(|c| c.as_os_str().to_string_lossy());
     while let Some(comp) = components.next() {
         if comp == "snapshots" {
             if let Some(sha) = components.next() {
                 let sha = sha.to_string();
                 if !sha.trim().is_empty() {
-                    return Some(ModelRevision(sha));
+                    return Some(sha);
                 }
             }
             return None;
@@ -534,7 +519,7 @@ mod tests {
             "/x/.cache/huggingface/hub/models--foo--bar/snapshots/abcd1234/config.json",
         );
         assert_eq!(
-            extract_revision_from_snapshot_path(&p).unwrap().0,
+            extract_revision_from_snapshot_path(&p).unwrap(),
             "abcd1234"
         );
     }
@@ -554,10 +539,10 @@ mod tests {
         assert!(snap.queue.is_empty());
 
         let status = WeightsStatus::Downloading {
-            resolved_revision: Some(ModelRevision("deadbeef".to_string())),
+            resolved_revision: Some("deadbeef".to_string()),
         };
         if let WeightsStatus::Downloading { resolved_revision } = status {
-            assert_eq!(resolved_revision.unwrap().0, "deadbeef");
+            assert_eq!(resolved_revision.unwrap(), "deadbeef");
         }
     }
 }

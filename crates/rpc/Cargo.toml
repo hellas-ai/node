@@ -12,7 +12,6 @@ default = []
 client = ["tonic/channel"]
 discovery = [
     "client",
-    "dep:anyhow",
     "dep:futures",
     "dep:pkarr",
     "dep:tonic-iroh-transport",
@@ -22,12 +21,13 @@ server = ["tonic/server"]
 compile = ["dep:tonic-prost-build"]
 
 [dependencies]
-tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip"] }
 tonic-prost = "0.14"
 prost = "0.14"
-anyhow = { version = "1", optional = true }
+futures-core = "0.3"
 futures = { version = "0.3", optional = true }
 pkarr = { version = "5", optional = true }
+thiserror = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 
 [build-dependencies]

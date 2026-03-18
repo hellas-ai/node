@@ -14,6 +14,21 @@ Execute:
 cargo run -- execute -p hey
 ```
 
+Execute locally with the catgrad backend:
+
+```bash
+cargo run -- execute --local -p hey
+```
+
+Local execution uses the same catgrad executor backend as `serve` and prefers
+accelerated backends when built with `--features cuda` or `--features metal`.
+
+Verify a remote execution against the local catgrad backend:
+
+```bash
+cargo run -- execute --verify-local -p hey
+```
+
 ## End-to-end
 
 Install server features:

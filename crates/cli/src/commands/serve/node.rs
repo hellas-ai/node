@@ -1,7 +1,7 @@
 use super::peer_tracker::{PeerTracker, RequestKind, MAX_SERVICE_ALPN_LEN};
 use anyhow::Context;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
-use hellas_rpc::discovery::shared_pkarr_client;
+use hellas_rpc::discovery::attach_discovery_lookups;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
@@ -10,9 +10,8 @@ use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
-use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::endpoint::PathId;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::DhtBackend;
@@ -117,20 +116,19 @@ fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::
 }
 
 pub(super) struct NodeHandle {
-    endpoint: Endpoint,
+    node_id: EndpointId,
     guard: tonic_iroh_transport::TransportGuard,
 }
 
 impl NodeHandle {
     pub(super) fn node_id(&self) -> EndpointId {
-        self.endpoint.id()
+        self.node_id
     }
 
     pub(super) async fn shutdown(self) -> anyhow::Result<()> {
-        self.guard
-            .shutdown()
-            .await
-            .context("failed to shut down transport")?;
+        let Self { guard, .. } = self;
+        guard.endpoint().close().await;
+        drop(guard);
         Ok(())
     }
 }
@@ -139,25 +137,13 @@ pub(super) async fn spawn_node(
     port: Option<u16>,
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
+    queue_size: usize,
 ) -> anyhow::Result<NodeHandle> {
-    let shared_pkarr = shared_pkarr_client().context("failed to initialize shared pkarr client")?;
-    let shared_dht = Arc::new(
-        shared_pkarr
-            .dht()
-            .ok_or_else(|| anyhow::anyhow!("shared pkarr client has no DHT handle"))?,
-    );
-
     let endpoint = if let Some(port) = port {
         // Explicit port: fail if it can't bind.
         Endpoint::builder()
             .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?
             .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))?
-            .address_lookup(MdnsAddressLookup::builder().service_name("hellas"))
-            .address_lookup(
-                DhtAddressLookup::builder()
-                    .client(shared_pkarr.clone())
-                    .n0_dns_pkarr_relay(),
-            )
             .bind()
             .await
             .with_context(|| format!("failed to bind on port {port}"))?
@@ -170,27 +156,18 @@ pub(super) async fn spawn_node(
                 .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))
                 .and_then(|b| b.bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0)))
             {
-                Ok(builder) => {
-                    let builder = builder
-                        .address_lookup(MdnsAddressLookup::builder().service_name("hellas"))
-                        .address_lookup(
-                            DhtAddressLookup::builder()
-                                .client(shared_pkarr.clone())
-                                .n0_dns_pkarr_relay(),
-                        );
-                    match builder.bind().await {
-                        Ok(ep) => {
-                            if offset > 0 {
-                                info!("port {DEFAULT_PORT} in use, bound to port {p}");
-                            }
-                            endpoint = Some(ep);
-                            break;
+                Ok(builder) => match builder.bind().await {
+                    Ok(ep) => {
+                        if offset > 0 {
+                            info!("port {DEFAULT_PORT} in use, bound to port {p}");
                         }
-                        Err(e) => {
-                            debug!("port {p} unavailable: {e:#}");
-                        }
+                        endpoint = Some(ep);
+                        break;
                     }
-                }
+                    Err(e) => {
+                        debug!("port {p} unavailable: {e:#}");
+                    }
+                },
                 Err(e) => {
                     debug!("port {p} unavailable: {e:#}");
                 }
@@ -203,6 +180,9 @@ pub(super) async fn spawn_node(
             )
         })?
     };
+    let shared_dht = attach_discovery_lookups(&endpoint, true, true)
+        .context("failed to attach node discovery lookups")?
+        .dht;
 
     let node_service = NodeService {
         start_time: Instant::now(),
@@ -214,8 +194,11 @@ pub(super) async fn spawn_node(
         peer_tracker: node_service.peer_tracker.clone(),
     };
 
-    let executor = Executor::spawn(download_policy, execute_policy);
+    let executor = Executor::spawn(download_policy, execute_policy, queue_size)
+        .context("failed to initialize executor backend")?;
     let execute_service = ExecuteServer::new(executor)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
     let execute_service =
@@ -234,5 +217,8 @@ pub(super) async fn spawn_node(
         .await
         .context("failed to start transport")?;
 
-    Ok(NodeHandle { endpoint, guard })
+    Ok(NodeHandle {
+        node_id: endpoint.id(),
+        guard,
+    })
 }
