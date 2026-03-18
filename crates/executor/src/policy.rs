@@ -55,21 +55,16 @@ fn parse_allow_patterns(s: &str) -> Result<Vec<String>, String> {
 // ---------------------------------------------------------------------------
 
 /// Controls whether the executor may download model weights from HuggingFace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum DownloadPolicy {
     /// Download any model if not cached (default).
+    #[default]
     Eager,
     /// Download only models whose HuggingFace model ID matches one of the
     /// given glob patterns; deny all others unless already cached locally.
     Allow(Vec<String>),
     /// Never download; only use models already present in the local HF cache.
     Skip,
-}
-
-impl Default for DownloadPolicy {
-    fn default() -> Self {
-        Self::Eager
-    }
 }
 
 impl DownloadPolicy {
@@ -126,20 +121,15 @@ pub enum ExecutePattern {
 }
 
 /// Controls which graphs the executor will run.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum ExecutePolicy {
     /// Execute any graph (default).
+    #[default]
     Eager,
     /// Execute only graphs matching one of the given patterns.
     Allow(Vec<ExecutePattern>),
     /// Refuse all executions.
     Skip,
-}
-
-impl Default for ExecutePolicy {
-    fn default() -> Self {
-        Self::Eager
-    }
 }
 
 impl ExecutePolicy {
@@ -152,7 +142,7 @@ impl ExecutePolicy {
             Self::Skip => false,
             Self::Allow(patterns) => patterns.iter().any(|p| match p {
                 ExecutePattern::HuggingFace(pat) => {
-                    hf_model_id.map_or(false, |id| glob_matches(pat, id))
+                    hf_model_id.is_some_and(|id| glob_matches(pat, id))
                 }
                 ExecutePattern::Graph(pat) => glob_matches(pat, graph_id),
             }),

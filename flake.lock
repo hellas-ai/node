@@ -10,14 +10,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1772785376,
-        "narHash": "sha256-NBmOIjXf6AMU0dLDQhJoOyuxehUPsuTnzw7MOBLLTUg=",
-        "path": "/home/grw/src/catgrad",
-        "type": "path"
+        "lastModified": 1773423467,
+        "narHash": "sha256-REJIrS/EvoDe2x5qO/SdntvvdlRP2J2/AiWBCfKgWZg=",
+        "owner": "hellas-ai",
+        "repo": "catgrad",
+        "rev": "220e2b17412c61eb8d0aa2bf97f8f5685724fa31",
+        "type": "github"
       },
       "original": {
-        "path": "/home/grw/src/catgrad",
-        "type": "path"
+        "owner": "hellas-ai",
+        "repo": "catgrad",
+        "type": "github"
       }
     },
     "flake-utils": {

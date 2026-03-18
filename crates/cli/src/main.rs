@@ -7,6 +7,7 @@ use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use tonic_iroh_transport::iroh::EndpointId;
 
 mod commands;
+mod execution;
 
 #[derive(Parser)]
 #[command(name = "hellas")]
@@ -35,6 +36,12 @@ enum Commands {
         /// or 'allow(hf/pattern,...,graph/pattern,...)' (execute only matching)
         #[arg(long = "execute-policy", default_value = "skip")]
         execute_policy: hellas_executor::ExecutePolicy,
+        /// Maximum number of queued executions waiting behind the active worker
+        #[arg(
+            long = "queue-size",
+            default_value_t = hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY
+        )]
+        queue_size: usize,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -47,6 +54,15 @@ enum Commands {
         /// Direct target node id (omit to use discovery)
         #[arg(long)]
         node_id: Option<EndpointId>,
+        /// Run locally with the catgrad backend instead of the Hellas network
+        #[arg(long = "local", default_value_t = false, conflicts_with = "node_id")]
+        local: bool,
+        /// Maximum number of queued local executions when `--local` is set
+        #[arg(
+            long = "queue-size",
+            default_value_t = hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY
+        )]
+        queue_size: usize,
         /// Max execution retries on failure (discovery mode)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
@@ -62,9 +78,9 @@ enum Commands {
         /// Node ID to check
         node_id: EndpointId,
     },
-    /// Execute a job on a remote node
+    /// Execute a job remotely or locally
     Execute {
-        /// Node ID to execute on (omit to auto-discover)
+        /// Node ID to execute on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// HuggingFace model id used to fetch weights, optionally with @revision
         #[arg(
@@ -85,6 +101,16 @@ enum Commands {
         /// Number of accepted backup quotes to pre-fetch
         #[arg(long = "backup-quotes", default_value_t = 2)]
         backup_quotes: usize,
+        /// Run locally with the catgrad backend instead of the Hellas network
+        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id"])]
+        local: bool,
+        /// Run remotely and locally, then verify that both outputs match
+        #[arg(
+            long = "verify-local",
+            default_value_t = false,
+            conflicts_with = "local"
+        )]
+        verify_local: bool,
     },
     /// Discover peers and log network events
     Monitor {
@@ -212,23 +238,28 @@ async fn main() {
             port,
             download_policy,
             execute_policy,
-        } => commands::serve::run(port, download_policy, execute_policy).await,
+            queue_size,
+        } => commands::serve::run(port, download_policy, execute_policy, queue_size).await,
         Commands::Gateway {
             host,
             port,
             node_id,
+            local,
+            queue_size,
             retries,
             default_max_tokens,
             force_model,
         } => {
-            commands::gateway::run(
+            commands::gateway::run(commands::gateway::GatewayOptions {
                 host,
                 port,
                 node_id,
+                local,
+                queue_size,
                 retries,
                 default_max_tokens,
                 force_model,
-            )
+            })
             .await
         }
         Commands::Health { node_id } => commands::health::run(node_id).await,
@@ -239,7 +270,21 @@ async fn main() {
             max_seq,
             retries,
             backup_quotes,
-        } => commands::execute::run(node_id, model, prompt, max_seq, retries, backup_quotes).await,
+            local,
+            verify_local,
+        } => {
+            commands::execute::run(commands::execute::ExecuteOptions {
+                node_id,
+                model,
+                prompt,
+                max_seq,
+                retries,
+                backup_quotes,
+                local,
+                verify_local,
+            })
+            .await
+        }
         Commands::Monitor {
             timeout_secs,
             no_interrogate,
@@ -255,5 +300,81 @@ async fn main() {
     if let Err(err) = result {
         eprintln!("error: {err:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_accepts_local_mode() {
+        let cli = Cli::try_parse_from(["hellas", "execute", "--local", "-p", "hello"]).unwrap();
+        match cli.command {
+            Commands::Execute {
+                node_id,
+                local,
+                verify_local,
+                ..
+            } => {
+                assert!(node_id.is_none());
+                assert!(local);
+                assert!(!verify_local);
+            }
+            _ => panic!("expected execute command"),
+        }
+    }
+
+    #[test]
+    fn execute_rejects_local_with_node_id() {
+        let result = Cli::try_parse_from([
+            "hellas",
+            "execute",
+            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+            "--local",
+            "-p",
+            "hello",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_rejects_conflicting_local_modes() {
+        let result = Cli::try_parse_from([
+            "hellas",
+            "execute",
+            "--local",
+            "--verify-local",
+            "-p",
+            "hello",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gateway_accepts_local_mode() {
+        let cli = Cli::try_parse_from(["hellas", "gateway", "--local"]).unwrap();
+        match cli.command {
+            Commands::Gateway { node_id, local, .. } => {
+                assert!(node_id.is_none());
+                assert!(local);
+            }
+            _ => panic!("expected gateway command"),
+        }
+    }
+
+    #[test]
+    fn gateway_rejects_local_with_node_id() {
+        let result = Cli::try_parse_from([
+            "hellas",
+            "gateway",
+            "--local",
+            "--node-id",
+            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+        ]);
+
+        assert!(result.is_err());
     }
 }

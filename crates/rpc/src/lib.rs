@@ -1,19 +1,16 @@
 #[cfg(feature = "discovery")]
 pub mod discovery;
+#[cfg(feature = "client")]
+pub mod driver;
 pub mod pb;
 pub mod service;
 
-pub const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
+// Graph execution requests can carry full serialized model graphs for large models.
+pub const GRPC_MESSAGE_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenBytesError {
     len: usize,
-}
-
-impl TokenBytesError {
-    pub fn len(&self) -> usize {
-        self.len
-    }
 }
 
 impl std::fmt::Display for TokenBytesError {
@@ -29,7 +26,7 @@ impl std::fmt::Display for TokenBytesError {
 impl std::error::Error for TokenBytesError {}
 
 pub fn encode_token_ids(token_ids: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(token_ids.len() * std::mem::size_of::<u32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(token_ids));
     for token_id in token_ids {
         bytes.extend_from_slice(&token_id.to_le_bytes());
     }

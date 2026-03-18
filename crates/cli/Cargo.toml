@@ -12,14 +12,15 @@ default = ["client"]
 client = [
     "hellas-rpc/client",
     "hellas-rpc/discovery",
+    "dep:hellas-executor",
     "dep:tonic-iroh-transport",
     "dep:tonic",
     "tonic-iroh-transport/client",
     "tonic-iroh-transport/discovery",
 ]
-serve = ["client", "hellas-rpc/server", "dep:hellas-executor", "dep:tonic", "tonic-iroh-transport/server"]
-cuda = ["serve", "hellas-executor/candle-cuda"]
-metal = ["serve", "hellas-executor/candle-metal"]
+serve = ["client", "hellas-rpc/server", "dep:tonic", "tonic-iroh-transport/server"]
+cuda = ["client", "hellas-executor/candle-cuda"]
+metal = ["client", "hellas-executor/candle-metal"]
 
 [dependencies]
 tokio.workspace = true
@@ -30,7 +31,6 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 reqwest.workspace = true
-catgrad.workspace = true
 catgrad-llm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -46,7 +46,6 @@ futures = "0.3"
 axum = "0.8"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
-tokenizers = "0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }

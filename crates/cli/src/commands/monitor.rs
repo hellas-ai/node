@@ -2,18 +2,15 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
-use hellas_rpc::discovery::shared_pkarr_client;
+use hellas_rpc::discovery::bind_resolver_endpoint;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::pb::hellas::{GetKnownPeersRequest, HealthCheckRequest, HealthCheckResponse};
 use hellas_rpc::service::{ExecuteService, NodeService};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::collections::HashSet;
 use std::future;
-use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
-use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
-use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
@@ -30,35 +27,20 @@ struct PeerInterrogationOutcome {
     known_peers_error: Option<String>,
 }
 
+struct DiscoveryEventContext<'a> {
+    endpoint: &'a Endpoint,
+    interrogate: bool,
+    service_seen: &'a mut HashSet<EndpointId>,
+    unique_peers: &'a mut HashSet<EndpointId>,
+    interrogated: &'a mut HashSet<EndpointId>,
+    interrogations: &'a mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
+}
+
 pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> {
-    let endpoint = Endpoint::builder()
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
-    // Local-network discovery only (do not advertise as a service).
-    let mdns = MdnsAddressLookup::builder()
-        .advertise(false)
-        .service_name("hellas")
-        .build(endpoint.id())
-        .context("failed to start mDNS discovery")?;
-    endpoint.address_lookup().add(mdns.clone());
-
-    let shared_pkarr = shared_pkarr_client().context("failed to initialize shared pkarr client")?;
-    let shared_dht = Arc::new(
-        shared_pkarr
-            .dht()
-            .ok_or_else(|| anyhow::anyhow!("shared pkarr client has no DHT handle"))?,
-    );
-
-    // Internet discovery via pkarr + DHT (resolver-only; no publish).
-    let pkarr = DhtAddressLookup::builder()
-        .client(shared_pkarr)
-        .n0_dns_pkarr_relay()
-        .no_publish()
-        .build()
-        .context("failed to initialize pkarr+DHT discovery")?;
-    endpoint.address_lookup().add(pkarr);
+    let bound = bind_resolver_endpoint().await?;
+    let endpoint = bound.endpoint;
+    let mdns = bound.bindings.mdns;
+    let shared_dht = bound.bindings.dht;
 
     let peer_exchange = PeerExchangeBackend::new();
     let mut registry = ServiceRegistry::new(&endpoint);
@@ -115,13 +97,15 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
                     Some(Ok(peer)) => {
                         handle_discovery_event(
                             "node",
-                            &endpoint,
                             &peer,
-                            interrogate,
-                            &mut node_seen,
-                            &mut unique_peers,
-                            &mut interrogated,
-                            &mut interrogations,
+                            DiscoveryEventContext {
+                                endpoint: &endpoint,
+                                interrogate,
+                                service_seen: &mut node_seen,
+                                unique_peers: &mut unique_peers,
+                                interrogated: &mut interrogated,
+                                interrogations: &mut interrogations,
+                            },
                         );
                     }
                     Some(Err(err)) => {
@@ -138,13 +122,15 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
                     Some(Ok(peer)) => {
                         handle_discovery_event(
                             "execute",
-                            &endpoint,
                             &peer,
-                            interrogate,
-                            &mut execute_seen,
-                            &mut unique_peers,
-                            &mut interrogated,
-                            &mut interrogations,
+                            DiscoveryEventContext {
+                                endpoint: &endpoint,
+                                interrogate,
+                                service_seen: &mut execute_seen,
+                                unique_peers: &mut unique_peers,
+                                interrogated: &mut interrogated,
+                                interrogations: &mut interrogations,
+                            },
                         );
                     }
                     Some(Err(err)) => {
@@ -227,22 +213,13 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
     Ok(())
 }
 
-fn handle_discovery_event(
-    service: &str,
-    endpoint: &Endpoint,
-    peer: &Peer,
-    interrogate: bool,
-    service_seen: &mut HashSet<EndpointId>,
-    unique_peers: &mut HashSet<EndpointId>,
-    interrogated: &mut HashSet<EndpointId>,
-    interrogations: &mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
-) {
+fn handle_discovery_event(service: &str, peer: &Peer, context: DiscoveryEventContext<'_>) {
     let peer_id = peer.id();
-    if !service_seen.insert(peer_id) {
+    if !context.service_seen.insert(peer_id) {
         return;
     }
 
-    unique_peers.insert(peer_id);
+    context.unique_peers.insert(peer_id);
     println!(
         "event=discovered service={} peer={} source={} trust={} remote_trust={} source_trust={}",
         service,
@@ -253,10 +230,10 @@ fn handle_discovery_event(
         peer.source_trust()
     );
 
-    if interrogate && interrogated.insert(peer_id) {
+    if context.interrogate && context.interrogated.insert(peer_id) {
         println!("event=interrogate-start peer={}", peer_id);
-        let endpoint = endpoint.clone();
-        interrogations.spawn(async move {
+        let endpoint = context.endpoint.clone();
+        context.interrogations.spawn(async move {
             let result = interrogate_peer(endpoint, peer_id).await;
             (peer_id, result)
         });

@@ -1,21 +1,28 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::stream::{FuturesUnordered, Stream};
+use pkarr::mainline::Dht;
 use pkarr::Client as PkarrClient;
+use thiserror::Error;
 use tonic::transport::Channel;
+use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
+use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::{
     N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
 };
+use tonic_iroh_transport::iroh::address_lookup::IntoAddressLookupError;
+use tonic_iroh_transport::iroh::endpoint::BindError;
+use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::swarm::Locator;
 
-use crate::pb::hellas::execute_client::ExecuteClient;
+use crate::driver::{configured_execute_client, ExecuteDriver, RemoteExecuteDriver};
 use crate::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
-use crate::GRPC_MESSAGE_LIMIT;
 
 /// An accepted quote: the gRPC client and the quote response.
-pub type AcceptedQuote = (ExecuteClient<Channel>, GetQuoteResponse);
+pub type AcceptedQuote = (RemoteExecuteDriver, GetQuoteResponse);
 
 /// Errors surfaced by the quote stream.
 pub enum QuoteError {
@@ -32,6 +39,44 @@ impl std::fmt::Display for QuoteError {
             QuoteError::ConnectFailed(e) => write!(f, "connect failed: {e}"),
         }
     }
+}
+
+pub struct DiscoveryBindings {
+    pub mdns: MdnsAddressLookup,
+    pub dht: Arc<Dht>,
+}
+
+pub struct DiscoveryEndpoint {
+    pub endpoint: Endpoint,
+    pub bindings: DiscoveryBindings,
+}
+
+#[derive(Debug, Error)]
+pub enum DiscoveryError {
+    #[error("failed to create iroh endpoint")]
+    BindEndpoint {
+        #[source]
+        source: BindError,
+    },
+    #[error("failed to start mDNS discovery")]
+    BuildMdnsLookup {
+        #[source]
+        source: IntoAddressLookupError,
+    },
+    #[error("failed to initialize pkarr client")]
+    BuildPkarrClient {
+        #[source]
+        source: pkarr::errors::BuildError,
+    },
+    #[error("invalid pkarr relay URL: {relay}")]
+    InvalidPkarrRelay { relay: &'static str },
+    #[error("shared pkarr client has no DHT handle")]
+    MissingDhtHandle,
+    #[error("failed to initialize pkarr+DHT discovery")]
+    BuildPkarrLookup {
+        #[source]
+        source: IntoAddressLookupError,
+    },
 }
 
 type QuoteFuture = Pin<Box<dyn Future<Output = Result<AcceptedQuote, QuoteError>> + Send>>;
@@ -86,40 +131,44 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        loop {
-            match Pin::new(&mut this.pending).poll_next(cx) {
-                Poll::Ready(Some(Ok(accepted))) => return Poll::Ready(Some(Ok(accepted))),
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
-                Poll::Ready(None) | Poll::Pending => {}
-            }
+        if let Poll::Ready(item) = poll_pending(&mut this.pending, cx) {
+            return Poll::Ready(item);
+        }
 
-            let mut progressed = false;
-
-            if !this.discovery_done {
-                match Pin::new(&mut this.locator).poll_next(cx) {
-                    Poll::Ready(Some(Ok(channel))) => {
-                        this.pending.push((this.quoter)(channel));
-                        progressed = true;
+        if !this.discovery_done {
+            match Pin::new(&mut this.locator).poll_next(cx) {
+                Poll::Ready(Some(Ok(channel))) => {
+                    this.pending.push((this.quoter)(channel));
+                    if let Poll::Ready(item) = poll_pending(&mut this.pending, cx) {
+                        return Poll::Ready(item);
                     }
-                    Poll::Ready(Some(Err(err))) => {
-                        return Poll::Ready(Some(Err(QuoteError::ConnectFailed(err))));
-                    }
-                    Poll::Ready(None) => {
-                        this.discovery_done = true;
-                        progressed = true;
-                    }
-                    Poll::Pending => {}
                 }
-            }
-
-            if !progressed {
-                return if this.discovery_done && this.pending.is_empty() {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
-                };
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Some(Err(QuoteError::ConnectFailed(err))));
+                }
+                Poll::Ready(None) => {
+                    this.discovery_done = true;
+                }
+                Poll::Pending => {}
             }
         }
+
+        if this.discovery_done && this.pending.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+fn poll_pending(
+    pending: &mut FuturesUnordered<QuoteFuture>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<AcceptedQuote, QuoteError>>> {
+    match Pin::new(pending).poll_next(cx) {
+        Poll::Ready(Some(Ok(accepted))) => Poll::Ready(Some(Ok(accepted))),
+        Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+        Poll::Ready(None) | Poll::Pending => Poll::Pending,
     }
 }
 
@@ -131,24 +180,61 @@ fn n0_pkarr_relay() -> &'static str {
     }
 }
 
-pub fn shared_pkarr_client() -> anyhow::Result<PkarrClient> {
+pub fn shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
     let mut builder = PkarrClient::builder();
     builder.no_default_network();
     builder.dht(|dht| dht);
+    let relay = n0_pkarr_relay();
     builder
-        .relays(&[n0_pkarr_relay()])
-        .map_err(|err| anyhow::anyhow!("failed to configure pkarr relay: {err}"))?;
+        .relays(&[relay])
+        .map_err(|_| DiscoveryError::InvalidPkarrRelay { relay })?;
     builder
         .build()
-        .map_err(|err| anyhow::anyhow!("failed to build pkarr client: {err}"))
+        .map_err(|source| DiscoveryError::BuildPkarrClient { source })
+}
+
+pub async fn bind_resolver_endpoint() -> Result<DiscoveryEndpoint, DiscoveryError> {
+    let endpoint = Endpoint::builder()
+        .bind()
+        .await
+        .map_err(|source| DiscoveryError::BindEndpoint { source })?;
+    let bindings = attach_discovery_lookups(&endpoint, false, false)?;
+    Ok(DiscoveryEndpoint { endpoint, bindings })
+}
+
+pub fn attach_discovery_lookups(
+    endpoint: &Endpoint,
+    advertise_mdns: bool,
+    publish_pkarr: bool,
+) -> Result<DiscoveryBindings, DiscoveryError> {
+    let mdns = MdnsAddressLookup::builder()
+        .advertise(advertise_mdns)
+        .service_name("hellas")
+        .build(endpoint.id())
+        .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
+    endpoint.address_lookup().add(mdns.clone());
+
+    let shared_pkarr = shared_pkarr_client()?;
+    let dht = Arc::new(shared_pkarr.dht().ok_or(DiscoveryError::MissingDhtHandle)?);
+
+    let mut pkarr = DhtAddressLookup::builder()
+        .client(shared_pkarr)
+        .n0_dns_pkarr_relay();
+    if !publish_pkarr {
+        pkarr = pkarr.no_publish();
+    }
+    let pkarr = pkarr
+        .build()
+        .map_err(|source| DiscoveryError::BuildPkarrLookup { source })?;
+    endpoint.address_lookup().add(pkarr);
+
+    Ok(DiscoveryBindings { mdns, dht })
 }
 
 async fn try_quote(channel: Channel, req: GetQuoteRequest) -> Result<AcceptedQuote, QuoteError> {
-    let mut client = ExecuteClient::new(channel)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+    let mut client = RemoteExecuteDriver::from_client(configured_execute_client(channel));
     match client.get_quote(req).await {
-        Ok(resp) => Ok((client, resp.into_inner())),
+        Ok(quote) => Ok((client, quote)),
         Err(status) => Err(QuoteError::Declined(status)),
     }
 }
@@ -163,9 +249,7 @@ mod tests {
     }
 
     fn mock_accepted() -> AcceptedQuote {
-        let client = ExecuteClient::new(mock_channel())
-            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-            .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+        let client = RemoteExecuteDriver::from_client(configured_execute_client(mock_channel()));
         let quote = GetQuoteResponse {
             quote_id: "test".into(),
             ..Default::default()
@@ -239,7 +323,7 @@ mod tests {
         let quoter: QuoterFn = Box::new(move |_ch| {
             let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     Ok(mock_accepted())
                 } else {
                     Err(QuoteError::Declined(tonic::Status::permission_denied("no")))
