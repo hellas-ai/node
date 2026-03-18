@@ -5,7 +5,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
     catgrad = {
-      url = "path:/home/grw/src/catgrad";
+      url = "github:hellas-ai/catgrad";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };
@@ -44,6 +44,9 @@
         '';
         cargoLock = {
           lockFile = ./Cargo.lock;
+          outputHashes = {
+            "catgrad-0.2.1" = pkgs.lib.fakeHash;
+          };
         };
         auditable = false;
         buildInputs = with pkgs; [openssl];
@@ -224,22 +227,23 @@
 
       cli = rustPlatform.buildRustPackage commonArgs;
       server = rustPlatform.buildRustPackage (commonArgs // {buildFeatures = ["serve"];});
-      serverCuda = rustPlatform.buildRustPackage (commonArgs // {
-        buildFeatures = ["serve" "cuda"];
-        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper] ++ catgradCudaEnv.nativeBuildInputs;
-        buildInputs = commonArgs.buildInputs ++ catgradCudaEnv.buildInputs;
-        CUDA_COMPUTE_CAP = catgradCudaEnv.CUDA_COMPUTE_CAP;
-        CUDA_TOOLKIT_ROOT_DIR = catgradCudaEnv.CUDA_TOOLKIT_ROOT_DIR;
-        doCheck = false;
-        postInstall = ''
-          for bin in $out/bin/*; do
-            if [ -x "$bin" ] && [ ! -L "$bin" ]; then
-              wrapProgram "$bin" \
-                --prefix LD_LIBRARY_PATH : "${catgradCudaEnv.runtimeLibraryPath}"
-            fi
-          done
-        '';
-      });
+      serverCuda = rustPlatform.buildRustPackage (commonArgs
+        // {
+          buildFeatures = ["serve" "cuda"];
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper] ++ catgradCudaEnv.nativeBuildInputs;
+          buildInputs = commonArgs.buildInputs ++ catgradCudaEnv.buildInputs;
+          CUDA_COMPUTE_CAP = catgradCudaEnv.CUDA_COMPUTE_CAP;
+          CUDA_TOOLKIT_ROOT_DIR = catgradCudaEnv.CUDA_TOOLKIT_ROOT_DIR;
+          doCheck = false;
+          postInstall = ''
+            for bin in $out/bin/*; do
+              if [ -x "$bin" ] && [ ! -L "$bin" ]; then
+                wrapProgram "$bin" \
+                  --prefix LD_LIBRARY_PATH : "${catgradCudaEnv.runtimeLibraryPath}"
+              fi
+            done
+          '';
+        });
 
       runtimeCoreLibs = with pkgs; [
         stdenv.cc.cc.lib
@@ -286,11 +290,13 @@
         pkgs.dockerTools.buildLayeredImage {
           name = imageName;
           tag = "latest";
-          contents = [
-            runtimePkg
-            pkgs.cacert
-            pkgs.iana-etc
-          ] ++ runtimeCoreLibs ++ extraRuntimeContents;
+          contents =
+            [
+              runtimePkg
+              pkgs.cacert
+              pkgs.iana-etc
+            ]
+            ++ runtimeCoreLibs ++ extraRuntimeContents;
           config = {
             Entrypoint = ["${runtimePkg}/bin/hellas-cli" "serve"];
             WorkingDir = "/var/lib/hellas";

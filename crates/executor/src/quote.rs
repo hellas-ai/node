@@ -1,10 +1,10 @@
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
 
+use crate::model::validate_execution_config;
 use crate::state::ExecutionPlan;
 use crate::weights::{
-    weights_cached, EnsureDisposition, ModelId, ModelRevision, WeightsError, WeightsLocator,
-    DEFAULT_REF,
+    weights_cached, EnsureDisposition, WeightsError, WeightsLocator, DEFAULT_REF,
 };
 use crate::{Executor, ExecutorError, DEFAULT_MAX_SEQ};
 
@@ -55,6 +55,18 @@ impl Executor {
 
         let input_ids = decode_token_ids(&request.input)
             .map_err(|err| ExecutorError::InvalidTokenPayload(err.to_string()))?;
+        let stop_token_ids = request
+            .stop_token_ids
+            .iter()
+            .copied()
+            .map(|token| {
+                i32::try_from(token).map_err(|_| {
+                    ExecutorError::InvalidTokenPayload(format!(
+                        "stop token id {token} exceeds i32 range"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let expected_prompt_tokens = usize::try_from(request.prompt_tokens).unwrap_or(usize::MAX);
         if input_ids.len() != expected_prompt_tokens {
             return Err(ExecutorError::InvalidTokenPayload(format!(
@@ -64,14 +76,12 @@ impl Executor {
             )));
         }
 
-        serde_json::from_slice::<serde_json::Value>(&request.model_config_json).map_err(|err| {
-            ExecutorError::InvalidQuoteRequest(format!("invalid model_config_json: {err}"))
-        })?;
+        validate_execution_config(&request.model_config_json, input_ids.len(), max_new_tokens)?;
 
         let model_id = model_id.to_string();
         let weights_key = WeightsLocator {
-            model_id: ModelId(model_id.clone()),
-            revision: ModelRevision(requested_revision.clone()),
+            model_id: model_id.clone(),
+            revision: requested_revision.clone(),
         };
         let disposition = self.weights.ensure_ready(weights_key.clone()).await;
 
@@ -104,7 +114,7 @@ impl Executor {
             input: request.input,
             prompt_tokens: request.prompt_tokens,
             max_new_tokens,
-            stop_token_ids: request.stop_token_ids,
+            stop_token_ids,
         };
         let amount = 1000; // stub
         let quote_id = self.state.create_quote(plan);

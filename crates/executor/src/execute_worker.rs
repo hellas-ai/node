@@ -1,4 +1,5 @@
 use crate::catgrad_support;
+use crate::catgrad_support::ExecutionRunSpec;
 use crate::state::ExecutionPlan;
 use crate::weights::ModelBundle;
 use catgrad::category::lang::TypedTerm;
@@ -13,45 +14,15 @@ pub struct ExecuteWorker {
     busy: Arc<AtomicBool>,
 }
 
-pub struct ExecuteReservation {
-    tx: mpsc::Sender<ExecuteJob>,
-    busy: Arc<AtomicBool>,
-    committed: bool,
-}
-
-struct BusyGuard {
-    busy: Arc<AtomicBool>,
-}
-
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        self.busy.store(false, Ordering::Release);
-    }
-}
-
 #[derive(Debug)]
 pub enum ExecuteWorkerError {
     Busy,
     Stopped,
 }
 
-impl Drop for ExecuteReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.busy.store(false, Ordering::Release);
-        }
-    }
-}
-
-impl ExecuteReservation {
-    pub fn enqueue(mut self, job: ExecuteJob) -> Result<(), ExecuteWorkerError> {
-        if self.tx.send(job).is_err() {
-            self.busy.store(false, Ordering::Release);
-            return Err(ExecuteWorkerError::Stopped);
-        }
-        self.committed = true;
-        Ok(())
-    }
+pub struct EnqueueError {
+    pub error: ExecuteWorkerError,
+    pub job: Box<ExecuteJob>,
 }
 
 pub struct ExecuteJob {
@@ -75,17 +46,32 @@ impl ExecuteWorker {
         Self { tx, busy }
     }
 
-    pub fn reserve(&self) -> Result<ExecuteReservation, ExecuteWorkerError> {
+    pub fn try_enqueue(&self, job: ExecuteJob) -> Result<(), EnqueueError> {
         match self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(false) => Ok(ExecuteReservation {
-                tx: self.tx.clone(),
-                busy: self.busy.clone(),
-                committed: false,
+            Ok(false) => self.tx.send(job).map_err(|err| {
+                self.busy.store(false, Ordering::Release);
+                EnqueueError {
+                    error: ExecuteWorkerError::Stopped,
+                    job: Box::new(err.0),
+                }
             }),
-            _ => Err(ExecuteWorkerError::Busy),
+            _ => Err(EnqueueError {
+                error: ExecuteWorkerError::Busy,
+                job: Box::new(job),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn stopped() -> Self {
+        let (tx, rx) = mpsc::channel::<ExecuteJob>();
+        drop(rx);
+        Self {
+            tx,
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -96,13 +82,13 @@ fn worker_loop(
     busy: Arc<AtomicBool>,
 ) {
     while let Ok(job) = rx.recv() {
-        let _busy_guard = BusyGuard { busy: busy.clone() };
         let exec_id = job.execution_id.clone();
 
         // Candle backend types are not `UnwindSafe`; treat panic as job failure and continue.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(job, executor_tx.clone())
         }));
+        busy.store(false, Ordering::Release);
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -159,13 +145,15 @@ fn execute_plan_sync(
 
     catgrad_support::run_graph_streaming(
         bundle,
-        &plan.model_config_json,
-        &plan.input,
-        &term,
-        plan.prompt_tokens,
-        plan.max_new_tokens,
-        &plan.stop_token_ids,
-        stream_batch_size,
+        ExecutionRunSpec {
+            model_config_json: &plan.model_config_json,
+            encoded_input: &plan.input,
+            typed_term: &term,
+            prompt_tokens: plan.prompt_tokens,
+            max_new_tokens: plan.max_new_tokens,
+            stop_token_ids: &plan.stop_token_ids,
+            stream_batch_size,
+        },
         |progress, chunk| {
             let _ = tx.send(ExecutorMessage::Progress {
                 execution_id: execution_id.to_string(),

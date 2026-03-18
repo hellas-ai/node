@@ -11,15 +11,21 @@ pub async fn run(
     port: Option<u16>,
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
+    queue_size: usize,
 ) -> CliResult<()> {
-    let node = node::spawn_node(port, download_policy.clone(), execute_policy.clone())
-        .await
-        .context("failed to start node server")?;
+    let node = node::spawn_node(
+        port,
+        download_policy.clone(),
+        execute_policy.clone(),
+        queue_size,
+    )
+    .await
+    .context("failed to start node server")?;
 
     eprintln!("Node Address: {}", node.node_id());
     println!(
-        "Policies: download={} execute={}",
-        download_policy, execute_policy
+        "Policies: download={} execute={} queue_size={}",
+        download_policy, execute_policy, queue_size
     );
     if matches!(download_policy, DownloadPolicy::Skip)
         && matches!(execute_policy, ExecutePolicy::Skip)

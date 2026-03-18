@@ -1,5 +1,8 @@
-use crate::commands::local_model::LocalModelAssets;
-use crate::commands::{bind_client_endpoint, CliResult};
+use crate::commands::CliResult;
+use crate::execution::{
+    ExecutionInvocation, ExecutionOutput, ExecutionRequest, ExecutionRoute, ExecutionRuntime,
+    ExecutionStrategy,
+};
 use anyhow::{anyhow, Context};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -10,72 +13,103 @@ use axum::routing::post;
 use axum::{Json, Router};
 use catgrad_llm::types::{self, anthropic, openai, plain};
 use catgrad_llm::utils::from_json_slice;
-use catgrad_llm::IncrementalDetokenizer;
-use futures::StreamExt;
-use hellas_rpc::discovery::{
-    shared_pkarr_client, AcceptedQuote, QuoteError, QuoteStream, QuoteStreamBuilder,
-};
-use hellas_rpc::pb::hellas::execute_client::ExecuteClient;
-use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteStatusRequest, ExecutionStatus, GetQuoteRequest, GetQuoteResponse,
-};
-use hellas_rpc::service::ExecuteService;
-use hellas_rpc::{decode_token_ids, GRPC_MESSAGE_LIMIT};
+use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::Duration;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::Channel;
-use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
-use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-use tonic_iroh_transport::swarm::{DhtBackend, Locator, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::IrohConnect;
+use tonic_iroh_transport::iroh::EndpointId;
 
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub struct GatewayOptions {
+    pub host: String,
+    pub port: u16,
+    pub node_id: Option<EndpointId>,
+    pub local: bool,
+    pub queue_size: usize,
+    pub retries: usize,
+    pub default_max_tokens: u32,
+    pub force_model: Option<String>,
+}
 
 #[derive(Clone)]
 struct GatewayState {
     node_id: Option<EndpointId>,
+    local: bool,
     retries: usize,
     default_max_tokens: u32,
     force_model: Option<String>,
-    model_cache: Arc<RwLock<HashMap<String, Arc<LocalModelAssets>>>>,
+    inference_timeout: Duration,
+    runtime: ExecutionRuntime,
+    model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
+    model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
-struct GenerationOutput {
-    text: String,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+enum GenerationError {
+    Timeout(Duration),
+    Failed(anyhow::Error),
 }
 
-struct PreparedRemoteExecution {
-    _endpoint: Endpoint,
-    client: ExecuteClient<Channel>,
-    quote: GetQuoteResponse,
+struct HttpError {
+    status: StatusCode,
+    message: String,
 }
 
-pub async fn run(
-    host: String,
-    port: u16,
-    node_id: Option<EndpointId>,
-    retries: usize,
-    default_max_tokens: u32,
-    force_model: Option<String>,
-) -> CliResult<()> {
+impl fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenerationError::Timeout(duration) => {
+                write!(f, "inference timed out after {}s", duration.as_secs())
+            }
+            GenerationError::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for GenerationError {
+    fn from(err: anyhow::Error) -> Self {
+        GenerationError::Failed(err)
+    }
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        json_error(self.status, self.message)
+    }
+}
+
+pub async fn run(options: GatewayOptions) -> CliResult<()> {
+    let runtime = if options.local {
+        ExecutionRuntime::with_local_executor(
+            Executor::spawn(
+                DownloadPolicy::Eager,
+                ExecutePolicy::Eager,
+                options.queue_size,
+            )
+            .context("failed to initialize local execution backend")?,
+        )
+    } else {
+        ExecutionRuntime::default()
+    };
     let state = Arc::new(GatewayState {
-        node_id,
-        retries,
-        default_max_tokens,
-        force_model,
+        node_id: options.node_id,
+        local: options.local,
+        retries: options.retries,
+        default_max_tokens: options.default_max_tokens,
+        force_model: options.force_model,
+        inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
+        runtime,
         model_cache: Arc::new(RwLock::new(HashMap::new())),
+        model_load_locks: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let app = Router::new()
@@ -84,7 +118,7 @@ pub async fn run(
         .route("/v1/completions", post(handle_plain))
         .with_state(state.clone());
 
-    let addr = format!("{host}:{port}");
+    let addr = format!("{}:{}", options.host, options.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind gateway on {addr}"))?;
@@ -93,6 +127,11 @@ pub async fn run(
     println!("POST /v1/chat/completions (OpenAI)");
     println!("POST /v1/messages (Anthropic)");
     println!("POST /v1/completions (plain)");
+    if state.local {
+        println!("Using local catgrad execution backend");
+        println!("Local execution queue size: {}", options.queue_size);
+    }
+    println!("Inference timeout: {}s", state.inference_timeout.as_secs());
     if let Some(model) = state.force_model.as_deref() {
         println!("Forcing request model override to `{model}`");
     }
@@ -110,7 +149,7 @@ pub async fn run(
 async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
     let req = match parse_json_body::<openai::ChatCompletionRequest>(&body, "OpenAI") {
         Ok(req) => req,
-        Err(err) => return err,
+        Err(err) => return err.into_response(),
     };
 
     let model = resolve_model(&state, &req.model);
@@ -151,6 +190,7 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
         let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let state_clone = state.clone();
         let assets_clone = assets.clone();
+        let prompt_tokens = prepared.input_ids.len() as u32;
         let prepared_clone = prepared.clone();
         tokio::spawn(async move {
             let id = next_id("chatcmpl");
@@ -219,7 +259,7 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
                 .choices(vec![openai::ChatStreamChoice::builder()
                     .index(0)
                     .delta(openai::ChatDelta::default())
-                    .finish_reason(Some(openai_finish_reason()))
+                    .finish_reason(Some(openai::FinishReason::Stop))
                     .build()])
                 .build();
             if tx.send(Ok(sse_data(&final_chunk))).is_err() {
@@ -234,7 +274,7 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
                     .model(model)
                     .choices(vec![])
                     .usage(Some(openai::Usage::from_counts(
-                        generated.prompt_tokens,
+                        prompt_tokens,
                         generated.completion_tokens,
                     )))
                     .build();
@@ -251,16 +291,12 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
             .into_response();
     }
 
+    let prompt_tokens = prepared.input_ids.len() as u32;
     let generated =
         match generate_prepared(state, assets, prepared.clone(), max_tokens, |_delta| Ok(())).await
         {
             Ok(out) => out,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Inference error: {err}"),
-                );
-            }
+            Err(err) => return inference_error_response(err),
         };
 
     let response = openai::ChatCompletionResponse::builder()
@@ -271,10 +307,10 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
         .choices(vec![openai::ChatChoice::builder()
             .index(0)
             .message(openai::ChatMessage::assistant(generated.text))
-            .finish_reason(Some(openai_finish_reason()))
+            .finish_reason(Some(openai::FinishReason::Stop))
             .build()])
         .usage(Some(openai::Usage::from_counts(
-            generated.prompt_tokens,
+            prompt_tokens,
             generated.completion_tokens,
         )))
         .build();
@@ -282,14 +318,10 @@ async fn handle_openai(State(state): State<Arc<GatewayState>>, body: Bytes) -> R
     Json(response).into_response()
 }
 
-fn openai_finish_reason() -> openai::FinishReason {
-    openai::FinishReason::Stop
-}
-
 async fn handle_anthropic(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
     let req = match parse_json_body::<anthropic::MessageRequest>(&body, "Anthropic") {
         Ok(req) => req,
-        Err(err) => return err,
+        Err(err) => return err.into_response(),
     };
 
     let model = resolve_model(&state, &req.model);
@@ -411,8 +443,7 @@ async fn handle_anthropic(State(state): State<Arc<GatewayState>>, body: Bytes) -
                     "message_delta",
                     &anthropic::MessageStreamEvent::MessageDelta {
                         delta: anthropic::StreamMessageDelta {
-                            stop_reason: Some(anthropic_stop_reason()),
-                            ..Default::default()
+                            stop_reason: Some(anthropic::StopReason::EndTurn),
                         },
                         usage: anthropic::AnthropicUsage::new(
                             prepared_clone.input_ids.len() as u32,
@@ -436,16 +467,12 @@ async fn handle_anthropic(State(state): State<Arc<GatewayState>>, body: Bytes) -
             .into_response();
     }
 
+    let prompt_tokens = prepared.input_ids.len() as u32;
     let generated =
         match generate_prepared(state, assets, prepared.clone(), max_tokens, |_delta| Ok(())).await
         {
             Ok(out) => out,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Inference error: {err}"),
-                );
-            }
+            Err(err) => return inference_error_response(err),
         };
 
     let response = anthropic::MessageResponse::builder()
@@ -456,9 +483,9 @@ async fn handle_anthropic(State(state): State<Arc<GatewayState>>, body: Bytes) -
             text: generated.text,
         }])
         .model(model)
-        .stop_reason(Some(anthropic_stop_reason()))
+        .stop_reason(Some(anthropic::StopReason::EndTurn))
         .usage(anthropic::AnthropicUsage::new(
-            generated.prompt_tokens,
+            prompt_tokens,
             generated.completion_tokens,
         ))
         .build();
@@ -466,14 +493,10 @@ async fn handle_anthropic(State(state): State<Arc<GatewayState>>, body: Bytes) -
     Json(response).into_response()
 }
 
-fn anthropic_stop_reason() -> anthropic::StopReason {
-    anthropic::StopReason::EndTurn
-}
-
 async fn handle_plain(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
     let req = match parse_json_body::<plain::CompletionRequest>(&body, "completion") {
         Ok(req) => req,
-        Err(err) => return err,
+        Err(err) => return err.into_response(),
     };
 
     let model = resolve_model(&state, &req.model);
@@ -565,15 +588,11 @@ async fn handle_plain(State(state): State<Arc<GatewayState>>, body: Bytes) -> Re
             .into_response();
     }
 
+    let prompt_tokens = prepared.input_ids.len() as u32;
     let generated =
         match generate_prepared(state, assets, prepared, max_tokens, |_delta| Ok(())).await {
             Ok(out) => out,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Inference error: {err}"),
-                );
-            }
+            Err(err) => return inference_error_response(err),
         };
 
     let response = plain::CompletionResponse::builder()
@@ -587,7 +606,7 @@ async fn handle_plain(State(state): State<Arc<GatewayState>>, body: Bytes) -> Re
             .finish_reason(Some(openai::FinishReason::Stop))
             .build()])
         .usage(Some(openai::Usage::from_counts(
-            generated.prompt_tokens,
+            prompt_tokens,
             generated.completion_tokens,
         )))
         .build();
@@ -598,12 +617,10 @@ async fn handle_plain(State(state): State<Arc<GatewayState>>, body: Bytes) -> Re
 fn parse_json_body<T: serde::de::DeserializeOwned>(
     body: &Bytes,
     protocol: &str,
-) -> Result<T, Response> {
-    from_json_slice::<T>(body).map_err(|err| {
-        json_error(
-            StatusCode::BAD_REQUEST,
-            format!("Invalid {protocol} request: {err}"),
-        )
+) -> Result<T, HttpError> {
+    from_json_slice::<T>(body).map_err(|err| HttpError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid {protocol} request: {err}"),
     })
 }
 
@@ -620,6 +637,14 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
         Json(json!({ "error": { "message": message.into() } })),
     )
         .into_response()
+}
+
+fn inference_error_response(err: GenerationError) -> Response {
+    let status = match err {
+        GenerationError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        GenerationError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_error(status, format!("Inference error: {err}"))
 }
 
 fn sse_data<T: Serialize>(payload: &T) -> Event {
@@ -647,7 +672,23 @@ fn now_unix() -> i64 {
 async fn get_model_assets_cached(
     state: Arc<GatewayState>,
     model: &str,
-) -> anyhow::Result<Arc<LocalModelAssets>> {
+) -> anyhow::Result<Arc<ModelAssets>> {
+    {
+        let cache = state.model_cache.read().await;
+        if let Some(assets) = cache.get(model) {
+            return Ok(assets.clone());
+        }
+    }
+
+    let load_lock = {
+        let mut locks = state.model_load_locks.lock().await;
+        locks
+            .entry(model.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _load_guard = load_lock.lock().await;
+
     {
         let cache = state.model_cache.read().await;
         if let Some(assets) = cache.get(model) {
@@ -656,7 +697,7 @@ async fn get_model_assets_cached(
     }
 
     let model_name = model.to_string();
-    let assets = tokio::task::spawn_blocking(move || LocalModelAssets::load(&model_name))
+    let assets = tokio::task::spawn_blocking(move || ModelAssets::load(&model_name))
         .await
         .context("local model loader panicked")??;
 
@@ -668,232 +709,30 @@ async fn get_model_assets_cached(
 
 async fn generate_prepared<F>(
     state: Arc<GatewayState>,
-    assets: Arc<LocalModelAssets>,
+    assets: Arc<ModelAssets>,
     prepared_prompt: catgrad_llm::PreparedPrompt,
     max_seq: u32,
     mut on_delta: F,
-) -> anyhow::Result<GenerationOutput>
+) -> Result<ExecutionOutput, GenerationError>
 where
     F: FnMut(&str) -> anyhow::Result<()> + Send,
 {
-    let max_attempts = state.retries.saturating_add(1);
-    for attempt in 1..=max_attempts {
-        let prepared = prepare_generation(
-            state.clone(),
-            assets.clone(),
-            prepared_prompt.clone(),
-            max_seq,
-        )
-        .await?;
-
-        match execute_prepared(
-            prepared,
-            assets.clone(),
-            prepared_prompt.clone(),
-            &mut on_delta,
-        )
-        .await
-        {
-            Ok(output) => return Ok(output),
-            Err(err) => {
-                if attempt == max_attempts {
-                    return Err(err.context(format!("max retries ({}) exceeded", state.retries)));
-                }
-                tracing::warn!(attempt, "execution failed, retrying: {err:#}");
-            }
-        }
-    }
-
-    Err(anyhow!("max retries ({}) exceeded", state.retries))
-}
-
-async fn prepare_generation(
-    state: Arc<GatewayState>,
-    assets: Arc<LocalModelAssets>,
-    prepared_prompt: catgrad_llm::PreparedPrompt,
-    max_seq: u32,
-) -> anyhow::Result<PreparedRemoteExecution> {
-    let quote_req = assets.build_quote_request(&prepared_prompt, max_seq)?;
-
-    match state.node_id {
-        Some(node_id) => prepare_direct(node_id, quote_req).await,
-        None => prepare_discovery(quote_req).await,
-    }
-}
-
-async fn prepare_direct(
-    node_id: EndpointId,
-    quote_req: GetQuoteRequest,
-) -> anyhow::Result<PreparedRemoteExecution> {
-    let endpoint = bind_client_endpoint().await?;
-    let channel = ExecuteService::connect(&endpoint, node_id.into())
-        .await
-        .with_context(|| format!("failed to connect to node {node_id}"))?;
-    let mut client = ExecuteClient::new(channel)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-    let quote = client
-        .get_quote(quote_req)
-        .await
-        .with_context(|| format!("node {node_id} declined quote"))?
-        .into_inner();
-
-    Ok(PreparedRemoteExecution {
-        _endpoint: endpoint,
-        client,
-        quote,
-    })
-}
-
-async fn prepare_discovery(quote_req: GetQuoteRequest) -> anyhow::Result<PreparedRemoteExecution> {
-    let endpoint = Endpoint::builder()
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
-    let mdns = MdnsAddressLookup::builder()
-        .advertise(false)
-        .service_name("hellas")
-        .build(endpoint.id())
-        .context("failed to start mDNS discovery")?;
-    endpoint.address_lookup().add(mdns.clone());
-
-    let shared_pkarr = shared_pkarr_client().context("failed to initialize shared pkarr client")?;
-    let shared_dht = Arc::new(
-        shared_pkarr
-            .dht()
-            .ok_or_else(|| anyhow!("shared pkarr client has no DHT handle"))?,
+    let request = ExecutionRequest::new(
+        state.runtime.clone(),
+        ExecutionInvocation::from_prepared_prompt(assets, prepared_prompt, max_seq)?,
+        ExecutionStrategy::Run(execution_route(&state)),
     );
-
-    let pkarr = DhtAddressLookup::builder()
-        .client(shared_pkarr)
-        .n0_dns_pkarr_relay()
-        .no_publish()
-        .build()
-        .context("failed to initialize pkarr+DHT discovery")?;
-    endpoint.address_lookup().add(pkarr);
-
-    let mut registry = ServiceRegistry::new(&endpoint);
-    registry.add(MdnsBackend::new(mdns));
-    registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
-    let locator = registry
-        .find::<ExecuteService>()
-        .timeout(DISCOVERY_TIMEOUT)
-        .start();
-
-    let mut quotes = QuoteStreamBuilder::new(quote_req).start(locator);
-    let (client, quote) = next_accepted_quote(&mut quotes).await?;
-    Ok(PreparedRemoteExecution {
-        _endpoint: endpoint,
-        client,
-        quote,
-    })
-}
-
-async fn next_accepted_quote(quotes: &mut QuoteStream<Locator>) -> anyhow::Result<AcceptedQuote> {
-    while let Some(result) = quotes.next().await {
-        match result {
-            Ok(accepted) => return Ok(accepted),
-            Err(QuoteError::Declined(status)) => {
-                tracing::info!("provider declined quote: {status}")
-            }
-            Err(QuoteError::ConnectFailed(err)) => {
-                tracing::debug!("candidate connect error: {err:#}")
-            }
-        }
-    }
-    Err(anyhow!("no provider could serve the request"))
-}
-
-async fn execute_and_collect<F>(
-    client: &mut ExecuteClient<Channel>,
-    quote: &GetQuoteResponse,
-    assets: Arc<LocalModelAssets>,
-    prepared_prompt: catgrad_llm::PreparedPrompt,
-    on_delta: &mut F,
-) -> anyhow::Result<(String, u32)>
-where
-    F: FnMut(&str) -> anyhow::Result<()> + Send,
-{
-    let execute = client
-        .execute(ExecuteRequest {
-            quote_id: quote.quote_id.clone(),
-            stream_batch_size: Some(1),
-        })
+    let output = timeout(state.inference_timeout, request.run(&mut on_delta))
         .await
-        .context("Execute RPC failed")?
-        .into_inner();
+        .map_err(|_| GenerationError::Timeout(state.inference_timeout))??;
 
-    let mut stream = client
-        .execute_stream(ExecuteStatusRequest {
-            execution_id: execute.execution_id,
-        })
-        .await
-        .context("ExecuteStream RPC failed")?
-        .into_inner();
-
-    let mut decoder = IncrementalDetokenizer::new(
-        {
-            let assets = Arc::clone(&assets);
-            move |tokens| assets.decode_tokens(tokens)
-        },
-        &prepared_prompt.stop_token_ids,
-    );
-    let mut completion_tokens = 0u32;
-    while let Some(progress) = stream.next().await {
-        let progress = progress.context("ExecuteStream RPC progress failed")?;
-        let status =
-            ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified);
-        completion_tokens = u32::try_from(progress.progress).unwrap_or(u32::MAX);
-        if !progress.chunk.is_empty() {
-            let token_ids = decode_token_ids(&progress.chunk)
-                .map_err(|err| anyhow!("failed to decode streamed token batch: {err}"))?;
-            let token_ids: Vec<i32> = token_ids
-                .into_iter()
-                .map(|token| {
-                    i32::try_from(token)
-                        .map_err(|_| anyhow!("streamed token id {token} exceeds i32 range"))
-                })
-                .collect::<Result<_, _>>()?;
-            let delta = decoder
-                .push_tokens(&token_ids)
-                .context("failed to detokenize streamed token batch")?;
-            if !delta.is_empty() {
-                on_delta(&delta)?;
-            }
-        }
-        if status == ExecutionStatus::Failed {
-            return Err(anyhow!("remote execution failed"));
-        }
-        if status == ExecutionStatus::Completed {
-            break;
-        }
-    }
-
-    Ok((decoder.finish(), completion_tokens))
+    Ok(output)
 }
 
-async fn execute_prepared<F>(
-    mut prepared: PreparedRemoteExecution,
-    assets: Arc<LocalModelAssets>,
-    prepared_prompt: catgrad_llm::PreparedPrompt,
-    on_delta: &mut F,
-) -> anyhow::Result<GenerationOutput>
-where
-    F: FnMut(&str) -> anyhow::Result<()> + Send,
-{
-    let (text, completion_tokens) = execute_and_collect(
-        &mut prepared.client,
-        &prepared.quote,
-        assets,
-        prepared_prompt.clone(),
-        on_delta,
-    )
-    .await?;
-
-    Ok(GenerationOutput {
-        text,
-        prompt_tokens: prepared_prompt.input_ids.len() as u32,
-        completion_tokens,
-    })
+fn execution_route(state: &GatewayState) -> ExecutionRoute {
+    if state.local {
+        ExecutionRoute::Local
+    } else {
+        ExecutionRoute::remote(state.node_id, state.retries, 0)
+    }
 }
