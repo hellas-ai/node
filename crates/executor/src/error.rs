@@ -1,5 +1,5 @@
-use crate::model::ModelAssetsError;
 use crate::backend::BackendInitError;
+use crate::model::ModelAssetsError;
 use crate::state::StateError;
 use catgrad::abstract_interpreter::types::InterpreterError;
 use catgrad::interpreter::backend::BackendError;
@@ -78,7 +78,7 @@ impl From<ExecutorError> for Status {
             ExecutorError::State(StateError::ExecutionNotFound(_)) => {
                 Status::not_found(err.to_string())
             }
-            ExecutorError::State(StateError::ResultNotAvailable(_)) => {
+            ExecutorError::State(StateError::OutputNotAvailable(_)) => {
                 Status::failed_precondition(err.to_string())
             }
         }

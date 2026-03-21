@@ -27,3 +27,6 @@ hf-hub = "0.4"
 blake3 = "1"
 tokenizers = "0.21"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"

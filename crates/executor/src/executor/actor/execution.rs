@@ -1,9 +1,12 @@
-use hellas_rpc::pb::hellas::{ExecuteRequest, ExecuteResponse};
-
-use crate::execute_worker::{EnqueueError, ExecuteJob, ExecuteWorkerError};
 use crate::state::ExecutionStatus;
-use crate::weights::WeightsError;
-use crate::{Executor, ExecutorError};
+use crate::worker::{EnqueueError, ExecuteJob};
+use crate::ExecutorError;
+use hellas_rpc::pb::hellas::{
+    ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
+    ExecuteStatusRequest, ExecuteStatusResponse,
+};
+
+use super::Executor;
 
 impl Executor {
     pub(super) async fn handle_execute(
@@ -12,15 +15,15 @@ impl Executor {
     ) -> Result<ExecuteResponse, ExecutorError> {
         let quote_id = request.quote_id;
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
-        let plan = self.state.get_quote(&quote_id)?.clone();
+        let plan = self.store.get_quote(&quote_id)?.clone();
         let key = plan.weights_key.clone();
-        let bundle = self.weights.bundle(&key).await.map_err(|e| match e {
-            WeightsError::NotReady => ExecutorError::WeightsNotReady(key.to_string()),
-            WeightsError::Failed(msg) => ExecutorError::WeightsError(msg),
-            other => ExecutorError::WeightsError(other.to_string()),
-        })?;
+        let bundle = self
+            .weights
+            .bundle(&key)
+            .await
+            .map_err(|error| super::map_weights_error(&key, error))?;
 
-        let execution_id = self.state.create_execution(quote_id.clone())?;
+        let execution_id = self.store.create_execution(quote_id.clone())?;
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
             plan,
@@ -30,9 +33,9 @@ impl Executor {
 
         let queued = match self.accept_execution(job) {
             Ok(queued) => queued,
-            Err(err) => {
-                let _ = self.state.remove_execution(&execution_id);
-                return Err(err);
+            Err(error) => {
+                let _ = self.store.remove_execution(&execution_id);
+                return Err(error);
             }
         };
 
@@ -50,6 +53,23 @@ impl Executor {
         })
     }
 
+    pub(super) fn handle_status(
+        &self,
+        request: ExecuteStatusRequest,
+    ) -> Result<ExecuteStatusResponse, ExecutorError> {
+        self.status_response(&request.execution_id)
+    }
+
+    pub(super) fn handle_result(
+        &self,
+        request: ExecuteResultRequest,
+    ) -> Result<ExecuteResultResponse, ExecutorError> {
+        let output = self.store.output(&request.execution_id)?;
+        Ok(ExecuteResultResponse {
+            output: output.to_vec(),
+        })
+    }
+
     fn accept_execution(&mut self, job: ExecuteJob) -> Result<bool, ExecutorError> {
         match self.try_start_execution(job) {
             Ok(()) => Ok(false),
@@ -59,33 +79,26 @@ impl Executor {
                         capacity: self.queue_capacity,
                     });
                 }
-
-                self.pending_executions.push_back(*job);
+                self.pending_executions.push_back(job);
                 Ok(true)
             }
             Err(StartExecutionError::Closed) => Err(ExecutorError::ChannelClosed),
-            Err(StartExecutionError::Other(err)) => Err(err),
+            Err(StartExecutionError::Other(error)) => Err(error),
         }
     }
 
     fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
         let execution_id = job.execution_id.clone();
-        match self.execute_worker.try_enqueue(job) {
+        match self.worker.try_enqueue(job) {
             Ok(()) => {
-                self.state
-                    .set_status(&execution_id, ExecutionStatus::Running)
+                self.store
+                    .mark_running(&execution_id)
                     .map_err(ExecutorError::from)?;
                 self.send_status(&execution_id, ExecutionStatus::Running);
                 Ok(())
             }
-            Err(EnqueueError {
-                error: ExecuteWorkerError::Busy,
-                job,
-            }) => Err(StartExecutionError::Busy(job)),
-            Err(EnqueueError {
-                error: ExecuteWorkerError::Stopped,
-                job: _job,
-            }) => {
+            Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
+            Err(EnqueueError::Stopped(_job)) => {
                 self.handle_complete(execution_id, None, ExecutionStatus::Failed);
                 Err(StartExecutionError::Closed)
             }
@@ -97,16 +110,14 @@ impl Executor {
             match self.try_start_execution(job) {
                 Ok(()) => return,
                 Err(StartExecutionError::Busy(job)) => {
-                    // Another execution started before the completion event was processed.
-                    // Re-queue the job at the front and stop trying for now.
-                    self.pending_executions.push_front(*job);
+                    self.pending_executions.push_front(job);
                     return;
                 }
                 Err(StartExecutionError::Closed) => {
                     warn!("failed to start queued execution: executor channel closed");
                 }
-                Err(StartExecutionError::Other(err)) => {
-                    warn!("failed to start queued execution: {err:#}");
+                Err(StartExecutionError::Other(error)) => {
+                    warn!("failed to start queued execution: {error:#}");
                 }
             }
         }
@@ -122,16 +133,32 @@ impl Executor {
             self.handle_complete(execution_id.to_string(), None, ExecutionStatus::Failed);
         }
     }
+
+    pub(super) fn handle_complete(
+        &mut self,
+        execution_id: String,
+        output: Option<Vec<u8>>,
+        status: ExecutionStatus,
+    ) {
+        let success = matches!(status, ExecutionStatus::Completed);
+        info!(%execution_id, success, "execution finished");
+
+        if let Err(error) = self.store.complete_execution(&execution_id, status, output) {
+            warn!("failed to update completion state for {execution_id}: {error}");
+        }
+
+        self.send_status(&execution_id, status);
+    }
 }
 
 enum StartExecutionError {
-    Busy(Box<ExecuteJob>),
+    Busy(ExecuteJob),
     Closed,
     Other(ExecutorError),
 }
 
 impl From<ExecutorError> for StartExecutionError {
-    fn from(err: ExecutorError) -> Self {
-        StartExecutionError::Other(err)
+    fn from(error: ExecutorError) -> Self {
+        StartExecutionError::Other(error)
     }
 }

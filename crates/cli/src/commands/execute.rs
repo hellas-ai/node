@@ -1,7 +1,6 @@
 use crate::commands::CliResult;
-use crate::execution::{
-    ExecutionInvocation, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy,
-};
+use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
+use crate::text_output::TextOutputDecoder;
 use hellas_executor::ModelAssets;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ pub struct ExecuteOptions {
 pub async fn run(options: ExecuteOptions) -> CliResult<()> {
     let assets = Arc::new(ModelAssets::load(&options.model)?);
     let prepared = assets.prepare_plain_prompt(&options.prompt)?;
+    let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
         ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
     } else {
@@ -28,11 +28,17 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
     };
     let request = ExecutionRequest::new(
         runtime,
-        ExecutionInvocation::from_prepared_prompt(assets, prepared, options.max_seq)?,
+        assets,
+        prepared,
+        options.max_seq,
         if options.verify_local {
             info!("executing remotely and verifying against local catgrad backend");
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::remote(options.node_id, options.retries, options.backup_quotes),
+                primary: ExecutionRoute::remote(
+                    options.node_id,
+                    options.retries,
+                    options.backup_quotes,
+                ),
                 shadow: ExecutionRoute::Local,
             }
         } else if options.local {
@@ -45,9 +51,10 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
                 options.backup_quotes,
             ))
         },
-    );
+    )?;
 
-    let mut stdout_sink = |delta: &str| {
+    let mut stdout_sink = |output: &[u8]| {
+        let delta = decoder.push_output(output)?;
         if !delta.is_empty() {
             print!("{delta}");
             io::stdout().flush()?;
@@ -58,4 +65,3 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
 
     Ok(())
 }
-

@@ -2,7 +2,7 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
-use hellas_rpc::discovery::bind_resolver_endpoint;
+use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::pb::hellas::{GetKnownPeersRequest, HealthCheckRequest, HealthCheckResponse};
 use hellas_rpc::service::{ExecuteService, NodeService};
@@ -37,7 +37,7 @@ struct DiscoveryEventContext<'a> {
 }
 
 pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> {
-    let bound = bind_resolver_endpoint().await?;
+    let bound = DiscoveryEndpoint::bind().await?;
     let endpoint = bound.endpoint;
     let mdns = bound.bindings.mdns;
     let shared_dht = bound.bindings.dht;
