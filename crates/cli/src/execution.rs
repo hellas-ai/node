@@ -3,9 +3,11 @@ use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ExecutorHandle, ModelAssets};
 use hellas_rpc::decode_token_ids;
-use hellas_rpc::discovery::{bind_resolver_endpoint, QuoteError, QuoteStream, QuoteStreamBuilder};
+use hellas_rpc::discovery::{DiscoveryEndpoint, QuoteError, QuoteStream};
 use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
-use hellas_rpc::pb::hellas::{ExecuteRequest, ExecutionStatus, GetQuoteRequest, GetQuoteResponse};
+use hellas_rpc::pb::hellas::{
+    execute_stream_event, ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest,
+};
 use hellas_rpc::service::ExecuteService;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,8 +17,8 @@ use tonic_iroh_transport::swarm::{DhtBackend, Locator, MdnsBackend, ServiceRegis
 use tonic_iroh_transport::IrohConnect;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-const OUTPUT_PREVIEW_CHARS: usize = 96;
-const OUTPUT_PREVIEW_TOKENS: usize = 24;
+
+type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 
 #[derive(Clone)]
 pub enum ExecutionRoute {
@@ -29,11 +31,7 @@ pub enum ExecutionRoute {
 }
 
 impl ExecutionRoute {
-    pub fn remote(
-        node_id: Option<EndpointId>,
-        retries: usize,
-        backup_quotes: usize,
-    ) -> Self {
+    pub fn remote(node_id: Option<EndpointId>, retries: usize, backup_quotes: usize) -> Self {
         match node_id {
             Some(node_id) => Self::RemoteDirect(node_id),
             None => Self::RemoteDiscovery {
@@ -58,15 +56,9 @@ pub struct ExecutionRuntime {
     local_executor: Option<ExecutorHandle>,
 }
 
-pub struct ExecutionInvocation {
-    assets: Arc<ModelAssets>,
-    quote_req: GetQuoteRequest,
-    stop_token_ids: Vec<i32>,
-}
-
 pub struct ExecutionRequest {
     runtime: ExecutionRuntime,
-    invocation: ExecutionInvocation,
+    quote_req: GetQuoteRequest,
     strategy: ExecutionStrategy,
 }
 
@@ -75,33 +67,28 @@ struct DiscoverySession {
     quotes: QuoteStream<Locator>,
 }
 
-struct PreparedExecution {
-    _endpoint_guard: Option<Arc<Endpoint>>,
-    quote: GetQuoteResponse,
+struct QuotedDriver {
+    _endpoint: Option<Arc<Endpoint>>,
+    quote_id: String,
     driver: Box<dyn ExecuteDriver>,
 }
 
-pub struct ExecutionOutput {
-    pub token_bytes: Vec<u8>,
-    pub text: String,
-    pub completion_tokens: u32,
+impl QuotedDriver {
+    fn new<D>(endpoint: Option<Arc<Endpoint>>, quote_id: String, driver: D) -> Self
+    where
+        D: ExecuteDriver + 'static,
+    {
+        Self {
+            _endpoint: endpoint,
+            quote_id,
+            driver: Box::new(driver),
+        }
+    }
 }
 
-impl ExecutionInvocation {
-    pub fn from_prepared_prompt(
-        assets: Arc<ModelAssets>,
-        prepared_prompt: PreparedPrompt,
-        max_seq: u32,
-    ) -> anyhow::Result<Self> {
-        let stop_token_ids = prepared_prompt.stop_token_ids.clone();
-        let quote_req = assets.build_quote_request(&prepared_prompt, max_seq)?;
-
-        Ok(Self {
-            assets,
-            quote_req,
-            stop_token_ids,
-        })
-    }
+pub struct ExecutionOutput {
+    pub output: Vec<u8>,
+    pub completion_tokens: u32,
 }
 
 impl ExecutionRuntime {
@@ -118,7 +105,7 @@ impl ExecutionRuntime {
         Ok(Self::with_local_executor(local_executor))
     }
 
-    fn local_executor(&self) -> anyhow::Result<ExecutorHandle> {
+    fn require_local_executor(&self) -> anyhow::Result<ExecutorHandle> {
         self.local_executor
             .clone()
             .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
@@ -128,50 +115,35 @@ impl ExecutionRuntime {
 impl ExecutionRequest {
     pub fn new(
         runtime: ExecutionRuntime,
-        invocation: ExecutionInvocation,
+        assets: Arc<ModelAssets>,
+        prepared_prompt: PreparedPrompt,
+        max_seq: u32,
         strategy: ExecutionStrategy,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             runtime,
-            invocation,
+            quote_req: assets.build_quote_request(&prepared_prompt, max_seq)?,
             strategy,
-        }
+        })
     }
 
-    pub async fn run<S>(&self, sink: &mut S) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
-        self.run_strategy(&self.strategy, sink).await
-    }
-
-    async fn run_strategy<S>(
-        &self,
-        strategy: &ExecutionStrategy,
-        sink: &mut S,
-    ) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
-        match strategy {
+    pub async fn run(&self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+        match &self.strategy {
             ExecutionStrategy::Run(route) => self.run_route(route, sink).await,
             ExecutionStrategy::Verify { primary, shadow } => {
                 let primary_output = self.run_route(primary, sink).await?;
-                let shadow_output = self.run_route(shadow, &mut |_: &str| Ok(())).await?;
+                let shadow_output = self.run_route(shadow, &mut |_: &[u8]| Ok(())).await?;
                 self.verify_matching_output(&primary_output, &shadow_output)?;
                 Ok(primary_output)
             }
         }
     }
 
-    async fn run_route<S>(
+    async fn run_route(
         &self,
         route: &ExecutionRoute,
-        sink: &mut S,
-    ) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
         match route {
             ExecutionRoute::RemoteDiscovery {
                 retries,
@@ -180,54 +152,46 @@ impl ExecutionRequest {
                 self.execute_discovered(*retries, *backup_quotes, sink)
                     .await
             }
-            route => {
-                let mut prepared = self.prepare_execution(route).await?;
-                self.execute_prepared(&mut prepared, sink).await
+            ExecutionRoute::Local => {
+                let executor = self.runtime.require_local_executor()?;
+                let quoted = self
+                    .quote_driver(None, executor, || "local quote failed".to_string())
+                    .await?;
+                self.execute_quoted(quoted, sink).await
+            }
+            ExecutionRoute::RemoteDirect(node_id) => {
+                let endpoint = Arc::new(DiscoveryEndpoint::bind().await?.endpoint);
+                let channel = ExecuteService::connect(&endpoint, (*node_id).into())
+                    .await
+                    .with_context(|| format!("failed to connect to node {node_id}"))?;
+                let quoted = self
+                    .quote_driver(Some(endpoint), RemoteExecuteDriver::new(channel), || {
+                        format!("node {node_id} declined quote")
+                    })
+                    .await?;
+                self.execute_quoted(quoted, sink).await
             }
         }
     }
 
-    async fn prepare_execution(&self, route: &ExecutionRoute) -> anyhow::Result<PreparedExecution> {
-        match route {
-            ExecutionRoute::Local => self.prepare_local_execution().await,
-            ExecutionRoute::RemoteDirect(node_id) => self.prepare_direct_execution(*node_id).await,
-            ExecutionRoute::RemoteDiscovery { .. } => self.prepare_discovery_execution().await,
-        }
-    }
-
-    async fn prepare_local_execution(&self) -> anyhow::Result<PreparedExecution> {
-        let mut executor = self.runtime.local_executor()?;
-        let quote = executor
-            .get_quote(self.invocation.quote_req.clone())
-            .await
-            .context("local quote failed")?;
-        Ok(PreparedExecution::from_local(executor, quote))
-    }
-
-    async fn prepare_direct_execution(
+    async fn quote_driver<D>(
         &self,
-        node_id: EndpointId,
-    ) -> anyhow::Result<PreparedExecution> {
-        let endpoint = Arc::new(bind_resolver_endpoint().await?.endpoint);
-        let channel = ExecuteService::connect(&endpoint, node_id.into())
-            .await
-            .with_context(|| format!("failed to connect to node {node_id}"))?;
-        let mut driver = RemoteExecuteDriver::new(channel);
+        endpoint: Option<Arc<Endpoint>>,
+        mut driver: D,
+        context: impl FnOnce() -> String,
+    ) -> anyhow::Result<QuotedDriver>
+    where
+        D: ExecuteDriver + 'static,
+    {
         let quote = driver
-            .get_quote(self.invocation.quote_req.clone())
+            .get_quote(self.quote_req.clone())
             .await
-            .with_context(|| format!("node {node_id} declined quote"))?;
-
-        Ok(PreparedExecution::from_remote(endpoint, driver, quote))
-    }
-
-    async fn prepare_discovery_execution(&self) -> anyhow::Result<PreparedExecution> {
-        let mut discovery = self.start_discovery_session().await?;
-        self.next_accepted_execution(&mut discovery).await
+            .with_context(context)?;
+        Ok(QuotedDriver::new(endpoint, quote.quote_id, driver))
     }
 
     async fn start_discovery_session(&self) -> anyhow::Result<DiscoverySession> {
-        let bound = bind_resolver_endpoint().await?;
+        let bound = DiscoveryEndpoint::bind().await?;
         let endpoint = Arc::new(bound.endpoint);
         let mdns = bound.bindings.mdns;
         let shared_dht = bound.bindings.dht;
@@ -243,24 +207,24 @@ impl ExecutionRequest {
 
         Ok(DiscoverySession {
             endpoint,
-            quotes: QuoteStreamBuilder::new(self.invocation.quote_req.clone()).start(locator),
+            quotes: QuoteStream::from_request(locator, self.quote_req.clone()),
         })
     }
 
     async fn next_accepted_execution(
         &self,
         discovery: &mut DiscoverySession,
-    ) -> anyhow::Result<PreparedExecution> {
+    ) -> anyhow::Result<QuotedDriver> {
         let mut last_decline = None;
         let mut last_connect_error = None;
 
         while let Some(result) = discovery.quotes.next().await {
             match result {
                 Ok((client, quote)) => {
-                    return Ok(PreparedExecution::from_remote(
-                        discovery.endpoint.clone(),
+                    return Ok(QuotedDriver::new(
+                        Some(discovery.endpoint.clone()),
+                        quote.quote_id,
                         client,
-                        quote,
                     ));
                 }
                 Err(QuoteError::Declined(status)) => {
@@ -284,15 +248,12 @@ impl ExecutionRequest {
         anyhow::bail!("no provider could serve the request");
     }
 
-    async fn execute_discovered<S>(
+    async fn execute_discovered(
         &self,
         retries: usize,
         backup_quotes: usize,
-        sink: &mut S,
-    ) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
         let mut discovery = self.start_discovery_session().await?;
         let mut buffered = VecDeque::new();
         let max_attempts = retries.saturating_add(1);
@@ -300,9 +261,10 @@ impl ExecutionRequest {
         info!("No node ID provided, discovering executor");
 
         for attempt in 1..=max_attempts {
-            let prepared = self
-                .next_prepared_execution(&mut discovery, &mut buffered)
-                .await?;
+            let prepared = match buffered.pop_front() {
+                Some(prepared) => prepared,
+                None => self.next_accepted_execution(&mut discovery).await?,
+            };
 
             match self
                 .execute_with_prefetch(prepared, &mut discovery, &mut buffered, backup_quotes, sink)
@@ -321,33 +283,15 @@ impl ExecutionRequest {
         anyhow::bail!("max retries ({retries}) exceeded");
     }
 
-    async fn next_prepared_execution(
+    async fn execute_with_prefetch(
         &self,
+        quoted: QuotedDriver,
         discovery: &mut DiscoverySession,
-        buffered: &mut VecDeque<PreparedExecution>,
-    ) -> anyhow::Result<PreparedExecution> {
-        if let Some(prepared) = buffered.pop_front() {
-            return Ok(prepared);
-        }
-
-        self.next_accepted_execution(discovery).await
-    }
-
-    async fn execute_with_prefetch<S>(
-        &self,
-        prepared: PreparedExecution,
-        discovery: &mut DiscoverySession,
-        buffered: &mut VecDeque<PreparedExecution>,
+        buffered: &mut VecDeque<QuotedDriver>,
         backup_quotes: usize,
-        sink: &mut S,
-    ) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
-        let mut execute_fut = Box::pin(async move {
-            let mut prepared = prepared;
-            self.execute_prepared(&mut prepared, sink).await
-        });
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
+        let mut execute_fut = Box::pin(async move { self.execute_quoted(quoted, sink).await });
         let mut discovery_done = false;
 
         loop {
@@ -366,59 +310,40 @@ impl ExecutionRequest {
         }
     }
 
-    async fn execute_prepared<S>(
+    async fn execute_quoted(
         &self,
-        prepared: &mut PreparedExecution,
-        sink: &mut S,
-    ) -> anyhow::Result<ExecutionOutput>
-    where
-        S: FnMut(&str) -> anyhow::Result<()>,
-    {
-        let mut stream = prepared.start_progress_stream().await?;
-        let mut decoder = self
-            .invocation
-            .assets
-            .create_detokenizer(&self.invocation.stop_token_ids);
-        let mut token_bytes = Vec::new();
+        mut quoted: QuotedDriver,
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
+        let mut stream = quoted
+            .driver
+            .execute_streaming(ExecuteRequest {
+                quote_id: quoted.quote_id.clone(),
+                stream_batch_size: Some(1),
+            })
+            .await
+            .context("failed to start execution stream")?;
+        let mut output = Vec::new();
         let mut completion_tokens = 0u32;
 
-        while let Some(progress) = stream.next().await {
-            let progress = progress.context("execution stream failed")?;
-            let status =
-                ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified);
-            completion_tokens = u32::try_from(progress.progress).unwrap_or(u32::MAX);
-
-            if !progress.chunk.is_empty() {
-                token_bytes.extend_from_slice(&progress.chunk);
-
-                let token_ids = decode_token_ids(&progress.chunk)
-                    .map_err(|err| anyhow!("failed to decode streamed token batch: {err}"))?;
-                let token_ids: Vec<i32> = token_ids
-                    .into_iter()
-                    .map(|token| {
-                        i32::try_from(token)
-                            .map_err(|_| anyhow!("streamed token id {token} exceeds i32 range"))
-                    })
-                    .collect::<Result<_, _>>()?;
-                let delta = decoder
-                    .push_tokens(&token_ids)
-                    .context("failed to detokenize streamed token batch")?;
-                if !delta.is_empty() {
-                    sink(&delta)?;
+        while let Some(event) = stream.next().await {
+            if let Some(status) = self.consume_stream_event(
+                event.context("execution stream failed")?,
+                &mut output,
+                &mut completion_tokens,
+                sink,
+            )? {
+                if status == ExecutionStatus::Failed {
+                    anyhow::bail!("execution failed");
                 }
-            }
-
-            if status == ExecutionStatus::Failed {
-                anyhow::bail!("execution failed");
-            }
-            if status == ExecutionStatus::Completed {
-                break;
+                if status == ExecutionStatus::Completed {
+                    break;
+                }
             }
         }
 
         Ok(ExecutionOutput {
-            token_bytes,
-            text: decoder.finish(),
+            output,
             completion_tokens,
         })
     }
@@ -428,85 +353,86 @@ impl ExecutionRequest {
         primary: &ExecutionOutput,
         shadow: &ExecutionOutput,
     ) -> anyhow::Result<()> {
-        if primary.token_bytes == shadow.token_bytes {
+        if primary.output == shadow.output {
             return Ok(());
         }
 
-        let primary_tokens = decode_token_ids(&primary.token_bytes)
-            .map_err(|err| anyhow!("failed to decode primary output tokens: {err}"))?;
-        let shadow_tokens = decode_token_ids(&shadow.token_bytes)
-            .map_err(|err| anyhow!("failed to decode shadow output tokens: {err}"))?;
+        if let (Ok(primary_tokens), Ok(shadow_tokens)) = (
+            decode_token_ids(&primary.output),
+            decode_token_ids(&shadow.output),
+        ) {
+            let mismatch_index = primary_tokens
+                .iter()
+                .zip(&shadow_tokens)
+                .position(|(primary, shadow)| primary != shadow)
+                .unwrap_or_else(|| primary_tokens.len().min(shadow_tokens.len()));
+            let primary_token = primary_tokens.get(mismatch_index).copied();
+            let shadow_token = shadow_tokens.get(mismatch_index).copied();
+            anyhow::bail!(
+                "primary/shadow outputs diverged at token {} (primary={:?}, shadow={:?}); primary_tokens={} shadow_tokens={}",
+                mismatch_index,
+                primary_token,
+                shadow_token,
+                primary_tokens.len(),
+                shadow_tokens.len(),
+            );
+        }
 
-        let mismatch_index = primary_tokens
+        let mismatch_index = primary
+            .output
             .iter()
-            .zip(&shadow_tokens)
+            .zip(&shadow.output)
             .position(|(primary, shadow)| primary != shadow)
-            .unwrap_or_else(|| primary_tokens.len().min(shadow_tokens.len()));
-
-        let primary_token = primary_tokens.get(mismatch_index).copied();
-        let shadow_token = shadow_tokens.get(mismatch_index).copied();
-        let primary_preview = self.decode_preview(&primary_tokens);
-        let shadow_preview = self.decode_preview(&shadow_tokens);
+            .unwrap_or_else(|| primary.output.len().min(shadow.output.len()));
+        let primary_byte = primary.output.get(mismatch_index).copied();
+        let shadow_byte = shadow.output.get(mismatch_index).copied();
 
         anyhow::bail!(
-            "primary/shadow outputs diverged at token {} (primary={:?}, shadow={:?}); primary_tokens={} shadow_tokens={}; primary_preview={:?}; shadow_preview={:?}",
+            "primary/shadow outputs diverged at byte {} (primary={:?}, shadow={:?}); primary_bytes={} shadow_bytes={}",
             mismatch_index,
-            primary_token,
-            shadow_token,
-            primary_tokens.len(),
-            shadow_tokens.len(),
-            primary_preview,
-            shadow_preview,
+            primary_byte,
+            shadow_byte,
+            primary.output.len(),
+            shadow.output.len(),
         );
     }
 
-    fn decode_preview(&self, token_ids: &[u32]) -> String {
-        let end = token_ids.len().min(OUTPUT_PREVIEW_TOKENS);
-        let mut preview = self
-            .invocation
-            .assets
-            .decode_tokens(&token_ids[..end])
-            .unwrap_or_else(|_| format!("{:?}", &token_ids[..end]));
-        if preview.chars().count() > OUTPUT_PREVIEW_CHARS {
-            preview = preview.chars().take(OUTPUT_PREVIEW_CHARS).collect();
-            preview.push_str("...");
-        } else if end < token_ids.len() {
-            preview.push_str("...");
-        }
-        preview
-    }
-}
+    fn consume_stream_event(
+        &self,
+        event: ExecuteStreamEvent,
+        output: &mut Vec<u8>,
+        completion_tokens: &mut u32,
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<Option<ExecutionStatus>> {
+        let (status, progress) = match event.event {
+            Some(execute_stream_event::Event::Snapshot(snapshot)) => {
+                if let Some(output_chunk) = snapshot.output.get(output.len()..) {
+                    if !output_chunk.is_empty() {
+                        output.extend_from_slice(output_chunk);
+                        sink(output_chunk)?;
+                    }
+                }
+                (
+                    ExecutionStatus::try_from(snapshot.status)
+                        .unwrap_or(ExecutionStatus::Unspecified),
+                    snapshot.progress,
+                )
+            }
+            Some(execute_stream_event::Event::Progress(progress)) => {
+                if !progress.output_chunk.is_empty() {
+                    output.extend_from_slice(&progress.output_chunk);
+                    sink(&progress.output_chunk)?;
+                }
+                (
+                    ExecutionStatus::try_from(progress.status)
+                        .unwrap_or(ExecutionStatus::Unspecified),
+                    progress.progress,
+                )
+            }
+            None => return Ok(None),
+        };
 
-impl PreparedExecution {
-    fn from_remote(
-        endpoint: Arc<Endpoint>,
-        driver: RemoteExecuteDriver,
-        quote: GetQuoteResponse,
-    ) -> Self {
-        Self {
-            _endpoint_guard: Some(endpoint),
-            quote,
-            driver: Box::new(driver),
-        }
-    }
-
-    fn from_local(driver: impl ExecuteDriver + 'static, quote: GetQuoteResponse) -> Self {
-        Self {
-            _endpoint_guard: None,
-            quote,
-            driver: Box::new(driver),
-        }
-    }
-
-    async fn start_progress_stream(
-        &mut self,
-    ) -> anyhow::Result<hellas_rpc::driver::ExecuteProgressStream> {
-        self.driver
-            .execute_streaming(ExecuteRequest {
-                quote_id: self.quote.quote_id.clone(),
-                stream_batch_size: Some(1),
-            })
-            .await
-            .context("failed to start execution stream")
+        *completion_tokens = u32::try_from(progress).unwrap_or(u32::MAX);
+        Ok(Some(status))
     }
 }

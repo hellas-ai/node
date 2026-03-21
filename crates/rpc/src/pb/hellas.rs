@@ -94,14 +94,12 @@ impl ::prost::Name for ExecuteStatusRequest {
         "/hellas.ExecuteStatusRequest".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStatusResponse {
     #[prost(enumeration = "ExecutionStatus", tag = "1")]
     pub status: i32,
     #[prost(uint64, tag = "2")]
     pub progress: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub result: ::prost::alloc::vec::Vec<u8>,
 }
 impl ::prost::Name for ExecuteStatusResponse {
     const NAME: &'static str = "ExecuteStatusResponse";
@@ -114,13 +112,32 @@ impl ::prost::Name for ExecuteStatusResponse {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteSnapshot {
+    #[prost(enumeration = "ExecutionStatus", tag = "1")]
+    pub status: i32,
+    #[prost(uint64, tag = "2")]
+    pub progress: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub output: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for ExecuteSnapshot {
+    const NAME: &'static str = "ExecuteSnapshot";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteSnapshot".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteSnapshot".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteProgress {
     #[prost(enumeration = "ExecutionStatus", tag = "1")]
     pub status: i32,
     #[prost(uint64, tag = "2")]
     pub progress: u64,
     #[prost(bytes = "vec", tag = "3")]
-    pub chunk: ::prost::alloc::vec::Vec<u8>,
+    pub output_chunk: ::prost::alloc::vec::Vec<u8>,
 }
 impl ::prost::Name for ExecuteProgress {
     const NAME: &'static str = "ExecuteProgress";
@@ -130,6 +147,31 @@ impl ::prost::Name for ExecuteProgress {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/hellas.ExecuteProgress".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteStreamEvent {
+    #[prost(oneof = "execute_stream_event::Event", tags = "1, 2")]
+    pub event: ::core::option::Option<execute_stream_event::Event>,
+}
+/// Nested message and enum types in `ExecuteStreamEvent`.
+pub mod execute_stream_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Snapshot(super::ExecuteSnapshot),
+        #[prost(message, tag = "2")]
+        Progress(super::ExecuteProgress),
+    }
+}
+impl ::prost::Name for ExecuteStreamEvent {
+    const NAME: &'static str = "ExecuteStreamEvent";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ExecuteStreamEvent".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ExecuteStreamEvent".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -150,7 +192,7 @@ impl ::prost::Name for ExecuteResultRequest {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteResultResponse {
     #[prost(bytes = "vec", tag = "1")]
-    pub result: ::prost::alloc::vec::Vec<u8>,
+    pub output: ::prost::alloc::vec::Vec<u8>,
 }
 impl ::prost::Name for ExecuteResultResponse {
     const NAME: &'static str = "ExecuteResultResponse";
@@ -789,7 +831,7 @@ pub mod execute_client {
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteStatusRequest>,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::ExecuteProgress>>,
+            tonic::Response<tonic::codec::Streaming<super::ExecuteStreamEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -868,7 +910,7 @@ pub mod execute_server {
         >;
         /// Server streaming response type for the ExecuteStream method.
         type ExecuteStreamStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::ExecuteProgress, tonic::Status>,
+                Item = std::result::Result<super::ExecuteStreamEvent, tonic::Status>,
             >
             + std::marker::Send
             + 'static;
@@ -1101,7 +1143,7 @@ pub mod execute_server {
                         T: Execute,
                     > tonic::server::ServerStreamingService<super::ExecuteStatusRequest>
                     for ExecuteStreamSvc<T> {
-                        type Response = super::ExecuteProgress;
+                        type Response = super::ExecuteStreamEvent;
                         type ResponseStream = T::ExecuteStreamStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,

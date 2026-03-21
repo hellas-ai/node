@@ -82,27 +82,6 @@ pub enum DiscoveryError {
 type QuoteFuture = Pin<Box<dyn Future<Output = Result<AcceptedQuote, QuoteError>> + Send>>;
 type QuoterFn = Box<dyn Fn(Channel) -> QuoteFuture + Send + Sync>;
 
-pub struct QuoteStreamBuilder {
-    quote_req: GetQuoteRequest,
-}
-
-impl QuoteStreamBuilder {
-    pub fn new(quote_req: GetQuoteRequest) -> Self {
-        Self { quote_req }
-    }
-
-    pub fn start(self, locator: Locator) -> QuoteStream<Locator> {
-        let req = self.quote_req;
-        QuoteStream::new(
-            locator,
-            Box::new(move |channel| {
-                let req = req.clone();
-                Box::pin(try_quote(channel, req))
-            }),
-        )
-    }
-}
-
 /// Races quote requests across discovered providers and yields accepted quotes as they arrive.
 pub struct QuoteStream<S> {
     locator: S,
@@ -120,6 +99,29 @@ impl<S> QuoteStream<S> {
             discovery_done: false,
         }
     }
+
+    fn poll_pending(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<AcceptedQuote, QuoteError>>> {
+        match Pin::new(&mut self.pending).poll_next(cx) {
+            Poll::Ready(Some(Ok(accepted))) => Poll::Ready(Some(Ok(accepted))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl QuoteStream<Locator> {
+    pub fn from_request(locator: Locator, quote_req: GetQuoteRequest) -> Self {
+        Self::new(
+            locator,
+            Box::new(move |channel| {
+                let quote_req = quote_req.clone();
+                Box::pin(try_quote(channel, quote_req))
+            }),
+        )
+    }
 }
 
 impl<S> Stream for QuoteStream<S>
@@ -131,7 +133,7 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if let Poll::Ready(item) = poll_pending(&mut this.pending, cx) {
+        if let Poll::Ready(item) = this.poll_pending(cx) {
             return Poll::Ready(item);
         }
 
@@ -139,7 +141,7 @@ where
             match Pin::new(&mut this.locator).poll_next(cx) {
                 Poll::Ready(Some(Ok(channel))) => {
                     this.pending.push((this.quoter)(channel));
-                    if let Poll::Ready(item) = poll_pending(&mut this.pending, cx) {
+                    if let Poll::Ready(item) = this.poll_pending(cx) {
                         return Poll::Ready(item);
                     }
                 }
@@ -161,17 +163,6 @@ where
     }
 }
 
-fn poll_pending(
-    pending: &mut FuturesUnordered<QuoteFuture>,
-    cx: &mut Context<'_>,
-) -> Poll<Option<Result<AcceptedQuote, QuoteError>>> {
-    match Pin::new(pending).poll_next(cx) {
-        Poll::Ready(Some(Ok(accepted))) => Poll::Ready(Some(Ok(accepted))),
-        Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
-        Poll::Ready(None) | Poll::Pending => Poll::Pending,
-    }
-}
-
 fn n0_pkarr_relay() -> &'static str {
     if std::env::var_os("IROH_FORCE_STAGING_RELAYS").is_some() {
         N0_DNS_PKARR_RELAY_STAGING
@@ -180,7 +171,49 @@ fn n0_pkarr_relay() -> &'static str {
     }
 }
 
-pub fn shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
+impl DiscoveryBindings {
+    pub fn attach(
+        endpoint: &Endpoint,
+        advertise_mdns: bool,
+        publish_pkarr: bool,
+    ) -> Result<Self, DiscoveryError> {
+        let mdns = MdnsAddressLookup::builder()
+            .advertise(advertise_mdns)
+            .service_name("hellas")
+            .build(endpoint.id())
+            .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
+        endpoint.address_lookup().add(mdns.clone());
+
+        let shared_pkarr = build_shared_pkarr_client()?;
+        let dht = Arc::new(shared_pkarr.dht().ok_or(DiscoveryError::MissingDhtHandle)?);
+
+        let mut pkarr = DhtAddressLookup::builder()
+            .client(shared_pkarr)
+            .n0_dns_pkarr_relay();
+        if !publish_pkarr {
+            pkarr = pkarr.no_publish();
+        }
+        let pkarr = pkarr
+            .build()
+            .map_err(|source| DiscoveryError::BuildPkarrLookup { source })?;
+        endpoint.address_lookup().add(pkarr);
+
+        Ok(Self { mdns, dht })
+    }
+}
+
+impl DiscoveryEndpoint {
+    pub async fn bind() -> Result<Self, DiscoveryError> {
+        let endpoint = Endpoint::builder()
+            .bind()
+            .await
+            .map_err(|source| DiscoveryError::BindEndpoint { source })?;
+        let bindings = DiscoveryBindings::attach(&endpoint, false, false)?;
+        Ok(Self { endpoint, bindings })
+    }
+}
+
+fn build_shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
     let mut builder = PkarrClient::builder();
     builder.no_default_network();
     builder.dht(|dht| dht);
@@ -191,44 +224,6 @@ pub fn shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
     builder
         .build()
         .map_err(|source| DiscoveryError::BuildPkarrClient { source })
-}
-
-pub async fn bind_resolver_endpoint() -> Result<DiscoveryEndpoint, DiscoveryError> {
-    let endpoint = Endpoint::builder()
-        .bind()
-        .await
-        .map_err(|source| DiscoveryError::BindEndpoint { source })?;
-    let bindings = attach_discovery_lookups(&endpoint, false, false)?;
-    Ok(DiscoveryEndpoint { endpoint, bindings })
-}
-
-pub fn attach_discovery_lookups(
-    endpoint: &Endpoint,
-    advertise_mdns: bool,
-    publish_pkarr: bool,
-) -> Result<DiscoveryBindings, DiscoveryError> {
-    let mdns = MdnsAddressLookup::builder()
-        .advertise(advertise_mdns)
-        .service_name("hellas")
-        .build(endpoint.id())
-        .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
-    endpoint.address_lookup().add(mdns.clone());
-
-    let shared_pkarr = shared_pkarr_client()?;
-    let dht = Arc::new(shared_pkarr.dht().ok_or(DiscoveryError::MissingDhtHandle)?);
-
-    let mut pkarr = DhtAddressLookup::builder()
-        .client(shared_pkarr)
-        .n0_dns_pkarr_relay();
-    if !publish_pkarr {
-        pkarr = pkarr.no_publish();
-    }
-    let pkarr = pkarr
-        .build()
-        .map_err(|source| DiscoveryError::BuildPkarrLookup { source })?;
-    endpoint.address_lookup().add(pkarr);
-
-    Ok(DiscoveryBindings { mdns, dht })
 }
 
 async fn try_quote(channel: Channel, req: GetQuoteRequest) -> Result<AcceptedQuote, QuoteError> {

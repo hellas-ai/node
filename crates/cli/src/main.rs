@@ -8,6 +8,7 @@ use tonic_iroh_transport::iroh::EndpointId;
 
 mod commands;
 mod execution;
+mod text_output;
 
 #[derive(Parser)]
 #[command(name = "hellas")]

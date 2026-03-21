@@ -1,7 +1,7 @@
 use super::peer_tracker::{PeerTracker, RequestKind, MAX_SERVICE_ALPN_LEN};
 use anyhow::Context;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
-use hellas_rpc::discovery::attach_discovery_lookups;
+use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
@@ -180,7 +180,7 @@ pub(super) async fn spawn_node(
             )
         })?
     };
-    let shared_dht = attach_discovery_lookups(&endpoint, true, true)
+    let shared_dht = DiscoveryBindings::attach(&endpoint, true, true)
         .context("failed to attach node discovery lookups")?
         .dht;
 

@@ -7,12 +7,12 @@ use tonic::Status;
 
 use crate::pb::hellas::execute_client::ExecuteClient;
 use crate::pb::hellas::{
-    ExecuteProgress, ExecuteRequest, ExecuteStatusRequest, GetQuoteRequest, GetQuoteResponse,
+    ExecuteRequest, ExecuteStatusRequest, ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse,
 };
 use crate::GRPC_MESSAGE_LIMIT;
 
-pub type ExecuteProgressStream =
-    Pin<Box<dyn Stream<Item = Result<ExecuteProgress, Status>> + Send>>;
+pub type ExecuteEventStream =
+    Pin<Box<dyn Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
 
 #[tonic::async_trait]
 pub trait ExecuteDriver: Send {
@@ -20,7 +20,7 @@ pub trait ExecuteDriver: Send {
     async fn execute_streaming(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteProgressStream, Status>;
+    ) -> Result<ExecuteEventStream, Status>;
 }
 
 pub struct RemoteExecuteDriver {
@@ -56,7 +56,7 @@ impl ExecuteDriver for RemoteExecuteDriver {
     async fn execute_streaming(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteProgressStream, Status> {
+    ) -> Result<ExecuteEventStream, Status> {
         let execution = self.client.execute(request).await?.into_inner();
         let stream = self
             .client
