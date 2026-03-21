@@ -39,13 +39,23 @@ enum ExecutionStatus {
 message ExecuteStatusResponse {
   ExecutionStatus status = 1;
   uint64 progress = 2;
-  bytes result = 3;
+}
+message ExecuteSnapshot {
+  ExecutionStatus status = 1;
+  uint64 progress = 2;
+  bytes output = 3;
 }
 message ExecuteProgress {
   ExecutionStatus status = 1;
   uint64 progress = 2;
-  bytes chunk = 3;
+  bytes output_chunk = 3;
+}
+message ExecuteStreamEvent {
+  oneof event {
+    ExecuteSnapshot snapshot = 1;
+    ExecuteProgress progress = 2;
+  }
 }
 
 message ExecuteResultRequest { string execution_id = 1; }
-message ExecuteResultResponse { bytes result = 1; }
+message ExecuteResultResponse { bytes output = 1; }

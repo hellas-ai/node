@@ -1,21 +1,13 @@
 use crate::backend::create_backend;
-use crate::weights::ModelBundle;
+use crate::state::ExecutionPlan;
+use crate::weights::WeightsBundle;
 use crate::ExecutorError;
 use catgrad::category::core::{Dtype, Shape};
+use catgrad::category::lang::TypedTerm;
 use catgrad::interpreter::{self, Backend, Interpreter};
 use catgrad::prelude::*;
 use catgrad_llm::utils::get_model;
 use hellas_rpc::{decode_token_ids, encode_token_ids};
-
-pub struct ExecutionRunSpec<'a> {
-    pub model_config_json: &'a [u8],
-    pub encoded_input: &'a [u8],
-    pub typed_term: &'a catgrad::category::lang::TypedTerm,
-    pub prompt_tokens: u32,
-    pub max_new_tokens: u32,
-    pub stop_token_ids: &'a [i32],
-    pub stream_batch_size: u32,
-}
 
 fn initialize_state_tensors(
     interpreter: &Interpreter<crate::backend::ExecBackend>,
@@ -56,27 +48,28 @@ fn extract_generated_token(
         .ok_or(ExecutorError::UnexpectedOutput)
 }
 
-/// Execute the provided TypedTerm and stream generated token batches.
 pub fn run_graph_streaming(
-    bundle: &ModelBundle,
-    spec: ExecutionRunSpec<'_>,
+    bundle: &WeightsBundle,
+    plan: &ExecutionPlan,
+    typed_term: &TypedTerm,
+    stream_batch_size: u32,
     mut on_progress: impl FnMut(u64, &[u8]),
 ) -> Result<(), ExecutorError> {
-    let input_ids = decode_token_ids(spec.encoded_input)
+    let input_ids = decode_token_ids(&plan.input)
         .map_err(|err| ExecutorError::InvalidTokenPayload(err.to_string()))?;
-    let expected_prompt_tokens = usize::try_from(spec.prompt_tokens).unwrap_or(usize::MAX);
+    let expected_prompt_tokens = usize::try_from(plan.prompt_tokens).unwrap_or(usize::MAX);
     if input_ids.len() != expected_prompt_tokens {
         return Err(ExecutorError::InvalidTokenPayload(format!(
             "prompt token count mismatch: plan says {}, input decodes to {}",
-            spec.prompt_tokens,
+            plan.prompt_tokens,
             input_ids.len()
         )));
     }
 
     let backend = create_backend()?;
-    let max_sequence_length = input_ids.len() + spec.max_new_tokens as usize;
+    let max_sequence_length = input_ids.len() + plan.max_new_tokens as usize;
     let model_config: serde_json::Value =
-        serde_json::from_slice(spec.model_config_json).map_err(|err| {
+        serde_json::from_slice(&plan.model_config_json).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!("invalid model config JSON: {err}"))
         })?;
     let model = get_model(&model_config, max_sequence_length)?;
@@ -89,10 +82,10 @@ pub fn run_graph_streaming(
     let mut state_tensors = initialize_state_tensors(&interpreter, &model.empty_state_type())?;
     let mut token_ids = input_ids;
     let mut generated_tokens = 0u64;
-    let batch_size = usize::try_from(spec.stream_batch_size.max(1)).unwrap_or(usize::MAX);
+    let batch_size = usize::try_from(stream_batch_size.max(1)).unwrap_or(usize::MAX);
     let mut pending_batch = Vec::with_capacity(batch_size);
 
-    for _ in 0..spec.max_new_tokens {
+    for _ in 0..plan.max_new_tokens {
         let input_tensor = interpreter::tensor(
             &interpreter.backend,
             Shape(vec![1, token_ids.len()]),
@@ -103,7 +96,7 @@ pub fn run_graph_streaming(
         let mut sources = vec![input_tensor];
         sources.append(&mut state_tensors);
 
-        let mut results = interpreter.run(spec.typed_term.term.clone(), sources)?;
+        let mut results = interpreter.run(typed_term.term.clone(), sources)?;
         if results.is_empty() {
             return Err(ExecutorError::NoOutput);
         }
@@ -113,7 +106,7 @@ pub fn run_graph_streaming(
         let next_token = extract_generated_token(&interpreter.backend, output)?;
         if i32::try_from(next_token)
             .ok()
-            .is_some_and(|token| spec.stop_token_ids.contains(&token))
+            .is_some_and(|token| plan.stop_token_ids.contains(&token))
         {
             break;
         }

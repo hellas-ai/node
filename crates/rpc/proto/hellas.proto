@@ -14,7 +14,7 @@ service Execute {
   rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
-  rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteProgress);
+  rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteStreamEvent);
   rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
 }
 
