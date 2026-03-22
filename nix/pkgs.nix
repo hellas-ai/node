@@ -59,7 +59,7 @@
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catgrad-0.2.1" = "sha256-xkAEnK1IbTygDLi/jgiV9ksE6fo0mhWVLaG6i4lrK2A=";
+        "catgrad-0.2.1" = "sha256-O72K/g3mz4rfwZBTnQFLopNAGNUVH2KWI0BknASOEaM=";
       };
     };
     auditable = false;
