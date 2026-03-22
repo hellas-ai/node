@@ -7,6 +7,7 @@ use crate::ExecutorError;
 use catgrad_llm::{BoundProgram, Program, Runtime};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
@@ -108,6 +109,7 @@ impl WeightsManager {
         locator: &WeightsLocator,
         program_json: &[u8],
     ) -> Result<Arc<BoundProgram<ExecBackend>>, ExecutorError> {
+        let start = Instant::now();
         let program: Program =
             serde_json::from_slice(program_json).map_err(ExecutorError::InvalidProgram)?;
         let program_id = program.id()?;
@@ -119,6 +121,13 @@ impl WeightsManager {
                 .cached_program(locator, &program_id)
                 .map_err(|error| map_program_cache_error(locator, error))?
             {
+                info!(
+                    model = %locator.model_id,
+                    requested_revision = %locator.revision,
+                    %program_id,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "bound program cache hit"
+                );
                 return Ok(cached);
             }
 
@@ -137,10 +146,17 @@ impl WeightsManager {
         let bound_program = Arc::new(runtime.bind(program)?);
 
         let mut state = self.inner.state.lock().await;
-        state
+        let cached = state
             .weights
             .cache_program(locator, program_id, bound_program)
-            .map_err(|error| map_program_cache_error(locator, error))
+            .map_err(|error| map_program_cache_error(locator, error))?;
+        info!(
+            model = %locator.model_id,
+            requested_revision = %locator.revision,
+            elapsed_ms = start.elapsed().as_millis(),
+            "bound program cache miss"
+        );
+        Ok(cached)
     }
 
     fn denied_error(&self, locator: &WeightsLocator) -> Option<String> {
