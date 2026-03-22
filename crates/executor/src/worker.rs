@@ -1,9 +1,9 @@
 use crate::executor::ExecutorMessage;
 use crate::runner;
 use crate::state::{ExecutionPlan, ExecutionStatus};
-use crate::weights::WeightsBundle;
+use crate::backend::ExecBackend;
 use crate::ExecutorError;
-use catgrad_llm::Program;
+use catgrad_llm::BoundProgram;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,7 +20,7 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub plan: ExecutionPlan,
-    pub bundle: Arc<WeightsBundle>,
+    pub bound_program: Arc<BoundProgram<ExecBackend>>,
     pub stream_batch_size: u32,
 }
 
@@ -92,18 +92,15 @@ impl WorkerThread {
         let ExecuteJob {
             execution_id,
             plan,
-            bundle,
+            bound_program,
             stream_batch_size,
         } = job;
-        let program: Program =
-            serde_json::from_slice(&plan.program).map_err(ExecutorError::InvalidProgram)?;
 
         info!(execution_id = %execution_id, "execute worker running plan");
 
-        runner::run_program_streaming(
-            bundle.as_ref(),
+        runner::run_bound_program_streaming(
+            bound_program.as_ref(),
             &plan,
-            program,
             stream_batch_size,
             |progress, chunk| {
                 let _ = executor_tx.send(ExecutorMessage::Progress {

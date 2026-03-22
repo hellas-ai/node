@@ -1,4 +1,6 @@
 use super::{EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator};
+use crate::backend::ExecBackend;
+use catgrad_llm::BoundProgram;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ enum EntryStatus {
 struct Entry {
     status: EntryStatus,
     bundle: Option<Arc<WeightsBundle>>,
+    programs: HashMap<String, Arc<BoundProgram<ExecBackend>>>,
 }
 
 impl Default for Entry {
@@ -20,6 +23,7 @@ impl Default for Entry {
         Self {
             status: EntryStatus::Queued,
             bundle: None,
+            programs: HashMap::new(),
         }
     }
 }
@@ -102,6 +106,7 @@ impl WeightsState {
         let entry = self.entries.entry(locator.clone()).or_default();
         entry.status = EntryStatus::Ready;
         entry.bundle = Some(bundle);
+        entry.programs.clear();
         if self.active.as_ref() == Some(locator) {
             self.active = None;
         }
@@ -116,10 +121,41 @@ impl WeightsState {
         let entry = self.entries.entry(locator.clone()).or_default();
         entry.status = EntryStatus::Failed(error);
         entry.bundle = None;
+        entry.programs.clear();
         if self.active.as_ref() == Some(locator) {
             self.active = None;
         }
         self.start_next()
+    }
+
+    pub(crate) fn cached_program(
+        &self,
+        locator: &WeightsLocator,
+        program_id: &str,
+    ) -> Result<Option<Arc<BoundProgram<ExecBackend>>>, WeightsError> {
+        let entry = self.entries.get(locator).ok_or(WeightsError::UnknownKey)?;
+        match &entry.status {
+            EntryStatus::Ready => Ok(entry.programs.get(program_id).cloned()),
+            EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
+            EntryStatus::Queued | EntryStatus::Loading => Err(WeightsError::NotReady),
+        }
+    }
+
+    pub(crate) fn cache_program(
+        &mut self,
+        locator: &WeightsLocator,
+        program_id: String,
+        program: Arc<BoundProgram<ExecBackend>>,
+    ) -> Result<Arc<BoundProgram<ExecBackend>>, WeightsError> {
+        let entry = self.entries.get_mut(locator).ok_or(WeightsError::UnknownKey)?;
+        match &entry.status {
+            EntryStatus::Ready => {
+                let cached = entry.programs.entry(program_id).or_insert(program);
+                Ok(cached.clone())
+            }
+            EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
+            EntryStatus::Queued | EntryStatus::Loading => Err(WeightsError::NotReady),
+        }
     }
 
     fn requeue(&mut self, locator: WeightsLocator) {

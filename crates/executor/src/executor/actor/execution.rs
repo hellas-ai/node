@@ -17,17 +17,16 @@ impl Executor {
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         let plan = self.store.get_quote(&quote_id)?.clone();
         let key = plan.weights_key.clone();
-        let bundle = self
+        let bound_program = self
             .weights
-            .bundle(&key)
-            .await
-            .map_err(|error| super::map_weights_error(&key, error))?;
+            .bound_program(&key, &plan.program)
+            .await?;
 
         let execution_id = self.store.create_execution(quote_id.clone())?;
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
             plan,
-            bundle,
+            bound_program,
             stream_batch_size,
         };
 
