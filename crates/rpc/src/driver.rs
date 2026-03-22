@@ -30,21 +30,29 @@ pub struct RemoteExecuteDriver {
 impl RemoteExecuteDriver {
     pub fn new(channel: Channel) -> Self {
         Self {
-            client: configured_execute_client(channel),
+            client: Self::client(channel),
         }
     }
 
-    pub fn from_client(client: ExecuteClient<Channel>) -> Self {
-        Self { client }
+    fn client(channel: Channel) -> ExecuteClient<Channel> {
+        ExecuteClient::new(channel)
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+            .max_encoding_message_size(GRPC_MESSAGE_LIMIT)
     }
-}
 
-pub fn configured_execute_client(channel: Channel) -> ExecuteClient<Channel> {
-    ExecuteClient::new(channel)
-        .send_compressed(CompressionEncoding::Gzip)
-        .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT)
+    async fn subscribe_execution(
+        &mut self,
+        execution_id: String,
+    ) -> Result<ExecuteEventStream, Status> {
+        let stream = self
+            .client
+            .execute_stream(ExecuteStatusRequest { execution_id })
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream))
+    }
 }
 
 #[tonic::async_trait]
@@ -57,14 +65,12 @@ impl ExecuteDriver for RemoteExecuteDriver {
         &mut self,
         request: ExecuteRequest,
     ) -> Result<ExecuteEventStream, Status> {
-        let execution = self.client.execute(request).await?.into_inner();
-        let stream = self
+        let execution_id = self
             .client
-            .execute_stream(ExecuteStatusRequest {
-                execution_id: execution.execution_id,
-            })
+            .execute(request)
             .await?
-            .into_inner();
-        Ok(Box::pin(stream))
+            .into_inner()
+            .execution_id;
+        self.subscribe_execution(execution_id).await
     }
 }

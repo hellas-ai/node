@@ -94,43 +94,11 @@ docker load < result
 docker run --rm -it --device=nvidia.com/gpu=all -p 31145:31145/udp hellas-server-cuda:latest
 ```
 
-Or run directly via flake launchers (loads image, runs as current user, mounts HF cache):
+Build and push a docker image directly from the flake:
 
 ```bash
-HELLAS_DOWNLOAD_POLICY=eager HELLAS_EXECUTE_POLICY=eager nix run .#docker-run-server
-HELLAS_DOWNLOAD_POLICY=eager HELLAS_EXECUTE_POLICY=eager nix run .#docker-run-server-cuda
-```
-
-Useful overrides:
-
-```bash
-HELLAS_DOWNLOAD_POLICY=eager HELLAS_EXECUTE_POLICY=eager nix run .#docker-run-server
-HELLAS_PORT=32145 nix run .#docker-run-server-cuda
-HELLAS_HF_CACHE_DIR=$HOME/.cache/huggingface nix run .#docker-run-server-cuda
-HELLAS_DATA_DIR=$HOME/.local/share/hellas nix run .#docker-run-server-cuda
-HELLAS_LOG=info nix run .#docker-run-server-cuda
-```
-
-The docker launchers inherit the CLI's deny-by-default behavior unless you set
-`HELLAS_DOWNLOAD_POLICY` and `HELLAS_EXECUTE_POLICY`.
-
-The CUDA launcher expects Docker CDI/NVIDIA integration so `--device=nvidia.com/gpu=all` works.
-
-You can also pass a config file:
-
-```bash
-cat > hellas-docker.env <<'EOF'
-HELLAS_CONTAINER_NAME=hellas-server-cuda
-HELLAS_PORT=32145
-HELLAS_HF_CACHE_DIR=$HOME/.cache/huggingface
-HELLAS_DATA_DIR=$HOME/.local/share/hellas
-HELLAS_DOCKER_USER=1000:100
-HELLAS_DOWNLOAD_POLICY=eager
-HELLAS_EXECUTE_POLICY=eager
-HELLAS_LOG=info
-EOF
-
-nix run .#docker-run-server-cuda -- --config ./hellas-docker.env
+nix run .#docker-push -- docker-server ghcr.io/acme/hellas-server:latest
+nix run .#docker-push -- docker-server-cuda-13-1 ghcr.io/acme/hellas-server-cuda:13.1
 ```
 
 ## Dependency hygiene (CI + local)

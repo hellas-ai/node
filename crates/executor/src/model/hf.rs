@@ -26,22 +26,16 @@ pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, Pa
         model.revision.clone(),
     ));
 
-    let config =
-        repo.get("config.json")
-            .map_err(|source| ModelAssetsError::FetchModelMetadata {
-                model_id: model.id.clone(),
-                revision: model.revision.clone(),
-                file: "config.json",
-                source,
-            })?;
-    let tokenizer =
-        repo.get("tokenizer.json")
-            .map_err(|source| ModelAssetsError::FetchModelMetadata {
-                model_id: model.id.clone(),
-                revision: model.revision.clone(),
-                file: "tokenizer.json",
-                source,
-            })?;
+    let fetch = |file: &'static str| {
+        repo.get(file).map_err(|source| ModelAssetsError::FetchModelMetadata {
+            model_id: model.id.clone(),
+            revision: model.revision.clone(),
+            file,
+            source,
+        })
+    };
+    let config = fetch("config.json")?;
+    let tokenizer = fetch("tokenizer.json")?;
 
     Ok((config, tokenizer))
 }

@@ -30,7 +30,7 @@ fn init_backend() -> Result<ExecBackend, BackendInitError> {
     .map_err(|panic| BackendInitError {
         message: format!(
             "failed to initialize executor backend: {}",
-            panic_message(panic)
+            panic_message(&panic)
         ),
     })?;
 
@@ -42,7 +42,7 @@ pub fn create_backend() -> Result<ExecBackend, BackendInitError> {
     EXEC_BACKEND.get_or_init(init_backend).clone()
 }
 
-fn panic_message(panic: Box<dyn Any + Send>) -> String {
+fn panic_message(panic: &(dyn Any + Send)) -> String {
     if let Some(message) = panic.downcast_ref::<&'static str>() {
         (*message).to_string()
     } else if let Some(message) = panic.downcast_ref::<String>() {

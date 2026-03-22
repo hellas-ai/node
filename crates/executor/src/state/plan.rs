@@ -10,8 +10,7 @@ pub struct ExecutionPlan {
     pub graph: Vec<u8>,
     pub model_config_json: Vec<u8>,
     pub weights_key: WeightsLocator,
-    pub input: Vec<u8>,
-    pub prompt_tokens: u32,
+    pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,
     pub stop_token_ids: Vec<i32>,
 }
@@ -27,10 +26,11 @@ impl ExecutionPlan {
 
         let requested_revision = request.huggingface_revision.trim();
         let requested_revision = if requested_revision.is_empty() {
-            DEFAULT_MODEL_REVISION.to_string()
+            DEFAULT_MODEL_REVISION
         } else {
-            requested_revision.to_string()
-        };
+            requested_revision
+        }
+        .to_string();
 
         if request.graph.is_empty() {
             return Err(ExecutorError::InvalidQuoteRequest(
@@ -83,8 +83,7 @@ impl ExecutionPlan {
                     model_id: model_id.to_string(),
                     revision: requested_revision,
                 },
-                input: request.input,
-                prompt_tokens: request.prompt_tokens,
+                input_ids,
                 max_new_tokens,
                 stop_token_ids,
             },

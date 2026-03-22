@@ -8,7 +8,6 @@ use hellas_rpc::pb::hellas::{
 };
 use std::pin::Pin;
 use tokio::sync::oneshot;
-use tonic::Status as TonicStatus;
 use tonic::{Request, Response, Status};
 
 use super::{ExecutorHandle, ExecutorMessage, LocalExecutionStream};
@@ -94,7 +93,7 @@ impl Execute for ExecutorHandle {
     }
 
     type ExecuteStreamStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStreamEvent, TonicStatus>> + Send>>;
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
 
     async fn execute_stream(
         &self,

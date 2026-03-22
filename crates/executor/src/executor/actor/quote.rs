@@ -27,7 +27,7 @@ impl Executor {
 
         let model_id = plan.weights_key.model_id.clone();
         let requested_revision = plan.weights_key.revision.clone();
-        let prompt_tokens = plan.prompt_tokens;
+        let prompt_tokens = plan.input_ids.len();
         let max_new_tokens = plan.max_new_tokens;
         let quote_id = self.store.create_quote(plan);
 

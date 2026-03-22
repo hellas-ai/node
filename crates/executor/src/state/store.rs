@@ -27,6 +27,7 @@ struct ExecutionRecord {
     output: Option<Vec<u8>>,
 }
 
+#[derive(Default)]
 pub struct ExecutorState {
     quotes: HashMap<String, ExecutionPlan>,
     executions: HashMap<String, ExecutionRecord>,
@@ -34,10 +35,7 @@ pub struct ExecutorState {
 
 impl ExecutorState {
     pub fn new() -> Self {
-        Self {
-            quotes: HashMap::new(),
-            executions: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn create_quote(&mut self, plan: ExecutionPlan) -> String {
@@ -132,11 +130,7 @@ impl ExecutorState {
         chunk: &[u8],
         progress: u64,
     ) -> Result<(), StateError> {
-        let execution = self
-            .executions
-            .get_mut(execution_id)
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))?;
-
+        let execution = self.execution_mut(execution_id)?;
         execution.progress = progress;
         if !chunk.is_empty() {
             execution
@@ -144,7 +138,6 @@ impl ExecutorState {
                 .get_or_insert_with(Vec::new)
                 .extend_from_slice(chunk);
         }
-
         Ok(())
     }
 
@@ -158,12 +151,6 @@ impl ExecutorState {
         self.executions
             .get_mut(execution_id)
             .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-}
-
-impl Default for ExecutorState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -197,8 +184,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 revision: "deadbeef".to_string(),
             },
-            input: Vec::new(),
-            prompt_tokens: 0,
+            input_ids: Vec::new(),
             max_new_tokens: DEFAULT_MAX_SEQ,
             stop_token_ids: Vec::new(),
         }
