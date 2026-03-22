@@ -1,25 +1,15 @@
-use crate::backend::create_backend;
 use crate::state::ExecutionPlan;
-use crate::weights::WeightsBundle;
 use crate::ExecutorError;
-use catgrad_llm::{Program, Runtime};
+use crate::backend::ExecBackend;
+use catgrad_llm::BoundProgram;
 use hellas_rpc::encode_token_ids;
 
-pub fn run_program_streaming(
-    bundle: &WeightsBundle,
+pub fn run_bound_program_streaming(
+    bound_program: &BoundProgram<ExecBackend>,
     plan: &ExecutionPlan,
-    program: Program,
     stream_batch_size: u32,
     mut on_progress: impl FnMut(u64, &[u8]),
 ) -> Result<(), ExecutorError> {
-    let backend = create_backend()?;
-    let runtime = Runtime::new(
-        backend,
-        &program,
-        bundle.parameter_values.clone(),
-        bundle.parameter_types.clone(),
-    )?;
-    let bound_program = runtime.bind(program)?;
     let mut session = bound_program.start(bound_program.empty_snapshot())?;
     let mut token_ids = plan.input_ids.clone();
     let mut generated_tokens = 0u64;
