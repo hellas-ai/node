@@ -440,10 +440,11 @@ impl ExecutionRequest {
 #[cfg(all(test, feature = "client"))]
 mod timing_tests {
     use super::*;
-    use hellas_executor::ModelAssets;
+    use hellas_executor::{ExecutorError, ModelAssets};
     use std::env;
     use std::sync::Arc;
     use std::time::Instant;
+    use tokio::time::{Duration, sleep};
 
     fn required_env(name: &str) -> String {
         env::var(name).unwrap_or_else(|_| panic!("set {name} to run this timing test"))
@@ -468,6 +469,28 @@ mod timing_tests {
         let runtime =
             ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)
                 .expect("failed to start local executor");
+        let prepared = assets
+            .prepare_plain_prompt(&prompt)
+            .expect("failed to prepare prompt");
+        let quote_req = assets
+            .build_quote_request(&prepared, max_seq)
+            .expect("failed to build quote request");
+        let executor = runtime
+            .require_local_executor()
+            .expect("missing local executor");
+
+        for attempt in 1..=120 {
+            match executor.quote(quote_req.clone()).await {
+                Ok(_) => {
+                    eprintln!("weights ready after {attempt} quote attempt(s)");
+                    break;
+                }
+                Err(ExecutorError::WeightsNotReady(_)) if attempt < 120 => {
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => panic!("failed to ready local weights: {err}"),
+            }
+        }
 
         for run_idx in 1..=2 {
             let prepared = assets
