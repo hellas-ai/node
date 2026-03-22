@@ -55,14 +55,14 @@ impl Executor {
 
     pub(super) fn handle_status(
         &self,
-        request: ExecuteStatusRequest,
+        request: &ExecuteStatusRequest,
     ) -> Result<ExecuteStatusResponse, ExecutorError> {
         self.status_response(&request.execution_id)
     }
 
     pub(super) fn handle_result(
         &self,
-        request: ExecuteResultRequest,
+        request: &ExecuteResultRequest,
     ) -> Result<ExecuteResultResponse, ExecutorError> {
         let output = self.store.output(&request.execution_id)?;
         Ok(ExecuteResultResponse {
@@ -99,7 +99,7 @@ impl Executor {
             }
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
             Err(EnqueueError::Stopped(_job)) => {
-                self.handle_complete(execution_id, None, ExecutionStatus::Failed);
+                self.handle_complete(&execution_id, None, ExecutionStatus::Failed);
                 Err(StartExecutionError::Closed)
             }
         }
@@ -130,24 +130,24 @@ impl Executor {
 
         if self.pending_executions.len() != original_len {
             info!(%execution_id, "cancelled queued execution without active watchers");
-            self.handle_complete(execution_id.to_string(), None, ExecutionStatus::Failed);
+            self.handle_complete(execution_id, None, ExecutionStatus::Failed);
         }
     }
 
     pub(super) fn handle_complete(
         &mut self,
-        execution_id: String,
+        execution_id: &str,
         output: Option<Vec<u8>>,
         status: ExecutionStatus,
     ) {
         let success = matches!(status, ExecutionStatus::Completed);
         info!(%execution_id, success, "execution finished");
 
-        if let Err(error) = self.store.complete_execution(&execution_id, status, output) {
+        if let Err(error) = self.store.complete_execution(execution_id, status, output) {
             warn!("failed to update completion state for {execution_id}: {error}");
         }
 
-        self.send_status(&execution_id, status);
+        self.send_status(execution_id, status);
     }
 }
 

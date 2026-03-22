@@ -18,7 +18,7 @@ use tonic_iroh_transport::iroh::endpoint::BindError;
 use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::swarm::Locator;
 
-use crate::driver::{configured_execute_client, ExecuteDriver, RemoteExecuteDriver};
+use crate::driver::{ExecuteDriver, RemoteExecuteDriver};
 use crate::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
 
 /// An accepted quote: the gRPC client and the quote response.
@@ -227,7 +227,7 @@ fn build_shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
 }
 
 async fn try_quote(channel: Channel, req: GetQuoteRequest) -> Result<AcceptedQuote, QuoteError> {
-    let mut client = RemoteExecuteDriver::from_client(configured_execute_client(channel));
+    let mut client = RemoteExecuteDriver::new(channel);
     match client.get_quote(req).await {
         Ok(quote) => Ok((client, quote)),
         Err(status) => Err(QuoteError::Declined(status)),
@@ -244,7 +244,7 @@ mod tests {
     }
 
     fn mock_accepted() -> AcceptedQuote {
-        let client = RemoteExecuteDriver::from_client(configured_execute_client(mock_channel()));
+        let client = RemoteExecuteDriver::new(mock_channel());
         let quote = GetQuoteResponse {
             quote_id: "test".into(),
             ..Default::default()

@@ -4,13 +4,13 @@ use std::str::FromStr;
 use super::glob;
 use super::parse_allow_patterns;
 
-/// Controls whether the executor may download model weights from HuggingFace.
+/// Controls whether the executor may download model weights from `HuggingFace`.
 #[derive(Clone, Debug, Default)]
 pub enum DownloadPolicy {
     /// Download any model if not cached (default).
     #[default]
     Eager,
-    /// Download only models whose HuggingFace model ID matches one of the
+    /// Download only models whose `HuggingFace` model ID matches one of the
     /// given glob patterns; deny all others unless already cached locally.
     Allow(Vec<String>),
     /// Never download; only use models already present in the local HF cache.

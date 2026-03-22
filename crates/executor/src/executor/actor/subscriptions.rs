@@ -60,8 +60,8 @@ impl Executor {
         self.send_progress(execution_id, status, progress, Vec::new());
     }
 
-    pub(super) fn handle_subscriptions_closed(&mut self, execution_id: String) {
-        let should_remove = match self.subscriptions.get_mut(&execution_id) {
+    pub(super) fn handle_subscriptions_closed(&mut self, execution_id: &str) {
+        let should_remove = match self.subscriptions.get_mut(execution_id) {
             Some(subscriptions) => {
                 if subscriptions.updates.receiver_count() == 0 {
                     subscriptions.closed_monitor_running = false;
@@ -69,7 +69,7 @@ impl Executor {
                 } else {
                     subscriptions.closed_monitor_running = true;
                     spawn_closed_monitor(
-                        execution_id.clone(),
+                        execution_id.to_string(),
                         subscriptions.updates.clone(),
                         self.notify_tx.clone(),
                     );
@@ -80,13 +80,13 @@ impl Executor {
         };
 
         if should_remove {
-            self.subscriptions.remove(&execution_id);
+            self.subscriptions.remove(execution_id);
 
             if matches!(
-                self.store.status(&execution_id),
+                self.store.status(execution_id),
                 Ok(ExecutionStatus::Pending)
             ) {
-                self.cancel_pending_execution(&execution_id);
+                self.cancel_pending_execution(execution_id);
             }
         }
     }

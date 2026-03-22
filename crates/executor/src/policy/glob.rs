@@ -22,10 +22,8 @@ pub(super) fn matches(pattern: &str, text: &str) -> bool {
         }
     }
 
-    if let Some(last) = parts.last() {
-        if !last.is_empty() {
-            return pos == text.len();
-        }
+    if parts.last().is_some_and(|last| !last.is_empty()) {
+        return pos == text.len();
     }
 
     true

@@ -7,7 +7,7 @@ use super::parse_allow_patterns;
 /// A namespaced pattern for execute policy matching.
 #[derive(Clone, Debug)]
 pub enum ExecutePattern {
-    /// `hf/<glob>` matches on the HuggingFace model ID.
+    /// `hf/<glob>` matches on the `HuggingFace` model ID.
     HuggingFace(String),
     /// `graph/<glob>` matches on the blake3 graph hash.
     Graph(String),

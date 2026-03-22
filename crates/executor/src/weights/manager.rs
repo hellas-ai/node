@@ -72,7 +72,7 @@ impl WeightsManager {
     async fn admit(&self, locator: WeightsLocator, register_waiter: bool) -> EnsureAdmission {
         let denied_error = self.denied_error(&locator);
         let mut state = self.inner.state.lock().await;
-        let action = state.weights.ensure(locator.clone(), denied_error);
+        let action = state.weights.ensure(&locator, denied_error);
         let waiter = if register_waiter
             && matches!(
                 action.disposition,
@@ -96,8 +96,7 @@ impl WeightsManager {
     ) -> Result<(), WeightsError> {
         match timeout(wait_timeout, receiver).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(WeightsError::NotReady),
-            Err(_) => Err(WeightsError::NotReady),
+            _ => Err(WeightsError::NotReady),
         }
     }
 
@@ -170,7 +169,7 @@ impl WeightsManager {
     ) {
         let (waiters, next_load, waiter_result) = {
             let mut state = self.inner.state.lock().await;
-            match load_result {
+            let (next_load, waiter_result) = match load_result {
                 Ok(loaded) => {
                     info!(
                         model = %locator.model_id,
@@ -178,9 +177,7 @@ impl WeightsManager {
                         resolved_revision = %loaded.resolved_revision,
                         "weights ready"
                     );
-                    let next_load = state.weights.finish_ready(&locator, loaded.bundle);
-                    let waiters = state.waiters.remove(&locator).unwrap_or_default();
-                    (waiters, next_load, Ok(()))
+                    (state.weights.finish_ready(&locator, loaded.bundle), Ok(()))
                 }
                 Err(error) => {
                     warn!(
@@ -189,25 +186,25 @@ impl WeightsManager {
                         error = %error,
                         "weights failed"
                     );
-                    let next_load = state.weights.finish_failed(&locator, error.clone());
-                    let waiters = state.waiters.remove(&locator).unwrap_or_default();
-                    (waiters, next_load, Err(WeightsError::Failed(error)))
+                    (
+                        state.weights.finish_failed(&locator, error.clone()),
+                        Err(WeightsError::Failed(error)),
+                    )
                 }
-            }
+            };
+            let waiters = state.waiters.remove(&locator).unwrap_or_default();
+            (waiters, next_load, waiter_result)
         };
 
-        Self::notify_waiters(waiters, waiter_result);
+        Self::notify_waiters(waiters, &waiter_result);
         self.spawn_load_if_needed(next_load);
     }
 
     fn notify_waiters(
         waiters: Vec<oneshot::Sender<Result<(), WeightsError>>>,
-        waiter_result: Result<(), WeightsError>,
+        waiter_result: &Result<(), WeightsError>,
     ) {
         for waiter in waiters {
-            if waiter.is_closed() {
-                continue;
-            }
             let _ = waiter.send(waiter_result.clone());
         }
     }

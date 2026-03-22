@@ -43,14 +43,13 @@ impl ModelAssets {
             }
         })?;
 
-        let chat_template = match get_model_chat_template(&model.id, &model.revision) {
-            Ok(template) => Some(
+        let chat_template = get_model_chat_template(&model.id, &model.revision)
+            .ok()
+            .map(|template| {
                 template
                     .replace("{% generation %}", "")
-                    .replace("{% endgeneration %}", ""),
-            ),
-            Err(_) => None,
-        };
+                    .replace("{% endgeneration %}", "")
+            });
 
         Ok(Self {
             model,
@@ -108,7 +107,7 @@ impl ModelAssets {
         .map_err(|source| ModelAssetsError::PrepareMessages { source })
     }
 
-    pub fn create_detokenizer<'a>(&'a self, stop_token_ids: &[i32]) -> Detokenizer<'a> {
+    pub fn create_detokenizer(&self, stop_token_ids: &[i32]) -> Detokenizer<'_> {
         Detokenizer::from_tokenizer(&self.tokenizer, stop_token_ids)
     }
 

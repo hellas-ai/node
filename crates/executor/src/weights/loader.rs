@@ -31,7 +31,7 @@ pub(crate) fn load_weights_bundle(
         get_model_files(&locator.model_id, &locator.revision)?;
     let resolved_revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
         ExecutorError::WeightsError(format!(
-            "unexpected hf cache path (no snapshots/<sha>): {config_path:?}"
+            "unexpected hf cache path (no snapshots/<sha>): {}", config_path.display()
         ))
     })?;
 
@@ -52,13 +52,9 @@ fn extract_revision_from_snapshot_path(path: &Path) -> Option<String> {
     let mut components = path
         .components()
         .map(|component| component.as_os_str().to_string_lossy());
-    while let Some(component) = components.next() {
-        if component == "snapshots" {
-            let revision = components.next()?.to_string();
-            return (!revision.trim().is_empty()).then_some(revision);
-        }
-    }
-    None
+    components.find(|c| c == "snapshots")?;
+    let revision = components.next()?.to_string();
+    (!revision.trim().is_empty()).then_some(revision)
 }
 
 #[cfg(test)]

@@ -39,10 +39,10 @@ pub(crate) struct WeightsState {
 impl WeightsState {
     pub(crate) fn ensure(
         &mut self,
-        locator: WeightsLocator,
+        locator: &WeightsLocator,
         denied_error: Option<String>,
     ) -> EnsureTransition {
-        let disposition = match self.entries.get(&locator).map(|entry| &entry.status) {
+        let disposition = match self.entries.get(locator).map(|entry| &entry.status) {
             Some(EntryStatus::Ready) => EnsureDisposition::Ready,
             Some(EntryStatus::Failed(_)) => {
                 if let Some(error) = denied_error {
@@ -53,7 +53,7 @@ impl WeightsState {
                 }
             }
             Some(EntryStatus::Queued | EntryStatus::Loading) => {
-                if self.is_pending(&locator) {
+                if self.is_pending(locator) {
                     EnsureDisposition::InFlight
                 } else {
                     self.requeue(locator.clone());
@@ -85,16 +85,12 @@ impl WeightsState {
         &self,
         locator: &WeightsLocator,
     ) -> Result<Arc<WeightsBundle>, WeightsError> {
-        match self
-            .entries
-            .get(locator)
-            .map(|entry| (&entry.status, &entry.bundle))
-        {
-            Some((EntryStatus::Ready, Some(bundle))) => Ok(bundle.clone()),
-            Some((EntryStatus::Ready, None)) => Err(WeightsError::UnknownKey),
-            Some((EntryStatus::Failed(error), _)) => Err(WeightsError::Failed(error.clone())),
-            Some((EntryStatus::Queued | EntryStatus::Loading, _)) => Err(WeightsError::NotReady),
-            None => Err(WeightsError::UnknownKey),
+        let entry = self.entries.get(locator).ok_or(WeightsError::UnknownKey)?;
+        match (&entry.status, &entry.bundle) {
+            (EntryStatus::Ready, Some(bundle)) => Ok(bundle.clone()),
+            (EntryStatus::Ready, None) => Err(WeightsError::UnknownKey),
+            (EntryStatus::Failed(error), _) => Err(WeightsError::Failed(error.clone())),
+            (EntryStatus::Queued | EntryStatus::Loading, _) => Err(WeightsError::NotReady),
         }
     }
 
@@ -186,7 +182,7 @@ mod tests {
     #[test]
     fn ensure_starts_loading_immediately_when_idle() {
         let mut state = WeightsState::default();
-        let action = state.ensure(locator(0), None);
+        let action = state.ensure(&locator(0), None);
         assert_eq!(action.disposition, EnsureDisposition::Queued);
         assert_eq!(action.next_load, Some(locator(0)));
     }
@@ -195,10 +191,10 @@ mod tests {
     fn failed_locator_can_requeue_when_admission_is_allowed() {
         let mut state = WeightsState::default();
         let locator = locator(0);
-        state.ensure(locator.clone(), None);
+        state.ensure(&locator, None);
         state.finish_failed(&locator, "boom".to_string());
 
-        let action = state.ensure(locator.clone(), None);
+        let action = state.ensure(&locator, None);
         assert_eq!(action.disposition, EnsureDisposition::Queued);
         assert_eq!(action.next_load, Some(locator));
     }
@@ -207,10 +203,10 @@ mod tests {
     fn failed_locator_stays_failed_when_admission_is_denied() {
         let mut state = WeightsState::default();
         let locator = locator(0);
-        state.ensure(locator.clone(), None);
+        state.ensure(&locator, None);
         state.finish_failed(&locator, "boom".to_string());
 
-        let action = state.ensure(locator, Some("denied".to_string()));
+        let action = state.ensure(&locator, Some("denied".to_string()));
         assert_eq!(
             action.disposition,
             EnsureDisposition::Failed("denied".to_string())
@@ -222,7 +218,7 @@ mod tests {
     fn ready_bundle_is_returned_after_completion() {
         let mut state = WeightsState::default();
         let locator = locator(0);
-        state.ensure(locator.clone(), None);
+        state.ensure(&locator, None);
         state.finish_ready(&locator, dummy_bundle());
 
         assert!(state.bundle(&locator).is_ok());
@@ -235,7 +231,7 @@ mod tests {
             let locators: Vec<_> = (0..4).map(locator).collect();
 
             for index in sequence {
-                let locator = locators[index as usize].clone();
+                let locator = &locators[index as usize];
                 state.ensure(locator, None);
 
                 for locator in &locators {
