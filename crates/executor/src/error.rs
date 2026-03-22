@@ -19,8 +19,8 @@ pub enum ExecutorError {
     BackendInit(#[from] BackendInitError),
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
-    #[error("invalid catgrad graph: {0}")]
-    InvalidGraph(#[from] serde_json::Error),
+    #[error("invalid catgrad program: {0}")]
+    InvalidProgram(#[from] serde_json::Error),
     #[error("LLM error: {0}")]
     Llm(#[from] LLMError),
     #[error("interpreter error: {0}")]
@@ -49,7 +49,7 @@ impl From<ExecutorError> for Status {
             ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
 
             ExecutorError::InvalidQuoteRequest(_)
-            | ExecutorError::InvalidGraph(_)
+            | ExecutorError::InvalidProgram(_)
             | ExecutorError::InvalidTokenPayload(_) => tonic::Code::InvalidArgument,
 
             ExecutorError::ModelAssets(model_err) => match model_err {

@@ -5,12 +5,12 @@ package hellas;
 message GetQuoteRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
-  bytes model_config_json = 3;
-  bytes graph = 4;
   bytes input = 5;
   uint32 prompt_tokens = 6;
   uint32 max_new_tokens = 7;
   repeated uint32 stop_token_ids = 8;
+  reserved 3, 4;
+  bytes program = 9;
 }
 
 message GetQuoteResponse {

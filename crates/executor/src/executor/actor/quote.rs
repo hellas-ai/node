@@ -12,13 +12,13 @@ impl Executor {
         &mut self,
         request: GetQuoteRequest,
     ) -> Result<GetQuoteResponse, ExecutorError> {
-        let (plan, graph_id) = ExecutionPlan::from_quote_request(request)?;
+        let (plan, program_id) = ExecutionPlan::from_quote_request(request)?;
         if !self
             .execute_policy
-            .allows_execute(&graph_id, Some(plan.weights_key.model_id.as_str()))
+            .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
         {
             return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied graph {graph_id} for model {}",
+                "execute policy denied program {program_id} for model {}",
                 plan.weights_key.model_id
             )));
         }
@@ -33,13 +33,13 @@ impl Executor {
 
         info!(
             %quote_id,
-            %graph_id,
+            %program_id,
             amount = STATIC_QUOTE_AMOUNT,
             model = model_id,
             requested_revision,
             prompt_tokens,
             max_new_tokens,
-            "quoted graph execution"
+            "quoted program execution"
         );
 
         Ok(GetQuoteResponse {

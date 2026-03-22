@@ -6,7 +6,7 @@ use hellas_rpc::pb::hellas::GetQuoteRequest;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::config::{build_graph_bytes, encode_i32_tokens, validate_prefill_prompt_length};
+use super::config::{build_program_bytes, encode_i32_tokens, validate_prefill_prompt_length};
 use super::hf::get_model_metadata_files;
 use super::spec::ModelSpec;
 use super::{ModelAssetsError, Result};
@@ -14,7 +14,6 @@ use super::{ModelAssetsError, Result};
 pub struct ModelAssets {
     model: ModelSpec,
     config: Value,
-    model_config_json: Vec<u8>,
     tokenizer: Tokenizer,
     chat_template: Option<String>,
     stop_token_ids: Vec<i32>,
@@ -24,12 +23,12 @@ impl ModelAssets {
     pub fn load(model_name: &str) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
         let (config_path, tokenizer_path) = get_model_metadata_files(&model)?;
-        let model_config_json =
+        let config_bytes =
             std::fs::read(&config_path).map_err(|source| ModelAssetsError::ReadModelConfig {
                 path: config_path.clone(),
                 source,
             })?;
-        let config: Value = serde_json::from_slice(&model_config_json)
+        let config: Value = serde_json::from_slice(&config_bytes)
             .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
 
         let graph_model = get_model(&config, 1)
@@ -54,7 +53,6 @@ impl ModelAssets {
         Ok(Self {
             model,
             config,
-            model_config_json,
             tokenizer,
             chat_template,
             stop_token_ids,
@@ -68,7 +66,7 @@ impl ModelAssets {
     ) -> Result<GetQuoteRequest> {
         validate_prefill_prompt_length(&self.config, prepared_prompt.input_ids.len())?;
         let max_sequence_length = prepared_prompt.input_ids.len() + max_seq as usize;
-        let graph = build_graph_bytes(&self.config, max_sequence_length)?;
+        let program = build_program_bytes(&self.config, max_sequence_length)?;
         let input_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
             ModelAssetsError::NegativePromptTokenId { token }
         })?;
@@ -79,8 +77,7 @@ impl ModelAssets {
         Ok(GetQuoteRequest {
             huggingface_model_id: self.model.id.clone(),
             huggingface_revision: self.model.revision.clone(),
-            model_config_json: self.model_config_json.clone(),
-            graph,
+            program,
             input: encode_token_ids(&input_ids),
             prompt_tokens: prepared_prompt.input_ids.len() as u32,
             max_new_tokens: max_seq,
