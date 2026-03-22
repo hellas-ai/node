@@ -1,6 +1,4 @@
-use super::{EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator};
-use crate::backend::ExecBackend;
-use catgrad_llm::BoundProgram;
+use super::{CachedProgram, EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -15,7 +13,7 @@ enum EntryStatus {
 struct Entry {
     status: EntryStatus,
     bundle: Option<Arc<WeightsBundle>>,
-    programs: HashMap<String, Arc<BoundProgram<ExecBackend>>>,
+    programs: HashMap<String, Arc<CachedProgram>>,
 }
 
 impl Default for Entry {
@@ -132,7 +130,7 @@ impl WeightsState {
         &self,
         locator: &WeightsLocator,
         program_id: &str,
-    ) -> Result<Option<Arc<BoundProgram<ExecBackend>>>, WeightsError> {
+    ) -> Result<Option<Arc<CachedProgram>>, WeightsError> {
         let entry = self.entries.get(locator).ok_or(WeightsError::UnknownKey)?;
         match &entry.status {
             EntryStatus::Ready => Ok(entry.programs.get(program_id).cloned()),
@@ -145,8 +143,8 @@ impl WeightsState {
         &mut self,
         locator: &WeightsLocator,
         program_id: String,
-        program: Arc<BoundProgram<ExecBackend>>,
-    ) -> Result<Arc<BoundProgram<ExecBackend>>, WeightsError> {
+        program: Arc<CachedProgram>,
+    ) -> Result<Arc<CachedProgram>, WeightsError> {
         let entry = self.entries.get_mut(locator).ok_or(WeightsError::UnknownKey)?;
         match &entry.status {
             EntryStatus::Ready => {

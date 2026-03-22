@@ -1,10 +1,10 @@
 use super::loader::{load_weights_bundle, LoadedWeights};
 use super::state::WeightsState;
-use super::{has_cached_weights, EnsureDisposition, WeightsError, WeightsLocator};
-use crate::backend::{ExecBackend, create_backend};
+use super::{has_cached_weights, CachedProgram, EnsureDisposition, WeightsError, WeightsLocator};
+use crate::backend::create_backend;
 use crate::policy::DownloadPolicy;
 use crate::ExecutorError;
-use catgrad_llm::{BoundProgram, Program, Runtime};
+use catgrad_llm::{Program, Runtime};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -108,7 +108,7 @@ impl WeightsManager {
         &self,
         locator: &WeightsLocator,
         program_json: &[u8],
-    ) -> Result<Arc<BoundProgram<ExecBackend>>, ExecutorError> {
+    ) -> Result<Arc<CachedProgram>, ExecutorError> {
         let start = Instant::now();
         let program: Program =
             serde_json::from_slice(program_json).map_err(ExecutorError::InvalidProgram)?;
@@ -143,7 +143,7 @@ impl WeightsManager {
             bundle.parameter_values.clone(),
             bundle.parameter_types.clone(),
         )?;
-        let bound_program = Arc::new(runtime.bind(program)?);
+        let bound_program = Arc::new(CachedProgram::new(Arc::new(runtime.bind(program)?)));
 
         let mut state = self.inner.state.lock().await;
         let cached = state

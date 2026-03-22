@@ -1,5 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
+use crate::backend::ExecBackend;
+use crate::weights::{CachedProgram, PrefixHash};
+use catgrad_llm::Snapshot;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -9,10 +14,23 @@ use super::{ExecutionPlan, ExecutionStatus};
 pub enum StateError {
     #[error("quote not found: {0}")]
     QuoteNotFound(String),
+    #[error("quote expired: {0}")]
+    QuoteExpired(String),
     #[error("execution not found: {0}")]
     ExecutionNotFound(String),
     #[error("output not available: {0}")]
     OutputNotAvailable(String),
+}
+
+#[derive(Clone)]
+pub struct QuoteRecord {
+    pub plan: ExecutionPlan,
+    pub program: Arc<CachedProgram>,
+    pub start_snapshot: Arc<Snapshot<ExecBackend>>,
+    pub start_prefix_len: usize,
+    pub start_prefix_hash: PrefixHash,
+    pub start_next_token: Option<u32>,
+    pub expires_at: Instant,
 }
 
 pub struct ExecutionSnapshot {
@@ -29,7 +47,7 @@ struct ExecutionRecord {
 
 #[derive(Default)]
 pub struct ExecutorState {
-    quotes: HashMap<String, ExecutionPlan>,
+    quotes: HashMap<String, QuoteRecord>,
     executions: HashMap<String, ExecutionRecord>,
 }
 
@@ -38,23 +56,34 @@ impl ExecutorState {
         Self::default()
     }
 
-    pub fn create_quote(&mut self, plan: ExecutionPlan) -> String {
+    pub fn create_quote(&mut self, quote: QuoteRecord) -> String {
         let quote_id = make_id("quote");
-        self.quotes.insert(quote_id.clone(), plan);
+        self.quotes.insert(quote_id.clone(), quote);
         quote_id
     }
 
-    pub fn get_quote(&self, quote_id: &str) -> Result<&ExecutionPlan, StateError> {
-        self.quotes
+    pub fn get_quote(&self, quote_id: &str, now: Instant) -> Result<&QuoteRecord, StateError> {
+        let quote = self
+            .quotes
             .get(quote_id)
-            .ok_or_else(|| StateError::QuoteNotFound(quote_id.to_string()))
+            .ok_or_else(|| StateError::QuoteNotFound(quote_id.to_string()))?;
+        if quote.expires_at <= now {
+            return Err(StateError::QuoteExpired(quote_id.to_string()));
+        }
+        Ok(quote)
     }
 
-    pub fn create_execution(&mut self, quote_id: String) -> Result<String, StateError> {
-        if !self.quotes.contains_key(&quote_id) {
-            return Err(StateError::QuoteNotFound(quote_id));
-        }
+    pub fn remove_quote(&mut self, quote_id: &str) -> Option<QuoteRecord> {
+        self.quotes.remove(quote_id)
+    }
 
+    pub fn prune_expired_quotes(&mut self, now: Instant) -> usize {
+        let before = self.quotes.len();
+        self.quotes.retain(|_, quote| quote.expires_at > now);
+        before - self.quotes.len()
+    }
+
+    pub fn create_execution(&mut self) -> String {
         let execution_id = make_id("exec");
         self.executions.insert(
             execution_id.clone(),
@@ -64,7 +93,7 @@ impl ExecutorState {
                 output: None,
             },
         );
-        Ok(execution_id)
+        execution_id
     }
 
     pub fn remove_execution(&mut self, execution_id: &str) -> Result<(), StateError> {
@@ -171,23 +200,8 @@ impl ExecutionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::weights::WeightsLocator;
-    use crate::DEFAULT_MAX_SEQ;
     use proptest::collection::vec;
     use proptest::prelude::*;
-
-    fn stub_plan() -> ExecutionPlan {
-        ExecutionPlan {
-            program: Vec::new(),
-            weights_key: WeightsLocator {
-                model_id: "test-model".to_string(),
-                revision: "deadbeef".to_string(),
-            },
-            input_ids: Vec::new(),
-            max_new_tokens: DEFAULT_MAX_SEQ,
-            stop_token_ids: Vec::new(),
-        }
-    }
 
     proptest! {
         #[test]
@@ -195,8 +209,7 @@ mod tests {
             updates in vec((any::<u64>(), vec(any::<u8>(), 0..16)), 0..32)
         ) {
             let mut state = ExecutorState::new();
-            let quote_id = state.create_quote(stub_plan());
-            let execution_id = state.create_execution(quote_id).unwrap();
+            let execution_id = state.create_execution();
 
             let mut expected_output = Vec::new();
             let mut expected_progress = 0;
@@ -216,8 +229,7 @@ mod tests {
     #[test]
     fn snapshot_defaults_missing_output_to_empty() {
         let mut state = ExecutorState::new();
-        let quote_id = state.create_quote(stub_plan());
-        let execution_id = state.create_execution(quote_id).unwrap();
+        let execution_id = state.create_execution();
 
         let snapshot = state.snapshot(&execution_id).unwrap();
         assert_eq!(snapshot.status, ExecutionStatus::Pending);

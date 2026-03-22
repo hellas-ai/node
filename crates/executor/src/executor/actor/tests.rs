@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::policy::{DownloadPolicy, ExecutePolicy};
-use crate::state::{ExecutionPlan, ExecutionStatus, ExecutorState};
-use crate::weights::{WeightsLocator, WeightsManager};
+use crate::state::{ExecutionStatus, ExecutorState};
+use crate::weights::WeightsManager;
 use crate::worker::ExecuteWorker;
 use crate::ExecutorError;
 use crate::DEFAULT_EXECUTION_QUEUE_CAPACITY;
@@ -13,19 +13,6 @@ use tokio_stream::StreamExt;
 
 use super::super::{ExecutorMessage, LocalExecutionStream};
 use super::Executor;
-
-fn stub_execution_plan() -> ExecutionPlan {
-    ExecutionPlan {
-        program: Vec::new(),
-        weights_key: WeightsLocator {
-            model_id: "test-model".to_string(),
-            revision: "deadbeef".to_string(),
-        },
-        input_ids: Vec::new(),
-        max_new_tokens: crate::DEFAULT_MAX_SEQ,
-        stop_token_ids: Vec::new(),
-    }
-}
 
 fn test_executor(
     notify_tx: mpsc::WeakUnboundedSender<ExecutorMessage>,
@@ -124,11 +111,7 @@ async fn output_before_completion_reports_unavailable() {
         rx,
     );
 
-    let quote_id = executor.store.create_quote(stub_execution_plan());
-    let execution_id = executor
-        .store
-        .create_execution(quote_id)
-        .expect("execution should be created");
+    let execution_id = executor.store.create_execution();
 
     let err = executor
         .handle_result(&hellas_rpc::pb::hellas::ExecuteResultRequest {
@@ -146,11 +129,7 @@ async fn subscribe_sends_snapshot_immediately() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let quote_id = executor.store.create_quote(stub_execution_plan());
-    let execution_id = executor
-        .store
-        .create_execution(quote_id)
-        .expect("execution should be created");
+    let execution_id = executor.store.create_execution();
     executor.store.mark_running(&execution_id).unwrap();
 
     let mut updates =
@@ -174,11 +153,7 @@ async fn subscribe_after_completion_receives_buffered_output() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let quote_id = executor.store.create_quote(stub_execution_plan());
-    let execution_id = executor
-        .store
-        .create_execution(quote_id)
-        .expect("execution should be created");
+    let execution_id = executor.store.create_execution();
     let chunk = encode_token_ids(&[42]);
     executor
         .store
@@ -204,11 +179,7 @@ async fn subscribe_midstream_receives_buffered_output_and_future_updates() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let quote_id = executor.store.create_quote(stub_execution_plan());
-    let execution_id = executor
-        .store
-        .create_execution(quote_id)
-        .expect("execution should be created");
+    let execution_id = executor.store.create_execution();
     let first_chunk = encode_token_ids(&[11]);
     executor
         .store
@@ -243,11 +214,7 @@ async fn dropped_last_subscription_closes_stream() {
     let (_tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(notify_tx.downgrade(), rx);
 
-    let quote_id = executor.store.create_quote(stub_execution_plan());
-    let execution_id = executor
-        .store
-        .create_execution(quote_id)
-        .expect("execution should be created");
+    let execution_id = executor.store.create_execution();
 
     let updates = executor
         .handle_subscribe(execution_id.clone())
