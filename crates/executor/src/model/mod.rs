@@ -11,7 +11,6 @@ use thiserror::Error;
 use tokenizers::Error as TokenizerError;
 
 pub use assets::ModelAssets;
-pub(crate) use config::validate_execution_config;
 pub(crate) use spec::DEFAULT_MODEL_REVISION;
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
@@ -73,17 +72,15 @@ pub enum ModelAssetsError {
     NegativePromptTokenId { token: i32 },
     #[error("negative stop token id {token} cannot be encoded")]
     NegativeStopTokenId { token: i32 },
-    #[error("failed to build graph model")]
-    BuildGraphModel {
+    #[error("failed to build program model")]
+    BuildProgramModel {
         #[source]
         source: LLMError,
     },
-    #[error("failed to construct typed graph term")]
-    MissingTypedGraphTerm,
-    #[error("failed to serialize graph")]
-    SerializeGraph {
+    #[error("failed to serialize program")]
+    SerializeProgram {
         #[source]
-        source: serde_json::Error,
+        source: LLMError,
     },
     #[error("failed to decode tokens")]
     DecodeTokens {

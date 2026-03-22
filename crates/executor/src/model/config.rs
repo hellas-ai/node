@@ -1,22 +1,8 @@
 use catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE;
-use catgrad_llm::utils::get_model;
+use catgrad_llm::Program;
 use serde_json::Value;
 
 use super::{ModelAssetsError, Result};
-
-pub(crate) fn validate_execution_config(
-    model_config_json: &[u8],
-    prompt_tokens: usize,
-    max_new_tokens: u32,
-) -> Result<()> {
-    let config: Value = serde_json::from_slice(model_config_json)
-        .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
-    validate_prefill_prompt_length(&config, prompt_tokens)?;
-    let max_sequence_length = prompt_tokens.saturating_add(max_new_tokens as usize);
-    let _ = get_model(&config, max_sequence_length)
-        .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?;
-    Ok(())
-}
 
 pub(super) fn encode_i32_tokens(
     token_ids: &[i32],
@@ -28,13 +14,12 @@ pub(super) fn encode_i32_tokens(
         .collect()
 }
 
-pub(super) fn build_graph_bytes(config: &Value, max_sequence_length: usize) -> Result<Vec<u8>> {
-    let model = get_model(config, max_sequence_length)
-        .map_err(|source| ModelAssetsError::BuildGraphModel { source })?;
-    let typed_term = model
-        .term()
-        .ok_or(ModelAssetsError::MissingTypedGraphTerm)?;
-    serde_json::to_vec(&typed_term).map_err(|source| ModelAssetsError::SerializeGraph { source })
+pub(super) fn build_program_bytes(config: &Value, max_sequence_length: usize) -> Result<Vec<u8>> {
+    let program = Program::text_from_config(config, max_sequence_length)
+        .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
+    program
+        .normalized_json()
+        .map_err(|source| ModelAssetsError::SerializeProgram { source })
 }
 
 pub(super) fn validate_prefill_prompt_length(config: &Value, prompt_tokens: usize) -> Result<()> {

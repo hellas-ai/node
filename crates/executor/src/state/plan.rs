@@ -1,14 +1,14 @@
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::pb::hellas::GetQuoteRequest;
 
-use crate::model::{validate_execution_config, DEFAULT_MODEL_REVISION};
+use crate::model::DEFAULT_MODEL_REVISION;
 use crate::weights::WeightsLocator;
 use crate::{ExecutorError, DEFAULT_MAX_SEQ};
+use catgrad_llm::Program;
 
 #[derive(Clone)]
 pub struct ExecutionPlan {
-    pub graph: Vec<u8>,
-    pub model_config_json: Vec<u8>,
+    pub program: Vec<u8>,
     pub weights_key: WeightsLocator,
     pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,
@@ -32,14 +32,9 @@ impl ExecutionPlan {
         }
         .to_string();
 
-        if request.graph.is_empty() {
+        if request.program.is_empty() {
             return Err(ExecutorError::InvalidQuoteRequest(
-                "missing graph bytes".to_string(),
-            ));
-        }
-        if request.model_config_json.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "missing model_config_json".to_string(),
+                "missing program bytes".to_string(),
             ));
         }
 
@@ -48,7 +43,10 @@ impl ExecutionPlan {
         } else {
             request.max_new_tokens
         };
-        let graph_id = blake3::hash(&request.graph).to_hex().to_string();
+        let program: Program =
+            serde_json::from_slice(&request.program).map_err(ExecutorError::InvalidProgram)?;
+        let program_bytes = program.normalized_json()?;
+        let program_id = blake3::hash(&program_bytes).to_hex().to_string();
 
         let input_ids = decode_token_ids(&request.input)
             .map_err(|error| ExecutorError::InvalidTokenPayload(error.to_string()))?;
@@ -72,13 +70,17 @@ impl ExecutionPlan {
                 input_ids.len()
             )));
         }
-
-        validate_execution_config(&request.model_config_json, input_ids.len(), max_new_tokens)?;
+        let expected_max_sequence_length = input_ids.len().saturating_add(max_new_tokens as usize);
+        if program.max_sequence_length != expected_max_sequence_length {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "program max_sequence_length mismatch: request implies {expected_max_sequence_length}, program declares {}",
+                program.max_sequence_length
+            )));
+        }
 
         Ok((
             Self {
-                graph: request.graph,
-                model_config_json: request.model_config_json,
+                program: program_bytes,
                 weights_key: WeightsLocator {
                     model_id: model_id.to_string(),
                     revision: requested_revision,
@@ -87,7 +89,7 @@ impl ExecutionPlan {
                 max_new_tokens,
                 stop_token_ids,
             },
-            graph_id,
+            program_id,
         ))
     }
 }

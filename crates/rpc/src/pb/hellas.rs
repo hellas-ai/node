@@ -5,10 +5,6 @@ pub struct GetQuoteRequest {
     pub huggingface_model_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub huggingface_revision: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub model_config_json: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "4")]
-    pub graph: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "5")]
     pub input: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint32, tag = "6")]
@@ -17,6 +13,8 @@ pub struct GetQuoteRequest {
     pub max_new_tokens: u32,
     #[prost(uint32, repeated, tag = "8")]
     pub stop_token_ids: ::prost::alloc::vec::Vec<u32>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub program: ::prost::alloc::vec::Vec<u8>,
 }
 impl ::prost::Name for GetQuoteRequest {
     const NAME: &'static str = "GetQuoteRequest";
