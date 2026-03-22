@@ -178,8 +178,7 @@ mod tests {
 
     fn stub_plan() -> ExecutionPlan {
         ExecutionPlan {
-            graph: Vec::new(),
-            model_config_json: b"{}".to_vec(),
+            program: Vec::new(),
             weights_key: WeightsLocator {
                 model_id: "test-model".to_string(),
                 revision: "deadbeef".to_string(),

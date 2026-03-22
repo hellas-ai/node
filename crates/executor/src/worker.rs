@@ -3,7 +3,7 @@ use crate::runner;
 use crate::state::{ExecutionPlan, ExecutionStatus};
 use crate::weights::WeightsBundle;
 use crate::ExecutorError;
-use catgrad::category::lang::TypedTerm;
+use catgrad_llm::Program;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -95,15 +95,15 @@ impl WorkerThread {
             bundle,
             stream_batch_size,
         } = job;
-        let term: TypedTerm =
-            serde_json::from_slice(&plan.graph).map_err(ExecutorError::InvalidGraph)?;
+        let program: Program =
+            serde_json::from_slice(&plan.program).map_err(ExecutorError::InvalidProgram)?;
 
         info!(execution_id = %execution_id, "execute worker running plan");
 
-        runner::run_graph_streaming(
+        runner::run_program_streaming(
             bundle.as_ref(),
             &plan,
-            &term,
+            program,
             stream_batch_size,
             |progress, chunk| {
                 let _ = executor_tx.send(ExecutorMessage::Progress {

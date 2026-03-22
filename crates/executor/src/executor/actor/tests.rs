@@ -16,8 +16,7 @@ use super::Executor;
 
 fn stub_execution_plan() -> ExecutionPlan {
     ExecutionPlan {
-        graph: Vec::new(),
-        model_config_json: b"{}".to_vec(),
+        program: Vec::new(),
         weights_key: WeightsLocator {
             model_id: "test-model".to_string(),
             revision: "deadbeef".to_string(),
@@ -91,8 +90,7 @@ async fn quote_rejects_missing_model_id() {
 
     let err = handle
         .quote(hellas_rpc::pb::hellas::GetQuoteRequest {
-            graph: b"test-graph".to_vec(),
-            model_config_json: b"{}".to_vec(),
+            program: b"test-program".to_vec(),
             ..Default::default()
         })
         .await

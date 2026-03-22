@@ -643,7 +643,6 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/hellas-ai/catgrad?branch=master#5a4c9bc5ddc6c3be142e1cca0d2ecdbfef485b3f"
 dependencies = [
  "candle-core",
  "open-hypergraphs",
@@ -653,7 +652,6 @@ dependencies = [
 [[package]]
 name = "catgrad-legacy"
 version = "0.1.1"
-source = "git+https://github.com/hellas-ai/catgrad?branch=master#5a4c9bc5ddc6c3be142e1cca0d2ecdbfef485b3f"
 dependencies = [
  "gemm 0.18.2",
  "half",
@@ -671,8 +669,8 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/hellas-ai/catgrad?branch=master#5a4c9bc5ddc6c3be142e1cca0d2ecdbfef485b3f"
 dependencies = [
+ "blake3",
  "catgrad",
  "catgrad-legacy",
  "chrono",
