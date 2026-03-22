@@ -19,11 +19,14 @@ pub fn run_cached_program_streaming(
     mut on_progress: impl FnMut(u64, &[u8]),
 ) -> Result<(), ExecutorError> {
     let start = Instant::now();
+    let session_start = Instant::now();
     let mut session = program.bound_program().start(start_snapshot.clone())?;
+    let session_start_ms = session_start.elapsed().as_millis();
     let mut generated_tokens = 0u64;
     let batch_size = usize::try_from(stream_batch_size.max(1)).unwrap_or(usize::MAX);
     let mut pending_batch = Vec::with_capacity(batch_size);
     let prompt_tokens = plan.input_ids.len();
+    let mut prefill_chunks = 0usize;
     let mut next_token = if prompt_tokens == 0 {
         Some(session.step_text(&[])?)
     } else if start_prefix_len == prompt_tokens {
@@ -40,6 +43,7 @@ pub fn run_cached_program_streaming(
             let chunk = &plan.input_ids[cursor..next_boundary];
             let step_start = Instant::now();
             let predicted = session.step_text(chunk)?;
+            prefill_chunks += 1;
             prefix_state.extend_tokens(chunk);
             cursor = next_boundary;
             program.cache_prefix(cursor, prefix_state.hash(), predicted, session.snapshot());
@@ -53,6 +57,16 @@ pub fn run_cached_program_streaming(
                     first_token_total_ms = start.elapsed().as_millis(),
                     "first token ready"
                 );
+                debug!(
+                    prompt_tokens,
+                    cached_prompt_tokens = start_prefix_len,
+                    exact_prefix_hit = false,
+                    session_start_ms,
+                    prefill_chunks,
+                    prefill_input_tokens = prompt_tokens.saturating_sub(start_prefix_len),
+                    first_token_total_ms = start.elapsed().as_millis(),
+                    "execute first-token phases"
+                );
                 next_token = Some(predicted);
             }
         }
@@ -64,6 +78,16 @@ pub fn run_cached_program_streaming(
             first_token_step_ms = 0,
             first_token_total_ms = start.elapsed().as_millis(),
             "first token ready"
+        );
+        debug!(
+            prompt_tokens,
+            cached_prompt_tokens = start_prefix_len,
+            exact_prefix_hit = start_prefix_len == prompt_tokens,
+            session_start_ms,
+            prefill_chunks,
+            prefill_input_tokens = prompt_tokens.saturating_sub(start_prefix_len),
+            first_token_total_ms = start.elapsed().as_millis(),
+            "execute first-token phases"
         );
     }
 
