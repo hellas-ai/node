@@ -64,7 +64,8 @@ impl From<ExecutorError> for Status {
             },
 
             ExecutorError::WeightsNotReady(_)
-            | ExecutorError::State(StateError::OutputNotAvailable(_)) => {
+            | ExecutorError::State(StateError::OutputNotAvailable(_))
+            | ExecutorError::State(StateError::QuoteExpired(_)) => {
                 tonic::Code::FailedPrecondition
             }
 

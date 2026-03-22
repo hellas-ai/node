@@ -2,8 +2,9 @@ use crate::executor::ExecutorMessage;
 use crate::runner;
 use crate::state::{ExecutionPlan, ExecutionStatus};
 use crate::backend::ExecBackend;
+use crate::weights::{CachedProgram, PrefixHash};
 use crate::ExecutorError;
-use catgrad_llm::BoundProgram;
+use catgrad_llm::Snapshot;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,7 +21,11 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub plan: ExecutionPlan,
-    pub bound_program: Arc<BoundProgram<ExecBackend>>,
+    pub program: Arc<CachedProgram>,
+    pub start_snapshot: Arc<Snapshot<ExecBackend>>,
+    pub start_prefix_len: usize,
+    pub start_prefix_hash: PrefixHash,
+    pub start_next_token: Option<u32>,
     pub stream_batch_size: u32,
 }
 
@@ -92,14 +97,22 @@ impl WorkerThread {
         let ExecuteJob {
             execution_id,
             plan,
-            bound_program,
+            program,
+            start_snapshot,
+            start_prefix_len,
+            start_prefix_hash,
+            start_next_token,
             stream_batch_size,
         } = job;
 
         info!(execution_id = %execution_id, "execute worker running plan");
 
-        runner::run_bound_program_streaming(
-            bound_program.as_ref(),
+        runner::run_cached_program_streaming(
+            program.as_ref(),
+            start_snapshot.as_ref(),
+            start_prefix_len,
+            start_prefix_hash,
+            start_next_token,
             &plan,
             stream_batch_size,
             |progress, chunk| {
