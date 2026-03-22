@@ -1,7 +1,10 @@
 use super::loader::{load_weights_bundle, LoadedWeights};
 use super::state::WeightsState;
-use super::{has_cached_weights, EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator};
+use super::{has_cached_weights, EnsureDisposition, WeightsError, WeightsLocator};
+use crate::backend::{ExecBackend, create_backend};
 use crate::policy::DownloadPolicy;
+use crate::ExecutorError;
+use catgrad_llm::{BoundProgram, Program, Runtime};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
@@ -100,12 +103,44 @@ impl WeightsManager {
         }
     }
 
-    pub(crate) async fn bundle(
+    pub(crate) async fn bound_program(
         &self,
         locator: &WeightsLocator,
-    ) -> Result<Arc<WeightsBundle>, WeightsError> {
-        let state = self.inner.state.lock().await;
-        state.weights.bundle(locator)
+        program_json: &[u8],
+    ) -> Result<Arc<BoundProgram<ExecBackend>>, ExecutorError> {
+        let program: Program =
+            serde_json::from_slice(program_json).map_err(ExecutorError::InvalidProgram)?;
+        let program_id = program.id()?;
+
+        let bundle = {
+            let state = self.inner.state.lock().await;
+            if let Some(cached) = state
+                .weights
+                .cached_program(locator, &program_id)
+                .map_err(|error| map_program_cache_error(locator, error))?
+            {
+                return Ok(cached);
+            }
+
+            state
+                .weights
+                .bundle(locator)
+                .map_err(|error| map_program_cache_error(locator, error))?
+        };
+
+        let runtime = Runtime::new(
+            create_backend()?,
+            &program,
+            bundle.parameter_values.clone(),
+            bundle.parameter_types.clone(),
+        )?;
+        let bound_program = Arc::new(runtime.bind(program)?);
+
+        let mut state = self.inner.state.lock().await;
+        state
+            .weights
+            .cache_program(locator, program_id, bound_program)
+            .map_err(|error| map_program_cache_error(locator, error))
     }
 
     fn denied_error(&self, locator: &WeightsLocator) -> Option<String> {
@@ -207,5 +242,14 @@ impl WeightsManager {
         for waiter in waiters {
             let _ = waiter.send(waiter_result.clone());
         }
+    }
+}
+
+fn map_program_cache_error(locator: &WeightsLocator, error: WeightsError) -> ExecutorError {
+    match error {
+        WeightsError::NotReady | WeightsError::UnknownKey => {
+            ExecutorError::WeightsNotReady(locator.to_string())
+        }
+        WeightsError::Failed(message) => ExecutorError::WeightsError(message),
     }
 }

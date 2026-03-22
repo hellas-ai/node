@@ -24,6 +24,10 @@ impl Executor {
         }
 
         self.ensure_quote_weights_ready(&plan).await?;
+        let _ = self
+            .weights
+            .bound_program(&plan.weights_key, &plan.program)
+            .await?;
 
         let model_id = plan.weights_key.model_id.clone();
         let requested_revision = plan.weights_key.revision.clone();
