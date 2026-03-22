@@ -22,8 +22,7 @@ fn stub_execution_plan() -> ExecutionPlan {
             model_id: "test-model".to_string(),
             revision: "deadbeef".to_string(),
         },
-        input: Vec::new(),
-        prompt_tokens: 0,
+        input_ids: Vec::new(),
         max_new_tokens: crate::DEFAULT_MAX_SEQ,
         stop_token_ids: Vec::new(),
     }
@@ -134,7 +133,7 @@ async fn output_before_completion_reports_unavailable() {
         .expect("execution should be created");
 
     let err = executor
-        .handle_result(hellas_rpc::pb::hellas::ExecuteResultRequest {
+        .handle_result(&hellas_rpc::pb::hellas::ExecuteResultRequest {
             execution_id: execution_id.clone(),
         })
         .expect_err("output should not be available yet");
@@ -262,7 +261,7 @@ async fn dropped_last_subscription_closes_stream() {
             execution_id: closed_execution_id,
         }) => {
             assert_eq!(closed_execution_id, execution_id);
-            executor.handle_subscriptions_closed(closed_execution_id.clone());
+            executor.handle_subscriptions_closed(&closed_execution_id);
             assert!(!executor.subscriptions.contains_key(&closed_execution_id));
         }
         _ => panic!("unexpected executor message"),

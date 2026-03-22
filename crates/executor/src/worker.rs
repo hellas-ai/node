@@ -112,9 +112,7 @@ impl WorkerThread {
                     progress,
                 });
             },
-        )?;
-
-        Ok(())
+        )
     }
 
     fn send_completion(

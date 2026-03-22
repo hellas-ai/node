@@ -45,11 +45,13 @@ pub enum ExecutorError {
 
 impl From<ExecutorError> for Status {
     fn from(err: ExecutorError) -> Self {
-        match &err {
-            ExecutorError::ChannelClosed => Status::internal(err.to_string()),
-            ExecutorError::QueueFull { .. } => Status::resource_exhausted(err.to_string()),
-            ExecutorError::InvalidQuoteRequest(_) => Status::invalid_argument(err.to_string()),
-            ExecutorError::BackendInit(_) => Status::internal(err.to_string()),
+        let code = match &err {
+            ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
+
+            ExecutorError::InvalidQuoteRequest(_)
+            | ExecutorError::InvalidGraph(_)
+            | ExecutorError::InvalidTokenPayload(_) => tonic::Code::InvalidArgument,
+
             ExecutorError::ModelAssets(model_err) => match model_err {
                 ModelAssetsError::EmptyModelId
                 | ModelAssetsError::EmptyModelRevision
@@ -57,30 +59,30 @@ impl From<ExecutorError> for Status {
                 | ModelAssetsError::ConstructModelConfig { .. }
                 | ModelAssetsError::NegativePromptTokenId { .. }
                 | ModelAssetsError::NegativeStopTokenId { .. }
-                | ModelAssetsError::PromptTooLong { .. } => {
-                    Status::invalid_argument(err.to_string())
-                }
-                _ => Status::internal(err.to_string()),
+                | ModelAssetsError::PromptTooLong { .. } => tonic::Code::InvalidArgument,
+                _ => tonic::Code::Internal,
             },
-            ExecutorError::InvalidGraph(_) => Status::invalid_argument(err.to_string()),
-            ExecutorError::Llm(_) => Status::internal(err.to_string()),
-            ExecutorError::Interpreter(_) => Status::internal(err.to_string()),
-            ExecutorError::Backend(_) => Status::internal(err.to_string()),
-            ExecutorError::WeightsNotReady(_) => Status::failed_precondition(err.to_string()),
-            ExecutorError::WeightsError(_) => Status::internal(err.to_string()),
-            ExecutorError::PolicyDenied(_) => Status::permission_denied(err.to_string()),
-            ExecutorError::InvalidTokenPayload(_) => Status::invalid_argument(err.to_string()),
-            ExecutorError::NoOutput => Status::internal(err.to_string()),
-            ExecutorError::UnexpectedOutput => Status::internal(err.to_string()),
-            ExecutorError::State(StateError::QuoteNotFound(_)) => {
-                Status::not_found(err.to_string())
+
+            ExecutorError::WeightsNotReady(_)
+            | ExecutorError::State(StateError::OutputNotAvailable(_)) => {
+                tonic::Code::FailedPrecondition
             }
-            ExecutorError::State(StateError::ExecutionNotFound(_)) => {
-                Status::not_found(err.to_string())
-            }
-            ExecutorError::State(StateError::OutputNotAvailable(_)) => {
-                Status::failed_precondition(err.to_string())
-            }
-        }
+
+            ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
+
+            ExecutorError::State(
+                StateError::QuoteNotFound(_) | StateError::ExecutionNotFound(_),
+            ) => tonic::Code::NotFound,
+
+            ExecutorError::ChannelClosed
+            | ExecutorError::BackendInit(_)
+            | ExecutorError::Llm(_)
+            | ExecutorError::Interpreter(_)
+            | ExecutorError::Backend(_)
+            | ExecutorError::WeightsError(_)
+            | ExecutorError::NoOutput
+            | ExecutorError::UnexpectedOutput => tonic::Code::Internal,
+        };
+        Status::new(code, err.to_string())
     }
 }

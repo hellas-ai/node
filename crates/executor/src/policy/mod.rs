@@ -7,11 +7,11 @@ pub use execute::{ExecutePattern, ExecutePolicy};
 
 fn parse_allow_patterns(policy: &str) -> Result<Vec<String>, String> {
     let trimmed = policy.trim();
-    if !trimmed.starts_with("allow(") || !trimmed.ends_with(')') {
-        return Err(format!("expected 'allow(pattern,...)' but got '{trimmed}'"));
-    }
+    let inner = trimmed
+        .strip_prefix("allow(")
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| format!("expected 'allow(pattern,...)' but got '{trimmed}'"))?;
 
-    let inner = &trimmed["allow(".len()..trimmed.len() - 1];
     let patterns: Vec<String> = inner
         .split(',')
         .map(|pattern| pattern.trim().to_string())

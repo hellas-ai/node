@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::Stream;
-use tonic::{Status, Status as TonicStatus};
+use tonic::Status;
 
 use super::ExecutorMessage;
 
@@ -57,7 +57,7 @@ impl LocalExecutionStream {
 }
 
 impl Stream for LocalExecutionStream {
-    type Item = Result<ExecuteStreamEvent, TonicStatus>;
+    type Item = Result<ExecuteStreamEvent, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(initial) = self.initial.take() {

@@ -68,10 +68,10 @@ impl Executor {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
                 ExecutorMessage::Status { request, reply } => {
-                    let _ = reply.send(self.handle_status(request));
+                    let _ = reply.send(self.handle_status(&request));
                 }
                 ExecutorMessage::Result { request, reply } => {
-                    let _ = reply.send(self.handle_result(request));
+                    let _ = reply.send(self.handle_result(&request));
                 }
                 ExecutorMessage::Progress {
                     execution_id,
@@ -93,11 +93,11 @@ impl Executor {
                     output,
                     status,
                 } => {
-                    self.handle_complete(execution_id, output, status);
+                    self.handle_complete(&execution_id, output, status);
                     self.dispatch_next_execution();
                 }
                 ExecutorMessage::SubscriptionsClosed { execution_id } => {
-                    self.handle_subscriptions_closed(execution_id);
+                    self.handle_subscriptions_closed(&execution_id);
                 }
             }
         }
@@ -110,8 +110,7 @@ fn weights_not_ready_error(locator: &WeightsLocator) -> ExecutorError {
 
 fn map_weights_error(locator: &WeightsLocator, error: WeightsError) -> ExecutorError {
     match error {
-        WeightsError::NotReady => weights_not_ready_error(locator),
+        WeightsError::NotReady | WeightsError::UnknownKey => weights_not_ready_error(locator),
         WeightsError::Failed(message) => ExecutorError::WeightsError(message),
-        other => ExecutorError::WeightsError(other.to_string()),
     }
 }
