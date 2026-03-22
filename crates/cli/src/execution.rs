@@ -436,3 +436,68 @@ impl ExecutionRequest {
         Ok(Some(status))
     }
 }
+
+#[cfg(all(test, feature = "client"))]
+mod timing_tests {
+    use super::*;
+    use hellas_executor::ModelAssets;
+    use std::env;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn required_env(name: &str) -> String {
+        env::var(name).unwrap_or_else(|_| panic!("set {name} to run this timing test"))
+    }
+
+    fn optional_env_u32(name: &str, default: u32) -> u32 {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
+    #[tokio::test]
+    #[ignore = "manual local timing harness"]
+    async fn local_two_job_timing() {
+        let model = required_env("HELLAS_TIMING_MODEL");
+        let prompt = env::var("HELLAS_TIMING_PROMPT")
+            .unwrap_or_else(|_| "tell me a story about a boy named billy".to_string());
+        let max_seq = optional_env_u32("HELLAS_TIMING_MAX_SEQ", 128);
+
+        let assets = Arc::new(ModelAssets::load(&model).expect("failed to load model assets"));
+        let runtime =
+            ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)
+                .expect("failed to start local executor");
+
+        for run_idx in 1..=2 {
+            let prepared = assets
+                .prepare_plain_prompt(&prompt)
+                .expect("failed to prepare prompt");
+            let request = ExecutionRequest::new(
+                runtime.clone(),
+                assets.clone(),
+                prepared,
+                max_seq,
+                ExecutionStrategy::Run(ExecutionRoute::Local),
+            )
+            .expect("failed to build execution request");
+
+            let start = Instant::now();
+            let mut first_output_ms = None;
+            let mut sink = |output: &[u8]| -> anyhow::Result<()> {
+                if first_output_ms.is_none() && !output.is_empty() {
+                    first_output_ms = Some(start.elapsed().as_millis());
+                }
+                Ok(())
+            };
+
+            let result = request.run(&mut sink).await.expect("execution failed");
+            eprintln!(
+                "run={run_idx} first_output_ms={} total_ms={} completion_tokens={}",
+                first_output_ms.unwrap_or(0),
+                start.elapsed().as_millis(),
+                result.completion_tokens,
+            );
+        }
+    }
+}
