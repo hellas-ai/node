@@ -7,6 +7,7 @@ use crate::ExecutorError;
 use catgrad_llm::Snapshot;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
 pub(crate) struct ExecuteWorker {
@@ -27,6 +28,7 @@ pub(crate) struct ExecuteJob {
     pub start_prefix_hash: PrefixHash,
     pub start_next_token: Option<u32>,
     pub stream_batch_size: u32,
+    pub accepted_at: Instant,
 }
 
 struct WorkerThread {
@@ -103,9 +105,17 @@ impl WorkerThread {
             start_prefix_hash,
             start_next_token,
             stream_batch_size,
+            accepted_at,
         } = job;
 
         info!(execution_id = %execution_id, "execute worker running plan");
+        debug!(
+            execution_id = %execution_id,
+            queue_wait_ms = accepted_at.elapsed().as_millis(),
+            prompt_tokens = plan.input_ids.len(),
+            cached_prompt_tokens = start_prefix_len,
+            "execute worker starting"
+        );
 
         runner::run_cached_program_streaming(
             program.as_ref(),

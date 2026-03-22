@@ -11,6 +11,7 @@ use hellas_rpc::pb::hellas::{
 use hellas_rpc::service::ExecuteService;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::Duration;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{DhtBackend, Locator, MdnsBackend, ServiceRegistry};
@@ -183,10 +184,17 @@ impl ExecutionRequest {
     where
         D: ExecuteDriver + 'static,
     {
+        let start = Instant::now();
         let quote = driver
             .get_quote(self.quote_req.clone())
             .await
             .with_context(context)?;
+        debug!(
+            quote_id = %quote.quote_id,
+            ttl_ms = quote.ttl_ms,
+            quote_rpc_ms = start.elapsed().as_millis(),
+            "quote rpc completed"
+        );
         Ok(QuotedDriver::new(endpoint, quote.quote_id, driver))
     }
 
@@ -315,6 +323,8 @@ impl ExecutionRequest {
         mut quoted: QuotedDriver,
         sink: &mut OutputSink<'_>,
     ) -> anyhow::Result<ExecutionOutput> {
+        let start = Instant::now();
+        let stream_start = Instant::now();
         let mut stream = quoted
             .driver
             .execute_streaming(ExecuteRequest {
@@ -323,22 +333,43 @@ impl ExecutionRequest {
             })
             .await
             .context("failed to start execution stream")?;
+        let stream_open_ms = stream_start.elapsed().as_millis();
         let mut output = Vec::new();
         let mut completion_tokens = 0u32;
+        let mut first_event_logged = false;
+        let mut first_output_logged = false;
 
         while let Some(event) = stream.next().await {
-            if let Some(status) = self.consume_stream_event(
-                event.context("execution stream failed")?,
-                &mut output,
-                &mut completion_tokens,
-                sink,
-            )? {
+            let event = event.context("execution stream failed")?;
+            if !first_event_logged {
+                debug!(
+                    quote_id = %quoted.quote_id,
+                    stream_open_ms,
+                    first_event_ms = start.elapsed().as_millis(),
+                    "execute stream first event"
+                );
+                first_event_logged = true;
+            }
+
+            let had_output = output.len();
+            if let Some(status) =
+                self.consume_stream_event(event, &mut output, &mut completion_tokens, sink)?
+            {
                 if status == ExecutionStatus::Failed {
                     anyhow::bail!("execution failed");
                 }
                 if status == ExecutionStatus::Completed {
                     break;
                 }
+            }
+            if !first_output_logged && output.len() > had_output {
+                debug!(
+                    quote_id = %quoted.quote_id,
+                    stream_open_ms,
+                    first_output_ms = start.elapsed().as_millis(),
+                    "execute stream first output"
+                );
+                first_output_logged = true;
             }
         }
 

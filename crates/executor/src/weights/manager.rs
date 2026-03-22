@@ -110,10 +110,13 @@ impl WeightsManager {
         program_json: &[u8],
     ) -> Result<Arc<CachedProgram>, ExecutorError> {
         let start = Instant::now();
+        let parse_start = Instant::now();
         let program: Program =
             serde_json::from_slice(program_json).map_err(ExecutorError::InvalidProgram)?;
         let program_id = program.id()?;
+        let parse_program_ms = parse_start.elapsed().as_millis();
 
+        let lookup_start = Instant::now();
         let bundle = {
             let state = self.inner.state.lock().await;
             if let Some(cached) = state
@@ -125,6 +128,8 @@ impl WeightsManager {
                     model = %locator.model_id,
                     requested_revision = %locator.revision,
                     %program_id,
+                    parse_program_ms,
+                    cache_lookup_ms = lookup_start.elapsed().as_millis(),
                     elapsed_ms = start.elapsed().as_millis(),
                     "bound program cache hit"
                 );
@@ -136,7 +141,9 @@ impl WeightsManager {
                 .bundle(locator)
                 .map_err(|error| map_program_cache_error(locator, error))?
         };
+        let cache_lookup_ms = lookup_start.elapsed().as_millis();
 
+        let bind_start = Instant::now();
         let runtime = Runtime::new(
             create_backend()?,
             &program,
@@ -144,12 +151,22 @@ impl WeightsManager {
             bundle.parameter_types.clone(),
         )?;
         let bound_program = Arc::new(CachedProgram::new(Arc::new(runtime.bind(program)?)));
+        let runtime_bind_ms = bind_start.elapsed().as_millis();
 
         let mut state = self.inner.state.lock().await;
         let cached = state
             .weights
             .cache_program(locator, program_id, bound_program)
             .map_err(|error| map_program_cache_error(locator, error))?;
+        debug!(
+            model = %locator.model_id,
+            requested_revision = %locator.revision,
+            parse_program_ms,
+            cache_lookup_ms,
+            runtime_bind_ms,
+            total_ms = start.elapsed().as_millis(),
+            "bound program phase timings"
+        );
         info!(
             model = %locator.model_id,
             requested_revision = %locator.revision,
