@@ -15,8 +15,11 @@ impl Executor {
         &mut self,
         request: GetQuoteRequest,
     ) -> Result<GetQuoteResponse, ExecutorError> {
+        let total_start = Instant::now();
         self.store.prune_expired_quotes(Instant::now());
+        let plan_start = Instant::now();
         let (plan, program_id) = ExecutionPlan::from_quote_request(request)?;
+        let plan_parse_ms = plan_start.elapsed().as_millis();
         if !self
             .execute_policy
             .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
@@ -27,12 +30,18 @@ impl Executor {
             )));
         }
 
+        let ensure_start = Instant::now();
         self.ensure_quote_weights_ready(&plan).await?;
+        let ensure_weights_ms = ensure_start.elapsed().as_millis();
+        let bind_start = Instant::now();
         let program = self
             .weights
             .bound_program(&plan.weights_key, &plan.program)
             .await?;
+        let bind_program_ms = bind_start.elapsed().as_millis();
+        let prefix_start = Instant::now();
         let prefix_match = program.lookup_prefix(&plan.input_ids);
+        let prefix_lookup_ms = prefix_start.elapsed().as_millis();
         let (start_snapshot, start_prefix_len, start_prefix_hash, start_next_token) =
             match prefix_match {
                 Some(prefix_match) => (
@@ -74,6 +83,18 @@ impl Executor {
             cached_prompt_tokens,
             max_new_tokens,
             "quoted program execution"
+        );
+        debug!(
+            %quote_id,
+            %program_id,
+            prompt_tokens,
+            cached_prompt_tokens,
+            plan_parse_ms,
+            ensure_weights_ms,
+            bind_program_ms,
+            prefix_lookup_ms,
+            total_ms = total_start.elapsed().as_millis(),
+            "quote phase timings"
         );
 
         Ok(GetQuoteResponse {

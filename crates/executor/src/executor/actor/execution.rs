@@ -28,6 +28,7 @@ impl Executor {
             start_prefix_hash: quote.start_prefix_hash,
             start_next_token: quote.start_next_token,
             stream_batch_size,
+            accepted_at: Instant::now(),
         };
 
         let queued = match self.accept_execution(job) {
