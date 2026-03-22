@@ -5,6 +5,7 @@ use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse,
 };
+use std::time::Instant;
 
 use super::Executor;
 
@@ -15,18 +16,17 @@ impl Executor {
     ) -> Result<ExecuteResponse, ExecutorError> {
         let quote_id = request.quote_id;
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
-        let plan = self.store.get_quote(&quote_id)?.clone();
-        let key = plan.weights_key.clone();
-        let bound_program = self
-            .weights
-            .bound_program(&key, &plan.program)
-            .await?;
-
-        let execution_id = self.store.create_execution(quote_id.clone())?;
+        self.store.prune_expired_quotes(Instant::now());
+        let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
+        let execution_id = self.store.create_execution();
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
-            plan,
-            bound_program,
+            plan: quote.plan.clone(),
+            program: quote.program.clone(),
+            start_snapshot: quote.start_snapshot.clone(),
+            start_prefix_len: quote.start_prefix_len,
+            start_prefix_hash: quote.start_prefix_hash,
+            start_next_token: quote.start_next_token,
             stream_batch_size,
         };
 
@@ -37,6 +37,7 @@ impl Executor {
                 return Err(error);
             }
         };
+        let _ = self.store.remove_quote(&quote_id);
 
         info!(
             %execution_id,

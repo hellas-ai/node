@@ -32,6 +32,8 @@ pub struct GetQuoteResponse {
     pub quote_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub amount: u64,
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
 }
 impl ::prost::Name for GetQuoteResponse {
     const NAME: &'static str = "GetQuoteResponse";
