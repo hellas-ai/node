@@ -12,7 +12,6 @@ pub struct ExecuteOptions {
     pub prompt: String,
     pub max_seq: u32,
     pub retries: usize,
-    pub backup_quotes: usize,
     pub local: bool,
     pub verify_local: bool,
 }
@@ -37,7 +36,6 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
                 primary: ExecutionRoute::remote(
                     options.node_id,
                     options.retries,
-                    options.backup_quotes,
                 ),
                 shadow: ExecutionRoute::Local,
             }
@@ -48,7 +46,6 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
             ExecutionStrategy::Run(ExecutionRoute::remote(
                 options.node_id,
                 options.retries,
-                options.backup_quotes,
             ))
         },
     )?;

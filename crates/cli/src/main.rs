@@ -116,9 +116,6 @@ enum Commands {
         /// Max execution retries on failure (discovery path only)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
-        /// Number of accepted backup quotes to pre-fetch
-        #[arg(long = "backup-quotes", default_value_t = 2)]
-        backup_quotes: usize,
         /// Run locally with the catgrad backend instead of the Hellas network
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id"])]
         local: bool,
@@ -301,7 +298,6 @@ async fn main() {
             prompt,
             max_seq,
             retries,
-            backup_quotes,
             local,
             verify_local,
         } => {
@@ -311,7 +307,6 @@ async fn main() {
                 prompt,
                 max_seq,
                 retries,
-                backup_quotes,
                 local,
                 verify_local,
             })

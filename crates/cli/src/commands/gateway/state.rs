@@ -92,7 +92,7 @@ impl GatewayState {
         if self.local {
             ExecutionRoute::Local
         } else {
-            ExecutionRoute::remote(self.node_id, self.retries, 0)
+            ExecutionRoute::remote(self.node_id, self.retries)
         }
     }
 
