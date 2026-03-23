@@ -1,4 +1,4 @@
-use super::{json_error, GatewayOptions};
+use super::{GatewayOptions, json_error};
 use crate::execution::{
     ExecutionOutput, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy,
 };
@@ -6,14 +6,14 @@ use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use catgrad_llm::types::{self, anthropic, openai, plain};
 use catgrad_llm::PreparedPrompt;
+use catgrad_llm::types::{self, anthropic, openai, plain};
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::EndpointId;
 
 const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -22,6 +22,8 @@ const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 pub(super) struct GatewayState {
     pub(super) node_id: Option<EndpointId>,
     pub(super) local: bool,
+    pub(super) verify_local: bool,
+    pub(super) verify_node_id: Option<EndpointId>,
     pub(super) retries: usize,
     default_max_tokens: u32,
     pub(super) force_model: Option<String>,
@@ -52,7 +54,7 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
-        let runtime = if options.local {
+        let runtime = if options.local || options.verify_local {
             ExecutionRuntime::with_local_executor(
                 Executor::spawn(
                     DownloadPolicy::Eager,
@@ -68,6 +70,8 @@ impl GatewayState {
         Ok(Self {
             node_id: options.node_id,
             local: options.local,
+            verify_local: options.verify_local,
+            verify_node_id: options.verify,
             retries: options.retries,
             default_max_tokens: options.default_max_tokens,
             force_model: options.force_model.clone(),
@@ -90,6 +94,25 @@ impl GatewayState {
         } else {
             ExecutionRoute::remote(self.node_id, self.retries, 0)
         }
+    }
+
+    fn execution_strategy(&self) -> ExecutionStrategy {
+        let primary = self.execution_route();
+        if self.verify_local {
+            return ExecutionStrategy::Verify {
+                primary,
+                shadow: ExecutionRoute::Local,
+            };
+        }
+
+        if let Some(node_id) = self.verify_node_id.clone() {
+            return ExecutionStrategy::Verify {
+                primary,
+                shadow: ExecutionRoute::RemoteDirect(node_id),
+            };
+        }
+
+        ExecutionStrategy::Run(primary)
     }
 
     async fn model_assets(&self, model: &str) -> anyhow::Result<Arc<ModelAssets>> {
@@ -154,7 +177,7 @@ impl GatewayState {
             assets.clone(),
             prepared_prompt,
             max_tokens,
-            ExecutionStrategy::Run(self.execution_route()),
+            self.execution_strategy(),
         )
         .map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -287,5 +310,75 @@ impl IntoResponse for GenerationError {
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         json_error(self.status, self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn endpoint(byte: u8) -> EndpointId {
+        match byte {
+            1 => EndpointId::from_str(
+                "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+            )
+            .expect("valid endpoint id"),
+            2 => EndpointId::from_str(
+                "edfadcefb3917925de1111087f11925542c97e14ab00cf42b9447f7567a25b62",
+            )
+            .expect("valid endpoint id"),
+            _ => panic!("unknown test endpoint"),
+        }
+    }
+
+    fn state(local: bool, verify_local: bool, verify_node_id: Option<EndpointId>) -> GatewayState {
+        GatewayState {
+            node_id: Some(endpoint(1)),
+            local,
+            verify_local,
+            verify_node_id,
+            retries: 2,
+            default_max_tokens: 128,
+            force_model: None,
+            inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
+            runtime: ExecutionRuntime::default(),
+            model_cache: Arc::default(),
+            model_load_locks: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn execution_strategy_uses_local_shadow_for_verify_local() {
+        let state = state(false, true, None);
+        assert_eq!(
+            state.execution_strategy(),
+            ExecutionStrategy::Verify {
+                primary: ExecutionRoute::RemoteDirect(endpoint(1)),
+                shadow: ExecutionRoute::Local,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_strategy_uses_remote_shadow_for_verify_node() {
+        let verify_node = endpoint(2);
+        let state = state(false, false, Some(verify_node));
+        assert_eq!(
+            state.execution_strategy(),
+            ExecutionStrategy::Verify {
+                primary: ExecutionRoute::RemoteDirect(endpoint(1)),
+                shadow: ExecutionRoute::RemoteDirect(endpoint(2)),
+            }
+        );
+    }
+
+    #[test]
+    fn execution_strategy_uses_local_run_when_local_is_enabled() {
+        let state = state(true, false, None);
+        assert_eq!(
+            state.execution_strategy(),
+            ExecutionStrategy::Run(ExecutionRoute::Local)
+        );
     }
 }

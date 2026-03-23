@@ -1,4 +1,5 @@
 use crate::backend::ExecBackend;
+use crate::model::ModelSpec;
 use catgrad::interpreter;
 use catgrad::typecheck;
 use thiserror::Error;
@@ -12,6 +13,15 @@ pub struct WeightsLocator {
 impl std::fmt::Display for WeightsLocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.model_id, self.revision)
+    }
+}
+
+impl From<ModelSpec> for WeightsLocator {
+    fn from(spec: ModelSpec) -> Self {
+        Self {
+            model_id: spec.id,
+            revision: spec.revision,
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use catgrad::interpreter::backend::candle::CandleBackend;
 use std::any::Any;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use thiserror::Error;
 use tracing::info;

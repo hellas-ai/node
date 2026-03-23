@@ -5,12 +5,12 @@ mod subscriptions;
 #[cfg(test)]
 mod tests;
 
+use crate::ExecutorError;
 use crate::backend;
 use crate::policy::{DownloadPolicy, ExecutePolicy};
 use crate::state::{ExecutionStatus, ExecutorState};
-use crate::weights::{WeightsError, WeightsLocator, WeightsManager};
+use crate::weights::{RuntimeManager, WeightsError, WeightsLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
-use crate::ExecutorError;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
@@ -24,7 +24,7 @@ pub struct Executor {
     pub(super) subscriptions: HashMap<String, SubscriptionSet>,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
-    pub(super) weights: WeightsManager,
+    pub(super) runtime_manager: RuntimeManager,
     pub(super) worker: ExecuteWorker,
     pub(super) execute_policy: ExecutePolicy,
 }
@@ -44,7 +44,7 @@ impl Executor {
             subscriptions: HashMap::new(),
             pending_executions: VecDeque::new(),
             queue_capacity,
-            weights: WeightsManager::new(download_policy),
+            runtime_manager: RuntimeManager::new(download_policy),
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
         };
@@ -57,6 +57,9 @@ impl Executor {
             match message {
                 ExecutorMessage::Quote { request, reply } => {
                     let _ = reply.send(self.handle_quote(request).await);
+                }
+                ExecutorMessage::Preload { model, reply } => {
+                    let _ = reply.send(self.handle_preload(model).await);
                 }
                 ExecutorMessage::Subscribe {
                     execution_id,

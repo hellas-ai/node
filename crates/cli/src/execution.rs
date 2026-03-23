@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ExecutorHandle, ModelAssets};
@@ -6,22 +6,22 @@ use hellas_rpc::decode_token_ids;
 use hellas_rpc::discovery::{DiscoveryEndpoint, QuoteError, QuoteStream};
 use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
 use hellas_rpc::pb::hellas::{
-    execute_stream_event, ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest,
+    ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest, execute_stream_event,
 };
 use hellas_rpc::service::ExecuteService;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::Duration;
+use tonic_iroh_transport::IrohConnect;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{DhtBackend, Locator, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::IrohConnect;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionRoute {
     Local,
     RemoteDirect(EndpointId),
@@ -43,7 +43,7 @@ impl ExecutionRoute {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStrategy {
     Run(ExecutionRoute),
     Verify {
@@ -488,7 +488,7 @@ mod timing_tests {
             .unwrap_or(default)
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     #[ignore = "manual local timing harness"]
     async fn local_two_job_timing() {
         let model = required_env("HELLAS_TIMING_MODEL");
@@ -497,9 +497,10 @@ mod timing_tests {
         let max_seq = optional_env_u32("HELLAS_TIMING_MAX_SEQ", 128);
 
         let assets = Arc::new(ModelAssets::load(&model).expect("failed to load model assets"));
-        let runtime =
-            ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)
-                .expect("failed to start local executor");
+        let runtime = ExecutionRuntime::spawn_default_local(
+            hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+        )
+        .expect("failed to start local executor");
         let prepared = assets
             .prepare_plain_prompt(&prompt)
             .expect("failed to prepare prompt");

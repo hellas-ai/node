@@ -2,7 +2,7 @@ use crate::state::ExecutionStatus;
 use hellas_rpc::pb::hellas::{ExecuteProgress, ExecuteSnapshot, ExecuteStatusResponse};
 
 use super::super::stream::SubscriptionSet;
-use super::super::{spawn_closed_monitor, LocalExecutionStream};
+use super::super::{LocalExecutionStream, spawn_closed_monitor};
 use super::Executor;
 
 impl Executor {

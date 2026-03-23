@@ -53,3 +53,4 @@ hellas-executor = { workspace = true, optional = true, features = ["candle-metal
 # dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]
 # hellas-rpc = { workspace = true, features = ["compile"] }
+test-log = { version = "0.2", default-features = false, features = ["trace"] }

@@ -1,12 +1,12 @@
+use crate::ExecutorError;
+use crate::backend::ExecBackend;
 use crate::executor::ExecutorMessage;
 use crate::runner;
-use crate::state::{ExecutionPlan, ExecutionStatus};
-use crate::backend::ExecBackend;
+use crate::state::{ExecutionStatus, Invocation};
 use crate::weights::{CachedProgram, PrefixHash};
-use crate::ExecutorError;
 use catgrad_llm::Snapshot;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -21,7 +21,7 @@ pub(crate) enum EnqueueError {
 
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
-    pub plan: ExecutionPlan,
+    pub invocation: Invocation,
     pub program: Arc<CachedProgram>,
     pub start_snapshot: Arc<Snapshot<ExecBackend>>,
     pub start_prefix_len: usize,
@@ -98,7 +98,7 @@ impl WorkerThread {
     ) -> Result<(), ExecutorError> {
         let ExecuteJob {
             execution_id,
-            plan,
+            invocation,
             program,
             start_snapshot,
             start_prefix_len,
@@ -112,7 +112,7 @@ impl WorkerThread {
         debug!(
             execution_id = %execution_id,
             queue_wait_ms = accepted_at.elapsed().as_millis(),
-            prompt_tokens = plan.input_ids.len(),
+            prompt_tokens = invocation.input_ids.len(),
             cached_prompt_tokens = start_prefix_len,
             "execute worker starting"
         );
@@ -123,7 +123,7 @@ impl WorkerThread {
             start_prefix_len,
             start_prefix_hash,
             start_next_token,
-            &plan,
+            &invocation,
             stream_batch_size,
             |progress, chunk| {
                 let _ = executor_tx.send(ExecutorMessage::Progress {

@@ -48,7 +48,7 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>, TokenBytesError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_token_ids, encode_token_ids, TokenBytesError};
+    use super::{TokenBytesError, decode_token_ids, encode_token_ids};
 
     #[test]
     fn token_ids_round_trip_through_bytes() {
