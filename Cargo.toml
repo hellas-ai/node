@@ -45,7 +45,3 @@ serde_json = "1"
 
 # [patch.crates-io]
 # tonic-iroh-transport = { path = "../tonic-iroh-transport" }
-
-# [patch."https://github.com/georgewhewell/catgrad"]
-# catgrad = { path = "../catgrad/catgrad" }
-# catgrad-llm = { path = "../catgrad/catgrad-llm" }

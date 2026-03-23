@@ -58,13 +58,8 @@ pub enum ModelAssetsError {
     },
     #[error("model does not expose a chat template")]
     MissingChatTemplate,
-    #[error("failed to prepare plain prompt")]
-    PreparePlainPrompt {
-        #[source]
-        source: LLMError,
-    },
-    #[error("failed to prepare chat messages")]
-    PrepareMessages {
+    #[error("failed to prepare prompt request")]
+    PreparePromptRequest {
         #[source]
         source: LLMError,
     },

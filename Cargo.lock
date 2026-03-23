@@ -674,7 +674,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#0da4d55f17625d1db9faa6ea2777d4c550d3796c"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#094a86af21d80326da86cf490b1778c5ecad82c8"
 dependencies = [
  "candle-core",
  "open-hypergraphs",
@@ -684,7 +684,7 @@ dependencies = [
 [[package]]
 name = "catgrad-legacy"
 version = "0.1.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#0da4d55f17625d1db9faa6ea2777d4c550d3796c"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#094a86af21d80326da86cf490b1778c5ecad82c8"
 dependencies = [
  "gemm 0.18.2",
  "half",
@@ -702,7 +702,7 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#0da4d55f17625d1db9faa6ea2777d4c550d3796c"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime#094a86af21d80326da86cf490b1778c5ecad82c8"
 dependencies = [
  "bincode",
  "blake3",
