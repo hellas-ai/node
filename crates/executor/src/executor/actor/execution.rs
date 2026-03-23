@@ -1,5 +1,6 @@
 use crate::ExecutorError;
 use crate::state::ExecutionStatus;
+use crate::state::StateError;
 use crate::worker::{EnqueueError, ExecuteJob};
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
@@ -91,7 +92,7 @@ impl Executor {
             Ok(()) => {
                 self.store
                     .mark_running(&execution_id)
-                    .map_err(ExecutorError::from)?;
+                    ?;
                 self.send_status(&execution_id, ExecutionStatus::Running);
                 Ok(())
             }
@@ -158,5 +159,11 @@ enum StartExecutionError {
 impl From<ExecutorError> for StartExecutionError {
     fn from(error: ExecutorError) -> Self {
         StartExecutionError::Other(error)
+    }
+}
+
+impl From<StateError> for StartExecutionError {
+    fn from(error: StateError) -> Self {
+        ExecutorError::from(error).into()
     }
 }

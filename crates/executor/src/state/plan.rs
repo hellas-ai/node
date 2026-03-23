@@ -47,7 +47,7 @@ impl QuotePlan {
         } else {
             request.max_new_tokens
         };
-        let program = Program::parse_json(&request.program).map_err(ExecutorError::from)?;
+        let program: Program = request.program.as_slice().try_into()?;
 
         let input_ids = decode_token_ids(&request.input)
             .map_err(|error| ExecutorError::InvalidTokenPayload(error.to_string()))?;

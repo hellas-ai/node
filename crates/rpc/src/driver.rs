@@ -36,8 +36,8 @@ impl RemoteExecuteDriver {
 
     fn client(channel: Channel) -> ExecuteClient<Channel> {
         ExecuteClient::new(channel)
-            .send_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
             .max_encoding_message_size(GRPC_MESSAGE_LIMIT)
     }
