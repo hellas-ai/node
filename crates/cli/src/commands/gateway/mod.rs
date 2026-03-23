@@ -61,22 +61,23 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         crate::metrics::spawn_metrics_server(metrics_port, registry);
     }
 
-    println!("Hellas gateway listening on http://{addr}");
-    println!("POST /v1/chat/completions (OpenAI)");
-    println!("POST /v1/messages (Anthropic)");
-    println!("POST /v1/completions (plain)");
     if state.local {
-        println!("Using local catgrad execution backend");
-        println!("Local execution queue size: {}", options.queue_size);
+        info!(
+            "local catgrad execution, queue size: {}",
+            options.queue_size
+        );
     } else if state.verify_local {
-        println!("Verifying remote executions against local catgrad backend");
-        println!("Local verification queue size: {}", options.queue_size);
+        info!(
+            "local catgrad verification, queue size: {}",
+            options.queue_size
+        );
     } else if let Some(verify_node) = state.verify_node_id.as_ref() {
-        println!("Verifying primary node against remote shadow node {verify_node}");
+        info!("Verifying primary node against remote shadow node {verify_node}");
     }
-    println!("Inference timeout: {}s", state.inference_timeout.as_secs());
+
+    info!("timeout: {}s", state.inference_timeout.as_secs());
     if let Some(model) = state.force_model.as_deref() {
-        println!("Forcing request model override to `{model}`");
+        info!("Forcing request model override to `{model}`");
     }
 
     axum::serve(listener, app)
@@ -114,7 +115,6 @@ where
 {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(task(tx));
-
     Sse::new(UnboundedReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
