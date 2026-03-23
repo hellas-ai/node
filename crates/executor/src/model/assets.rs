@@ -1,5 +1,4 @@
-use catgrad_llm::types::Message;
-use catgrad_llm::utils::{get_model, get_model_chat_template};
+use catgrad_llm::utils::{PromptRequest, get_model, get_model_chat_template};
 use catgrad_llm::{Detokenizer, PreparedPrompt};
 use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::hellas::GetQuoteRequest;
@@ -85,23 +84,14 @@ impl ModelAssets {
         })
     }
 
-    pub fn prepare_plain_prompt(&self, prompt: &str) -> Result<PreparedPrompt> {
-        PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
-            .map_err(|source| ModelAssetsError::PreparePlainPrompt { source })
-    }
-
-    pub fn prepare_messages(&self, messages: &[Message]) -> Result<PreparedPrompt> {
-        let chat_template = self
-            .chat_template
-            .as_ref()
-            .ok_or(ModelAssetsError::MissingChatTemplate)?;
-        PreparedPrompt::from_messages(
+    pub fn prepare_request(&self, request: &PromptRequest) -> Result<PreparedPrompt> {
+        PreparedPrompt::from_request(
             &self.tokenizer,
-            chat_template,
-            messages,
+            self.chat_template.as_deref(),
+            request,
             &self.stop_token_ids,
         )
-        .map_err(|source| ModelAssetsError::PrepareMessages { source })
+        .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 
     pub fn create_detokenizer(&self, stop_token_ids: &[i32]) -> Detokenizer<'_> {

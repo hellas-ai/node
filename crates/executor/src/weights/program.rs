@@ -4,7 +4,7 @@ use catgrad_llm::{BoundProgram, Snapshot};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_EXECUTION_CACHE_MAX_BYTES: usize = 1 << 30;
+const DEFAULT_EXECUTION_CACHE_MAX_BYTES: usize = 8 << 30;
 
 #[derive(Clone)]
 pub(crate) struct ExecutionContext {
