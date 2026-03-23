@@ -12,7 +12,7 @@ mod weights;
 mod worker;
 
 pub use error::ExecutorError;
-pub use executor::{Executor, ExecutorHandle, DEFAULT_EXECUTION_QUEUE_CAPACITY};
+pub use executor::{DEFAULT_EXECUTION_QUEUE_CAPACITY, Executor, ExecutorHandle};
 pub use hellas_rpc::pb::hellas::execute_server::ExecuteServer;
 pub use model::ModelAssets;
 pub use policy::{DownloadPolicy, ExecutePolicy};

@@ -1,5 +1,5 @@
+use catgrad_llm::ProgramSpec;
 use catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE;
-use catgrad_llm::Program;
 use serde_json::Value;
 
 use super::{ModelAssetsError, Result};
@@ -15,7 +15,7 @@ pub(super) fn encode_i32_tokens(
 }
 
 pub(super) fn build_program_bytes(config: &Value, max_sequence_length: usize) -> Result<Vec<u8>> {
-    let program = Program::text_from_config(config, max_sequence_length)
+    let program = ProgramSpec::text_from_config(config, max_sequence_length)
         .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
     program
         .normalized_json()

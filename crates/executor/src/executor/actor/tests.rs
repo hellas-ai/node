@@ -1,13 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 
+use crate::DEFAULT_EXECUTION_QUEUE_CAPACITY;
+use crate::ExecutorError;
 use crate::policy::{DownloadPolicy, ExecutePolicy};
 use crate::state::{ExecutionStatus, ExecutorState};
-use crate::weights::WeightsManager;
+use crate::weights::RuntimeManager;
 use crate::worker::ExecuteWorker;
-use crate::ExecutorError;
-use crate::DEFAULT_EXECUTION_QUEUE_CAPACITY;
 use hellas_rpc::encode_token_ids;
-use hellas_rpc::pb::hellas::{execute_stream_event, ExecutionStatus as RpcExecutionStatus};
+use hellas_rpc::pb::hellas::{ExecutionStatus as RpcExecutionStatus, execute_stream_event};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -25,7 +25,7 @@ fn test_executor(
         subscriptions: HashMap::new(),
         pending_executions: VecDeque::new(),
         queue_capacity: DEFAULT_EXECUTION_QUEUE_CAPACITY,
-        weights: WeightsManager::new(DownloadPolicy::default()),
+        runtime_manager: RuntimeManager::new(DownloadPolicy::default()),
         worker: ExecuteWorker::stopped(),
         execute_policy: ExecutePolicy::default(),
     }

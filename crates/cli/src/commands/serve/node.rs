@@ -1,12 +1,13 @@
-use super::peer_tracker::{PeerTracker, RequestKind, MAX_SERVICE_ALPN_LEN};
+use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
+use futures::future::try_join_all;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
+use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
 };
-use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -138,6 +139,7 @@ pub(super) async fn spawn_node(
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
     queue_size: usize,
+    preload_weights: Vec<String>,
 ) -> anyhow::Result<NodeHandle> {
     let endpoint = if let Some(port) = port {
         // Explicit port: fail if it can't bind.
@@ -196,6 +198,7 @@ pub(super) async fn spawn_node(
 
     let executor = Executor::spawn(download_policy, execute_policy, queue_size)
         .context("failed to initialize executor backend")?;
+    preload_startup_weights(&executor, &preload_weights).await?;
     let execute_service = ExecuteServer::new(executor)
         .accept_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Gzip)
@@ -221,4 +224,26 @@ pub(super) async fn spawn_node(
         node_id: endpoint.id(),
         guard,
     })
+}
+
+async fn preload_startup_weights(
+    executor: &hellas_executor::ExecutorHandle,
+    preload_weights: &[String],
+) -> anyhow::Result<()> {
+    if preload_weights.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = preload_weights.len(), "preloading startup weights");
+    try_join_all(preload_weights.iter().cloned().map(|model| {
+        let executor = executor.clone();
+        async move {
+            executor
+                .preload_weights(model.clone())
+                .await
+                .with_context(|| format!("failed to preload weights for {model}"))
+        }
+    }))
+    .await?;
+    Ok(())
 }

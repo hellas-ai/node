@@ -2,20 +2,20 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
+use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::pb::hellas::{GetKnownPeersRequest, HealthCheckRequest, HealthCheckResponse};
 use hellas_rpc::service::{ExecuteService, NodeService};
-use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use std::collections::HashSet;
 use std::future;
 use tokio::task::JoinSet;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
+use tonic_iroh_transport::IrohConnect;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };
-use tonic_iroh_transport::IrohConnect;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);

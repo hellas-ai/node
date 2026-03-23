@@ -18,12 +18,12 @@
   # CUDA 12: broad driver compat, covers Ampere–Ada   (sm80–sm89)
   # CUDA 13: required for Blackwell+                   (sm100+)
   variants = [
-    {cuda = pkgs.cudaPackages_12; sm = "80"; tag = "sm80";}   # A100, A30
-    {cuda = pkgs.cudaPackages_12; sm = "86"; tag = "sm86";}   # RTX 3090/3080, A40
-    {cuda = pkgs.cudaPackages_12; sm = "89"; tag = "sm89";}   # RTX 4090/4080, L40S
-    {cuda = pkgs.cudaPackages_13; sm = "120"; tag = "sm120";} # RTX 5090/5080, Blackwell
+    {cuda = pkgs.cudaPackages_12; sm = "80"; tag = "cuda12-sm80";}   # A100, A30
+    {cuda = pkgs.cudaPackages_12; sm = "86"; tag = "cuda12-sm86";}   # RTX 3090/3080, A40
+    {cuda = pkgs.cudaPackages_12; sm = "89"; tag = "cuda12-sm89";}   # RTX 4090/4080, L40S
+    {cuda = pkgs.cudaPackages_13; sm = "120"; tag = "cuda13-sm120";} # RTX 5090/5080, Blackwell
   ];
-  defaultTag = "sm89";
+  defaultTag = "cuda12-sm89";
 
   mkCudaEnv = v:
     catgrad.lib.${system}.mkCudaEnv {

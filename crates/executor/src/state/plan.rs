@@ -3,20 +3,24 @@ use hellas_rpc::pb::hellas::GetQuoteRequest;
 
 use crate::model::DEFAULT_MODEL_REVISION;
 use crate::weights::WeightsLocator;
-use crate::{ExecutorError, DEFAULT_MAX_SEQ};
+use crate::{DEFAULT_MAX_SEQ, ExecutorError};
 use catgrad_llm::Program;
 
 #[derive(Clone)]
-pub struct ExecutionPlan {
-    pub program: Vec<u8>,
-    pub weights_key: WeightsLocator,
+pub struct Invocation {
     pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,
     pub stop_token_ids: Vec<i32>,
 }
 
-impl ExecutionPlan {
-    pub fn from_quote_request(request: GetQuoteRequest) -> Result<(Self, String), ExecutorError> {
+pub(crate) struct QuotePlan {
+    pub program: Program,
+    pub weights_key: WeightsLocator,
+    pub invocation: Invocation,
+}
+
+impl QuotePlan {
+    pub(crate) fn from_quote_request(request: GetQuoteRequest) -> Result<Self, ExecutorError> {
         let model_id = request.huggingface_model_id.trim();
         if model_id.is_empty() {
             return Err(ExecutorError::InvalidQuoteRequest(
@@ -43,10 +47,7 @@ impl ExecutionPlan {
         } else {
             request.max_new_tokens
         };
-        let program: Program =
-            serde_json::from_slice(&request.program).map_err(ExecutorError::InvalidProgram)?;
-        let program_bytes = program.normalized_json()?;
-        let program_id = blake3::hash(&program_bytes).to_hex().to_string();
+        let program = Program::parse_json(&request.program).map_err(ExecutorError::from)?;
 
         let input_ids = decode_token_ids(&request.input)
             .map_err(|error| ExecutorError::InvalidTokenPayload(error.to_string()))?;
@@ -78,18 +79,17 @@ impl ExecutionPlan {
             )));
         }
 
-        Ok((
-            Self {
-                program: program_bytes,
-                weights_key: WeightsLocator {
-                    model_id: model_id.to_string(),
-                    revision: requested_revision,
-                },
+        Ok(Self {
+            program,
+            weights_key: WeightsLocator {
+                model_id: model_id.to_string(),
+                revision: requested_revision,
+            },
+            invocation: Invocation {
                 input_ids,
                 max_new_tokens,
                 stop_token_ids,
             },
-            program_id,
-        ))
+        })
     }
 }

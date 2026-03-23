@@ -1,6 +1,6 @@
 use super::{WeightsBundle, WeightsLocator};
-use crate::backend::create_backend;
 use crate::ExecutorError;
+use crate::backend::create_backend;
 use catgrad_llm::utils::{get_model_files, load_model_weights};
 use hf_hub::{Cache, Repo, RepoType};
 use std::path::Path;
@@ -31,7 +31,8 @@ pub(crate) fn load_weights_bundle(
         get_model_files(&locator.model_id, &locator.revision)?;
     let resolved_revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
         ExecutorError::WeightsError(format!(
-            "unexpected hf cache path (no snapshots/<sha>): {}", config_path.display()
+            "unexpected hf cache path (no snapshots/<sha>): {}",
+            config_path.display()
         ))
     })?;
 

@@ -29,6 +29,11 @@ impl ExecutorHandle {
             .await
     }
 
+    pub async fn preload_weights(&self, model: String) -> Result<(), ExecutorError> {
+        self.send(|reply| ExecutorMessage::Preload { model, reply })
+            .await
+    }
+
     pub async fn start_execution(
         &self,
         request: ExecuteRequest,

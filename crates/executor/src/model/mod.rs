@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokenizers::Error as TokenizerError;
 
 pub use assets::ModelAssets;
-pub(crate) use spec::DEFAULT_MODEL_REVISION;
+pub(crate) use spec::{DEFAULT_MODEL_REVISION, ModelSpec};
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
 

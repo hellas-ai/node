@@ -1,7 +1,7 @@
-use crate::state::ExecutionPlan;
-use crate::backend::ExecBackend;
-use crate::weights::{CachedProgram, PrefixHash, PrefixState};
 use crate::ExecutorError;
+use crate::backend::ExecBackend;
+use crate::state::Invocation;
+use crate::weights::{CachedProgram, PrefixHash, PrefixState};
 use catgrad_llm::Snapshot;
 use hellas_rpc::encode_token_ids;
 use std::time::Instant;
@@ -14,7 +14,7 @@ pub fn run_cached_program_streaming(
     start_prefix_len: usize,
     start_prefix_hash: PrefixHash,
     start_next_token: Option<u32>,
-    plan: &ExecutionPlan,
+    invocation: &Invocation,
     stream_batch_size: u32,
     mut on_progress: impl FnMut(u64, &[u8]),
 ) -> Result<(), ExecutorError> {
@@ -25,7 +25,7 @@ pub fn run_cached_program_streaming(
     let mut generated_tokens = 0u64;
     let batch_size = usize::try_from(stream_batch_size.max(1)).unwrap_or(usize::MAX);
     let mut pending_batch = Vec::with_capacity(batch_size);
-    let prompt_tokens = plan.input_ids.len();
+    let prompt_tokens = invocation.input_ids.len();
     let mut prefill_chunks = 0usize;
     let mut next_token = if prompt_tokens == 0 {
         Some(session.step_text(&[])?)
@@ -40,7 +40,7 @@ pub fn run_cached_program_streaming(
         let mut cursor = start_prefix_len;
         while cursor < prompt_tokens {
             let next_boundary = next_checkpoint_boundary(cursor, prompt_tokens);
-            let chunk = &plan.input_ids[cursor..next_boundary];
+            let chunk = &invocation.input_ids[cursor..next_boundary];
             let step_start = Instant::now();
             let predicted = session.step_text(chunk)?;
             prefill_chunks += 1;
@@ -95,10 +95,10 @@ pub fn run_cached_program_streaming(
         return Err(ExecutorError::NoOutput);
     };
 
-    for step_idx in 0..plan.max_new_tokens {
+    for step_idx in 0..invocation.max_new_tokens {
         if i32::try_from(current_token)
             .ok()
-            .is_some_and(|token| plan.stop_token_ids.contains(&token))
+            .is_some_and(|token| invocation.stop_token_ids.contains(&token))
         {
             break;
         }
@@ -111,7 +111,7 @@ pub fn run_cached_program_streaming(
             pending_batch.clear();
         }
 
-        if step_idx + 1 < plan.max_new_tokens {
+        if step_idx + 1 < invocation.max_new_tokens {
             current_token = session.step_text(&[current_token])?;
         }
     }

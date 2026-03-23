@@ -15,8 +15,8 @@ use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -31,6 +31,8 @@ pub struct GatewayOptions {
     pub port: u16,
     pub node_id: Option<EndpointId>,
     pub local: bool,
+    pub verify_local: bool,
+    pub verify: Option<EndpointId>,
     pub queue_size: usize,
     pub retries: usize,
     pub default_max_tokens: u32,
@@ -60,6 +62,11 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
     if state.local {
         println!("Using local catgrad execution backend");
         println!("Local execution queue size: {}", options.queue_size);
+    } else if state.verify_local {
+        println!("Verifying remote executions against local catgrad backend");
+        println!("Local verification queue size: {}", options.queue_size);
+    } else if let Some(verify_node) = state.verify_node_id.as_ref() {
+        println!("Verifying primary node against remote shadow node {verify_node}");
     }
     println!("Inference timeout: {}s", state.inference_timeout.as_secs());
     if let Some(model) = state.force_model.as_deref() {

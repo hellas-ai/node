@@ -8,7 +8,7 @@ use catgrad_llm::Snapshot;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{ExecutionPlan, ExecutionStatus};
+use super::{ExecutionStatus, Invocation};
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -24,7 +24,7 @@ pub enum StateError {
 
 #[derive(Clone)]
 pub struct QuoteRecord {
-    pub plan: ExecutionPlan,
+    pub invocation: Invocation,
     pub program: Arc<CachedProgram>,
     pub start_snapshot: Arc<Snapshot<ExecBackend>>,
     pub start_prefix_len: usize,

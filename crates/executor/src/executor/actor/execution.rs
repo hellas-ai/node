@@ -1,6 +1,6 @@
+use crate::ExecutorError;
 use crate::state::ExecutionStatus;
 use crate::worker::{EnqueueError, ExecuteJob};
-use crate::ExecutorError;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse,
@@ -21,7 +21,7 @@ impl Executor {
         let execution_id = self.store.create_execution();
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
-            plan: quote.plan.clone(),
+            invocation: quote.invocation.clone(),
             program: quote.program.clone(),
             start_snapshot: quote.start_snapshot.clone(),
             start_prefix_len: quote.start_prefix_len,
