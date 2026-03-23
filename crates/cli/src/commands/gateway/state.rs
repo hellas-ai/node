@@ -7,9 +7,11 @@ use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::types::{self, anthropic, openai, plain};
+use catgrad_llm::PromptRequest;
+use catgrad_llm::types::{anthropic, openai, plain};
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -159,7 +161,7 @@ impl GatewayState {
     ) -> Result<PreparedGeneration, HttpError>
     where
         F: FnOnce(&ModelAssets) -> Result<PreparedPrompt, E>,
-        E: fmt::Display,
+        E: StdError + Send + Sync + 'static,
     {
         let model = self.resolve_model(request_model);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
@@ -168,7 +170,7 @@ impl GatewayState {
         })?;
         let prepared_prompt = prepare(assets.as_ref()).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
-            message: format!("{prepare_error}: {err}"),
+            message: format!("{prepare_error}: {}", format_error_causes(&err)),
         })?;
         let prompt_tokens = prepared_prompt.input_ids.len() as u32;
         let stop_token_ids = prepared_prompt.stop_token_ids.clone();
@@ -199,17 +201,15 @@ impl GatewayState {
         req: &openai::ChatCompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let messages: Vec<types::Message> = req
-            .messages
-            .iter()
-            .cloned()
-            .map(|message| types::Message::OpenAI(Box::new(message)))
-            .collect();
+        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to normalize chat request: {err}"),
+        })?;
         self.prepare_generation(
             &req.model,
             max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_messages(&messages),
+            move |assets| assets.prepare_request(&prompt_request),
         )
         .await
     }
@@ -218,12 +218,15 @@ impl GatewayState {
         &self,
         req: &anthropic::MessageRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let messages: Vec<_> = req.into();
+        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to normalize chat request: {err}"),
+        })?;
         self.prepare_generation(
             &req.model,
             req.max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_messages(&messages),
+            move |assets| assets.prepare_request(&prompt_request),
         )
         .await
     }
@@ -233,15 +236,29 @@ impl GatewayState {
         req: &plain::CompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let prompt = req.prompt.clone();
+        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to normalize completion request: {err}"),
+        })?;
         self.prepare_generation(
             &req.model,
             max_tokens,
             "Failed to prepare completion prompt",
-            move |assets| assets.prepare_plain_prompt(&prompt),
+            move |assets| assets.prepare_request(&prompt_request),
         )
         .await
     }
+}
+
+fn format_error_causes(err: &(dyn StdError + 'static)) -> String {
+    let mut parts = Vec::new();
+    let mut current = err.source().unwrap_or(err);
+    parts.push(current.to_string());
+    while let Some(source) = current.source() {
+        parts.push(source.to_string());
+        current = source;
+    }
+    parts.join(": ")
 }
 
 impl PreparedGeneration {
@@ -303,12 +320,36 @@ impl IntoResponse for GenerationError {
             GenerationError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GenerationError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        match &self {
+            GenerationError::Timeout(duration) => {
+                warn!(
+                    timeout_secs = duration.as_secs(),
+                    "gateway inference timed out"
+                );
+            }
+            GenerationError::Failed(err) => {
+                error!(error = %err, "gateway inference failed");
+            }
+        }
         json_error(status, format!("Inference error: {self}"))
     }
 }
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            error!(
+                status = %self.status,
+                message = %self.message,
+                "gateway request failed"
+            );
+        } else {
+            warn!(
+                status = %self.status,
+                message = %self.message,
+                "gateway request rejected"
+            );
+        }
         json_error(self.status, self.message)
     }
 }
