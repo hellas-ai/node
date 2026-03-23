@@ -64,7 +64,16 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
         }
         Ok(())
     };
-    let _ = request.run(&mut stdout_sink).await?;
+
+    if request.uses_remote_transport() {
+        let mut prepared = request.prepare().await?;
+        let result = prepared.run(&mut stdout_sink).await;
+        crate::tracing_config::suppress_execute_tail_logs();
+        drop(prepared);
+        let _ = result?;
+    } else {
+        let _ = request.run(&mut stdout_sink).await?;
+    }
 
     Ok(())
 }
