@@ -22,11 +22,8 @@ impl Executor {
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
             invocation: quote.invocation.clone(),
-            program: quote.program.clone(),
-            start_snapshot: quote.start_snapshot.clone(),
-            start_prefix_len: quote.start_prefix_len,
-            start_prefix_hash: quote.start_prefix_hash,
-            start_next_token: quote.start_next_token,
+            execution: quote.execution.clone(),
+            start: quote.start.clone(),
             stream_batch_size,
             accepted_at: Instant::now(),
         };

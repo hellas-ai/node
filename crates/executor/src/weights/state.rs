@@ -1,4 +1,4 @@
-use super::{CachedProgram, WeightsBundle, WeightsError, WeightsLocator};
+use super::{ExecutionContext, WeightsBundle, WeightsError, WeightsLocator};
 use crate::backend::ExecBackend;
 use catgrad_llm::Runtime;
 use catgrad_llm::helpers::WeightPostProcess;
@@ -15,7 +15,7 @@ enum EntryStatus {
 
 struct RuntimeEntry {
     runtime: Arc<Runtime<ExecBackend>>,
-    programs: HashMap<String, Arc<CachedProgram>>,
+    programs: HashMap<String, Arc<ExecutionContext>>,
 }
 
 struct Entry {
@@ -40,11 +40,11 @@ pub(crate) struct ProgramLookup {
     pub generation: u64,
     pub bundle: Arc<WeightsBundle>,
     pub runtime: Option<Arc<Runtime<ExecBackend>>>,
-    pub program: Option<Arc<CachedProgram>>,
+    pub program: Option<Arc<ExecutionContext>>,
 }
 
 pub(crate) enum CacheProgramOutcome {
-    Cached(Arc<CachedProgram>),
+    Cached(Arc<ExecutionContext>),
     Stale,
 }
 
@@ -173,7 +173,7 @@ impl WeightsState {
         generation: u64,
         weight_post_process: WeightPostProcess,
         program_id: String,
-        program: Arc<CachedProgram>,
+        program: Arc<ExecutionContext>,
     ) -> Result<CacheProgramOutcome, WeightsError> {
         let entry = self
             .entries
@@ -247,8 +247,8 @@ mod tests {
         .unwrap()
     }
 
-    fn dummy_cached_program() -> Arc<CachedProgram> {
-        Arc::new(CachedProgram::new(Arc::new(
+    fn dummy_execution_context() -> Arc<ExecutionContext> {
+        Arc::new(ExecutionContext::new(Arc::new(
             dummy_runtime().bind(dummy_program()).unwrap(),
         )))
     }
@@ -331,7 +331,7 @@ mod tests {
 
         state.finish_ready(&locator, bundle);
 
-        let bound_program = dummy_cached_program();
+        let bound_program = dummy_execution_context();
 
         assert!(matches!(
             state
