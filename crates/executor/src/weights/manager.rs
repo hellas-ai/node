@@ -263,7 +263,7 @@ impl RuntimeManager {
 
             match next_step {
                 BoundProgramStep::Ready(cached) => {
-                    info!(
+                    debug!(
                         model = %locator.model_id,
                         requested_revision = %locator.revision,
                         %program_id,

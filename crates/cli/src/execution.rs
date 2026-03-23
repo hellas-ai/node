@@ -3,21 +3,21 @@ use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ExecutorHandle, ModelAssets};
 use hellas_rpc::decode_token_ids;
-use hellas_rpc::discovery::{DiscoveryEndpoint, QuoteError, QuoteStream};
+use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest, execute_stream_event,
 };
 use hellas_rpc::service::ExecuteService;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::Duration;
+use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::IrohConnect;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-use tonic_iroh_transport::swarm::{DhtBackend, Locator, MdnsBackend, ServiceRegistry};
+use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 
@@ -25,20 +25,14 @@ type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 pub enum ExecutionRoute {
     Local,
     RemoteDirect(EndpointId),
-    RemoteDiscovery {
-        retries: usize,
-        backup_quotes: usize,
-    },
+    RemoteDiscovery { retries: usize },
 }
 
 impl ExecutionRoute {
-    pub fn remote(node_id: Option<EndpointId>, retries: usize, backup_quotes: usize) -> Self {
+    pub fn remote(node_id: Option<EndpointId>, retries: usize) -> Self {
         match node_id {
             Some(node_id) => Self::RemoteDirect(node_id),
-            None => Self::RemoteDiscovery {
-                retries,
-                backup_quotes,
-            },
+            None => Self::RemoteDiscovery { retries },
         }
     }
 }
@@ -63,33 +57,21 @@ pub struct ExecutionRequest {
     strategy: ExecutionStrategy,
 }
 
-struct DiscoverySession {
-    endpoint: Arc<Endpoint>,
-    quotes: QuoteStream<Locator>,
-}
-
-struct QuotedDriver {
-    _endpoint: Option<Arc<Endpoint>>,
-    quote_id: String,
-    driver: Box<dyn ExecuteDriver>,
-}
-
-impl QuotedDriver {
-    fn new<D>(endpoint: Option<Arc<Endpoint>>, quote_id: String, driver: D) -> Self
-    where
-        D: ExecuteDriver + 'static,
-    {
-        Self {
-            _endpoint: endpoint,
-            quote_id,
-            driver: Box::new(driver),
-        }
-    }
-}
-
 pub struct ExecutionOutput {
     pub output: Vec<u8>,
     pub completion_tokens: u32,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedQuote {
+    peer_id: EndpointId,
+    quote: hellas_rpc::pb::hellas::GetQuoteResponse,
+}
+
+#[derive(Debug)]
+enum QuoteCandidateError {
+    Declined(tonic::Status),
+    Connect(anyhow::Error),
 }
 
 impl ExecutionRuntime {
@@ -146,43 +128,31 @@ impl ExecutionRequest {
         sink: &mut OutputSink<'_>,
     ) -> anyhow::Result<ExecutionOutput> {
         match route {
-            ExecutionRoute::RemoteDiscovery {
-                retries,
-                backup_quotes,
-            } => {
-                self.execute_discovered(*retries, *backup_quotes, sink)
-                    .await
-            }
+            ExecutionRoute::RemoteDiscovery { retries } => self.execute_discovered(*retries, sink).await,
             ExecutionRoute::Local => {
-                let executor = self.runtime.require_local_executor()?;
-                let quoted = self
-                    .quote_driver(None, executor, || "local quote failed".to_string())
+                let mut executor = self.runtime.require_local_executor()?;
+                let quote = self
+                    .quote_with_driver(&mut executor, || "local quote failed".to_string())
                     .await?;
-                self.execute_quoted(quoted, sink).await
+                self.execute_with_driver(&mut executor, quote.quote_id, sink).await
             }
             ExecutionRoute::RemoteDirect(node_id) => {
-                let endpoint = Arc::new(DiscoveryEndpoint::bind().await?.endpoint);
-                let channel = ExecuteService::connect(&endpoint, (*node_id).into())
-                    .await
-                    .with_context(|| format!("failed to connect to node {node_id}"))?;
-                let quoted = self
-                    .quote_driver(Some(endpoint), RemoteExecuteDriver::new(channel), || {
-                        format!("node {node_id} declined quote")
-                    })
-                    .await?;
-                self.execute_quoted(quoted, sink).await
+                let endpoint = Self::bind_remote_endpoint().await?;
+                let quote = self.quote_remote_peer(&endpoint, *node_id).await?;
+                let result = self.execute_remote_quote(&endpoint, quote, sink).await;
+                endpoint.close().await;
+                result
             }
         }
     }
 
-    async fn quote_driver<D>(
+    async fn quote_with_driver<D>(
         &self,
-        endpoint: Option<Arc<Endpoint>>,
-        mut driver: D,
+        driver: &mut D,
         context: impl FnOnce() -> String,
-    ) -> anyhow::Result<QuotedDriver>
+    ) -> anyhow::Result<hellas_rpc::pb::hellas::GetQuoteResponse>
     where
-        D: ExecuteDriver + 'static,
+        D: ExecuteDriver,
     {
         let start = Instant::now();
         let quote = driver
@@ -195,95 +165,161 @@ impl ExecutionRequest {
             quote_rpc_ms = start.elapsed().as_millis(),
             "quote rpc completed"
         );
-        Ok(QuotedDriver::new(endpoint, quote.quote_id, driver))
+        Ok(quote)
     }
 
-    async fn start_discovery_session(&self) -> anyhow::Result<DiscoverySession> {
-        let bound = DiscoveryEndpoint::bind().await?;
-        let endpoint = Arc::new(bound.endpoint);
-        let mdns = bound.bindings.mdns;
-        let shared_dht = bound.bindings.dht;
+    async fn bind_remote_endpoint() -> anyhow::Result<Arc<Endpoint>> {
+        Ok(Arc::new(
+            Endpoint::builder()
+                .bind()
+                .await
+                .context("failed to create client transport endpoint")?,
+        ))
+    }
+
+    async fn quote_remote_endpoint(
+        quote_req: &GetQuoteRequest,
+        endpoint: &Endpoint,
+        peer_id: EndpointId,
+    ) -> Result<AcceptedQuote, QuoteCandidateError> {
+        let start = Instant::now();
+        let channel = ExecuteService::connect(endpoint, peer_id.into())
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .await
+            .with_context(|| format!("failed to connect to node {peer_id}"))
+            .map_err(QuoteCandidateError::Connect)?;
+        let mut driver = RemoteExecuteDriver::new(channel);
+        let quote = match driver.get_quote(quote_req.clone()).await {
+            Ok(quote) => quote,
+            Err(status) => return Err(QuoteCandidateError::Declined(status)),
+        };
+        debug!(
+            quote_id = %quote.quote_id,
+            ttl_ms = quote.ttl_ms,
+            %peer_id,
+            quote_rpc_ms = start.elapsed().as_millis(),
+            "quote rpc completed"
+        );
+        Ok(AcceptedQuote { peer_id, quote })
+    }
+
+    async fn quote_remote_peer(
+        &self,
+        endpoint: &Endpoint,
+        peer_id: EndpointId,
+    ) -> anyhow::Result<AcceptedQuote> {
+        Self::quote_remote_endpoint(&self.quote_req, endpoint, peer_id)
+            .await
+            .map_err(|err| match err {
+                QuoteCandidateError::Declined(status) => {
+                    anyhow::Error::from(status).context(format!("node {peer_id} declined quote"))
+                }
+                QuoteCandidateError::Connect(err) => err,
+            })
+    }
+
+    async fn discover_remote_quote(&self, endpoint: &Endpoint) -> anyhow::Result<AcceptedQuote> {
+        let bindings = DiscoveryBindings::client(endpoint.id())?;
 
         let mut registry = ServiceRegistry::new(&endpoint);
-        registry.add(MdnsBackend::new(mdns));
-        registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
+        registry.add(MdnsBackend::new(bindings.mdns));
+        registry.add(DhtBackend::with_dht(&endpoint, bindings.dht));
 
-        let locator = registry
-            .find::<ExecuteService>()
-            .timeout(DISCOVERY_TIMEOUT)
-            .start();
+        let peers = Box::pin(registry.discover::<ExecuteService>());
+        timeout(DISCOVERY_TIMEOUT, async {
+            let mut last_decline = None;
+            let mut last_connect_error = None;
+            futures::pin_mut!(peers);
 
-        Ok(DiscoverySession {
-            endpoint,
-            quotes: QuoteStream::from_request(locator, self.quote_req.clone()),
-        })
-    }
-
-    async fn next_accepted_execution(
-        &self,
-        discovery: &mut DiscoverySession,
-    ) -> anyhow::Result<QuotedDriver> {
-        let mut last_decline = None;
-        let mut last_connect_error = None;
-
-        while let Some(result) = discovery.quotes.next().await {
-            match result {
-                Ok((client, quote)) => {
-                    return Ok(QuotedDriver::new(
-                        Some(discovery.endpoint.clone()),
-                        quote.quote_id,
-                        client,
-                    ));
-                }
-                Err(QuoteError::Declined(status)) => {
-                    info!("provider declined quote: {status}");
-                    last_decline = Some(status);
-                }
-                Err(QuoteError::ConnectFailed(err)) => {
-                    debug!("candidate connect error: {err:#}");
-                    last_connect_error = Some(err);
+            while let Some(result) = peers.next().await {
+                match result {
+                    Ok(peer) => {
+                        let peer_id = peer.id();
+                        match Self::quote_remote_endpoint(&self.quote_req, endpoint, peer_id).await {
+                            Ok(accepted) => return Ok(accepted),
+                            Err(QuoteCandidateError::Declined(status)) => {
+                                info!("provider declined quote: {status}");
+                                last_decline = Some(status);
+                            }
+                            Err(QuoteCandidateError::Connect(err)) => {
+                                debug!("candidate connect error: {err:#}");
+                                last_connect_error = Some(err);
+                            }
+                        }
+                    }
+                    Err(err) => last_connect_error = Some(err.into()),
                 }
             }
-        }
 
-        if let Some(status) = last_decline {
-            anyhow::bail!("all discovered providers declined the quote: {status}");
-        }
-        if let Some(err) = last_connect_error {
-            return Err(err).context("failed to connect to discovered providers");
-        }
+            if let Some(status) = last_decline {
+                anyhow::bail!("all discovered providers declined the quote: {status}");
+            }
+            if let Some(err) = last_connect_error {
+                return Err(err).context("failed to connect to discovered providers");
+            }
 
-        anyhow::bail!("no provider could serve the request");
+            anyhow::bail!("no provider could serve the request");
+        })
+        .await
+        .context("discovery timed out")?
+    }
+
+    async fn execute_remote_quote(
+        &self,
+        endpoint: &Endpoint,
+        quote: AcceptedQuote,
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
+        let mut driver = RemoteExecuteDriver::new(
+            ExecuteService::connect(endpoint, quote.peer_id.into())
+                .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+                .await
+                .with_context(|| format!("failed to connect to node {}", quote.peer_id))?,
+        );
+        self.execute_with_driver(&mut driver, quote.quote.quote_id, sink)
+            .await
     }
 
     async fn execute_discovered(
         &self,
         retries: usize,
-        backup_quotes: usize,
         sink: &mut OutputSink<'_>,
     ) -> anyhow::Result<ExecutionOutput> {
-        let mut discovery = self.start_discovery_session().await?;
-        let mut buffered = VecDeque::new();
         let max_attempts = retries.saturating_add(1);
 
         info!("No node ID provided, discovering executor");
 
         for attempt in 1..=max_attempts {
-            let prepared = match buffered.pop_front() {
-                Some(prepared) => prepared,
-                None => self.next_accepted_execution(&mut discovery).await?,
+            let endpoint = Self::bind_remote_endpoint().await?;
+            let quote = self.discover_remote_quote(&endpoint).await?;
+            let peer_id = quote.peer_id;
+            let mut committed = false;
+            let mut tracked_sink = |output: &[u8]| -> anyhow::Result<()> {
+                if !output.is_empty() {
+                    committed = true;
+                }
+                sink(output)
             };
 
-            match self
-                .execute_with_prefetch(prepared, &mut discovery, &mut buffered, backup_quotes, sink)
-                .await
-            {
+            let result = self.execute_remote_quote(&endpoint, quote, &mut tracked_sink).await;
+            endpoint.close().await;
+
+            match result {
                 Ok(output) => return Ok(output),
                 Err(err) => {
+                    if committed {
+                        return Err(err.context(format!(
+                            "execution failed on {peer_id} after output was emitted"
+                        )));
+                    }
                     if attempt == max_attempts {
                         return Err(err.context(format!("max retries ({retries}) exceeded")));
                     }
-                    warn!(attempt, "execution failed, trying next provider: {err:#}");
+                    warn!(
+                        attempt,
+                        %peer_id,
+                        "execution failed before output, rediscovering: {err:#}"
+                    );
                 }
             }
         }
@@ -291,44 +327,20 @@ impl ExecutionRequest {
         anyhow::bail!("max retries ({retries}) exceeded");
     }
 
-    async fn execute_with_prefetch(
+    async fn execute_with_driver<D>(
         &self,
-        quoted: QuotedDriver,
-        discovery: &mut DiscoverySession,
-        buffered: &mut VecDeque<QuotedDriver>,
-        backup_quotes: usize,
+        driver: &mut D,
+        quote_id: String,
         sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
-        let mut execute_fut = Box::pin(async move { self.execute_quoted(quoted, sink).await });
-        let mut discovery_done = false;
-
-        loop {
-            tokio::select! {
-                result = &mut execute_fut => return result,
-                result = self.next_accepted_execution(discovery), if !discovery_done && buffered.len() < backup_quotes => {
-                    match result {
-                        Ok(prepared) => buffered.push_back(prepared),
-                        Err(err) => {
-                            debug!("no more backup providers available: {err:#}");
-                            discovery_done = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    async fn execute_quoted(
-        &self,
-        mut quoted: QuotedDriver,
-        sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
+    ) -> anyhow::Result<ExecutionOutput>
+    where
+        D: ExecuteDriver,
+    {
         let start = Instant::now();
         let stream_start = Instant::now();
-        let mut stream = quoted
-            .driver
+        let mut stream = driver
             .execute_streaming(ExecuteRequest {
-                quote_id: quoted.quote_id.clone(),
+                quote_id: quote_id.clone(),
                 stream_batch_size: Some(1),
             })
             .await
@@ -343,7 +355,7 @@ impl ExecutionRequest {
             let event = event.context("execution stream failed")?;
             if !first_event_logged {
                 debug!(
-                    quote_id = %quoted.quote_id,
+                    quote_id = %quote_id,
                     stream_open_ms,
                     first_event_ms = start.elapsed().as_millis(),
                     "execute stream first event"
@@ -364,7 +376,7 @@ impl ExecutionRequest {
             }
             if !first_output_logged && output.len() > had_output {
                 debug!(
-                    quote_id = %quoted.quote_id,
+                    quote_id = %quote_id,
                     stream_open_ms,
                     first_output_ms = start.elapsed().as_millis(),
                     "execute stream first output"

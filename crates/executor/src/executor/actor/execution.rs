@@ -139,7 +139,7 @@ impl Executor {
         status: ExecutionStatus,
     ) {
         let success = matches!(status, ExecutionStatus::Completed);
-        info!(%execution_id, success, "execution finished");
+        debug!(%execution_id, success, "execution finished");
 
         if let Err(error) = self.store.complete_execution(execution_id, status, output) {
             warn!("failed to update completion state for {execution_id}: {error}");
