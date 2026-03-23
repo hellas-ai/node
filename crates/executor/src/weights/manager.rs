@@ -1,7 +1,7 @@
 use super::loader::{LoadedWeights, load_weights_bundle};
 use super::state::{CacheProgramOutcome, CacheRuntimeOutcome, EntryStatusSnapshot, WeightsState};
 use super::{
-    CachedProgram, EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator,
+    EnsureDisposition, ExecutionContext, WeightsBundle, WeightsError, WeightsLocator,
     has_cached_weights,
 };
 use crate::ExecutorError;
@@ -68,7 +68,7 @@ enum BuildAdmission {
 }
 
 enum BoundProgramStep {
-    Ready(Arc<CachedProgram>),
+    Ready(Arc<ExecutionContext>),
     BuildRuntime {
         generation: u64,
         bundle: Arc<WeightsBundle>,
@@ -213,7 +213,7 @@ impl RuntimeManager {
         &self,
         locator: &WeightsLocator,
         program: &Program,
-    ) -> Result<Arc<CachedProgram>, ExecutorError> {
+    ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         let start = Instant::now();
         let program_id = program.id().to_string();
         let weight_post_process = program.weight_post_process;
@@ -441,8 +441,8 @@ impl RuntimeManager {
     fn build_program(
         runtime: &Arc<Runtime<ExecBackend>>,
         program: &Program,
-    ) -> Result<Arc<CachedProgram>, ExecutorError> {
-        Ok(Arc::new(CachedProgram::new(Arc::new(
+    ) -> Result<Arc<ExecutionContext>, ExecutorError> {
+        Ok(Arc::new(ExecutionContext::new(Arc::new(
             runtime.bind(program.clone())?,
         ))))
     }

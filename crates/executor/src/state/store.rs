@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::backend::ExecBackend;
-use crate::weights::{CachedProgram, PrefixHash};
-use catgrad_llm::Snapshot;
+use crate::weights::{ExecutionContext, ExecutionStart};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -25,11 +23,8 @@ pub enum StateError {
 #[derive(Clone)]
 pub struct QuoteRecord {
     pub invocation: Invocation,
-    pub program: Arc<CachedProgram>,
-    pub start_snapshot: Arc<Snapshot<ExecBackend>>,
-    pub start_prefix_len: usize,
-    pub start_prefix_hash: PrefixHash,
-    pub start_next_token: Option<u32>,
+    pub execution: Arc<ExecutionContext>,
+    pub start: ExecutionStart,
     pub expires_at: Instant,
 }
 
