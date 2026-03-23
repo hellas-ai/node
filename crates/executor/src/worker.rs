@@ -6,7 +6,7 @@ use crate::weights::{ExecutionContext, ExecutionStart};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub(crate) struct ExecuteWorker {
     tx: SyncSender<ExecuteJob>,
@@ -100,7 +100,7 @@ impl WorkerThread {
             accepted_at,
         } = job;
 
-        info!(execution_id = %execution_id, "execute worker running plan");
+        debug!(execution_id = %execution_id, "execute worker running plan");
         debug!(
             execution_id = %execution_id,
             queue_wait_ms = accepted_at.elapsed().as_millis(),
