@@ -13,7 +13,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::IrohConnect;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId, endpoint::presets};
+use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
+use tonic_iroh_transport::iroh::{
+    Endpoint, EndpointId,
+    endpoint::{PortmapperConfig, default_relay_mode},
+};
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +64,38 @@ pub struct ExecutionRequest {
 pub struct ExecutionOutput {
     pub output: Vec<u8>,
     pub completion_tokens: u32,
+}
+
+pub struct PreparedExecution {
+    strategy: PreparedExecutionStrategy,
+}
+
+enum PreparedExecutionStrategy {
+    Run(PreparedRoute),
+    Verify {
+        primary: PreparedRoute,
+        shadow: PreparedRoute,
+    },
+}
+
+enum PreparedRoute {
+    Local {
+        executor: ExecutorHandle,
+        quote_id: String,
+    },
+    RemoteDirect(RemoteExecution),
+    RemoteDiscovery {
+        quote_req: GetQuoteRequest,
+        retries: usize,
+        active: Option<RemoteExecution>,
+    },
+}
+
+struct RemoteExecution {
+    endpoint: Arc<Endpoint>,
+    peer_id: EndpointId,
+    quote_id: String,
+    driver: RemoteExecuteDriver,
 }
 
 struct QuotedRemoteDriver {
@@ -111,45 +147,44 @@ impl ExecutionRequest {
     }
 
     pub async fn run(&self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
-        match &self.strategy {
-            ExecutionStrategy::Run(route) => self.run_route(route, sink).await,
+        let mut prepared = self.prepare().await?;
+        prepared.run(sink).await
+    }
+
+    pub async fn prepare(&self) -> anyhow::Result<PreparedExecution> {
+        let strategy = match &self.strategy {
+            ExecutionStrategy::Run(route) => {
+                PreparedExecutionStrategy::Run(
+                    PreparedRoute::prepare(&self.runtime, &self.quote_req, route).await?,
+                )
+            }
             ExecutionStrategy::Verify { primary, shadow } => {
-                let primary_output = self.run_route(primary, sink).await?;
-                let shadow_output = self.run_route(shadow, &mut |_: &[u8]| Ok(())).await?;
-                self.verify_matching_output(&primary_output, &shadow_output)?;
-                Ok(primary_output)
+                PreparedExecutionStrategy::Verify {
+                    primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, primary)
+                        .await?,
+                    shadow: PreparedRoute::prepare(&self.runtime, &self.quote_req, shadow)
+                        .await?,
+                }
+            }
+        };
+        Ok(PreparedExecution { strategy })
+    }
+
+    pub fn uses_remote_transport(&self) -> bool {
+        match &self.strategy {
+            ExecutionStrategy::Run(route) => Self::route_uses_remote(route),
+            ExecutionStrategy::Verify { primary, shadow } => {
+                Self::route_uses_remote(primary) || Self::route_uses_remote(shadow)
             }
         }
     }
 
-    async fn run_route(
-        &self,
-        route: &ExecutionRoute,
-        sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
-        match route {
-            ExecutionRoute::RemoteDiscovery { retries } => self.execute_discovered(*retries, sink).await,
-            ExecutionRoute::Local => {
-                let mut executor = self.runtime.require_local_executor()?;
-                let quote = self
-                    .quote_with_driver(&mut executor, || "local quote failed".to_string())
-                    .await?;
-                self.execute_with_driver(&mut executor, quote.quote_id, sink).await
-            }
-            ExecutionRoute::RemoteDirect(node_id) => {
-                let endpoint = Self::bind_remote_endpoint().await?;
-                let mut quote = self.quote_remote_peer(&endpoint, *node_id).await?;
-                let result = self
-                    .execute_with_driver(&mut quote.driver, quote.quote.quote_id, sink)
-                    .await;
-                endpoint.close().await;
-                result
-            }
-        }
+    fn route_uses_remote(route: &ExecutionRoute) -> bool {
+        !matches!(route, ExecutionRoute::Local)
     }
 
     async fn quote_with_driver<D>(
-        &self,
+        quote_req: &GetQuoteRequest,
         driver: &mut D,
         context: impl FnOnce() -> String,
     ) -> anyhow::Result<hellas_rpc::pb::hellas::GetQuoteResponse>
@@ -158,7 +193,7 @@ impl ExecutionRequest {
     {
         let start = Instant::now();
         let quote = driver
-            .get_quote(self.quote_req.clone())
+            .get_quote(quote_req.clone())
             .await
             .with_context(context)?;
         debug!(
@@ -172,7 +207,11 @@ impl ExecutionRequest {
 
     async fn bind_remote_endpoint() -> anyhow::Result<Arc<Endpoint>> {
         Ok(Arc::new(
-            Endpoint::bind(presets::N0)
+            Endpoint::empty_builder()
+                .address_lookup(DnsAddressLookup::n0_dns())
+                .relay_mode(default_relay_mode())
+                .portmapper_config(PortmapperConfig::Disabled)
+                .bind()
                 .await
                 .context("failed to create client transport endpoint")?,
         ))
@@ -209,11 +248,11 @@ impl ExecutionRequest {
     }
 
     async fn quote_remote_peer(
-        &self,
+        quote_req: &GetQuoteRequest,
         endpoint: &Endpoint,
         peer_id: EndpointId,
     ) -> anyhow::Result<QuotedRemoteDriver> {
-        Self::quote_remote_endpoint(&self.quote_req, endpoint, peer_id)
+        Self::quote_remote_endpoint(quote_req, endpoint, peer_id)
             .await
             .map_err(|err| match err {
                 QuoteCandidateError::Declined(status) => {
@@ -224,7 +263,7 @@ impl ExecutionRequest {
     }
 
     async fn discover_remote_quote(
-        &self,
+        quote_req: &GetQuoteRequest,
         endpoint: &Endpoint,
     ) -> anyhow::Result<QuotedRemoteDriver> {
         let bindings = DiscoveryBindings::client(endpoint.id())?;
@@ -243,7 +282,7 @@ impl ExecutionRequest {
                 match result {
                     Ok(peer) => {
                         let peer_id = peer.id();
-                        match Self::quote_remote_endpoint(&self.quote_req, endpoint, peer_id).await {
+                        match Self::quote_remote_endpoint(quote_req, endpoint, peer_id).await {
                             Ok(accepted) => return Ok(accepted),
                             Err(QuoteCandidateError::Declined(status)) => {
                                 info!("provider declined quote: {status}");
@@ -272,57 +311,13 @@ impl ExecutionRequest {
         .context("discovery timed out")?
     }
 
-    async fn execute_discovered(
-        &self,
-        retries: usize,
-        sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
-        let max_attempts = retries.saturating_add(1);
-
-        info!("No node ID provided, discovering executor");
-
-        for attempt in 1..=max_attempts {
-            let endpoint = Self::bind_remote_endpoint().await?;
-            let mut quote = self.discover_remote_quote(&endpoint).await?;
-            let peer_id = quote.peer_id;
-            let mut committed = false;
-            let mut tracked_sink = |output: &[u8]| -> anyhow::Result<()> {
-                if !output.is_empty() {
-                    committed = true;
-                }
-                sink(output)
-            };
-
-            let result = self
-                .execute_with_driver(&mut quote.driver, quote.quote.quote_id, &mut tracked_sink)
-                .await;
-            endpoint.close().await;
-
-            match result {
-                Ok(output) => return Ok(output),
-                Err(err) => {
-                    if committed {
-                        return Err(err.context(format!(
-                            "execution failed on {peer_id} after output was emitted"
-                        )));
-                    }
-                    if attempt == max_attempts {
-                        return Err(err.context(format!("max retries ({retries}) exceeded")));
-                    }
-                    warn!(
-                        attempt,
-                        %peer_id,
-                        "execution failed before output, rediscovering: {err:#}"
-                    );
-                }
-            }
-        }
-
-        anyhow::bail!("max retries ({retries}) exceeded");
+    async fn prepare_discovered_remote(quote_req: &GetQuoteRequest) -> anyhow::Result<RemoteExecution> {
+        let endpoint = Self::bind_remote_endpoint().await?;
+        let quote = Self::discover_remote_quote(quote_req, &endpoint).await?;
+        Ok(RemoteExecution::from_quoted(endpoint, quote))
     }
 
     async fn execute_with_driver<D>(
-        &self,
         driver: &mut D,
         quote_id: String,
         sink: &mut OutputSink<'_>,
@@ -359,7 +354,7 @@ impl ExecutionRequest {
 
             let had_output = output.len();
             if let Some(status) =
-                self.consume_stream_event(event, &mut output, &mut completion_tokens, sink)?
+                Self::consume_stream_event(event, &mut output, &mut completion_tokens, sink)?
             {
                 if status == ExecutionStatus::Failed {
                     anyhow::bail!("execution failed");
@@ -385,11 +380,7 @@ impl ExecutionRequest {
         })
     }
 
-    fn verify_matching_output(
-        &self,
-        primary: &ExecutionOutput,
-        shadow: &ExecutionOutput,
-    ) -> anyhow::Result<()> {
+    fn verify_matching_output(primary: &ExecutionOutput, shadow: &ExecutionOutput) -> anyhow::Result<()> {
         if primary.output == shadow.output {
             return Ok(());
         }
@@ -435,7 +426,6 @@ impl ExecutionRequest {
     }
 
     fn consume_stream_event(
-        &self,
         event: ExecuteStreamEvent,
         output: &mut Vec<u8>,
         completion_tokens: &mut u32,
@@ -471,6 +461,142 @@ impl ExecutionRequest {
 
         *completion_tokens = u32::try_from(progress).unwrap_or(u32::MAX);
         Ok(Some(status))
+    }
+}
+
+impl PreparedExecution {
+    pub async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+        match &mut self.strategy {
+            PreparedExecutionStrategy::Run(route) => route.run(sink).await,
+            PreparedExecutionStrategy::Verify { primary, shadow } => {
+                let primary_output = primary.run(sink).await?;
+                let shadow_output = shadow.run(&mut |_: &[u8]| Ok(())).await?;
+                ExecutionRequest::verify_matching_output(&primary_output, &shadow_output)?;
+                Ok(primary_output)
+            }
+        }
+    }
+}
+
+impl PreparedRoute {
+    async fn prepare(
+        runtime: &ExecutionRuntime,
+        quote_req: &GetQuoteRequest,
+        route: &ExecutionRoute,
+    ) -> anyhow::Result<Self> {
+        match route {
+            ExecutionRoute::Local => {
+                let mut executor = runtime.require_local_executor()?;
+                executor
+                    .preload_weights(local_model_spec(quote_req))
+                    .await
+                    .context("failed to preload local weights")?;
+                let quote = ExecutionRequest::quote_with_driver(
+                    quote_req,
+                    &mut executor,
+                    || "local quote failed".to_string(),
+                )
+                .await?;
+                Ok(Self::Local {
+                    executor,
+                    quote_id: quote.quote_id,
+                })
+            }
+            ExecutionRoute::RemoteDirect(node_id) => {
+                let endpoint = ExecutionRequest::bind_remote_endpoint().await?;
+                let quote = ExecutionRequest::quote_remote_peer(quote_req, &endpoint, *node_id).await?;
+                Ok(Self::RemoteDirect(RemoteExecution::from_quoted(
+                    endpoint, quote,
+                )))
+            }
+            ExecutionRoute::RemoteDiscovery { retries } => Ok(Self::RemoteDiscovery {
+                quote_req: quote_req.clone(),
+                retries: *retries,
+                active: None,
+            }),
+        }
+    }
+
+    async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+        match self {
+            PreparedRoute::Local { executor, quote_id } => {
+                ExecutionRequest::execute_with_driver(executor, quote_id.clone(), sink).await
+            }
+            PreparedRoute::RemoteDirect(remote) => remote.run(sink).await,
+            PreparedRoute::RemoteDiscovery {
+                quote_req,
+                retries,
+                active,
+            } => {
+                let max_attempts = retries.saturating_add(1);
+                info!("No node ID provided, discovering executor");
+
+                for attempt in 1..=max_attempts {
+                    if active.is_none() {
+                        *active = Some(ExecutionRequest::prepare_discovered_remote(quote_req).await?);
+                    }
+
+                    let remote = active.as_mut().expect("active remote execution");
+                    let peer_id = remote.peer_id;
+                    let mut committed = false;
+                    let mut tracked_sink = |output: &[u8]| -> anyhow::Result<()> {
+                        if !output.is_empty() {
+                            committed = true;
+                        }
+                        sink(output)
+                    };
+
+                    let result = remote.run(&mut tracked_sink).await;
+
+                    match result {
+                        Ok(output) => return Ok(output),
+                        Err(err) => {
+                            if committed {
+                                return Err(err.context(format!(
+                                    "execution failed on {peer_id} after output was emitted"
+                                )));
+                            }
+                            *active = None;
+                            if attempt == max_attempts {
+                                return Err(err.context(format!("max retries ({retries}) exceeded")));
+                            }
+                            warn!(
+                                attempt,
+                                %peer_id,
+                                "execution failed before output, rediscovering: {err:#}"
+                            );
+                        }
+                    }
+                }
+
+                anyhow::bail!("max retries ({retries}) exceeded");
+            }
+        }
+    }
+}
+
+fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
+    let revision = quote_req.huggingface_revision.trim();
+    if revision.is_empty() {
+        quote_req.huggingface_model_id.clone()
+    } else {
+        format!("{}@{revision}", quote_req.huggingface_model_id)
+    }
+}
+
+impl RemoteExecution {
+    fn from_quoted(endpoint: Arc<Endpoint>, quoted: QuotedRemoteDriver) -> Self {
+        Self {
+            endpoint,
+            peer_id: quoted.peer_id,
+            quote_id: quoted.quote.quote_id,
+            driver: quoted.driver,
+        }
+    }
+
+    async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+        let _endpoint = &self.endpoint;
+        ExecutionRequest::execute_with_driver(&mut self.driver, self.quote_id.clone(), sink).await
     }
 }
 
