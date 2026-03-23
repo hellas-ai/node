@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tonic_iroh_transport::iroh::endpoint::PathId;
+use tonic_iroh_transport::iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher};
+use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::DhtBackend;
 use tonic_iroh_transport::{IrohContext, TransportBuilder};
@@ -141,9 +142,15 @@ pub(super) async fn spawn_node(
     queue_size: usize,
     preload_weights: Vec<String>,
 ) -> anyhow::Result<NodeHandle> {
+    let make_builder = || {
+        Endpoint::builder(presets::N0)
+            .clear_address_lookup()
+            .address_lookup(PkarrPublisher::n0_dns().addr_filter(AddrFilter::ip_only()))
+            .address_lookup(DnsAddressLookup::n0_dns())
+    };
     let endpoint = if let Some(port) = port {
         // Explicit port: fail if it can't bind.
-        Endpoint::builder()
+        make_builder()
             .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?
             .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))?
             .bind()
@@ -154,7 +161,7 @@ pub(super) async fn spawn_node(
         let mut endpoint = None;
         for offset in 0..MAX_PORT_RETRIES {
             let p = DEFAULT_PORT.wrapping_add(offset);
-            match Endpoint::builder()
+            match make_builder()
                 .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))
                 .and_then(|b| b.bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0)))
             {
@@ -200,8 +207,8 @@ pub(super) async fn spawn_node(
         .context("failed to initialize executor backend")?;
     preload_startup_weights(&executor, &preload_weights).await?;
     let execute_service = ExecuteServer::new(executor)
-        .accept_compressed(CompressionEncoding::Gzip)
-        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Zstd)
+        .send_compressed(CompressionEncoding::Zstd)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
     let execute_service =

@@ -14,9 +14,15 @@ pub struct ExecuteOptions {
     pub retries: usize,
     pub local: bool,
     pub verify_local: bool,
+    pub metrics_port: Option<u16>,
 }
 
 pub async fn run(options: ExecuteOptions) -> CliResult<()> {
+    if let Some(metrics_port) = options.metrics_port {
+        let registry = std::sync::Arc::new(prometheus_client::registry::Registry::default());
+        crate::metrics::spawn_metrics_server(metrics_port, registry);
+    }
+
     let assets = Arc::new(ModelAssets::load(&options.model)?);
     let prepared = assets.prepare_plain_prompt(&options.prompt)?;
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);

@@ -37,6 +37,7 @@ pub struct GatewayOptions {
     pub retries: usize,
     pub default_max_tokens: u32,
     pub force_model: Option<String>,
+    pub metrics_port: Option<u16>,
 }
 
 type SseSender = mpsc::UnboundedSender<Result<Event, Infallible>>;
@@ -54,6 +55,11 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind gateway on {addr}"))?;
+
+    if let Some(metrics_port) = options.metrics_port {
+        let registry = Arc::new(prometheus_client::registry::Registry::default());
+        crate::metrics::spawn_metrics_server(metrics_port, registry);
+    }
 
     println!("Hellas gateway listening on http://{addr}");
     println!("POST /v1/chat/completions (OpenAI)");
