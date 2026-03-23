@@ -5,13 +5,13 @@ use pkarr::mainline::Dht;
 use thiserror::Error;
 use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::iroh::EndpointId;
-use tonic_iroh_transport::iroh::address_lookup::IntoAddressLookupError;
+use tonic_iroh_transport::iroh::address_lookup::AddressLookupBuilderError;
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::{
     N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
 };
-use tonic_iroh_transport::iroh::endpoint::BindError;
+use tonic_iroh_transport::iroh::endpoint::{BindError, EndpointError, presets};
 
 pub struct DiscoveryBindings {
     pub mdns: MdnsAddressLookup,
@@ -33,7 +33,7 @@ pub enum DiscoveryError {
     #[error("failed to start mDNS discovery")]
     BuildMdnsLookup {
         #[source]
-        source: IntoAddressLookupError,
+        source: AddressLookupBuilderError,
     },
     #[error("failed to initialize DHT client")]
     BuildDhtClient {
@@ -52,7 +52,12 @@ pub enum DiscoveryError {
     #[error("failed to initialize pkarr+DHT discovery")]
     BuildPkarrLookup {
         #[source]
-        source: IntoAddressLookupError,
+        source: AddressLookupBuilderError,
+    },
+    #[error("failed to access endpoint address lookup services")]
+    AddressLookupUnavailable {
+        #[source]
+        source: EndpointError,
     },
 }
 
@@ -82,12 +87,15 @@ impl DiscoveryBindings {
         advertise_mdns: bool,
         publish_pkarr: bool,
     ) -> Result<Self, DiscoveryError> {
+        let address_lookup = endpoint
+            .address_lookup()
+            .map_err(|source| DiscoveryError::AddressLookupUnavailable { source })?;
         let mdns = MdnsAddressLookup::builder()
             .advertise(advertise_mdns)
             .service_name("hellas")
             .build(endpoint.id())
             .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
-        endpoint.address_lookup().add(mdns.clone());
+        address_lookup.add(mdns.clone());
 
         let shared_pkarr = build_shared_pkarr_client()?;
         let dht = Arc::new(shared_pkarr.dht().ok_or(DiscoveryError::MissingDhtHandle)?);
@@ -101,7 +109,7 @@ impl DiscoveryBindings {
         let pkarr = pkarr
             .build()
             .map_err(|source| DiscoveryError::BuildPkarrLookup { source })?;
-        endpoint.address_lookup().add(pkarr);
+        address_lookup.add(pkarr);
 
         Ok(Self { mdns, dht })
     }
@@ -109,8 +117,7 @@ impl DiscoveryBindings {
 
 impl DiscoveryEndpoint {
     pub async fn bind() -> Result<Self, DiscoveryError> {
-        let endpoint = Endpoint::builder()
-            .bind()
+        let endpoint = Endpoint::bind(presets::N0)
             .await
             .map_err(|source| DiscoveryError::BindEndpoint { source })?;
         let bindings = DiscoveryBindings::attach(&endpoint, false, false)?;

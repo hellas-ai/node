@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::IrohConnect;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
+use tonic_iroh_transport::iroh::{Endpoint, EndpointId, endpoint::presets};
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -62,10 +62,10 @@ pub struct ExecutionOutput {
     pub completion_tokens: u32,
 }
 
-#[derive(Debug, Clone)]
-struct AcceptedQuote {
+struct QuotedRemoteDriver {
     peer_id: EndpointId,
     quote: hellas_rpc::pb::hellas::GetQuoteResponse,
+    driver: RemoteExecuteDriver,
 }
 
 #[derive(Debug)]
@@ -138,8 +138,10 @@ impl ExecutionRequest {
             }
             ExecutionRoute::RemoteDirect(node_id) => {
                 let endpoint = Self::bind_remote_endpoint().await?;
-                let quote = self.quote_remote_peer(&endpoint, *node_id).await?;
-                let result = self.execute_remote_quote(&endpoint, quote, sink).await;
+                let mut quote = self.quote_remote_peer(&endpoint, *node_id).await?;
+                let result = self
+                    .execute_with_driver(&mut quote.driver, quote.quote.quote_id, sink)
+                    .await;
                 endpoint.close().await;
                 result
             }
@@ -170,8 +172,7 @@ impl ExecutionRequest {
 
     async fn bind_remote_endpoint() -> anyhow::Result<Arc<Endpoint>> {
         Ok(Arc::new(
-            Endpoint::builder()
-                .bind()
+            Endpoint::bind(presets::N0)
                 .await
                 .context("failed to create client transport endpoint")?,
         ))
@@ -181,7 +182,7 @@ impl ExecutionRequest {
         quote_req: &GetQuoteRequest,
         endpoint: &Endpoint,
         peer_id: EndpointId,
-    ) -> Result<AcceptedQuote, QuoteCandidateError> {
+    ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
         let start = Instant::now();
         let channel = ExecuteService::connect(endpoint, peer_id.into())
             .connect_timeout(REMOTE_CONNECT_TIMEOUT)
@@ -200,14 +201,18 @@ impl ExecutionRequest {
             quote_rpc_ms = start.elapsed().as_millis(),
             "quote rpc completed"
         );
-        Ok(AcceptedQuote { peer_id, quote })
+        Ok(QuotedRemoteDriver {
+            peer_id,
+            quote,
+            driver,
+        })
     }
 
     async fn quote_remote_peer(
         &self,
         endpoint: &Endpoint,
         peer_id: EndpointId,
-    ) -> anyhow::Result<AcceptedQuote> {
+    ) -> anyhow::Result<QuotedRemoteDriver> {
         Self::quote_remote_endpoint(&self.quote_req, endpoint, peer_id)
             .await
             .map_err(|err| match err {
@@ -218,7 +223,10 @@ impl ExecutionRequest {
             })
     }
 
-    async fn discover_remote_quote(&self, endpoint: &Endpoint) -> anyhow::Result<AcceptedQuote> {
+    async fn discover_remote_quote(
+        &self,
+        endpoint: &Endpoint,
+    ) -> anyhow::Result<QuotedRemoteDriver> {
         let bindings = DiscoveryBindings::client(endpoint.id())?;
 
         let mut registry = ServiceRegistry::new(&endpoint);
@@ -264,22 +272,6 @@ impl ExecutionRequest {
         .context("discovery timed out")?
     }
 
-    async fn execute_remote_quote(
-        &self,
-        endpoint: &Endpoint,
-        quote: AcceptedQuote,
-        sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
-        let mut driver = RemoteExecuteDriver::new(
-            ExecuteService::connect(endpoint, quote.peer_id.into())
-                .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-                .await
-                .with_context(|| format!("failed to connect to node {}", quote.peer_id))?,
-        );
-        self.execute_with_driver(&mut driver, quote.quote.quote_id, sink)
-            .await
-    }
-
     async fn execute_discovered(
         &self,
         retries: usize,
@@ -291,7 +283,7 @@ impl ExecutionRequest {
 
         for attempt in 1..=max_attempts {
             let endpoint = Self::bind_remote_endpoint().await?;
-            let quote = self.discover_remote_quote(&endpoint).await?;
+            let mut quote = self.discover_remote_quote(&endpoint).await?;
             let peer_id = quote.peer_id;
             let mut committed = false;
             let mut tracked_sink = |output: &[u8]| -> anyhow::Result<()> {
@@ -301,7 +293,9 @@ impl ExecutionRequest {
                 sink(output)
             };
 
-            let result = self.execute_remote_quote(&endpoint, quote, &mut tracked_sink).await;
+            let result = self
+                .execute_with_driver(&mut quote.driver, quote.quote.quote_id, &mut tracked_sink)
+                .await;
             endpoint.close().await;
 
             match result {

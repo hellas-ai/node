@@ -18,7 +18,7 @@ pub(super) fn build_program_bytes(config: &Value, max_sequence_length: usize) ->
     let program = ProgramSpec::text_from_config(config, max_sequence_length)
         .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
     program
-        .normalized_json()
+        .canonical_bytes()
         .map_err(|source| ModelAssetsError::SerializeProgram { source })
 }
 

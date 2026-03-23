@@ -8,6 +8,7 @@ use tonic_iroh_transport::iroh::EndpointId;
 
 mod commands;
 mod execution;
+mod metrics;
 mod text_output;
 
 #[derive(Parser)]
@@ -90,6 +91,9 @@ enum Commands {
         /// Override request model and force this HuggingFace model id, optionally with @revision
         #[arg(long = "force-model")]
         force_model: Option<String>,
+        /// Prometheus metrics port (e.g. 9090)
+        #[arg(long = "metrics-port")]
+        metrics_port: Option<u16>,
     },
     /// Check health of a remote node
     Health {
@@ -126,6 +130,9 @@ enum Commands {
             conflicts_with = "local"
         )]
         verify_local: bool,
+        /// Prometheus metrics port (e.g. 9090)
+        #[arg(long = "metrics-port")]
+        metrics_port: Option<u16>,
     },
     /// Discover peers and log network events
     Monitor {
@@ -276,6 +283,7 @@ async fn main() {
             retries,
             default_max_tokens,
             force_model,
+            metrics_port,
         } => {
             commands::gateway::run(commands::gateway::GatewayOptions {
                 host,
@@ -288,6 +296,7 @@ async fn main() {
                 retries,
                 default_max_tokens,
                 force_model,
+                metrics_port,
             })
             .await
         }
@@ -300,6 +309,7 @@ async fn main() {
             retries,
             local,
             verify_local,
+            metrics_port,
         } => {
             commands::execute::run(commands::execute::ExecuteOptions {
                 node_id,
@@ -309,6 +319,7 @@ async fn main() {
                 retries,
                 local,
                 verify_local,
+                metrics_port,
             })
             .await
         }
