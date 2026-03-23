@@ -1,16 +1,32 @@
-use crate::state::{ExecutionPlan, QuoteRecord};
-use crate::weights::PrefixState;
-use crate::weights::{has_cached_weights, EnsureDisposition};
 use crate::ExecutorError;
+use crate::model::ModelSpec;
+use crate::state::{QuotePlan, QuoteRecord};
+use crate::weights::PrefixState;
+use crate::weights::{EnsureDisposition, WeightsLocator, has_cached_weights};
 use hellas_rpc::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
 use std::time::{Duration, Instant};
 
-use super::{weights_not_ready_error, Executor};
+use super::{Executor, weights_not_ready_error};
 
 const STATIC_QUOTE_AMOUNT: u64 = 1000;
 const QUOTE_TTL: Duration = Duration::from_secs(30);
 
 impl Executor {
+    pub(super) async fn handle_preload(&mut self, model: String) -> Result<(), ExecutorError> {
+        let spec = ModelSpec::parse(&model)?;
+        let locator: WeightsLocator = spec.into();
+        self.runtime_manager
+            .ensure_preloaded(locator.clone())
+            .await
+            .map_err(|error| super::map_weights_error(&locator, error))?;
+        info!(
+            model = %locator.model_id,
+            requested_revision = %locator.revision,
+            "preloaded weights"
+        );
+        Ok(())
+    }
+
     pub(super) async fn handle_quote(
         &mut self,
         request: GetQuoteRequest,
@@ -18,8 +34,9 @@ impl Executor {
         let total_start = Instant::now();
         self.store.prune_expired_quotes(Instant::now());
         let plan_start = Instant::now();
-        let (plan, program_id) = ExecutionPlan::from_quote_request(request)?;
+        let plan = QuotePlan::from_quote_request(request)?;
         let plan_parse_ms = plan_start.elapsed().as_millis();
+        let program_id = plan.program.id().to_string();
         if !self
             .execute_policy
             .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
@@ -31,16 +48,16 @@ impl Executor {
         }
 
         let ensure_start = Instant::now();
-        self.ensure_quote_weights_ready(&plan).await?;
+        self.ensure_quote_weights_ready(&plan.weights_key).await?;
         let ensure_weights_ms = ensure_start.elapsed().as_millis();
         let bind_start = Instant::now();
         let program = self
-            .weights
+            .runtime_manager
             .bound_program(&plan.weights_key, &plan.program)
             .await?;
         let bind_program_ms = bind_start.elapsed().as_millis();
         let prefix_start = Instant::now();
-        let prefix_match = program.lookup_prefix(&plan.input_ids);
+        let prefix_match = program.lookup_prefix(&plan.invocation.input_ids);
         let prefix_lookup_ms = prefix_start.elapsed().as_millis();
         let (start_snapshot, start_prefix_len, start_prefix_hash, start_next_token) =
             match prefix_match {
@@ -60,11 +77,11 @@ impl Executor {
 
         let model_id = plan.weights_key.model_id.clone();
         let requested_revision = plan.weights_key.revision.clone();
-        let prompt_tokens = plan.input_ids.len();
-        let max_new_tokens = plan.max_new_tokens;
+        let prompt_tokens = plan.invocation.input_ids.len();
+        let max_new_tokens = plan.invocation.max_new_tokens;
         let cached_prompt_tokens = start_prefix_len;
         let quote_id = self.store.create_quote(QuoteRecord {
-            plan,
+            invocation: plan.invocation,
             program,
             start_snapshot,
             start_prefix_len,
@@ -104,16 +121,18 @@ impl Executor {
         })
     }
 
-    async fn ensure_quote_weights_ready(&self, plan: &ExecutionPlan) -> Result<(), ExecutorError> {
-        let locator = &plan.weights_key;
-        match self.weights.ensure_ready(locator.clone()).await {
+    async fn ensure_quote_weights_ready(
+        &self,
+        locator: &crate::weights::WeightsLocator,
+    ) -> Result<(), ExecutorError> {
+        match self.runtime_manager.ensure_ready(locator.clone()).await {
             EnsureDisposition::Ready => Ok(()),
             EnsureDisposition::Queued | EnsureDisposition::InFlight => {
                 if !has_cached_weights(locator) {
                     return Err(weights_not_ready_error(locator));
                 }
 
-                self.weights
+                self.runtime_manager
                     .ensure_ready_wait(locator.clone(), tokio::time::Duration::from_secs(2))
                     .await
                     .map_err(|error| super::map_weights_error(locator, error))

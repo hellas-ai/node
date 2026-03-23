@@ -1,10 +1,10 @@
 use super::state::{GatewayState, PreparedGeneration};
 use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
 use anyhow::anyhow;
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use catgrad_llm::types::openai;
 use serde_json::json;
 use std::sync::Arc;
@@ -42,13 +42,15 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
             .object("chat.completion.chunk".to_string())
             .created(created)
             .model(prepared.model.clone())
-            .choices(vec![openai::ChatStreamChoice::builder()
-                .index(0)
-                .delta(openai::ChatDelta {
-                    role: Some("assistant".to_string()),
-                    ..Default::default()
-                })
-                .build()])
+            .choices(vec![
+                openai::ChatStreamChoice::builder()
+                    .index(0)
+                    .delta(openai::ChatDelta {
+                        role: Some("assistant".to_string()),
+                        ..Default::default()
+                    })
+                    .build(),
+            ])
             .build();
 
         if tx.send(Ok(sse_data(&start_chunk))).is_err() {
@@ -62,13 +64,15 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
                     .object("chat.completion.chunk".to_string())
                     .created(created)
                     .model(prepared.model.clone())
-                    .choices(vec![openai::ChatStreamChoice::builder()
-                        .index(0)
-                        .delta(openai::ChatDelta {
-                            content: Some(delta.to_string()),
-                            ..Default::default()
-                        })
-                        .build()])
+                    .choices(vec![
+                        openai::ChatStreamChoice::builder()
+                            .index(0)
+                            .delta(openai::ChatDelta {
+                                content: Some(delta.to_string()),
+                                ..Default::default()
+                            })
+                            .build(),
+                    ])
                     .build();
                 tx.send(Ok(sse_data(&chunk)))
                     .map_err(|_| anyhow!("stream closed"))?;
@@ -92,11 +96,13 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
             .object("chat.completion.chunk".to_string())
             .created(created)
             .model(prepared.model.clone())
-            .choices(vec![openai::ChatStreamChoice::builder()
-                .index(0)
-                .delta(openai::ChatDelta::default())
-                .finish_reason(Some(openai::FinishReason::Stop))
-                .build()])
+            .choices(vec![
+                openai::ChatStreamChoice::builder()
+                    .index(0)
+                    .delta(openai::ChatDelta::default())
+                    .finish_reason(Some(openai::FinishReason::Stop))
+                    .build(),
+            ])
             .build();
         if tx.send(Ok(sse_data(&final_chunk))).is_err() {
             return;
@@ -134,11 +140,13 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         .object("chat.completion".to_string())
         .created(now_unix())
         .model(prepared.model.clone())
-        .choices(vec![openai::ChatChoice::builder()
-            .index(0)
-            .message(openai::ChatMessage::assistant(text))
-            .finish_reason(Some(openai::FinishReason::Stop))
-            .build()])
+        .choices(vec![
+            openai::ChatChoice::builder()
+                .index(0)
+                .message(openai::ChatMessage::assistant(text))
+                .finish_reason(Some(openai::FinishReason::Stop))
+                .build(),
+        ])
         .usage(Some(openai::Usage::from_counts(
             prepared.prompt_tokens,
             generated.completion_tokens,

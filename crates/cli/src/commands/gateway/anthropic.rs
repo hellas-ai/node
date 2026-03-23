@@ -1,10 +1,10 @@
 use super::state::{GatewayState, PreparedGeneration};
 use super::{next_id, parse_json_body, sse_event_data, sse_response};
 use anyhow::anyhow;
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use catgrad_llm::types::anthropic;
 use std::sync::Arc;
 

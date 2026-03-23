@@ -1,5 +1,8 @@
-use super::{CachedProgram, EnsureDisposition, WeightsBundle, WeightsError, WeightsLocator};
-use std::collections::{HashMap, VecDeque};
+use super::{CachedProgram, WeightsBundle, WeightsError, WeightsLocator};
+use crate::backend::ExecBackend;
+use catgrad_llm::Runtime;
+use catgrad_llm::helpers::WeightPostProcess;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -10,10 +13,16 @@ enum EntryStatus {
     Failed(String),
 }
 
+struct RuntimeEntry {
+    runtime: Arc<Runtime<ExecBackend>>,
+    programs: HashMap<String, Arc<CachedProgram>>,
+}
+
 struct Entry {
     status: EntryStatus,
     bundle: Option<Arc<WeightsBundle>>,
-    programs: HashMap<String, Arc<CachedProgram>>,
+    runtimes: HashMap<WeightPostProcess, RuntimeEntry>,
+    generation: u64,
 }
 
 impl Default for Entry {
@@ -21,119 +30,138 @@ impl Default for Entry {
         Self {
             status: EntryStatus::Queued,
             bundle: None,
-            programs: HashMap::new(),
+            runtimes: HashMap::new(),
+            generation: 0,
         }
     }
 }
 
-pub(crate) struct EnsureTransition {
-    pub disposition: EnsureDisposition,
-    pub next_load: Option<WeightsLocator>,
+pub(crate) struct ProgramLookup {
+    pub generation: u64,
+    pub bundle: Arc<WeightsBundle>,
+    pub runtime: Option<Arc<Runtime<ExecBackend>>>,
+    pub program: Option<Arc<CachedProgram>>,
+}
+
+pub(crate) enum CacheProgramOutcome {
+    Cached(Arc<CachedProgram>),
+    Stale,
+}
+
+pub(crate) enum CacheRuntimeOutcome {
+    Cached,
+    Stale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EntryStatusSnapshot {
+    Queued,
+    Loading,
+    Ready,
+    Failed(String),
 }
 
 #[derive(Default)]
 pub(crate) struct WeightsState {
     entries: HashMap<WeightsLocator, Entry>,
-    active: Option<WeightsLocator>,
-    queue: VecDeque<WeightsLocator>,
 }
 
 impl WeightsState {
-    pub(crate) fn ensure(
-        &mut self,
-        locator: &WeightsLocator,
-        denied_error: Option<String>,
-    ) -> EnsureTransition {
-        let disposition = match self.entries.get(locator).map(|entry| &entry.status) {
-            Some(EntryStatus::Ready) => EnsureDisposition::Ready,
-            Some(EntryStatus::Failed(_)) => {
-                if let Some(error) = denied_error {
-                    EnsureDisposition::Failed(error)
-                } else {
-                    self.requeue(locator.clone());
-                    EnsureDisposition::Queued
-                }
-            }
-            Some(EntryStatus::Queued | EntryStatus::Loading) => {
-                if self.is_pending(locator) {
-                    EnsureDisposition::InFlight
-                } else {
-                    self.requeue(locator.clone());
-                    EnsureDisposition::Queued
-                }
-            }
-            None => {
-                if let Some(error) = denied_error {
-                    EnsureDisposition::Failed(error)
-                } else {
-                    self.entries.insert(locator.clone(), Entry::default());
-                    self.queue.push_back(locator.clone());
-                    EnsureDisposition::Queued
-                }
-            }
-        };
+    pub(crate) fn status(&self, locator: &WeightsLocator) -> Option<EntryStatusSnapshot> {
+        self.entries.get(locator).map(|entry| match &entry.status {
+            EntryStatus::Queued => EntryStatusSnapshot::Queued,
+            EntryStatus::Loading => EntryStatusSnapshot::Loading,
+            EntryStatus::Ready => EntryStatusSnapshot::Ready,
+            EntryStatus::Failed(error) => EntryStatusSnapshot::Failed(error.clone()),
+        })
+    }
 
-        let next_load = matches!(disposition, EnsureDisposition::Queued)
-            .then(|| self.start_next())
-            .flatten();
+    pub(crate) fn mark_queued(&mut self, locator: WeightsLocator) {
+        let entry = self.entries.entry(locator).or_default();
+        entry.status = EntryStatus::Queued;
+    }
 
-        EnsureTransition {
-            disposition,
-            next_load,
+    pub(crate) fn mark_loading(&mut self, locator: &WeightsLocator) -> Result<(), WeightsError> {
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or(WeightsError::UnknownKey)?;
+        match &entry.status {
+            EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
+            _ => {
+                entry.status = EntryStatus::Loading;
+                Ok(())
+            }
         }
     }
 
-    pub(crate) fn bundle(
-        &self,
-        locator: &WeightsLocator,
-    ) -> Result<Arc<WeightsBundle>, WeightsError> {
-        let entry = self.entries.get(locator).ok_or(WeightsError::UnknownKey)?;
-        match (&entry.status, &entry.bundle) {
-            (EntryStatus::Ready, Some(bundle)) => Ok(bundle.clone()),
-            (EntryStatus::Ready, None) => Err(WeightsError::UnknownKey),
-            (EntryStatus::Failed(error), _) => Err(WeightsError::Failed(error.clone())),
-            (EntryStatus::Queued | EntryStatus::Loading, _) => Err(WeightsError::NotReady),
-        }
-    }
-
-    pub(crate) fn finish_ready(
-        &mut self,
-        locator: &WeightsLocator,
-        bundle: Arc<WeightsBundle>,
-    ) -> Option<WeightsLocator> {
+    pub(crate) fn finish_ready(&mut self, locator: &WeightsLocator, bundle: Arc<WeightsBundle>) {
         let entry = self.entries.entry(locator.clone()).or_default();
         entry.status = EntryStatus::Ready;
         entry.bundle = Some(bundle);
-        entry.programs.clear();
-        if self.active.as_ref() == Some(locator) {
-            self.active = None;
-        }
-        self.start_next()
+        entry.runtimes.clear();
+        entry.generation = entry.generation.wrapping_add(1);
     }
 
-    pub(crate) fn finish_failed(
-        &mut self,
-        locator: &WeightsLocator,
-        error: String,
-    ) -> Option<WeightsLocator> {
+    pub(crate) fn finish_failed(&mut self, locator: &WeightsLocator, error: String) {
         let entry = self.entries.entry(locator.clone()).or_default();
         entry.status = EntryStatus::Failed(error);
         entry.bundle = None;
-        entry.programs.clear();
-        if self.active.as_ref() == Some(locator) {
-            self.active = None;
-        }
-        self.start_next()
+        entry.runtimes.clear();
+        entry.generation = entry.generation.wrapping_add(1);
     }
 
-    pub(crate) fn cached_program(
+    pub(crate) fn lookup_program(
         &self,
         locator: &WeightsLocator,
+        weight_post_process: WeightPostProcess,
         program_id: &str,
-    ) -> Result<Option<Arc<CachedProgram>>, WeightsError> {
+    ) -> Result<ProgramLookup, WeightsError> {
         let entry = self.entries.get(locator).ok_or(WeightsError::UnknownKey)?;
         match &entry.status {
-            EntryStatus::Ready => Ok(entry.programs.get(program_id).cloned()),
+            EntryStatus::Ready => {
+                let runtime_entry = entry.runtimes.get(&weight_post_process);
+                Ok(ProgramLookup {
+                    generation: entry.generation,
+                    bundle: entry.bundle.clone().ok_or(WeightsError::UnknownKey)?,
+                    runtime: runtime_entry.map(|runtime| runtime.runtime.clone()),
+                    program: runtime_entry
+                        .and_then(|runtime| runtime.programs.get(program_id))
+                        .cloned(),
+                })
+            }
+            EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
+            EntryStatus::Queued | EntryStatus::Loading => Err(WeightsError::NotReady),
+        }
+    }
+
+    pub(crate) fn cache_runtime(
+        &mut self,
+        locator: &WeightsLocator,
+        generation: u64,
+        weight_post_process: WeightPostProcess,
+        runtime: Arc<Runtime<ExecBackend>>,
+    ) -> Result<CacheRuntimeOutcome, WeightsError> {
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or(WeightsError::UnknownKey)?;
+        match &entry.status {
+            EntryStatus::Ready => {
+                if entry.generation != generation {
+                    return Ok(CacheRuntimeOutcome::Stale);
+                }
+
+                let cached = entry
+                    .runtimes
+                    .entry(weight_post_process)
+                    .or_insert_with(|| RuntimeEntry {
+                        runtime,
+                        programs: HashMap::new(),
+                    });
+                let _ = cached;
+                Ok(CacheRuntimeOutcome::Cached)
+            }
             EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
             EntryStatus::Queued | EntryStatus::Loading => Err(WeightsError::NotReady),
         }
@@ -142,62 +170,41 @@ impl WeightsState {
     pub(crate) fn cache_program(
         &mut self,
         locator: &WeightsLocator,
+        generation: u64,
+        weight_post_process: WeightPostProcess,
         program_id: String,
         program: Arc<CachedProgram>,
-    ) -> Result<Arc<CachedProgram>, WeightsError> {
-        let entry = self.entries.get_mut(locator).ok_or(WeightsError::UnknownKey)?;
+    ) -> Result<CacheProgramOutcome, WeightsError> {
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or(WeightsError::UnknownKey)?;
         match &entry.status {
             EntryStatus::Ready => {
-                let cached = entry.programs.entry(program_id).or_insert(program);
-                Ok(cached.clone())
+                if entry.generation != generation {
+                    return Ok(CacheProgramOutcome::Stale);
+                }
+
+                let runtime = entry
+                    .runtimes
+                    .get_mut(&weight_post_process)
+                    .ok_or(WeightsError::UnknownKey)?;
+                let cached = runtime.programs.entry(program_id).or_insert(program);
+                Ok(CacheProgramOutcome::Cached(cached.clone()))
             }
             EntryStatus::Failed(error) => Err(WeightsError::Failed(error.clone())),
             EntryStatus::Queued | EntryStatus::Loading => Err(WeightsError::NotReady),
         }
-    }
-
-    fn requeue(&mut self, locator: WeightsLocator) {
-        if let Some(entry) = self.entries.get_mut(&locator) {
-            entry.status = EntryStatus::Queued;
-        }
-        if !self.is_pending(&locator) {
-            self.queue.push_back(locator);
-        }
-    }
-
-    fn start_next(&mut self) -> Option<WeightsLocator> {
-        if self.active.is_some() {
-            return None;
-        }
-
-        let locator = self.queue.pop_front()?;
-        self.active = Some(locator.clone());
-        if let Some(entry) = self.entries.get_mut(&locator) {
-            entry.status = EntryStatus::Loading;
-        }
-        Some(locator)
-    }
-
-    fn is_pending(&self, locator: &WeightsLocator) -> bool {
-        self.active.as_ref() == Some(locator) || self.queue.iter().any(|queued| queued == locator)
-    }
-
-    #[cfg(test)]
-    fn pending_occurrences(&self, locator: &WeightsLocator) -> usize {
-        usize::from(self.active.as_ref() == Some(locator))
-            + self
-                .queue
-                .iter()
-                .filter(|queued| *queued == locator)
-                .count()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::collection::vec;
-    use proptest::prelude::*;
+    use catgrad::category::lang::{Term, TypedTerm};
+    use catgrad::path::Path;
+    use catgrad_llm::helpers::WeightPostProcess;
+    use catgrad_llm::{Program, ProgramSpec};
 
     fn locator(index: u8) -> WeightsLocator {
         WeightsLocator {
@@ -213,65 +220,143 @@ mod tests {
         })
     }
 
-    #[test]
-    fn ensure_starts_loading_immediately_when_idle() {
-        let mut state = WeightsState::default();
-        let action = state.ensure(&locator(0), None);
-        assert_eq!(action.disposition, EnsureDisposition::Queued);
-        assert_eq!(action.next_load, Some(locator(0)));
+    fn dummy_runtime() -> Arc<Runtime<ExecBackend>> {
+        Arc::new(
+            Runtime::new(
+                crate::backend::create_backend().unwrap(),
+                WeightPostProcess::None,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn dummy_program() -> Program {
+        Program::from_spec(ProgramSpec::from_typed_term(
+            TypedTerm {
+                term: Term::empty(),
+                source_type: vec![],
+                target_type: vec![],
+            },
+            Path::empty(),
+            vec![],
+            1,
+            WeightPostProcess::None,
+        ))
+        .unwrap()
+    }
+
+    fn dummy_cached_program() -> Arc<CachedProgram> {
+        Arc::new(CachedProgram::new(Arc::new(
+            dummy_runtime().bind(dummy_program()).unwrap(),
+        )))
     }
 
     #[test]
-    fn failed_locator_can_requeue_when_admission_is_allowed() {
+    fn mark_queued_inserts_missing_entry() {
         let mut state = WeightsState::default();
         let locator = locator(0);
-        state.ensure(&locator, None);
-        state.finish_failed(&locator, "boom".to_string());
+        state.mark_queued(locator.clone());
 
-        let action = state.ensure(&locator, None);
-        assert_eq!(action.disposition, EnsureDisposition::Queued);
-        assert_eq!(action.next_load, Some(locator));
+        assert_eq!(state.status(&locator), Some(EntryStatusSnapshot::Queued));
     }
 
     #[test]
-    fn failed_locator_stays_failed_when_admission_is_denied() {
+    fn mark_loading_updates_existing_entry() {
         let mut state = WeightsState::default();
         let locator = locator(0);
-        state.ensure(&locator, None);
-        state.finish_failed(&locator, "boom".to_string());
+        state.mark_queued(locator.clone());
 
-        let action = state.ensure(&locator, Some("denied".to_string()));
+        state.mark_loading(&locator).unwrap();
+        assert_eq!(state.status(&locator), Some(EntryStatusSnapshot::Loading));
+    }
+
+    #[test]
+    fn ready_lookup_returns_bundle_after_completion() {
+        let mut state = WeightsState::default();
+        let locator = locator(0);
+        let bundle = dummy_bundle();
+        state.mark_queued(locator.clone());
+        state.finish_ready(&locator, bundle.clone());
+
+        let lookup = state
+            .lookup_program(&locator, WeightPostProcess::None, "missing")
+            .unwrap();
+        assert!(Arc::ptr_eq(&lookup.bundle, &bundle));
+    }
+
+    #[test]
+    fn cache_runtime_returns_stale_after_generation_changes() {
+        let mut state = WeightsState::default();
+        let locator = locator(0);
+        let bundle = dummy_bundle();
+        state.mark_queued(locator.clone());
+        state.finish_ready(&locator, bundle.clone());
+
+        let generation = state
+            .lookup_program(&locator, WeightPostProcess::None, "missing")
+            .unwrap()
+            .generation;
+
+        state.finish_ready(&locator, bundle);
+
+        let runtime = dummy_runtime();
+
+        assert!(matches!(
+            state
+                .cache_runtime(&locator, generation, WeightPostProcess::None, runtime)
+                .unwrap(),
+            CacheRuntimeOutcome::Stale
+        ));
+    }
+
+    #[test]
+    fn cache_program_returns_stale_after_generation_changes() {
+        let mut state = WeightsState::default();
+        let locator = locator(0);
+        let bundle = dummy_bundle();
+        state.mark_queued(locator.clone());
+        state.finish_ready(&locator, bundle.clone());
+
+        let generation = state
+            .lookup_program(&locator, WeightPostProcess::None, "missing")
+            .unwrap()
+            .generation;
+
+        let runtime = dummy_runtime();
+        let _ = state
+            .cache_runtime(&locator, generation, WeightPostProcess::None, runtime)
+            .unwrap();
+
+        state.finish_ready(&locator, bundle);
+
+        let bound_program = dummy_cached_program();
+
+        assert!(matches!(
+            state
+                .cache_program(
+                    &locator,
+                    generation,
+                    WeightPostProcess::None,
+                    "program".to_string(),
+                    bound_program,
+                )
+                .unwrap(),
+            CacheProgramOutcome::Stale
+        ));
+    }
+
+    #[test]
+    fn finish_failed_marks_entry_failed() {
+        let mut state = WeightsState::default();
+        let locator = locator(0);
+        state.mark_queued(locator.clone());
+
+        state.finish_failed(&locator, "boom".to_string());
         assert_eq!(
-            action.disposition,
-            EnsureDisposition::Failed("denied".to_string())
+            state.status(&locator),
+            Some(EntryStatusSnapshot::Failed("boom".to_string()))
         );
-        assert!(action.next_load.is_none());
-    }
-
-    #[test]
-    fn ready_bundle_is_returned_after_completion() {
-        let mut state = WeightsState::default();
-        let locator = locator(0);
-        state.ensure(&locator, None);
-        state.finish_ready(&locator, dummy_bundle());
-
-        assert!(state.bundle(&locator).is_ok());
-    }
-
-    proptest! {
-        #[test]
-        fn ensure_never_duplicates_pending_locators(sequence in vec(0u8..4, 0..64)) {
-            let mut state = WeightsState::default();
-            let locators: Vec<_> = (0..4).map(locator).collect();
-
-            for index in sequence {
-                let locator = &locators[index as usize];
-                state.ensure(locator, None);
-
-                for locator in &locators {
-                    prop_assert!(state.pending_occurrences(locator) <= 1);
-                }
-            }
-        }
     }
 }

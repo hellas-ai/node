@@ -49,6 +49,17 @@ RPC server running. Press Ctrl+C to stop
 (`--download-policy=skip --execute-policy=skip`). Only pass eager or allow-list
 policies when you intentionally want a node to serve remote work.
 
+Preload weights on startup:
+
+```bash
+hellas-cli serve \
+  --download-policy=eager \
+  --execute-policy=eager \
+  --preload HuggingFaceTB/SmolLM2-135M-Instruct
+```
+
+Repeat `--preload` to warm multiple models before the node starts serving.
+
 Run client:
 
 ```bash
@@ -83,7 +94,7 @@ Build and load CPU server image:
 ```bash
 nix build .#docker-server
 docker load < result
-docker run --rm -it -p 31145:31145/udp hellas-server:latest
+docker run --rm -it -p 31145:31145/udp ghcr.io/hellas-ai/node:latest
 ```
 
 Build and load CUDA server image:
@@ -91,14 +102,15 @@ Build and load CUDA server image:
 ```bash
 nix build .#docker-server-cuda
 docker load < result
-docker run --rm -it --device=nvidia.com/gpu=all -p 31145:31145/udp hellas-server-cuda:latest
+docker run --rm -it --device=nvidia.com/gpu=all -p 31145:31145/udp ghcr.io/hellas-ai/node:cuda-latest
 ```
 
 Build and push a docker image directly from the flake:
 
 ```bash
-nix run .#docker-push -- docker-server ghcr.io/acme/hellas-server:latest
-nix run .#docker-push -- docker-server-cuda-13-1 ghcr.io/acme/hellas-server-cuda:13.1
+nix run .#docker-push -- docker-server ghcr.io/hellas-ai/node:latest
+nix run .#docker-push -- docker-server-cuda ghcr.io/hellas-ai/node:cuda-latest
+nix run .#docker-push -- docker-server-cuda-13-1 ghcr.io/hellas-ai/node:cuda-13.1
 ```
 
 ## Dependency hygiene (CI + local)

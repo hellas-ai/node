@@ -27,12 +27,13 @@ pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, Pa
     ));
 
     let fetch = |file: &'static str| {
-        repo.get(file).map_err(|source| ModelAssetsError::FetchModelMetadata {
-            model_id: model.id.clone(),
-            revision: model.revision.clone(),
-            file,
-            source,
-        })
+        repo.get(file)
+            .map_err(|source| ModelAssetsError::FetchModelMetadata {
+                model_id: model.id.clone(),
+                revision: model.revision.clone(),
+                file,
+                source,
+            })
     };
     let config = fetch("config.json")?;
     let tokenizer = fetch("tokenizer.json")?;

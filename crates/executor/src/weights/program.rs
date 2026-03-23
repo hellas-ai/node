@@ -1,5 +1,4 @@
 use crate::backend::ExecBackend;
-use catgrad::category::core::Dtype;
 use catgrad_llm::{BoundProgram, Snapshot};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,31 +33,28 @@ pub(crate) struct PrefixState {
 struct PrefixEntry {
     snapshot: Arc<Snapshot<ExecBackend>>,
     next_token: u32,
+    bytes: usize,
     last_touch: u64,
 }
 
 struct PrefixCache {
     entries: HashMap<(usize, PrefixHash), PrefixEntry>,
     max_bytes: usize,
-    entry_bytes: usize,
     total_bytes: usize,
     touch_clock: u64,
 }
 
 impl CachedProgram {
     pub(crate) fn new(bound_program: Arc<BoundProgram<ExecBackend>>) -> Self {
-        let entry_bytes = bound_program
-            .program()
-            .empty_state_type
-            .iter()
-            .map(|(dtype, shape)| shape.size().saturating_mul(dtype_size(dtype)))
-            .sum();
+        debug!(
+            program_id = %bound_program.id(),
+            state_tensors = bound_program.program().empty_state_type.len(),
+            max_bytes = DEFAULT_PREFIX_CACHE_MAX_BYTES,
+            "initialized prefix cache"
+        );
         Self {
             empty_snapshot: Arc::new(bound_program.empty_snapshot()),
-            prefix_cache: Arc::new(Mutex::new(PrefixCache::new(
-                DEFAULT_PREFIX_CACHE_MAX_BYTES,
-                entry_bytes,
-            ))),
+            prefix_cache: Arc::new(Mutex::new(PrefixCache::new(DEFAULT_PREFIX_CACHE_MAX_BYTES))),
             bound_program,
         }
     }
@@ -72,10 +68,20 @@ impl CachedProgram {
     }
 
     pub(crate) fn lookup_prefix(&self, tokens: &[u32]) -> Option<PrefixMatch> {
-        self.prefix_cache
+        let mut cache = self
+            .prefix_cache
             .lock()
-            .expect("prefix cache mutex poisoned")
-            .lookup_deepest(tokens)
+            .expect("prefix cache mutex poisoned");
+        let matched = cache.lookup_deepest(tokens);
+        debug!(
+            program_id = %self.bound_program.id(),
+            prompt_tokens = tokens.len(),
+            matched_prefix_tokens = matched.as_ref().map_or(0, |entry| entry.prefix_len),
+            cache_entries = cache.entry_count(),
+            cache_bytes = cache.total_bytes(),
+            "prefix cache lookup"
+        );
+        matched
     }
 
     pub(crate) fn cache_prefix(
@@ -85,10 +91,18 @@ impl CachedProgram {
         next_token: u32,
         snapshot: Snapshot<ExecBackend>,
     ) {
+        let snapshot_bytes = snapshot.logical_bytes();
         self.prefix_cache
             .lock()
             .expect("prefix cache mutex poisoned")
-            .insert(prefix_len, prefix_hash, next_token, Arc::new(snapshot));
+            .insert(
+                self.bound_program.id(),
+                prefix_len,
+                prefix_hash,
+                next_token,
+                snapshot_bytes,
+                Arc::new(snapshot),
+            );
     }
 }
 
@@ -145,11 +159,10 @@ impl PrefixState {
 }
 
 impl PrefixCache {
-    fn new(max_bytes: usize, entry_bytes: usize) -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             max_bytes,
-            entry_bytes,
             total_bytes: 0,
             touch_clock: 0,
         }
@@ -177,14 +190,34 @@ impl PrefixCache {
         best
     }
 
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
     fn insert(
         &mut self,
+        program_id: &str,
         prefix_len: usize,
         prefix_hash: PrefixHash,
         next_token: u32,
+        snapshot_bytes: usize,
         snapshot: Arc<Snapshot<ExecBackend>>,
     ) {
-        if prefix_len == 0 || self.entry_bytes == 0 || self.entry_bytes > self.max_bytes {
+        if prefix_len == 0 || snapshot_bytes == 0 || snapshot_bytes > self.max_bytes {
+            debug!(
+                %program_id,
+                prefix_len,
+                snapshot_bytes,
+                max_bytes = self.max_bytes,
+                skip_zero_len = prefix_len == 0,
+                skip_zero_size = snapshot_bytes == 0,
+                skip_oversize = snapshot_bytes > self.max_bytes,
+                "skipping prefix cache insert"
+            );
             return;
         }
 
@@ -192,10 +225,18 @@ impl PrefixCache {
         let touch = self.next_touch();
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_touch = touch;
+            debug!(
+                %program_id,
+                prefix_len,
+                cache_entries = self.entries.len(),
+                cache_bytes = self.total_bytes,
+                snapshot_bytes,
+                "prefix cache insert hit existing entry"
+            );
             return;
         }
 
-        while self.total_bytes.saturating_add(self.entry_bytes) > self.max_bytes {
+        while self.total_bytes.saturating_add(snapshot_bytes) > self.max_bytes {
             let Some(lru_key) = self
                 .entries
                 .iter()
@@ -204,8 +245,15 @@ impl PrefixCache {
             else {
                 break;
             };
-            if self.entries.remove(&lru_key).is_some() {
-                self.total_bytes = self.total_bytes.saturating_sub(self.entry_bytes);
+            if let Some(removed) = self.entries.remove(&lru_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+                debug!(
+                    %program_id,
+                    evicted_prefix_len = lru_key.0,
+                    cache_entries = self.entries.len(),
+                    cache_bytes = self.total_bytes,
+                    "evicted prefix cache entry"
+                );
             }
         }
 
@@ -214,22 +262,25 @@ impl PrefixCache {
             PrefixEntry {
                 snapshot,
                 next_token,
+                bytes: snapshot_bytes,
                 last_touch: touch,
             },
         );
-        self.total_bytes = self.total_bytes.saturating_add(self.entry_bytes);
+        self.total_bytes = self.total_bytes.saturating_add(snapshot_bytes);
+        debug!(
+            %program_id,
+            prefix_len,
+            cache_entries = self.entries.len(),
+            cache_bytes = self.total_bytes,
+            snapshot_bytes,
+            "inserted prefix cache entry"
+        );
     }
 
     fn next_touch(&mut self) -> u64 {
         let touch = self.touch_clock;
         self.touch_clock = self.touch_clock.wrapping_add(1);
         touch
-    }
-}
-
-const fn dtype_size(dtype: &Dtype) -> usize {
-    match dtype {
-        Dtype::F32 | Dtype::U32 => 4,
     }
 }
 

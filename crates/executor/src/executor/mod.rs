@@ -2,8 +2,8 @@ mod actor;
 mod handle;
 mod stream;
 
-use crate::state::ExecutionStatus;
 use crate::ExecutorError;
+use crate::state::ExecutionStatus;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse, GetQuoteRequest, GetQuoteResponse,
@@ -11,7 +11,7 @@ use hellas_rpc::pb::hellas::{
 use tokio::sync::{mpsc, oneshot};
 
 pub use actor::Executor;
-pub(crate) use stream::{spawn_closed_monitor, LocalExecutionStream};
+pub(crate) use stream::{LocalExecutionStream, spawn_closed_monitor};
 
 pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
@@ -19,6 +19,10 @@ pub(crate) enum ExecutorMessage {
     Quote {
         request: GetQuoteRequest,
         reply: oneshot::Sender<Result<GetQuoteResponse, ExecutorError>>,
+    },
+    Preload {
+        model: String,
+        reply: oneshot::Sender<Result<(), ExecutorError>>,
     },
     Subscribe {
         execution_id: String,

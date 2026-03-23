@@ -1,15 +1,15 @@
 use std::pin::Pin;
 
 use futures_core::Stream;
+use tonic::Status;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tonic::Status;
 
+use crate::GRPC_MESSAGE_LIMIT;
 use crate::pb::hellas::execute_client::ExecuteClient;
 use crate::pb::hellas::{
     ExecuteRequest, ExecuteStatusRequest, ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse,
 };
-use crate::GRPC_MESSAGE_LIMIT;
 
 pub type ExecuteEventStream =
     Pin<Box<dyn Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;

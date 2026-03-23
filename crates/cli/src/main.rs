@@ -43,6 +43,9 @@ enum Commands {
             default_value_t = hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
+        /// Preload model weights on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
+        #[arg(long = "preload", value_delimiter = ',')]
+        preload_weights: Vec<String>,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -58,6 +61,20 @@ enum Commands {
         /// Run locally with the catgrad backend instead of the Hellas network
         #[arg(long = "local", default_value_t = false, conflicts_with = "node_id")]
         local: bool,
+        /// Run remotely and verify that the response matches a local catgrad execution
+        #[arg(
+            long = "verify-local",
+            default_value_t = false,
+            conflicts_with_all = ["local", "verify"]
+        )]
+        verify_local: bool,
+        /// Verify the primary remote node against a second remote node
+        #[arg(
+            long = "verify",
+            conflicts_with_all = ["local", "verify_local"],
+            requires = "node_id"
+        )]
+        verify: Option<EndpointId>,
         /// Maximum number of queued local executions when `--local` is set
         #[arg(
             long = "queue-size",
@@ -240,12 +257,24 @@ async fn main() {
             download_policy,
             execute_policy,
             queue_size,
-        } => commands::serve::run(port, download_policy, execute_policy, queue_size).await,
+            preload_weights,
+        } => {
+            commands::serve::run(
+                port,
+                download_policy,
+                execute_policy,
+                queue_size,
+                preload_weights,
+            )
+            .await
+        }
         Commands::Gateway {
             host,
             port,
             node_id,
             local,
+            verify_local,
+            verify,
             queue_size,
             retries,
             default_max_tokens,
@@ -256,6 +285,8 @@ async fn main() {
                 port,
                 node_id,
                 local,
+                verify_local,
+                verify,
                 queue_size,
                 retries,
                 default_max_tokens,

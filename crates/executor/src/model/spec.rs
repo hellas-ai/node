@@ -3,13 +3,13 @@ use super::{ModelAssetsError, Result};
 pub(crate) const DEFAULT_MODEL_REVISION: &str = "main";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ModelSpec {
-    pub(super) id: String,
-    pub(super) revision: String,
+pub(crate) struct ModelSpec {
+    pub(crate) id: String,
+    pub(crate) revision: String,
 }
 
 impl ModelSpec {
-    pub(super) fn parse(raw: &str) -> Result<Self> {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err(ModelAssetsError::EmptyModelId);
@@ -36,7 +36,7 @@ impl ModelSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelSpec, DEFAULT_MODEL_REVISION};
+    use super::{DEFAULT_MODEL_REVISION, ModelSpec};
 
     #[test]
     fn parses_default_revision_when_not_specified() {

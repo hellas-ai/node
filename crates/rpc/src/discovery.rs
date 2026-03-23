@@ -4,18 +4,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::stream::{FuturesUnordered, Stream};
-use pkarr::mainline::Dht;
 use pkarr::Client as PkarrClient;
+use pkarr::mainline::Dht;
 use thiserror::Error;
 use tonic::transport::Channel;
+use tonic_iroh_transport::iroh::Endpoint;
+use tonic_iroh_transport::iroh::address_lookup::IntoAddressLookupError;
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::{
     N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
 };
-use tonic_iroh_transport::iroh::address_lookup::IntoAddressLookupError;
 use tonic_iroh_transport::iroh::endpoint::BindError;
-use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::swarm::Locator;
 
 use crate::driver::{ExecuteDriver, RemoteExecuteDriver};
