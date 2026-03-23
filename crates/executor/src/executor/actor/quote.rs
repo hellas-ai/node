@@ -1,7 +1,6 @@
 use crate::ExecutorError;
 use crate::model::ModelSpec;
 use crate::state::{QuotePlan, QuoteRecord};
-use crate::weights::PrefixState;
 use crate::weights::{EnsureDisposition, WeightsLocator, has_cached_weights};
 use hellas_rpc::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
 use std::time::{Duration, Instant};
@@ -51,42 +50,28 @@ impl Executor {
         self.ensure_quote_weights_ready(&plan.weights_key).await?;
         let ensure_weights_ms = ensure_start.elapsed().as_millis();
         let bind_start = Instant::now();
-        let program = self
+        let execution = self
             .runtime_manager
             .bound_program(&plan.weights_key, &plan.program)
             .await?;
         let bind_program_ms = bind_start.elapsed().as_millis();
-        let prefix_start = Instant::now();
-        let prefix_match = program.lookup_prefix(&plan.invocation.input_ids);
-        let prefix_lookup_ms = prefix_start.elapsed().as_millis();
-        let (start_snapshot, start_prefix_len, start_prefix_hash, start_next_token) =
-            match prefix_match {
-                Some(prefix_match) => (
-                    prefix_match.snapshot,
-                    prefix_match.prefix_len,
-                    prefix_match.prefix_hash,
-                    Some(prefix_match.next_token),
-                ),
-                None => (
-                    program.empty_snapshot(),
-                    0,
-                    PrefixState::seed().hash(),
-                    None,
-                ),
-            };
+        let cache_start = Instant::now();
+        let start = execution.execution_start(&plan.invocation);
+        let cache_lookup_ms = cache_start.elapsed().as_millis();
 
         let model_id = plan.weights_key.model_id.clone();
         let requested_revision = plan.weights_key.revision.clone();
         let prompt_tokens = plan.invocation.input_ids.len();
         let max_new_tokens = plan.invocation.max_new_tokens;
-        let cached_prompt_tokens = start_prefix_len;
+        let cached_prompt_tokens = start.transcript.len();
+        let cached_output_tokens = start
+            .cached_output_tokens
+            .as_ref()
+            .map_or(0, |tokens| tokens.len());
         let quote_id = self.store.create_quote(QuoteRecord {
             invocation: plan.invocation,
-            program,
-            start_snapshot,
-            start_prefix_len,
-            start_prefix_hash,
-            start_next_token,
+            execution,
+            start,
             expires_at: Instant::now() + QUOTE_TTL,
         });
 
@@ -98,6 +83,7 @@ impl Executor {
             requested_revision,
             prompt_tokens,
             cached_prompt_tokens,
+            cached_output_tokens,
             max_new_tokens,
             "quoted program execution"
         );
@@ -106,10 +92,11 @@ impl Executor {
             %program_id,
             prompt_tokens,
             cached_prompt_tokens,
+            cached_output_tokens,
             plan_parse_ms,
             ensure_weights_ms,
             bind_program_ms,
-            prefix_lookup_ms,
+            cache_lookup_ms,
             total_ms = total_start.elapsed().as_millis(),
             "quote phase timings"
         );

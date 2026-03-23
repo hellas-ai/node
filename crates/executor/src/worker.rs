@@ -1,10 +1,8 @@
 use crate::ExecutorError;
-use crate::backend::ExecBackend;
 use crate::executor::ExecutorMessage;
 use crate::runner;
 use crate::state::{ExecutionStatus, Invocation};
-use crate::weights::{CachedProgram, PrefixHash};
-use catgrad_llm::Snapshot;
+use crate::weights::{ExecutionContext, ExecutionStart};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
@@ -22,11 +20,8 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub invocation: Invocation,
-    pub program: Arc<CachedProgram>,
-    pub start_snapshot: Arc<Snapshot<ExecBackend>>,
-    pub start_prefix_len: usize,
-    pub start_prefix_hash: PrefixHash,
-    pub start_next_token: Option<u32>,
+    pub execution: Arc<ExecutionContext>,
+    pub start: ExecutionStart,
     pub stream_batch_size: u32,
     pub accepted_at: Instant,
 }
@@ -99,11 +94,8 @@ impl WorkerThread {
         let ExecuteJob {
             execution_id,
             invocation,
-            program,
-            start_snapshot,
-            start_prefix_len,
-            start_prefix_hash,
-            start_next_token,
+            execution,
+            start,
             stream_batch_size,
             accepted_at,
         } = job;
@@ -113,16 +105,14 @@ impl WorkerThread {
             execution_id = %execution_id,
             queue_wait_ms = accepted_at.elapsed().as_millis(),
             prompt_tokens = invocation.input_ids.len(),
-            cached_prompt_tokens = start_prefix_len,
+            cached_prompt_tokens = start.transcript.len(),
+            cached_output_tokens = start.cached_output_tokens.as_ref().map_or(0, |tokens| tokens.len()),
             "execute worker starting"
         );
 
         runner::run_cached_program_streaming(
-            program.as_ref(),
-            start_snapshot.as_ref(),
-            start_prefix_len,
-            start_prefix_hash,
-            start_next_token,
+            execution.as_ref(),
+            &start,
             &invocation,
             stream_batch_size,
             |progress, chunk| {
