@@ -11,7 +11,6 @@
     inherit system overlays;
     config.allowUnfree = true;
   };
-  isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
   rust-toolchain = pkgs.buildPackages.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
   rustPlatform = pkgs.makeRustPlatform {
@@ -21,19 +20,18 @@
 
   buildSrc = pkgs.lib.cleanSourceWith {
     src = repoRoot;
-    filter = path: type:
-      let
-        name = builtins.baseNameOf (toString path);
-      in
-        pkgs.lib.cleanSourceFilter path type
-        && !(builtins.elem name [
-          ".claude"
-          ".direnv"
-          ".envrc"
-          "result"
-          "target"
-        ])
-        && !pkgs.lib.hasPrefix "result-" name;
+    filter = path: type: let
+      name = builtins.baseNameOf (toString path);
+    in
+      pkgs.lib.cleanSourceFilter path type
+      && !(builtins.elem name [
+        ".claude"
+        ".direnv"
+        ".envrc"
+        "result"
+        "target"
+      ])
+      && !pkgs.lib.hasPrefix "result-" name;
   };
 
   workspaceBuildInputs = with pkgs; [openssl];
@@ -71,16 +69,11 @@
     meta.mainProgram = "hellas-cli";
   };
 
-  cli = rustPlatform.buildRustPackage (
-    commonArgs
-    // pkgs.lib.optionalAttrs isDarwin {
-      buildFeatures = ["metal"];
-    }
-  );
+  cli = rustPlatform.buildRustPackage commonArgs;
   server = rustPlatform.buildRustPackage (
     commonArgs
     // {
-      buildFeatures = ["serve"] ++ pkgs.lib.optionals isDarwin ["metal"];
+      buildFeatures = ["serve"];
     }
   );
 

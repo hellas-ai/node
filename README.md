@@ -21,7 +21,7 @@ cargo run -- execute --local -p hey
 ```
 
 Local execution uses the same catgrad executor backend as `serve` and prefers
-accelerated backends when built with `--features cuda` or `--features metal`.
+accelerated backends when available (Metal on macOS, `--features cuda` on Linux).
 
 Verify a remote execution against the local catgrad backend:
 
