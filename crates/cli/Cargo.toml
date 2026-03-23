@@ -20,7 +20,6 @@ client = [
 ]
 serve = ["client", "hellas-rpc/server", "dep:tonic", "tonic-iroh-transport/server"]
 cuda = ["client", "hellas-executor/candle-cuda"]
-metal = ["client", "hellas-executor/candle-metal"]
 
 [dependencies]
 tokio.workspace = true
