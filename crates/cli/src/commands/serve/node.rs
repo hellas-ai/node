@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tonic::codec::CompressionEncoding;
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher};
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
@@ -205,18 +206,21 @@ pub(super) async fn spawn_node(
 
     let executor = Executor::spawn(download_policy, execute_policy, queue_size)
         .context("failed to initialize executor backend")?;
+
     preload_startup_weights(&executor, &preload_weights).await?;
+
     let execute_service = ExecuteServer::new(executor)
         .accept_compressed(CompressionEncoding::Zstd)
         .send_compressed(CompressionEncoding::Zstd)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-    let execute_service =
-        tonic::service::interceptor::InterceptedService::new(execute_service, execute_interceptor);
 
     let mut transport = TransportBuilder::new(endpoint.clone())
         .add_rpc(NodeServer::new(node_service))
-        .add_rpc(execute_service);
+        .add_rpc(InterceptedService::new(
+            execute_service,
+            execute_interceptor,
+        ));
 
     let dht = DhtBackend::with_dht(&endpoint, shared_dht);
     let publisher = dht.create_publisher(Default::default());
