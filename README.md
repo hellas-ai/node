@@ -113,20 +113,12 @@ nix run .#docker-push -- docker-server-cuda ghcr.io/hellas-ai/node:cuda-latest
 nix run .#docker-push -- docker-server-cuda-13-1 ghcr.io/hellas-ai/node:cuda-13.1
 ```
 
-## Dependency hygiene (CI + local)
+## Dependency maintenance
 
-Run the shared maintenance checks from flake:
-
-```bash
-nix run .#dep-hygiene -- check
-```
-
-Useful subcommands:
+Available in the dev shell (`nix develop`):
 
 ```bash
-nix run .#dep-hygiene -- outdated
-nix run .#dep-hygiene -- major
-nix run .#dep-hygiene -- audit
-nix run .#dep-hygiene -- update-check
-nix run .#dep-hygiene -- update
+cargo audit                # security advisories
+cargo outdated --workspace --root-deps-only  # outdated deps
+cargo update --workspace   # update Cargo.lock
 ```
