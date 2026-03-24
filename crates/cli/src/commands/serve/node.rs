@@ -18,7 +18,7 @@ use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublishe
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::DhtBackend;
-use tonic_iroh_transport::otel::TraceContextExtractor;
+use tonic_iroh_transport::otel::TraceContextLayer;
 use tonic_iroh_transport::{IrohContext, TransportBuilder};
 
 const DEFAULT_PORT: u16 = 31145;
@@ -216,13 +216,12 @@ pub(super) async fn spawn_node(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
+    let trace_layer = TraceContextLayer;
+
     let mut transport = TransportBuilder::new(endpoint.clone())
+        .add_rpc(trace_layer.layer(NodeServer::new(node_service)))
         .add_rpc(InterceptedService::new(
-            NodeServer::new(node_service),
-            TraceContextExtractor,
-        ))
-        .add_rpc(InterceptedService::new(
-            InterceptedService::new(execute_service, TraceContextExtractor),
+            trace_layer.layer(execute_service),
             execute_interceptor,
         ));
 
