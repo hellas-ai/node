@@ -1,6 +1,7 @@
 use super::{GatewayOptions, json_error};
 use crate::execution::{
     ExecutionOutput, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy,
+    RemoteNodeTarget,
 };
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
@@ -13,6 +14,7 @@ use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
@@ -23,6 +25,7 @@ const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub(super) struct GatewayState {
     pub(super) node_id: Option<EndpointId>,
+    pub(super) node_addrs: Vec<SocketAddr>,
     pub(super) local: bool,
     pub(super) verify_local: bool,
     pub(super) verify_node_id: Option<EndpointId>,
@@ -71,6 +74,7 @@ impl GatewayState {
 
         Ok(Self {
             node_id: options.node_id,
+            node_addrs: options.node_addrs.clone(),
             local: options.local,
             verify_local: options.verify_local,
             verify_node_id: options.verify,
@@ -94,7 +98,7 @@ impl GatewayState {
         if self.local {
             ExecutionRoute::Local
         } else {
-            ExecutionRoute::remote(self.node_id, self.retries)
+            ExecutionRoute::remote(self.node_id, self.node_addrs.clone(), self.retries)
         }
     }
 
@@ -110,7 +114,10 @@ impl GatewayState {
         if let Some(node_id) = self.verify_node_id.clone() {
             return ExecutionStrategy::Verify {
                 primary,
-                shadow: ExecutionRoute::RemoteDirect(node_id),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
+                    node_id,
+                    node_addrs: Vec::new(),
+                }),
             };
         }
 
@@ -376,6 +383,7 @@ mod tests {
     fn state(local: bool, verify_local: bool, verify_node_id: Option<EndpointId>) -> GatewayState {
         GatewayState {
             node_id: Some(endpoint(1)),
+            node_addrs: Vec::new(),
             local,
             verify_local,
             verify_node_id,
@@ -395,7 +403,10 @@ mod tests {
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(endpoint(1)),
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
+                    node_id: endpoint(1),
+                    node_addrs: Vec::new(),
+                }),
                 shadow: ExecutionRoute::Local,
             }
         );
@@ -408,8 +419,14 @@ mod tests {
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(endpoint(1)),
-                shadow: ExecutionRoute::RemoteDirect(endpoint(2)),
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
+                    node_id: endpoint(1),
+                    node_addrs: Vec::new(),
+                }),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
+                    node_id: endpoint(2),
+                    node_addrs: Vec::new(),
+                }),
             }
         );
     }

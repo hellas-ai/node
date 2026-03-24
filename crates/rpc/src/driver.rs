@@ -3,6 +3,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 use tonic::Status;
 use tonic::codec::CompressionEncoding;
+use tonic::codegen::*;
 use tonic::transport::Channel;
 
 use crate::GRPC_MESSAGE_LIMIT;
@@ -23,40 +24,49 @@ pub trait ExecuteDriver: Send {
     ) -> Result<ExecuteEventStream, Status>;
 }
 
-pub struct RemoteExecuteDriver {
-    client: ExecuteClient<Channel>,
+pub struct RemoteExecuteDriver<T = Channel> {
+    client: ExecuteClient<T>,
 }
 
-impl RemoteExecuteDriver {
+impl RemoteExecuteDriver<Channel> {
     pub fn new(channel: Channel) -> Self {
         Self {
-            client: Self::client(channel),
+            client: ExecuteClient::new(channel)
+                .send_compressed(CompressionEncoding::Zstd)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+                .max_encoding_message_size(GRPC_MESSAGE_LIMIT),
         }
     }
+}
 
-    fn client(channel: Channel) -> ExecuteClient<Channel> {
-        ExecuteClient::new(channel)
-            .send_compressed(CompressionEncoding::Zstd)
-            .accept_compressed(CompressionEncoding::Zstd)
-            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-            .max_encoding_message_size(GRPC_MESSAGE_LIMIT)
-    }
-
-    async fn subscribe_execution(
-        &mut self,
-        execution_id: String,
-    ) -> Result<ExecuteEventStream, Status> {
-        let stream = self
-            .client
-            .execute_stream(ExecuteStatusRequest { execution_id })
-            .await?
-            .into_inner();
-        Ok(Box::pin(stream))
+impl<T> RemoteExecuteDriver<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<StdError>,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
+    pub fn with_service(service: T) -> Self {
+        Self {
+            client: ExecuteClient::new(service)
+                .send_compressed(CompressionEncoding::Zstd)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+                .max_encoding_message_size(GRPC_MESSAGE_LIMIT),
+        }
     }
 }
 
 #[tonic::async_trait]
-impl ExecuteDriver for RemoteExecuteDriver {
+impl<T> ExecuteDriver for RemoteExecuteDriver<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
+    T::Error: Into<StdError>,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+    T::Future: Send,
+{
     async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<GetQuoteResponse, Status> {
         Ok(self.client.get_quote(request).await?.into_inner())
     }
@@ -71,6 +81,11 @@ impl ExecuteDriver for RemoteExecuteDriver {
             .await?
             .into_inner()
             .execution_id;
-        self.subscribe_execution(execution_id).await
+        let stream = self
+            .client
+            .execute_stream(ExecuteStatusRequest { execution_id })
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream))
     }
 }

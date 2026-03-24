@@ -29,6 +29,11 @@ fn base_env_filter() -> EnvFilter {
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
 ///                                          (use for CF-Access-Client-Id / CF-Access-Client-Secret)
 pub fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    // Register W3C TraceContext propagator so trace IDs flow across RPC calls.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
     let (filter_layer, filter_handle) = reload::Layer::new(base_env_filter());
     let _ = LOG_FILTER.set(filter_handle);
 

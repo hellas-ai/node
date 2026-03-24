@@ -6066,8 +6066,6 @@ dependencies = [
 [[package]]
 name = "tonic-iroh-transport"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc14e509a6dc7c30dd3386873414336040cb676d628aa9d3f267a6e3ff4f530"
 dependencies = [
  "async-stream",
  "axum",
@@ -6078,6 +6076,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "mainline",
+ "opentelemetry",
  "postcard",
  "serde",
  "sha2 0.10.9",
