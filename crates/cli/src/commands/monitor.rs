@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::future;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
-use tonic_iroh_transport::IrohConnect;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
+use tonic_iroh_transport::{ConnectionPool, PoolOptions};
+use tonic_iroh_transport::iroh::EndpointId;
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };
@@ -28,7 +28,7 @@ struct PeerInterrogationOutcome {
 }
 
 struct DiscoveryEventContext<'a> {
-    endpoint: &'a Endpoint,
+    node_pool: &'a ConnectionPool,
     interrogate: bool,
     service_seen: &'a mut HashSet<EndpointId>,
     unique_peers: &'a mut HashSet<EndpointId>,
@@ -44,9 +44,14 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
 
     let peer_exchange = PeerExchangeBackend::new();
     let mut registry = ServiceRegistry::new(&endpoint);
+    registry.with_pool_options(PoolOptions {
+        connect_timeout: CONNECT_TIMEOUT,
+        ..PoolOptions::default()
+    });
     registry.add(MdnsBackend::new(mdns));
     registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
     registry.add(peer_exchange.clone());
+    let node_pool = registry.pool::<NodeService>();
 
     let mut node_discovery = Box::pin(registry.discover::<NodeService>());
     let mut execute_discovery = Box::pin(registry.discover::<ExecuteService>());
@@ -99,7 +104,7 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
                             "node",
                             &peer,
                             DiscoveryEventContext {
-                                endpoint: &endpoint,
+                                node_pool: &node_pool,
                                 interrogate,
                                 service_seen: &mut node_seen,
                                 unique_peers: &mut unique_peers,
@@ -124,7 +129,7 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
                             "execute",
                             &peer,
                             DiscoveryEventContext {
-                                endpoint: &endpoint,
+                                node_pool: &node_pool,
                                 interrogate,
                                 service_seen: &mut execute_seen,
                                 unique_peers: &mut unique_peers,
@@ -232,20 +237,20 @@ fn handle_discovery_event(service: &str, peer: &Peer, context: DiscoveryEventCon
 
     if context.interrogate && context.interrogated.insert(peer_id) {
         println!("event=interrogate-start peer={}", peer_id);
-        let endpoint = context.endpoint.clone();
+        let node_pool = context.node_pool.clone();
         context.interrogations.spawn(async move {
-            let result = interrogate_peer(endpoint, peer_id).await;
+            let result = interrogate_peer(node_pool, peer_id).await;
             (peer_id, result)
         });
     }
 }
 
 async fn interrogate_peer(
-    endpoint: Endpoint,
+    node_pool: ConnectionPool,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
-    let channel = NodeService::connect(&endpoint, peer_id.into())
-        .connect_timeout(CONNECT_TIMEOUT)
+    let channel = node_pool
+        .channel(peer_id)
         .await
         .with_context(|| format!("failed to connect to node service on {peer_id}"))?;
 

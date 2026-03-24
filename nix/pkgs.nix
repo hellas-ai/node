@@ -58,7 +58,7 @@
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catgrad-0.2.1" = "sha256-O72K/g3mz4rfwZBTnQFLopNAGNUVH2KWI0BknASOEaM=";
+        "catgrad-0.2.1" = "sha256-rGc/uMao5PGwk33wkL62UvhcbH9rs4tbGcJVw9GPrlA=";
       };
     };
     auditable = false;
@@ -102,20 +102,31 @@ in rec {
       inherit cli server;
       "e2e-test" = e2eTest;
     }
-    // docker.packages;
+    // pkgs.lib.mapAttrs' (name: value: pkgs.lib.nameValuePair "docker-${name}" value) docker.dockerImages;
 
-  apps =
-    {
-      "e2e" = {
-        type = "app";
-        program = "${e2eTest}/bin/e2e-test";
-      };
-    }
-    // docker.apps;
+  apps = {
+    "e2e" = {
+      type = "app";
+      program = "${e2eTest}/bin/e2e-test";
+    };
+    "docker-push-all" = {
+      type = "app";
+      program = "${docker.pushAll}/bin/docker-push-all";
+    };
+  };
+
+  envShellHook = ''
+    if [ -f .env ]; then
+      set -a
+      source .env
+      set +a
+    fi
+  '';
 
   devShells = rec {
     default = pkgs.mkShell {
       packages = devShellPackages;
+      shellHook = envShellHook;
     };
 
     # Explicit shell aliases so users can `nix develop .#server` / `.#server-cuda`
@@ -124,6 +135,7 @@ in rec {
 
     cuda = pkgs.mkShell {
       packages = devShellPackages;
+      shellHook = envShellHook;
       nativeBuildInputs = docker.defaultCudaEnv.nativeBuildInputs;
       buildInputs = docker.defaultCudaEnv.buildInputs;
       inherit

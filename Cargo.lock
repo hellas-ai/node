@@ -6001,9 +6001,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.7+spec-1.1.0"
+version = "0.25.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d15b06e6c39068c203e7c1d0bc3944796d867449e7668ef7fa5ea43727cb846e"
+checksum = "16bff38f1d86c47f9ff0647e6838d7bb362522bdf44006c7068c2b1e606f1f3c"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -6065,9 +6065,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-iroh-transport"
-version = "0.5.1"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3ce79fe06c6c526e0f8bc9410fcf4d7baa4dae88558aa3ed4c9ada1c6e25b0c"
+checksum = "8dc14e509a6dc7c30dd3386873414336040cb676d628aa9d3f267a6e3ff4f530"
 dependencies = [
  "async-stream",
  "axum",

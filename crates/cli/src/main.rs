@@ -46,6 +46,9 @@ enum Commands {
         /// Preload model weights on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
         #[arg(long = "preload", value_delimiter = ',')]
         preload_weights: Vec<String>,
+        /// Prometheus metrics port (e.g. 9090)
+        #[arg(long = "metrics-port")]
+        metrics_port: Option<u16>,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -129,9 +132,6 @@ enum Commands {
             conflicts_with = "local"
         )]
         verify_local: bool,
-        /// Prometheus metrics port (e.g. 9090)
-        #[arg(long = "metrics-port")]
-        metrics_port: Option<u16>,
     },
     /// Discover peers and log network events
     Monitor {
@@ -157,6 +157,7 @@ async fn main() {
             execute_policy,
             queue_size,
             preload_weights,
+            metrics_port,
         } => {
             commands::serve::run(
                 port,
@@ -164,6 +165,7 @@ async fn main() {
                 execute_policy,
                 queue_size,
                 preload_weights,
+                metrics_port,
             )
             .await
         }
@@ -204,7 +206,6 @@ async fn main() {
             retries,
             local,
             verify_local,
-            metrics_port,
         } => {
             commands::execute::run(commands::execute::ExecuteOptions {
                 node_id,
@@ -214,7 +215,6 @@ async fn main() {
                 retries,
                 local,
                 verify_local,
-                metrics_port,
             })
             .await
         }
