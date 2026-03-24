@@ -4,12 +4,14 @@ use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::pb::hellas::HealthCheckRequest;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::service::NodeService;
-use tonic_iroh_transport::IrohConnect;
+use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 use tonic_iroh_transport::iroh::EndpointId;
 
 pub async fn run(node_id: EndpointId) -> CliResult<()> {
     let endpoint = DiscoveryEndpoint::bind().await?.endpoint;
-    let channel = NodeService::connect(&endpoint, node_id.into())
+    let pool = ConnectionPool::for_service::<NodeService>(endpoint, PoolOptions::default());
+    let channel = pool
+        .channel(node_id)
         .await
         .with_context(|| format!("failed to connect to node {node_id}"))?;
 

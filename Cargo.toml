@@ -23,7 +23,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.14", features = ["gzip"] }
-tonic-iroh-transport = { version = "0.5", default-features = false }
+tonic-iroh-transport = { version = "0.6", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-executor = { path = "crates/executor" }
 tracing = "0.1"

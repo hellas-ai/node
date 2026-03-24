@@ -14,7 +14,13 @@ pub async fn run(
     execute_policy: ExecutePolicy,
     queue_size: usize,
     preload_weights: Vec<String>,
+    metrics_port: Option<u16>,
 ) -> CliResult<()> {
+    if let Some(metrics_port) = metrics_port {
+        let registry = std::sync::Arc::new(prometheus_client::registry::Registry::default());
+        crate::metrics::spawn_metrics_server(metrics_port, registry);
+    }
+
     let preload_weights = dedupe_preload_weights(preload_weights);
     let node = node::spawn_node(
         port,
