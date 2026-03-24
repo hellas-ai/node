@@ -22,8 +22,11 @@ use futures::FutureExt;
 use hellas_types::rpc::{ConsensusActivity, NotarizeInfo, ProposalInfo};
 use hellas_types::{Activity, Address, EPOCH, PublicKey, Scheme};
 use rand_core::CryptoRngCore;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::gauge::Gauge;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
+    sync::atomic::AtomicI64,
     time::Duration,
 };
 use tokio::sync::broadcast;
@@ -98,10 +101,63 @@ fn convert_activity(activity: &Activity) -> ConsensusActivity {
 }
 
 #[derive(Clone)]
+struct ConsensusMetrics {
+    finalization_total: Counter,
+    nullification_total: Counter,
+    active_participants: Gauge<i64, AtomicI64>,
+    total_participants: i64,
+}
+
+impl ConsensusMetrics {
+    fn register<E: Metrics>(context: &E, total_participants: usize) -> Self {
+        let metrics = Self {
+            finalization_total: Counter::default(),
+            nullification_total: Counter::default(),
+            active_participants: Gauge::default(),
+            total_participants: total_participants as i64,
+        };
+        context.register(
+            "consensus_finalization_total",
+            "total finalized views",
+            metrics.finalization_total.clone(),
+        );
+        context.register(
+            "consensus_nullification_total",
+            "total nullified views",
+            metrics.nullification_total.clone(),
+        );
+        context.register(
+            "consensus_active_participants",
+            "unique signers in the most recent certificate",
+            metrics.active_participants.clone(),
+        );
+        metrics.active_participants.set(metrics.total_participants);
+        metrics
+    }
+
+    fn observe(&self, activity: &Activity) {
+        match activity {
+            Activity::Finalization(f) => {
+                self.finalization_total.inc();
+                self.active_participants
+                    .set(f.certificate.signers.len() as i64);
+            }
+            Activity::Nullification(n) => {
+                self.nullification_total.inc();
+                self.active_participants
+                    .set(n.certificate.signers.len() as i64);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ActivityReporter<F, O> {
     forward: F,
     observe: O,
     activity_tx: broadcast::Sender<ConsensusActivity>,
+    metrics: ConsensusMetrics,
 }
 
 impl<F, O> Reporter for ActivityReporter<F, O>
@@ -112,6 +168,7 @@ where
     type Activity = Activity;
 
     async fn report(&mut self, activity: Self::Activity) {
+        self.metrics.observe(&activity);
         let _ = self.activity_tx.send(convert_activity(&activity));
         self.observe.report(activity.clone()).await;
         self.forward.report(activity).await;
@@ -250,10 +307,15 @@ where
         let (buffer_engine, buffer) = buffered::Engine::new(context.clone(), broadcast_config);
 
         let (activity_tx, _) = broadcast::channel(1024);
+        let consensus_metrics = ConsensusMetrics::register(
+            &context,
+            scheme.participants().len(),
+        );
         let reporter = ActivityReporter {
             forward: marshal_mailbox.clone(),
             observe: observer,
             activity_tx: activity_tx.clone(),
+            metrics: consensus_metrics,
         };
 
         let inline = standard::Inline::new(
