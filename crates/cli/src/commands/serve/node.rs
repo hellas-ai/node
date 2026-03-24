@@ -14,10 +14,11 @@ use std::time::Instant;
 use tonic::codec::CompressionEncoding;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
-use tonic_iroh_transport::iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher};
+use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::DhtBackend;
+use tonic_iroh_transport::otel::TraceContextExtractor;
 use tonic_iroh_transport::{IrohContext, TransportBuilder};
 
 const DEFAULT_PORT: u16 = 31145;
@@ -146,7 +147,7 @@ pub(super) async fn spawn_node(
     let make_builder = || {
         Endpoint::builder(presets::N0)
             .clear_address_lookup()
-            .address_lookup(PkarrPublisher::n0_dns().addr_filter(AddrFilter::ip_only()))
+            .address_lookup(PkarrPublisher::n0_dns())
             .address_lookup(DnsAddressLookup::n0_dns())
     };
     let endpoint = if let Some(port) = port {
@@ -216,9 +217,12 @@ pub(super) async fn spawn_node(
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
     let mut transport = TransportBuilder::new(endpoint.clone())
-        .add_rpc(NodeServer::new(node_service))
         .add_rpc(InterceptedService::new(
-            execute_service,
+            NodeServer::new(node_service),
+            TraceContextExtractor,
+        ))
+        .add_rpc(InterceptedService::new(
+            InterceptedService::new(execute_service, TraceContextExtractor),
             execute_interceptor,
         ));
 

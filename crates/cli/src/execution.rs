@@ -9,16 +9,23 @@ use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest, execute_stream_event,
 };
 use hellas_rpc::service::ExecuteService;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
-use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
-    Endpoint, EndpointId,
+    Endpoint, EndpointAddr, EndpointId, TransportAddr,
     endpoint::{PortmapperConfig, default_relay_mode},
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
+use tonic_iroh_transport::otel::TraceContextInjector;
+use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
 use tracing::instrument;
+
+type TracedChannel = InterceptedService<Channel, TraceContextInjector>;
+type TracedDriver = RemoteExecuteDriver<TracedChannel>;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,16 +39,38 @@ type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionRoute {
     Local,
-    RemoteDirect(EndpointId),
+    RemoteDirect(RemoteNodeTarget),
     RemoteDiscovery { retries: usize },
 }
 
 impl ExecutionRoute {
-    pub fn remote(node_id: Option<EndpointId>, retries: usize) -> Self {
+    pub fn remote(
+        node_id: Option<EndpointId>,
+        node_addrs: Vec<SocketAddr>,
+        retries: usize,
+    ) -> Self {
         match node_id {
-            Some(node_id) => Self::RemoteDirect(node_id),
+            Some(node_id) => Self::RemoteDirect(RemoteNodeTarget {
+                node_id,
+                node_addrs,
+            }),
             None => Self::RemoteDiscovery { retries },
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteNodeTarget {
+    pub node_id: EndpointId,
+    pub node_addrs: Vec<SocketAddr>,
+}
+
+impl RemoteNodeTarget {
+    fn endpoint_addr(&self) -> EndpointAddr {
+        EndpointAddr::from_parts(
+            self.node_id,
+            self.node_addrs.iter().copied().map(TransportAddr::Ip),
+        )
     }
 }
 
@@ -129,7 +158,8 @@ impl ExecutionRequest {
                 })
             }
             ExecutionStrategy::Verify { primary, shadow } => {
-                let primary = PreparedRoute::prepare(&self.runtime, &self.quote_req, primary).await?;
+                let primary =
+                    PreparedRoute::prepare(&self.runtime, &self.quote_req, primary).await?;
                 let shadow = PreparedRoute::prepare(&self.runtime, &self.quote_req, shadow).await?;
                 Ok(PreparedExecution {
                     primary,
@@ -160,7 +190,10 @@ pub(crate) struct PreparedExecution {
 }
 
 impl PreparedExecution {
-    pub(crate) async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+    pub(crate) async fn run(
+        &mut self,
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<ExecutionOutput> {
         let primary_output = self.primary.run(sink).await?;
         if let Some(shadow) = &mut self.shadow {
             let shadow_output = shadow.run(&mut |_: &[u8]| Ok(())).await?;
@@ -192,13 +225,13 @@ struct RemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
     quote_id: String,
-    driver: RemoteExecuteDriver,
+    driver: TracedDriver,
 }
 
 struct QuotedRemoteDriver {
     peer_id: EndpointId,
     quote: hellas_rpc::pb::hellas::GetQuoteResponse,
-    driver: RemoteExecuteDriver,
+    driver: TracedDriver,
 }
 
 #[derive(Debug)]
@@ -221,20 +254,18 @@ impl PreparedRoute {
                     .preload_weights(local_model_spec(quote_req))
                     .await
                     .context("failed to preload local weights")?;
-                let quote = quote_with_driver(
-                    quote_req,
-                    &mut executor,
-                    || "local quote failed".to_string(),
-                )
+                let quote = quote_with_driver(quote_req, &mut executor, || {
+                    "local quote failed".to_string()
+                })
                 .await?;
                 Ok(Self::Local {
                     executor,
                     quote_id: quote.quote_id,
                 })
             }
-            ExecutionRoute::RemoteDirect(node_id) => {
+            ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint().await?;
-                let quote = quote_remote_peer(quote_req, &endpoint, *node_id).await?;
+                let quote = quote_remote_target(quote_req, &endpoint, target).await?;
                 Ok(Self::RemoteDirect(RemoteExecution::from_quoted(
                     endpoint, quote,
                 )))
@@ -289,7 +320,9 @@ impl PreparedRoute {
                             }
                             *active = None;
                             if attempt == max_attempts {
-                                return Err(err.context(format!("max retries ({retries}) exceeded")));
+                                return Err(
+                                    err.context(format!("max retries ({retries}) exceeded"))
+                                );
                             }
                             warn!(
                                 attempt,
@@ -377,7 +410,8 @@ async fn quote_remote_endpoint(
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let mut driver = RemoteExecuteDriver::new(channel);
+    let mut driver =
+        RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
     let quote = match driver.get_quote(quote_req.clone()).await {
         Ok(quote) => quote,
         Err(status) => return Err(QuoteCandidateError::Declined(status)),
@@ -403,6 +437,33 @@ async fn quote_remote_peer(
             }
             QuoteCandidateError::Connect(err) => err,
         })
+}
+
+async fn quote_remote_target(
+    quote_req: &GetQuoteRequest,
+    endpoint: &Endpoint,
+    target: &RemoteNodeTarget,
+) -> anyhow::Result<QuotedRemoteDriver> {
+    if target.node_addrs.is_empty() {
+        return quote_remote_peer(quote_req, endpoint, target.node_id).await;
+    }
+
+    let channel = ExecuteService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let mut driver =
+        RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
+    let quote = quote_with_driver(quote_req, &mut driver, || {
+        format!("node {} declined quote", target.node_id)
+    })
+    .await?;
+
+    Ok(QuotedRemoteDriver {
+        peer_id: target.node_id,
+        quote,
+        driver,
+    })
 }
 
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
@@ -505,7 +566,10 @@ where
     })
 }
 
-fn verify_matching_output(primary: &ExecutionOutput, shadow: &ExecutionOutput) -> anyhow::Result<()> {
+fn verify_matching_output(
+    primary: &ExecutionOutput,
+    shadow: &ExecutionOutput,
+) -> anyhow::Result<()> {
     if primary.output == shadow.output {
         return Ok(());
     }
@@ -565,8 +629,7 @@ fn consume_stream_event(
                 }
             }
             (
-                ExecutionStatus::try_from(snapshot.status)
-                    .unwrap_or(ExecutionStatus::Unspecified),
+                ExecutionStatus::try_from(snapshot.status).unwrap_or(ExecutionStatus::Unspecified),
                 snapshot.progress,
             )
         }
@@ -576,8 +639,7 @@ fn consume_stream_event(
                 sink(&progress.output_chunk)?;
             }
             (
-                ExecutionStatus::try_from(progress.status)
-                    .unwrap_or(ExecutionStatus::Unspecified),
+                ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified),
                 progress.progress,
             )
         }
@@ -607,23 +669,41 @@ mod tests {
 
     #[test]
     fn verify_matching_output_accepts_identical() {
-        let a = ExecutionOutput { output: vec![1, 2, 3], completion_tokens: 3 };
-        let b = ExecutionOutput { output: vec![1, 2, 3], completion_tokens: 3 };
+        let a = ExecutionOutput {
+            output: vec![1, 2, 3],
+            completion_tokens: 3,
+        };
+        let b = ExecutionOutput {
+            output: vec![1, 2, 3],
+            completion_tokens: 3,
+        };
         verify_matching_output(&a, &b).unwrap();
     }
 
     #[test]
     fn verify_matching_output_rejects_divergent() {
-        let a = ExecutionOutput { output: vec![1, 2, 3], completion_tokens: 3 };
-        let b = ExecutionOutput { output: vec![1, 2, 4], completion_tokens: 3 };
+        let a = ExecutionOutput {
+            output: vec![1, 2, 3],
+            completion_tokens: 3,
+        };
+        let b = ExecutionOutput {
+            output: vec![1, 2, 4],
+            completion_tokens: 3,
+        };
         let err = verify_matching_output(&a, &b).unwrap_err();
         assert!(format!("{err}").contains("diverged at byte 2"));
     }
 
     #[test]
     fn verify_matching_output_rejects_different_lengths() {
-        let a = ExecutionOutput { output: vec![1, 2], completion_tokens: 2 };
-        let b = ExecutionOutput { output: vec![1, 2, 3], completion_tokens: 3 };
+        let a = ExecutionOutput {
+            output: vec![1, 2],
+            completion_tokens: 2,
+        };
+        let b = ExecutionOutput {
+            output: vec![1, 2, 3],
+            completion_tokens: 3,
+        };
         let err = verify_matching_output(&a, &b).unwrap_err();
         assert!(format!("{err}").contains("diverged"));
     }

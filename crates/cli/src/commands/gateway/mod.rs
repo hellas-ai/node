@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ pub struct GatewayOptions {
     pub host: String,
     pub port: u16,
     pub node_id: Option<EndpointId>,
+    pub node_addrs: Vec<SocketAddr>,
     pub local: bool,
     pub verify_local: bool,
     pub verify: Option<EndpointId>,
