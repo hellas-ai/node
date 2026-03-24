@@ -87,30 +87,28 @@ POST /v1/messages
 POST /v1/completions
 ```
 
-## Docker images via Nix
+## Docker
 
-Build and load CPU server image:
+Docker images: `.#docker-cpu`, `.#docker-cuda12-sm89`, etc. They stream to stdout.
 
 ```bash
-nix build .#docker-server
-docker load < result
-docker run --rm -it -p 31145:31145/udp ghcr.io/hellas-ai/node:latest
+$(nix build .#docker-cuda12-sm89 --print-out-paths) | docker load
+nix run .#docker-push-all                # push all images to ghcr.io/hellas-ai/node
 ```
 
-Build and load CUDA server image:
+Run a CUDA server with persistent HF cache, metrics, and Jaeger tracing:
 
 ```bash
-nix build .#docker-server-cuda
-docker load < result
-docker run --rm -it --device=nvidia.com/gpu=all -p 31145:31145/udp ghcr.io/hellas-ai/node:cuda-latest
-```
-
-Build and push a docker image directly from the flake:
-
-```bash
-nix run .#docker-push -- docker-server ghcr.io/hellas-ai/node:latest
-nix run .#docker-push -- docker-server-cuda ghcr.io/hellas-ai/node:cuda-latest
-nix run .#docker-push -- docker-server-cuda-13-1 ghcr.io/hellas-ai/node:cuda-13.1
+docker run --rm -it \
+  --device=nvidia.com/gpu=all \
+  -p 31145:31145/udp \
+  -p 9090:9090 \
+  -v huggingface:/home/hellas/.cache/huggingface \
+  -e OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://jaeger:4318/v1/traces \
+  ghcr.io/hellas-ai/node:cuda12-sm89 \
+  --download-policy=eager --execute-policy=eager \
+  --metrics-port=9090 \
+  --preload HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
 ## Dependency maintenance
