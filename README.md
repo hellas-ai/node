@@ -103,7 +103,7 @@ docker run --rm -it \
   --device=nvidia.com/gpu=all \
   -p 31145:31145/udp \
   -p 9090:9090 \
-  -v huggingface:/home/hellas/.cache/huggingface \
+  -v ~/.cache/huggingface:/home/hellas/.cache/huggingface \
   -e OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://jaeger:4318/v1/traces \
   ghcr.io/hellas-ai/node:cuda12-sm89 \
   --download-policy=eager --execute-policy=eager \
