@@ -24,7 +24,7 @@
     forAllSystems = nixpkgs.lib.genAttrs systems;
     perSystem = forAllSystems (
       system:
-        import ./nix/pkgs.nix {
+        import ./nix {
           inherit
             self
             system
@@ -40,13 +40,17 @@
       apps = forAllSystems (system: perSystem.${system}.apps);
       devShells = forAllSystems (system: perSystem.${system}.devShells);
       checks = forAllSystems (system: perSystem.${system}.checks);
+      nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
 
       overlays.default = final: _prev: {
         hellas = self.packages.${final.system}.cli;
         hellas-serve = self.packages.${final.system}.server;
       };
 
-      nixosModules.hellas = import ./nix/module.nix {inherit self;};
+      nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};
       nixosModules.default = self.nixosModules.hellas;
+
+      homeManagerModules.hellas = import ./nix/modules/home-manager.nix {inherit self;};
+      homeManagerModules.default = self.homeManagerModules.hellas;
     };
 }

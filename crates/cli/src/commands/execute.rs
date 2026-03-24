@@ -4,11 +4,13 @@ use crate::text_output::TextOutputDecoder;
 use catgrad_llm::PromptRequest;
 use hellas_executor::ModelAssets;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic_iroh_transport::iroh::EndpointId;
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
+    pub node_addrs: Vec<SocketAddr>,
     pub model: String,
     pub prompt: String,
     pub max_seq: u32,
@@ -37,6 +39,7 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
             ExecutionStrategy::Verify {
                 primary: ExecutionRoute::remote(
                     options.node_id,
+                    options.node_addrs.clone(),
                     options.retries,
                 ),
                 shadow: ExecutionRoute::Local,
@@ -47,6 +50,7 @@ pub async fn run(options: ExecuteOptions) -> CliResult<()> {
         } else {
             ExecutionStrategy::Run(ExecutionRoute::remote(
                 options.node_id,
+                options.node_addrs,
                 options.retries,
             ))
         },

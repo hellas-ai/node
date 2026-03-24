@@ -2,6 +2,7 @@
 extern crate tracing;
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::EndpointId;
 
 mod commands;
@@ -61,8 +62,11 @@ enum Commands {
         /// Direct target node id (omit to use discovery)
         #[arg(long)]
         node_id: Option<EndpointId>,
+        /// Direct UDP address hint for the target node. Repeat or use commas.
+        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        node_addrs: Vec<SocketAddr>,
         /// Run locally with the catgrad backend instead of the Hellas network
-        #[arg(long = "local", default_value_t = false, conflicts_with = "node_id")]
+        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
         local: bool,
         /// Run remotely and verify that the response matches a local catgrad execution
         #[arg(
@@ -101,11 +105,17 @@ enum Commands {
     Health {
         /// Node ID to check
         node_id: EndpointId,
+        /// Direct UDP address hint for the target node. Repeat or use commas.
+        #[arg(long = "node-addr", value_delimiter = ',')]
+        node_addrs: Vec<SocketAddr>,
     },
     /// Execute a job remotely or locally
     Execute {
         /// Node ID to execute on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
+        /// Direct UDP address hint for the target node. Repeat or use commas.
+        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        node_addrs: Vec<SocketAddr>,
         /// HuggingFace model id used to fetch weights, optionally with @revision
         #[arg(
             short = 'm',
@@ -123,7 +133,7 @@ enum Commands {
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
         /// Run locally with the catgrad backend instead of the Hellas network
-        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id"])]
+        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id", "node_addrs"])]
         local: bool,
         /// Run remotely and locally, then verify that both outputs match
         #[arg(
@@ -173,6 +183,7 @@ async fn main() {
             host,
             port,
             node_id,
+            node_addrs,
             local,
             verify_local,
             verify,
@@ -186,6 +197,7 @@ async fn main() {
                 host,
                 port,
                 node_id,
+                node_addrs,
                 local,
                 verify_local,
                 verify,
@@ -197,9 +209,13 @@ async fn main() {
             })
             .await
         }
-        Commands::Health { node_id } => commands::health::run(node_id).await,
+        Commands::Health {
+            node_id,
+            node_addrs,
+        } => commands::health::run(node_id, node_addrs).await,
         Commands::Execute {
             node_id,
+            node_addrs,
             model,
             prompt,
             max_seq,
@@ -209,6 +225,7 @@ async fn main() {
         } => {
             commands::execute::run(commands::execute::ExecuteOptions {
                 node_id,
+                node_addrs,
                 model,
                 prompt,
                 max_seq,
@@ -246,11 +263,13 @@ mod tests {
         match cli.command {
             Commands::Execute {
                 node_id,
+                node_addrs,
                 local,
                 verify_local,
                 ..
             } => {
                 assert!(node_id.is_none());
+                assert!(node_addrs.is_empty());
                 assert!(local);
                 assert!(!verify_local);
             }
@@ -290,8 +309,14 @@ mod tests {
     fn gateway_accepts_local_mode() {
         let cli = Cli::try_parse_from(["hellas", "gateway", "--local"]).unwrap();
         match cli.command {
-            Commands::Gateway { node_id, local, .. } => {
+            Commands::Gateway {
+                node_id,
+                node_addrs,
+                local,
+                ..
+            } => {
                 assert!(node_id.is_none());
+                assert!(node_addrs.is_empty());
                 assert!(local);
             }
             _ => panic!("expected gateway command"),
@@ -307,6 +332,27 @@ mod tests {
             "--node-id",
             "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
         ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_rejects_node_addr_without_node_id() {
+        let result = Cli::try_parse_from([
+            "hellas",
+            "execute",
+            "--node-addr",
+            "127.0.0.1:31145",
+            "-p",
+            "hello",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gateway_rejects_node_addr_without_node_id() {
+        let result = Cli::try_parse_from(["hellas", "gateway", "--node-addr", "127.0.0.1:31145"]);
 
         assert!(result.is_err());
     }

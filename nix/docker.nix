@@ -3,7 +3,7 @@
   lib,
   rustPlatform,
   commonArgs,
-  rust-toolchain,
+  rustToolchain,
   catgrad,
   system,
   server,
@@ -60,7 +60,7 @@
       mkdir -p "$out/bin"
       cp "${pkg}/bin/${sourceBin}" "$out/bin/hellas-cli"
       chmod u+w "$out/bin/hellas-cli"
-      remove-references-to -t ${rust-toolchain} "$out/bin/hellas-cli"
+      remove-references-to -t ${rustToolchain} "$out/bin/hellas-cli"
       chmod 0555 "$out/bin/hellas-cli"
     '';
 
