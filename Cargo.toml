@@ -14,6 +14,7 @@ loom-tests = ["dep:loom"]
 
 [dependencies]
 bytes = { workspace = true }
+axum = { workspace = true }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
 clap = { workspace = true }
 commonware-broadcast = { workspace = true }
@@ -52,7 +53,7 @@ tonic = { version = "0.14", features = ["server", "channel"] }
 ws-mux = { workspace = true, features = ["native-client", "server"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]

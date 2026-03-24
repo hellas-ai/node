@@ -20,6 +20,8 @@ use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
 use thiserror::Error;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use tracing::{info, warn};
 
 const NAMESPACE: &[u8] = b"hellas";
@@ -30,6 +32,7 @@ const DEFAULT_OTLP_SAMPLE_RATE: f64 = 1.0;
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const OTLP_SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
 const OTLP_SAMPLE_RATE_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
+const OTLP_HEADERS_ENV: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
@@ -657,15 +660,144 @@ fn otlp_sample_rate() -> f64 {
     }
 }
 
-fn otlp_config_from_env() -> Option<tokio::tracing::Config> {
-    let endpoint = env_non_empty(OTLP_ENDPOINT_ENV)?;
-    let name = env_non_empty(OTLP_SERVICE_NAME_ENV)
+/// Initialise the tracing subscriber.
+///
+/// When `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set (and non-empty), an
+/// OpenTelemetry OTLP layer is added that exports traces over HTTP/protobuf.
+///
+/// Supported environment variables:
+///   RUST_LOG                             — log filter (default: info)
+///   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT   — collector URL
+///   OTEL_SERVICE_NAME                    — service name (default: hellas-validator)
+///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
+///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
+fn init_telemetry(json: bool) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use tracing_subscriber::prelude::*;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_writer(std::io::stderr);
+
+    let fmt_layer = if json {
+        fmt_layer.json().boxed()
+    } else {
+        fmt_layer.compact().boxed()
+    };
+
+    let (otel_layer, provider) = init_otlp_layer();
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(otel_layer)
+        .init();
+
+    provider
+}
+
+fn init_otlp_layer<S>() -> (
+    Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
+    Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+)
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    let endpoint = match env_non_empty(OTLP_ENDPOINT_ENV) {
+        Some(v) => v,
+        None => return (None, None),
+    };
+
+    let service_name = env_non_empty(OTLP_SERVICE_NAME_ENV)
         .unwrap_or_else(|| DEFAULT_OTLP_SERVICE_NAME.to_string());
-    Some(tokio::tracing::Config {
-        endpoint,
-        name,
-        rate: otlp_sample_rate(),
-    })
+
+    let sample_rate = otlp_sample_rate();
+
+    let headers: std::collections::HashMap<String, String> = env_non_empty(OTLP_HEADERS_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut http = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(&endpoint);
+
+    if !headers.is_empty() {
+        http = http.with_headers(headers);
+    }
+
+    let exporter = match http.build() {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("warning: failed to build OTLP exporter: {err}");
+            return (None, None);
+        }
+    };
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
+            sample_rate,
+        ))
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name.clone())
+                .build(),
+        )
+        .build();
+
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let tracer = provider.tracer(service_name.clone());
+
+    eprintln!("otlp: enabled endpoint={endpoint} service={service_name} sample_rate={sample_rate}");
+
+    let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    (Some(layer), Some(provider))
+}
+
+fn spawn_metrics_server(context: tokio::Context, addr: SocketAddr) {
+    use axum::{Extension, Router, routing::get};
+
+    context
+        .with_label("metrics")
+        .spawn(move |context| async move {
+            let listener = ::tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("failed to bind metrics server");
+
+            let app = Router::new()
+                .route(
+                    "/metrics",
+                    get(
+                        |Extension(ctx): Extension<tokio::Context>| async move {
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::OK)
+                                .header(
+                                    axum::http::header::CONTENT_TYPE,
+                                    "text/plain; version=0.0.4",
+                                )
+                                .body(axum::body::Body::from(ctx.encode()))
+                                .expect("failed to create response")
+                        },
+                    ),
+                )
+                .layer(Extension(context));
+
+            axum::serve(listener, app.into_make_service())
+                .await
+                .expect("could not serve metrics");
+        });
 }
 
 async fn wait_for_shutdown_signal() -> &'static str {
@@ -783,15 +915,11 @@ fn run(
     let genesis_allocations = node_config.genesis_allocations()?;
     if let Some(path) = log_json.as_ref() {
         eprintln!(
-            "warning: --log-json file output ({}) is ignored by commonware_runtime::tokio::telemetry::init; enabling JSON logs on stderr instead",
+            "note: --log-json file path ({}) is ignored; JSON logs go to stderr",
             path.display(),
         );
     }
     let telemetry_json = log_json.is_some();
-    let telemetry_traces = otlp_config_from_env();
-    let otlp_info = telemetry_traces
-        .as_ref()
-        .map(|cfg| (cfg.endpoint.clone(), cfg.name.clone(), cfg.rate));
 
     let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
 
@@ -825,15 +953,12 @@ fn run(
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(move |context| async move {
-        commonware_runtime::tokio::telemetry::init(
-            context.with_label("telemetry"),
-            commonware_runtime::tokio::telemetry::Logging {
-                level: tracing::Level::INFO,
-                json: telemetry_json,
-            },
-            metrics_addr,
-            telemetry_traces,
-        );
+        let tracer_provider = init_telemetry(telemetry_json);
+
+        if let Some(addr) = metrics_addr {
+            spawn_metrics_server(context.with_label("telemetry"), addr);
+        }
+
         info!(
             git_rev,
             version = env!("CARGO_PKG_VERSION"),
@@ -841,14 +966,6 @@ fn run(
         );
         if let Some(metrics_port) = node_config.metrics_port {
             info!(metrics_port, "prometheus metrics server started");
-        }
-        if let Some((endpoint, service_name, sample_rate)) = otlp_info.as_ref() {
-            info!(
-                otlp_endpoint = %endpoint,
-                otlp_service_name = %service_name,
-                otlp_sample_rate = sample_rate,
-                "OTLP trace export enabled",
-            );
         }
 
         // Create lookup-based p2p network
@@ -992,6 +1109,12 @@ fn run(
         }
 
         graceful_stop(context, monitor_second_signal).await;
+
+        if let Some(provider) = tracer_provider {
+            if let Err(err) = provider.shutdown() {
+                warn!(?err, "failed to flush OTLP traces on shutdown");
+            }
+        }
     });
     Ok(())
 }

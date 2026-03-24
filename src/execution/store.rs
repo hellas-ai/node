@@ -1,6 +1,8 @@
 use commonware_cryptography::Sha256;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{
+    journal::contiguous::fixed::Config as FConfig,
+    merkle::mmr::journaled::Config as MmrConfig,
     qmdb::current::{FixedConfig, unordered::fixed::Db as CurrentFixedDb},
     translator::EightCap,
 };
@@ -43,18 +45,24 @@ pub fn utxo_db_config(
 ) -> FixedConfig<EightCap> {
     let page_cache_size = NonZeroU16::new(page_cache_size).unwrap_or(DEFAULT_PAGE_CACHE_SIZE);
     let page_cache_count = NonZeroUsize::new(page_cache_count).unwrap_or(DEFAULT_PAGE_CACHE_COUNT);
+    let page_cache = CacheRef::from_pooler(pooler, page_cache_size, page_cache_count);
 
     FixedConfig {
-        mmr_journal_partition: format!("{partition_prefix}_utxo_mmr_journal"),
-        mmr_items_per_blob: ITEMS_PER_BLOB,
-        mmr_write_buffer: WRITE_BUFFER,
-        mmr_metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata"),
-        log_journal_partition: format!("{partition_prefix}_utxo_log_journal"),
-        log_items_per_blob: ITEMS_PER_BLOB,
-        log_write_buffer: WRITE_BUFFER,
+        mmr: MmrConfig {
+            journal_partition: format!("{partition_prefix}_utxo_mmr_journal"),
+            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata"),
+            items_per_blob: ITEMS_PER_BLOB,
+            write_buffer: WRITE_BUFFER,
+            thread_pool: None,
+            page_cache: page_cache.clone(),
+        },
+        log: FConfig {
+            partition: format!("{partition_prefix}_utxo_log_journal"),
+            items_per_blob: ITEMS_PER_BLOB,
+            page_cache,
+            write_buffer: WRITE_BUFFER,
+        },
         grafted_mmr_metadata_partition: format!("{partition_prefix}_utxo_grafted_mmr_metadata"),
         translator: EightCap,
-        thread_pool: None,
-        page_cache: CacheRef::from_pooler(pooler, page_cache_size, page_cache_count),
     }
 }
