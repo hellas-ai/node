@@ -345,6 +345,11 @@ impl AppState {
         context: &Context<Digest, PublicKey>,
         now: u64,
     ) -> Option<HellasBlock> {
+        let _span = tracing::info_span!(
+            "app.build_block",
+            view = %context.round,
+        )
+        .entered();
         self.metrics.propose_total.inc();
         self.ensure_genesis_anchor_root();
 
@@ -424,6 +429,13 @@ impl AppState {
         now: u64,
         local_anchor_root: Digest,
     ) -> bool {
+        let _span = tracing::info_span!(
+            "app.verify_block",
+            view = %context.round,
+            height = %block.height(),
+            tx_count = block.txs().len(),
+        )
+        .entered();
         self.metrics.verify_requests_total.inc();
         let Some(parent) = self.blocks.get(&block.parent()).cloned() else {
             warn!(parent = ?block.parent(), "missing parent block during verify");
@@ -831,6 +843,11 @@ impl Reporter for Application {
         match update {
             Update::Tip(_, _, _) => {}
             Update::Block(block, ack) => {
+                tracing::info!(
+                    name: "app.finalize",
+                    height = %block.height(),
+                    tx_count = block.txs().len(),
+                );
                 let mut inner = self.inner.lock().await;
                 inner.note_block(block.clone());
                 if inner.persisted_root(block.digest()).is_some() {
