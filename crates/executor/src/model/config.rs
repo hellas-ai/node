@@ -1,4 +1,4 @@
-use catgrad_llm::ProgramSpec;
+use catgrad_llm::Program;
 use catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE;
 use serde_json::Value;
 
@@ -15,11 +15,11 @@ pub(super) fn encode_i32_tokens(
 }
 
 pub(super) fn build_program_bytes(config: &Value, max_sequence_length: usize) -> Result<Vec<u8>> {
-    let program = ProgramSpec::text_from_config(config, max_sequence_length)
+    let spec = Program::text_from_config(config, max_sequence_length)
         .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
-    program
-        .canonical_bytes()
-        .map_err(|source| ModelAssetsError::SerializeProgram { source })
+    serde_json::to_vec(&spec).map_err(|source| ModelAssetsError::SerializeProgram {
+        source: catgrad_llm::LLMError::from(source),
+    })
 }
 
 pub(super) fn validate_prefill_prompt_length(config: &Value, prompt_tokens: usize) -> Result<()> {

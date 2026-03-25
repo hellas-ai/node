@@ -47,7 +47,8 @@ impl QuotePlan {
         } else {
             request.max_new_tokens
         };
-        let program: Program = request.program.as_slice().try_into()?;
+        let program: Program = serde_json::from_slice(&request.program)
+            .map_err(|e| ExecutorError::InvalidQuoteRequest(format!("invalid program: {e}")))?;
 
         let input_ids = decode_token_ids(&request.input)
             .map_err(|error| ExecutorError::InvalidTokenPayload(error.to_string()))?;
