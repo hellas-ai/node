@@ -151,9 +151,6 @@ enum Command {
         /// Explorer WebSocket URL for pushing activity events and serving queries
         #[arg(long)]
         ws_push: Option<String>,
-        /// Minimum time (ms) the leader waits before emitting a proposal
-        #[arg(long)]
-        min_propose_ms: Option<u64>,
         /// Prometheus metrics port (defaults to 9090 + node index)
         #[arg(long)]
         metrics_port: Option<u16>,
@@ -268,7 +265,6 @@ fn main() {
             seed,
             addresses,
             ws_push,
-            min_propose_ms,
             metrics_port,
         } => setup(
             validators,
@@ -277,7 +273,6 @@ fn main() {
             seed,
             addresses,
             ws_push,
-            min_propose_ms,
             metrics_port,
         ),
         Command::Run {
@@ -349,7 +344,6 @@ fn setup(
     seed: Option<u64>,
     addresses: Option<Vec<String>>,
     ws_push: Option<String>,
-    min_propose_ms: Option<u64>,
     metrics_port: Option<u16>,
 ) -> Result<(), ValidatorError> {
     if validators == 0 {
@@ -406,7 +400,6 @@ fn setup(
         metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
         ws_bind: None,
         explorer_url: ws_push,
-        min_propose_ms,
         genesis_allocations: Vec::new(),
         peers,
     };
@@ -1009,11 +1002,7 @@ fn run(
             .map(|pk| hex::encode(&pk.encode()[..8]))
             .collect();
 
-        let mut chain_config = Config::mainnet();
-        if let Some(ms) = node_config.min_propose_ms {
-            chain_config.min_propose_delay = Duration::from_millis(ms);
-            info!(min_propose_ms = ms, "proposal throttle enabled");
-        }
+        let chain_config = Config::mainnet();
         let (engine, application, activity_tx) = Engine::new(
             context.clone(),
             chain_config,

@@ -259,7 +259,6 @@ where
             ApplicationConfig {
                 page_cache_size: config.page_cache_size,
                 page_cache_count: config.page_cache_count,
-                min_propose_delay: config.min_propose_delay,
                 execution_retention_depth: (config.activity_timeout as usize).max(1),
             },
             &finalized_blocks,

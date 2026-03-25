@@ -47,7 +47,6 @@ pub struct Config {
     pub skip_timeout: u64,
     pub fetch_timeout: Duration,
     pub fetch_concurrent: usize,
-    pub min_propose_delay: Duration,
     pub broadcast_cache_per_peer: usize,
     pub max_repair: usize,
 }
@@ -67,7 +66,6 @@ impl Config {
             skip_timeout: 5,
             fetch_timeout: Duration::from_secs(5),
             fetch_concurrent: 3,
-            min_propose_delay: Duration::ZERO,
             broadcast_cache_per_peer: 128,
             max_repair: 16,
         }
@@ -87,7 +85,6 @@ impl Config {
             skip_timeout: 5,
             fetch_timeout: Duration::from_millis(500),
             fetch_concurrent: 3,
-            min_propose_delay: Duration::ZERO,
             broadcast_cache_per_peer: 64,
             max_repair: 8,
         }
@@ -111,8 +108,6 @@ pub struct NodeConfig {
     pub ws_bind: Option<String>,
     #[serde(default)]
     pub explorer_url: Option<String>,
-    #[serde(default)]
-    pub min_propose_ms: Option<u64>,
     #[serde(default)]
     pub genesis_allocations: Vec<GenesisEntry>,
     pub peers: Vec<PeerEntry>,

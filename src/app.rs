@@ -37,10 +37,7 @@ use hellas_types::{
 use indexmap::IndexMap;
 use metrics::{ApplicationMetrics, PersistenceMetrics};
 use persistence::{PageCacheConfig, PersistenceCommand, PersistenceEvent, PersistenceWorker};
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot as tokio_oneshot;
 
 pub(crate) type MarshalVariant = standard::StandardMinimmit<HellasBlock, Scheme>;
@@ -49,7 +46,6 @@ pub(crate) type MarshalMailbox = MarshalCoreMailbox<MarshalVariant>;
 pub(crate) struct ApplicationConfig {
     pub page_cache_size: u16,
     pub page_cache_count: usize,
-    pub min_propose_delay: Duration,
     pub execution_retention_depth: usize,
 }
 
@@ -58,7 +54,6 @@ impl Default for ApplicationConfig {
         Self {
             page_cache_size: crate::execution::store::DEFAULT_PAGE_CACHE_SIZE.get(),
             page_cache_count: crate::execution::store::DEFAULT_PAGE_CACHE_COUNT.get(),
-            min_propose_delay: Duration::ZERO,
             execution_retention_depth: 10,
         }
     }
@@ -520,7 +515,6 @@ pub struct Application {
     inner: Arc<AsyncMutex<AppState>>,
     persistence: PersistenceClient,
     marshal: Arc<OnceLock<MarshalMailbox>>,
-    min_propose_delay: Duration,
 }
 
 impl Application {
@@ -600,7 +594,6 @@ impl Application {
             inner: Arc::new(AsyncMutex::new(state)),
             persistence: persistence.clone(),
             marshal: Arc::new(OnceLock::new()),
-            min_propose_delay: config.min_propose_delay,
         };
 
         let app_for_events = application.clone();
@@ -753,16 +746,13 @@ where
         mut ancestry: AncestorStream<A, Self::Block>,
     ) -> Option<Self::Block> {
         let (runtime, consensus_context) = context;
-        if !self.min_propose_delay.is_zero() {
-            {
-                let inner = self.inner.lock().await;
-                inner.metrics.propose_throttled_total.inc();
-            }
-            runtime.sleep(self.min_propose_delay).await;
-        }
 
         let recovered = self.collect_relevant_ancestry(&mut ancestry, 1).await;
         let Some(parent) = recovered.first().cloned() else {
+            warn!(
+                view = %consensus_context.round,
+                "propose failed: ancestry stream yielded no blocks"
+            );
             return None;
         };
 

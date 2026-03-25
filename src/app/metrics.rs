@@ -15,7 +15,6 @@ pub(super) struct ApplicationMetrics {
     pub(crate) persistence_ack_total: Counter,
     pub(crate) persistence_ack_unexpected_total: Counter,
     pub(crate) genesis_anchor_seeded_total: Counter,
-    pub(crate) propose_throttled_total: Counter,
     pub(crate) mempool_size: Gauge<i64, AtomicI64>,
     pub(crate) persisted_roots: Gauge<i64, AtomicI64>,
     pub(crate) inflight_persistence: Gauge<i64, AtomicI64>,
@@ -37,7 +36,6 @@ impl ApplicationMetrics {
             persistence_ack_total: Counter::default(),
             persistence_ack_unexpected_total: Counter::default(),
             genesis_anchor_seeded_total: Counter::default(),
-            propose_throttled_total: Counter::default(),
             mempool_size: Gauge::default(),
             persisted_roots: Gauge::default(),
             inflight_persistence: Gauge::default(),
@@ -99,11 +97,6 @@ impl ApplicationMetrics {
             "genesis_anchor_seeded_total",
             "genesis anchor roots successfully seeded",
             metrics.genesis_anchor_seeded_total.clone(),
-        );
-        context.register(
-            "propose_throttled_total",
-            "proposals delayed by min_propose_ms throttle",
-            metrics.propose_throttled_total.clone(),
         );
         context.register(
             "mempool_size",
