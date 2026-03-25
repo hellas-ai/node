@@ -19,6 +19,7 @@
     ++ lib.optionals (cfg.executePolicy != null) ["--execute-policy" cfg.executePolicy]
     ++ lib.optionals (cfg.queueSize != null) ["--queue-size" (toString cfg.queueSize)]
     ++ lib.optionals (cfg.metricsPort != null) ["--metrics-port" (toString cfg.metricsPort)]
+    ++ lib.optionals (cfg.graffiti != null) ["--graffiti" cfg.graffiti]
     ++ lib.concatMap (model: ["--preload" model]) cfg.preloadWeights
     ++ cfg.extraArgs;
 
@@ -87,6 +88,11 @@ in {
         type = types.nullOr types.port;
         default = null;
         description = "Optional Prometheus metrics port.";
+      };
+      graffiti = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Operator graffiti tag (up to 16 bytes, padded/truncated). Self-reported to peers.";
       };
       extraArgs = mkOption {
         type = types.listOf types.str;

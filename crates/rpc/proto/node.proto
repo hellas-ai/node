@@ -2,11 +2,18 @@ syntax = "proto3";
 
 package hellas;
 
-message HealthCheckRequest {}
-message HealthCheckResponse {
-  string version = 1;
+message GetNodeInfoRequest {}
+message GetNodeInfoResponse {
+  string node_id = 1;
   uint64 uptime_seconds = 2;
-  string node_id = 3;
+  // Semver string, e.g. "0.1.0". Self-reported; treat as untrusted.
+  string version = 3;
+  // Build commit hash (short hex). Self-reported; treat as untrusted.
+  string build = 4;
+  // Platform triple, e.g. "x86_64-linux". Self-reported; treat as untrusted.
+  string os = 5;
+  // Operator-chosen tag, exactly 16 bytes. Self-reported; treat as untrusted.
+  bytes graffiti = 6;
 }
 
 message GetKnownPeersRequest {

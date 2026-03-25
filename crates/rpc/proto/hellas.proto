@@ -6,7 +6,7 @@ import "execute.proto";
 import "node.proto";
 
 service Node {
-  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
   rpc GetKnownPeers(GetKnownPeersRequest) returns (GetKnownPeersResponse);
 }
 

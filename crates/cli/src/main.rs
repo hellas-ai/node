@@ -50,6 +50,9 @@ enum Commands {
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
+        /// Operator graffiti tag (up to 16 bytes, padded/truncated)
+        #[arg(long = "graffiti", default_value = "")]
+        graffiti: String,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -168,6 +171,7 @@ async fn main() {
             queue_size,
             preload_weights,
             metrics_port,
+            graffiti,
         } => {
             commands::serve::run(
                 port,
@@ -176,6 +180,7 @@ async fn main() {
                 queue_size,
                 preload_weights,
                 metrics_port,
+                graffiti,
             )
             .await
         }

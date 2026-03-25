@@ -6043,7 +6043,8 @@ dependencies = [
 [[package]]
 name = "tonic-iroh-transport"
 version = "0.9.0"
-source = "git+https://github.com/hellas-ai/tonic-iroh-transport?branch=grw%2Ffeat%2Fdiscovery#f1d9ec5eab0861b1d214f3d176e8c97cbef7c92f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80629f36e14377d1689fd929adbe4636b51a3c3514ae6dfc234bb2072a7ef3fa"
 dependencies = [
  "async-stream",
  "axum",
