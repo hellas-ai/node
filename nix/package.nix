@@ -59,6 +59,7 @@
       lockFile = ../Cargo.lock;
       outputHashes = {
         "catgrad-0.2.1" = "sha256-CjjrUwC5leYNoJn03x04ds59V5BZyTh73Z0WRZWsziQ=";
+        "tonic-iroh-transport-0.9.0" = "sha256-BLUlCkyAOVywzyU1rpS+m+9TZA4Ns4d0gHNZlQv2ILM=";
       };
     };
     auditable = false;
