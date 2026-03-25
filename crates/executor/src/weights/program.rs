@@ -134,7 +134,7 @@ impl ExecutionContext {
         next_token: u32,
         snapshot: Snapshot<ExecBackend>,
     ) {
-        let snapshot_bytes = snapshot.logical_bytes();
+        let snapshot_bytes = snapshot.allocated();
         self.execution_cache
             .lock()
             .expect("execution cache mutex poisoned")

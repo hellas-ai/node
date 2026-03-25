@@ -14,6 +14,7 @@ static LOG_FILTER: OnceLock<FilterHandle> = OnceLock::new();
 fn base_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn"))
+        .add_directive("noq::connection=error".parse().unwrap())
         .add_directive("netlink_packet_route=error".parse().unwrap())
 }
 
