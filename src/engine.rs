@@ -464,7 +464,7 @@ where
                 freezer_value_partition: format!(
                     "{partition_prefix}-finalizations-by-height-freezer-value"
                 ),
-                freezer_value_target_size: 1024,
+                freezer_value_target_size: 65536,
                 freezer_value_compression: None,
                 ordinal_partition: format!("{partition_prefix}-finalizations-by-height-ordinal"),
                 items_per_section: NonZeroU64::new(256).unwrap(),
@@ -503,7 +503,7 @@ where
                 freezer_value_partition: format!(
                     "{partition_prefix}-finalized-blocks-freezer-value"
                 ),
-                freezer_value_target_size: 1024,
+                freezer_value_target_size: 65536,
                 freezer_value_compression: None,
                 ordinal_partition: format!("{partition_prefix}-finalized-blocks-ordinal"),
                 items_per_section: NonZeroU64::new(256).unwrap(),
