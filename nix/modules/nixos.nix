@@ -1,8 +1,7 @@
 {
   self,
   common ? import ./default.nix {inherit self;},
-}:
-{
+}: {
   config,
   lib,
   pkgs,
@@ -84,6 +83,8 @@ in {
     };
 
   config = mkIf cfg.enable {
+    nixpkgs.overlays = [self.overlays.default];
+
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
