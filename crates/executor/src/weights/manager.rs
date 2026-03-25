@@ -93,6 +93,11 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) async fn list_models(&self) -> Vec<(WeightsLocator, EntryStatusSnapshot)> {
+        let state = self.inner.state.lock().await;
+        state.weights.list_models()
+    }
+
     pub(crate) async fn ensure_ready(&self, locator: WeightsLocator) -> EnsureDisposition {
         let admission = self.admit(locator, false, false).await;
         self.spawn_loads_if_needed(admission.next_loads);
@@ -215,7 +220,7 @@ impl RuntimeManager {
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         let start = Instant::now();
-        let program_id = program.id().to_string();
+        let program_id = spec_cache_key(program);
         let weight_post_process = program.weight_post_process;
 
         loop {
@@ -283,7 +288,7 @@ impl RuntimeManager {
                     build_key,
                 } => {
                     let runtime_create_start = Instant::now();
-                    let runtime = match Self::build_runtime(&bundle, weight_post_process) {
+                    let runtime = match Self::build_runtime(&bundle) {
                         Ok(runtime) => runtime,
                         Err(error) => {
                             let mut state = self.inner.state.lock().await;
@@ -428,14 +433,12 @@ impl RuntimeManager {
 
     fn build_runtime(
         bundle: &Arc<WeightsBundle>,
-        weight_post_process: WeightPostProcess,
     ) -> Result<Arc<Runtime<ExecBackend>>, ExecutorError> {
         Ok(Arc::new(Runtime::new(
             create_backend()?,
-            weight_post_process,
             bundle.parameter_values.clone(),
             bundle.parameter_types.clone(),
-        )?))
+        )))
     }
 
     fn build_program(
@@ -658,4 +661,13 @@ mod tests {
         follower.await.expect("follower should be notified");
         assert!(inflight.is_empty());
     }
+}
+
+pub(crate) fn spec_cache_key(spec: &Program) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let bytes = serde_json::to_vec(spec).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }

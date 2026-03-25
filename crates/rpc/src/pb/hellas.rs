@@ -248,6 +248,56 @@ impl ::prost::Name for QuotePromptResponse {
         "/hellas.QuotePromptResponse".into()
     }
 }
+/// List models known to the executor and their readiness status.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListModelsRequest {}
+impl ::prost::Name for ListModelsRequest {
+    const NAME: &'static str = "ListModelsRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ListModelsRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ListModelsRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelInfo {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub revision: ::prost::alloc::string::String,
+    #[prost(enumeration = "ModelStatus", tag = "3")]
+    pub status: i32,
+    /// Human-readable error when status is FAILED.
+    #[prost(string, tag = "4")]
+    pub error: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ModelInfo {
+    const NAME: &'static str = "ModelInfo";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ModelInfo".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ModelInfo".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListModelsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub models: ::prost::alloc::vec::Vec<ModelInfo>,
+}
+impl ::prost::Name for ListModelsResponse {
+    const NAME: &'static str = "ListModelsResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ListModelsResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ListModelsResponse".into()
+    }
+}
 /// Convenience RPC: stateless token decoding.
 /// Client streams raw token bytes, server decodes with the model's tokenizer
 /// and streams back text chunks.
@@ -318,6 +368,41 @@ impl ExecutionStatus {
             "RUNNING" => Some(Self::Running),
             "COMPLETED" => Some(Self::Completed),
             "FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModelStatus {
+    Unspecified = 0,
+    Queued = 1,
+    Loading = 2,
+    Ready = 3,
+    Failed = 4,
+}
+impl ModelStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODEL_STATUS_UNSPECIFIED",
+            Self::Queued => "MODEL_STATUS_QUEUED",
+            Self::Loading => "MODEL_STATUS_LOADING",
+            Self::Ready => "MODEL_STATUS_READY",
+            Self::Failed => "MODEL_STATUS_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODEL_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODEL_STATUS_QUEUED" => Some(Self::Queued),
+            "MODEL_STATUS_LOADING" => Some(Self::Loading),
+            "MODEL_STATUS_READY" => Some(Self::Ready),
+            "MODEL_STATUS_FAILED" => Some(Self::Failed),
             _ => None,
         }
     }
@@ -889,6 +974,29 @@ pub mod execute_client {
                 .insert(GrpcMethod::new("hellas.Execute", "QuotePrompt"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn list_models(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListModelsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListModelsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Execute/ListModels",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("hellas.Execute", "ListModels"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn decode_tokens(
             &mut self,
             request: impl tonic::IntoStreamingRequest<
@@ -1035,6 +1143,13 @@ pub mod execute_server {
             request: tonic::Request<super::QuotePromptRequest>,
         ) -> std::result::Result<
             tonic::Response<super::QuotePromptResponse>,
+            tonic::Status,
+        >;
+        async fn list_models(
+            &self,
+            request: tonic::Request<super::ListModelsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListModelsResponse>,
             tonic::Status,
         >;
         /// Server streaming response type for the DecodeTokens method.
@@ -1231,6 +1346,51 @@ pub mod execute_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QuotePromptSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/ListModels" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListModelsSvc<T: Execute>(pub Arc<T>);
+                    impl<
+                        T: Execute,
+                    > tonic::server::UnaryService<super::ListModelsRequest>
+                    for ListModelsSvc<T> {
+                        type Response = super::ListModelsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListModelsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::list_models(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListModelsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

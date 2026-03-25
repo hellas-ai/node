@@ -105,6 +105,9 @@ impl Executor {
                 ExecutorMessage::SubscriptionsClosed { execution_id } => {
                     self.handle_subscriptions_closed(&execution_id);
                 }
+                ExecutorMessage::ListModels { reply } => {
+                    let _ = reply.send(Ok(self.handle_list_models().await));
+                }
             }
         }
     }

@@ -4,8 +4,8 @@ use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
     DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteResponse,
     ExecuteResultRequest, ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse,
-    ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse, QuotePromptRequest,
-    QuotePromptResponse,
+    ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse, ListModelsRequest, ListModelsResponse,
+    QuotePromptRequest, QuotePromptResponse,
 };
 use std::pin::Pin;
 use tokio::sync::oneshot;
@@ -35,6 +35,11 @@ impl ExecutorHandle {
         request: QuotePromptRequest,
     ) -> Result<QuotePromptResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
+            .await
+    }
+
+    pub async fn list_models(&self) -> Result<ListModelsResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::ListModels { reply })
             .await
     }
 
@@ -95,6 +100,13 @@ impl Execute for ExecutorHandle {
         Ok(Response::new(
             self.quote_prompt(request.into_inner()).await?,
         ))
+    }
+
+    async fn list_models(
+        &self,
+        _request: Request<ListModelsRequest>,
+    ) -> Result<Response<ListModelsResponse>, Status> {
+        Ok(Response::new(self.list_models().await?))
     }
 
     async fn execute(

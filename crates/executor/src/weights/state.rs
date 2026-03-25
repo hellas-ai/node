@@ -67,6 +67,21 @@ pub(crate) struct WeightsState {
 }
 
 impl WeightsState {
+    pub(crate) fn list_models(&self) -> Vec<(WeightsLocator, EntryStatusSnapshot)> {
+        self.entries
+            .iter()
+            .map(|(locator, entry)| {
+                let status = match &entry.status {
+                    EntryStatus::Queued => EntryStatusSnapshot::Queued,
+                    EntryStatus::Loading => EntryStatusSnapshot::Loading,
+                    EntryStatus::Ready => EntryStatusSnapshot::Ready,
+                    EntryStatus::Failed(error) => EntryStatusSnapshot::Failed(error.clone()),
+                };
+                (locator.clone(), status)
+            })
+            .collect()
+    }
+
     pub(crate) fn status(&self, locator: &WeightsLocator) -> Option<EntryStatusSnapshot> {
         self.entries.get(locator).map(|entry| match &entry.status {
             EntryStatus::Queued => EntryStatusSnapshot::Queued,
@@ -204,7 +219,7 @@ mod tests {
     use catgrad::category::lang::{Term, TypedTerm};
     use catgrad::path::Path;
     use catgrad_llm::helpers::WeightPostProcess;
-    use catgrad_llm::{Program, ProgramSpec};
+    use catgrad_llm::Program;
 
     fn locator(index: u8) -> WeightsLocator {
         WeightsLocator {
@@ -221,19 +236,15 @@ mod tests {
     }
 
     fn dummy_runtime() -> Arc<Runtime<ExecBackend>> {
-        Arc::new(
-            Runtime::new(
-                crate::backend::create_backend().unwrap(),
-                WeightPostProcess::None,
-                Default::default(),
-                Default::default(),
-            )
-            .unwrap(),
-        )
+        Arc::new(Runtime::new(
+            crate::backend::create_backend().unwrap(),
+            Default::default(),
+            Default::default(),
+        ))
     }
 
-    fn dummy_program() -> Program {
-        Program::from_spec(ProgramSpec::from_typed_term(
+    fn dummy_spec() -> Program {
+        Program::new(
             TypedTerm {
                 term: Term::empty(),
                 source_type: vec![],
@@ -243,13 +254,12 @@ mod tests {
             vec![],
             1,
             WeightPostProcess::None,
-        ))
-        .unwrap()
+        )
     }
 
     fn dummy_execution_context() -> Arc<ExecutionContext> {
         Arc::new(ExecutionContext::new(Arc::new(
-            dummy_runtime().bind(dummy_program()).unwrap(),
+            dummy_runtime().bind(dummy_spec()).unwrap(),
         )))
     }
 
