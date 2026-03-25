@@ -125,6 +125,7 @@
     };
   in {
     inherit cudaEnv;
+    server = serverCuda;
     image = mkServerImage {
       imageTag = v.tag;
       runtimePkg = runtime;
@@ -159,7 +160,9 @@
       '')
       dockerImages);
   };
+  cudaServerPackages = lib.mapAttrs (_: v: v.server) cudaImages;
+  defaultCudaServer = defaultCuda.server;
 in {
   defaultCudaEnv = defaultCuda.cudaEnv;
-  inherit dockerImages pushAll;
+  inherit dockerImages pushAll cudaServerPackages defaultCudaServer;
 }

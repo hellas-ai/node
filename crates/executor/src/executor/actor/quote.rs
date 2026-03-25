@@ -1,8 +1,11 @@
 use crate::ExecutorError;
-use crate::model::ModelSpec;
+use crate::model::{ModelAssets, ModelSpec};
 use crate::state::{QuotePlan, QuoteRecord};
 use crate::weights::{EnsureDisposition, WeightsLocator, has_cached_weights};
-use hellas_rpc::pb::hellas::{GetQuoteRequest, GetQuoteResponse};
+use catgrad_llm::PromptRequest;
+use hellas_rpc::pb::hellas::{
+    GetQuoteRequest, GetQuoteResponse, QuotePromptRequest, QuotePromptResponse,
+};
 use std::time::{Duration, Instant};
 
 use super::{Executor, weights_not_ready_error};
@@ -105,6 +108,34 @@ impl Executor {
             quote_id,
             amount: STATIC_QUOTE_AMOUNT,
             ttl_ms: QUOTE_TTL.as_millis() as u64,
+        })
+    }
+
+    pub(super) async fn handle_quote_prompt(
+        &mut self,
+        request: QuotePromptRequest,
+    ) -> Result<QuotePromptResponse, ExecutorError> {
+        let model_spec = format!(
+            "{}{}",
+            request.huggingface_model_id,
+            if request.huggingface_revision.is_empty() {
+                String::new()
+            } else {
+                format!("@{}", request.huggingface_revision)
+            }
+        );
+        let assets = ModelAssets::load(&model_spec)?;
+        let prompt_request = PromptRequest::plain(&request.prompt);
+        let prepared = assets.prepare_request(&prompt_request)?;
+        let prompt_tokens = prepared.input_ids.len() as u32;
+        let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
+        let quote_response = self.handle_quote(full_request).await?;
+
+        Ok(QuotePromptResponse {
+            quote_id: quote_response.quote_id,
+            amount: quote_response.amount,
+            ttl_ms: quote_response.ttl_ms,
+            prompt_tokens,
         })
     }
 

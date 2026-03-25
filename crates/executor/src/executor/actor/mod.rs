@@ -58,6 +58,9 @@ impl Executor {
                 ExecutorMessage::Quote { request, reply } => {
                     let _ = reply.send(self.handle_quote(request).await);
                 }
+                ExecutorMessage::QuotePrompt { request, reply } => {
+                    let _ = reply.send(self.handle_quote_prompt(request).await);
+                }
                 ExecutorMessage::Preload { model, reply } => {
                     let _ = reply.send(self.handle_preload(model).await);
                 }

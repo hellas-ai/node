@@ -12,6 +12,8 @@ service Node {
 
 service Execute {
   rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+  rpc QuotePrompt(QuotePromptRequest) returns (QuotePromptResponse);
+  rpc DecodeTokens(stream DecodeTokensRequest) returns (stream DecodeTokensResponse);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
   rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteStreamEvent);

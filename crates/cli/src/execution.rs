@@ -19,12 +19,11 @@ use tonic_iroh_transport::iroh::{
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tonic_iroh_transport::otel::TraceContextInjector;
-use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
+use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
 use tracing::instrument;
 
-type TracedChannel = InterceptedService<Channel, TraceContextInjector>;
+type TracedChannel = InterceptedService<IrohChannel, TraceContextInjector>;
 type TracedDriver = RemoteExecuteDriver<TracedChannel>;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
