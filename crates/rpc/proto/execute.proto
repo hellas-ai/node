@@ -77,6 +77,29 @@ message QuotePromptResponse {
   uint32 prompt_tokens = 4;
 }
 
+// List models known to the executor and their readiness status.
+message ListModelsRequest {}
+
+message ModelInfo {
+  string model_id = 1;
+  string revision = 2;
+  ModelStatus status = 3;
+  // Human-readable error when status is FAILED.
+  string error = 4;
+}
+
+enum ModelStatus {
+  MODEL_STATUS_UNSPECIFIED = 0;
+  MODEL_STATUS_QUEUED = 1;
+  MODEL_STATUS_LOADING = 2;
+  MODEL_STATUS_READY = 3;
+  MODEL_STATUS_FAILED = 4;
+}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
 // Convenience RPC: stateless token decoding.
 // Client streams raw token bytes, server decodes with the model's tokenizer
 // and streams back text chunks.
