@@ -2,9 +2,10 @@ use crate::ExecutorError;
 use hellas_rpc::driver::{ExecuteDriver, ExecuteEventStream};
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
-    ExecuteStatusRequest, ExecuteStatusResponse, ExecuteStreamEvent, GetQuoteRequest,
-    GetQuoteResponse,
+    DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteResponse,
+    ExecuteResultRequest, ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse,
+    ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse, QuotePromptRequest,
+    QuotePromptResponse,
 };
 use std::pin::Pin;
 use tokio::sync::oneshot;
@@ -26,6 +27,14 @@ impl ExecutorHandle {
 
     pub async fn quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::Quote { request, reply })
+            .await
+    }
+
+    pub async fn quote_prompt(
+        &self,
+        request: QuotePromptRequest,
+    ) -> Result<QuotePromptResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
             .await
     }
 
@@ -79,6 +88,15 @@ impl Execute for ExecutorHandle {
         Ok(Response::new(self.quote(request.into_inner()).await?))
     }
 
+    async fn quote_prompt(
+        &self,
+        request: Request<QuotePromptRequest>,
+    ) -> Result<Response<QuotePromptResponse>, Status> {
+        Ok(Response::new(
+            self.quote_prompt(request.into_inner()).await?,
+        ))
+    }
+
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
@@ -116,6 +134,80 @@ impl Execute for ExecutorHandle {
         Ok(Response::new(
             self.execution_result(request.into_inner()).await?,
         ))
+    }
+
+    type DecodeTokensStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<DecodeTokensResponse, Status>> + Send>>;
+
+    async fn decode_tokens(
+        &self,
+        request: Request<tonic::Streaming<DecodeTokensRequest>>,
+    ) -> Result<Response<Self::DecodeTokensStream>, Status> {
+        use crate::model::ModelAssets;
+        use hellas_rpc::decode_token_ids;
+        use tokio_stream::StreamExt;
+
+        let mut stream = request.into_inner();
+
+        // First message must contain the model ID.
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty stream"))?
+            .map_err(|e| Status::internal(format!("stream error: {e}")))?;
+
+        let model_spec = if first.huggingface_revision.is_empty() {
+            first.huggingface_model_id.clone()
+        } else {
+            format!("{}@{}", first.huggingface_model_id, first.huggingface_revision)
+        };
+        let assets = ModelAssets::load(&model_spec)
+            .map_err(|e| Status::internal(format!("failed to load model: {e}")))?;
+
+        // Process the first message's tokens too.
+        let output_stream = async_stream::stream! {
+            // Decode first message's tokens.
+            if !first.token_bytes.is_empty() {
+                match decode_token_ids(&first.token_bytes) {
+                    Ok(ids) => match assets.decode_tokens(&ids) {
+                        Ok(text) => yield Ok(DecodeTokensResponse { text }),
+                        Err(e) => yield Err(Status::internal(format!("decode error: {e}"))),
+                    },
+                    Err(e) => yield Err(Status::internal(format!("invalid token bytes: {e}"))),
+                }
+            }
+
+            // Process remaining messages.
+            tokio::pin!(stream);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(req) => {
+                        if req.token_bytes.is_empty() {
+                            continue;
+                        }
+                        match decode_token_ids(&req.token_bytes) {
+                            Ok(ids) => match assets.decode_tokens(&ids) {
+                                Ok(text) => yield Ok(DecodeTokensResponse { text }),
+                                Err(e) => {
+                                    yield Err(Status::internal(format!("decode error: {e}")));
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                yield Err(Status::internal(format!("invalid token bytes: {e}")));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(Status::internal(format!("stream error: {e}")));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(output_stream) as Self::DecodeTokensStream))
     }
 }
 

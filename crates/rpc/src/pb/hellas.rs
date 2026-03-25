@@ -204,6 +204,89 @@ impl ::prost::Name for ExecuteResultResponse {
         "/hellas.ExecuteResultResponse".into()
     }
 }
+/// Convenience RPC: the server handles tokenization and graph construction.
+/// Intended for lightweight clients (browsers) that don't have the tokenizer.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct QuotePromptRequest {
+    #[prost(string, tag = "1")]
+    pub huggingface_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub huggingface_revision: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub prompt: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub max_new_tokens: u32,
+}
+impl ::prost::Name for QuotePromptRequest {
+    const NAME: &'static str = "QuotePromptRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.QuotePromptRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.QuotePromptRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct QuotePromptResponse {
+    #[prost(string, tag = "1")]
+    pub quote_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub amount: u64,
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
+    #[prost(uint32, tag = "4")]
+    pub prompt_tokens: u32,
+}
+impl ::prost::Name for QuotePromptResponse {
+    const NAME: &'static str = "QuotePromptResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.QuotePromptResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.QuotePromptResponse".into()
+    }
+}
+/// Convenience RPC: stateless token decoding.
+/// Client streams raw token bytes, server decodes with the model's tokenizer
+/// and streams back text chunks.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecodeTokensRequest {
+    #[prost(string, tag = "1")]
+    pub huggingface_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub huggingface_revision: ::prost::alloc::string::String,
+    /// Raw token bytes (little-endian u32 token IDs, same format as ExecuteStream output).
+    #[prost(bytes = "vec", tag = "3")]
+    pub token_bytes: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for DecodeTokensRequest {
+    const NAME: &'static str = "DecodeTokensRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.DecodeTokensRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.DecodeTokensRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecodeTokensResponse {
+    /// Decoded text (incremental delta — concatenate all responses for full output).
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+impl ::prost::Name for DecodeTokensResponse {
+    const NAME: &'static str = "DecodeTokensResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.DecodeTokensResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.DecodeTokensResponse".into()
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionStatus {
@@ -782,6 +865,56 @@ pub mod execute_client {
             req.extensions_mut().insert(GrpcMethod::new("hellas.Execute", "GetQuote"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn quote_prompt(
+            &mut self,
+            request: impl tonic::IntoRequest<super::QuotePromptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::QuotePromptResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Execute/QuotePrompt",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.Execute", "QuotePrompt"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn decode_tokens(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::DecodeTokensRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DecodeTokensResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Execute/DecodeTokens",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.Execute", "DecodeTokens"));
+            self.inner.streaming(req, path, codec).await
+        }
         pub async fn execute(
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteRequest>,
@@ -895,6 +1028,26 @@ pub mod execute_server {
             request: tonic::Request<super::GetQuoteRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetQuoteResponse>,
+            tonic::Status,
+        >;
+        async fn quote_prompt(
+            &self,
+            request: tonic::Request<super::QuotePromptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::QuotePromptResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the DecodeTokens method.
+        type DecodeTokensStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DecodeTokensResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn decode_tokens(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::DecodeTokensRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::DecodeTokensStream>,
             tonic::Status,
         >;
         async fn execute(
@@ -1044,6 +1197,99 @@ pub mod execute_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/QuotePrompt" => {
+                    #[allow(non_camel_case_types)]
+                    struct QuotePromptSvc<T: Execute>(pub Arc<T>);
+                    impl<
+                        T: Execute,
+                    > tonic::server::UnaryService<super::QuotePromptRequest>
+                    for QuotePromptSvc<T> {
+                        type Response = super::QuotePromptResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::QuotePromptRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::quote_prompt(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = QuotePromptSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/DecodeTokens" => {
+                    #[allow(non_camel_case_types)]
+                    struct DecodeTokensSvc<T: Execute>(pub Arc<T>);
+                    impl<
+                        T: Execute,
+                    > tonic::server::StreamingService<super::DecodeTokensRequest>
+                    for DecodeTokensSvc<T> {
+                        type Response = super::DecodeTokensResponse;
+                        type ResponseStream = T::DecodeTokensStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::DecodeTokensRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::decode_tokens(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DecodeTokensSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -32,7 +32,11 @@ pub async fn run(
     .await
     .context("failed to start node server")?;
 
-    eprintln!("Node Address: {}", node.node_id());
+    let node_id = node.node_id();
+    let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");
+    eprintln!("Node ID:      {node_id}");
+    eprintln!("Explorer:     {add_url}");
+    print_qr(&add_url);
     println!(
         "Policies: download={} execute={} queue_size={}",
         download_policy, execute_policy, queue_size
@@ -73,6 +77,39 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Print a QR code to stderr using Unicode half-block characters.
+fn print_qr(data: &str) {
+    use qrcode::QrCode;
+    let Ok(code) = QrCode::new(data.as_bytes()) else {
+        return;
+    };
+    let width = code.width();
+    let modules = code.into_colors();
+    // Two rows per character using upper/lower half blocks.
+    // ██ = both dark, ▀ = top dark, ▄ = bottom dark, ' ' = both light.
+    for y in (0..width).step_by(2) {
+        eprint!("  ");
+        for x in 0..width {
+            let top = modules[y * width + x] == qrcode::Color::Dark;
+            let bottom = if y + 1 < width {
+                modules[(y + 1) * width + x] == qrcode::Color::Dark
+            } else {
+                false
+            };
+            eprint!(
+                "{}",
+                match (top, bottom) {
+                    (true, true) => "█",
+                    (true, false) => "▀",
+                    (false, true) => "▄",
+                    (false, false) => " ",
+                }
+            );
+        }
+        eprintln!();
+    }
 }
 
 fn dedupe_preload_weights(mut models: Vec<String>) -> Vec<String> {

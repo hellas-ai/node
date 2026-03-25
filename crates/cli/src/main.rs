@@ -101,17 +101,17 @@ enum Commands {
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
     },
-    /// Check health of a remote node
-    Health {
+    /// Query a remote node via RPC
+    Rpc {
         /// Node ID to check
         node_id: EndpointId,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
-    /// Execute a job remotely or locally
-    Execute {
-        /// Node ID to execute on remotely (omit to auto-discover)
+    /// Run LLM inference remotely or locally
+    Llm {
+        /// Node ID to run on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
@@ -123,7 +123,7 @@ enum Commands {
             default_value = "HuggingFaceTB/SmolLM2-135M-Instruct"
         )]
         model: String,
-        /// Prompt to execute (required)
+        /// Prompt to send (required)
         #[arg(short = 'p', long = "prompt")]
         prompt: String,
         /// Maximum number of new tokens to generate
@@ -209,11 +209,11 @@ async fn main() {
             })
             .await
         }
-        Commands::Health {
+        Commands::Rpc {
             node_id,
             node_addrs,
-        } => commands::health::run(node_id, node_addrs).await,
-        Commands::Execute {
+        } => commands::rpc::run(node_id, node_addrs).await,
+        Commands::Llm {
             node_id,
             node_addrs,
             model,
@@ -223,7 +223,7 @@ async fn main() {
             local,
             verify_local,
         } => {
-            commands::execute::run(commands::execute::ExecuteOptions {
+            commands::llm::run(commands::llm::ExecuteOptions {
                 node_id,
                 node_addrs,
                 model,
@@ -258,10 +258,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execute_accepts_local_mode() {
-        let cli = Cli::try_parse_from(["hellas", "execute", "--local", "-p", "hello"]).unwrap();
+    fn llm_accepts_local_mode() {
+        let cli = Cli::try_parse_from(["hellas", "llm", "--local", "-p", "hello"]).unwrap();
         match cli.command {
-            Commands::Execute {
+            Commands::Llm {
                 node_id,
                 node_addrs,
                 local,
@@ -273,15 +273,15 @@ mod tests {
                 assert!(local);
                 assert!(!verify_local);
             }
-            _ => panic!("expected execute command"),
+            _ => panic!("expected llm command"),
         }
     }
 
     #[test]
-    fn execute_rejects_local_with_node_id() {
+    fn llm_rejects_local_with_node_id() {
         let result = Cli::try_parse_from([
             "hellas",
-            "execute",
+            "llm",
             "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
             "--local",
             "-p",
@@ -292,10 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_conflicting_local_modes() {
+    fn llm_rejects_conflicting_local_modes() {
         let result = Cli::try_parse_from([
             "hellas",
-            "execute",
+            "llm",
             "--local",
             "--verify-local",
             "-p",
@@ -337,10 +337,10 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_node_addr_without_node_id() {
+    fn llm_rejects_node_addr_without_node_id() {
         let result = Cli::try_parse_from([
             "hellas",
-            "execute",
+            "llm",
             "--node-addr",
             "127.0.0.1:31145",
             "-p",

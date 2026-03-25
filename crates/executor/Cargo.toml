@@ -13,7 +13,7 @@ candle-cuda = ["catgrad/candle-backend", "catgrad/cuda"]
 candle-metal = ["catgrad/candle-backend", "catgrad/metal"]
 
 [dependencies]
-hellas-rpc = { workspace = true, features = ["server", "client"] }
+hellas-rpc = { workspace = true, features = ["server", "client", "compression"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
@@ -27,6 +27,7 @@ hf-hub = "0.5"
 blake3 = "1"
 tokenizers = "0.21"
 uuid = { version = "1", features = ["v4"] }
+async-stream = "0.3"
 
 [dev-dependencies]
 proptest = "1"
