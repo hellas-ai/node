@@ -1,10 +1,10 @@
 use crate::ExecutorError;
 use crate::model::{ModelAssets, ModelSpec};
 use crate::state::{QuotePlan, QuoteRecord};
-use crate::weights::{EnsureDisposition, WeightsLocator, has_cached_weights};
-use catgrad_llm::PromptRequest;
+use crate::weights::{EnsureDisposition, EntryStatusSnapshot, WeightsLocator, has_cached_weights};
 use hellas_rpc::pb::hellas::{
-    GetQuoteRequest, GetQuoteResponse, QuotePromptRequest, QuotePromptResponse,
+    GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
+    QuotePromptRequest, QuotePromptResponse,
 };
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ impl Executor {
         let plan_start = Instant::now();
         let plan = QuotePlan::from_quote_request(request)?;
         let plan_parse_ms = plan_start.elapsed().as_millis();
-        let program_id = plan.program.id().to_string();
+        let program_id = crate::weights::spec_cache_key(&plan.program);
         if !self
             .execute_policy
             .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
@@ -125,8 +125,7 @@ impl Executor {
             }
         );
         let assets = ModelAssets::load(&model_spec)?;
-        let prompt_request = PromptRequest::plain(&request.prompt);
-        let prepared = assets.prepare_request(&prompt_request)?;
+        let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
         let quote_response = self.handle_quote(full_request).await?;
@@ -137,6 +136,28 @@ impl Executor {
             ttl_ms: quote_response.ttl_ms,
             prompt_tokens,
         })
+    }
+
+    pub(super) async fn handle_list_models(&self) -> ListModelsResponse {
+        let entries = self.runtime_manager.list_models().await;
+        let models = entries
+            .into_iter()
+            .map(|(locator, status)| {
+                let (proto_status, error) = match status {
+                    EntryStatusSnapshot::Queued => (ModelStatus::Queued, String::new()),
+                    EntryStatusSnapshot::Loading => (ModelStatus::Loading, String::new()),
+                    EntryStatusSnapshot::Ready => (ModelStatus::Ready, String::new()),
+                    EntryStatusSnapshot::Failed(err) => (ModelStatus::Failed, err),
+                };
+                ModelInfo {
+                    model_id: locator.model_id,
+                    revision: locator.revision,
+                    status: proto_status.into(),
+                    error,
+                }
+            })
+            .collect();
+        ListModelsResponse { models }
     }
 
     async fn ensure_quote_weights_ready(
