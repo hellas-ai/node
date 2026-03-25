@@ -2,9 +2,11 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 use tonic::Status;
+#[cfg(feature = "compression")]
 use tonic::codec::CompressionEncoding;
 use tonic::codegen::*;
-use tonic::transport::Channel;
+#[cfg(feature = "discovery")]
+use tonic_iroh_transport::IrohChannel;
 
 use crate::GRPC_MESSAGE_LIMIT;
 use crate::pb::hellas::execute_client::ExecuteClient;
@@ -24,18 +26,15 @@ pub trait ExecuteDriver: Send {
     ) -> Result<ExecuteEventStream, Status>;
 }
 
-pub struct RemoteExecuteDriver<T = Channel> {
+pub struct RemoteExecuteDriver<T> {
     client: ExecuteClient<T>,
 }
 
-impl RemoteExecuteDriver<Channel> {
-    pub fn new(channel: Channel) -> Self {
+#[cfg(feature = "discovery")]
+impl RemoteExecuteDriver<IrohChannel> {
+    pub fn new(channel: IrohChannel) -> Self {
         Self {
-            client: ExecuteClient::new(channel)
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd)
-                .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-                .max_encoding_message_size(GRPC_MESSAGE_LIMIT),
+            client: Self::configure(ExecuteClient::new(channel)),
         }
     }
 }
@@ -49,12 +48,19 @@ where
 {
     pub fn with_service(service: T) -> Self {
         Self {
-            client: ExecuteClient::new(service)
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd)
-                .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-                .max_encoding_message_size(GRPC_MESSAGE_LIMIT),
+            client: Self::configure(ExecuteClient::new(service)),
         }
+    }
+
+    fn configure(client: ExecuteClient<T>) -> ExecuteClient<T> {
+        let client = client
+            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+            .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+        #[cfg(feature = "compression")]
+        let client = client
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
+        client
     }
 }
 

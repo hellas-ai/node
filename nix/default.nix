@@ -48,7 +48,13 @@
       packages =
         lib.mapAttrs'
         (name: value: lib.nameValuePair "docker-${name}" value)
-        docker.dockerImages;
+        docker.dockerImages
+        // lib.mapAttrs'
+        (name: value: lib.nameValuePair "server-${name}" value)
+        docker.cudaServerPackages
+        // {
+          server-cuda = docker.defaultCudaServer;
+        };
 
       apps = {
         "docker-push-all" = {

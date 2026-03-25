@@ -60,3 +60,34 @@ message ExecuteStreamEvent {
 
 message ExecuteResultRequest { string execution_id = 1; }
 message ExecuteResultResponse { bytes output = 1; }
+
+// Convenience RPC: the server handles tokenization and graph construction.
+// Intended for lightweight clients (browsers) that don't have the tokenizer.
+message QuotePromptRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  string prompt = 3;
+  uint32 max_new_tokens = 4;
+}
+
+message QuotePromptResponse {
+  string quote_id = 1;
+  uint64 amount = 2;
+  uint64 ttl_ms = 3;
+  uint32 prompt_tokens = 4;
+}
+
+// Convenience RPC: stateless token decoding.
+// Client streams raw token bytes, server decodes with the model's tokenizer
+// and streams back text chunks.
+message DecodeTokensRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  // Raw token bytes (little-endian u32 token IDs, same format as ExecuteStream output).
+  bytes token_bytes = 3;
+}
+
+message DecodeTokensResponse {
+  // Decoded text (incremental delta — concatenate all responses for full output).
+  string text = 1;
+}

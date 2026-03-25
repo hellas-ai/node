@@ -11,6 +11,7 @@ documentation.workspace = true
 default = ["client"]
 client = [
     "hellas-rpc/client",
+    "hellas-rpc/compression",
     "hellas-rpc/discovery",
     "dep:hellas-executor",
     "dep:tonic-iroh-transport",
@@ -46,6 +47,7 @@ axum = "0.8"
 prometheus-client = "0.24"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }

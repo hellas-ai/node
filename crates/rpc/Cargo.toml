@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [features]
 default = []
+compression = ["tonic/gzip", "tonic/zstd"]
 client = ["tonic/channel"]
 discovery = [
     "client",
@@ -21,7 +22,7 @@ server = ["tonic/server"]
 compile = ["dep:tonic-prost-build"]
 
 [dependencies]
-tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "zstd"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
 futures-core = "0.3"

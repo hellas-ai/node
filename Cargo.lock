@@ -2315,6 +2315,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus-client",
+ "qrcode",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
@@ -2332,6 +2333,7 @@ dependencies = [
 name = "hellas-executor"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "blake3",
  "catgrad",
  "catgrad-llm",
@@ -4664,6 +4666,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6065,19 +6073,21 @@ dependencies = [
 
 [[package]]
 name = "tonic-iroh-transport"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf84a224b56a1bff2068b790f87974784b39cca00974db25693b88dd5560bb0e"
+checksum = "bb97eacbe78bce2bd861b5e21b587132efd6578354a2cb0860dc37cd4361fc35"
 dependencies = [
  "async-stream",
  "axum",
  "bytes",
  "data-encoding",
  "futures-util",
+ "h2",
  "http",
- "hyper-util",
+ "http-body",
  "iroh",
  "mainline",
+ "n0-future",
  "opentelemetry",
  "postcard",
  "serde",
@@ -6086,7 +6096,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-prost-build",
  "tower 0.4.13",
  "tracing",
  "tracing-opentelemetry",
