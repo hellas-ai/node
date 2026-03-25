@@ -1,7 +1,7 @@
 use crate::commands::CliResult;
 use anyhow::Context;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::pb::hellas::HealthCheckRequest;
+use hellas_rpc::pb::hellas::GetNodeInfoRequest;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::service::NodeService;
 use std::net::SocketAddr;
@@ -27,14 +27,20 @@ pub async fn run(node_id: EndpointId, node_addrs: Vec<SocketAddr>) -> CliResult<
 
     let mut client = NodeClient::new(channel);
     let response = client
-        .health_check(HealthCheckRequest {})
+        .get_node_info(GetNodeInfoRequest {})
         .await
-        .context("health check RPC failed")?
+        .context("get_node_info RPC failed")?
         .into_inner();
 
-    println!("Version: {}", response.version);
-    println!("Uptime: {}s", response.uptime_seconds);
-    println!("Node ID: {}", response.node_id);
+    println!("Node ID:  {}", response.node_id);
+    println!("Version:  {}", response.version);
+    println!("Build:    {}", response.build);
+    println!("OS:       {}", response.os);
+    println!("Uptime:   {}s", response.uptime_seconds);
+    println!(
+        "Graffiti: {}",
+        String::from_utf8_lossy(&response.graffiti)
+    );
 
     Ok(())
 }

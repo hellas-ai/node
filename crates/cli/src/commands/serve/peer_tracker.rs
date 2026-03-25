@@ -15,7 +15,7 @@ const DEFAULT_LATENCY_SCORE: i64 = 450;
 /// Request classes with different admission costs.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RequestKind {
-    HealthCheck,
+    GetNodeInfo,
     GetKnownPeers,
     ExecuteRpc,
 }
@@ -39,7 +39,7 @@ impl PeerTracker {
             local_id,
             peers: HashMap::new(),
             // Bound global CPU/alloc pressure from many concurrent GetKnownPeers calls.
-            known_peers_global_bucket: TokenBucket::new(200.0, 40.0),
+            known_peers_global_bucket: TokenBucket::new(16.0, 4.0),
         }
     }
 
@@ -51,7 +51,7 @@ impl PeerTracker {
     ) -> RequestAdmission {
         let now = Instant::now();
         let (cost, throttleable) = match kind {
-            RequestKind::HealthCheck => (0.5, false),
+            RequestKind::GetNodeInfo => (0.5, false),
             RequestKind::ExecuteRpc => (1.0, false),
             RequestKind::GetKnownPeers => (4.0, true),
         };
@@ -213,13 +213,13 @@ impl PeerStats {
         }
     }
 
-    fn register_kind(&mut self, kind: RequestKind) {
-        match kind {
-            RequestKind::HealthCheck | RequestKind::GetKnownPeers => {
-                self.seen_node_service = true;
-            }
-            RequestKind::ExecuteRpc => {}
-        }
+    fn register_kind(&mut self, _kind: RequestKind) {
+        // Intentionally does not set `seen_node_service`. Calling an RPC on
+        // this node only proves the peer is a *client*, not that it provides
+        // the Node service itself. Without this distinction, ephemeral browser
+        // sessions get shared as "known peers" even though they can't serve
+        // anything. Service capability should be signalled explicitly (e.g.
+        // via DHT publishing or a future RegisterPeer RPC).
     }
 
     fn record_rtt(&mut self, rtt: Option<Duration>) {
@@ -360,35 +360,29 @@ mod tests {
     }
 
     #[test]
-    fn service_filter_only_returns_matching_activity() {
+    fn rpc_callers_are_not_marked_as_service_providers() {
         let local = endpoint_id(1);
-        let execute_peer = endpoint_id(2);
-        let node_only_peer = endpoint_id(3);
-        let requester = endpoint_id(4);
+        let health_caller = endpoint_id(2);
+        let known_peers_caller = endpoint_id(3);
+        let execute_caller = endpoint_id(4);
+        let requester = endpoint_id(5);
         let mut tracker = PeerTracker::new(local);
 
-        let _ = tracker.observe_request(execute_peer, None, RequestKind::ExecuteRpc);
-        let _ = tracker.observe_request(node_only_peer, None, RequestKind::HealthCheck);
-        let _ = tracker.observe_request(requester, None, RequestKind::GetKnownPeers);
-
-        let execute_only = tracker.ranked_known_peers(requester, EXECUTE_SERVICE_ALPN, 64);
-        assert_eq!(execute_only, vec![node_only_peer]);
-    }
-
-    #[test]
-    fn execute_rpc_alone_does_not_mark_service_capability() {
-        let local = endpoint_id(1);
-        let execute_caller = endpoint_id(2);
-        let requester = endpoint_id(3);
-        let mut tracker = PeerTracker::new(local);
-
+        let _ = tracker.observe_request(health_caller, None, RequestKind::GetNodeInfo);
+        let _ = tracker.observe_request(known_peers_caller, None, RequestKind::GetKnownPeers);
         let _ = tracker.observe_request(execute_caller, None, RequestKind::ExecuteRpc);
         let _ = tracker.observe_request(requester, None, RequestKind::GetKnownPeers);
 
-        let execute_candidates = tracker.ranked_known_peers(requester, EXECUTE_SERVICE_ALPN, 64);
+        // No RPC call type should mark a peer as a service provider. Callers
+        // are clients, not servers — especially ephemeral browser sessions.
+        let candidates = tracker.ranked_known_peers(requester, EXECUTE_SERVICE_ALPN, 64);
         assert!(
-            execute_candidates.is_empty(),
-            "execute callers are not assumed to provide execute service"
+            candidates.is_empty(),
+            "RPC callers should not be returned as service providers"
         );
+
+        // Unfiltered query still returns all tracked peers (excluding requester/local).
+        let all = tracker.ranked_known_peers(requester, "", 64);
+        assert_eq!(all.len(), 3);
     }
 }

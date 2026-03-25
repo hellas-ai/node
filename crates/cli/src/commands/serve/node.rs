@@ -6,7 +6,7 @@ use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
-    GetKnownPeersRequest, GetKnownPeersResponse, HealthCheckRequest, HealthCheckResponse,
+    GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 };
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,8 @@ const MAX_PORT_RETRIES: u16 = 100;
 struct NodeService {
     start_time: Instant,
     node_id: String,
+    build: String,
+    graffiti: Vec<u8>,
     peer_tracker: Arc<Mutex<PeerTracker>>,
 }
 
@@ -48,20 +50,23 @@ impl tonic::service::Interceptor for ExecutePeerInterceptor {
 
 #[tonic::async_trait]
 impl Node for NodeService {
-    async fn health_check(
+    async fn get_node_info(
         &self,
-        request: Request<HealthCheckRequest>,
-    ) -> Result<Response<HealthCheckResponse>, Status> {
+        request: Request<GetNodeInfoRequest>,
+    ) -> Result<Response<GetNodeInfoResponse>, Status> {
         if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
             if let Ok(mut tracker) = self.peer_tracker.lock() {
-                let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::HealthCheck);
+                let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::GetNodeInfo);
             }
         }
 
-        Ok(Response::new(HealthCheckResponse {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: self.start_time.elapsed().as_secs(),
+        Ok(Response::new(GetNodeInfoResponse {
             node_id: self.node_id.clone(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: self.build.clone(),
+            os: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            graffiti: self.graffiti.clone(),
         }))
     }
 
@@ -143,6 +148,8 @@ pub(super) async fn spawn_node(
     execute_policy: ExecutePolicy,
     queue_size: usize,
     preload_weights: Vec<String>,
+    build: String,
+    graffiti: Vec<u8>,
 ) -> anyhow::Result<NodeHandle> {
     let make_builder = || {
         Endpoint::builder(presets::N0)
@@ -198,6 +205,8 @@ pub(super) async fn spawn_node(
     let node_service = NodeService {
         start_time: Instant::now(),
         node_id: endpoint.id().to_string(),
+        build,
+        graffiti,
         peer_tracker: Arc::new(Mutex::new(PeerTracker::new(endpoint.id()))),
     };
 

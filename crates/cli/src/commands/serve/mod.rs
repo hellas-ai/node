@@ -15,6 +15,7 @@ pub async fn run(
     queue_size: usize,
     preload_weights: Vec<String>,
     metrics_port: Option<u16>,
+    graffiti: String,
 ) -> CliResult<()> {
     if let Some(metrics_port) = metrics_port {
         let registry = std::sync::Arc::new(prometheus_client::registry::Registry::default());
@@ -22,12 +23,22 @@ pub async fn run(
     }
 
     let preload_weights = dedupe_preload_weights(preload_weights);
+    let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
+    let graffiti = {
+        let mut buf = [0u8; 16];
+        let src = graffiti.as_bytes();
+        let len = src.len().min(16);
+        buf[..len].copy_from_slice(&src[..len]);
+        buf.to_vec()
+    };
     let node = node::spawn_node(
         port,
         download_policy.clone(),
         execute_policy.clone(),
         queue_size,
         preload_weights.clone(),
+        build,
+        graffiti,
     )
     .await
     .context("failed to start node server")?;

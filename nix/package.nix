@@ -1,4 +1,5 @@
 {
+  self,
   system,
   nixpkgs,
   rust-overlay,
@@ -51,6 +52,8 @@
     skopeo
   ];
 
+  rev = self.rev or self.dirtyRev or "unknown";
+
   commonArgs = {
     pname = "hellas";
     version = "0.1.0";
@@ -59,10 +62,10 @@
       lockFile = ../Cargo.lock;
       outputHashes = {
         "catgrad-0.2.1" = "sha256-CjjrUwC5leYNoJn03x04ds59V5BZyTh73Z0WRZWsziQ=";
-        "tonic-iroh-transport-0.9.0" = "sha256-BLUlCkyAOVywzyU1rpS+m+9TZA4Ns4d0gHNZlQv2ILM=";
       };
     };
     auditable = false;
+    GIT_REV = builtins.substring 0 12 rev;
     buildInputs = workspaceBuildInputs;
     nativeBuildInputs = workspaceNativeBuildInputs;
     checkInputs = with pkgs; [cargo-outdated];

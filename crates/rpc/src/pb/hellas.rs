@@ -408,34 +408,44 @@ impl ModelStatus {
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HealthCheckRequest {}
-impl ::prost::Name for HealthCheckRequest {
-    const NAME: &'static str = "HealthCheckRequest";
+pub struct GetNodeInfoRequest {}
+impl ::prost::Name for GetNodeInfoRequest {
+    const NAME: &'static str = "GetNodeInfoRequest";
     const PACKAGE: &'static str = "hellas";
     fn full_name() -> ::prost::alloc::string::String {
-        "hellas.HealthCheckRequest".into()
+        "hellas.GetNodeInfoRequest".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.HealthCheckRequest".into()
+        "/hellas.GetNodeInfoRequest".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HealthCheckResponse {
+pub struct GetNodeInfoResponse {
     #[prost(string, tag = "1")]
-    pub version: ::prost::alloc::string::String,
+    pub node_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub uptime_seconds: u64,
+    /// Semver string, e.g. "0.1.0". Self-reported; treat as untrusted.
     #[prost(string, tag = "3")]
-    pub node_id: ::prost::alloc::string::String,
+    pub version: ::prost::alloc::string::String,
+    /// Build commit hash (short hex). Self-reported; treat as untrusted.
+    #[prost(string, tag = "4")]
+    pub build: ::prost::alloc::string::String,
+    /// Platform triple, e.g. "x86_64-linux". Self-reported; treat as untrusted.
+    #[prost(string, tag = "5")]
+    pub os: ::prost::alloc::string::String,
+    /// Operator-chosen tag, exactly 16 bytes. Self-reported; treat as untrusted.
+    #[prost(bytes = "vec", tag = "6")]
+    pub graffiti: ::prost::alloc::vec::Vec<u8>,
 }
-impl ::prost::Name for HealthCheckResponse {
-    const NAME: &'static str = "HealthCheckResponse";
+impl ::prost::Name for GetNodeInfoResponse {
+    const NAME: &'static str = "GetNodeInfoResponse";
     const PACKAGE: &'static str = "hellas";
     fn full_name() -> ::prost::alloc::string::String {
-        "hellas.HealthCheckResponse".into()
+        "hellas.GetNodeInfoResponse".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.HealthCheckResponse".into()
+        "/hellas.GetNodeInfoResponse".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -571,11 +581,11 @@ pub mod node_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        pub async fn health_check(
+        pub async fn get_node_info(
             &mut self,
-            request: impl tonic::IntoRequest<super::HealthCheckRequest>,
+            request: impl tonic::IntoRequest<super::GetNodeInfoRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::HealthCheckResponse>,
+            tonic::Response<super::GetNodeInfoResponse>,
             tonic::Status,
         > {
             self.inner
@@ -587,9 +597,9 @@ pub mod node_client {
                     )
                 })?;
             let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/hellas.Node/HealthCheck");
+            let path = http::uri::PathAndQuery::from_static("/hellas.Node/GetNodeInfo");
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("hellas.Node", "HealthCheck"));
+            req.extensions_mut().insert(GrpcMethod::new("hellas.Node", "GetNodeInfo"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_known_peers(
@@ -630,11 +640,11 @@ pub mod node_server {
     /// Generated trait containing gRPC methods that should be implemented for use with NodeServer.
     #[async_trait]
     pub trait Node: std::marker::Send + std::marker::Sync + 'static {
-        async fn health_check(
+        async fn get_node_info(
             &self,
-            request: tonic::Request<super::HealthCheckRequest>,
+            request: tonic::Request<super::GetNodeInfoRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::HealthCheckResponse>,
+            tonic::Response<super::GetNodeInfoResponse>,
             tonic::Status,
         >;
         async fn get_known_peers(
@@ -721,23 +731,23 @@ pub mod node_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/hellas.Node/HealthCheck" => {
+                "/hellas.Node/GetNodeInfo" => {
                     #[allow(non_camel_case_types)]
-                    struct HealthCheckSvc<T: Node>(pub Arc<T>);
-                    impl<T: Node> tonic::server::UnaryService<super::HealthCheckRequest>
-                    for HealthCheckSvc<T> {
-                        type Response = super::HealthCheckResponse;
+                    struct GetNodeInfoSvc<T: Node>(pub Arc<T>);
+                    impl<T: Node> tonic::server::UnaryService<super::GetNodeInfoRequest>
+                    for GetNodeInfoSvc<T> {
+                        type Response = super::GetNodeInfoResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::HealthCheckRequest>,
+                            request: tonic::Request<super::GetNodeInfoRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as Node>::health_check(&inner, request).await
+                                <T as Node>::get_node_info(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -748,7 +758,7 @@ pub mod node_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = HealthCheckSvc(inner);
+                        let method = GetNodeInfoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
