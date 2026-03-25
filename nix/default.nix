@@ -6,7 +6,7 @@
   catgrad,
 }: let
   package = import ./package.nix {
-    inherit system nixpkgs rust-overlay;
+    inherit self system nixpkgs rust-overlay;
   };
   inherit
     (package)

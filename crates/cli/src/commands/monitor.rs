@@ -5,7 +5,7 @@ use futures::StreamExt;
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::pb::hellas::node_client::NodeClient;
-use hellas_rpc::pb::hellas::{GetKnownPeersRequest, HealthCheckRequest, HealthCheckResponse};
+use hellas_rpc::pb::hellas::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
 use std::future;
@@ -21,7 +21,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct PeerInterrogationOutcome {
-    health: HealthCheckResponse,
+    node_info: GetNodeInfoResponse,
     known_peers: Vec<EndpointId>,
     invalid_known_peers: usize,
     known_peers_error: Option<String>,
@@ -151,12 +151,16 @@ pub async fn run(timeout_secs: Option<u64>, interrogate: bool) -> CliResult<()> 
                 match joined {
                     Some(Ok((peer_id, Ok(outcome)))) => {
                         interrogation_ok += 1;
+                        let info = &outcome.node_info;
                         println!(
-                            "event=health peer={} version={} uptime_seconds={} reported_node_id={}",
+                            "event=node-info peer={} reported_node_id={} version={} build={} os={} uptime_seconds={} graffiti={}",
                             peer_id,
-                            outcome.health.version,
-                            outcome.health.uptime_seconds,
-                            outcome.health.node_id
+                            info.node_id,
+                            info.version,
+                            info.build,
+                            info.os,
+                            info.uptime_seconds,
+                            String::from_utf8_lossy(&info.graffiti),
                         );
 
                         if let Some(err) = outcome.known_peers_error.as_deref() {
@@ -258,10 +262,10 @@ async fn interrogate_peer(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let health = timeout(RPC_TIMEOUT, client.health_check(HealthCheckRequest {}))
+    let node_info = timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {}))
         .await
-        .map_err(|_| anyhow::anyhow!("health_check timed out after {RPC_TIMEOUT:?}"))?
-        .context("health_check RPC failed")?
+        .map_err(|_| anyhow::anyhow!("get_node_info timed out after {RPC_TIMEOUT:?}"))?
+        .context("get_node_info RPC failed")?
         .into_inner();
 
     let mut known_peers = Vec::new();
@@ -299,7 +303,7 @@ async fn interrogate_peer(
     }
 
     Ok(PeerInterrogationOutcome {
-        health,
+        node_info,
         known_peers,
         invalid_known_peers,
         known_peers_error,
