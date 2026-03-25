@@ -120,7 +120,7 @@ enum Commands {
         #[arg(
             short = 'm',
             long = "model",
-            default_value = "HuggingFaceTB/SmolLM2-135M-Instruct"
+            default_value = "Qwen/Qwen3-0.6B"
         )]
         model: String,
         /// Prompt to send (required)

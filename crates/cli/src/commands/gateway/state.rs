@@ -7,8 +7,8 @@ use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use catgrad_llm::ChatInput;
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::PromptRequest;
 use catgrad_llm::types::{anthropic, openai, plain};
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
 use std::collections::HashMap;
@@ -208,7 +208,7 @@ impl GatewayState {
         req: &openai::ChatCompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
+        let chat_input = ChatInput::try_from(req).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to normalize chat request: {err}"),
         })?;
@@ -216,7 +216,7 @@ impl GatewayState {
             &req.model,
             max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_request(&prompt_request),
+            move |assets| assets.prepare_chat(&chat_input),
         )
         .await
     }
@@ -225,7 +225,7 @@ impl GatewayState {
         &self,
         req: &anthropic::MessageRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
+        let chat_input = ChatInput::try_from(req).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to normalize chat request: {err}"),
         })?;
@@ -233,7 +233,7 @@ impl GatewayState {
             &req.model,
             req.max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_request(&prompt_request),
+            move |assets| assets.prepare_chat(&chat_input),
         )
         .await
     }
@@ -243,15 +243,12 @@ impl GatewayState {
         req: &plain::CompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let prompt_request = PromptRequest::try_from(req).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to normalize completion request: {err}"),
-        })?;
+        let prompt = req.prompt.clone();
         self.prepare_generation(
             &req.model,
             max_tokens,
             "Failed to prepare completion prompt",
-            move |assets| assets.prepare_request(&prompt_request),
+            move |assets| assets.prepare_plain(&prompt),
         )
         .await
     }

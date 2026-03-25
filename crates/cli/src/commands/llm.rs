@@ -1,7 +1,6 @@
 use crate::commands::CliResult;
 use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
 use crate::text_output::TextOutputDecoder;
-use catgrad_llm::PromptRequest;
 use hellas_executor::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -21,8 +20,7 @@ pub struct ExecuteOptions {
 
 pub async fn run(options: ExecuteOptions) -> CliResult<()> {
     let assets = Arc::new(ModelAssets::load(&options.model)?);
-    let prompt_request = PromptRequest::plain(&options.prompt);
-    let prepared = assets.prepare_request(&prompt_request)?;
+    let prepared = assets.prepare_plain(&options.prompt)?;
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
         ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)?

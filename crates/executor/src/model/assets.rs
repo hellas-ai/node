@@ -1,5 +1,5 @@
-use catgrad_llm::utils::{PromptRequest, get_model, get_model_chat_template};
-use catgrad_llm::{Detokenizer, PreparedPrompt};
+use catgrad_llm::utils::{ChatInput, get_model, get_model_chat_template};
+use catgrad_llm::{Detokenizer, LLMError, PreparedPrompt};
 use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::hellas::GetQuoteRequest;
 use serde_json::Value;
@@ -84,14 +84,22 @@ impl ModelAssets {
         })
     }
 
-    pub fn prepare_request(&self, request: &PromptRequest) -> Result<PreparedPrompt> {
-        PreparedPrompt::from_request(
-            &self.tokenizer,
-            self.chat_template.as_deref(),
-            request,
-            &self.stop_token_ids,
-        )
-        .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+    pub fn prepare_chat(&self, request: &ChatInput) -> Result<PreparedPrompt> {
+        let template = self.chat_template.as_deref().ok_or_else(|| {
+            ModelAssetsError::PreparePromptRequest {
+                source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
+            }
+        })?;
+        let prompt = request
+            .render(template)
+            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })?;
+        PreparedPrompt::from_prompt(&self.tokenizer, &prompt, &self.stop_token_ids)
+            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+    }
+
+    pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
+        PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
+            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 
     pub fn create_detokenizer(&self, stop_token_ids: &[i32]) -> Detokenizer<'_> {

@@ -16,7 +16,8 @@ discovery = [
     "dep:futures",
     "dep:pkarr",
     "dep:tonic-iroh-transport",
-    "tonic-iroh-transport/discovery",
+    "tonic-iroh-transport/discovery-mdns",
+    "tonic-iroh-transport/discovery-dht",
 ]
 server = ["tonic/server"]
 compile = ["dep:tonic-prost-build"]

@@ -17,7 +17,8 @@ client = [
     "dep:tonic-iroh-transport",
     "dep:tonic",
     "tonic-iroh-transport/client",
-    "tonic-iroh-transport/discovery",
+    "tonic-iroh-transport/discovery-mdns",
+    "tonic-iroh-transport/discovery-dht",
 ]
 serve = ["client", "hellas-rpc/server", "dep:tonic", "tonic-iroh-transport/server"]
 cuda = ["client", "hellas-executor/candle-cuda"]

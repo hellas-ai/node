@@ -727,7 +727,6 @@ mod tests {
 #[cfg(all(test, feature = "client"))]
 mod timing_tests {
     use super::*;
-    use catgrad_llm::PromptRequest;
     use hellas_executor::{ExecutorError, ModelAssets};
     use std::env;
     use std::sync::Arc;
@@ -759,7 +758,7 @@ mod timing_tests {
         )
         .expect("failed to start local executor");
         let prepared = assets
-            .prepare_request(&PromptRequest::plain(&prompt))
+            .prepare_plain(&prompt)
             .expect("failed to prepare prompt");
         let quote_req = assets
             .build_quote_request(&prepared, max_seq)
@@ -783,7 +782,7 @@ mod timing_tests {
 
         for run_idx in 1..=2 {
             let prepared = assets
-                .prepare_request(&PromptRequest::plain(&prompt))
+                .prepare_plain(&prompt)
                 .expect("failed to prepare prompt");
             let request = ExecutionRequest::new(
                 runtime.clone(),
