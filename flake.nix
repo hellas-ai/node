@@ -34,23 +34,23 @@
             ;
         }
     );
-  in
-    {
-      packages = forAllSystems (system: perSystem.${system}.packages);
-      apps = forAllSystems (system: perSystem.${system}.apps);
-      devShells = forAllSystems (system: perSystem.${system}.devShells);
-      checks = forAllSystems (system: perSystem.${system}.checks);
-      nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
+  in {
+    packages = forAllSystems (system: perSystem.${system}.packages);
+    apps = forAllSystems (system: perSystem.${system}.apps);
+    devShells = forAllSystems (system: perSystem.${system}.devShells);
+    checks = forAllSystems (system: perSystem.${system}.checks);
+    nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
 
-      overlays.default = final: _prev: {
-        hellas = self.packages.${final.system}.cli;
-        hellas-serve = self.packages.${final.system}.server;
-      };
-
-      nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};
-      nixosModules.default = self.nixosModules.hellas;
-
-      homeManagerModules.hellas = import ./nix/modules/home-manager.nix {inherit self;};
-      homeManagerModules.default = self.homeManagerModules.hellas;
+    overlays.default = final: _prev: {
+      hellas = self.packages.${final.system}.cli;
+      hellas-serve = self.packages.${final.system}.server;
+      hellas-cuda = self.packages.${final.system}.server-cuda;
     };
+
+    nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};
+    nixosModules.default = self.nixosModules.hellas;
+
+    homeManagerModules.hellas = import ./nix/modules/home-manager.nix {inherit self;};
+    homeManagerModules.default = self.homeManagerModules.hellas;
+  };
 }
