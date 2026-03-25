@@ -24,7 +24,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.14", features = ["gzip"] }
 # tonic-iroh-transport = { version = "0.8", default-features = false, features = ["otel"] }
-tonic-iroh-transport = {path = "../tonic-iroh-transport", default-features = false, features = ["otel"] }
+# tonic-iroh-transport = {path = "../tonic-iroh-transport", default-features = false, features = ["otel"] }
+tonic-iroh-transport = { git = "https://github.com/hellas-ai/tonic-iroh-transport", branch = "grw/feat/discovery", default-features = false, features = ["otel"] }
 
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-executor = { path = "crates/executor" }
