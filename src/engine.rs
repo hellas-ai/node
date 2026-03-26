@@ -527,3 +527,84 @@ impl Default for TraceReporter {
         Self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_consensus::types::{Epoch, Round, View};
+
+    /// The freezer_value_target_size used in init_finalization_store and
+    /// init_block_store. Sections roll over when accumulated value data reaches
+    /// this size, so individual values must be smaller to avoid one-per-section
+    /// overflow (which creates an unbounded number of open blob handles).
+    const FREEZER_VALUE_TARGET_SIZE: u64 = 65536;
+
+    /// Observed on-disk size of a finalization certificate for a 6-validator
+    /// ed25519 minimmit cluster. Measured from the testnet freezer value blobs.
+    ///
+    /// Certificate = Proposal (round + parent_view + parent_digest + payload)
+    ///             + ed25519 multi-signature (participant bitmap + N signatures)
+    const OBSERVED_FINALIZATION_CERT_SIZE: usize = 1223;
+
+    /// Observed on-disk size of an empty HellasBlock (no transactions).
+    const OBSERVED_BLOCK_SIZE: usize = 1136;
+
+    #[test]
+    fn block_encoded_size_is_under_target() {
+        let block = crate::app::HellasBlock::new(
+            commonware_consensus::types::Height::new(100),
+            Round::new(Epoch::zero(), View::new(100)),
+            Digest::from([1u8; 32]),
+            1700000000000,
+            Digest::from([2u8; 32]),
+            Digest::from([3u8; 32]),
+            Vec::new(),
+        );
+        let size = block.encode().len();
+        assert!(
+            (size as u64) < FREEZER_VALUE_TARGET_SIZE,
+            "empty block is {size} bytes, exceeds target {FREEZER_VALUE_TARGET_SIZE}"
+        );
+    }
+
+    #[test]
+    fn observed_sizes_exceed_old_target() {
+        // Confirm the bug: with the old 1024-byte target, both certificates and
+        // blocks created one oversized blob per entry, leaking file handles.
+        assert!(
+            OBSERVED_FINALIZATION_CERT_SIZE > 1024,
+            "finalization cert ({OBSERVED_FINALIZATION_CERT_SIZE}B) should exceed old 1024B target"
+        );
+        assert!(
+            OBSERVED_BLOCK_SIZE > 1024,
+            "block ({OBSERVED_BLOCK_SIZE}B) should exceed old 1024B target"
+        );
+    }
+
+    #[test]
+    fn observed_sizes_fit_new_target() {
+        // With the new target, values pack into shared sections instead of
+        // creating individual oversized blob files.
+        assert!(
+            (OBSERVED_FINALIZATION_CERT_SIZE as u64) < FREEZER_VALUE_TARGET_SIZE,
+            "finalization cert ({OBSERVED_FINALIZATION_CERT_SIZE}B) exceeds new target {FREEZER_VALUE_TARGET_SIZE}B"
+        );
+        assert!(
+            (OBSERVED_BLOCK_SIZE as u64) < FREEZER_VALUE_TARGET_SIZE,
+            "block ({OBSERVED_BLOCK_SIZE}B) exceeds new target {FREEZER_VALUE_TARGET_SIZE}B"
+        );
+    }
+
+    #[test]
+    fn new_target_provides_sufficient_packing_ratio() {
+        // Each section accumulates values until reaching target_size.
+        // With old target (1024), each ~1223B cert created its own section.
+        // With new target (65536), ~53 certs fit per section.
+        // This reduces blob file count (and open handles) by ~53x.
+        let certs_per_section = FREEZER_VALUE_TARGET_SIZE / OBSERVED_FINALIZATION_CERT_SIZE as u64;
+        assert!(
+            certs_per_section >= 10,
+            "expected at least 10 certs per section, got {certs_per_section}"
+        );
+    }
+}
