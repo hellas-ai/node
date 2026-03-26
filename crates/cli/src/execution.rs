@@ -15,7 +15,7 @@ use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
-    endpoint::{PortmapperConfig, default_relay_mode},
+    endpoint::PortmapperConfig,
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic::service::interceptor::InterceptedService;
@@ -387,9 +387,13 @@ where
 }
 
 async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
-    let mut builder = Endpoint::empty_builder()
+    use tonic_iroh_transport::iroh::endpoint::presets;
+    use tonic_iroh_transport::iroh::address_lookup::PkarrPublisher;
+
+    let mut builder = Endpoint::builder(presets::N0)
+        .clear_address_lookup()
         .address_lookup(DnsAddressLookup::n0_dns())
-        .relay_mode(default_relay_mode())
+        .address_lookup(PkarrPublisher::n0_dns())
         .portmapper_config(PortmapperConfig::Disabled);
     if let Some(key) = secret_key {
         builder = builder.secret_key(key.clone());
@@ -484,7 +488,7 @@ async fn discover_remote_quote(
     quote_req: &GetQuoteRequest,
     endpoint: &Endpoint,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let bindings = DiscoveryBindings::client(endpoint.id())?;
+    let bindings = DiscoveryBindings::attach(endpoint, false, false)?;
 
     let mut registry = ServiceRegistry::new(&endpoint);
     registry.with_pool_options(PoolOptions {
