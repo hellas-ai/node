@@ -5,7 +5,7 @@ use hellas_executor::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tonic_iroh_transport::iroh::EndpointId;
+use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
@@ -18,14 +18,15 @@ pub struct ExecuteOptions {
     pub verify_local: bool,
 }
 
-pub async fn run(options: ExecuteOptions) -> CliResult<()> {
+pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
     let assets = Arc::new(ModelAssets::load(&options.model)?);
     let prepared = assets.prepare_plain(&options.prompt)?;
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
         ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
+            .with_secret_key(secret_key)
     } else {
-        ExecutionRuntime::default()
+        ExecutionRuntime::default().with_secret_key(secret_key)
     };
     let request = ExecutionRequest::new(
         runtime,

@@ -49,6 +49,7 @@ prometheus-client = "0.24"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 qrcode = { version = "0.14", default-features = false }
+rand = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }
@@ -57,3 +58,4 @@ hellas-executor = { workspace = true, optional = true, features = ["candle-metal
 [dev-dependencies]
 # hellas-rpc = { workspace = true, features = ["compile"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tempfile = "3"

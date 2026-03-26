@@ -3,10 +3,12 @@ extern crate tracing;
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tonic_iroh_transport::iroh::EndpointId;
 
 mod commands;
 mod execution;
+mod identity;
 mod metrics;
 mod text_output;
 mod tracing_config;
@@ -16,6 +18,10 @@ mod tracing_config;
 #[command(version)]
 #[command(about = "Hellas node CLI")]
 struct Cli {
+    /// Path to node identity file (default: $HOME/.hellas/identity)
+    #[arg(long = "identity", global = true)]
+    identity: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -162,6 +168,15 @@ async fn main() {
     let tracer_provider = tracing_config::init_tracing();
 
     let cli = Cli::parse();
+
+    let secret_key = match identity::load_or_create(cli.identity.as_deref()) {
+        Ok(key) => key,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
+
     let result = match cli.command {
         #[cfg(feature = "serve")]
         Commands::Serve {
@@ -181,6 +196,7 @@ async fn main() {
                 preload_weights,
                 metrics_port,
                 graffiti,
+                secret_key,
             )
             .await
         }
@@ -211,13 +227,14 @@ async fn main() {
                 default_max_tokens,
                 force_model,
                 metrics_port,
+                secret_key,
             })
             .await
         }
         Commands::Rpc {
             node_id,
             node_addrs,
-        } => commands::rpc::run(node_id, node_addrs).await,
+        } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::Llm {
             node_id,
             node_addrs,
@@ -228,22 +245,25 @@ async fn main() {
             local,
             verify_local,
         } => {
-            commands::llm::run(commands::llm::ExecuteOptions {
-                node_id,
-                node_addrs,
-                model,
-                prompt,
-                max_seq,
-                retries,
-                local,
-                verify_local,
-            })
+            commands::llm::run(
+                commands::llm::ExecuteOptions {
+                    node_id,
+                    node_addrs,
+                    model,
+                    prompt,
+                    max_seq,
+                    retries,
+                    local,
+                    verify_local,
+                },
+                secret_key,
+            )
             .await
         }
         Commands::Monitor {
             timeout_secs,
             no_interrogate,
-        } => commands::monitor::run(timeout_secs, !no_interrogate).await,
+        } => commands::monitor::run(timeout_secs, !no_interrogate, secret_key).await,
     };
 
     if let Some(provider) = tracer_provider {
