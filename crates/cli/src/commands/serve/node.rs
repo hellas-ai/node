@@ -127,6 +127,7 @@ fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::
 pub(super) struct NodeHandle {
     node_id: EndpointId,
     guard: tonic_iroh_transport::TransportGuard,
+    pub executor: hellas_executor::ExecutorHandle,
 }
 
 impl NodeHandle {
@@ -245,9 +246,10 @@ pub(super) async fn spawn_node(
     if !preload_weights.is_empty() {
         let count = preload_weights.len();
         info!(count, "preloading startup weights in background");
+        let preload_executor = executor.clone();
         tokio::spawn(async move {
             let results = try_join_all(preload_weights.into_iter().map(|model| {
-                let executor = executor.clone();
+                let executor = preload_executor.clone();
                 async move {
                     executor
                         .preload_weights(model.clone())
@@ -266,5 +268,6 @@ pub(super) async fn spawn_node(
     Ok(NodeHandle {
         node_id: endpoint.id(),
         guard,
+        executor,
     })
 }

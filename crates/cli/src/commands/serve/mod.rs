@@ -7,6 +7,7 @@ use tracing::warn;
 
 mod node;
 mod peer_tracker;
+mod stats_metrics;
 
 pub async fn run(
     port: Option<u16>,
@@ -17,11 +18,6 @@ pub async fn run(
     metrics_port: Option<u16>,
     graffiti: String,
 ) -> CliResult<()> {
-    if let Some(metrics_port) = metrics_port {
-        let registry = std::sync::Arc::new(prometheus_client::registry::Registry::default());
-        crate::metrics::spawn_metrics_server(metrics_port, registry);
-    }
-
     let preload_weights = dedupe_preload_weights(preload_weights);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
@@ -42,6 +38,12 @@ pub async fn run(
     )
     .await
     .context("failed to start node server")?;
+
+    if let Some(metrics_port) = metrics_port {
+        let mut registry = prometheus_client::registry::Registry::default();
+        stats_metrics::register_and_spawn(&mut registry, node.executor.clone());
+        crate::metrics::spawn_metrics_server(metrics_port, std::sync::Arc::new(registry));
+    }
 
     let node_id = node.node_id();
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");
