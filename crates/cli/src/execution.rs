@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
-    Endpoint, EndpointAddr, EndpointId, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
     endpoint::{PortmapperConfig, default_relay_mode},
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
@@ -85,6 +85,7 @@ pub enum ExecutionStrategy {
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
     local_executor: Option<ExecutorHandle>,
+    secret_key: Option<SecretKey>,
 }
 
 pub struct ExecutionOutput {
@@ -100,7 +101,13 @@ impl ExecutionRuntime {
     pub fn with_local_executor(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
+            secret_key: None,
         }
+    }
+
+    pub fn with_secret_key(mut self, secret_key: SecretKey) -> Self {
+        self.secret_key = Some(secret_key);
+        self
     }
 
     pub fn spawn_default_local(queue_capacity: usize) -> anyhow::Result<Self> {
@@ -217,6 +224,7 @@ enum PreparedRoute {
         quote_req: GetQuoteRequest,
         retries: usize,
         active: Option<RemoteExecution>,
+        secret_key: Option<SecretKey>,
     },
 }
 
@@ -263,7 +271,7 @@ impl PreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let endpoint = bind_remote_endpoint().await?;
+                let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
                 let quote = quote_remote_target(quote_req, &endpoint, target).await?;
                 Ok(Self::RemoteDirect(RemoteExecution::from_quoted(
                     endpoint, quote,
@@ -273,6 +281,7 @@ impl PreparedRoute {
                 quote_req: quote_req.clone(),
                 retries: *retries,
                 active: None,
+                secret_key: runtime.secret_key.clone(),
             }),
         }
     }
@@ -288,13 +297,14 @@ impl PreparedRoute {
                 quote_req,
                 retries,
                 active,
+                secret_key,
             } => {
                 let max_attempts = retries.saturating_add(1);
                 info!("No node ID provided, discovering executor");
 
                 for attempt in 1..=max_attempts {
                     if active.is_none() {
-                        *active = Some(prepare_discovered_remote(quote_req).await?);
+                        *active = Some(prepare_discovered_remote(quote_req, secret_key.as_ref()).await?);
                     }
 
                     let remote = active.as_mut().expect("active remote execution");
@@ -376,12 +386,16 @@ where
     Ok(quote)
 }
 
-async fn bind_remote_endpoint() -> anyhow::Result<Arc<Endpoint>> {
+async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
+    let mut builder = Endpoint::empty_builder()
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .relay_mode(default_relay_mode())
+        .portmapper_config(PortmapperConfig::Disabled);
+    if let Some(key) = secret_key {
+        builder = builder.secret_key(key.clone());
+    }
     Ok(Arc::new(
-        Endpoint::empty_builder()
-            .address_lookup(DnsAddressLookup::n0_dns())
-            .relay_mode(default_relay_mode())
-            .portmapper_config(PortmapperConfig::Disabled)
+        builder
             .bind()
             .await
             .context("failed to create client transport endpoint")?,
@@ -520,8 +534,8 @@ async fn discover_remote_quote(
     .context("discovery timed out")?
 }
 
-async fn prepare_discovered_remote(quote_req: &GetQuoteRequest) -> anyhow::Result<RemoteExecution> {
-    let endpoint = bind_remote_endpoint().await?;
+async fn prepare_discovered_remote(quote_req: &GetQuoteRequest, secret_key: Option<&SecretKey>) -> anyhow::Result<RemoteExecution> {
+    let endpoint = bind_remote_endpoint(secret_key).await?;
     let quote = discover_remote_quote(quote_req, &endpoint).await?;
     Ok(RemoteExecution::from_quoted(endpoint, quote))
 }
@@ -717,6 +731,7 @@ mod tests {
                 quote_req: GetQuoteRequest::default(),
                 retries: 0,
                 active: None,
+                secret_key: None,
             },
             shadow: None,
         };

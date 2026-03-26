@@ -151,9 +151,11 @@ pub(super) async fn spawn_node(
     preload_weights: Vec<String>,
     build: String,
     graffiti: Vec<u8>,
+    secret_key: tonic_iroh_transport::iroh::SecretKey,
 ) -> anyhow::Result<NodeHandle> {
     let make_builder = || {
         Endpoint::builder(presets::N0)
+            .secret_key(secret_key.clone())
             .clear_address_lookup()
             .address_lookup(PkarrPublisher::n0_dns())
             .address_lookup(DnsAddressLookup::n0_dns())

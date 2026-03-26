@@ -5,6 +5,7 @@ use pkarr::mainline::Dht;
 use thiserror::Error;
 use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::iroh::EndpointId;
+use tonic_iroh_transport::iroh::SecretKey;
 use tonic_iroh_transport::iroh::address_lookup::AddressLookupBuilderError;
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
@@ -116,8 +117,13 @@ impl DiscoveryBindings {
 }
 
 impl DiscoveryEndpoint {
-    pub async fn bind() -> Result<Self, DiscoveryError> {
-        let endpoint = Endpoint::bind(presets::N0)
+    pub async fn bind(secret_key: Option<SecretKey>) -> Result<Self, DiscoveryError> {
+        let mut builder = Endpoint::builder(presets::N0);
+        if let Some(key) = secret_key {
+            builder = builder.secret_key(key);
+        }
+        let endpoint = builder
+            .bind()
             .await
             .map_err(|source| DiscoveryError::BindEndpoint { source })?;
         let bindings = DiscoveryBindings::attach(&endpoint, false, false)?;

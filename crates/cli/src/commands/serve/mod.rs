@@ -3,6 +3,7 @@ use anyhow::Context;
 use hellas_executor::{DownloadPolicy, ExecutePolicy};
 use std::collections::HashSet;
 use tokio::time::{Duration, timeout};
+use tonic_iroh_transport::iroh::SecretKey;
 use tracing::warn;
 
 mod node;
@@ -17,6 +18,7 @@ pub async fn run(
     preload_weights: Vec<String>,
     metrics_port: Option<u16>,
     graffiti: String,
+    secret_key: SecretKey,
 ) -> CliResult<()> {
     let preload_weights = dedupe_preload_weights(preload_weights);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
@@ -35,6 +37,7 @@ pub async fn run(
         preload_weights.clone(),
         build,
         graffiti,
+        secret_key,
     )
     .await
     .context("failed to start node server")?;

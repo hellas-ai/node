@@ -68,8 +68,9 @@ impl GatewayState {
                 )
                 .context("failed to initialize local execution backend")?,
             )
+            .with_secret_key(options.secret_key.clone())
         } else {
-            ExecutionRuntime::default()
+            ExecutionRuntime::default().with_secret_key(options.secret_key.clone())
         };
 
         Ok(Self {
