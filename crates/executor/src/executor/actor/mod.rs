@@ -61,6 +61,9 @@ impl Executor {
                 ExecutorMessage::QuotePrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_prompt(request).await);
                 }
+                ExecutorMessage::QuoteChatPrompt { request, reply } => {
+                    let _ = reply.send(self.handle_quote_chat_prompt(request).await);
+                }
                 ExecutorMessage::Preload { model, reply } => {
                     let _ = reply.send(self.handle_preload(model).await);
                 }

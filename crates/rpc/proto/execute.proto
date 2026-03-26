@@ -77,6 +77,29 @@ message QuotePromptResponse {
   uint32 prompt_tokens = 4;
 }
 
+// Convenience RPC: chat-style prompt quoting.
+// Like QuotePrompt but accepts a message array + system prompt.
+// The server applies the model's chat template to produce the prompt.
+message ChatMessage {
+  string role = 1;    // "user", "assistant"
+  string content = 2;
+}
+
+message QuoteChatPromptRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  repeated ChatMessage messages = 3;
+  uint32 max_new_tokens = 4;
+  string system_prompt = 5;
+}
+
+message QuoteChatPromptResponse {
+  string quote_id = 1;
+  uint64 amount = 2;
+  uint64 ttl_ms = 3;
+  uint32 prompt_tokens = 4;
+}
+
 // List models known to the executor and their readiness status.
 message ListModelsRequest {}
 

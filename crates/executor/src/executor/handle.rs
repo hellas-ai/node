@@ -5,7 +5,7 @@ use hellas_rpc::pb::hellas::{
     DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteResponse,
     ExecuteResultRequest, ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse,
     ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse, ListModelsRequest, ListModelsResponse,
-    QuotePromptRequest, QuotePromptResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use std::pin::Pin;
 use tokio::sync::oneshot;
@@ -35,6 +35,14 @@ impl ExecutorHandle {
         request: QuotePromptRequest,
     ) -> Result<QuotePromptResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
+            .await
+    }
+
+    pub async fn quote_chat_prompt(
+        &self,
+        request: QuoteChatPromptRequest,
+    ) -> Result<QuoteChatPromptResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
             .await
     }
 
@@ -99,6 +107,15 @@ impl Execute for ExecutorHandle {
     ) -> Result<Response<QuotePromptResponse>, Status> {
         Ok(Response::new(
             self.quote_prompt(request.into_inner()).await?,
+        ))
+    }
+
+    async fn quote_chat_prompt(
+        &self,
+        request: Request<QuoteChatPromptRequest>,
+    ) -> Result<Response<QuoteChatPromptResponse>, Status> {
+        Ok(Response::new(
+            self.quote_chat_prompt(request.into_inner()).await?,
         ))
     }
 

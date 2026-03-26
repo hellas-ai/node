@@ -7,7 +7,8 @@ use crate::state::ExecutionStatus;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse, GetQuoteRequest, GetQuoteResponse,
-    ListModelsResponse, QuotePromptRequest, QuotePromptResponse,
+    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest,
+    QuotePromptResponse,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,6 +25,10 @@ pub(crate) enum ExecutorMessage {
     QuotePrompt {
         request: QuotePromptRequest,
         reply: oneshot::Sender<Result<QuotePromptResponse, ExecutorError>>,
+    },
+    QuoteChatPrompt {
+        request: QuoteChatPromptRequest,
+        reply: oneshot::Sender<Result<QuoteChatPromptResponse, ExecutorError>>,
     },
     Preload {
         model: String,
