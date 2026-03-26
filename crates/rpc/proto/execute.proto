@@ -152,8 +152,14 @@ message TokenStats {
   uint64 generated_tokens = 8;
 }
 
+message ModelTokenStats {
+  string model_id = 1;
+  TokenStats stats = 2;
+}
+
 message GetStatsResponse {
   TokenStats stats = 1;
+  repeated ModelTokenStats model_stats = 2;
 }
 
 message GetModelStatsRequest {
