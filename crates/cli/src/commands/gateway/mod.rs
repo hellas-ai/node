@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic_iroh_transport::iroh::EndpointId;
+use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
 use self::state::{GatewayState, HttpError};
 
@@ -40,6 +40,7 @@ pub struct GatewayOptions {
     pub default_max_tokens: u32,
     pub force_model: Option<String>,
     pub metrics_port: Option<u16>,
+    pub secret_key: SecretKey,
 }
 
 type SseSender = mpsc::UnboundedSender<Result<Event, Infallible>>;
