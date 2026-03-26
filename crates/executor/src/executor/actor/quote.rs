@@ -2,9 +2,11 @@ use crate::ExecutorError;
 use crate::model::{ModelAssets, ModelSpec};
 use crate::state::{QuotePlan, QuoteRecord};
 use crate::weights::{EnsureDisposition, EntryStatusSnapshot, WeightsLocator, has_cached_weights};
+use catgrad_llm::utils::ChatInput;
+use catgrad_llm::types;
 use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
-    QuotePromptRequest, QuotePromptResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use std::time::{Duration, Instant};
 
@@ -131,6 +133,54 @@ impl Executor {
         let quote_response = self.handle_quote(full_request).await?;
 
         Ok(QuotePromptResponse {
+            quote_id: quote_response.quote_id,
+            amount: quote_response.amount,
+            ttl_ms: quote_response.ttl_ms,
+            prompt_tokens,
+        })
+    }
+
+    pub(super) async fn handle_quote_chat_prompt(
+        &mut self,
+        request: QuoteChatPromptRequest,
+    ) -> Result<QuoteChatPromptResponse, ExecutorError> {
+        let model_spec = format!(
+            "{}{}",
+            request.huggingface_model_id,
+            if request.huggingface_revision.is_empty() {
+                String::new()
+            } else {
+                format!("@{}", request.huggingface_revision)
+            }
+        );
+        let assets = ModelAssets::load(&model_spec)?;
+
+        // Build ChatInput from proto messages + system_prompt.
+        let mut messages: Vec<types::Message> = Vec::new();
+        if !request.system_prompt.is_empty() {
+            messages.push(types::Message::openai(
+                types::openai::ChatMessage::system(&request.system_prompt),
+            ));
+        }
+        for m in &request.messages {
+            let msg = match m.role.as_str() {
+                "assistant" => types::openai::ChatMessage::assistant(&m.content),
+                _ => types::openai::ChatMessage::user(&m.content),
+            };
+            messages.push(types::Message::openai(msg));
+        }
+        let chat_input = ChatInput {
+            messages,
+            enable_thinking: false,
+            has_image: false,
+        };
+
+        let prepared = assets.prepare_chat(&chat_input)?;
+        let prompt_tokens = prepared.input_ids.len() as u32;
+        let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
+        let quote_response = self.handle_quote(full_request).await?;
+
+        Ok(QuoteChatPromptResponse {
             quote_id: quote_response.quote_id,
             amount: quote_response.amount,
             ttl_ms: quote_response.ttl_ms,
