@@ -247,6 +247,20 @@ impl<L: LightClient> light_client_server::LightClient for LightClientGrpcServer<
         Ok(tonic::Response::new(GetValidatorsResponse { validators }))
     }
 
+    async fn get_relay_info(
+        &self,
+        _request: tonic::Request<GetRelayInfoRequest>,
+    ) -> Result<tonic::Response<GetRelayInfoResponse>, tonic::Status> {
+        // Relay info is only meaningful when served by the relay.
+        // Validators return their own node-rpc version as a fallback.
+        Ok(tonic::Response::new(GetRelayInfoResponse {
+            relay_version: String::new(),
+            relay_rev: String::new(),
+            node_rpc_version: hellas_rpc::VERSION.into(),
+            node_rpc_rev: hellas_rpc::GIT_REV.into(),
+        }))
+    }
+
     async fn get_coins_by_owner(
         &self,
         request: tonic::Request<GetCoinsByOwnerRequest>,
