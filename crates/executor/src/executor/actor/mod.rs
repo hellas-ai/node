@@ -14,8 +14,37 @@ use crate::worker::{ExecuteJob, ExecuteWorker};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
+use hellas_rpc::pb::hellas::{GetModelStatsResponse, GetStatsResponse};
+
 use super::stream::SubscriptionSet;
 use super::{ExecutorHandle, ExecutorMessage};
+
+#[derive(Default, Clone)]
+pub(super) struct TokenStats {
+    pub executions_started: u64,
+    pub executions_completed: u64,
+    pub executions_failed: u64,
+    pub prompt_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    pub cached_output_tokens: u64,
+    pub prefill_tokens: u64,
+    pub generated_tokens: u64,
+}
+
+impl TokenStats {
+    fn to_proto(&self) -> hellas_rpc::pb::hellas::TokenStats {
+        hellas_rpc::pb::hellas::TokenStats {
+            executions_started: self.executions_started,
+            executions_completed: self.executions_completed,
+            executions_failed: self.executions_failed,
+            prompt_tokens: self.prompt_tokens,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cached_output_tokens: self.cached_output_tokens,
+            prefill_tokens: self.prefill_tokens,
+            generated_tokens: self.generated_tokens,
+        }
+    }
+}
 
 pub struct Executor {
     pub(super) notify_tx: mpsc::WeakUnboundedSender<ExecutorMessage>,
@@ -27,6 +56,8 @@ pub struct Executor {
     pub(super) runtime_manager: RuntimeManager,
     pub(super) worker: ExecuteWorker,
     pub(super) execute_policy: ExecutePolicy,
+    pub(super) stats: TokenStats,
+    pub(super) model_stats: HashMap<String, TokenStats>,
 }
 
 impl Executor {
@@ -47,6 +78,8 @@ impl Executor {
             runtime_manager: RuntimeManager::new(download_policy),
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
+            stats: TokenStats::default(),
+            model_stats: HashMap::new(),
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle { tx })
@@ -111,7 +144,37 @@ impl Executor {
                 ExecutorMessage::ListModels { reply } => {
                     let _ = reply.send(Ok(self.handle_list_models().await));
                 }
+                ExecutorMessage::GetStats { reply } => {
+                    let _ = reply.send(Ok(self.handle_get_stats()));
+                }
+                ExecutorMessage::GetModelStats { request, reply } => {
+                    let _ = reply.send(Ok(self.handle_get_model_stats(request)));
+                }
             }
+        }
+    }
+}
+
+impl Executor {
+    fn handle_get_stats(&self) -> GetStatsResponse {
+        GetStatsResponse {
+            stats: Some(self.stats.to_proto()),
+        }
+    }
+
+    fn handle_get_model_stats(
+        &self,
+        request: hellas_rpc::pb::hellas::GetModelStatsRequest,
+    ) -> GetModelStatsResponse {
+        let model_id = request.model_id;
+        let stats = self
+            .model_stats
+            .get(&model_id)
+            .cloned()
+            .unwrap_or_default();
+        GetModelStatsResponse {
+            model_id,
+            stats: Some(stats.to_proto()),
         }
     }
 }

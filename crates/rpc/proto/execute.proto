@@ -137,3 +137,30 @@ message DecodeTokensResponse {
   // Decoded text (incremental delta — concatenate all responses for full output).
   string text = 1;
 }
+
+// Cumulative token statistics since node start.
+message GetStatsRequest {}
+
+message TokenStats {
+  uint64 executions_started = 1;
+  uint64 executions_completed = 2;
+  uint64 executions_failed = 3;
+  uint64 prompt_tokens = 4;
+  uint64 cached_prompt_tokens = 5;
+  uint64 cached_output_tokens = 6;
+  uint64 prefill_tokens = 7;
+  uint64 generated_tokens = 8;
+}
+
+message GetStatsResponse {
+  TokenStats stats = 1;
+}
+
+message GetModelStatsRequest {
+  string model_id = 1;
+}
+
+message GetModelStatsResponse {
+  string model_id = 1;
+  TokenStats stats = 2;
+}

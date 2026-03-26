@@ -28,6 +28,8 @@ fn test_executor(
         runtime_manager: RuntimeManager::new(DownloadPolicy::default()),
         worker: ExecuteWorker::stopped(),
         execute_policy: ExecutePolicy::default(),
+        stats: Default::default(),
+        model_stats: Default::default(),
     }
 }
 
@@ -111,7 +113,7 @@ async fn output_before_completion_reports_unavailable() {
         rx,
     );
 
-    let execution_id = executor.store.create_execution();
+    let execution_id = executor.store.create_execution("");
 
     let err = executor
         .handle_result(&hellas_rpc::pb::hellas::ExecuteResultRequest {
@@ -129,7 +131,7 @@ async fn subscribe_sends_snapshot_immediately() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let execution_id = executor.store.create_execution();
+    let execution_id = executor.store.create_execution("");
     executor.store.mark_running(&execution_id).unwrap();
 
     let mut updates =
@@ -153,7 +155,7 @@ async fn subscribe_after_completion_receives_buffered_output() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let execution_id = executor.store.create_execution();
+    let execution_id = executor.store.create_execution("");
     let chunk = encode_token_ids(&[42]);
     executor
         .store
@@ -179,7 +181,7 @@ async fn subscribe_midstream_receives_buffered_output_and_future_updates() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(tx.downgrade(), rx);
 
-    let execution_id = executor.store.create_execution();
+    let execution_id = executor.store.create_execution("");
     let first_chunk = encode_token_ids(&[11]);
     executor
         .store
@@ -214,7 +216,7 @@ async fn dropped_last_subscription_closes_stream() {
     let (_tx, rx) = mpsc::unbounded_channel();
     let mut executor = test_executor(notify_tx.downgrade(), rx);
 
-    let execution_id = executor.store.create_execution();
+    let execution_id = executor.store.create_execution("");
 
     let updates = executor
         .handle_subscribe(execution_id.clone())
@@ -231,4 +233,33 @@ async fn dropped_last_subscription_closes_stream() {
         }
         _ => panic!("unexpected executor message"),
     }
+}
+
+#[tokio::test]
+async fn stats_accumulate_on_completion() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut executor = test_executor(tx.downgrade(), rx);
+
+    let execution_id = executor.store.create_execution("");
+    executor.store.mark_running(&execution_id).unwrap();
+    let chunk = encode_token_ids(&[1, 2, 3]);
+    executor
+        .store
+        .append_output_chunk(&execution_id, &chunk, 3)
+        .unwrap();
+
+    executor.handle_complete(&execution_id, None, ExecutionStatus::Completed);
+
+    assert_eq!(executor.stats.generated_tokens, 3);
+    assert_eq!(executor.stats.executions_completed, 1);
+    assert_eq!(executor.stats.executions_failed, 0);
+
+    // A failed execution should increment the failed counter.
+    let execution_id2 = executor.store.create_execution("");
+    executor.store.mark_running(&execution_id2).unwrap();
+    executor.handle_complete(&execution_id2, None, ExecutionStatus::Failed);
+
+    assert_eq!(executor.stats.generated_tokens, 3);
+    assert_eq!(executor.stats.executions_completed, 1);
+    assert_eq!(executor.stats.executions_failed, 1);
 }

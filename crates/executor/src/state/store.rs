@@ -26,6 +26,7 @@ pub struct QuoteRecord {
     pub execution: Arc<ExecutionContext>,
     pub start: ExecutionStart,
     pub expires_at: Instant,
+    pub model_id: String,
 }
 
 pub struct ExecutionSnapshot {
@@ -38,6 +39,7 @@ struct ExecutionRecord {
     status: ExecutionStatus,
     progress: u64,
     output: Option<Vec<u8>>,
+    model_id: String,
 }
 
 #[derive(Default)]
@@ -78,7 +80,7 @@ impl ExecutorState {
         before - self.quotes.len()
     }
 
-    pub fn create_execution(&mut self) -> String {
+    pub fn create_execution(&mut self, model_id: &str) -> String {
         let execution_id = make_id("exec");
         self.executions.insert(
             execution_id.clone(),
@@ -86,6 +88,7 @@ impl ExecutorState {
                 status: ExecutionStatus::Pending,
                 progress: 0,
                 output: None,
+                model_id: model_id.to_owned(),
             },
         );
         execution_id
@@ -123,6 +126,10 @@ impl ExecutorState {
 
     pub fn progress(&self, execution_id: &str) -> Result<u64, StateError> {
         Ok(self.execution(execution_id)?.progress)
+    }
+
+    pub fn model_id(&self, execution_id: &str) -> Result<&str, StateError> {
+        Ok(&self.execution(execution_id)?.model_id)
     }
 
     pub fn mark_running(&mut self, execution_id: &str) -> Result<(), StateError> {
@@ -204,7 +211,7 @@ mod tests {
             updates in vec((any::<u64>(), vec(any::<u8>(), 0..16)), 0..32)
         ) {
             let mut state = ExecutorState::new();
-            let execution_id = state.create_execution();
+            let execution_id = state.create_execution("");
 
             let mut expected_output = Vec::new();
             let mut expected_progress = 0;
@@ -224,7 +231,7 @@ mod tests {
     #[test]
     fn snapshot_defaults_missing_output_to_empty() {
         let mut state = ExecutorState::new();
-        let execution_id = state.create_execution();
+        let execution_id = state.create_execution("");
 
         let snapshot = state.snapshot(&execution_id).unwrap();
         assert_eq!(snapshot.status, ExecutionStatus::Pending);
