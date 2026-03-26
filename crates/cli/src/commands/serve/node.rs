@@ -1,6 +1,7 @@
 use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
 use futures::future::try_join_all;
+use futures::StreamExt;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
@@ -17,9 +18,9 @@ use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-use tonic_iroh_transport::swarm::DhtBackend;
+use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::otel::TraceContextLayer;
-use tonic_iroh_transport::{IrohContext, TransportBuilder};
+use tonic_iroh_transport::{IrohContext, PoolOptions, TransportBuilder};
 
 const DEFAULT_PORT: u16 = 31145;
 const MAX_PORT_RETRIES: u16 = 100;
@@ -213,8 +214,10 @@ pub(super) async fn spawn_node(
         peer_tracker: Arc::new(Mutex::new(PeerTracker::new(endpoint.id()))),
     };
 
+    let peer_tracker = node_service.peer_tracker.clone();
+
     let execute_interceptor = ExecutePeerInterceptor {
-        peer_tracker: node_service.peer_tracker.clone(),
+        peer_tracker: peer_tracker.clone(),
     };
 
     let executor = Executor::spawn(download_policy, execute_policy, queue_size)
@@ -235,7 +238,7 @@ pub(super) async fn spawn_node(
             execute_interceptor,
         ));
 
-    let dht = DhtBackend::with_dht(&endpoint, shared_dht);
+    let dht = DhtBackend::with_dht(&endpoint, Arc::clone(&shared_dht));
     let publisher = dht.create_publisher(Default::default());
     transport = transport.with_publisher(publisher);
 
@@ -243,6 +246,37 @@ pub(super) async fn spawn_node(
         .spawn()
         .await
         .context("failed to start transport")?;
+
+    // Background peer discovery: watch DHT + mDNS for other executors and
+    // feed them into the PeerTracker so GetKnownPeers returns useful results.
+    {
+        let peer_tracker = peer_tracker.clone();
+        let disc_endpoint = endpoint.clone();
+        let disc_dht = DhtBackend::with_dht(&disc_endpoint, Arc::clone(&shared_dht));
+        tokio::spawn(async move {
+            use hellas_rpc::service::{ExecuteService as ExecSvc, NodeService as NodeSvc};
+            let Ok(bindings) = DiscoveryBindings::client(disc_endpoint.id()) else {
+                warn!("failed to create discovery bindings for peer tracker");
+                return;
+            };
+            let mut registry = ServiceRegistry::new(&disc_endpoint);
+            registry.with_pool_options(PoolOptions::default());
+            registry.add(MdnsBackend::new(bindings.mdns));
+            registry.add(disc_dht);
+            let mut node_peers = Box::pin(registry.discover::<NodeSvc>());
+            let mut exec_peers = Box::pin(registry.discover::<ExecSvc>());
+            loop {
+                let peer_id = tokio::select! {
+                    Some(Ok(peer)) = node_peers.next() => peer.id(),
+                    Some(Ok(peer)) = exec_peers.next() => peer.id(),
+                    else => break,
+                };
+                if let Ok(mut tracker) = peer_tracker.lock() {
+                    tracker.mark_service_provider(peer_id);
+                }
+            }
+        });
+    }
 
     // Preload weights in the background so the node is reachable immediately.
     if !preload_weights.is_empty() {
