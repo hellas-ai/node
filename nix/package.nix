@@ -49,6 +49,7 @@
     gh
     cargo-audit
     cargo-outdated
+    cargo-sort
     skopeo
   ];
 
