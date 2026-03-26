@@ -654,7 +654,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#dc3d64b5e3dc12e104e79c1322026b9660217539"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#4c4a0b792f1a6c735deeeef6503efb8a8b6c0f2a"
 dependencies = [
  "candle-core",
  "open-hypergraphs",
@@ -662,30 +662,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "catgrad-legacy"
-version = "0.1.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#dc3d64b5e3dc12e104e79c1322026b9660217539"
-dependencies = [
- "gemm 0.18.2",
- "half",
- "log",
- "memmap2",
- "num-traits",
- "num_cpus",
- "open-hypergraphs",
- "rayon",
- "serde",
- "serde_json",
- "test-log",
-]
-
-[[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#dc3d64b5e3dc12e104e79c1322026b9660217539"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#4c4a0b792f1a6c735deeeef6503efb8a8b6c0f2a"
 dependencies = [
  "catgrad",
- "catgrad-legacy",
  "chrono",
  "half",
  "hf-hub 0.4.3",
@@ -1476,27 +1457,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "env_filter"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
-dependencies = [
- "log",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "log",
 ]
 
 [[package]]
@@ -5701,7 +5661,6 @@ version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37d53ac171c92a39e4769491c4b4dde7022c60042254b5fc044ae409d34a24d4"
 dependencies = [
- "env_logger",
  "test-log-macros",
  "tracing-subscriber",
 ]
@@ -6355,9 +6314,9 @@ dependencies = [
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.13.1"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da36089a805484bcccfffe0739803392c8298778a2d2f09febf76fac5ad9025b"
+checksum = "9629274872b2bfaf8d66f5f15725007f635594914870f65218920345aa11aa8c"
 
 [[package]]
 name = "unicode-width"
