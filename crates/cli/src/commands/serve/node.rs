@@ -217,9 +217,7 @@ pub(super) async fn spawn_node(
     let executor = Executor::spawn(download_policy, execute_policy, queue_size)
         .context("failed to initialize executor backend")?;
 
-    preload_startup_weights(&executor, &preload_weights).await?;
-
-    let execute_service = ExecuteServer::new(executor)
+    let execute_service = ExecuteServer::new(executor.clone())
         .accept_compressed(CompressionEncoding::Zstd)
         .send_compressed(CompressionEncoding::Zstd)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
@@ -243,30 +241,30 @@ pub(super) async fn spawn_node(
         .await
         .context("failed to start transport")?;
 
+    // Preload weights in the background so the node is reachable immediately.
+    if !preload_weights.is_empty() {
+        let count = preload_weights.len();
+        info!(count, "preloading startup weights in background");
+        tokio::spawn(async move {
+            let results = try_join_all(preload_weights.into_iter().map(|model| {
+                let executor = executor.clone();
+                async move {
+                    executor
+                        .preload_weights(model.clone())
+                        .await
+                        .with_context(|| format!("failed to preload weights for {model}"))
+                }
+            }))
+            .await;
+            match results {
+                Ok(_) => info!(count, "startup weight preload complete"),
+                Err(e) => warn!("startup weight preload failed: {e:#}"),
+            }
+        });
+    }
+
     Ok(NodeHandle {
         node_id: endpoint.id(),
         guard,
     })
-}
-
-async fn preload_startup_weights(
-    executor: &hellas_executor::ExecutorHandle,
-    preload_weights: &[String],
-) -> anyhow::Result<()> {
-    if preload_weights.is_empty() {
-        return Ok(());
-    }
-
-    info!(count = preload_weights.len(), "preloading startup weights");
-    try_join_all(preload_weights.iter().cloned().map(|model| {
-        let executor = executor.clone();
-        async move {
-            executor
-                .preload_weights(model.clone())
-                .await
-                .with_context(|| format!("failed to preload weights for {model}"))
-        }
-    }))
-    .await?;
-    Ok(())
 }
