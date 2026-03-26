@@ -1,3 +1,9 @@
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_REV: &str = match option_env!("GIT_REV") {
+    Some(rev) => rev,
+    None => "unknown",
+};
+
 #[cfg(feature = "discovery")]
 pub mod discovery;
 #[cfg(feature = "client")]
