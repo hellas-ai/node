@@ -45,20 +45,19 @@ pub async fn run(
 
     let node_id = node.node_id();
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");
+
     eprintln!("Node ID:      {node_id}");
-    eprintln!("Explorer:     {add_url}");
     print_qr(&add_url);
-    println!(
-        "Policies: download={} execute={} queue_size={}",
-        download_policy, execute_policy, queue_size
-    );
+    eprintln!("Explorer:     {add_url}");
+
     if !preload_weights.is_empty() {
-        println!("Preloaded weights: {}", preload_weights.join(", "));
+        info!("Preloaded weights: {}", preload_weights.join(", "));
     }
+
     if matches!(download_policy, DownloadPolicy::Skip)
         && matches!(execute_policy, ExecutePolicy::Skip)
     {
-        println!(
+        warn!(
             "Node is running in deny-by-default mode. Pass explicit policies to allow remote downloads or execution."
         );
     } else {
@@ -67,9 +66,7 @@ pub async fn run(
             %execute_policy,
             "node is permitting remote downloads and/or execution; only run this on trusted networks"
         );
-        eprintln!(
-            "warning: current policies allow remote peers to trigger downloads and/or execution"
-        );
+        warn!("warning: current policies allow remote peers to trigger downloads and/or execution");
     }
 
     println!("RPC server running. Press Ctrl+C to stop.");
@@ -77,7 +74,7 @@ pub async fn run(
         .await
         .context("failed to listen for shutdown signal")?;
 
-    println!("Shutting down RPC server...");
+    println!("Shutting down...");
     match timeout(Duration::from_secs(5), node.shutdown()).await {
         Ok(result) => result.context("failed to shut down RPC server")?,
         Err(_) => {
