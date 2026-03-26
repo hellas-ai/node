@@ -21,6 +21,10 @@
     envShellHook
     ;
 
+  ci = import ./ci.nix {
+    inherit pkgs lib rustToolchain;
+  };
+
   testsLib = import ./tests/lib.nix {
     inherit pkgs lib;
   };
@@ -99,7 +103,20 @@ in {
     }
     // linuxOutputs.packages;
 
-  apps = linuxOutputs.apps;
+  apps =
+    {
+      check = {
+        type = "app";
+        program = "${ci.checkPackages.all}/bin/hellas-check-all";
+        meta.description = "Run all CI checks (sort, fmt, clippy, outdated)";
+      };
+      fix = {
+        type = "app";
+        program = "${ci.fixPackages.all}/bin/hellas-fix-all";
+        meta.description = "Apply all CI auto-fixes where supported";
+      };
+    }
+    // linuxOutputs.apps;
 
   devShells =
     {
