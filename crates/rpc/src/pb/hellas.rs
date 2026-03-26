@@ -444,10 +444,29 @@ impl ::prost::Name for TokenStats {
         "/hellas.TokenStats".into()
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelTokenStats {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub stats: ::core::option::Option<TokenStats>,
+}
+impl ::prost::Name for ModelTokenStats {
+    const NAME: &'static str = "ModelTokenStats";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ModelTokenStats".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ModelTokenStats".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetStatsResponse {
     #[prost(message, optional, tag = "1")]
     pub stats: ::core::option::Option<TokenStats>,
+    #[prost(message, repeated, tag = "2")]
+    pub model_stats: ::prost::alloc::vec::Vec<ModelTokenStats>,
 }
 impl ::prost::Name for GetStatsResponse {
     const NAME: &'static str = "GetStatsResponse";

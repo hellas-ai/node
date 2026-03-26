@@ -14,7 +14,7 @@ use crate::worker::{ExecuteJob, ExecuteWorker};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
-use hellas_rpc::pb::hellas::{GetModelStatsResponse, GetStatsResponse};
+use hellas_rpc::pb::hellas::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 
 use super::stream::SubscriptionSet;
 use super::{ExecutorHandle, ExecutorMessage};
@@ -157,8 +157,17 @@ impl Executor {
 
 impl Executor {
     fn handle_get_stats(&self) -> GetStatsResponse {
+        let model_stats = self
+            .model_stats
+            .iter()
+            .map(|(model_id, stats)| ModelTokenStats {
+                model_id: model_id.clone(),
+                stats: Some(stats.to_proto()),
+            })
+            .collect();
         GetStatsResponse {
             stats: Some(self.stats.to_proto()),
+            model_stats,
         }
     }
 
