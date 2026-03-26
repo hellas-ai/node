@@ -78,6 +78,7 @@ impl Executor {
             execution,
             start,
             expires_at: Instant::now() + QUOTE_TTL,
+            model_id: model_id.clone(),
         });
 
         info!(

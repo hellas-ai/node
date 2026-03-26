@@ -402,6 +402,95 @@ impl ::prost::Name for DecodeTokensResponse {
         "/hellas.DecodeTokensResponse".into()
     }
 }
+/// Cumulative token statistics since node start.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetStatsRequest {}
+impl ::prost::Name for GetStatsRequest {
+    const NAME: &'static str = "GetStatsRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetStatsRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetStatsRequest".into()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TokenStats {
+    #[prost(uint64, tag = "1")]
+    pub executions_started: u64,
+    #[prost(uint64, tag = "2")]
+    pub executions_completed: u64,
+    #[prost(uint64, tag = "3")]
+    pub executions_failed: u64,
+    #[prost(uint64, tag = "4")]
+    pub prompt_tokens: u64,
+    #[prost(uint64, tag = "5")]
+    pub cached_prompt_tokens: u64,
+    #[prost(uint64, tag = "6")]
+    pub cached_output_tokens: u64,
+    #[prost(uint64, tag = "7")]
+    pub prefill_tokens: u64,
+    #[prost(uint64, tag = "8")]
+    pub generated_tokens: u64,
+}
+impl ::prost::Name for TokenStats {
+    const NAME: &'static str = "TokenStats";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.TokenStats".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.TokenStats".into()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetStatsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub stats: ::core::option::Option<TokenStats>,
+}
+impl ::prost::Name for GetStatsResponse {
+    const NAME: &'static str = "GetStatsResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetStatsResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetStatsResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetModelStatsRequest {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for GetModelStatsRequest {
+    const NAME: &'static str = "GetModelStatsRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetModelStatsRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetModelStatsRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetModelStatsResponse {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub stats: ::core::option::Option<TokenStats>,
+}
+impl ::prost::Name for GetModelStatsResponse {
+    const NAME: &'static str = "GetModelStatsResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetModelStatsResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetModelStatsResponse".into()
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionStatus {
@@ -1215,6 +1304,51 @@ pub mod execute_client {
                 .insert(GrpcMethod::new("hellas.Execute", "ExecuteResult"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetStatsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/hellas.Execute/GetStats");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("hellas.Execute", "GetStats"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_model_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetModelStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetModelStatsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Execute/GetModelStats",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.Execute", "GetModelStats"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1300,6 +1434,20 @@ pub mod execute_server {
             request: tonic::Request<super::ExecuteResultRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ExecuteResultResponse>,
+            tonic::Status,
+        >;
+        async fn get_stats(
+            &self,
+            request: tonic::Request<super::GetStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetStatsResponse>,
+            tonic::Status,
+        >;
+        async fn get_model_stats(
+            &self,
+            request: tonic::Request<super::GetModelStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetModelStatsResponse>,
             tonic::Status,
         >;
     }
@@ -1769,6 +1917,94 @@ pub mod execute_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExecuteResultSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/GetStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetStatsSvc<T: Execute>(pub Arc<T>);
+                    impl<T: Execute> tonic::server::UnaryService<super::GetStatsRequest>
+                    for GetStatsSvc<T> {
+                        type Response = super::GetStatsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetStatsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::get_stats(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetStatsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/GetModelStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetModelStatsSvc<T: Execute>(pub Arc<T>);
+                    impl<
+                        T: Execute,
+                    > tonic::server::UnaryService<super::GetModelStatsRequest>
+                    for GetModelStatsSvc<T> {
+                        type Response = super::GetModelStatsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetModelStatsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::get_model_stats(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetModelStatsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

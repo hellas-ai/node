@@ -6,9 +6,9 @@ use crate::ExecutorError;
 use crate::state::ExecutionStatus;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
-    ExecuteStatusRequest, ExecuteStatusResponse, GetQuoteRequest, GetQuoteResponse,
-    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest,
-    QuotePromptResponse,
+    ExecuteStatusRequest, ExecuteStatusResponse, GetModelStatsRequest, GetModelStatsResponse,
+    GetQuoteRequest, GetQuoteResponse, GetStatsResponse, ListModelsResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -65,6 +65,13 @@ pub(crate) enum ExecutorMessage {
     },
     ListModels {
         reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
+    },
+    GetStats {
+        reply: oneshot::Sender<Result<GetStatsResponse, ExecutorError>>,
+    },
+    GetModelStats {
+        request: GetModelStatsRequest,
+        reply: oneshot::Sender<Result<GetModelStatsResponse, ExecutorError>>,
     },
 }
 

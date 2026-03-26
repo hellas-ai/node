@@ -19,7 +19,32 @@ impl Executor {
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         self.store.prune_expired_quotes(Instant::now());
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
-        let execution_id = self.store.create_execution();
+
+        let stat_prompt = quote.invocation.input_ids.len() as u64;
+        let stat_cached_prompt = quote.start.transcript.len() as u64;
+        let stat_cached_output = quote
+            .start
+            .cached_output_tokens
+            .as_ref()
+            .map_or(0, |t| t.len() as u64);
+        let stat_prefill = stat_prompt.saturating_sub(stat_cached_prompt);
+
+        let model_id = quote.model_id.clone();
+
+        self.stats.executions_started += 1;
+        self.stats.prompt_tokens += stat_prompt;
+        self.stats.cached_prompt_tokens += stat_cached_prompt;
+        self.stats.cached_output_tokens += stat_cached_output;
+        self.stats.prefill_tokens += stat_prefill;
+
+        let ms = self.model_stats.entry(model_id.clone()).or_default();
+        ms.executions_started += 1;
+        ms.prompt_tokens += stat_prompt;
+        ms.cached_prompt_tokens += stat_cached_prompt;
+        ms.cached_output_tokens += stat_cached_output;
+        ms.prefill_tokens += stat_prefill;
+
+        let execution_id = self.store.create_execution(&model_id);
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
             invocation: quote.invocation.clone(),
@@ -33,6 +58,18 @@ impl Executor {
             Ok(queued) => queued,
             Err(error) => {
                 let _ = self.store.remove_execution(&execution_id);
+                self.stats.executions_started -= 1;
+                self.stats.prompt_tokens -= stat_prompt;
+                self.stats.cached_prompt_tokens -= stat_cached_prompt;
+                self.stats.cached_output_tokens -= stat_cached_output;
+                self.stats.prefill_tokens -= stat_prefill;
+                if let Some(ms) = self.model_stats.get_mut(&model_id) {
+                    ms.executions_started -= 1;
+                    ms.prompt_tokens -= stat_prompt;
+                    ms.cached_prompt_tokens -= stat_cached_prompt;
+                    ms.cached_output_tokens -= stat_cached_output;
+                    ms.prefill_tokens -= stat_prefill;
+                }
                 return Err(error);
             }
         };
@@ -141,6 +178,24 @@ impl Executor {
     ) {
         let success = matches!(status, ExecutionStatus::Completed);
         debug!(%execution_id, success, "execution finished");
+
+        let generated = self.store.progress(execution_id).unwrap_or(0);
+        let model_id = self.store.model_id(execution_id).ok().map(str::to_owned);
+        self.stats.generated_tokens += generated;
+        if success {
+            self.stats.executions_completed += 1;
+        } else {
+            self.stats.executions_failed += 1;
+        }
+        if let Some(model_id) = model_id {
+            let ms = self.model_stats.entry(model_id).or_default();
+            ms.generated_tokens += generated;
+            if success {
+                ms.executions_completed += 1;
+            } else {
+                ms.executions_failed += 1;
+            }
+        }
 
         if let Err(error) = self.store.complete_execution(execution_id, status, output) {
             warn!("failed to update completion state for {execution_id}: {error}");
