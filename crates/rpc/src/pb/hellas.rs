@@ -248,6 +248,71 @@ impl ::prost::Name for QuotePromptResponse {
         "/hellas.QuotePromptResponse".into()
     }
 }
+/// Convenience RPC: chat-style prompt quoting.
+/// Like QuotePrompt but accepts a message array + system prompt.
+/// The server applies the model's chat template to produce the prompt.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChatMessage {
+    /// "user", "assistant"
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub content: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ChatMessage {
+    const NAME: &'static str = "ChatMessage";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.ChatMessage".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.ChatMessage".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuoteChatPromptRequest {
+    #[prost(string, tag = "1")]
+    pub huggingface_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub huggingface_revision: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub messages: ::prost::alloc::vec::Vec<ChatMessage>,
+    #[prost(uint32, tag = "4")]
+    pub max_new_tokens: u32,
+    #[prost(string, tag = "5")]
+    pub system_prompt: ::prost::alloc::string::String,
+}
+impl ::prost::Name for QuoteChatPromptRequest {
+    const NAME: &'static str = "QuoteChatPromptRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.QuoteChatPromptRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.QuoteChatPromptRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct QuoteChatPromptResponse {
+    #[prost(string, tag = "1")]
+    pub quote_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub amount: u64,
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
+    #[prost(uint32, tag = "4")]
+    pub prompt_tokens: u32,
+}
+impl ::prost::Name for QuoteChatPromptResponse {
+    const NAME: &'static str = "QuoteChatPromptResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.QuoteChatPromptResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.QuoteChatPromptResponse".into()
+    }
+}
 /// List models known to the executor and their readiness status.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListModelsRequest {}
@@ -984,6 +1049,30 @@ pub mod execute_client {
                 .insert(GrpcMethod::new("hellas.Execute", "QuotePrompt"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn quote_chat_prompt(
+            &mut self,
+            request: impl tonic::IntoRequest<super::QuoteChatPromptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::QuoteChatPromptResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.Execute/QuoteChatPrompt",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.Execute", "QuoteChatPrompt"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_models(
             &mut self,
             request: impl tonic::IntoRequest<super::ListModelsRequest>,
@@ -1153,6 +1242,13 @@ pub mod execute_server {
             request: tonic::Request<super::QuotePromptRequest>,
         ) -> std::result::Result<
             tonic::Response<super::QuotePromptResponse>,
+            tonic::Status,
+        >;
+        async fn quote_chat_prompt(
+            &self,
+            request: tonic::Request<super::QuoteChatPromptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::QuoteChatPromptResponse>,
             tonic::Status,
         >;
         async fn list_models(
@@ -1356,6 +1452,51 @@ pub mod execute_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QuotePromptSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.Execute/QuoteChatPrompt" => {
+                    #[allow(non_camel_case_types)]
+                    struct QuoteChatPromptSvc<T: Execute>(pub Arc<T>);
+                    impl<
+                        T: Execute,
+                    > tonic::server::UnaryService<super::QuoteChatPromptRequest>
+                    for QuoteChatPromptSvc<T> {
+                        type Response = super::QuoteChatPromptResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::QuoteChatPromptRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Execute>::quote_chat_prompt(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = QuoteChatPromptSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
