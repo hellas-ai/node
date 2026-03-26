@@ -1,6 +1,20 @@
 fn main() {
     #[cfg(feature = "compile")]
     compile();
+
+    // Capture git rev for version info
+    if std::env::var("GIT_REV").is_err() {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            && output.status.success()
+        {
+            let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            println!("cargo:rustc-env=GIT_REV={rev}");
+        }
+    }
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs");
 }
 
 #[cfg(feature = "compile")]
