@@ -20,6 +20,8 @@ service Execute {
   rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
   rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteStreamEvent);
   rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
 }
 
 message Presence {

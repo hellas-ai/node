@@ -4,7 +4,8 @@ use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
     DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteResponse,
     ExecuteResultRequest, ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse,
-    ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse, ListModelsRequest, ListModelsResponse,
+    ExecuteStreamEvent, GetModelStatsRequest, GetModelStatsResponse, GetQuoteRequest,
+    GetQuoteResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use std::pin::Pin;
@@ -80,6 +81,18 @@ impl ExecutorHandle {
             .await
     }
 
+    pub async fn get_stats(&self) -> Result<GetStatsResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::GetStats { reply }).await
+    }
+
+    pub async fn get_model_stats(
+        &self,
+        request: GetModelStatsRequest,
+    ) -> Result<GetModelStatsResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::GetModelStats { request, reply })
+            .await
+    }
+
     async fn subscribe_execution(
         &self,
         execution_id: String,
@@ -124,6 +137,22 @@ impl Execute for ExecutorHandle {
         _request: Request<ListModelsRequest>,
     ) -> Result<Response<ListModelsResponse>, Status> {
         Ok(Response::new(self.list_models().await?))
+    }
+
+    async fn get_stats(
+        &self,
+        _request: Request<GetStatsRequest>,
+    ) -> Result<Response<GetStatsResponse>, Status> {
+        Ok(Response::new(self.get_stats().await?))
+    }
+
+    async fn get_model_stats(
+        &self,
+        request: Request<GetModelStatsRequest>,
+    ) -> Result<Response<GetModelStatsResponse>, Status> {
+        Ok(Response::new(
+            self.get_model_stats(request.into_inner()).await?,
+        ))
     }
 
     async fn execute(
