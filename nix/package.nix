@@ -34,6 +34,8 @@
       && !lib.hasPrefix "result-" name;
   };
 
+  # Use clang stdenv to avoid GCC 15 ICE in zstd-sys (gimple_lower_bitint crash)
+  stdenv = pkgs.clangStdenv;
   workspaceBuildInputs = with pkgs; [openssl];
   workspaceNativeBuildInputs = with pkgs; [pkg-config protobuf llvmPackages.lld];
 
@@ -62,10 +64,12 @@
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catgrad-0.2.1" = "sha256-j2CDXsHloJctpnbsPNT3pXlQpWR2e5GdIgnLNB4FSis=";
+        "catgrad-0.2.1" = "sha256-KAq1weuNAU7IBW5JXJt0XkBl/zkMM1djPBfPSEe6P+0=";
       };
     };
+    inherit stdenv;
     auditable = false;
+    RUST_MIN_STACK = "16777216";
     GIT_REV = builtins.substring 0 12 rev;
     buildInputs = workspaceBuildInputs;
     nativeBuildInputs = workspaceNativeBuildInputs;
