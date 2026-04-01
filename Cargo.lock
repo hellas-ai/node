@@ -644,6 +644,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#f9cf6772c5b73ba0d4e5d207604513c0cb9462d3"
 dependencies = [
  "candle-core",
  "open-hypergraphs",
@@ -653,6 +654,7 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#f9cf6772c5b73ba0d4e5d207604513c0cb9462d3"
 dependencies = [
  "catgrad",
  "chrono",
