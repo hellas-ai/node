@@ -4,35 +4,26 @@ use crate::state::Invocation;
 use crate::weights::{ExecutionContext, ExecutionStart};
 use catgrad::interpreter::{self, Backend};
 use catgrad::prelude::Shape;
-use catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE;
 use catgrad_llm::Session;
 use hellas_rpc::encode_token_ids;
 use std::time::Instant;
 
 const CHECKPOINT_STRIDE: usize = 64;
 
-/// Number of non-state user inputs expected by the program.
-///
-/// Standard text models expect 1 (token tensor). Gated-delta models
-/// (OLMo-hybrid, Qwen3.5) expect 2 (token tensor + Nat chunk count).
-fn user_input_arity(program: &ExecutionContext) -> usize {
-    let p = program.bound_program().program();
-    p.typed_term.source_type.len() - p.empty_state_type.len()
-}
-
 fn step_tokens(
     session: &mut Session<ExecBackend>,
     backend: &ExecBackend,
     tokens: &[u32],
-    extra_nat: bool,
+    max_sequence_length: usize,
+    extra_nat_chunk_size: Option<usize>,
 ) -> Result<u32, ExecutorError> {
     let input = interpreter::tensor(backend, Shape(vec![1, tokens.len()]), tokens.to_vec())
         .map_err(ExecutorError::Backend)?;
     let mut inputs = vec![input];
-    if extra_nat {
-        inputs.push(interpreter::Value::Nat(
-            tokens.len().div_ceil(GATED_DELTA_CHUNK_SIZE),
-        ));
+    inputs.extend(session.state().iter().cloned());
+    inputs.push(interpreter::Value::Nat(max_sequence_length));
+    if let Some(chunk_size) = extra_nat_chunk_size {
+        inputs.push(interpreter::Value::Nat(tokens.len().div_ceil(chunk_size)));
     }
     let mut outputs = session.run(inputs)?;
     if outputs.len() != 1 {
@@ -59,7 +50,16 @@ pub fn run_cached_program_streaming(
     let started_at = Instant::now();
     let batch_size = usize::try_from(stream_batch_size.max(1)).unwrap_or(usize::MAX);
     let prompt_tokens = invocation.input_ids.len();
-    let extra_nat = user_input_arity(program) > 1;
+    let p = program.bound_program().program();
+    let max_sequence_length = p.max_sequence_length;
+    let state_arity = p.empty_state_type.len();
+    let total_inputs = p.typed_term.source_type.len();
+    // Non-state inputs beyond [token_tensor, state..., max_positions] are extra nats (e.g. num_chunks)
+    let extra_nat_chunk_size = if total_inputs > state_arity + 2 {
+        Some(catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE)
+    } else {
+        None
+    };
 
     if let Some(cached_output_tokens) = start.cached_output_tokens.as_deref() {
         info!(
@@ -98,7 +98,7 @@ pub fn run_cached_program_streaming(
     let mut prefill_chunks = 0usize;
     let mut prompt_state = start.transcript;
     let mut next_token = if prompt_tokens == 0 {
-        Some(step_tokens(&mut session, backend, &[], extra_nat)?)
+        Some(step_tokens(&mut session, backend, &[], max_sequence_length, extra_nat_chunk_size)?)
     } else if start.transcript.len() == prompt_tokens {
         start.next_token
     } else {
@@ -111,7 +111,7 @@ pub fn run_cached_program_streaming(
             let next_boundary = next_checkpoint_boundary(cursor, prompt_tokens);
             let chunk = &invocation.input_ids[cursor..next_boundary];
             let step_start = Instant::now();
-            let predicted = step_tokens(&mut session, backend, chunk, extra_nat)?;
+            let predicted = step_tokens(&mut session, backend, chunk, max_sequence_length, extra_nat_chunk_size)?;
             prefill_chunks += 1;
             prompt_state.extend_tokens(chunk);
             cursor = next_boundary;
@@ -195,7 +195,7 @@ pub fn run_cached_program_streaming(
         }
 
         if step_idx + 1 < invocation.max_new_tokens {
-            current_token = step_tokens(&mut session, backend, &[current_token], extra_nat)?;
+            current_token = step_tokens(&mut session, backend, &[current_token], max_sequence_length, extra_nat_chunk_size)?;
         }
     }
 
@@ -215,7 +215,7 @@ pub fn run_cached_program_streaming(
         Some(token) => Some(token),
         None => {
             if let Some(last_token) = last_emitted_token {
-                Some(step_tokens(&mut session, backend, &[last_token], extra_nat)?)
+                Some(step_tokens(&mut session, backend, &[last_token], max_sequence_length, extra_nat_chunk_size)?)
             } else {
                 None
             }

@@ -37,7 +37,7 @@ pub(crate) fn load_weights_bundle(
     })?;
 
     let (parameter_values, parameter_types, _total_params) =
-        load_model_weights(model_paths, &backend)?;
+        load_model_weights(model_paths, &backend, catgrad::prelude::Dtype::F32)?;
     let bundle = Arc::new(WeightsBundle {
         parameter_values,
         parameter_types,
