@@ -30,7 +30,7 @@ impl ModelAssets {
         let config: Value = serde_json::from_slice(&config_bytes)
             .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
 
-        let graph_model = get_model(&config, 1, None)
+        let graph_model = get_model(&config, 1, None, catgrad::prelude::Dtype::F32)
             .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?;
         let stop_token_ids = graph_model.config().get_eos_token_ids();
 
