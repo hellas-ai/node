@@ -1,7 +1,7 @@
 use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
-use futures::future::try_join_all;
 use futures::StreamExt;
+use futures::future::try_join_all;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
@@ -18,8 +18,8 @@ use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::otel::TraceContextLayer;
+use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::{IrohContext, PoolOptions, TransportBuilder};
 
 const DEFAULT_PORT: u16 = 31145;

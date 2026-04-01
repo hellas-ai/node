@@ -342,8 +342,7 @@ mod tests {
         let browsers: Vec<_> = (10..13).map(endpoint_id).collect();
         for &browser in &browsers {
             let _ = tracker.observe_request(browser, None, RequestKind::GetNodeInfo);
-            let admission =
-                tracker.observe_request(browser, None, RequestKind::GetKnownPeers);
+            let admission = tracker.observe_request(browser, None, RequestKind::GetKnownPeers);
             assert!(admission.allow);
 
             let peers = tracker.ranked_known_peers(browser, NODE_SERVICE_ALPN, 64);
@@ -354,8 +353,16 @@ mod tests {
 
         // CLI monitor discovers and queries.
         let cli = endpoint_id(20);
-        let _ = tracker.observe_request(cli, Some(Duration::from_millis(5)), RequestKind::GetNodeInfo);
-        let _ = tracker.observe_request(cli, Some(Duration::from_millis(5)), RequestKind::GetKnownPeers);
+        let _ = tracker.observe_request(
+            cli,
+            Some(Duration::from_millis(5)),
+            RequestKind::GetNodeInfo,
+        );
+        let _ = tracker.observe_request(
+            cli,
+            Some(Duration::from_millis(5)),
+            RequestKind::GetKnownPeers,
+        );
 
         let peers = tracker.ranked_known_peers(cli, NODE_SERVICE_ALPN, 64);
         assert_eq!(peers.len(), 2, "CLI should also only see the 2 servers");
@@ -377,8 +384,7 @@ mod tests {
         let mut denied = 0;
         for _ in 0..20 {
             let _ = tracker.observe_request(browser, None, RequestKind::GetNodeInfo);
-            let admission =
-                tracker.observe_request(browser, None, RequestKind::GetKnownPeers);
+            let admission = tracker.observe_request(browser, None, RequestKind::GetKnownPeers);
             if !admission.allow {
                 denied += 1;
             }
@@ -402,8 +408,7 @@ mod tests {
         // can deny a fresh peer — a known trade-off for simplicity.
         let browser2 = endpoint_id(11);
         let _ = tracker.observe_request(browser2, None, RequestKind::GetNodeInfo);
-        let admission =
-            tracker.observe_request(browser2, None, RequestKind::GetKnownPeers);
+        let admission = tracker.observe_request(browser2, None, RequestKind::GetKnownPeers);
         if admission.allow {
             let peers = tracker.ranked_known_peers(browser2, NODE_SERVICE_ALPN, 64);
             assert_eq!(peers, vec![server]);
@@ -412,7 +417,11 @@ mod tests {
         // Simulate the global bucket refilling (in real life, time passes).
         // We can verify by just calling ranked_known_peers directly.
         let peers = tracker.ranked_known_peers(browser2, NODE_SERVICE_ALPN, 64);
-        assert_eq!(peers, vec![server], "server should be visible once admitted");
+        assert_eq!(
+            peers,
+            vec![server],
+            "server should be visible once admitted"
+        );
     }
 
     /// Simulates a small network: node X knows about servers A, B, C. Server
@@ -431,9 +440,15 @@ mod tests {
         for &s in &[a, b, c] {
             tracker.mark_service_provider(s);
         }
-        let _ = tracker.observe_request(a, Some(Duration::from_millis(40)), RequestKind::GetNodeInfo);
-        let _ = tracker.observe_request(b, Some(Duration::from_millis(10)), RequestKind::GetNodeInfo);
-        let _ = tracker.observe_request(c, Some(Duration::from_millis(2000)), RequestKind::GetNodeInfo);
+        let _ =
+            tracker.observe_request(a, Some(Duration::from_millis(40)), RequestKind::GetNodeInfo);
+        let _ =
+            tracker.observe_request(b, Some(Duration::from_millis(10)), RequestKind::GetNodeInfo);
+        let _ = tracker.observe_request(
+            c,
+            Some(Duration::from_millis(2000)),
+            RequestKind::GetNodeInfo,
+        );
 
         // A sends garbage.
         for _ in 0..15 {
@@ -446,7 +461,10 @@ mod tests {
         let peers = tracker.ranked_known_peers(requester, NODE_SERVICE_ALPN, 64);
         // B should be first (low latency, no penalties).
         assert!(!peers.is_empty());
-        assert_eq!(peers[0], b, "well-behaved low-latency server should rank first");
+        assert_eq!(
+            peers[0], b,
+            "well-behaved low-latency server should rank first"
+        );
         // A may be excluded entirely (score ≤ 0) due to penalties.
         assert!(!peers.contains(&a) || peers.last() == Some(&a));
     }
@@ -537,8 +555,11 @@ mod tests {
             );
             // First few should be allowed, later ones may be throttled.
             if admission.allow {
-                let peers =
-                    tracker.ranked_known_peers(server_a, NODE_SERVICE_ALPN, admission.disclosure_limit);
+                let peers = tracker.ranked_known_peers(
+                    server_a,
+                    NODE_SERVICE_ALPN,
+                    admission.disclosure_limit,
+                );
                 assert_eq!(
                     peers,
                     vec![server_b],

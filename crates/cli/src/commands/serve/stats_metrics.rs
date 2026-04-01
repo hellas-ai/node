@@ -4,8 +4,8 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::time::{Duration, interval};
 
 type U64Gauge = Gauge<u64, AtomicU64>;
@@ -51,14 +51,46 @@ pub fn register_and_spawn(registry: &mut Registry, executor: ExecutorHandle) {
         generated_tokens: Default::default(),
     });
 
-    sub.register("executions_started", "Executions started", global.executions_started.clone());
-    sub.register("executions_completed", "Executions completed", global.executions_completed.clone());
-    sub.register("executions_failed", "Executions failed", global.executions_failed.clone());
-    sub.register("prompt_tokens", "Total prompt tokens", global.prompt_tokens.clone());
-    sub.register("cached_prompt_tokens", "Prompt tokens from cache", global.cached_prompt_tokens.clone());
-    sub.register("cached_output_tokens", "Output tokens from cache", global.cached_output_tokens.clone());
-    sub.register("prefill_tokens", "Prefill tokens computed", global.prefill_tokens.clone());
-    sub.register("generated_tokens", "Output tokens generated", global.generated_tokens.clone());
+    sub.register(
+        "executions_started",
+        "Executions started",
+        global.executions_started.clone(),
+    );
+    sub.register(
+        "executions_completed",
+        "Executions completed",
+        global.executions_completed.clone(),
+    );
+    sub.register(
+        "executions_failed",
+        "Executions failed",
+        global.executions_failed.clone(),
+    );
+    sub.register(
+        "prompt_tokens",
+        "Total prompt tokens",
+        global.prompt_tokens.clone(),
+    );
+    sub.register(
+        "cached_prompt_tokens",
+        "Prompt tokens from cache",
+        global.cached_prompt_tokens.clone(),
+    );
+    sub.register(
+        "cached_output_tokens",
+        "Output tokens from cache",
+        global.cached_output_tokens.clone(),
+    );
+    sub.register(
+        "prefill_tokens",
+        "Prefill tokens computed",
+        global.prefill_tokens.clone(),
+    );
+    sub.register(
+        "generated_tokens",
+        "Output tokens generated",
+        global.generated_tokens.clone(),
+    );
 
     let model = Arc::new(ModelStatsGauges {
         executions_started: Default::default(),
@@ -72,14 +104,46 @@ pub fn register_and_spawn(registry: &mut Registry, executor: ExecutorHandle) {
     });
 
     let model_sub = sub.sub_registry_with_prefix("model");
-    model_sub.register("executions_started", "Executions started", model.executions_started.clone());
-    model_sub.register("executions_completed", "Executions completed", model.executions_completed.clone());
-    model_sub.register("executions_failed", "Executions failed", model.executions_failed.clone());
-    model_sub.register("prompt_tokens", "Total prompt tokens", model.prompt_tokens.clone());
-    model_sub.register("cached_prompt_tokens", "Prompt tokens from cache", model.cached_prompt_tokens.clone());
-    model_sub.register("cached_output_tokens", "Output tokens from cache", model.cached_output_tokens.clone());
-    model_sub.register("prefill_tokens", "Prefill tokens computed", model.prefill_tokens.clone());
-    model_sub.register("generated_tokens", "Output tokens generated", model.generated_tokens.clone());
+    model_sub.register(
+        "executions_started",
+        "Executions started",
+        model.executions_started.clone(),
+    );
+    model_sub.register(
+        "executions_completed",
+        "Executions completed",
+        model.executions_completed.clone(),
+    );
+    model_sub.register(
+        "executions_failed",
+        "Executions failed",
+        model.executions_failed.clone(),
+    );
+    model_sub.register(
+        "prompt_tokens",
+        "Total prompt tokens",
+        model.prompt_tokens.clone(),
+    );
+    model_sub.register(
+        "cached_prompt_tokens",
+        "Prompt tokens from cache",
+        model.cached_prompt_tokens.clone(),
+    );
+    model_sub.register(
+        "cached_output_tokens",
+        "Output tokens from cache",
+        model.cached_output_tokens.clone(),
+    );
+    model_sub.register(
+        "prefill_tokens",
+        "Prefill tokens computed",
+        model.prefill_tokens.clone(),
+    );
+    model_sub.register(
+        "generated_tokens",
+        "Output tokens generated",
+        model.generated_tokens.clone(),
+    );
 
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(5));
@@ -118,12 +182,24 @@ fn set_gauges(g: &StatsGauges, s: &ProtoTokenStats) {
 }
 
 fn set_family_gauges(g: &ModelStatsGauges, label: &ModelLabel, s: &ProtoTokenStats) {
-    g.executions_started.get_or_create(label).set(s.executions_started);
-    g.executions_completed.get_or_create(label).set(s.executions_completed);
-    g.executions_failed.get_or_create(label).set(s.executions_failed);
+    g.executions_started
+        .get_or_create(label)
+        .set(s.executions_started);
+    g.executions_completed
+        .get_or_create(label)
+        .set(s.executions_completed);
+    g.executions_failed
+        .get_or_create(label)
+        .set(s.executions_failed);
     g.prompt_tokens.get_or_create(label).set(s.prompt_tokens);
-    g.cached_prompt_tokens.get_or_create(label).set(s.cached_prompt_tokens);
-    g.cached_output_tokens.get_or_create(label).set(s.cached_output_tokens);
+    g.cached_prompt_tokens
+        .get_or_create(label)
+        .set(s.cached_prompt_tokens);
+    g.cached_output_tokens
+        .get_or_create(label)
+        .set(s.cached_output_tokens);
     g.prefill_tokens.get_or_create(label).set(s.prefill_tokens);
-    g.generated_tokens.get_or_create(label).set(s.generated_tokens);
+    g.generated_tokens
+        .get_or_create(label)
+        .set(s.generated_tokens);
 }

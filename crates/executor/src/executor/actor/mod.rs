@@ -176,11 +176,7 @@ impl Executor {
         request: hellas_rpc::pb::hellas::GetModelStatsRequest,
     ) -> GetModelStatsResponse {
         let model_id = request.model_id;
-        let stats = self
-            .model_stats
-            .get(&model_id)
-            .cloned()
-            .unwrap_or_default();
+        let stats = self.model_stats.get(&model_id).cloned().unwrap_or_default();
         GetModelStatsResponse {
             model_id,
             stats: Some(stats.to_proto()),

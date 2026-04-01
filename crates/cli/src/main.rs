@@ -126,15 +126,14 @@ enum Commands {
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
         /// HuggingFace model id used to fetch weights, optionally with @revision
-        #[arg(
-            short = 'm',
-            long = "model",
-            default_value = "Qwen/Qwen3-0.6B"
-        )]
+        #[arg(short = 'm', long = "model", default_value = "Qwen/Qwen3-0.6B")]
         model: String,
         /// Prompt to send (required)
         #[arg(short = 'p', long = "prompt")]
         prompt: String,
+        /// Pass the prompt through unchanged instead of applying the model chat template
+        #[arg(long = "raw", default_value_t = false)]
+        raw: bool,
         /// Maximum number of new tokens to generate
         #[arg(long = "max-seq", default_value_t = 16)]
         max_seq: u32,
@@ -240,6 +239,7 @@ async fn main() {
             node_addrs,
             model,
             prompt,
+            raw,
             max_seq,
             retries,
             local,
@@ -251,6 +251,7 @@ async fn main() {
                     node_addrs,
                     model,
                     prompt,
+                    raw,
                     max_seq,
                     retries,
                     local,
@@ -291,13 +292,24 @@ mod tests {
                 node_addrs,
                 local,
                 verify_local,
+                raw,
                 ..
             } => {
                 assert!(node_id.is_none());
                 assert!(node_addrs.is_empty());
                 assert!(local);
                 assert!(!verify_local);
+                assert!(!raw);
             }
+            _ => panic!("expected llm command"),
+        }
+    }
+
+    #[test]
+    fn llm_accepts_raw_mode() {
+        let cli = Cli::try_parse_from(["hellas", "llm", "--raw", "-p", "hello"]).unwrap();
+        match cli.command {
+            Commands::Llm { raw, .. } => assert!(raw),
             _ => panic!("expected llm command"),
         }
     }
@@ -318,14 +330,8 @@ mod tests {
 
     #[test]
     fn llm_rejects_conflicting_local_modes() {
-        let result = Cli::try_parse_from([
-            "hellas",
-            "llm",
-            "--local",
-            "--verify-local",
-            "-p",
-            "hello",
-        ]);
+        let result =
+            Cli::try_parse_from(["hellas", "llm", "--local", "--verify-local", "-p", "hello"]);
 
         assert!(result.is_err());
     }

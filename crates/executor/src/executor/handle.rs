@@ -217,7 +217,10 @@ impl Execute for ExecutorHandle {
         let model_spec = if first.huggingface_revision.is_empty() {
             first.huggingface_model_id.clone()
         } else {
-            format!("{}@{}", first.huggingface_model_id, first.huggingface_revision)
+            format!(
+                "{}@{}",
+                first.huggingface_model_id, first.huggingface_revision
+            )
         };
         let assets = ModelAssets::load(&model_spec)
             .map_err(|e| Status::internal(format!("failed to load model: {e}")))?;
@@ -265,7 +268,9 @@ impl Execute for ExecutorHandle {
             }
         };
 
-        Ok(Response::new(Box::pin(output_stream) as Self::DecodeTokensStream))
+        Ok(Response::new(
+            Box::pin(output_stream) as Self::DecodeTokensStream
+        ))
     }
 }
 
