@@ -11,11 +11,11 @@ use std::collections::HashSet;
 use std::future;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
-use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };
+use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -36,7 +36,11 @@ struct DiscoveryEventContext<'a> {
     interrogations: &'a mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
 }
 
-pub async fn run(timeout_secs: Option<u64>, interrogate: bool, secret_key: SecretKey) -> CliResult<()> {
+pub async fn run(
+    timeout_secs: Option<u64>,
+    interrogate: bool,
+    secret_key: SecretKey,
+) -> CliResult<()> {
     let bound = DiscoveryEndpoint::bind(Some(secret_key)).await?;
     let endpoint = bound.endpoint;
     let mdns = bound.bindings.mdns;

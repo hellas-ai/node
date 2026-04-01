@@ -31,9 +31,7 @@ fn step_tokens(
     }
     match outputs.remove(0) {
         interpreter::Value::Tensor(arr) => match backend.to_vec(arr) {
-            interpreter::TaggedVec::U32(v) => {
-                v.last().copied().ok_or(ExecutorError::NoOutput)
-            }
+            interpreter::TaggedVec::U32(v) => v.last().copied().ok_or(ExecutorError::NoOutput),
             _ => Err(ExecutorError::UnexpectedOutput),
         },
         _ => Err(ExecutorError::UnexpectedOutput),
@@ -98,7 +96,13 @@ pub fn run_cached_program_streaming(
     let mut prefill_chunks = 0usize;
     let mut prompt_state = start.transcript;
     let mut next_token = if prompt_tokens == 0 {
-        Some(step_tokens(&mut session, backend, &[], max_sequence_length, extra_nat_chunk_size)?)
+        Some(step_tokens(
+            &mut session,
+            backend,
+            &[],
+            max_sequence_length,
+            extra_nat_chunk_size,
+        )?)
     } else if start.transcript.len() == prompt_tokens {
         start.next_token
     } else {
@@ -111,7 +115,13 @@ pub fn run_cached_program_streaming(
             let next_boundary = next_checkpoint_boundary(cursor, prompt_tokens);
             let chunk = &invocation.input_ids[cursor..next_boundary];
             let step_start = Instant::now();
-            let predicted = step_tokens(&mut session, backend, chunk, max_sequence_length, extra_nat_chunk_size)?;
+            let predicted = step_tokens(
+                &mut session,
+                backend,
+                chunk,
+                max_sequence_length,
+                extra_nat_chunk_size,
+            )?;
             prefill_chunks += 1;
             prompt_state.extend_tokens(chunk);
             cursor = next_boundary;
@@ -195,7 +205,13 @@ pub fn run_cached_program_streaming(
         }
 
         if step_idx + 1 < invocation.max_new_tokens {
-            current_token = step_tokens(&mut session, backend, &[current_token], max_sequence_length, extra_nat_chunk_size)?;
+            current_token = step_tokens(
+                &mut session,
+                backend,
+                &[current_token],
+                max_sequence_length,
+                extra_nat_chunk_size,
+            )?;
         }
     }
 
@@ -215,7 +231,13 @@ pub fn run_cached_program_streaming(
         Some(token) => Some(token),
         None => {
             if let Some(last_token) = last_emitted_token {
-                Some(step_tokens(&mut session, backend, &[last_token], max_sequence_length, extra_nat_chunk_size)?)
+                Some(step_tokens(
+                    &mut session,
+                    backend,
+                    &[last_token],
+                    max_sequence_length,
+                    extra_nat_chunk_size,
+                )?)
             } else {
                 None
             }

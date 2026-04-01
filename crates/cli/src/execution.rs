@@ -12,14 +12,13 @@ use hellas_rpc::service::ExecuteService;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
+use tonic::service::interceptor::InterceptedService;
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
-    endpoint::PortmapperConfig,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
 };
-use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
-use tonic::service::interceptor::InterceptedService;
 use tonic_iroh_transport::otel::TraceContextInjector;
+use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
 use tracing::instrument;
 
@@ -304,7 +303,8 @@ impl PreparedRoute {
 
                 for attempt in 1..=max_attempts {
                     if active.is_none() {
-                        *active = Some(prepare_discovered_remote(quote_req, secret_key.as_ref()).await?);
+                        *active =
+                            Some(prepare_discovered_remote(quote_req, secret_key.as_ref()).await?);
                     }
 
                     let remote = active.as_mut().expect("active remote execution");
@@ -387,8 +387,8 @@ where
 }
 
 async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
-    use tonic_iroh_transport::iroh::endpoint::presets;
     use tonic_iroh_transport::iroh::address_lookup::PkarrPublisher;
+    use tonic_iroh_transport::iroh::endpoint::presets;
 
     let mut builder = Endpoint::builder(presets::N0)
         .clear_address_lookup()
@@ -538,7 +538,10 @@ async fn discover_remote_quote(
     .context("discovery timed out")?
 }
 
-async fn prepare_discovered_remote(quote_req: &GetQuoteRequest, secret_key: Option<&SecretKey>) -> anyhow::Result<RemoteExecution> {
+async fn prepare_discovered_remote(
+    quote_req: &GetQuoteRequest,
+    secret_key: Option<&SecretKey>,
+) -> anyhow::Result<RemoteExecution> {
     let endpoint = bind_remote_endpoint(secret_key).await?;
     let quote = discover_remote_quote(quote_req, &endpoint).await?;
     Ok(RemoteExecution::from_quoted(endpoint, quote))

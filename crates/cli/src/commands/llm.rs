@@ -1,6 +1,7 @@
 use crate::commands::CliResult;
 use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
 use crate::text_output::TextOutputDecoder;
+use catgrad_llm::ChatInput;
 use hellas_executor::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -16,11 +17,22 @@ pub struct ExecuteOptions {
     pub retries: usize,
     pub local: bool,
     pub verify_local: bool,
+    pub raw: bool,
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
     let assets = Arc::new(ModelAssets::load(&options.model)?);
-    let prepared = assets.prepare_plain(&options.prompt)?;
+    let prepared = if options.raw || !assets.has_chat_template() {
+        if options.raw {
+            info!("executing raw prompt without chat template");
+        } else {
+            info!("model has no chat template; using raw prompt");
+        }
+        assets.prepare_plain(&options.prompt)?
+    } else {
+        info!("executing prompt with model chat template");
+        assets.prepare_chat(&ChatInput::single(&options.prompt))?
+    };
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
         ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)?

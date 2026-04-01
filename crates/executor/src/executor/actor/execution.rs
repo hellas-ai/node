@@ -127,9 +127,7 @@ impl Executor {
         let execution_id = job.execution_id.clone();
         match self.worker.try_enqueue(job) {
             Ok(()) => {
-                self.store
-                    .mark_running(&execution_id)
-                    ?;
+                self.store.mark_running(&execution_id)?;
                 self.send_status(&execution_id, ExecutionStatus::Running);
                 Ok(())
             }
