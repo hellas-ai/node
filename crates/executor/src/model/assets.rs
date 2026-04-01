@@ -84,6 +84,10 @@ impl ModelAssets {
         })
     }
 
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     pub fn prepare_chat(&self, request: &ChatInput) -> Result<PreparedPrompt> {
         let template = self.chat_template.as_deref().ok_or_else(|| {
             ModelAssetsError::PreparePromptRequest {

@@ -218,8 +218,8 @@ mod tests {
     use super::*;
     use catgrad::category::lang::{Term, TypedTerm};
     use catgrad::path::Path;
-    use catgrad_llm::helpers::WeightPostProcess;
     use catgrad_llm::Program;
+    use catgrad_llm::helpers::WeightPostProcess;
 
     fn locator(index: u8) -> WeightsLocator {
         WeightsLocator {

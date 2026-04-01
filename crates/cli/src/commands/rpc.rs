@@ -8,7 +8,11 @@ use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
 
-pub async fn run(node_id: EndpointId, node_addrs: Vec<SocketAddr>, secret_key: SecretKey) -> CliResult<()> {
+pub async fn run(
+    node_id: EndpointId,
+    node_addrs: Vec<SocketAddr>,
+    secret_key: SecretKey,
+) -> CliResult<()> {
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
     let channel = if node_addrs.is_empty() {
         let pool =
@@ -37,10 +41,7 @@ pub async fn run(node_id: EndpointId, node_addrs: Vec<SocketAddr>, secret_key: S
     println!("Build:    {}", response.build);
     println!("OS:       {}", response.os);
     println!("Uptime:   {}s", response.uptime_seconds);
-    println!(
-        "Graffiti: {}",
-        String::from_utf8_lossy(&response.graffiti)
-    );
+    println!("Graffiti: {}", String::from_utf8_lossy(&response.graffiti));
 
     Ok(())
 }

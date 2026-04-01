@@ -46,8 +46,9 @@ impl From<ExecutorError> for Status {
         let code = match &err {
             ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
 
-            ExecutorError::InvalidQuoteRequest(_)
-            | ExecutorError::InvalidTokenPayload(_) => tonic::Code::InvalidArgument,
+            ExecutorError::InvalidQuoteRequest(_) | ExecutorError::InvalidTokenPayload(_) => {
+                tonic::Code::InvalidArgument
+            }
 
             ExecutorError::ModelAssets(model_err) => match model_err {
                 ModelAssetsError::EmptyModelId

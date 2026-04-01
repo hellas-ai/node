@@ -2,8 +2,8 @@ use crate::ExecutorError;
 use crate::model::{ModelAssets, ModelSpec};
 use crate::state::{QuotePlan, QuoteRecord};
 use crate::weights::{EnsureDisposition, EntryStatusSnapshot, WeightsLocator, has_cached_weights};
-use catgrad_llm::utils::ChatInput;
 use catgrad_llm::types;
+use catgrad_llm::utils::ChatInput;
 use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
@@ -159,9 +159,9 @@ impl Executor {
         // Build ChatInput from proto messages + system_prompt.
         let mut messages: Vec<types::Message> = Vec::new();
         if !request.system_prompt.is_empty() {
-            messages.push(types::Message::openai(
-                types::openai::ChatMessage::system(&request.system_prompt),
-            ));
+            messages.push(types::Message::openai(types::openai::ChatMessage::system(
+                &request.system_prompt,
+            )));
         }
         for m in &request.messages {
             let msg = match m.role.as_str() {

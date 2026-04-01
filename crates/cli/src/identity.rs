@@ -20,7 +20,9 @@ pub fn load_or_create(path: Option<&Path>) -> anyhow::Result<SecretKey> {
     match fs::read(&path) {
         Ok(bytes) => load_from_bytes(&path, &bytes),
         Err(e) if e.kind() == ErrorKind::NotFound => create_new(&path),
-        Err(e) => Err(e).with_context(|| format!("failed to read identity file {}", path.display())),
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to read identity file {}", path.display()))
+        }
     }
 }
 
@@ -56,7 +58,11 @@ fn create_new(path: &Path) -> anyhow::Result<SecretKey> {
 
     // Write to a temp file, then atomic rename. If rename fails because another
     // process created the file first, read the existing one instead.
-    let tmp_path = dir.join(format!(".identity.tmp.{}.{:?}", std::process::id(), std::thread::current().id()));
+    let tmp_path = dir.join(format!(
+        ".identity.tmp.{}.{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     write_file_restricted(&tmp_path, &bytes)
         .with_context(|| format!("failed to write temp identity file {}", tmp_path.display()))?;
 
@@ -74,9 +80,8 @@ fn create_new(path: &Path) -> anyhow::Result<SecretKey> {
                     .with_context(|| format!("failed to read identity file {}", path.display()))?;
                 load_from_bytes(path, &bytes)
             } else {
-                Err(e).with_context(|| {
-                    format!("failed to persist identity file {}", path.display())
-                })
+                Err(e)
+                    .with_context(|| format!("failed to persist identity file {}", path.display()))
             }
         }
     }
@@ -133,7 +138,10 @@ mod tests {
         assert!(path.exists());
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), KEY_LEN);
-        assert_eq!(SecretKey::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()).to_bytes(), key.to_bytes());
+        assert_eq!(
+            SecretKey::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()).to_bytes(),
+            key.to_bytes()
+        );
     }
 
     #[test]

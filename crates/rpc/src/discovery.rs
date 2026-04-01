@@ -77,9 +77,8 @@ impl DiscoveryBindings {
             .service_name("hellas")
             .build(endpoint_id)
             .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
-        let dht = Arc::new(Dht::client().map_err(|source| DiscoveryError::BuildDhtClient {
-            source,
-        })?);
+        let dht =
+            Arc::new(Dht::client().map_err(|source| DiscoveryError::BuildDhtClient { source })?);
         Ok(Self { mdns, dht })
     }
 
