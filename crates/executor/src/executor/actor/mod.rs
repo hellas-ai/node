@@ -128,14 +128,16 @@ impl Executor {
                         ExecutionStatus::Running,
                         progress,
                         output_chunk,
+                        None,
                     );
                 }
                 ExecutorMessage::Complete {
                     execution_id,
                     output,
                     status,
+                    error,
                 } => {
-                    self.handle_complete(&execution_id, output, status);
+                    self.handle_complete(&execution_id, output, status, error);
                     self.dispatch_next_execution();
                 }
                 ExecutorMessage::SubscriptionsClosed { execution_id } => {

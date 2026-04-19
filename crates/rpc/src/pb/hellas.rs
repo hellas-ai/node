@@ -119,6 +119,9 @@ pub struct ExecuteSnapshot {
     pub progress: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub output: ::prost::alloc::vec::Vec<u8>,
+    /// Populated when status is FAILED; empty otherwise.
+    #[prost(string, tag = "4")]
+    pub error: ::prost::alloc::string::String,
 }
 impl ::prost::Name for ExecuteSnapshot {
     const NAME: &'static str = "ExecuteSnapshot";
@@ -138,6 +141,9 @@ pub struct ExecuteProgress {
     pub progress: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub output_chunk: ::prost::alloc::vec::Vec<u8>,
+    /// Populated when status is FAILED; empty otherwise.
+    #[prost(string, tag = "4")]
+    pub error: ::prost::alloc::string::String,
 }
 impl ::prost::Name for ExecuteProgress {
     const NAME: &'static str = "ExecuteProgress";

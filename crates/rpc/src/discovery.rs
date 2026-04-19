@@ -147,11 +147,14 @@ fn build_shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn client_bindings_builds_unattached_resources() {
-        let mut bytes = [0u8; 32];
-        bytes[31] = 1;
-        let endpoint_id = EndpointId::from_bytes(&bytes).expect("valid endpoint id");
+    // `DiscoveryBindings::client` internally calls `MdnsAddressLookup::builder().build()`,
+    // which spawns a background task and so needs a running Tokio runtime.
+    #[tokio::test]
+    async fn client_bindings_builds_unattached_resources() {
+        // EndpointId is an Ed25519 public key — not every 32-byte sequence
+        // decompresses to a valid Edwards point. Any 32-byte secret does
+        // yield a valid public key though, so derive one deterministically.
+        let endpoint_id = SecretKey::from_bytes(&[1u8; 32]).public();
         let bindings = DiscoveryBindings::client(endpoint_id).expect("client bindings");
         let _ = bindings.mdns;
         let _ = bindings.dht;

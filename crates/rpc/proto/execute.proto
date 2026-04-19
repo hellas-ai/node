@@ -45,11 +45,15 @@ message ExecuteSnapshot {
   ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes output = 3;
+  // Populated when status is FAILED; empty otherwise.
+  string error = 4;
 }
 message ExecuteProgress {
   ExecutionStatus status = 1;
   uint64 progress = 2;
   bytes output_chunk = 3;
+  // Populated when status is FAILED; empty otherwise.
+  string error = 4;
 }
 message ExecuteStreamEvent {
   oneof event {

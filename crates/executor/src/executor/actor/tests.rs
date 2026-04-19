@@ -142,7 +142,7 @@ async fn subscribe_sends_snapshot_immediately() {
     assert_eq!(initial.progress, 0);
     assert!(initial.output.is_empty());
 
-    executor.send_status(&execution_id, ExecutionStatus::Completed);
+    executor.send_status(&execution_id, ExecutionStatus::Completed, None);
     let completed = expect_progress(&mut updates).await;
     assert_eq!(completed.status, RpcExecutionStatus::Completed as i32);
     assert_eq!(completed.progress, 0);
@@ -163,7 +163,7 @@ async fn subscribe_after_completion_receives_buffered_output() {
         .unwrap();
     executor
         .store
-        .complete_execution(&execution_id, ExecutionStatus::Completed, None)
+        .complete_execution(&execution_id, ExecutionStatus::Completed, None, None)
         .unwrap();
 
     let mut updates =
@@ -203,6 +203,7 @@ async fn subscribe_midstream_receives_buffered_output_and_future_updates() {
         ExecutionStatus::Running,
         2,
         second_chunk.clone(),
+        None,
     );
     let update = expect_progress(&mut updates).await;
     assert_eq!(update.status, RpcExecutionStatus::Running as i32);
@@ -248,7 +249,7 @@ async fn stats_accumulate_on_completion() {
         .append_output_chunk(&execution_id, &chunk, 3)
         .unwrap();
 
-    executor.handle_complete(&execution_id, None, ExecutionStatus::Completed);
+    executor.handle_complete(&execution_id, None, ExecutionStatus::Completed, None);
 
     assert_eq!(executor.stats.generated_tokens, 3);
     assert_eq!(executor.stats.executions_completed, 1);
@@ -257,7 +258,7 @@ async fn stats_accumulate_on_completion() {
     // A failed execution should increment the failed counter.
     let execution_id2 = executor.store.create_execution("");
     executor.store.mark_running(&execution_id2).unwrap();
-    executor.handle_complete(&execution_id2, None, ExecutionStatus::Failed);
+    executor.handle_complete(&execution_id2, None, ExecutionStatus::Failed, None);
 
     assert_eq!(executor.stats.generated_tokens, 3);
     assert_eq!(executor.stats.executions_completed, 1);

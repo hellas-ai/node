@@ -40,14 +40,14 @@ impl Executor {
         let plan_start = Instant::now();
         let plan = QuotePlan::from_quote_request(request)?;
         let plan_parse_ms = plan_start.elapsed().as_millis();
-        let program_id = crate::weights::spec_cache_key(&plan.program);
+        let program_id = plan.program_id.clone();
         if !self
             .execute_policy
             .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
         {
             return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied program {program_id} for model {}",
-                plan.weights_key.model_id
+                "execute policy denied program {} for model {}",
+                program_id, plan.weights_key.model_id
             )));
         }
 
@@ -57,7 +57,7 @@ impl Executor {
         let bind_start = Instant::now();
         let execution = self
             .runtime_manager
-            .bound_program(&plan.weights_key, &plan.program)
+            .bound_program(&plan.weights_key, &plan.program_id, &plan.program)
             .await?;
         let bind_program_ms = bind_start.elapsed().as_millis();
         let cache_start = Instant::now();

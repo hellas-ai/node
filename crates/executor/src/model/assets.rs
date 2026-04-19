@@ -5,7 +5,7 @@ use hellas_rpc::pb::hellas::GetQuoteRequest;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::config::{build_program_bytes, encode_i32_tokens, validate_prefill_prompt_length};
+use super::config::{build_program_bytes, encode_i32_tokens};
 use super::hf::get_model_metadata_files;
 use super::spec::ModelSpec;
 use super::{ModelAssetsError, Result};
@@ -21,8 +21,7 @@ pub struct ModelAssets {
 impl ModelAssets {
     pub fn load(model_name: &str) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
-        let (config_path, tokenizer_path, _tokenizer_config_path) =
-            get_model_metadata_files(&model)?;
+        let (config_path, tokenizer_path) = get_model_metadata_files(&model)?;
         let config_bytes =
             std::fs::read(&config_path).map_err(|source| ModelAssetsError::ReadModelConfig {
                 path: config_path.clone(),
@@ -64,9 +63,12 @@ impl ModelAssets {
         prepared_prompt: &PreparedPrompt,
         max_seq: u32,
     ) -> Result<GetQuoteRequest> {
-        validate_prefill_prompt_length(&self.config, prepared_prompt.input_ids.len())?;
         let max_sequence_length = prepared_prompt.input_ids.len() + max_seq as usize;
-        let program = build_program_bytes(&self.config, max_sequence_length)?;
+        let program = build_program_bytes(
+            &self.config,
+            prepared_prompt.input_ids.len(),
+            max_sequence_length,
+        )?;
         let input_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
             ModelAssetsError::NegativePromptTokenId { token }
         })?;

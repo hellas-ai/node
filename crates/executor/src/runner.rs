@@ -18,16 +18,22 @@ fn step_tokens(
     max_sequence_length: usize,
     extra_nat_chunk_size: Option<usize>,
 ) -> Result<u32, ExecutorError> {
-    let phase_name = match tokens.len() {
-        0 => "executor.bootstrap_step",
-        1 => "executor.decode_step",
-        _ => "executor.prefill_chunk",
+    #[cfg(feature = "candle-cuda")]
+    let _range = {
+        let phase_name = match tokens.len() {
+            0 => "executor.bootstrap_step",
+            1 => "executor.decode_step",
+            _ => "executor.prefill_chunk",
+        };
+        nvtx::range!(
+            "{phase_name} start_pos={} seq_len={}",
+            start_pos,
+            tokens.len()
+        )
     };
-    let _range = nvtx::range!(
-        "{phase_name} start_pos={} seq_len={}",
-        start_pos,
-        tokens.len()
-    );
+    #[cfg(not(feature = "candle-cuda"))]
+    let _ = start_pos;
+
     let token_tensor = interpreter::tensor(backend, Shape(vec![1, tokens.len()]), tokens.to_vec())
         .map_err(ExecutorError::Backend)?;
     let mut inputs = vec![token_tensor];

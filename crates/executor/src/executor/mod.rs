@@ -59,6 +59,7 @@ pub(crate) enum ExecutorMessage {
         execution_id: String,
         output: Option<Vec<u8>>,
         status: ExecutionStatus,
+        error: Option<String>,
     },
     SubscriptionsClosed {
         execution_id: String,
