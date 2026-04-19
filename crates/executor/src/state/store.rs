@@ -33,12 +33,14 @@ pub struct ExecutionSnapshot {
     pub status: ExecutionStatus,
     pub progress: u64,
     pub output: Vec<u8>,
+    pub error: Option<String>,
 }
 
 struct ExecutionRecord {
     status: ExecutionStatus,
     progress: u64,
     output: Option<Vec<u8>>,
+    error: Option<String>,
     model_id: String,
 }
 
@@ -88,6 +90,7 @@ impl ExecutorState {
                 status: ExecutionStatus::Pending,
                 progress: 0,
                 output: None,
+                error: None,
                 model_id: model_id.to_owned(),
             },
         );
@@ -142,9 +145,11 @@ impl ExecutorState {
         execution_id: &str,
         status: ExecutionStatus,
         output: Option<Vec<u8>>,
+        error: Option<String>,
     ) -> Result<(), StateError> {
         let execution = self.execution_mut(execution_id)?;
         execution.status = status;
+        execution.error = error;
 
         if let Some(output) = output {
             execution.output = Some(output);
@@ -195,6 +200,7 @@ impl ExecutionRecord {
             status: self.status,
             progress: self.progress,
             output: self.output.clone().unwrap_or_default(),
+            error: self.error.clone(),
         }
     }
 }

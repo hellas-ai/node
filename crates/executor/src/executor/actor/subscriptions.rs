@@ -43,6 +43,7 @@ impl Executor {
         status: ExecutionStatus,
         progress: u64,
         output_chunk: Vec<u8>,
+        error: Option<String>,
     ) {
         let Some(subscriptions) = self.subscriptions.get(execution_id) else {
             return;
@@ -52,12 +53,18 @@ impl Executor {
             status: status as i32,
             progress,
             output_chunk,
+            error: error.unwrap_or_default(),
         });
     }
 
-    pub(super) fn send_status(&mut self, execution_id: &str, status: ExecutionStatus) {
+    pub(super) fn send_status(
+        &mut self,
+        execution_id: &str,
+        status: ExecutionStatus,
+        error: Option<String>,
+    ) {
         let progress = self.store.progress(execution_id).unwrap_or(0);
-        self.send_progress(execution_id, status, progress, Vec::new());
+        self.send_progress(execution_id, status, progress, Vec::new(), error);
     }
 
     pub(super) fn handle_subscriptions_closed(&mut self, execution_id: &str) {
@@ -113,6 +120,7 @@ impl From<crate::state::ExecutionSnapshot> for ExecuteSnapshot {
             status: snapshot.status as i32,
             progress: snapshot.progress,
             output: snapshot.output,
+            error: snapshot.error.unwrap_or_default(),
         }
     }
 }

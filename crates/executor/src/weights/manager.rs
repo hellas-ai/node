@@ -217,10 +217,10 @@ impl RuntimeManager {
     pub(crate) async fn bound_program(
         &self,
         locator: &WeightsLocator,
+        program_id: &str,
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         let start = Instant::now();
-        let program_id = spec_cache_key(program);
         let weight_post_process = program.weight_post_process;
 
         loop {
@@ -229,7 +229,7 @@ impl RuntimeManager {
                 let mut state = self.inner.state.lock().await;
                 let lookup = state
                     .weights
-                    .lookup_program(locator, weight_post_process, &program_id)
+                    .lookup_program(locator, weight_post_process, program_id)
                     .map_err(|error| map_program_cache_error(locator, error))?;
                 if let Some(cached) = lookup.program {
                     BoundProgramStep::Ready(cached)
@@ -238,7 +238,7 @@ impl RuntimeManager {
                         locator: locator.clone(),
                         generation: lookup.generation,
                         weight_post_process,
-                        program_id: program_id.clone(),
+                        program_id: program_id.to_string(),
                     };
                     match Self::admit_build(&mut state.program_builds, build_key.clone()) {
                         BuildAdmission::Leader => BoundProgramStep::BuildProgram {
@@ -361,7 +361,7 @@ impl RuntimeManager {
                                 locator,
                                 generation,
                                 weight_post_process,
-                                program_id.clone(),
+                                program_id.to_string(),
                                 bound_program,
                             )
                             .map_err(|error| map_program_cache_error(locator, error));
@@ -663,11 +663,3 @@ mod tests {
     }
 }
 
-pub(crate) fn spec_cache_key(spec: &Program) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let bytes = serde_json::to_vec(spec).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}

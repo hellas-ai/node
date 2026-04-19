@@ -1,6 +1,8 @@
 use anyhow::{Context, anyhow};
 use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use std::collections::HashSet;
 use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ExecutorHandle, ModelAssets};
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::discovery::DiscoveryBindings;
@@ -27,6 +29,11 @@ type TracedDriver = RemoteExecuteDriver<TracedChannel>;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max quote RPCs in flight at once while draining the discovery stream.
+/// Keep this high enough that we never stall the mDNS subscriber (the
+/// consumer must drain at least as fast as iroh emits, i.e. ~1/sec per
+/// peer), but low enough to avoid thundering-herd on the network.
+const MAX_CONCURRENT_QUOTES: usize = 8;
 
 type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 
@@ -224,6 +231,10 @@ enum PreparedRoute {
         retries: usize,
         active: Option<RemoteExecution>,
         secret_key: Option<SecretKey>,
+        /// Peers that already failed in this request; re-discovery must skip them
+        /// so we actually try a different provider on retry instead of picking the
+        /// same mDNS-announced peer.
+        tried: HashSet<EndpointId>,
     },
 }
 
@@ -281,6 +292,7 @@ impl PreparedRoute {
                 retries: *retries,
                 active: None,
                 secret_key: runtime.secret_key.clone(),
+                tried: HashSet::new(),
             }),
         }
     }
@@ -297,14 +309,17 @@ impl PreparedRoute {
                 retries,
                 active,
                 secret_key,
+                tried,
             } => {
                 let max_attempts = retries.saturating_add(1);
                 info!("No node ID provided, discovering executor");
 
                 for attempt in 1..=max_attempts {
                     if active.is_none() {
-                        *active =
-                            Some(prepare_discovered_remote(quote_req, secret_key.as_ref()).await?);
+                        *active = Some(
+                            prepare_discovered_remote(quote_req, secret_key.as_ref(), tried)
+                                .await?,
+                        );
                     }
 
                     let remote = active.as_mut().expect("active remote execution");
@@ -327,6 +342,7 @@ impl PreparedRoute {
                                     "execution failed on {peer_id} after output was emitted"
                                 )));
                             }
+                            tried.insert(peer_id);
                             *active = None;
                             if attempt == max_attempts {
                                 return Err(
@@ -483,10 +499,11 @@ async fn quote_remote_target(
     })
 }
 
-#[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
+#[instrument(skip_all, fields(model = %quote_req.huggingface_model_id, excluded = exclude.len()))]
 async fn discover_remote_quote(
     quote_req: &GetQuoteRequest,
     endpoint: &Endpoint,
+    exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let bindings = DiscoveryBindings::attach(endpoint, false, false)?;
 
@@ -501,15 +518,19 @@ async fn discover_remote_quote(
 
     let peers = Box::pin(registry.discover::<ExecuteService>());
     timeout(DISCOVERY_TIMEOUT, async {
-        let mut last_decline = None;
-        let mut last_connect_error = None;
+        let mut last_decline: Option<tonic::Status> = None;
+        let mut last_connect_error: Option<anyhow::Error> = None;
+        let mut peers_done = false;
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         futures::pin_mut!(peers);
 
-        while let Some(result) = peers.next().await {
-            match result {
-                Ok(peer) => {
-                    let peer_id = peer.id();
-                    match quote_remote_endpoint(quote_req, &pool, peer_id).await {
+        loop {
+            tokio::select! {
+                biased;
+
+                // Consume completed quote attempts first; an early success short-circuits.
+                Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                    match result {
                         Ok(accepted) => return Ok(accepted),
                         Err(QuoteCandidateError::Declined(status)) => {
                             info!("provider declined quote: {status}");
@@ -521,7 +542,33 @@ async fn discover_remote_quote(
                         }
                     }
                 }
-                Err(err) => last_connect_error = Some(err.into()),
+
+                // Drain the mDNS/DHT stream as fast as we can, up to the concurrency cap,
+                // so iroh's subscriber buffer doesn't fill up and start dropping items.
+                peer = peers.next(), if !peers_done && in_flight.len() < MAX_CONCURRENT_QUOTES => {
+                    match peer {
+                        Some(Ok(peer)) => {
+                            let peer_id = peer.id();
+                            if exclude.contains(&peer_id) {
+                                debug!(%peer_id, "skipping previously-failed peer");
+                                continue;
+                            }
+                            let pool = pool.clone();
+                            let req = quote_req.clone();
+                            in_flight.push(async move {
+                                quote_remote_endpoint(&req, &pool, peer_id).await
+                            });
+                        }
+                        Some(Err(err)) => last_connect_error = Some(err.into()),
+                        None => peers_done = true,
+                    }
+                }
+
+                else => {
+                    if peers_done && in_flight.is_empty() {
+                        break;
+                    }
+                }
             }
         }
 
@@ -541,9 +588,10 @@ async fn discover_remote_quote(
 async fn prepare_discovered_remote(
     quote_req: &GetQuoteRequest,
     secret_key: Option<&SecretKey>,
+    exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<RemoteExecution> {
     let endpoint = bind_remote_endpoint(secret_key).await?;
-    let quote = discover_remote_quote(quote_req, &endpoint).await?;
+    let quote = discover_remote_quote(quote_req, &endpoint, exclude).await?;
     Ok(RemoteExecution::from_quoted(endpoint, quote))
 }
 
@@ -568,13 +616,16 @@ where
 
     while let Some(event) = stream.next().await {
         let event = event.context("execution stream failed")?;
-        if let Some(status) =
+        if let Some(update) =
             consume_stream_event(event, &mut output, &mut completion_tokens, sink)?
         {
-            if status == ExecutionStatus::Failed {
-                anyhow::bail!("execution failed");
+            if update.status == ExecutionStatus::Failed {
+                match update.error {
+                    Some(err) => anyhow::bail!("execution failed: {err}"),
+                    None => anyhow::bail!("execution failed (no error reported)"),
+                }
             }
-            if status == ExecutionStatus::Completed {
+            if update.status == ExecutionStatus::Completed {
                 break;
             }
         }
@@ -634,13 +685,18 @@ fn verify_matching_output(
     );
 }
 
+struct StreamUpdate {
+    status: ExecutionStatus,
+    error: Option<String>,
+}
+
 fn consume_stream_event(
     event: ExecuteStreamEvent,
     output: &mut Vec<u8>,
     completion_tokens: &mut u32,
     sink: &mut OutputSink<'_>,
-) -> anyhow::Result<Option<ExecutionStatus>> {
-    let (status, progress) = match event.event {
+) -> anyhow::Result<Option<StreamUpdate>> {
+    let (status, progress, error) = match event.event {
         Some(execute_stream_event::Event::Snapshot(snapshot)) => {
             if let Some(output_chunk) = snapshot.output.get(output.len()..) {
                 if !output_chunk.is_empty() {
@@ -651,6 +707,7 @@ fn consume_stream_event(
             (
                 ExecutionStatus::try_from(snapshot.status).unwrap_or(ExecutionStatus::Unspecified),
                 snapshot.progress,
+                snapshot.error,
             )
         }
         Some(execute_stream_event::Event::Progress(progress)) => {
@@ -661,13 +718,17 @@ fn consume_stream_event(
             (
                 ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified),
                 progress.progress,
+                progress.error,
             )
         }
         None => return Ok(None),
     };
 
     *completion_tokens = u32::try_from(progress).unwrap_or(u32::MAX);
-    Ok(Some(status))
+    Ok(Some(StreamUpdate {
+        status,
+        error: (!error.is_empty()).then_some(error),
+    }))
 }
 
 fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
@@ -739,6 +800,7 @@ mod tests {
                 retries: 0,
                 active: None,
                 secret_key: None,
+                tried: HashSet::new(),
             },
             shadow: None,
         };
