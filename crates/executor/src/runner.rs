@@ -14,12 +14,23 @@ fn step_tokens(
     session: &mut Session<ExecBackend>,
     backend: &ExecBackend,
     tokens: &[u32],
+    start_pos: usize,
     max_sequence_length: usize,
     extra_nat_chunk_size: Option<usize>,
 ) -> Result<u32, ExecutorError> {
-    let input = interpreter::tensor(backend, Shape(vec![1, tokens.len()]), tokens.to_vec())
+    let phase_name = match tokens.len() {
+        0 => "executor.bootstrap_step",
+        1 => "executor.decode_step",
+        _ => "executor.prefill_chunk",
+    };
+    let _range = nvtx::range!(
+        "{phase_name} start_pos={} seq_len={}",
+        start_pos,
+        tokens.len()
+    );
+    let token_tensor = interpreter::tensor(backend, Shape(vec![1, tokens.len()]), tokens.to_vec())
         .map_err(ExecutorError::Backend)?;
-    let mut inputs = vec![input];
+    let mut inputs = vec![token_tensor];
     inputs.extend(session.state().iter().cloned());
     inputs.push(interpreter::Value::Nat(max_sequence_length));
     if let Some(chunk_size) = extra_nat_chunk_size {
@@ -50,14 +61,7 @@ pub fn run_cached_program_streaming(
     let prompt_tokens = invocation.input_ids.len();
     let p = program.bound_program().program();
     let max_sequence_length = p.max_sequence_length;
-    let state_arity = p.empty_state_type.len();
-    let total_inputs = p.typed_term.source_type.len();
-    // Non-state inputs beyond [token_tensor, state..., max_positions] are extra nats (e.g. num_chunks)
-    let extra_nat_chunk_size = if total_inputs > state_arity + 2 {
-        Some(catgrad_llm::helpers::GATED_DELTA_CHUNK_SIZE)
-    } else {
-        None
-    };
+    let extra_nat_chunk_size = p.extra_nat_chunk_size;
 
     if let Some(cached_output_tokens) = start.cached_output_tokens.as_deref() {
         info!(
@@ -95,11 +99,13 @@ pub fn run_cached_program_streaming(
     let mut output_tokens = Vec::new();
     let mut prefill_chunks = 0usize;
     let mut prompt_state = start.transcript;
+    let mut session_pos = prompt_state.len();
     let mut next_token = if prompt_tokens == 0 {
         Some(step_tokens(
             &mut session,
             backend,
             &[],
+            session_pos,
             max_sequence_length,
             extra_nat_chunk_size,
         )?)
@@ -119,12 +125,14 @@ pub fn run_cached_program_streaming(
                 &mut session,
                 backend,
                 chunk,
+                cursor,
                 max_sequence_length,
                 extra_nat_chunk_size,
             )?;
             prefill_chunks += 1;
             prompt_state.extend_tokens(chunk);
             cursor = next_boundary;
+            session_pos = cursor;
             program.cache_checkpoint(cursor, prompt_state.hash(), predicted, session.snapshot());
 
             if cursor == prompt_tokens {
@@ -209,9 +217,11 @@ pub fn run_cached_program_streaming(
                 &mut session,
                 backend,
                 &[current_token],
+                session_pos,
                 max_sequence_length,
                 extra_nat_chunk_size,
             )?;
+            session_pos += 1;
         }
     }
 
@@ -235,6 +245,7 @@ pub fn run_cached_program_streaming(
                     &mut session,
                     backend,
                     &[last_token],
+                    session_pos,
                     max_sequence_length,
                     extra_nat_chunk_size,
                 )?)

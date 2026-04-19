@@ -6,7 +6,7 @@ use hf_hub::{Repo, RepoType};
 use super::spec::ModelSpec;
 use super::{ModelAssetsError, Result};
 
-pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, PathBuf)> {
+pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let mut builder = ApiBuilder::from_env();
     let env_token = std::env::var("HF_TOKEN")
         .ok()
@@ -37,6 +37,7 @@ pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, Pa
     };
     let config = fetch("config.json")?;
     let tokenizer = fetch("tokenizer.json")?;
+    let tokenizer_config = fetch("tokenizer_config.json")?;
 
-    Ok((config, tokenizer))
+    Ok((config, tokenizer, tokenizer_config))
 }
