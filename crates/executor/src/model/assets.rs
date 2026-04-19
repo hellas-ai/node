@@ -21,7 +21,8 @@ pub struct ModelAssets {
 impl ModelAssets {
     pub fn load(model_name: &str) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
-        let (config_path, tokenizer_path) = get_model_metadata_files(&model)?;
+        let (config_path, tokenizer_path, _tokenizer_config_path) =
+            get_model_metadata_files(&model)?;
         let config_bytes =
             std::fs::read(&config_path).map_err(|source| ModelAssetsError::ReadModelConfig {
                 path: config_path.clone(),

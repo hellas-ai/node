@@ -254,13 +254,14 @@ mod tests {
             vec![],
             1,
             WeightPostProcess::None,
+            None,
         )
     }
 
     fn dummy_execution_context() -> Arc<ExecutionContext> {
-        Arc::new(ExecutionContext::new(Arc::new(
-            dummy_runtime().bind(dummy_spec()).unwrap(),
-        )))
+        Arc::new(
+            ExecutionContext::new(Arc::new(dummy_runtime().bind(dummy_spec()).unwrap())).unwrap(),
+        )
     }
 
     #[test]

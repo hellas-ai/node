@@ -9,7 +9,7 @@ const DEFAULT_EXECUTION_CACHE_MAX_BYTES: usize = 8 << 30;
 #[derive(Clone)]
 pub(crate) struct ExecutionContext {
     bound_program: Arc<BoundProgram<ExecBackend>>,
-    empty_snapshot: Arc<Snapshot<ExecBackend>>,
+    initial_snapshot: Arc<Snapshot<ExecBackend>>,
     execution_cache: Arc<Mutex<ExecutionCache>>,
 }
 
@@ -77,20 +77,22 @@ enum CacheItemKey {
 }
 
 impl ExecutionContext {
-    pub(crate) fn new(bound_program: Arc<BoundProgram<ExecBackend>>) -> Self {
+    pub(crate) fn new(
+        bound_program: Arc<BoundProgram<ExecBackend>>,
+    ) -> Result<Self, crate::ExecutorError> {
         debug!(
             program_id = %bound_program.id(),
             state_tensors = bound_program.program().empty_state_type.len(),
             max_bytes = DEFAULT_EXECUTION_CACHE_MAX_BYTES,
             "initialized execution cache"
         );
-        Self {
-            empty_snapshot: Arc::new(bound_program.empty_snapshot()),
+        Ok(Self {
+            initial_snapshot: Arc::new(bound_program.empty_snapshot()),
             execution_cache: Arc::new(Mutex::new(ExecutionCache::new(
                 DEFAULT_EXECUTION_CACHE_MAX_BYTES,
             ))),
             bound_program,
-        }
+        })
     }
 
     pub(crate) fn bound_program(&self) -> &BoundProgram<ExecBackend> {
@@ -108,7 +110,7 @@ impl ExecutionContext {
             cache.lookup_continuation(prompt_key, ContinuationKey::from_invocation(invocation));
         let (snapshot, transcript, next_token) = match checkpoint {
             Some((transcript, next_token, snapshot)) => (snapshot, transcript, Some(next_token)),
-            None => (self.empty_snapshot.clone(), TranscriptState::seed(), None),
+            None => (self.initial_snapshot.clone(), TranscriptState::seed(), None),
         };
         debug!(
             program_id = %self.bound_program.id(),

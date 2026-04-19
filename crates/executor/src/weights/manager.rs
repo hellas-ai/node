@@ -447,7 +447,7 @@ impl RuntimeManager {
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         Ok(Arc::new(ExecutionContext::new(Arc::new(
             runtime.bind(program.clone())?,
-        ))))
+        ))?))
     }
 
     fn admit_build<K>(inflight: &mut HashMap<K, Vec<oneshot::Sender<()>>>, key: K) -> BuildAdmission
