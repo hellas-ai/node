@@ -45,6 +45,17 @@ pub enum ModelAssetsError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to read tokenizer config {path:?}")]
+    ReadTokenizerConfig {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse tokenizer config JSON")]
+    ParseTokenizerConfig {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to construct model config")]
     ConstructModelConfig {
         #[source]
