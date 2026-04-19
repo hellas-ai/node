@@ -128,12 +128,17 @@ impl Executor {
         match self.worker.try_enqueue(job) {
             Ok(()) => {
                 self.store.mark_running(&execution_id)?;
-                self.send_status(&execution_id, ExecutionStatus::Running);
+                self.send_status(&execution_id, ExecutionStatus::Running, None);
                 Ok(())
             }
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
             Err(EnqueueError::Stopped(_job)) => {
-                self.handle_complete(&execution_id, None, ExecutionStatus::Failed);
+                self.handle_complete(
+                    &execution_id,
+                    None,
+                    ExecutionStatus::Failed,
+                    Some("executor worker channel closed".to_string()),
+                );
                 Err(StartExecutionError::Closed)
             }
         }
@@ -164,7 +169,12 @@ impl Executor {
 
         if self.pending_executions.len() != original_len {
             info!(%execution_id, "cancelled queued execution without active watchers");
-            self.handle_complete(execution_id, None, ExecutionStatus::Failed);
+            self.handle_complete(
+                execution_id,
+                None,
+                ExecutionStatus::Failed,
+                Some("cancelled before start".to_string()),
+            );
         }
     }
 
@@ -173,6 +183,7 @@ impl Executor {
         execution_id: &str,
         output: Option<Vec<u8>>,
         status: ExecutionStatus,
+        error: Option<String>,
     ) {
         let success = matches!(status, ExecutionStatus::Completed);
         debug!(%execution_id, success, "execution finished");
@@ -195,11 +206,14 @@ impl Executor {
             }
         }
 
-        if let Err(error) = self.store.complete_execution(execution_id, status, output) {
-            warn!("failed to update completion state for {execution_id}: {error}");
+        if let Err(store_err) =
+            self.store
+                .complete_execution(execution_id, status, output, error.clone())
+        {
+            warn!("failed to update completion state for {execution_id}: {store_err}");
         }
 
-        self.send_status(execution_id, status);
+        self.send_status(execution_id, status, error);
     }
 }
 

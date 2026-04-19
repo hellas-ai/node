@@ -69,21 +69,29 @@ impl WorkerThread {
         let Self { rx, executor_tx } = self;
         while let Ok(job) = rx.recv() {
             let execution_id = job.execution_id.clone();
-            let status = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::run_job(job, &executor_tx)
-            })) {
-                Ok(Ok(())) => ExecutionStatus::Completed,
+            let (status, error) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || Self::run_job(job, &executor_tx),
+            )) {
+                Ok(Ok(())) => (ExecutionStatus::Completed, None),
                 Ok(Err(err)) => {
-                    warn!("execute worker job {execution_id} failed: {err}");
-                    ExecutionStatus::Failed
+                    let msg = format!("{err:#}");
+                    warn!("execute worker job {execution_id} failed: {msg}");
+                    (ExecutionStatus::Failed, Some(msg))
                 }
-                Err(_) => {
-                    warn!("execute worker job {execution_id} panicked");
-                    ExecutionStatus::Failed
+                Err(panic) => {
+                    let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
+                        format!("worker panicked: {s}")
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        format!("worker panicked: {s}")
+                    } else {
+                        "worker panicked".to_string()
+                    };
+                    warn!("execute worker job {execution_id} {msg}");
+                    (ExecutionStatus::Failed, Some(msg))
                 }
             };
 
-            Self::send_completion(&executor_tx, execution_id, status);
+            Self::send_completion(&executor_tx, execution_id, status, error);
         }
     }
 
@@ -129,11 +137,13 @@ impl WorkerThread {
         executor_tx: &tokio::sync::mpsc::UnboundedSender<ExecutorMessage>,
         execution_id: String,
         status: ExecutionStatus,
+        error: Option<String>,
     ) {
         let _ = executor_tx.send(ExecutorMessage::Complete {
             execution_id,
             output: None,
             status,
+            error,
         });
     }
 }

@@ -1,5 +1,7 @@
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::pb::hellas::GetQuoteRequest;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::model::DEFAULT_MODEL_REVISION;
 use crate::weights::WeightsLocator;
@@ -15,8 +17,19 @@ pub struct Invocation {
 
 pub(crate) struct QuotePlan {
     pub program: Program,
+    pub program_id: String,
     pub weights_key: WeightsLocator,
     pub invocation: Invocation,
+}
+
+/// Stable content-addressed id for a serialized program payload.
+///
+/// Hashing the raw RPC bytes avoids re-serializing the (potentially large)
+/// `TypedTerm` every time we need the cache key.
+fn hash_program_bytes(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 impl QuotePlan {
@@ -47,6 +60,7 @@ impl QuotePlan {
         } else {
             request.max_new_tokens
         };
+        let program_id = hash_program_bytes(&request.program);
         let program: Program = serde_json::from_slice(&request.program)
             .map_err(|e| ExecutorError::InvalidQuoteRequest(format!("invalid program: {e}")))?;
 
@@ -82,6 +96,7 @@ impl QuotePlan {
 
         Ok(Self {
             program,
+            program_id,
             weights_key: WeightsLocator {
                 model_id: model_id.to_string(),
                 revision: requested_revision,

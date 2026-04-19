@@ -9,7 +9,7 @@ documentation.workspace = true
 
 [features]
 default = ["catgrad/candle-backend"]
-candle-cuda = ["catgrad/candle-backend", "catgrad/cuda"]
+candle-cuda = ["catgrad/candle-backend", "catgrad/cuda", "dep:nvtx"]
 candle-metal = ["catgrad/candle-backend", "catgrad/metal"]
 
 [dependencies]
@@ -28,7 +28,7 @@ blake3 = "1"
 tokenizers = "0.21"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
-nvtx = { workspace = true }
+nvtx = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"
