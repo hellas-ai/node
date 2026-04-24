@@ -1,7 +1,6 @@
 mod assets;
 mod config;
 mod hf;
-mod spec;
 
 use std::path::PathBuf;
 
@@ -10,17 +9,16 @@ use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;
 
+use crate::spec::ModelSpecError;
+
 pub use assets::ModelAssets;
-pub(crate) use spec::{DEFAULT_MODEL_REVISION, ModelSpec};
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
 
 #[derive(Debug, Error)]
 pub enum ModelAssetsError {
-    #[error("model id is empty")]
-    EmptyModelId,
-    #[error("model revision is empty")]
-    EmptyModelRevision,
+    #[error(transparent)]
+    Spec(#[from] ModelSpecError),
     #[error("failed to initialize Hugging Face API")]
     BuildHfApi {
         #[source]

@@ -38,16 +38,16 @@ enum Commands {
         /// 'eager' (download freely),
         /// or 'allow(pattern,...)' (download only matching HF models)
         #[arg(long = "download-policy", default_value = "skip")]
-        download_policy: hellas_executor::DownloadPolicy,
+        download_policy: hellas_rpc::policy::DownloadPolicy,
         /// Execute policy: 'skip' (default, refuse all executions),
         /// 'eager' (execute any graph),
         /// or 'allow(hf/pattern,...,graph/pattern,...)' (execute only matching)
         #[arg(long = "execute-policy", default_value = "skip")]
-        execute_policy: hellas_executor::ExecutePolicy,
+        execute_policy: hellas_rpc::policy::ExecutePolicy,
         /// Maximum number of queued executions waiting behind the active worker
         #[arg(
             long = "queue-size",
-            default_value_t = hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY
+            default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
         /// Preload model weights on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
@@ -94,7 +94,7 @@ enum Commands {
         /// Maximum number of queued local executions when `--local` is set
         #[arg(
             long = "queue-size",
-            default_value_t = hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY
+            default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
         /// Max execution retries on failure (discovery mode)

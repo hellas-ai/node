@@ -8,20 +8,25 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["client"]
+default = ["client", "local"]
+# Remote-only client: no local executor, no tensor backend. Still pulls
+# `hellas-rpc/node` so the CLI can prepare prompts via ModelAssets and
+# configure policies without spawning a local executor.
 client = [
+    "hellas-rpc/node",
     "hellas-rpc/client",
     "hellas-rpc/compression",
     "hellas-rpc/discovery",
-    "dep:hellas-executor",
     "dep:tonic-iroh-transport",
     "dep:tonic",
     "tonic-iroh-transport/client",
     "tonic-iroh-transport/discovery-mdns",
     "tonic-iroh-transport/discovery-dht",
 ]
-serve = ["client", "hellas-rpc/server", "dep:tonic", "tonic-iroh-transport/server"]
-cuda = ["client", "hellas-executor/candle-cuda"]
+# Adds the candle-backed local executor actor.
+local = ["client", "dep:hellas-executor", "hellas-executor/candle"]
+serve = ["local", "hellas-rpc/server", "tonic-iroh-transport/server"]
+cuda = ["local", "hellas-executor/candle-cuda"]
 
 [dependencies]
 tokio.workspace = true
@@ -39,7 +44,7 @@ serde_json.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hellas-rpc = { workspace = true, default-features = false }
-hellas-executor = { workspace = true, optional = true }
+hellas-executor = { workspace = true, default-features = false, optional = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 tonic = { workspace = true, optional = true }
 tokio-stream = { workspace = true }
@@ -52,7 +57,7 @@ qrcode = { version = "0.14", default-features = false }
 rand = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-hellas-executor = { workspace = true, optional = true, features = ["candle-metal"] }
+hellas-executor = { workspace = true, default-features = false, optional = true, features = ["candle-metal"] }
 
 # dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]

@@ -15,8 +15,6 @@ use tokio::sync::{mpsc, oneshot};
 pub use actor::Executor;
 pub(crate) use stream::{LocalExecutionStream, spawn_closed_monitor};
 
-pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
-
 pub(crate) enum ExecutorMessage {
     Quote {
         request: GetQuoteRequest,

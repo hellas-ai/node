@@ -64,7 +64,7 @@
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catgrad-0.2.1" = "sha256-/AvkOpPxOuHLE+dBgC8Ds1wx0IlLH09n6MKzZDdG90I=";
+        "catgrad-0.2.1" = "sha256-nMQly2Zgxt0UBGHquumNHOrZUnOQxm+XA1ARyqnUgiY=";
       };
     };
     inherit stdenv;

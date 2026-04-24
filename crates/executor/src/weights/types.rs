@@ -1,5 +1,5 @@
 use crate::backend::ExecBackend;
-use crate::model::ModelSpec;
+use hellas_rpc::spec::ModelSpec;
 use catgrad::interpreter;
 use catgrad::typecheck;
 use thiserror::Error;

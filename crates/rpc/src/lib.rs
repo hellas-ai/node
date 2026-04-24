@@ -8,8 +8,28 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
 pub mod discovery;
 #[cfg(feature = "client")]
 pub mod driver;
+#[cfg(feature = "node")]
+pub mod error;
+#[cfg(feature = "node")]
+pub mod model;
 pub mod pb;
+#[cfg(feature = "node")]
+pub mod policy;
 pub mod service;
+pub mod spec;
+
+pub use spec::{DEFAULT_MODEL_REVISION, ModelSpec, ModelSpecError};
+
+#[cfg(feature = "node")]
+pub use error::{BackendInitError, ExecutorError, StateError};
+#[cfg(feature = "node")]
+pub use model::{ModelAssets, ModelAssetsError};
+#[cfg(feature = "node")]
+pub use policy::{DownloadPolicy, ExecutePattern, ExecutePolicy};
+
+/// Default bound on the in-memory execution queue carried by `hellas_executor::Executor`.
+#[cfg(feature = "node")]
+pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
 // Graph execution requests can carry full serialized model graphs for large models.
 pub const GRPC_MESSAGE_LIMIT: usize = 128 * 1024 * 1024;

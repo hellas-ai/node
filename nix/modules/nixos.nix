@@ -134,8 +134,6 @@ in {
     };
 
   config = mkIf cfg.enable {
-    nixpkgs.overlays = [self.overlays.default];
-
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.isLinux;

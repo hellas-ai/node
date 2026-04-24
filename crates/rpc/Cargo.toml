@@ -22,6 +22,19 @@ discovery = [
 server = ["tonic/server"]
 compile = ["dep:tonic-prost-build"]
 
+# Node-side shared types: model metadata loading (ModelAssets), policies,
+# ExecutorError, state-machine error. Pulls in catgrad, catgrad-llm,
+# tokenizers, and hf-hub (non-WASM-friendly deps). Enable from the node
+# binary crates; WASM consumers (explorer frontend) leave it off.
+node = [
+    "dep:catgrad",
+    "dep:catgrad-llm",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+
 [dependencies]
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
@@ -31,6 +44,12 @@ futures = { version = "0.3", optional = true }
 pkarr = { version = "5", optional = true }
 thiserror = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
+catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
+catgrad-llm = { workspace = true, default-features = false, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokenizers = { version = "0.21", optional = true }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }

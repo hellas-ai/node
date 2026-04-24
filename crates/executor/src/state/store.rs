@@ -3,22 +3,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::weights::{ExecutionContext, ExecutionStart};
-use thiserror::Error;
+use hellas_rpc::error::StateError;
 use uuid::Uuid;
 
 use super::{ExecutionStatus, Invocation};
-
-#[derive(Debug, Error)]
-pub enum StateError {
-    #[error("quote not found: {0}")]
-    QuoteNotFound(String),
-    #[error("quote expired: {0}")]
-    QuoteExpired(String),
-    #[error("execution not found: {0}")]
-    ExecutionNotFound(String),
-    #[error("output not available: {0}")]
-    OutputNotAvailable(String),
-}
 
 #[derive(Clone)]
 pub struct QuoteRecord {
