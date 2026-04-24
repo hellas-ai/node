@@ -26,9 +26,14 @@
 in {
   options.programs.hellas =
     common.mkCommonOptions {
-      inherit lib pkgs;
-      packageName = "cli";
-      packageDescription = "Package providing the hellas CLI.";
+      inherit lib;
+      package = common.pickCliPackage pkgs;
+      packageDescription = ''
+        The hellas CLI package. Defaults to the best backend variant for
+        the host: cli-metal on Darwin, cli-cuda when `nixpkgs.config.cudaSupport`
+        is enabled on Linux, otherwise cli-cpu. Override to `pkgs.hellas`
+        (lean remote-only) if you don't want a local backend.
+      '';
     }
     // {
       enable = mkEnableOption "Hellas CLI";

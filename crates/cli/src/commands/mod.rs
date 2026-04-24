@@ -4,5 +4,5 @@ pub mod gateway;
 pub mod llm;
 pub mod monitor;
 pub mod rpc;
-#[cfg(feature = "serve")]
+#[cfg(feature = "_backend")]
 pub mod serve;
