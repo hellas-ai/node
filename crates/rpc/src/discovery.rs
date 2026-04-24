@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use pkarr::Client as PkarrClient;
-use pkarr::mainline::Dht;
+use mainline::Dht;
 use thiserror::Error;
 use tonic_iroh_transport::iroh::Endpoint;
 use tonic_iroh_transport::iroh::EndpointId;
@@ -9,9 +8,6 @@ use tonic_iroh_transport::iroh::SecretKey;
 use tonic_iroh_transport::iroh::address_lookup::AddressLookupBuilderError;
 use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
-use tonic_iroh_transport::iroh::address_lookup::pkarr::{
-    N0_DNS_PKARR_RELAY_PROD, N0_DNS_PKARR_RELAY_STAGING,
-};
 use tonic_iroh_transport::iroh::endpoint::{BindError, EndpointError, presets};
 
 pub struct DiscoveryBindings {
@@ -41,16 +37,7 @@ pub enum DiscoveryError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to initialize pkarr client")]
-    BuildPkarrClient {
-        #[source]
-        source: pkarr::errors::BuildError,
-    },
-    #[error("invalid pkarr relay URL: {relay}")]
-    InvalidPkarrRelay { relay: &'static str },
-    #[error("shared pkarr client has no DHT handle")]
-    MissingDhtHandle,
-    #[error("failed to initialize pkarr+DHT discovery")]
+    #[error("failed to initialize DHT address lookup")]
     BuildPkarrLookup {
         #[source]
         source: AddressLookupBuilderError,
@@ -60,14 +47,6 @@ pub enum DiscoveryError {
         #[source]
         source: EndpointError,
     },
-}
-
-fn n0_pkarr_relay() -> &'static str {
-    if std::env::var_os("IROH_FORCE_STAGING_RELAYS").is_some() {
-        N0_DNS_PKARR_RELAY_STAGING
-    } else {
-        N0_DNS_PKARR_RELAY_PROD
-    }
 }
 
 impl DiscoveryBindings {
@@ -97,19 +76,19 @@ impl DiscoveryBindings {
             .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
         address_lookup.add(mdns.clone());
 
-        let shared_pkarr = build_shared_pkarr_client()?;
-        let dht = Arc::new(shared_pkarr.dht().ok_or(DiscoveryError::MissingDhtHandle)?);
+        // Standalone DHT handle for the sharded-service DhtBackend; iroh's
+        // DhtAddressLookup builds its own Dht internally (0.98 changed the
+        // constructor to take a DhtBuilder rather than a shared pkarr client).
+        let dht = Arc::new(Dht::client().map_err(|source| DiscoveryError::BuildDhtClient { source })?);
 
-        let mut pkarr = DhtAddressLookup::builder()
-            .client(shared_pkarr)
-            .n0_dns_pkarr_relay();
+        let mut dht_lookup = DhtAddressLookup::builder();
         if !publish_pkarr {
-            pkarr = pkarr.no_publish();
+            dht_lookup = dht_lookup.no_publish();
         }
-        let pkarr = pkarr
+        let dht_lookup = dht_lookup
             .build()
             .map_err(|source| DiscoveryError::BuildPkarrLookup { source })?;
-        address_lookup.add(pkarr);
+        address_lookup.add(dht_lookup);
 
         Ok(Self { mdns, dht })
     }
@@ -128,19 +107,6 @@ impl DiscoveryEndpoint {
         let bindings = DiscoveryBindings::attach(&endpoint, false, false)?;
         Ok(Self { endpoint, bindings })
     }
-}
-
-fn build_shared_pkarr_client() -> Result<PkarrClient, DiscoveryError> {
-    let mut builder = PkarrClient::builder();
-    builder.no_default_network();
-    builder.dht(|dht| dht);
-    let relay = n0_pkarr_relay();
-    builder
-        .relays(&[relay])
-        .map_err(|_| DiscoveryError::InvalidPkarrRelay { relay })?;
-    builder
-        .build()
-        .map_err(|source| DiscoveryError::BuildPkarrClient { source })
 }
 
 #[cfg(test)]
