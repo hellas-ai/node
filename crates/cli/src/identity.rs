@@ -53,7 +53,7 @@ fn create_new(path: &Path) -> anyhow::Result<SecretKey> {
     create_dir_restricted(dir)
         .with_context(|| format!("failed to create identity directory {}", dir.display()))?;
 
-    let key = SecretKey::generate(&mut rand::rng());
+    let key = SecretKey::generate();
     let bytes = key.to_bytes();
 
     // Write to a temp file, then atomic rename. If rename fails because another
