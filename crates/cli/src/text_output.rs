@@ -1,8 +1,8 @@
 use crate::execution::ExecutionOutput;
 use anyhow::{Context, anyhow};
 use catgrad_llm::{Detokenizer, LLMError};
-use hellas_executor::ModelAssets;
 use hellas_rpc::decode_token_ids;
+use hellas_rpc::model::ModelAssets;
 use std::sync::Arc;
 
 pub struct TextOutputDecoder {

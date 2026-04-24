@@ -3,7 +3,7 @@ use hellas_rpc::pb::hellas::GetQuoteRequest;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::model::DEFAULT_MODEL_REVISION;
+use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 use crate::weights::WeightsLocator;
 use crate::{DEFAULT_MAX_SEQ, ExecutorError};
 use catgrad_llm::Program;

@@ -1,8 +1,8 @@
 use crate::commands::CliResult;
 use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
 use crate::text_output::TextOutputDecoder;
-use catgrad_llm::ChatInput;
-use hellas_executor::ModelAssets;
+use catgrad_llm::types::{Message, openai::ChatMessage};
+use hellas_rpc::model::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,12 +31,22 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         assets.prepare_plain(&options.prompt)?
     } else {
         info!("executing prompt with model chat template");
-        assets.prepare_chat(&ChatInput::single(&options.prompt))?
+        let messages = vec![Message::openai(ChatMessage::user(&options.prompt))];
+        assets.prepare_chat(&messages)?
     };
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
-        ExecutionRuntime::spawn_default_local(hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
-            .with_secret_key(secret_key)
+        #[cfg(feature = "local")]
+        {
+            ExecutionRuntime::spawn_default_local(hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
+                .with_secret_key(secret_key)
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            anyhow::bail!(
+                "this build was compiled without the 'local' feature; --local / --verify-local unavailable"
+            );
+        }
     } else {
         ExecutionRuntime::default().with_secret_key(secret_key)
     };

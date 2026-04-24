@@ -14,26 +14,9 @@ fn step_tokens(
     session: &mut Session<ExecBackend>,
     backend: &ExecBackend,
     tokens: &[u32],
-    start_pos: usize,
     max_sequence_length: usize,
     extra_nat_chunk_size: Option<usize>,
 ) -> Result<u32, ExecutorError> {
-    #[cfg(feature = "candle-cuda")]
-    let _range = {
-        let phase_name = match tokens.len() {
-            0 => "executor.bootstrap_step",
-            1 => "executor.decode_step",
-            _ => "executor.prefill_chunk",
-        };
-        nvtx::range!(
-            "{phase_name} start_pos={} seq_len={}",
-            start_pos,
-            tokens.len()
-        )
-    };
-    #[cfg(not(feature = "candle-cuda"))]
-    let _ = start_pos;
-
     let token_tensor = interpreter::tensor(backend, Shape(vec![1, tokens.len()]), tokens.to_vec())
         .map_err(ExecutorError::Backend)?;
     let mut inputs = vec![token_tensor];
@@ -105,13 +88,11 @@ pub fn run_cached_program_streaming(
     let mut output_tokens = Vec::new();
     let mut prefill_chunks = 0usize;
     let mut prompt_state = start.transcript;
-    let mut session_pos = prompt_state.len();
     let mut next_token = if prompt_tokens == 0 {
         Some(step_tokens(
             &mut session,
             backend,
             &[],
-            session_pos,
             max_sequence_length,
             extra_nat_chunk_size,
         )?)
@@ -131,14 +112,12 @@ pub fn run_cached_program_streaming(
                 &mut session,
                 backend,
                 chunk,
-                cursor,
                 max_sequence_length,
                 extra_nat_chunk_size,
             )?;
             prefill_chunks += 1;
             prompt_state.extend_tokens(chunk);
             cursor = next_boundary;
-            session_pos = cursor;
             program.cache_checkpoint(cursor, prompt_state.hash(), predicted, session.snapshot());
 
             if cursor == prompt_tokens {
@@ -223,11 +202,9 @@ pub fn run_cached_program_streaming(
                 &mut session,
                 backend,
                 &[current_token],
-                session_pos,
                 max_sequence_length,
                 extra_nat_chunk_size,
             )?;
-            session_pos += 1;
         }
     }
 
@@ -251,7 +228,6 @@ pub fn run_cached_program_streaming(
                     &mut session,
                     backend,
                     &[last_token],
-                    session_pos,
                     max_sequence_length,
                     extra_nat_chunk_size,
                 )?)

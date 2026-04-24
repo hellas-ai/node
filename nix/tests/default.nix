@@ -29,6 +29,7 @@
   mkHellasNode = {
     executePolicy ? "skip",
     preload ? false,
+    rustLog ? "info",
   }: {
     services.hellas = {
       enable = true;
@@ -40,7 +41,7 @@
       preloadWeights = lib.optionals preload [model];
       environment = {
         HF_HOME = hfHome;
-        RUST_LOG = "info";
+        RUST_LOG = rustLog;
       };
     };
   };
@@ -133,16 +134,96 @@ in {
           "journalctl -u hellas -b -o cat --no-pager | grep -q '^RPC server running\\.'"
       )
       executor_node_id = executor.succeed(
-          "journalctl -u hellas -b -o cat --no-pager | sed -n 's/^Node Address: //p' | tail -1"
+          "journalctl -u hellas -b -o cat --no-pager | sed -n 's/^Node ID:[[:space:]]*//p' | tail -1"
       ).strip()
 
       client.succeed(
-          f"HF_HOME=${hfHome} timeout 300 ${server}/bin/hellas-cli execute {executor_node_id} --node-addr ${executorAddr}:${toString executorPort} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
+          f"HF_HOME=${hfHome} timeout 300 ${server}/bin/hellas-cli llm {executor_node_id} --node-addr ${executorAddr}:${toString executorPort} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
       )
       client.succeed("test -s /tmp/execute.out")
 
       client.copy_from_vm("/tmp/execute.out", "hellas-execute.out")
       client.copy_from_vm("/tmp/execute.err", "hellas-execute.err")
+    '';
+  };
+
+  # Same two-VM setup as execute-direct, but the client is given ONLY the
+  # node-id — no --node-addr hint. Forces the CLI endpoint to resolve the
+  # executor via its attached address_lookup stack (mDNS + Pkarr DHT + n0 DNS).
+  # A passing test means discovery-only dialling works in a clean subnet;
+  # a failure means we have a local reproducer for the iroh/swarm-discovery
+  # or QUIC path-validation issue seen on real LAN.
+  execute-discovery = pkgs.testers.runNixOSTest {
+    name = "hellas-execute-discovery";
+
+    nodes.executor = {
+      config,
+      pkgs,
+      ...
+    }: {
+      imports = [hellasModule];
+      config = lib.mkMerge [
+        baseNode
+        (mkHellasNode {
+          executePolicy = "eager";
+          preload = true;
+          rustLog = "info,iroh::socket=trace,iroh::address_lookup::mdns=trace,swarm_discovery=debug,netwatch=debug";
+        })
+        {
+          virtualisation.cores = 2;
+          virtualisation.memorySize = 4096;
+        }
+      ];
+    };
+
+    nodes.client = {
+      config,
+      pkgs,
+      ...
+    }: {
+      config = lib.mkMerge [
+        baseNode
+        {
+          virtualisation.cores = 1;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+
+    testScript = ''
+      start_all()
+
+      executor.wait_for_unit("hellas.service")
+      client.wait_for_unit("multi-user.target")
+
+      executor.wait_until_succeeds(
+          "journalctl -u hellas -b -o cat --no-pager | grep -q '^RPC server running\\.'"
+      )
+      executor_node_id = executor.succeed(
+          "journalctl -u hellas -b -o cat --no-pager | sed -n 's/^Node ID:[[:space:]]*//p' | tail -1"
+      ).strip()
+
+      # Diagnostic: interfaces + local-addr iroh/netwatch state at launch.
+      print("=== executor ip addr ===")
+      print(executor.succeed("ip addr"))
+      print("=== executor journal (first 400 lines) ===")
+      print(executor.succeed("journalctl -u hellas -b -o cat --no-pager | head -400"))
+
+      # Run the CLI without a node-addr hint. Capture output regardless of
+      # success so we can inspect failures in the build log.
+      status = client.execute(
+          f"HF_HOME=${hfHome} RUST_LOG=hellas_cli=info,tonic_iroh_transport=debug,iroh::socket=trace,iroh::address_lookup::mdns=trace,swarm_discovery=debug,netwatch=debug timeout 300 ${server}/bin/hellas-cli llm {executor_node_id} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
+      )
+
+      tail = client.succeed("tail -400 /tmp/execute.err || true")
+      print("=== client stderr (tail 400) ===")
+      print(tail)
+      exec_tail = executor.succeed("journalctl -u hellas -b -o cat --no-pager | tail -400")
+      print("=== executor journal (tail 400) ===")
+      print(exec_tail)
+
+      assert status == 0, f"hellas-cli exited with status {status}"
+      client.succeed("test -s /tmp/execute.out")
     '';
   };
 
@@ -211,7 +292,7 @@ in {
           "journalctl -u hellas -b -o cat --no-pager | grep -q '^RPC server running\\.'"
       )
       executor_node_id = executor.succeed(
-          "journalctl -u hellas -b -o cat --no-pager | sed -n 's/^Node Address: //p' | tail -1"
+          "journalctl -u hellas -b -o cat --no-pager | sed -n 's/^Node ID:[[:space:]]*//p' | tail -1"
       ).strip()
 
       gateway.succeed("install -d -m 0755 /var/lib/hellas-gateway")

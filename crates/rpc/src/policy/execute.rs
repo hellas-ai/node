@@ -29,7 +29,7 @@ impl ExecutePolicy {
     /// Returns `true` if this policy permits executing a graph with the given
     /// identifiers. For LLM graphs `hf_model_id` is `Some(id)`; for raw graphs
     /// it is `None`.
-    pub(crate) fn allows_execute(&self, graph_id: &str, hf_model_id: Option<&str>) -> bool {
+    pub fn allows_execute(&self, graph_id: &str, hf_model_id: Option<&str>) -> bool {
         match self {
             Self::Eager => true,
             Self::Skip => false,

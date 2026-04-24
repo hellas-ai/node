@@ -1,11 +1,41 @@
-use crate::backend::BackendInitError;
 use crate::model::ModelAssetsError;
-use crate::state::StateError;
 use catgrad::abstract_interpreter::types::InterpreterError;
 use catgrad::interpreter::backend::BackendError;
 use catgrad_llm::LLMError;
 use thiserror::Error;
 use tonic::Status;
+
+/// Error returned when the backend fails to initialize.
+///
+/// Defined here (rather than alongside the concrete backend) so that
+/// `ExecutorError` — which the CLI carries across feature configurations —
+/// stays in a single backend-free crate.
+#[derive(Clone, Debug, Error)]
+#[error("{message}")]
+pub struct BackendInitError {
+    pub message: String,
+}
+
+impl BackendInitError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Errors from the in-memory quote/execution state machine.
+#[derive(Debug, Error)]
+pub enum StateError {
+    #[error("quote not found: {0}")]
+    QuoteNotFound(String),
+    #[error("quote expired: {0}")]
+    QuoteExpired(String),
+    #[error("execution not found: {0}")]
+    ExecutionNotFound(String),
+    #[error("output not available: {0}")]
+    OutputNotAvailable(String),
+}
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -51,8 +81,7 @@ impl From<ExecutorError> for Status {
             }
 
             ExecutorError::ModelAssets(model_err) => match model_err {
-                ModelAssetsError::EmptyModelId
-                | ModelAssetsError::EmptyModelRevision
+                ModelAssetsError::Spec(_)
                 | ModelAssetsError::ParseModelConfig { .. }
                 | ModelAssetsError::ConstructModelConfig { .. }
                 | ModelAssetsError::NegativePromptTokenId { .. }

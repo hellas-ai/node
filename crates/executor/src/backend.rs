@@ -1,17 +1,11 @@
 use catgrad::interpreter::backend::candle::CandleBackend;
+use hellas_rpc::error::BackendInitError;
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
-use thiserror::Error;
 use tracing::info;
 
 pub type ExecBackend = CandleBackend;
-
-#[derive(Clone, Debug, Error)]
-#[error("{message}")]
-pub struct BackendInitError {
-    message: String,
-}
 
 static EXEC_BACKEND: OnceLock<Result<ExecBackend, BackendInitError>> = OnceLock::new();
 
@@ -27,11 +21,11 @@ fn init_backend() -> Result<ExecBackend, BackendInitError> {
             CandleBackend::new()
         }
     }))
-    .map_err(|panic| BackendInitError {
-        message: format!(
+    .map_err(|panic| {
+        BackendInitError::new(format!(
             "failed to initialize executor backend: {}",
             panic_message(&panic)
-        ),
+        ))
     })?;
 
     info!(?backend, "executor backend selected");

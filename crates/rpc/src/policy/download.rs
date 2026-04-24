@@ -19,7 +19,7 @@ pub enum DownloadPolicy {
 
 impl DownloadPolicy {
     /// Returns `true` if this policy permits downloading the given model.
-    pub(crate) fn allows_download(&self, model_id: &str) -> bool {
+    pub fn allows_download(&self, model_id: &str) -> bool {
         match self {
             Self::Eager => true,
             Self::Skip => false,

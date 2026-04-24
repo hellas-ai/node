@@ -1,9 +1,9 @@
 use crate::ExecutorError;
-use crate::model::{ModelAssets, ModelSpec};
+use crate::model::ModelAssets;
+use hellas_rpc::spec::ModelSpec;
 use crate::state::{QuotePlan, QuoteRecord};
 use crate::weights::{EnsureDisposition, EntryStatusSnapshot, WeightsLocator, has_cached_weights};
 use catgrad_llm::types;
-use catgrad_llm::utils::ChatInput;
 use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
@@ -17,7 +17,7 @@ const QUOTE_TTL: Duration = Duration::from_secs(30);
 
 impl Executor {
     pub(super) async fn handle_preload(&mut self, model: String) -> Result<(), ExecutorError> {
-        let spec = ModelSpec::parse(&model)?;
+        let spec = ModelSpec::parse(&model).map_err(hellas_rpc::ModelAssetsError::from)?;
         let locator: WeightsLocator = spec.into();
         self.runtime_manager
             .ensure_preloaded(locator.clone())
@@ -170,13 +170,7 @@ impl Executor {
             };
             messages.push(types::Message::openai(msg));
         }
-        let chat_input = ChatInput {
-            messages,
-            enable_thinking: false,
-            has_image: false,
-        };
-
-        let prepared = assets.prepare_chat(&chat_input)?;
+        let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
         let quote_response = self.handle_quote(full_request).await?;
