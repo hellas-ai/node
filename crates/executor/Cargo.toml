@@ -8,27 +8,25 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["catgrad/candle-backend"]
-candle-cuda = ["catgrad/candle-backend", "catgrad/cuda", "dep:nvtx"]
-candle-metal = ["catgrad/candle-backend", "catgrad/metal"]
+default = ["candle"]
+candle = ["catgrad/candle-backend"]
+candle-cuda = ["candle", "catgrad/cuda"]
+candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
-hellas-rpc = { workspace = true, features = ["server", "client", "compression"] }
+hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
 hf-hub = "0.5"
 blake3 = "1"
-tokenizers = "0.21"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
-nvtx = { workspace = true, optional = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

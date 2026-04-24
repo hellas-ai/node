@@ -1,10 +1,16 @@
-use anyhow::{Context, anyhow};
+use anyhow::Context;
+#[cfg(feature = "local")]
+use anyhow::anyhow;
 use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
-use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ExecutorHandle, ModelAssets};
+#[cfg(feature = "local")]
+use hellas_executor::{Executor, ExecutorHandle};
+#[cfg(feature = "local")]
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::decode_token_ids;
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
 use hellas_rpc::pb::hellas::{
@@ -90,6 +96,7 @@ pub enum ExecutionStrategy {
 
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
+    #[cfg(feature = "local")]
     local_executor: Option<ExecutorHandle>,
     secret_key: Option<SecretKey>,
 }
@@ -104,6 +111,7 @@ pub struct ExecutionOutput {
 // ---------------------------------------------------------------------------
 
 impl ExecutionRuntime {
+    #[cfg(feature = "local")]
     pub fn with_local_executor(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
@@ -116,6 +124,7 @@ impl ExecutionRuntime {
         self
     }
 
+    #[cfg(feature = "local")]
     pub fn spawn_default_local(queue_capacity: usize) -> anyhow::Result<Self> {
         let local_executor =
             Executor::spawn(DownloadPolicy::Eager, ExecutePolicy::Eager, queue_capacity)
@@ -123,6 +132,7 @@ impl ExecutionRuntime {
         Ok(Self::with_local_executor(local_executor))
     }
 
+    #[cfg(feature = "local")]
     fn require_local_executor(&self) -> anyhow::Result<ExecutorHandle> {
         self.local_executor
             .clone()
@@ -221,6 +231,7 @@ impl PreparedExecution {
 // ---------------------------------------------------------------------------
 
 enum PreparedRoute {
+    #[cfg(feature = "local")]
     Local {
         executor: ExecutorHandle,
         quote_id: String,
@@ -265,6 +276,7 @@ impl PreparedRoute {
         route: &ExecutionRoute,
     ) -> anyhow::Result<Self> {
         match route {
+            #[cfg(feature = "local")]
             ExecutionRoute::Local => {
                 let mut executor = runtime.require_local_executor()?;
                 executor
@@ -280,6 +292,10 @@ impl PreparedRoute {
                     quote_id: quote.quote_id,
                 })
             }
+            #[cfg(not(feature = "local"))]
+            ExecutionRoute::Local => anyhow::bail!(
+                "local execution requested but this build was compiled without the 'local' feature"
+            ),
             ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
                 let quote = quote_remote_target(quote_req, &endpoint, target).await?;
@@ -300,6 +316,7 @@ impl PreparedRoute {
     #[instrument(skip_all)]
     async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
         match self {
+            #[cfg(feature = "local")]
             PreparedRoute::Local { executor, quote_id } => {
                 execute_with_driver(executor, quote_id.clone(), sink).await
             }
@@ -403,6 +420,17 @@ where
 }
 
 async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
+    let (endpoint, _bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
+    Ok(endpoint)
+}
+
+/// Bind a client endpoint and attach the full discovery stack (DNS + Pkarr
+/// publisher + mDNS + DHT resolver). Without mDNS attached to the endpoint's
+/// address lookup, peers on the same LAN can only be resolved via the Pkarr
+/// DHT / n0 DNS relay, so LAN connections take minutes instead of milliseconds.
+async fn bind_remote_endpoint_with_bindings(
+    secret_key: Option<&SecretKey>,
+) -> anyhow::Result<(Arc<Endpoint>, DiscoveryBindings)> {
     use tonic_iroh_transport::iroh::address_lookup::PkarrPublisher;
     use tonic_iroh_transport::iroh::endpoint::presets;
 
@@ -414,12 +442,13 @@ async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<
     if let Some(key) = secret_key {
         builder = builder.secret_key(key.clone());
     }
-    Ok(Arc::new(
-        builder
-            .bind()
-            .await
-            .context("failed to create client transport endpoint")?,
-    ))
+    let endpoint = builder
+        .bind()
+        .await
+        .context("failed to create client transport endpoint")?;
+    let bindings = DiscoveryBindings::attach(&endpoint, false, false)
+        .context("failed to attach client discovery lookups")?;
+    Ok((Arc::new(endpoint), bindings))
 }
 
 fn bind_remote_pool(endpoint: &Endpoint) -> ConnectionPool {
@@ -503,10 +532,9 @@ async fn quote_remote_target(
 async fn discover_remote_quote(
     quote_req: &GetQuoteRequest,
     endpoint: &Endpoint,
+    bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let bindings = DiscoveryBindings::attach(endpoint, false, false)?;
-
     let mut registry = ServiceRegistry::new(&endpoint);
     registry.with_pool_options(PoolOptions {
         connect_timeout: REMOTE_CONNECT_TIMEOUT,
@@ -590,8 +618,8 @@ async fn prepare_discovered_remote(
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<RemoteExecution> {
-    let endpoint = bind_remote_endpoint(secret_key).await?;
-    let quote = discover_remote_quote(quote_req, &endpoint, exclude).await?;
+    let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
+    let quote = discover_remote_quote(quote_req, &endpoint, bindings, exclude).await?;
     Ok(RemoteExecution::from_quoted(endpoint, quote))
 }
 
@@ -731,6 +759,7 @@ fn consume_stream_event(
     }))
 }
 
+#[cfg(feature = "local")]
 fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {
@@ -808,10 +837,11 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "client"))]
+#[cfg(all(test, feature = "local"))]
 mod timing_tests {
     use super::*;
-    use hellas_executor::{ExecutorError, ModelAssets};
+    use hellas_rpc::error::ExecutorError;
+    use hellas_rpc::model::ModelAssets;
     use std::env;
     use std::sync::Arc;
     use std::time::Instant;
@@ -838,7 +868,7 @@ mod timing_tests {
 
         let assets = Arc::new(ModelAssets::load(&model).expect("failed to load model assets"));
         let runtime = ExecutionRuntime::spawn_default_local(
-            hellas_executor::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+            hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
         )
         .expect("failed to start local executor");
         let prepared = assets

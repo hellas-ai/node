@@ -7,10 +7,14 @@ use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use catgrad_llm::ChatInput;
+use catgrad_llm::types::Message;
 use catgrad_llm::PreparedPrompt;
 use catgrad_llm::types::{anthropic, openai, plain};
-use hellas_executor::{DownloadPolicy, ExecutePolicy, Executor, ModelAssets};
+#[cfg(feature = "local")]
+use hellas_executor::Executor;
+#[cfg(feature = "local")]
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::model::ModelAssets;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -60,15 +64,25 @@ pub(super) struct HttpError {
 impl GatewayState {
     pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
         let runtime = if options.local || options.verify_local {
-            ExecutionRuntime::with_local_executor(
-                Executor::spawn(
-                    DownloadPolicy::Eager,
-                    ExecutePolicy::Eager,
-                    options.queue_size,
+            #[cfg(feature = "local")]
+            {
+                ExecutionRuntime::with_local_executor(
+                    Executor::spawn(
+                        DownloadPolicy::Eager,
+                        ExecutePolicy::Eager,
+                        options.queue_size,
+                    )
+                    .context("failed to initialize local execution backend")?,
                 )
-                .context("failed to initialize local execution backend")?,
-            )
-            .with_secret_key(options.secret_key.clone())
+                .with_secret_key(options.secret_key.clone())
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                let _ = options.queue_size;
+                anyhow::bail!(
+                    "gateway --local / --verify-local require the 'local' cargo feature"
+                );
+            }
         } else {
             ExecutionRuntime::default().with_secret_key(options.secret_key.clone())
         };
@@ -209,15 +223,17 @@ impl GatewayState {
         req: &openai::ChatCompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let chat_input = ChatInput::try_from(req).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to normalize chat request: {err}"),
-        })?;
+        let messages: Vec<Message> = req
+            .messages
+            .iter()
+            .cloned()
+            .map(Message::from)
+            .collect();
         self.prepare_generation(
             &req.model,
             max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_chat(&chat_input),
+            move |assets| assets.prepare_chat(&messages),
         )
         .await
     }
@@ -226,15 +242,12 @@ impl GatewayState {
         &self,
         req: &anthropic::MessageRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let chat_input = ChatInput::try_from(req).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to normalize chat request: {err}"),
-        })?;
+        let messages: Vec<Message> = req.into();
         self.prepare_generation(
             &req.model,
             req.max_tokens,
             "Failed to prepare chat request",
-            move |assets| assets.prepare_chat(&chat_input),
+            move |assets| assets.prepare_chat(&messages),
         )
         .await
     }
