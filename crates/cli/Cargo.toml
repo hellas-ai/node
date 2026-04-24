@@ -8,7 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["client", "local"]
+default = ["client"]
 # Remote-only client: no local executor, no tensor backend. Still pulls
 # `hellas-rpc/node` so the CLI can prepare prompts via ModelAssets and
 # configure policies without spawning a local executor.
@@ -23,10 +23,21 @@ client = [
     "tonic-iroh-transport/discovery-mdns",
     "tonic-iroh-transport/discovery-dht",
 ]
-# Adds the candle-backed local executor actor.
-local = ["client", "dep:hellas-executor", "hellas-executor/candle"]
-serve = ["local", "hellas-rpc/server", "tonic-iroh-transport/server"]
-cuda = ["local", "hellas-executor/candle-cuda"]
+
+# Internal umbrella pulled in by every backend feature. Not user-facing:
+# picking a backend (candle-cpu / cuda / candle-metal) activates `_backend`
+# which adds the local executor actor and the RPC server bits so the binary
+# can `serve`.
+_backend = [
+    "client",
+    "dep:hellas-executor",
+    "hellas-rpc/server",
+    "tonic-iroh-transport/server",
+]
+
+candle-cpu   = ["_backend", "hellas-executor/candle"]
+cuda         = ["_backend", "hellas-executor/candle-cuda"]
+candle-metal = ["_backend", "hellas-executor/candle-metal"]
 
 [dependencies]
 tokio.workspace = true
@@ -55,9 +66,6 @@ minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 qrcode = { version = "0.14", default-features = false }
 rand = "0.9"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-hellas-executor = { workspace = true, default-features = false, optional = true, features = ["candle-metal"] }
 
 # dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]

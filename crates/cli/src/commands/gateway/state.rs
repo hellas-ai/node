@@ -10,9 +10,9 @@ use axum::response::{IntoResponse, Response};
 use catgrad_llm::types::Message;
 use catgrad_llm::PreparedPrompt;
 use catgrad_llm::types::{anthropic, openai, plain};
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 use hellas_executor::Executor;
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::model::ModelAssets;
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ pub(super) struct HttpError {
 impl GatewayState {
     pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
         let runtime = if options.local || options.verify_local {
-            #[cfg(feature = "local")]
+            #[cfg(feature = "_backend")]
             {
                 ExecutionRuntime::with_local_executor(
                     Executor::spawn(
@@ -76,7 +76,7 @@ impl GatewayState {
                 )
                 .with_secret_key(options.secret_key.clone())
             }
-            #[cfg(not(feature = "local"))]
+            #[cfg(not(feature = "_backend"))]
             {
                 let _ = options.queue_size;
                 anyhow::bail!(

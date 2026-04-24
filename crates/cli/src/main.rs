@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[cfg(feature = "serve")]
+    #[cfg(feature = "_backend")]
     /// Run the RPC server
     Serve {
         /// Port to listen on (auto-selects if not specified or if in use)
@@ -177,7 +177,7 @@ async fn main() {
     };
 
     let result = match cli.command {
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "_backend")]
         Commands::Serve {
             port,
             download_policy,

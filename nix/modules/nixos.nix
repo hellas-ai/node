@@ -38,9 +38,15 @@
 in {
   options.services.hellas =
     common.mkCommonOptions {
-      inherit lib pkgs;
-      packageName = "server";
-      packageDescription = "Package providing the hellas CLI with server support.";
+      inherit lib;
+      package = common.pickCliPackage pkgs;
+      packageDescription = ''
+        The hellas CLI used to run the serve daemon. Defaults to the best
+        backend variant for the host: cli-metal on Darwin, cli-cuda when
+        `nixpkgs.config.cudaSupport` is enabled on Linux, otherwise cli-cpu.
+        Override to a specific SM build (e.g. `pkgs.hellas.cli-cuda-cuda12-sm80`)
+        to pin a particular GPU generation.
+      '';
     }
     // {
       enable = mkEnableOption "Hellas node server";

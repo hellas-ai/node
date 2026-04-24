@@ -1,13 +1,13 @@
 use anyhow::Context;
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 use anyhow::anyhow;
 use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 use hellas_executor::{Executor, ExecutorHandle};
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::model::ModelAssets;
@@ -96,7 +96,7 @@ pub enum ExecutionStrategy {
 
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
-    #[cfg(feature = "local")]
+    #[cfg(feature = "_backend")]
     local_executor: Option<ExecutorHandle>,
     secret_key: Option<SecretKey>,
 }
@@ -111,7 +111,7 @@ pub struct ExecutionOutput {
 // ---------------------------------------------------------------------------
 
 impl ExecutionRuntime {
-    #[cfg(feature = "local")]
+    #[cfg(feature = "_backend")]
     pub fn with_local_executor(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
@@ -124,7 +124,7 @@ impl ExecutionRuntime {
         self
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "_backend")]
     pub fn spawn_default_local(queue_capacity: usize) -> anyhow::Result<Self> {
         let local_executor =
             Executor::spawn(DownloadPolicy::Eager, ExecutePolicy::Eager, queue_capacity)
@@ -132,7 +132,7 @@ impl ExecutionRuntime {
         Ok(Self::with_local_executor(local_executor))
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "_backend")]
     fn require_local_executor(&self) -> anyhow::Result<ExecutorHandle> {
         self.local_executor
             .clone()
@@ -231,7 +231,7 @@ impl PreparedExecution {
 // ---------------------------------------------------------------------------
 
 enum PreparedRoute {
-    #[cfg(feature = "local")]
+    #[cfg(feature = "_backend")]
     Local {
         executor: ExecutorHandle,
         quote_id: String,
@@ -276,7 +276,7 @@ impl PreparedRoute {
         route: &ExecutionRoute,
     ) -> anyhow::Result<Self> {
         match route {
-            #[cfg(feature = "local")]
+            #[cfg(feature = "_backend")]
             ExecutionRoute::Local => {
                 let mut executor = runtime.require_local_executor()?;
                 executor
@@ -292,9 +292,9 @@ impl PreparedRoute {
                     quote_id: quote.quote_id,
                 })
             }
-            #[cfg(not(feature = "local"))]
+            #[cfg(not(feature = "_backend"))]
             ExecutionRoute::Local => anyhow::bail!(
-                "local execution requested but this build was compiled without the 'local' feature"
+                "local execution requested but this build has no backend; rebuild with e.g. --features candle-cpu, cuda, or candle-metal"
             ),
             ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
@@ -316,7 +316,7 @@ impl PreparedRoute {
     #[instrument(skip_all)]
     async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
         match self {
-            #[cfg(feature = "local")]
+            #[cfg(feature = "_backend")]
             PreparedRoute::Local { executor, quote_id } => {
                 execute_with_driver(executor, quote_id.clone(), sink).await
             }
@@ -759,7 +759,7 @@ fn consume_stream_event(
     }))
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "_backend")]
 fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {
@@ -837,7 +837,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "local"))]
+#[cfg(all(test, feature = "_backend"))]
 mod timing_tests {
     use super::*;
     use hellas_rpc::error::ExecutorError;

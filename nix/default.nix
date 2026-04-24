@@ -5,18 +5,14 @@
   rust-overlay,
   catgrad,
 }: let
-  package = import ./package.nix {
+  nativePkg = import ./package.nix {
     inherit self system nixpkgs rust-overlay;
   };
   inherit
-    (package)
+    (nativePkg)
     pkgs
     lib
     rustToolchain
-    rustPlatform
-    commonArgs
-    cli
-    server
     devShellPackages
     envShellHook
     ;
@@ -29,36 +25,64 @@
     inherit pkgs lib;
   };
 
+  packagesFor = crossSystem: let
+    pkgSpec = import ./package.nix {
+      inherit self system nixpkgs rust-overlay crossSystem;
+    };
+    hostPlatform = pkgSpec.pkgs.stdenv.hostPlatform;
+  in
+    {
+      cli = pkgSpec.mkHellasPackage {
+        buildInputs = [];
+        doCheck = false;
+      };
+      cli-cpu = pkgSpec.mkHellasPackage {
+        buildNoDefaultFeatures = true;
+        buildFeatures = ["candle-cpu"];
+        doCheck = false;
+      };
+    }
+    // lib.optionalAttrs hostPlatform.isDarwin {
+      cli-metal = pkgSpec.mkHellasPackage {
+        buildNoDefaultFeatures = true;
+        buildFeatures = ["candle-metal"];
+        doCheck = false;
+      };
+    };
+
+  crossTargets = {
+    "aarch64-linux" = nixpkgs.lib.systems.examples.aarch64-multiplatform;
+    "riscv64-linux" = nixpkgs.lib.systems.examples.riscv64;
+    "x86_64-linux-musl" = nixpkgs.lib.systems.examples.musl64 // {isStatic = true;};
+    "aarch64-linux-musl" = nixpkgs.lib.systems.examples.aarch64-multiplatform-musl // {isStatic = true;};
+    "x86_64-windows" = nixpkgs.lib.systems.examples.mingwW64;
+  };
+
+  nativePackages = packagesFor null;
+  crossOutputs = lib.mapAttrs (_: spec: packagesFor spec) crossTargets;
+
   linuxOutputs =
     if pkgs.stdenv.hostPlatform.isLinux
     then let
       docker = import ./docker.nix {
-        inherit
-          pkgs
-          lib
-          rustPlatform
-          commonArgs
-          rustToolchain
-          catgrad
-          system
-          server
-          ;
+        inherit pkgs lib rustToolchain catgrad system;
+        mkHellasPackage = nativePkg.mkHellasPackage;
+        cliCpu = nativePackages.cli-cpu;
       };
 
       nixosTests = import ./tests {
-        inherit self pkgs lib server;
+        inherit self pkgs lib;
+        package = nativePackages.cli-cpu;
       };
     in {
       packages =
-        lib.mapAttrs'
+        {cli-cuda = docker.defaultCudaCli;}
+        // lib.mapAttrs'
         (name: value: lib.nameValuePair "docker-${name}" value)
         docker.dockerImages
         // lib.mapAttrs'
-        (name: value: lib.nameValuePair "server-${name}" value)
-        docker.cudaServerPackages
-        // {
-          server-cuda = docker.defaultCudaServer;
-        };
+        (name: value: lib.nameValuePair "cli-cuda-${name}" value)
+        docker.cudaCliPackages;
 
       apps = {
         "docker-push-all" = {
@@ -67,7 +91,7 @@
         };
       };
 
-      devShells = rec {
+      devShells = {
         cuda = pkgs.mkShell {
           packages = devShellPackages;
           shellHook = envShellHook;
@@ -80,8 +104,6 @@
             ;
           LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
         };
-
-        "server-cuda" = cuda;
       };
 
       checks = nixosTests;
@@ -96,9 +118,10 @@
     };
 in {
   packages =
-    {
-      default = cli;
-      inherit cli server;
+    nativePackages
+    // {
+      default = nativePackages.cli;
+      cross = crossOutputs;
       "hf-cache-smollm2-135m-instruct" = testsLib.smolLm2InstructCache;
     }
     // linuxOutputs.packages;
@@ -121,11 +144,6 @@ in {
   devShells =
     {
       default = pkgs.mkShell {
-        packages = devShellPackages;
-        shellHook = envShellHook;
-      };
-
-      server = pkgs.mkShell {
         packages = devShellPackages;
         shellHook = envShellHook;
       };
