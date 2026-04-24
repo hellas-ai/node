@@ -2,7 +2,7 @@
   self,
   pkgs,
   lib,
-  server,
+  package,
 }: let
   testsLib = import ./lib.nix {
     inherit pkgs lib;
@@ -18,7 +18,7 @@
     curl
     jq
     gnugrep
-    server
+    package
   ];
 
   baseNode = {
@@ -33,7 +33,7 @@
   }: {
     services.hellas = {
       enable = true;
-      package = server;
+      inherit package;
       port = executorPort;
       downloadPolicy = "skip";
       inherit executePolicy;
@@ -47,7 +47,7 @@
   };
 
   gatewayLauncher = pkgs.writeShellScript "hellas-gateway-launcher" ''
-    exec ${server}/bin/hellas-cli gateway \
+    exec ${package}/bin/hellas-cli gateway \
       --host=0.0.0.0 \
       --port=${toString gatewayPort} \
       --retries=1 \
@@ -138,7 +138,7 @@ in {
       ).strip()
 
       client.succeed(
-          f"HF_HOME=${hfHome} timeout 300 ${server}/bin/hellas-cli llm {executor_node_id} --node-addr ${executorAddr}:${toString executorPort} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
+          f"HF_HOME=${hfHome} timeout 300 ${package}/bin/hellas-cli llm {executor_node_id} --node-addr ${executorAddr}:${toString executorPort} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
       )
       client.succeed("test -s /tmp/execute.out")
 
@@ -212,7 +212,7 @@ in {
       # Run the CLI without a node-addr hint. Capture output regardless of
       # success so we can inspect failures in the build log.
       status = client.execute(
-          f"HF_HOME=${hfHome} RUST_LOG=hellas_cli=info,tonic_iroh_transport=debug,iroh::socket=trace,iroh::address_lookup::mdns=trace,swarm_discovery=debug,netwatch=debug timeout 300 ${server}/bin/hellas-cli llm {executor_node_id} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
+          f"HF_HOME=${hfHome} RUST_LOG=hellas_cli=info,tonic_iroh_transport=debug,iroh::socket=trace,iroh::address_lookup::mdns=trace,swarm_discovery=debug,netwatch=debug timeout 300 ${package}/bin/hellas-cli llm {executor_node_id} --model=${model} --prompt='Reply with the single word hello.' --max-seq 8 > /tmp/execute.out 2> /tmp/execute.err"
       )
 
       tail = client.succeed("tail -400 /tmp/execute.err || true")

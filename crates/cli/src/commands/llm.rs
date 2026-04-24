@@ -36,15 +36,15 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     };
     let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
     let runtime = if options.local || options.verify_local {
-        #[cfg(feature = "local")]
+        #[cfg(feature = "_backend")]
         {
             ExecutionRuntime::spawn_default_local(hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
                 .with_secret_key(secret_key)
         }
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "_backend"))]
         {
             anyhow::bail!(
-                "this build was compiled without the 'local' feature; --local / --verify-local unavailable"
+                "this build has no backend; --local / --verify-local require e.g. --features candle-cpu"
             );
         }
     } else {

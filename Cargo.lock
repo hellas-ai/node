@@ -625,7 +625,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#97d4134f46654119deac4389d63a9e91b8e11067"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#e6cddcd58c80e5f75fc8924ac137c178801c0182"
 dependencies = [
  "candle-core",
  "half",
@@ -636,7 +636,7 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#97d4134f46654119deac4389d63a9e91b8e11067"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#e6cddcd58c80e5f75fc8924ac137c178801c0182"
 dependencies = [
  "catgrad",
  "chrono",
@@ -1578,6 +1578,17 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2540,9 +2551,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.10"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214"
+checksum = "08d46837a0ed51fe95bd3b05de33cd64a1ee88fc797477ca48446872504507c5"
 dependencies = [
  "typenum",
 ]
@@ -5192,9 +5203,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
+checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "web-time",
  "zeroize",
@@ -5975,6 +5986,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
+ "fancy-regex",
  "getrandom 0.3.4",
  "hf-hub 0.4.3",
  "indicatif 0.17.11",
@@ -6202,7 +6214,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-iroh-transport"
-version = "0.9.0"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff3f91fdc7b00dd588c7ead4d969bbc1645ef407fbe6b868c01ba8cc2d3fe95f"
 dependencies = [
  "async-stream",
  "axum",

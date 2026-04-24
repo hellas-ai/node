@@ -1,10 +1,24 @@
-{self}: let
-  mkPackageDefault = pkgs: packageName: self.packages.${pkgs.stdenv.hostPlatform.system}.${packageName};
-in {
+{self}: rec {
+  # Pick the best available hellas CLI variant for the target system:
+  #   Darwin         → cli-metal
+  #   Linux + cuda   → cli-cuda  (requires `nixpkgs.config.cudaSupport = true`)
+  #   otherwise      → cli-cpu
+  # Each step checks the package set for membership so a missing variant
+  # falls through instead of erroring.
+  pickCliPackage = pkgs: let
+    pkgSet = self.packages.${pkgs.stdenv.hostPlatform.system};
+    isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+    cudaEnabled = pkgs.config.cudaSupport or false;
+  in
+    if isDarwin && pkgSet ? cli-metal
+    then pkgSet.cli-metal
+    else if cudaEnabled && pkgSet ? cli-cuda
+    then pkgSet.cli-cuda
+    else pkgSet.cli-cpu;
+
   mkCommonOptions = {
     lib,
-    pkgs,
-    packageName,
+    package,
     packageDescription,
   }: let
     inherit (lib) mkOption types;
@@ -17,7 +31,7 @@ in {
   in {
     package = mkOption {
       type = types.package;
-      default = mkPackageDefault pkgs packageName;
+      default = package;
       description = packageDescription;
     };
     environment = mkOption {

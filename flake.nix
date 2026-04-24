@@ -43,8 +43,8 @@
 
     overlays.default = final: _prev: {
       hellas = self.packages.${final.system}.cli;
-      hellas-serve = self.packages.${final.system}.server;
-      hellas-cuda = self.packages.${final.system}.server-cuda;
+      hellas-cpu = self.packages.${final.system}.cli-cpu;
+      hellas-cuda = self.packages.${final.system}.cli-cuda;
     };
 
     nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};

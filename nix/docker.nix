@@ -1,12 +1,11 @@
 {
   pkgs,
   lib,
-  rustPlatform,
-  commonArgs,
+  mkHellasPackage,
   rustToolchain,
   catgrad,
   system,
-  server,
+  cliCpu,
 }: let
   imageRepository = "ghcr.io/hellas-ai/node";
   runtimeCoreLibs = with pkgs; [stdenv.cc.cc.lib openssl glibc];
@@ -49,7 +48,7 @@
       cudaCapability = v.sm;
     };
 
-  mkServerRuntime = {
+  mkCliRuntime = {
     name,
     pkg,
     sourceBin,
@@ -94,38 +93,40 @@
       };
     };
 
-  serverRuntime = mkServerRuntime {
-    name = "hellas-server-runtime";
-    pkg = server;
+  cliCpuRuntime = mkCliRuntime {
+    name = "hellas-cli-cpu-runtime";
+    pkg = cliCpu;
     sourceBin = "hellas-cli";
   };
 
   mkCudaImage = v: let
     cudaEnv = mkCudaEnv v;
-    serverCuda = rustPlatform.buildRustPackage (commonArgs
-      // {
-        buildFeatures = ["serve" "cuda"];
-        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper] ++ cudaEnv.nativeBuildInputs;
-        buildInputs = commonArgs.buildInputs ++ cudaEnv.buildInputs;
-        inherit (cudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
-        doCheck = false;
-        postInstall = ''
-          for bin in $out/bin/*; do
-            if [ -x "$bin" ] && [ ! -L "$bin" ]; then
-              wrapProgram "$bin" \
-                --prefix LD_LIBRARY_PATH : "${cudaEnv.runtimeLibraryPath}"
-            fi
-          done
-        '';
-      });
-    runtime = mkServerRuntime {
-      name = "hellas-server-${v.tag}-runtime";
-      pkg = serverCuda;
+    cliCuda = mkHellasPackage {
+      buildNoDefaultFeatures = true;
+      buildFeatures = ["cuda"];
+      doCheck = false;
+      nativeBuildInputs =
+        (with pkgs.buildPackages; [pkg-config protobuf llvmPackages.lld makeWrapper])
+        ++ cudaEnv.nativeBuildInputs;
+      buildInputs = [pkgs.openssl] ++ cudaEnv.buildInputs;
+      inherit (cudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
+      postInstall = ''
+        for bin in $out/bin/*; do
+          if [ -x "$bin" ] && [ ! -L "$bin" ]; then
+            wrapProgram "$bin" \
+              --prefix LD_LIBRARY_PATH : "${cudaEnv.runtimeLibraryPath}"
+          fi
+        done
+      '';
+    };
+    runtime = mkCliRuntime {
+      name = "hellas-cli-${v.tag}-runtime";
+      pkg = cliCuda;
       sourceBin = ".hellas-cli-wrapped";
     };
   in {
     inherit cudaEnv;
-    server = serverCuda;
+    cli = cliCuda;
     image = mkServerImage {
       imageTag = v.tag;
       runtimePkg = runtime;
@@ -146,7 +147,7 @@
     {
       cpu = mkServerImage {
         imageTag = "cpu";
-        runtimePkg = serverRuntime;
+        runtimePkg = cliCpuRuntime;
       };
     }
     // lib.mapAttrs (_: v: v.image) cudaImages;
@@ -160,9 +161,9 @@
       '')
       dockerImages);
   };
-  cudaServerPackages = lib.mapAttrs (_: v: v.server) cudaImages;
-  defaultCudaServer = defaultCuda.server;
+  cudaCliPackages = lib.mapAttrs (_: v: v.cli) cudaImages;
+  defaultCudaCli = defaultCuda.cli;
 in {
   defaultCudaEnv = defaultCuda.cudaEnv;
-  inherit dockerImages pushAll cudaServerPackages defaultCudaServer;
+  inherit dockerImages pushAll cudaCliPackages defaultCudaCli;
 }
