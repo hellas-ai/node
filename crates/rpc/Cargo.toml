@@ -14,7 +14,7 @@ client = ["tonic/channel"]
 discovery = [
     "client",
     "dep:futures",
-    "dep:pkarr",
+    "dep:mainline",
     "dep:tonic-iroh-transport",
     "tonic-iroh-transport/discovery-mdns",
     "tonic-iroh-transport/discovery-dht",
@@ -41,7 +41,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 futures-core = "0.3"
 futures = { version = "0.3", optional = true }
-pkarr = { version = "5", optional = true }
+mainline = { version = "6", optional = true }
 thiserror = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
