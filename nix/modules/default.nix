@@ -1,8 +1,8 @@
 {self}: rec {
   # Pick the best available hellas CLI variant for the target system:
-  #   Darwin         → cli-metal
-  #   Linux + cuda   → cli-cuda  (requires `nixpkgs.config.cudaSupport = true`)
-  #   otherwise      → cli-cpu
+  #   Darwin         → cli-candle-metal
+  #   Linux + cuda   → cli-candle-cuda  (requires `nixpkgs.config.cudaSupport = true`)
+  #   otherwise      → cli-candle
   # Each step checks the package set for membership so a missing variant
   # falls through instead of erroring.
   pickCliPackage = pkgs: let
@@ -10,11 +10,11 @@
     isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
     cudaEnabled = pkgs.config.cudaSupport or false;
   in
-    if isDarwin && pkgSet ? cli-metal
-    then pkgSet.cli-metal
-    else if cudaEnabled && pkgSet ? cli-cuda
-    then pkgSet.cli-cuda
-    else pkgSet.cli-cpu;
+    if isDarwin && pkgSet ? cli-candle-metal
+    then pkgSet.cli-candle-metal
+    else if cudaEnabled && pkgSet ? cli-candle-cuda
+    then pkgSet.cli-candle-cuda
+    else pkgSet.cli-candle;
 
   mkCommonOptions = {
     lib,

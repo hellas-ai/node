@@ -30,9 +30,10 @@ in {
       package = common.pickCliPackage pkgs;
       packageDescription = ''
         The hellas CLI package. Defaults to the best backend variant for
-        the host: cli-metal on Darwin, cli-cuda when `nixpkgs.config.cudaSupport`
-        is enabled on Linux, otherwise cli-cpu. Override to `pkgs.hellas`
-        (lean remote-only) if you don't want a local backend.
+        the host: cli-candle-metal on Darwin, cli-candle-cuda when
+        `nixpkgs.config.cudaSupport` is enabled on Linux, otherwise
+        cli-candle. Override to `pkgs.hellas.cli` (lean remote-only) if
+        you don't want a local backend.
       '';
     }
     // {

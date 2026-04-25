@@ -10,31 +10,32 @@
   inherit (lib) mkEnableOption mkIf mkOption types;
   cfg = config.services.hellas;
 
+  optArg = flag: value: lib.optionals (value != null) [flag (toString value)];
+
   cliArgs =
-    [
-      "serve"
-    ]
-    ++ lib.optionals (cfg.port != null) ["--port" (toString cfg.port)]
-    ++ lib.optionals (cfg.downloadPolicy != null) ["--download-policy" cfg.downloadPolicy]
-    ++ lib.optionals (cfg.executePolicy != null) ["--execute-policy" cfg.executePolicy]
-    ++ lib.optionals (cfg.queueSize != null) ["--queue-size" (toString cfg.queueSize)]
-    ++ lib.optionals (cfg.metricsPort != null) ["--metrics-port" (toString cfg.metricsPort)]
-    ++ lib.optionals (cfg.graffiti != null) ["--graffiti" cfg.graffiti]
+    ["serve"]
+    ++ optArg "--port" cfg.port
+    ++ optArg "--download-policy" cfg.downloadPolicy
+    ++ optArg "--execute-policy" cfg.executePolicy
+    ++ optArg "--queue-size" cfg.queueSize
+    ++ optArg "--metrics-port" cfg.metricsPort
+    ++ optArg "--graffiti" cfg.graffiti
     ++ lib.concatMap (model: ["--preload" model]) cfg.preloadWeights
     ++ cfg.extraArgs;
 
-  otelEnv =
-    lib.optionalAttrs (cfg.otel.endpoint != null) {
+  otelEnv = lib.optionalAttrs (cfg.otel.endpoint != null) (
+    {
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = cfg.otel.endpoint;
       OTEL_SERVICE_NAME = cfg.otel.serviceName;
     }
-    // lib.optionalAttrs (cfg.otel.endpoint != null && cfg.otel.sampleRate != null) {
+    // lib.optionalAttrs (cfg.otel.sampleRate != null) {
       OTEL_TRACES_SAMPLER_ARG = toString cfg.otel.sampleRate;
     }
-    // lib.optionalAttrs (cfg.otel.endpoint != null && cfg.otel.headers != {}) {
+    // lib.optionalAttrs (cfg.otel.headers != {}) {
       OTEL_EXPORTER_OTLP_HEADERS =
         lib.concatStringsSep "," (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.otel.headers);
-    };
+    }
+  );
 in {
   options.services.hellas =
     common.mkCommonOptions {
@@ -42,10 +43,11 @@ in {
       package = common.pickCliPackage pkgs;
       packageDescription = ''
         The hellas CLI used to run the serve daemon. Defaults to the best
-        backend variant for the host: cli-metal on Darwin, cli-cuda when
-        `nixpkgs.config.cudaSupport` is enabled on Linux, otherwise cli-cpu.
-        Override to a specific SM build (e.g. `pkgs.hellas.cli-cuda-cuda12-sm80`)
-        to pin a particular GPU generation.
+        backend variant for the host: cli-candle-metal on Darwin,
+        cli-candle-cuda when `nixpkgs.config.cudaSupport` is enabled on
+        Linux, otherwise cli-candle. Override to a specific SM build (e.g.
+        `pkgs.hellas.cli-candle-cuda-cuda12-sm80`) to pin a particular GPU
+        generation.
       '';
     }
     // {
