@@ -42,9 +42,7 @@
     nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
 
     overlays.default = final: _prev: {
-      hellas = self.packages.${final.system}.cli;
-      hellas-cpu = self.packages.${final.system}.cli-cpu;
-      hellas-cuda = self.packages.${final.system}.cli-cuda;
+      hellas = self.packages.${final.system};
     };
 
     nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};

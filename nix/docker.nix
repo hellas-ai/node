@@ -5,7 +5,7 @@
   rustToolchain,
   catgrad,
   system,
-  cliCpu,
+  cliCandle,
 }: let
   imageRepository = "ghcr.io/hellas-ai/node";
   runtimeCoreLibs = with pkgs; [stdenv.cc.cc.lib openssl glibc];
@@ -93,9 +93,9 @@
       };
     };
 
-  cliCpuRuntime = mkCliRuntime {
-    name = "hellas-cli-cpu-runtime";
-    pkg = cliCpu;
+  cliCandleRuntime = mkCliRuntime {
+    name = "hellas-cli-candle-runtime";
+    pkg = cliCandle;
     sourceBin = "hellas-cli";
   };
 
@@ -103,7 +103,7 @@
     cudaEnv = mkCudaEnv v;
     cliCuda = mkHellasPackage {
       buildNoDefaultFeatures = true;
-      buildFeatures = ["cuda"];
+      buildFeatures = ["candle-cuda"];
       doCheck = false;
       nativeBuildInputs =
         (with pkgs.buildPackages; [pkg-config protobuf llvmPackages.lld makeWrapper])
@@ -147,7 +147,7 @@
     {
       cpu = mkServerImage {
         imageTag = "cpu";
-        runtimePkg = cliCpuRuntime;
+        runtimePkg = cliCandleRuntime;
       };
     }
     // lib.mapAttrs (_: v: v.image) cudaImages;

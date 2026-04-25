@@ -13,9 +13,31 @@
     pkgs
     lib
     rustToolchain
-    devShellPackages
-    envShellHook
     ;
+
+  devShellPackages = with pkgs; [
+    rustToolchain
+    openssl
+    pkg-config
+    protobuf
+    llvmPackages.lld
+    pre-commit
+    protobuf-language-server
+    cargo-watch
+    gh
+    cargo-audit
+    cargo-outdated
+    cargo-sort
+    skopeo
+  ];
+
+  envShellHook = ''
+    if [ -f .env ]; then
+      set -a
+      source .env
+      set +a
+    fi
+  '';
 
   ci = import ./ci.nix {
     inherit pkgs lib rustToolchain;
@@ -36,14 +58,14 @@
         buildInputs = [];
         doCheck = false;
       };
-      cli-cpu = pkgSpec.mkHellasPackage {
+      cli-candle = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        buildFeatures = ["candle-cpu"];
+        buildFeatures = ["candle"];
         doCheck = false;
       };
     }
     // lib.optionalAttrs hostPlatform.isDarwin {
-      cli-metal = pkgSpec.mkHellasPackage {
+      cli-candle-metal = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
         buildFeatures = ["candle-metal"];
         doCheck = false;
@@ -61,70 +83,49 @@
   nativePackages = packagesFor null;
   crossOutputs = lib.mapAttrs (_: spec: packagesFor spec) crossTargets;
 
-  linuxOutputs =
-    if pkgs.stdenv.hostPlatform.isLinux
-    then let
-      docker = import ./docker.nix {
-        inherit pkgs lib rustToolchain catgrad system;
-        mkHellasPackage = nativePkg.mkHellasPackage;
-        cliCpu = nativePackages.cli-cpu;
-      };
-
-      nixosTests = import ./tests {
-        inherit self pkgs lib;
-        package = nativePackages.cli-cpu;
-      };
-    in {
-      packages =
-        {cli-cuda = docker.defaultCudaCli;}
-        // lib.mapAttrs'
-        (name: value: lib.nameValuePair "docker-${name}" value)
-        docker.dockerImages
-        // lib.mapAttrs'
-        (name: value: lib.nameValuePair "cli-cuda-${name}" value)
-        docker.cudaCliPackages;
-
-      apps = {
-        "docker-push-all" = {
-          type = "app";
-          program = "${docker.pushAll}/bin/docker-push-all";
-        };
-      };
-
-      devShells = {
-        cuda = pkgs.mkShell {
-          packages = devShellPackages;
-          shellHook = envShellHook;
-          nativeBuildInputs = docker.defaultCudaEnv.nativeBuildInputs;
-          buildInputs = docker.defaultCudaEnv.buildInputs;
-          inherit
-            (docker.defaultCudaEnv)
-            CUDA_COMPUTE_CAP
-            CUDA_TOOLKIT_ROOT_DIR
-            ;
-          LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
-        };
-      };
-
-      checks = nixosTests;
-      inherit nixosTests;
-    }
-    else {
-      packages = {};
-      apps = {};
-      devShells = {};
-      checks = {};
-      nixosTests = {};
+  linuxOutputs = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (let
+    docker = import ./docker.nix {
+      inherit pkgs lib rustToolchain catgrad system;
+      mkHellasPackage = nativePkg.mkHellasPackage;
+      cliCandle = nativePackages.cli-candle;
     };
+
+    nixosTests = import ./tests {
+      inherit self pkgs lib;
+      package = nativePackages.cli-candle;
+    };
+  in {
+    packages =
+      {cli-candle-cuda = docker.defaultCudaCli;}
+      // lib.mapAttrs' (name: value: lib.nameValuePair "docker-${name}" value) docker.dockerImages
+      // lib.mapAttrs' (name: value: lib.nameValuePair "cli-candle-cuda-${name}" value) docker.cudaCliPackages;
+
+    apps."docker-push-all" = {
+      type = "app";
+      program = "${docker.pushAll}/bin/docker-push-all";
+    };
+
+    devShells.cuda = pkgs.mkShell {
+      packages = devShellPackages;
+      shellHook = envShellHook;
+      nativeBuildInputs = docker.defaultCudaEnv.nativeBuildInputs;
+      buildInputs = docker.defaultCudaEnv.buildInputs;
+      inherit (docker.defaultCudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
+      LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
+    };
+
+    inherit nixosTests;
+  });
 in {
   packages =
     nativePackages
     // {
       default = nativePackages.cli;
       cross = crossOutputs;
-      "hf-cache-smollm2-135m-instruct" = testsLib.smolLm2InstructCache;
+      "hf-cache-lfm2-350m" = testsLib.lfm2_350MCache;
+      "hf-cache-qwen3-0_6b" = testsLib.qwen3_0_6BCache;
     }
-    // linuxOutputs.packages;
+    // (linuxOutputs.packages or {});
 
   apps =
     {
@@ -139,7 +140,7 @@ in {
         meta.description = "Apply all CI auto-fixes where supported";
       };
     }
-    // linuxOutputs.apps;
+    // (linuxOutputs.apps or {});
 
   devShells =
     {
@@ -148,8 +149,9 @@ in {
         shellHook = envShellHook;
       };
     }
-    // linuxOutputs.devShells;
+    // (linuxOutputs.devShells or {});
 
-  checks = linuxOutputs.checks;
-  inherit (linuxOutputs) nixosTests;
+  # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
+  checks = linuxOutputs.nixosTests or {};
+  nixosTests = linuxOutputs.nixosTests or {};
 }
