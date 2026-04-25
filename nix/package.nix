@@ -7,7 +7,6 @@
   # Leave null for native builds.
   crossSystem ? null,
 }: let
-  repoRoot = ../.;
   overlays = [(import rust-overlay)];
   pkgs = import nixpkgs ({
       inherit system overlays;
@@ -35,40 +34,12 @@
     inherit stdenv;
   };
 
-  buildSrc = lib.cleanSourceWith {
-    src = repoRoot;
-    filter = path: type: let
-      name = builtins.baseNameOf (toString path);
-    in
-      lib.cleanSourceFilter path type
-      && !(builtins.elem name [
-        ".claude"
-        ".direnv"
-        ".envrc"
-        "result"
-        "target"
-      ])
-      && !lib.hasPrefix "result-" name;
-  };
+  # Flake `self` is git-tracked-only; nothing in the previous filter list
+  # (.direnv, target, result-*, etc.) ever lands here in the first place.
+  buildSrc = self;
 
   workspaceBuildInputs = with pkgs; [openssl];
   workspaceNativeBuildInputs = with pkgs.buildPackages; [pkg-config protobuf llvmPackages.lld];
-
-  devShellPackages = with pkgs; [
-    rustToolchain
-    openssl
-    pkg-config
-    protobuf
-    llvmPackages.lld
-    pre-commit
-    protobuf-language-server
-    cargo-watch
-    gh
-    cargo-audit
-    cargo-outdated
-    cargo-sort
-    skopeo
-  ];
 
   rev = self.rev or self.dirtyRev or "unknown";
 
@@ -87,7 +58,7 @@
       cargoLock = {
         lockFile = ../Cargo.lock;
         outputHashes = {
-          "catgrad-0.2.1" = "sha256-WAuFgZGG4fIDkz2gZAN/oPiVg5DwHGiiPPykHMA/2yc=";
+          "catgrad-0.2.1" = "sha256-y8HSxXNRj8Zvll7PqpFSEvGS91PUf77dCwzrdiAr3wE=";
         };
       };
       inherit stdenv;
@@ -106,14 +77,6 @@
     // crossEnv;
 
   mkHellasPackage = overrides: rustPlatform.buildRustPackage (commonArgs // overrides);
-
-  envShellHook = ''
-    if [ -f .env ]; then
-      set -a
-      source .env
-      set +a
-    fi
-  '';
 in {
   inherit
     pkgs
@@ -123,7 +86,5 @@ in {
     buildSrc
     commonArgs
     mkHellasPackage
-    devShellPackages
-    envShellHook
     ;
 }
