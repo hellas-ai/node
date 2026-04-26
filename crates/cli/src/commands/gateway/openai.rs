@@ -1,5 +1,8 @@
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
+use super::{
+    next_id, now_unix, parse_json_body, provenance_sse_event, receipt_sse_event, sse_data,
+    sse_response,
+};
 use crate::execution::{Outcome, StopReason};
 use async_stream::stream;
 use axum::Json;
@@ -42,9 +45,18 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
     let assets = prepared.assets.clone();
     let prompt_tokens = prepared.prompt_tokens;
     let has_tools = prepared.has_tools;
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
-    sse_response(stream! {
+    let stream_provenance = provenance.clone();
+    let mut response = sse_response(stream! {
+        // Initial in-band provenance frame for browser EventSource clients
+        // (which can't read response headers). Skipped when provenance is
+        // unknown pre-flight (e.g. RemoteDiscovery — quote happens lazily).
+        if let Some(prov) = stream_provenance.as_ref() {
+            yield Ok(provenance_sse_event(prov));
+        }
+
         // Initial role frame.
         yield Ok(sse_data(&build_chunk(
             &id,
@@ -127,7 +139,7 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
             Outcome::Completed {
                 stop_reason,
                 total_tokens,
-                ..
+                receipt_cid,
             } => {
                 let finish = if has_tools {
                     let parsed = assets.parse_tool_calls(&tool_buffer).unwrap_or_else(|err| {
@@ -189,10 +201,15 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
                     yield Ok(sse_data(&usage_chunk));
                 }
 
+                yield Ok(receipt_sse_event(&receipt_cid));
                 yield Ok(axum::response::sse::Event::default().data("[DONE]"));
             }
         }
-    })
+    });
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response
 }
 
 async fn respond(prepared: PreparedGeneration) -> Response {
@@ -201,6 +218,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let model = prepared.model.clone();
     let assets = prepared.assets.clone();
     let prompt_tokens = prepared.prompt_tokens;
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
     let stream = prepared.stream();
@@ -229,12 +247,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, stop_reason) = match outcome {
+    let (total_tokens, stop_reason, receipt_cid) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
-            ..
-        } => (total_tokens, stop_reason),
+            receipt_cid,
+        } => (total_tokens, stop_reason, receipt_cid),
         Outcome::Failed { position, error } => {
             warn!(position, %error, "openai chat request failed");
             return super::json_error(
@@ -277,7 +295,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         )))
         .build();
 
-    Json(response).into_response()
+    let mut response = Json(response).into_response();
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response.extensions_mut().insert(receipt_cid);
+    response
 }
 
 fn map_finish_reason(stop: StopReason, has_tool_calls: bool) -> openai::FinishReason {

@@ -7,6 +7,7 @@ use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, GetStatsResponse, ListModelsResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::provenance::ExecutionProvenance;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
@@ -17,18 +18,39 @@ pub use actor::Executor;
 /// worker observes on its next chunk send and converts into a cancel.
 pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<ExecuteStreamEvent, Status>>;
 
+/// Quote response paired with the provenance the executor committed to.
+/// `provenance` is the same value the executor logs at quote/accept time;
+/// callers (the tonic Execute impl) attach it to outgoing Response
+/// metadata so gateways/clients can correlate the wire response with the
+/// commitment that produced it.
+#[derive(Debug)]
+pub struct QuoteOutcome<R> {
+    pub response: R,
+    pub provenance: ExecutionProvenance,
+}
+
+/// Streaming execution paired with the provenance committed to at
+/// quote-acceptance time. The receipt CID is *terminal* and travels via
+/// the existing `Completed.receipt_cid` proto field on the stream's
+/// final event — it's not part of `ExecutionProvenance`.
+#[derive(Debug)]
+pub struct ExecuteOutcome {
+    pub provenance: ExecutionProvenance,
+    pub events: ExecuteEventReceiver,
+}
+
 pub(crate) enum ExecutorMessage {
     Quote {
         request: GetQuoteRequest,
-        reply: oneshot::Sender<Result<GetQuoteResponse, ExecutorError>>,
+        reply: oneshot::Sender<Result<QuoteOutcome<GetQuoteResponse>, ExecutorError>>,
     },
     QuotePrompt {
         request: QuotePromptRequest,
-        reply: oneshot::Sender<Result<QuotePromptResponse, ExecutorError>>,
+        reply: oneshot::Sender<Result<QuoteOutcome<QuotePromptResponse>, ExecutorError>>,
     },
     QuoteChatPrompt {
         request: QuoteChatPromptRequest,
-        reply: oneshot::Sender<Result<QuoteChatPromptResponse, ExecutorError>>,
+        reply: oneshot::Sender<Result<QuoteOutcome<QuoteChatPromptResponse>, ExecutorError>>,
     },
     Preload {
         model: String,
@@ -39,7 +61,7 @@ pub(crate) enum ExecutorMessage {
     /// the worker's per-execution sender.
     Execute {
         request: ExecuteRequest,
-        reply: oneshot::Sender<Result<ExecuteEventReceiver, ExecutorError>>,
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
     /// Worker → actor: this execution finished (or was cancelled).
     /// Sole purpose is advancing the pending queue.
