@@ -93,8 +93,7 @@ impl QuotePlan {
         // here, not the executor's preferred default.
         let request_dtype = program_dtype.unwrap_or_else(|| supported_dtypes[0]);
 
-        let input_ids = decode_token_ids(&request.input)
-            .map_err(|error| ExecutorError::InvalidTokenPayload(error.to_string()))?;
+        let input_ids = decode_token_ids(&request.input)?;
         if input_ids.is_empty() {
             return Err(ExecutorError::InvalidTokenPayload(
                 "prompt is empty after decoding".to_string(),

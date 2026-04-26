@@ -1,3 +1,4 @@
+use crate::TokenBytesError;
 use crate::model::ModelAssetsError;
 use catgrad_llm::LLMError;
 use thiserror::Error;
@@ -53,6 +54,8 @@ pub enum ExecutorError {
     PolicyDenied(String),
     #[error("invalid token payload: {0}")]
     InvalidTokenPayload(String),
+    #[error(transparent)]
+    TokenBytes(#[from] TokenBytesError),
     #[error(
         "program was built for dtype {request:?} but this executor only supports {supported:?}; rebuild the program at one of the supported dtypes or run an executor with --dtype {request:?} in its supported set"
     )]
@@ -64,38 +67,44 @@ pub enum ExecutorError {
     State(#[from] StateError),
 }
 
+fn model_assets_status_code(err: &ModelAssetsError) -> tonic::Code {
+    match err {
+        ModelAssetsError::Spec(_)
+        | ModelAssetsError::ParseModelConfig { .. }
+        | ModelAssetsError::ConstructModelConfig { .. }
+        | ModelAssetsError::NegativePromptTokenId { .. }
+        | ModelAssetsError::NegativeStopTokenId { .. } => tonic::Code::InvalidArgument,
+        _ => tonic::Code::Internal,
+    }
+}
+
+fn executor_status_code(err: &ExecutorError) -> tonic::Code {
+    match err {
+        ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
+        ExecutorError::InvalidQuoteRequest(_)
+        | ExecutorError::InvalidTokenPayload(_)
+        | ExecutorError::TokenBytes(_) => tonic::Code::InvalidArgument,
+        ExecutorError::DtypeNotSupported { .. } => tonic::Code::FailedPrecondition,
+        ExecutorError::ModelAssets(model_err) => model_assets_status_code(model_err),
+        ExecutorError::WeightsNotReady(_)
+        | ExecutorError::State(StateError::QuoteExpired(_)) => tonic::Code::FailedPrecondition,
+        ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
+        ExecutorError::State(StateError::QuoteNotFound(_)) => tonic::Code::NotFound,
+        ExecutorError::ChannelClosed
+        | ExecutorError::BackendInit(_)
+        | ExecutorError::Llm(_)
+        | ExecutorError::WeightsError(_) => tonic::Code::Internal,
+    }
+}
+
+impl From<ModelAssetsError> for Status {
+    fn from(err: ModelAssetsError) -> Self {
+        Status::new(model_assets_status_code(&err), err.to_string())
+    }
+}
+
 impl From<ExecutorError> for Status {
     fn from(err: ExecutorError) -> Self {
-        let code = match &err {
-            ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
-
-            ExecutorError::InvalidQuoteRequest(_) | ExecutorError::InvalidTokenPayload(_) => {
-                tonic::Code::InvalidArgument
-            }
-
-            ExecutorError::DtypeNotSupported { .. } => tonic::Code::FailedPrecondition,
-
-            ExecutorError::ModelAssets(model_err) => match model_err {
-                ModelAssetsError::Spec(_)
-                | ModelAssetsError::ParseModelConfig { .. }
-                | ModelAssetsError::ConstructModelConfig { .. }
-                | ModelAssetsError::NegativePromptTokenId { .. }
-                | ModelAssetsError::NegativeStopTokenId { .. } => tonic::Code::InvalidArgument,
-                _ => tonic::Code::Internal,
-            },
-
-            ExecutorError::WeightsNotReady(_)
-            | ExecutorError::State(StateError::QuoteExpired(_)) => tonic::Code::FailedPrecondition,
-
-            ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
-
-            ExecutorError::State(StateError::QuoteNotFound(_)) => tonic::Code::NotFound,
-
-            ExecutorError::ChannelClosed
-            | ExecutorError::BackendInit(_)
-            | ExecutorError::Llm(_)
-            | ExecutorError::WeightsError(_) => tonic::Code::Internal,
-        };
-        Status::new(code, err.to_string())
+        Status::new(executor_status_code(&err), err.to_string())
     }
 }

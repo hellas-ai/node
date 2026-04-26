@@ -50,6 +50,12 @@ impl std::fmt::Display for TokenBytesError {
 
 impl std::error::Error for TokenBytesError {}
 
+impl From<TokenBytesError> for tonic::Status {
+    fn from(err: TokenBytesError) -> Self {
+        tonic::Status::invalid_argument(err.to_string())
+    }
+}
+
 pub fn encode_token_ids(token_ids: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(token_ids.len() * TOKEN_BYTES_LEN);
     for token_id in token_ids {

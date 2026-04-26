@@ -38,7 +38,7 @@ impl TextOutputDecoder {
     /// bytes of a multi-byte UTF-8 character.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<String> {
         let token_ids: Vec<i32> = decode_token_ids(bytes)
-            .map_err(|err| anyhow!("failed to decode streamed output batch: {err}"))?
+            .context("failed to decode streamed output batch")?
             .into_iter()
             .map(|token| {
                 i32::try_from(token)
