@@ -158,17 +158,18 @@ mod tests {
     }
 
     fn dummy_spec() -> Program {
-        Program::new(
-            TypedTerm {
+        catgrad::runtime::ProgramSpec {
+            typed_term: TypedTerm {
                 term: Term::empty(),
                 source_type: vec![],
                 target_type: vec![],
             },
-            Path::empty(),
-            vec![],
-            1,
-            None,
-        )
+            module_path: Path::empty(),
+            empty_state_type: vec![],
+            max_sequence_length: 1,
+            extra_nat_chunk_size: None,
+        }
+        .into()
     }
 
     fn dummy_execution_context(bundle: &Arc<Bundle>) -> Arc<ExecutionContext> {
