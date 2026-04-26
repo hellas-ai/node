@@ -318,6 +318,5 @@ fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {
     let bytes: [u8; 32] = raw_id
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid endpoint id length: {}", raw_id.len()))?;
-    EndpointId::from_bytes(&bytes)
-        .map_err(|err| anyhow::anyhow!("invalid endpoint id bytes: {err}"))
+    EndpointId::from_bytes(&bytes).context("invalid endpoint id bytes")
 }
