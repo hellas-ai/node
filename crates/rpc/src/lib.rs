@@ -15,6 +15,7 @@ pub mod model;
 pub mod pb;
 #[cfg(feature = "node")]
 pub mod policy;
+pub mod provenance;
 pub mod service;
 pub mod spec;
 

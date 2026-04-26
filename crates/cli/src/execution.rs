@@ -41,7 +41,8 @@ use futures::stream::{BoxStream, FuturesUnordered, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
 use hellas_rpc::discovery::DiscoveryBindings;
-use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
+use hellas_rpc::driver::{ExecuteDriver, QuotedResponse, RemoteExecuteDriver};
+use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::hellas::{
     self as pb, ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, execute_stream_event,
@@ -265,6 +266,15 @@ impl ExecutionRequest {
         }
     }
 
+    /// Run the quote step (talking to the chosen executor) and return the
+    /// `PreparedExecution`. Splitting prepare from `stream` lets callers
+    /// (notably the gateway) read pre-flight provenance off
+    /// `PreparedExecution::provenance()` *before* the response stream
+    /// flushes its headers.
+    pub async fn prepare(self) -> anyhow::Result<PreparedExecution> {
+        prepare_execution(&self.runtime, &self.quote_req, &self.strategy).await
+    }
+
     /// Drive this request to completion as a stream of events.
     ///
     /// Owning consumption: dropping the returned stream cancels everything
@@ -272,7 +282,7 @@ impl ExecutionRequest {
     /// per-running cancel token).
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         try_stream! {
-            let prepared = prepare_execution(&self.runtime, &self.quote_req, &self.strategy).await?;
+            let prepared = self.prepare().await?;
             let inner = prepared.stream();
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -286,7 +296,7 @@ impl ExecutionRequest {
 // PreparedExecution — primary + optional shadow for Verify
 // ---------------------------------------------------------------------------
 
-struct PreparedExecution {
+pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
 }
@@ -309,11 +319,18 @@ async fn prepare_execution(
 }
 
 impl PreparedExecution {
+    /// See [`PreparedRoute::provenance`] — this delegates to the primary
+    /// route. Shadow's provenance is intentionally not exposed (verify is
+    /// internal; the primary is what the user sees).
+    pub fn provenance(&self) -> Option<&ExecutionProvenance> {
+        self.primary.provenance()
+    }
+
     /// Stream primary's events live. If a shadow is configured, run it
     /// after primary completes and only emit primary's `Done` once the two
     /// receipts agree. Mismatch is reported as a `Done(Failed)` so the
     /// terminal frame is honest about the disagreement.
-    fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         let Self { primary, shadow } = self;
         try_stream! {
             // Yield primary's chunks live; hold its Done back until shadow
@@ -419,6 +436,7 @@ enum PreparedRoute {
     Local {
         executor: ExecutorHandle,
         quote_id: String,
+        provenance: ExecutionProvenance,
     },
     RemoteDirect(RemoteExecution),
     RemoteDiscovery {
@@ -429,6 +447,21 @@ enum PreparedRoute {
 }
 
 impl PreparedRoute {
+    /// Pre-flight provenance — `Some` when the route's quote has already
+    /// happened (Local, RemoteDirect) so the gateway can attach
+    /// `x-hellas-*` response headers before any stream events flow.
+    /// `None` for `RemoteDiscovery`, where the quote is deferred until
+    /// the first peer responds during streaming; in that case the gateway
+    /// falls back to in-band SSE events for the same provenance.
+    fn provenance(&self) -> Option<&ExecutionProvenance> {
+        match self {
+            #[cfg(feature = "hellas-executor")]
+            PreparedRoute::Local { provenance, .. } => Some(provenance),
+            PreparedRoute::RemoteDirect(remote) => Some(&remote.provenance),
+            PreparedRoute::RemoteDiscovery { .. } => None,
+        }
+    }
+
     #[instrument(skip_all, fields(?route))]
     async fn prepare(
         runtime: &ExecutionRuntime,
@@ -443,13 +476,14 @@ impl PreparedRoute {
                     .preload_weights(local_model_spec(quote_req))
                     .await
                     .context("failed to preload local weights")?;
-                let quote = quote_with_driver(quote_req, &mut executor, || {
+                let quoted = quote_with_driver(quote_req, &mut executor, || {
                     "local quote failed".to_string()
                 })
                 .await?;
                 Ok(Self::Local {
                     executor,
-                    quote_id: quote.quote_id,
+                    quote_id: quoted.response.quote_id,
+                    provenance: quoted.provenance,
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
@@ -470,9 +504,11 @@ impl PreparedRoute {
     fn stream(self) -> BoxStream<'static, anyhow::Result<ExecutionEvent>> {
         match self {
             #[cfg(feature = "hellas-executor")]
-            PreparedRoute::Local { executor, quote_id } => {
-                execute_stream(executor, quote_id).boxed()
-            }
+            PreparedRoute::Local {
+                executor,
+                quote_id,
+                provenance: _,
+            } => execute_stream(executor, quote_id).boxed(),
             PreparedRoute::RemoteDirect(remote) => remote.stream().boxed(),
             PreparedRoute::RemoteDiscovery {
                 quote_req,
@@ -563,6 +599,7 @@ struct RemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
     quote_id: String,
+    provenance: ExecutionProvenance,
     driver: TracedDriver,
 }
 
@@ -572,6 +609,7 @@ impl RemoteExecution {
             endpoint,
             peer_id: quoted.peer_id,
             quote_id: quoted.quote.quote_id,
+            provenance: quoted.provenance,
             driver: quoted.driver,
         }
     }
@@ -581,6 +619,7 @@ impl RemoteExecution {
             endpoint,
             peer_id: _,
             quote_id,
+            provenance: _,
             driver,
         } = self;
         try_stream! {
@@ -606,13 +645,17 @@ fn execute_stream<D: ExecuteDriver + Send + 'static>(
     quote_id: String,
 ) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
     try_stream! {
+        // Provenance arrives in `streamed.provenance` (from response
+        // metadata server-side) but the gateway already has it from the
+        // quote step, so we drop it here and only forward the event stream.
         let mut wire = driver
             .execute_streaming(ExecuteRequest {
                 quote_id: quote_id.clone(),
                 stream_batch_size: Some(1),
             })
             .await
-            .context("failed to start execution stream")?;
+            .context("failed to start execution stream")?
+            .stream;
 
         let mut got_terminal = false;
         while let Some(item) = wire.next().await {
@@ -700,6 +743,7 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 struct QuotedRemoteDriver {
     peer_id: EndpointId,
     quote: hellas_rpc::pb::hellas::GetQuoteResponse,
+    provenance: ExecutionProvenance,
     driver: TracedDriver,
 }
 
@@ -714,16 +758,17 @@ async fn quote_with_driver<D>(
     quote_req: &GetQuoteRequest,
     driver: &mut D,
     context: impl FnOnce() -> String,
-) -> anyhow::Result<hellas_rpc::pb::hellas::GetQuoteResponse>
+) -> anyhow::Result<QuotedResponse>
 where
     D: ExecuteDriver,
 {
-    let quote = driver
+    let quoted = driver
         .get_quote(quote_req.clone())
         .await
         .with_context(context)?;
-    tracing::Span::current().record("quote_id", tracing::field::display(&quote.quote_id));
-    Ok(quote)
+    tracing::Span::current()
+        .record("quote_id", tracing::field::display(&quoted.response.quote_id));
+    Ok(quoted)
 }
 
 async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
@@ -781,13 +826,14 @@ async fn quote_remote_endpoint(
         .map_err(QuoteCandidateError::Connect)?;
     let mut driver =
         RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
-    let quote = match driver.get_quote(quote_req.clone()).await {
-        Ok(quote) => quote,
+    let quoted = match driver.get_quote(quote_req.clone()).await {
+        Ok(quoted) => quoted,
         Err(status) => return Err(QuoteCandidateError::Declined(status)),
     };
     Ok(QuotedRemoteDriver {
         peer_id,
-        quote,
+        quote: quoted.response,
+        provenance: quoted.provenance,
         driver,
     })
 }
@@ -823,14 +869,15 @@ async fn quote_remote_target(
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
     let mut driver =
         RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
-    let quote = quote_with_driver(quote_req, &mut driver, || {
+    let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {} declined quote", target.node_id)
     })
     .await?;
 
     Ok(QuotedRemoteDriver {
         peer_id: target.node_id,
-        quote,
+        quote: quoted.response,
+        provenance: quoted.provenance,
         driver,
     })
 }

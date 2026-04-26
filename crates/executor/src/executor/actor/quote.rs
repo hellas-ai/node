@@ -9,11 +9,13 @@ use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::spec::ModelSpec;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use super::Executor;
+use crate::executor::QuoteOutcome;
 
 const STATIC_QUOTE_AMOUNT: u64 = 1000;
 const QUOTE_TTL: Duration = Duration::from_secs(30);
@@ -83,7 +85,7 @@ impl Executor {
     pub(super) async fn handle_quote(
         &mut self,
         request: GetQuoteRequest,
-    ) -> Result<GetQuoteResponse, ExecutorError> {
+    ) -> Result<QuoteOutcome<GetQuoteResponse>, ExecutorError> {
         let total_start = Instant::now();
         self.store.prune_expired_quotes(Instant::now());
         let plan_start = Instant::now();
@@ -169,17 +171,23 @@ impl Executor {
             "quote phase timings"
         );
 
-        Ok(GetQuoteResponse {
-            quote_id,
-            amount: STATIC_QUOTE_AMOUNT,
-            ttl_ms: QUOTE_TTL.as_millis() as u64,
+        Ok(QuoteOutcome {
+            response: GetQuoteResponse {
+                quote_id,
+                amount: STATIC_QUOTE_AMOUNT,
+                ttl_ms: QUOTE_TTL.as_millis() as u64,
+            },
+            provenance: ExecutionProvenance {
+                commitment_id: *commitment_id.as_bytes(),
+                program_id: *program_id.as_bytes(),
+            },
         })
     }
 
     pub(super) async fn handle_quote_prompt(
         &mut self,
         request: QuotePromptRequest,
-    ) -> Result<QuotePromptResponse, ExecutorError> {
+    ) -> Result<QuoteOutcome<QuotePromptResponse>, ExecutorError> {
         let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
         let assets = load_assets(
             &request.huggingface_model_id,
@@ -189,21 +197,24 @@ impl Executor {
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
-        let quote_response = self.handle_quote(full_request).await?;
+        let inner = self.handle_quote(full_request).await?;
 
-        Ok(QuotePromptResponse {
-            quote_id: quote_response.quote_id,
-            amount: quote_response.amount,
-            ttl_ms: quote_response.ttl_ms,
-            prompt_tokens,
-            dtype: dtype_to_wire(dtype),
+        Ok(QuoteOutcome {
+            response: QuotePromptResponse {
+                quote_id: inner.response.quote_id,
+                amount: inner.response.amount,
+                ttl_ms: inner.response.ttl_ms,
+                prompt_tokens,
+                dtype: dtype_to_wire(dtype),
+            },
+            provenance: inner.provenance,
         })
     }
 
     pub(super) async fn handle_quote_chat_prompt(
         &mut self,
         request: QuoteChatPromptRequest,
-    ) -> Result<QuoteChatPromptResponse, ExecutorError> {
+    ) -> Result<QuoteOutcome<QuoteChatPromptResponse>, ExecutorError> {
         let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
         let assets = load_assets(
             &request.huggingface_model_id,
@@ -228,14 +239,17 @@ impl Executor {
         let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
-        let quote_response = self.handle_quote(full_request).await?;
+        let inner = self.handle_quote(full_request).await?;
 
-        Ok(QuoteChatPromptResponse {
-            quote_id: quote_response.quote_id,
-            amount: quote_response.amount,
-            ttl_ms: quote_response.ttl_ms,
-            prompt_tokens,
-            dtype: dtype_to_wire(dtype),
+        Ok(QuoteOutcome {
+            response: QuoteChatPromptResponse {
+                quote_id: inner.response.quote_id,
+                amount: inner.response.amount,
+                ttl_ms: inner.response.ttl_ms,
+                prompt_tokens,
+                dtype: dtype_to_wire(dtype),
+            },
+            provenance: inner.provenance,
         })
     }
 

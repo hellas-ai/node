@@ -2,6 +2,7 @@ mod anthropic;
 mod openai;
 mod pi;
 mod plain;
+mod provenance_layer;
 mod state;
 
 use crate::commands::CliResult;
@@ -12,7 +13,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use catgrad::cid::Cid;
 use catgrad::prelude::Dtype;
+use catgrad_llm::runtime::TextReceipt;
+use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 use futures::Stream;
 use serde::Serialize;
 use serde_json::json;
@@ -48,6 +52,7 @@ pub struct GatewayOptions {
     pub pi: bool,
     pub pi_bin: String,
     pub pi_api: String,
+    pub pi_log: Option<std::path::PathBuf>,
     pub pi_args: Vec<String>,
 }
 
@@ -58,7 +63,8 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         .route("/v1/chat/completions", post(openai::handle))
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(provenance_layer::ProvenanceLayer);
 
     let addr = format!("{}:{}", options.host, options.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -116,12 +122,16 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         };
         let base_url = format!("http://{host}:{}{path}", bound_addr.port());
         info!("spawning pi with provider baseUrl {base_url} (api={})", options.pi_api);
+        if let Some(path) = options.pi_log.as_deref() {
+            info!("pi stdout/stderr -> {}", path.display());
+        }
         Some(pi::spawn(
             &base_url,
             model,
             &options.pi_api,
             &options.pi_bin,
             &options.pi_args,
+            options.pi_log.as_deref(),
         )?)
     } else {
         None
@@ -203,6 +213,28 @@ fn sse_data<T: Serialize>(payload: &T) -> Event {
 fn sse_event_data<T: Serialize>(event: &str, payload: &T) -> Event {
     let data = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     Event::default().event(event).data(data)
+}
+
+/// Initial in-band SSE event carrying the request commitment + program
+/// CIDs. Browser `EventSource` consumers pick this up via
+/// `addEventListener("hellas-provenance", …)` since they can't read
+/// HTTP response headers.
+fn provenance_sse_event(prov: &ExecutionProvenance) -> Event {
+    sse_event_data(
+        "hellas-provenance",
+        &json!({
+            "commitment_id": encode_hex(&prov.commitment_id),
+            "program_id":    encode_hex(&prov.program_id),
+        }),
+    )
+}
+
+/// Terminal in-band SSE event carrying the execution receipt CID. Emitted
+/// once per successful run, immediately before the protocol's terminal
+/// frame (`[DONE]` / `message_stop`). Skipped on `Outcome::Failed` since
+/// no verifiable receipt was produced.
+fn receipt_sse_event(cid: &Cid<TextReceipt>) -> Event {
+    sse_event_data("hellas-receipt", &json!({ "receipt_id": cid.to_string() }))
 }
 
 fn next_id(prefix: &str) -> String {

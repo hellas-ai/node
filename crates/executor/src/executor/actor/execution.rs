@@ -1,8 +1,9 @@
-use crate::executor::ExecuteEventReceiver;
+use crate::executor::ExecuteOutcome;
 use crate::state::new_execution_id;
 use crate::worker::{EnqueueError, ExecuteJob};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::ExecuteRequest;
+use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -20,11 +21,15 @@ impl Executor {
     pub(super) async fn handle_execute(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteEventReceiver, ExecutorError> {
+    ) -> Result<ExecuteOutcome, ExecutorError> {
         let quote_id = request.quote_id;
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         self.store.prune_expired_quotes(Instant::now());
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
+        let provenance = ExecutionProvenance {
+            commitment_id: *quote.start.commitment_id.as_bytes(),
+            program_id: *quote.execution.bound_program().program().id().as_bytes(),
+        };
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;
         let stat_cached_output = quote
@@ -82,7 +87,10 @@ impl Executor {
             "accepted execution"
         );
 
-        Ok(receiver)
+        Ok(ExecuteOutcome {
+            provenance,
+            events: receiver,
+        })
     }
 
     fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
