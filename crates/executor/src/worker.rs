@@ -1,8 +1,8 @@
-use crate::ExecutorError;
 use crate::executor::ExecutorMessage;
 use crate::runner;
 use crate::state::{ExecutionStatus, Invocation};
-use crate::weights::{ExecutionContext, ExecutionStart};
+use crate::programs::{ExecutionContext, ExecutionStart};
+use hellas_rpc::ExecutorError;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
@@ -69,27 +69,23 @@ impl WorkerThread {
         let Self { rx, executor_tx } = self;
         while let Ok(job) = rx.recv() {
             let execution_id = job.execution_id.clone();
-            let (status, error) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || Self::run_job(job, &executor_tx),
-            )) {
-                Ok(Ok(())) => (ExecutionStatus::Completed, None),
-                Ok(Err(err)) => {
-                    let msg = format!("{err:#}");
-                    warn!("execute worker job {execution_id} failed: {msg}");
-                    (ExecutionStatus::Failed, Some(msg))
-                }
-                Err(panic) => {
-                    let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
-                        format!("worker panicked: {s}")
-                    } else if let Some(s) = panic.downcast_ref::<String>() {
-                        format!("worker panicked: {s}")
-                    } else {
-                        "worker panicked".to_string()
-                    };
-                    warn!("execute worker job {execution_id} {msg}");
-                    (ExecutionStatus::Failed, Some(msg))
-                }
-            };
+            let (status, error) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::run_job(job, &executor_tx)
+                })) {
+                    Ok(Ok(())) => (ExecutionStatus::Completed, None),
+                    Ok(Err(err)) => {
+                        let msg = format!("{err:#}");
+                        warn!("execute worker job {execution_id} failed: {msg}");
+                        (ExecutionStatus::Failed, Some(msg))
+                    }
+                    Err(panic) => {
+                        let msg =
+                            format!("worker panicked: {}", crate::backend::panic_message(&panic));
+                        warn!("execute worker job {execution_id} {msg}");
+                        (ExecutionStatus::Failed, Some(msg))
+                    }
+                };
 
             Self::send_completion(&executor_tx, execution_id, status, error);
         }
@@ -111,6 +107,7 @@ impl WorkerThread {
         debug!(execution_id = %execution_id, "execute worker running plan");
         debug!(
             execution_id = %execution_id,
+            commitment_id = %start.commitment_id,
             queue_wait_ms = accepted_at.elapsed().as_millis(),
             prompt_tokens = invocation.input_ids.len(),
             cached_prompt_tokens = start.transcript.len(),

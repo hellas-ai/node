@@ -8,36 +8,18 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["client"]
-# Remote-only client: no local executor, no tensor backend. Still pulls
-# `hellas-rpc/node` so the CLI can prepare prompts via ModelAssets and
-# configure policies without spawning a local executor.
-client = [
-    "hellas-rpc/node",
-    "hellas-rpc/client",
-    "hellas-rpc/compression",
-    "hellas-rpc/discovery",
-    "dep:tonic-iroh-transport",
-    "dep:tonic",
-    "tonic-iroh-transport/client",
-    "tonic-iroh-transport/discovery-mdns",
-    "tonic-iroh-transport/discovery-dht",
-]
+default = []
 
-# Internal umbrella pulled in by every backend feature. Not user-facing:
-# picking a backend (candle-cpu / cuda / candle-metal) activates `_backend`
-# which adds the local executor actor and the RPC server bits so the binary
-# can `serve`.
-_backend = [
-    "client",
-    "dep:hellas-executor",
+# Backend variants: each pulls in the optional `hellas-executor` dep plus the
+# RPC/transport server bits. Source code gates on the implicit `hellas-executor`
+# feature that cargo creates from the optional dep (no `dep:` prefix used).
+candle = [
+    "hellas-executor/candle",
     "hellas-rpc/server",
     "tonic-iroh-transport/server",
 ]
-
-candle-cpu   = ["_backend", "hellas-executor/candle"]
-cuda         = ["_backend", "hellas-executor/candle-cuda"]
-candle-metal = ["_backend", "hellas-executor/candle-metal"]
+candle-cuda = ["candle", "hellas-executor/candle-cuda"]
+candle-metal = ["candle", "hellas-executor/candle-metal"]
 
 [dependencies]
 tokio.workspace = true
@@ -48,16 +30,26 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 reqwest.workspace = true
+catgrad = { workspace = true, default-features = false }
 catgrad-llm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-hellas-rpc = { workspace = true, default-features = false }
+hellas-rpc = { workspace = true, default-features = false, features = [
+    "node",
+    "client",
+    "compression",
+    "discovery",
+] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
-tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
-tonic = { workspace = true, optional = true }
+tonic-iroh-transport = { workspace = true, default-features = false, features = [
+    "client",
+    "discovery-mdns",
+    "discovery-dht",
+] }
+tonic = { workspace = true }
 tokio-stream = { workspace = true }
 futures = "0.3"
 axum = "0.8"

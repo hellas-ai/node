@@ -5,46 +5,23 @@ mod subscriptions;
 #[cfg(test)]
 mod tests;
 
-use crate::ExecutorError;
 use crate::backend;
-use crate::policy::{DownloadPolicy, ExecutePolicy};
+use crate::inputs::{self, HuggingFaceLocator};
+use crate::metrics::ExecutorMetrics;
+use crate::programs;
 use crate::state::{ExecutionStatus, ExecutorState};
-use crate::weights::{RuntimeManager, WeightsError, WeightsLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
+use catgrad::prelude::Dtype;
+use hellas_rpc::ExecutorError;
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use hellas_rpc::pb::hellas::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 
 use super::stream::SubscriptionSet;
 use super::{ExecutorHandle, ExecutorMessage};
-
-#[derive(Default, Clone)]
-pub(super) struct TokenStats {
-    pub executions_started: u64,
-    pub executions_completed: u64,
-    pub executions_failed: u64,
-    pub prompt_tokens: u64,
-    pub cached_prompt_tokens: u64,
-    pub cached_output_tokens: u64,
-    pub prefill_tokens: u64,
-    pub generated_tokens: u64,
-}
-
-impl TokenStats {
-    fn to_proto(&self) -> hellas_rpc::pb::hellas::TokenStats {
-        hellas_rpc::pb::hellas::TokenStats {
-            executions_started: self.executions_started,
-            executions_completed: self.executions_completed,
-            executions_failed: self.executions_failed,
-            prompt_tokens: self.prompt_tokens,
-            cached_prompt_tokens: self.cached_prompt_tokens,
-            cached_output_tokens: self.cached_output_tokens,
-            prefill_tokens: self.prefill_tokens,
-            generated_tokens: self.generated_tokens,
-        }
-    }
-}
 
 pub struct Executor {
     pub(super) notify_tx: mpsc::WeakUnboundedSender<ExecutorMessage>,
@@ -53,11 +30,16 @@ pub struct Executor {
     pub(super) subscriptions: HashMap<String, SubscriptionSet>,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
-    pub(super) runtime_manager: RuntimeManager,
+    pub(super) programs: programs::Cache,
     pub(super) worker: ExecuteWorker,
     pub(super) execute_policy: ExecutePolicy,
-    pub(super) stats: TokenStats,
-    pub(super) model_stats: HashMap<String, TokenStats>,
+    pub(super) metrics: Arc<ExecutorMetrics>,
+    /// Dtypes this executor will accept. The first entry is the *preferred*
+    /// dtype, used whenever the executor itself constructs a program (e.g.
+    /// the `QuotePromptRequest` convenience path or `handle_preload`, which
+    /// don't carry a wire dtype). Other entries are also accepted for any
+    /// `GetQuoteRequest` whose program bytes name them.
+    pub(super) supported_dtypes: Vec<Dtype>,
 }
 
 impl Executor {
@@ -65,7 +47,28 @@ impl Executor {
         download_policy: DownloadPolicy,
         execute_policy: ExecutePolicy,
         queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
     ) -> Result<ExecutorHandle, ExecutorError> {
+        Self::spawn_with_metrics(
+            download_policy,
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            Arc::new(ExecutorMetrics::default()),
+        )
+    }
+
+    pub fn spawn_with_metrics(
+        download_policy: DownloadPolicy,
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        metrics: Arc<ExecutorMetrics>,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        assert!(
+            !supported_dtypes.is_empty(),
+            "executor must support at least one dtype"
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         backend::create_backend()?;
         let executor = Self {
@@ -75,14 +78,21 @@ impl Executor {
             subscriptions: HashMap::new(),
             pending_executions: VecDeque::new(),
             queue_capacity,
-            runtime_manager: RuntimeManager::new(download_policy),
+            programs: programs::Cache::new(download_policy),
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
-            stats: TokenStats::default(),
-            model_stats: HashMap::new(),
+            metrics,
+            supported_dtypes,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle { tx })
+    }
+
+    /// First entry of [`Executor::supported_dtypes`]. Used when this
+    /// executor must pick a dtype itself (e.g. preload, prompt-build
+    /// convenience RPCs).
+    pub(super) fn preferred_dtype(&self) -> Dtype {
+        self.supported_dtypes[0]
     }
 
     async fn run(mut self) {
@@ -160,15 +170,16 @@ impl Executor {
 impl Executor {
     fn handle_get_stats(&self) -> GetStatsResponse {
         let model_stats = self
-            .model_stats
-            .iter()
-            .map(|(model_id, stats)| ModelTokenStats {
-                model_id: model_id.clone(),
-                stats: Some(stats.to_proto()),
+            .metrics
+            .known_model_ids()
+            .into_iter()
+            .map(|model_id| ModelTokenStats {
+                stats: Some(self.metrics.model_snapshot(&model_id)),
+                model_id,
             })
             .collect();
         GetStatsResponse {
-            stats: Some(self.stats.to_proto()),
+            stats: Some(self.metrics.global_snapshot()),
             model_stats,
         }
     }
@@ -177,22 +188,20 @@ impl Executor {
         &self,
         request: hellas_rpc::pb::hellas::GetModelStatsRequest,
     ) -> GetModelStatsResponse {
-        let model_id = request.model_id;
-        let stats = self.model_stats.get(&model_id).cloned().unwrap_or_default();
         GetModelStatsResponse {
-            model_id,
-            stats: Some(stats.to_proto()),
+            stats: Some(self.metrics.model_snapshot(&request.model_id)),
+            model_id: request.model_id,
         }
     }
 }
 
-fn weights_not_ready_error(locator: &WeightsLocator) -> ExecutorError {
+fn weights_not_ready_error(locator: &HuggingFaceLocator) -> ExecutorError {
     ExecutorError::WeightsNotReady(locator.to_string())
 }
 
-fn map_weights_error(locator: &WeightsLocator, error: WeightsError) -> ExecutorError {
+fn map_weights_error(locator: &HuggingFaceLocator, error: inputs::Error) -> ExecutorError {
     match error {
-        WeightsError::NotReady | WeightsError::UnknownKey => weights_not_ready_error(locator),
-        WeightsError::Failed(message) => ExecutorError::WeightsError(message),
+        inputs::Error::NotReady | inputs::Error::UnknownKey => weights_not_ready_error(locator),
+        inputs::Error::Failed(message) => ExecutorError::WeightsError(message),
     }
 }

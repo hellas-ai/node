@@ -1,17 +1,22 @@
-use super::{WeightsBundle, WeightsLocator};
-use crate::ExecutorError;
+use super::{Bundle, HuggingFaceLocator};
 use crate::backend::create_backend;
+use catgrad::runtime::Inputs;
 use catgrad_llm::utils::{get_model_files, load_model_weights};
+use hellas_rpc::ExecutorError;
 use hf_hub::{Cache, Repo, RepoType};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) struct LoadedWeights {
+pub(crate) struct Loaded {
     pub resolved_revision: String,
-    pub bundle: Arc<WeightsBundle>,
+    pub bundle: Arc<Bundle>,
 }
 
-pub(crate) fn has_cached_weights(locator: &WeightsLocator) -> bool {
+/// Cheap pre-check: do we already have config + weight files for this
+/// locator in the local HF cache? Used by [`crate::programs::Cache`] to
+/// decide whether `download-policy=skip` should refuse the load or let it
+/// hit the existing cache hit-path.
+pub(crate) fn is_cached_locally(locator: &HuggingFaceLocator) -> bool {
     let repo = Cache::default().repo(Repo::with_revision(
         locator.model_id.clone(),
         RepoType::Model,
@@ -23,9 +28,7 @@ pub(crate) fn has_cached_weights(locator: &WeightsLocator) -> bool {
     has_config && has_weights
 }
 
-pub(crate) fn load_weights_bundle(
-    locator: &WeightsLocator,
-) -> Result<LoadedWeights, ExecutorError> {
+pub(crate) fn load_bundle(locator: &HuggingFaceLocator) -> Result<Loaded, ExecutorError> {
     let backend = create_backend()?;
     let (model_paths, config_path, _tokenizer_path, _tokenizer_config_path) =
         get_model_files(&locator.model_id, &locator.revision)?;
@@ -37,13 +40,12 @@ pub(crate) fn load_weights_bundle(
     })?;
 
     let (parameter_values, parameter_types, _total_params) =
-        load_model_weights(model_paths, &backend, catgrad::prelude::Dtype::F32)?;
-    let bundle = Arc::new(WeightsBundle {
-        parameter_values,
-        parameter_types,
-    });
+        load_model_weights(model_paths, &backend, locator.dtype)?;
+    let inputs = Inputs::new(backend, parameter_values, parameter_types)
+        .map_err(catgrad_llm::LLMError::from)?;
+    let bundle = Arc::new(Bundle { inputs });
 
-    Ok(LoadedWeights {
+    Ok(Loaded {
         resolved_revision,
         bundle,
     })

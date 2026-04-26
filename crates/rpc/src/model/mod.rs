@@ -80,12 +80,4 @@ pub enum ModelAssetsError {
         #[source]
         source: TokenizerError,
     },
-    #[error(
-        "prompt too long for current catgrad prefill on {architecture}: {prompt_tokens} tokens exceeds limit {limit}"
-    )]
-    PromptTooLong {
-        architecture: String,
-        prompt_tokens: usize,
-        limit: usize,
-    },
 }

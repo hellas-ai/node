@@ -1,13 +1,15 @@
 use anyhow::Context;
-#[cfg(feature = "_backend")]
+#[cfg(feature = "hellas-executor")]
 use anyhow::anyhow;
+#[cfg(feature = "hellas-executor")]
+use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
-#[cfg(feature = "_backend")]
+#[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
-#[cfg(feature = "_backend")]
+#[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::model::ModelAssets;
@@ -49,6 +51,7 @@ type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionRoute {
+    #[cfg(feature = "hellas-executor")]
     Local,
     RemoteDirect(RemoteNodeTarget),
     RemoteDiscovery { retries: usize },
@@ -96,7 +99,7 @@ pub enum ExecutionStrategy {
 
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
-    #[cfg(feature = "_backend")]
+    #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
     secret_key: Option<SecretKey>,
 }
@@ -111,7 +114,7 @@ pub struct ExecutionOutput {
 // ---------------------------------------------------------------------------
 
 impl ExecutionRuntime {
-    #[cfg(feature = "_backend")]
+    #[cfg(feature = "hellas-executor")]
     pub fn with_local_executor(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
@@ -124,15 +127,22 @@ impl ExecutionRuntime {
         self
     }
 
-    #[cfg(feature = "_backend")]
-    pub fn spawn_default_local(queue_capacity: usize) -> anyhow::Result<Self> {
-        let local_executor =
-            Executor::spawn(DownloadPolicy::Eager, ExecutePolicy::Eager, queue_capacity)
-                .context("failed to initialize local execution backend")?;
+    #[cfg(feature = "hellas-executor")]
+    pub fn spawn_default_local(
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+    ) -> anyhow::Result<Self> {
+        let local_executor = Executor::spawn(
+            DownloadPolicy::Eager,
+            ExecutePolicy::Eager,
+            queue_capacity,
+            supported_dtypes,
+        )
+        .context("failed to initialize local execution backend")?;
         Ok(Self::with_local_executor(local_executor))
     }
 
-    #[cfg(feature = "_backend")]
+    #[cfg(feature = "hellas-executor")]
     fn require_local_executor(&self) -> anyhow::Result<ExecutorHandle> {
         self.local_executor
             .clone()
@@ -192,7 +202,10 @@ impl ExecutionRequest {
     }
 
     pub fn uses_remote_transport(&self) -> bool {
+        #[cfg(feature = "hellas-executor")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
+        #[cfg(not(feature = "hellas-executor"))]
+        let is_remote = |_r: &ExecutionRoute| true;
         match &self.strategy {
             ExecutionStrategy::Run(route) => is_remote(route),
             ExecutionStrategy::Verify { primary, shadow } => {
@@ -231,7 +244,7 @@ impl PreparedExecution {
 // ---------------------------------------------------------------------------
 
 enum PreparedRoute {
-    #[cfg(feature = "_backend")]
+    #[cfg(feature = "hellas-executor")]
     Local {
         executor: ExecutorHandle,
         quote_id: String,
@@ -276,7 +289,7 @@ impl PreparedRoute {
         route: &ExecutionRoute,
     ) -> anyhow::Result<Self> {
         match route {
-            #[cfg(feature = "_backend")]
+            #[cfg(feature = "hellas-executor")]
             ExecutionRoute::Local => {
                 let mut executor = runtime.require_local_executor()?;
                 executor
@@ -292,10 +305,6 @@ impl PreparedRoute {
                     quote_id: quote.quote_id,
                 })
             }
-            #[cfg(not(feature = "_backend"))]
-            ExecutionRoute::Local => anyhow::bail!(
-                "local execution requested but this build has no backend; rebuild with e.g. --features candle-cpu, cuda, or candle-metal"
-            ),
             ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
                 let quote = quote_remote_target(quote_req, &endpoint, target).await?;
@@ -316,7 +325,7 @@ impl PreparedRoute {
     #[instrument(skip_all)]
     async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
         match self {
-            #[cfg(feature = "_backend")]
+            #[cfg(feature = "hellas-executor")]
             PreparedRoute::Local { executor, quote_id } => {
                 execute_with_driver(executor, quote_id.clone(), sink).await
             }
@@ -415,7 +424,7 @@ where
         .get_quote(quote_req.clone())
         .await
         .with_context(context)?;
-    tracing::Span::current().record("quote_id", &tracing::field::display(&quote.quote_id));
+    tracing::Span::current().record("quote_id", tracing::field::display(&quote.quote_id));
     Ok(quote)
 }
 
@@ -535,13 +544,13 @@ async fn discover_remote_quote(
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let mut registry = ServiceRegistry::new(&endpoint);
+    let mut registry = ServiceRegistry::new(endpoint);
     registry.with_pool_options(PoolOptions {
         connect_timeout: REMOTE_CONNECT_TIMEOUT,
         ..PoolOptions::default()
     });
     registry.add(MdnsBackend::new(bindings.mdns));
-    registry.add(DhtBackend::with_dht(&endpoint, bindings.dht));
+    registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
     let pool = registry.pool::<ExecuteService>();
 
     let peers = Box::pin(registry.discover::<ExecuteService>());
@@ -726,11 +735,11 @@ fn consume_stream_event(
 ) -> anyhow::Result<Option<StreamUpdate>> {
     let (status, progress, error) = match event.event {
         Some(execute_stream_event::Event::Snapshot(snapshot)) => {
-            if let Some(output_chunk) = snapshot.output.get(output.len()..) {
-                if !output_chunk.is_empty() {
-                    output.extend_from_slice(output_chunk);
-                    sink(output_chunk)?;
-                }
+            if let Some(output_chunk) = snapshot.output.get(output.len()..)
+                && !output_chunk.is_empty()
+            {
+                output.extend_from_slice(output_chunk);
+                sink(output_chunk)?;
             }
             (
                 ExecutionStatus::try_from(snapshot.status).unwrap_or(ExecutionStatus::Unspecified),
@@ -759,7 +768,7 @@ fn consume_stream_event(
     }))
 }
 
-#[cfg(feature = "_backend")]
+#[cfg(feature = "hellas-executor")]
 fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {
@@ -837,7 +846,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "_backend"))]
+#[cfg(all(test, feature = "hellas-executor"))]
 mod timing_tests {
     use super::*;
     use hellas_rpc::error::ExecutorError;
@@ -866,9 +875,13 @@ mod timing_tests {
             .unwrap_or_else(|_| "tell me a story about a boy named billy".to_string());
         let max_seq = optional_env_u32("HELLAS_TIMING_MAX_SEQ", 128);
 
-        let assets = Arc::new(ModelAssets::load(&model).expect("failed to load model assets"));
+        let assets = Arc::new(
+            ModelAssets::load(&model, Dtype::F32)
+                .expect("failed to load model assets"),
+        );
         let runtime = ExecutionRuntime::spawn_default_local(
             hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+            vec![Dtype::F32],
         )
         .expect("failed to start local executor");
         let prepared = assets
