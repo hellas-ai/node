@@ -28,7 +28,6 @@ impl Executor {
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
         let provenance = ExecutionProvenance {
             commitment_id: *quote.start.commitment_id.as_bytes(),
-            program_id: *quote.execution.bound_program().program().id().as_bytes(),
         };
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;

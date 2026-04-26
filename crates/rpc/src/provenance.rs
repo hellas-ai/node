@@ -21,12 +21,9 @@ use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
 /// HTTP header / tonic metadata key for the request commitment
 /// (`Cid<TextExecution>` — hash over program, parameter CIDs, prompt
-/// tokens, policy).
+/// tokens, policy). The commitment transitively names the program, so we
+/// don't expose the program CID separately.
 pub const COMMITMENT_HEADER: &str = "x-hellas-commitment-id";
-
-/// HTTP header / tonic metadata key for the bound program
-/// (`Cid<Program>`).
-pub const PROGRAM_HEADER: &str = "x-hellas-program-id";
 
 /// HTTP header / tonic metadata key for the terminal execution receipt
 /// (`Cid<TextReceipt>`). On streaming responses this only appears as an
@@ -41,7 +38,6 @@ pub const RECEIPT_HEADER: &str = "x-hellas-receipt-id";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],
-    pub program_id: [u8; 32],
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -104,13 +100,12 @@ pub fn cid_bytes_from_metadata(
     Ok(out)
 }
 
-/// Read the full pre-flight provenance (commitment + program) from a
-/// tonic metadata map. Returns `Err(Missing)` for the first absent key,
-/// so older servers that don't set provenance are detectable.
+/// Read the pre-flight provenance from a tonic metadata map. Returns
+/// `Err(Missing)` if the commitment key is absent, so older servers that
+/// don't set provenance are detectable.
 pub fn read_provenance_metadata(md: &MetadataMap) -> Result<ExecutionProvenance, ProvenanceError> {
     Ok(ExecutionProvenance {
         commitment_id: cid_bytes_from_metadata(md, COMMITMENT_HEADER)?,
-        program_id: cid_bytes_from_metadata(md, PROGRAM_HEADER)?,
     })
 }
 
@@ -119,7 +114,6 @@ pub fn read_provenance_metadata(md: &MetadataMap) -> Result<ExecutionProvenance,
 /// streaming RPCs.
 pub fn write_provenance_metadata(md: &mut MetadataMap, prov: &ExecutionProvenance) {
     md.insert(COMMITMENT_HEADER, cid_bytes_to_metadata(&prov.commitment_id));
-    md.insert(PROGRAM_HEADER, cid_bytes_to_metadata(&prov.program_id));
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -137,7 +131,6 @@ mod tests {
     fn sample() -> ExecutionProvenance {
         ExecutionProvenance {
             commitment_id: [0xab; 32],
-            program_id: [0xcd; 32],
         }
     }
 
@@ -166,18 +159,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_program_when_only_commitment_set() {
-        let mut md = MetadataMap::new();
-        md.insert(COMMITMENT_HEADER, cid_bytes_to_metadata(&[0; 32]));
-        let err = read_provenance_metadata(&md).expect_err("missing program should fail");
-        assert_eq!(err, ProvenanceError::Missing { key: PROGRAM_HEADER });
-    }
-
-    #[test]
     fn bad_length_reports_actual_length() {
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "deadbeef".parse().unwrap());
-        md.insert(PROGRAM_HEADER, cid_bytes_to_metadata(&[0; 32]));
         let err = read_provenance_metadata(&md).expect_err("too-short value must fail");
         assert_eq!(err, ProvenanceError::BadLength { key: COMMITMENT_HEADER, len: 8 });
     }
@@ -186,7 +170,6 @@ mod tests {
     fn bad_hex_rejected() {
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "z".repeat(64).parse().unwrap());
-        md.insert(PROGRAM_HEADER, cid_bytes_to_metadata(&[0; 32]));
         let err = read_provenance_metadata(&md).expect_err("non-hex value must fail");
         assert_eq!(err, ProvenanceError::BadHex { key: COMMITMENT_HEADER });
     }
@@ -196,7 +179,6 @@ mod tests {
         // Display is lowercase; we reject uppercase so the wire form is unambiguous.
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "AB".repeat(32).parse().unwrap());
-        md.insert(PROGRAM_HEADER, cid_bytes_to_metadata(&[0; 32]));
         let err = read_provenance_metadata(&md).expect_err("uppercase hex must fail");
         assert_eq!(err, ProvenanceError::BadHex { key: COMMITMENT_HEADER });
     }
