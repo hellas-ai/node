@@ -62,7 +62,7 @@ impl QuotePlan {
         // graphs, not part of node's text path today) are accepted: there's
         // nothing to mismatch on.
         let program_dtype = program
-            .empty_state_type
+            .empty_state_type()
             .first()
             .map(|&(dtype, _)| dtype);
         if let Some(program_dtype) = program_dtype
@@ -107,10 +107,10 @@ impl QuotePlan {
             )));
         }
         let expected_max_sequence_length = input_ids.len().saturating_add(max_new_tokens as usize);
-        if program.max_sequence_length != expected_max_sequence_length {
+        if program.max_sequence_length() != expected_max_sequence_length {
             return Err(ExecutorError::InvalidQuoteRequest(format!(
                 "program max_sequence_length mismatch: request implies {expected_max_sequence_length}, program declares {}",
-                program.max_sequence_length
+                program.max_sequence_length()
             )));
         }
 
