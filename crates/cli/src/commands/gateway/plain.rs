@@ -71,9 +71,16 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     stop_reason,
+                    total_tokens,
                     receipt_cid,
-                    ..
                 })))) => {
+                    info!(
+                        %receipt_cid,
+                        provenance = ?stream_provenance,
+                        total_tokens,
+                        ?stop_reason,
+                        "completion request ready"
+                    );
                     completed = Some((map_finish_reason(stop_reason), receipt_cid));
                     break;
                 }
@@ -159,7 +166,16 @@ async fn respond(prepared: PreparedGeneration) -> Response {
             total_tokens,
             stop_reason,
             receipt_cid,
-        }) => (total_tokens, map_finish_reason(stop_reason), receipt_cid),
+        }) => {
+            info!(
+                %receipt_cid,
+                ?provenance,
+                total_tokens,
+                ?stop_reason,
+                "completion request ready"
+            );
+            (total_tokens, map_finish_reason(stop_reason), receipt_cid)
+        }
         Ok(Outcome::Failed { position, error }) => {
             warn!(position, %error, "completion request failed");
             return super::json_error(
