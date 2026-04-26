@@ -15,7 +15,7 @@ use catgrad::cid::Cid;
 use catgrad_llm::runtime::TextReceipt;
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{
-    COMMITMENT_HEADER, ExecutionProvenance, PROGRAM_HEADER, RECEIPT_HEADER, encode_hex,
+    COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex,
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -66,9 +66,9 @@ where
 fn apply_provenance_headers(response: &mut Response<Body>) {
     let extensions = response.extensions().clone();
     if let Some(prov) = extensions.get::<ExecutionProvenance>() {
-        let headers = response.headers_mut();
-        headers.insert(commitment_header(), header_value(&prov.commitment_id));
-        headers.insert(program_header(), header_value(&prov.program_id));
+        response
+            .headers_mut()
+            .insert(commitment_header(), header_value(&prov.commitment_id));
     }
     if let Some(receipt) = extensions.get::<Cid<TextReceipt>>() {
         response
@@ -79,10 +79,6 @@ fn apply_provenance_headers(response: &mut Response<Body>) {
 
 fn commitment_header() -> HeaderName {
     HeaderName::from_static(COMMITMENT_HEADER)
-}
-
-fn program_header() -> HeaderName {
-    HeaderName::from_static(PROGRAM_HEADER)
 }
 
 fn receipt_header() -> HeaderName {
@@ -117,10 +113,9 @@ mod tests {
     }
 
     #[test]
-    fn applies_all_three_headers_when_present() {
+    fn applies_both_headers_when_present() {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
-            program_id: [0xcd; 32],
         };
         let receipt = Cid::<TextReceipt>::from_bytes([0xef; 32]);
         let mut response = build_response_with_extensions(Some(prov.clone()), Some(receipt));
@@ -135,13 +130,6 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get(PROGRAM_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some("cd".repeat(32).as_str())
-        );
-        assert_eq!(
-            response
-                .headers()
                 .get(RECEIPT_HEADER)
                 .and_then(|v| v.to_str().ok()),
             Some("ef".repeat(32).as_str())
@@ -152,12 +140,10 @@ mod tests {
     fn skips_receipt_header_when_absent() {
         let prov = ExecutionProvenance {
             commitment_id: [1; 32],
-            program_id: [2; 32],
         };
         let mut response = build_response_with_extensions(Some(prov), None);
         apply_provenance_headers(&mut response);
         assert!(response.headers().contains_key(COMMITMENT_HEADER));
-        assert!(response.headers().contains_key(PROGRAM_HEADER));
         assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
@@ -166,7 +152,6 @@ mod tests {
         let mut response = build_response_with_extensions(None, None);
         apply_provenance_headers(&mut response);
         assert!(!response.headers().contains_key(COMMITMENT_HEADER));
-        assert!(!response.headers().contains_key(PROGRAM_HEADER));
         assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
@@ -183,7 +168,6 @@ mod tests {
         async fn handler() -> Response<Body> {
             let prov = ExecutionProvenance {
                 commitment_id: [0x12; 32],
-                program_id: [0x34; 32],
             };
             let receipt = Cid::<TextReceipt>::from_bytes([0x56; 32]);
             let mut response = Response::new(Body::empty());
@@ -204,10 +188,6 @@ mod tests {
         assert_eq!(
             response.headers().get(COMMITMENT_HEADER).unwrap(),
             &"12".repeat(32)
-        );
-        assert_eq!(
-            response.headers().get(PROGRAM_HEADER).unwrap(),
-            &"34".repeat(32)
         );
         assert_eq!(
             response.headers().get(RECEIPT_HEADER).unwrap(),

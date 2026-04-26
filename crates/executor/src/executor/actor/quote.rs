@@ -179,7 +179,6 @@ impl Executor {
             },
             provenance: ExecutionProvenance {
                 commitment_id: *commitment_id.as_bytes(),
-                program_id: *program_id.as_bytes(),
             },
         })
     }

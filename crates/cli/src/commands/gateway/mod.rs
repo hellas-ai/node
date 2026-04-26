@@ -215,17 +215,14 @@ fn sse_event_data<T: Serialize>(event: &str, payload: &T) -> Event {
     Event::default().event(event).data(data)
 }
 
-/// Initial in-band SSE event carrying the request commitment + program
-/// CIDs. Browser `EventSource` consumers pick this up via
+/// Initial in-band SSE event carrying the request commitment CID.
+/// Browser `EventSource` consumers pick this up via
 /// `addEventListener("hellas-provenance", …)` since they can't read
 /// HTTP response headers.
 fn provenance_sse_event(prov: &ExecutionProvenance) -> Event {
     sse_event_data(
         "hellas-provenance",
-        &json!({
-            "commitment_id": encode_hex(&prov.commitment_id),
-            "program_id":    encode_hex(&prov.program_id),
-        }),
+        &json!({ "commitment_id": encode_hex(&prov.commitment_id) }),
     )
 }
 
