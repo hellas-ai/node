@@ -162,6 +162,13 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                 total_tokens,
                 receipt_cid,
             } => {
+                info!(
+                    %receipt_cid,
+                    provenance = ?stream_provenance,
+                    total_tokens,
+                    ?stop_reason,
+                    "anthropic message completion ready"
+                );
                 let final_stop_reason = if has_tools {
                     let parsed = assets.parse_tool_calls(&tool_buffer).unwrap_or_else(|err| {
                         warn!(error = %err, "failed to parse tool calls from streamed text");
@@ -321,7 +328,16 @@ async fn respond(prepared: PreparedGeneration) -> Response {
             total_tokens,
             stop_reason,
             receipt_cid,
-        } => (total_tokens, stop_reason, receipt_cid),
+        } => {
+            info!(
+                %receipt_cid,
+                ?provenance,
+                total_tokens,
+                ?stop_reason,
+                "anthropic message completion ready"
+            );
+            (total_tokens, stop_reason, receipt_cid)
+        }
         Outcome::Failed { position, error } => {
             warn!(position, %error, "anthropic message request failed");
             return super::json_error(

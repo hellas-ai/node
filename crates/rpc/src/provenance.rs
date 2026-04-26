@@ -35,9 +35,33 @@ pub const RECEIPT_HEADER: &str = "x-hellas-receipt-id";
 /// terminal and not part of this struct — it travels via the streaming
 /// `Outcome::Completed` payload (and from there into a separate
 /// `Cid<TextReceipt>` extension on the HTTP response when applicable).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],
+}
+
+/// Renders as the commitment's lowercase-hex string, matching how it
+/// appears in tonic metadata and HTTP headers. Lets callers log
+/// provenance with `%prov` (or `?Option<ExecutionProvenance>` for the
+/// `Some(deadbeef…) | None` form tracing produces) instead of
+/// hand-rolling the hex render.
+impl std::fmt::Display for ExecutionProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.commitment_id {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Debug == Display so `?provenance` and `?Option<ExecutionProvenance>`
+/// stay readable in tracing output. The default derive would render
+/// `ExecutionProvenance { commitment_id: [171, 171, …] }` which is the
+/// opposite of useful.
+impl std::fmt::Debug for ExecutionProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
