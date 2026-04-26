@@ -21,13 +21,13 @@ impl Executor {
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;
-        let stat_cached_prompt = quote.start.transcript.len() as u64;
+        let stat_cached_prompt = 0u64;
         let stat_cached_output = quote
             .start
             .cached_output_tokens
             .as_ref()
             .map_or(0, |t| t.len() as u64);
-        let stat_prefill = stat_prompt.saturating_sub(stat_cached_prompt);
+        let stat_prefill = stat_prompt;
 
         let model_id = quote.model_id.clone();
         let execution_id = self.store.create_execution(&model_id);

@@ -110,7 +110,6 @@ impl WorkerThread {
             commitment_id = %start.commitment_id,
             queue_wait_ms = accepted_at.elapsed().as_millis(),
             prompt_tokens = invocation.input_ids.len(),
-            cached_prompt_tokens = start.transcript.len(),
             cached_output_tokens = start.cached_output_tokens.as_ref().map_or(0, |tokens| tokens.len()),
             "execute worker starting"
         );
