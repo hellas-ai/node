@@ -78,4 +78,21 @@ pub enum ModelAssetsError {
         #[source]
         source: TokenizerError,
     },
+    /// One of the offered tool schemas is malformed (not a valid
+    /// JSON Schema, duplicate name, or a tool entry that doesn't fit
+    /// the expected wire shape). Gateway maps this to a request error
+    /// (HTTP 400 / OpenAI invalid_request) — the tools themselves are
+    /// bad, the model never ran.
+    #[error("invalid tool directory")]
+    InvalidToolDirectory {
+        #[source]
+        source: LLMError,
+    },
+    /// Caller asked for tools but the model architecture has no
+    /// registered tool-call protocol. Gateway maps this to a request
+    /// error (HTTP 400) with a "model X does not support tool calling"
+    /// message — the model is incapable, the request shouldn't have
+    /// been made.
+    #[error("model `{arch}` does not support tool calling")]
+    ToolsUnsupportedForModel { arch: String },
 }
