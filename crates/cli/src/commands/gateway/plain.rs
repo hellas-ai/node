@@ -1,11 +1,16 @@
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
+use super::{
+    next_id, now_unix, parse_json_body, provenance_sse_event, receipt_sse_event, sse_data,
+    sse_response,
+};
 use crate::execution::{Outcome, StopReason};
 use async_stream::stream;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
+use catgrad::cid::Cid;
+use catgrad_llm::runtime::TextReceipt;
 use catgrad_llm::types::{openai, plain};
 use futures::StreamExt;
 use serde_json::json;
@@ -32,13 +37,19 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
     let id = next_id("cmpl");
     let created = now_unix();
     let model = prepared.model.clone();
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
-    sse_response(stream! {
+    let stream_provenance = provenance.clone();
+    let mut response = sse_response(stream! {
+        if let Some(prov) = stream_provenance.as_ref() {
+            yield Ok(provenance_sse_event(prov));
+        }
+
         let inner = prepared.stream();
         tokio::pin!(inner);
 
-        let mut finish_reason: Option<openai::FinishReason> = None;
+        let mut completed: Option<(openai::FinishReason, Cid<TextReceipt>)> = None;
         let mut error_message: Option<String> = None;
 
         loop {
@@ -58,8 +69,12 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                         .build();
                     yield Ok(sse_data(&chunk));
                 }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed { stop_reason, .. })))) => {
-                    finish_reason = Some(map_finish_reason(stop_reason));
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
+                    stop_reason,
+                    receipt_cid,
+                    ..
+                })))) => {
+                    completed = Some((map_finish_reason(stop_reason), receipt_cid));
                     break;
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
@@ -87,7 +102,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
             yield Ok(sse_data(&json!({
                 "error": { "message": format!("Inference error: {err}") }
             })));
-        } else if let Some(reason) = finish_reason {
+        } else if let Some((reason, receipt_cid)) = completed {
             let final_chunk = plain::CompletionChunk::builder()
                 .id(id.clone())
                 .object("text_completion".to_string())
@@ -102,10 +117,15 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                 ])
                 .build();
             yield Ok(sse_data(&final_chunk));
+            yield Ok(receipt_sse_event(&receipt_cid));
         }
 
         yield Ok(axum::response::sse::Event::default().data("[DONE]"));
-    })
+    });
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response
 }
 
 async fn respond(prepared: PreparedGeneration) -> Response {
@@ -113,6 +133,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let created = now_unix();
     let model = prepared.model.clone();
     let prompt_tokens = prepared.prompt_tokens;
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
     let stream = prepared.stream();
@@ -133,12 +154,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (completion_tokens, finish_reason) = match outcome {
+    let (completion_tokens, finish_reason, receipt_cid) = match outcome {
         Ok(Outcome::Completed {
             total_tokens,
             stop_reason,
-            ..
-        }) => (total_tokens, map_finish_reason(stop_reason)),
+            receipt_cid,
+        }) => (total_tokens, map_finish_reason(stop_reason), receipt_cid),
         Ok(Outcome::Failed { position, error }) => {
             warn!(position, %error, "completion request failed");
             return super::json_error(
@@ -170,7 +191,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         )))
         .build();
 
-    Json(response).into_response()
+    let mut response = Json(response).into_response();
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response.extensions_mut().insert(receipt_cid);
+    response
 }
 
 fn map_finish_reason(stop: StopReason) -> openai::FinishReason {

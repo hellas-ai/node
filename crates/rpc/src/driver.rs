@@ -11,17 +11,36 @@ use tonic_iroh_transport::IrohChannel;
 use crate::GRPC_MESSAGE_LIMIT;
 use crate::pb::hellas::execute_client::ExecuteClient;
 use crate::pb::hellas::{ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse};
+use crate::provenance::{ExecutionProvenance, read_provenance_metadata};
 
 pub type ExecuteEventStream =
     Pin<Box<dyn Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
 
+/// Quote response paired with the provenance the executor committed to.
+/// Carried alongside `GetQuoteResponse` so callers (the gateway) can
+/// expose the same hashes the executor logged at quote/accept time.
+#[derive(Debug)]
+pub struct QuotedResponse {
+    pub response: GetQuoteResponse,
+    pub provenance: ExecutionProvenance,
+}
+
+/// Streaming execution paired with the provenance committed to at
+/// quote-acceptance time. The receipt CID is terminal and reaches the
+/// caller via the streamed `Completed.receipt_cid` proto field, not
+/// through `ExecutionProvenance`.
+pub struct StreamedExecution {
+    pub stream: ExecuteEventStream,
+    pub provenance: ExecutionProvenance,
+}
+
 #[tonic::async_trait]
 pub trait ExecuteDriver: Send {
-    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<GetQuoteResponse, Status>;
+    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<QuotedResponse, Status>;
     async fn execute_streaming(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteEventStream, Status>;
+    ) -> Result<StreamedExecution, Status>;
 }
 
 pub struct RemoteExecuteDriver<T> {
@@ -71,15 +90,24 @@ where
     <T::ResponseBody as Body>::Error: Into<StdError> + Send,
     T::Future: Send,
 {
-    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<GetQuoteResponse, Status> {
-        Ok(self.client.get_quote(request).await?.into_inner())
+    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<QuotedResponse, Status> {
+        let resp = self.client.get_quote(request).await?;
+        let provenance = read_provenance_metadata(resp.metadata())?;
+        Ok(QuotedResponse {
+            response: resp.into_inner(),
+            provenance,
+        })
     }
 
     async fn execute_streaming(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteEventStream, Status> {
-        let stream = self.client.execute(request).await?.into_inner();
-        Ok(Box::pin(stream))
+    ) -> Result<StreamedExecution, Status> {
+        let resp = self.client.execute(request).await?;
+        let provenance = read_provenance_metadata(resp.metadata())?;
+        Ok(StreamedExecution {
+            stream: Box::pin(resp.into_inner()),
+            provenance,
+        })
     }
 }
