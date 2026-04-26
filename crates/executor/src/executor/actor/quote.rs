@@ -1,13 +1,16 @@
-use crate::ExecutorError;
-use crate::model::ModelAssets;
-use hellas_rpc::spec::ModelSpec;
+use crate::inputs::{EnsureDisposition, HuggingFaceLocator, Status, is_cached_locally};
 use crate::state::{QuotePlan, QuoteRecord};
-use crate::weights::{EnsureDisposition, EntryStatusSnapshot, WeightsLocator, has_cached_weights};
+use catgrad::prelude::Dtype;
+use catgrad_llm::runtime::{BoundProgramText, TextPolicy};
 use catgrad_llm::types;
+use hellas_rpc::ExecutorError;
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::spec::ModelSpec;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use super::{Executor, weights_not_ready_error};
@@ -15,11 +18,63 @@ use super::{Executor, weights_not_ready_error};
 const STATIC_QUOTE_AMOUNT: u64 = 1000;
 const QUOTE_TTL: Duration = Duration::from_secs(30);
 
+/// Lower-case `Dtype` rendering used in wire fields so callers don't pay
+/// the `Debug` impl's upper-case quirk (`F32` etc.).
+fn dtype_to_wire(dtype: Dtype) -> String {
+    match dtype {
+        Dtype::F32 => "f32".to_string(),
+        Dtype::F16 => "f16".to_string(),
+        Dtype::BF16 => "bf16".to_string(),
+        Dtype::U32 => "u32".to_string(),
+    }
+}
+
+impl Executor {
+    /// Resolve a client-supplied dtype preference list against this
+    /// executor's `supported_dtypes`. The first entry of `prefs` that this
+    /// executor supports wins. An empty `prefs` list lets the executor
+    /// fall back to its preferred dtype. If `prefs` is non-empty and none
+    /// of its entries are supported, the request is refused with
+    /// `DtypeNotSupported`.
+    ///
+    /// Each entry must be `"f32"`, `"f16"`, or `"bf16"`. `"u32"` and
+    /// unknown strings produce `InvalidQuoteRequest`.
+    pub(super) fn resolve_accept_dtypes(
+        &self,
+        prefs: &[String],
+    ) -> Result<Dtype, ExecutorError> {
+        if prefs.is_empty() {
+            return Ok(self.preferred_dtype());
+        }
+        let mut parsed = Vec::with_capacity(prefs.len());
+        for raw in prefs {
+            let dtype = Dtype::from_str(raw).map_err(|e| {
+                ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
+            })?;
+            if matches!(dtype, Dtype::U32) {
+                return Err(ExecutorError::InvalidQuoteRequest(
+                    "model dtype must be f32, f16, or bf16".to_string(),
+                ));
+            }
+            parsed.push(dtype);
+        }
+        for dtype in &parsed {
+            if self.supported_dtypes.contains(dtype) {
+                return Ok(*dtype);
+            }
+        }
+        Err(ExecutorError::DtypeNotSupported {
+            request: parsed[0],
+            supported: self.supported_dtypes.clone(),
+        })
+    }
+}
+
 impl Executor {
     pub(super) async fn handle_preload(&mut self, model: String) -> Result<(), ExecutorError> {
         let spec = ModelSpec::parse(&model).map_err(hellas_rpc::ModelAssetsError::from)?;
-        let locator: WeightsLocator = spec.into();
-        self.runtime_manager
+        let locator = HuggingFaceLocator::from_spec(spec, self.preferred_dtype());
+        self.programs
             .ensure_preloaded(locator.clone())
             .await
             .map_err(|error| super::map_weights_error(&locator, error))?;
@@ -38,13 +93,13 @@ impl Executor {
         let total_start = Instant::now();
         self.store.prune_expired_quotes(Instant::now());
         let plan_start = Instant::now();
-        let plan = QuotePlan::from_quote_request(request)?;
+        let plan = QuotePlan::from_quote_request(request, &self.supported_dtypes)?;
         let plan_parse_ms = plan_start.elapsed().as_millis();
-        let program_id = plan.program_id.clone();
-        if !self
-            .execute_policy
-            .allows_execute(&program_id, Some(plan.weights_key.model_id.as_str()))
-        {
+        let program_id = plan.program.id();
+        if !self.execute_policy.allows_execute(
+            &program_id.to_string(),
+            Some(plan.weights_key.model_id.as_str()),
+        ) {
             return Err(ExecutorError::PolicyDenied(format!(
                 "execute policy denied program {} for model {}",
                 program_id, plan.weights_key.model_id
@@ -56,12 +111,23 @@ impl Executor {
         let ensure_weights_ms = ensure_start.elapsed().as_millis();
         let bind_start = Instant::now();
         let execution = self
-            .runtime_manager
-            .bound_program(&plan.weights_key, &plan.program_id, &plan.program)
+            .programs
+            .bound_program(&plan.weights_key, &plan.program)
             .await?;
         let bind_program_ms = bind_start.elapsed().as_millis();
+        // Canonical request commitment: program CID + parameter tensor CIDs +
+        // prompt token tensor CID + policy CID, all hashed via DAG-CBOR. This
+        // is the audit anchor and the exact-replay cache key.
+        let policy = TextPolicy::new(
+            plan.invocation.max_new_tokens,
+            plan.invocation.stop_token_ids.clone(),
+        );
+        let commitment_id = execution
+            .bound_program()
+            .text_execution(&plan.invocation.input_ids, &policy)
+            .id();
         let cache_start = Instant::now();
-        let start = execution.execution_start(&plan.invocation);
+        let start = execution.execution_start(&plan.invocation, commitment_id);
         let cache_lookup_ms = cache_start.elapsed().as_millis();
 
         let model_id = plan.weights_key.model_id.clone();
@@ -84,6 +150,7 @@ impl Executor {
         info!(
             %quote_id,
             %program_id,
+            %commitment_id,
             amount = STATIC_QUOTE_AMOUNT,
             model = model_id,
             requested_revision,
@@ -118,6 +185,7 @@ impl Executor {
         &mut self,
         request: QuotePromptRequest,
     ) -> Result<QuotePromptResponse, ExecutorError> {
+        let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
         let model_spec = format!(
             "{}{}",
             request.huggingface_model_id,
@@ -127,7 +195,7 @@ impl Executor {
                 format!("@{}", request.huggingface_revision)
             }
         );
-        let assets = ModelAssets::load(&model_spec)?;
+        let assets = ModelAssets::load(&model_spec, dtype)?;
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
@@ -138,6 +206,7 @@ impl Executor {
             amount: quote_response.amount,
             ttl_ms: quote_response.ttl_ms,
             prompt_tokens,
+            dtype: dtype_to_wire(dtype),
         })
     }
 
@@ -145,6 +214,7 @@ impl Executor {
         &mut self,
         request: QuoteChatPromptRequest,
     ) -> Result<QuoteChatPromptResponse, ExecutorError> {
+        let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
         let model_spec = format!(
             "{}{}",
             request.huggingface_model_id,
@@ -154,7 +224,7 @@ impl Executor {
                 format!("@{}", request.huggingface_revision)
             }
         );
-        let assets = ModelAssets::load(&model_spec)?;
+        let assets = ModelAssets::load(&model_spec, dtype)?;
 
         // Build ChatInput from proto messages + system_prompt.
         let mut messages: Vec<types::Message> = Vec::new();
@@ -180,19 +250,20 @@ impl Executor {
             amount: quote_response.amount,
             ttl_ms: quote_response.ttl_ms,
             prompt_tokens,
+            dtype: dtype_to_wire(dtype),
         })
     }
 
     pub(super) async fn handle_list_models(&self) -> ListModelsResponse {
-        let entries = self.runtime_manager.list_models().await;
+        let entries = self.programs.list_models().await;
         let models = entries
             .into_iter()
             .map(|(locator, status)| {
                 let (proto_status, error) = match status {
-                    EntryStatusSnapshot::Queued => (ModelStatus::Queued, String::new()),
-                    EntryStatusSnapshot::Loading => (ModelStatus::Loading, String::new()),
-                    EntryStatusSnapshot::Ready => (ModelStatus::Ready, String::new()),
-                    EntryStatusSnapshot::Failed(err) => (ModelStatus::Failed, err),
+                    Status::Queued => (ModelStatus::Queued, String::new()),
+                    Status::Loading => (ModelStatus::Loading, String::new()),
+                    Status::Ready => (ModelStatus::Ready, String::new()),
+                    Status::Failed(err) => (ModelStatus::Failed, err),
                 };
                 ModelInfo {
                     model_id: locator.model_id,
@@ -207,16 +278,16 @@ impl Executor {
 
     async fn ensure_quote_weights_ready(
         &self,
-        locator: &crate::weights::WeightsLocator,
+        locator: &HuggingFaceLocator,
     ) -> Result<(), ExecutorError> {
-        match self.runtime_manager.ensure_ready(locator.clone()).await {
+        match self.programs.ensure_ready(locator.clone()).await {
             EnsureDisposition::Ready => Ok(()),
             EnsureDisposition::Queued | EnsureDisposition::InFlight => {
-                if !has_cached_weights(locator) {
+                if !is_cached_locally(locator) {
                     return Err(weights_not_ready_error(locator));
                 }
 
-                self.runtime_manager
+                self.programs
                     .ensure_ready_wait(locator.clone(), tokio::time::Duration::from_secs(2))
                     .await
                     .map_err(|error| super::map_weights_error(locator, error))

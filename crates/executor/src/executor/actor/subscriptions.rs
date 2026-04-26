@@ -1,4 +1,5 @@
 use crate::state::ExecutionStatus;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{ExecuteProgress, ExecuteSnapshot, ExecuteStatusResponse};
 
 use super::super::stream::SubscriptionSet;
@@ -9,7 +10,7 @@ impl Executor {
     pub(super) fn handle_subscribe(
         &mut self,
         execution_id: String,
-    ) -> Result<LocalExecutionStream, crate::ExecutorError> {
+    ) -> Result<LocalExecutionStream, ExecutorError> {
         let snapshot = self.stream_snapshot(&execution_id)?;
 
         if matches!(
@@ -101,7 +102,7 @@ impl Executor {
     pub(super) fn status_response(
         &self,
         execution_id: &str,
-    ) -> Result<ExecuteStatusResponse, crate::ExecutorError> {
+    ) -> Result<ExecuteStatusResponse, ExecutorError> {
         let (status, progress) = self.store.status_snapshot(execution_id)?;
         Ok(ExecuteStatusResponse {
             status: status as i32,
@@ -109,7 +110,7 @@ impl Executor {
         })
     }
 
-    fn stream_snapshot(&self, execution_id: &str) -> Result<ExecuteSnapshot, crate::ExecutorError> {
+    fn stream_snapshot(&self, execution_id: &str) -> Result<ExecuteSnapshot, ExecutorError> {
         Ok(self.store.snapshot(execution_id)?.into())
     }
 }

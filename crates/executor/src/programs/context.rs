@@ -1,24 +1,39 @@
 use crate::backend::ExecBackend;
 use crate::state::Invocation;
-use catgrad_llm::{BoundProgram, Snapshot};
+use catgrad::cid::Cid;
+use catgrad::runtime::{BoundProgram, Program};
+use catgrad_llm::runtime::{BoundProgramText, TextExecution, TextSnapshot};
+use hellas_rpc::ExecutorError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_EXECUTION_CACHE_MAX_BYTES: usize = 8 << 30;
 
+/// Maximum number of suffix tokens to teacher-force via `advance_one` when
+/// resuming from a cached prefix snapshot. If the suffix is longer than this,
+/// we discard the prefix and run a parallel `prefill_from_empty` instead.
+///
+/// Conservative initial value per `docs/PREFIX.md` §4.2; should become a
+/// measured backend/model policy once we have decode/prefill cost data.
+const CATCH_UP_THRESHOLD: usize = 64;
+
 #[derive(Clone)]
 pub(crate) struct ExecutionContext {
     bound_program: Arc<BoundProgram<ExecBackend>>,
-    empty_snapshot: Arc<Snapshot<ExecBackend>>,
+    empty_snapshot: Arc<TextSnapshot<ExecBackend>>,
     execution_cache: Arc<Mutex<ExecutionCache>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ExecutionStart {
-    pub snapshot: Arc<Snapshot<ExecBackend>>,
+    pub snapshot: Arc<TextSnapshot<ExecBackend>>,
     pub transcript: TranscriptState,
     pub next_token: Option<u32>,
     pub cached_output_tokens: Option<Arc<[u32]>>,
+    /// Commitment for the request being quoted. Threaded into the worker so
+    /// `cache_continuation` can key the exact-output replay cache by the
+    /// canonical `Cid<TextExecution>` instead of bespoke per-cache identity.
+    pub commitment_id: Cid<TextExecution>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,15 +45,9 @@ pub(crate) struct TranscriptState {
     hash: TranscriptHash,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ContinuationKey {
-    max_new_tokens: u32,
-    stop_token_ids: Vec<i32>,
-}
-
 #[derive(Clone)]
 struct CheckpointEntry {
-    snapshot: Arc<Snapshot<ExecBackend>>,
+    snapshot: Arc<TextSnapshot<ExecBackend>>,
     next_token: u32,
     bytes: usize,
     last_touch: u64,
@@ -51,14 +60,14 @@ struct ContinuationEntry {
     last_touch: u64,
 }
 
-#[derive(Default)]
-struct TranscriptNode {
-    checkpoint: Option<CheckpointEntry>,
-    continuations: HashMap<ContinuationKey, ContinuationEntry>,
-}
-
+/// Two flat maps, no co-location: prefix snapshots are keyed by transcript
+/// position (because lookup is a prefix scan over the prompt), exact-replay
+/// continuations are keyed by `Cid<TextExecution>` (point lookup of the full
+/// request commitment). LRU eviction runs across both maps via a shared
+/// `touch_clock`.
 struct ExecutionCache {
-    nodes: HashMap<(usize, TranscriptHash), TranscriptNode>,
+    checkpoints: HashMap<(usize, TranscriptHash), CheckpointEntry>,
+    continuations: HashMap<Cid<TextExecution>, ContinuationEntry>,
     max_bytes: usize,
     total_bytes: usize,
     touch_clock: u64,
@@ -70,16 +79,14 @@ enum CacheItemKey {
         transcript_hash: TranscriptHash,
     },
     Continuation {
-        transcript_len: usize,
-        transcript_hash: TranscriptHash,
-        continuation: ContinuationKey,
+        commitment: Cid<TextExecution>,
     },
 }
 
 impl ExecutionContext {
     pub(crate) fn new(
         bound_program: Arc<BoundProgram<ExecBackend>>,
-    ) -> Result<Self, crate::ExecutorError> {
+    ) -> Result<Self, ExecutorError> {
         debug!(
             program_id = %bound_program.id(),
             state_tensors = bound_program.program().empty_state_type.len(),
@@ -87,7 +94,7 @@ impl ExecutionContext {
             "initialized execution cache"
         );
         Ok(Self {
-            empty_snapshot: Arc::new(bound_program.empty_snapshot()),
+            empty_snapshot: Arc::new(bound_program.empty_text_snapshot()),
             execution_cache: Arc::new(Mutex::new(ExecutionCache::new(
                 DEFAULT_EXECUTION_CACHE_MAX_BYTES,
             ))),
@@ -95,29 +102,38 @@ impl ExecutionContext {
         })
     }
 
-    pub(crate) fn bound_program(&self) -> &BoundProgram<ExecBackend> {
-        self.bound_program.as_ref()
+    pub(crate) fn bound_program(&self) -> &Arc<BoundProgram<ExecBackend>> {
+        &self.bound_program
     }
 
-    pub(crate) fn execution_start(&self, invocation: &Invocation) -> ExecutionStart {
+    pub(crate) fn execution_start(
+        &self,
+        invocation: &Invocation,
+        commitment_id: Cid<TextExecution>,
+    ) -> ExecutionStart {
         let mut cache = self
             .execution_cache
             .lock()
             .expect("execution cache mutex poisoned");
         let checkpoint = cache.lookup_checkpoint(invocation);
-        let prompt_key = cache.prompt_key(&invocation.input_ids);
-        let continuation =
-            cache.lookup_continuation(prompt_key, ContinuationKey::from_invocation(invocation));
+        let continuation = cache.lookup_continuation(commitment_id);
+        let prompt_tokens = invocation.input_ids.len();
         let (snapshot, transcript, next_token) = match checkpoint {
-            Some((transcript, next_token, snapshot)) => (snapshot, transcript, Some(next_token)),
-            None => (self.empty_snapshot.clone(), TranscriptState::seed(), None),
+            Some((transcript, next_token, snapshot))
+                if prompt_tokens.saturating_sub(transcript.len()) <= CATCH_UP_THRESHOLD =>
+            {
+                (snapshot, transcript, Some(next_token))
+            }
+            _ => (self.empty_snapshot.clone(), TranscriptState::seed(), None),
         };
         debug!(
             program_id = %self.bound_program.id(),
+            commitment_id = %commitment_id,
             prompt_tokens = invocation.input_ids.len(),
             matched_prefix_tokens = transcript.len(),
             cached_output_tokens = continuation.as_ref().map_or(0, |entry| entry.len()),
-            cache_nodes = cache.node_count(),
+            cache_checkpoints = cache.checkpoints.len(),
+            cache_continuations = cache.continuations.len(),
             cache_bytes = cache.total_bytes(),
             "execution cache lookup"
         );
@@ -126,6 +142,7 @@ impl ExecutionContext {
             transcript,
             next_token,
             cached_output_tokens: continuation,
+            commitment_id,
         }
     }
 
@@ -134,7 +151,7 @@ impl ExecutionContext {
         transcript_len: usize,
         transcript_hash: TranscriptHash,
         next_token: u32,
-        snapshot: Snapshot<ExecBackend>,
+        snapshot: TextSnapshot<ExecBackend>,
     ) {
         let snapshot_bytes = snapshot.allocated();
         self.execution_cache
@@ -152,9 +169,7 @@ impl ExecutionContext {
 
     pub(crate) fn cache_continuation(
         &self,
-        prompt_len: usize,
-        prompt_hash: TranscriptHash,
-        invocation: &Invocation,
+        commitment_id: Cid<TextExecution>,
         output_tokens: Vec<u32>,
     ) {
         self.execution_cache
@@ -162,9 +177,7 @@ impl ExecutionContext {
             .expect("execution cache mutex poisoned")
             .insert_continuation(
                 self.bound_program.id(),
-                prompt_len,
-                prompt_hash,
-                ContinuationKey::from_invocation(invocation),
+                commitment_id,
                 Arc::<[u32]>::from(output_tokens),
             );
     }
@@ -218,35 +231,21 @@ impl TranscriptState {
     }
 }
 
-impl ContinuationKey {
-    fn from_invocation(invocation: &Invocation) -> Self {
-        Self {
-            max_new_tokens: invocation.max_new_tokens,
-            stop_token_ids: invocation.stop_token_ids.clone(),
-        }
-    }
-}
-
 impl ExecutionCache {
     fn new(max_bytes: usize) -> Self {
         Self {
-            nodes: HashMap::new(),
+            checkpoints: HashMap::new(),
+            continuations: HashMap::new(),
             max_bytes,
             total_bytes: 0,
             touch_clock: 0,
         }
     }
 
-    fn prompt_key(&self, prompt_tokens: &[u32]) -> (usize, TranscriptHash) {
-        let mut state = TranscriptState::seed();
-        state.extend_tokens(prompt_tokens);
-        (state.len(), state.hash())
-    }
-
     fn lookup_checkpoint(
         &mut self,
         invocation: &Invocation,
-    ) -> Option<(TranscriptState, u32, Arc<Snapshot<ExecBackend>>)> {
+    ) -> Option<(TranscriptState, u32, Arc<TextSnapshot<ExecBackend>>)> {
         let mut state = TranscriptState::seed();
         let mut best_checkpoint = None;
 
@@ -254,35 +253,21 @@ impl ExecutionCache {
             state.extend(token);
             let key = (state.len(), state.hash());
             let touch = self.next_touch();
-            if let Some(node) = self.nodes.get_mut(&key) {
-                if let Some(checkpoint) = node.checkpoint.as_mut() {
-                    checkpoint.last_touch = touch;
-                    best_checkpoint =
-                        Some((state, checkpoint.next_token, checkpoint.snapshot.clone()));
-                }
+            if let Some(checkpoint) = self.checkpoints.get_mut(&key) {
+                checkpoint.last_touch = touch;
+                best_checkpoint = Some((state, checkpoint.next_token, checkpoint.snapshot.clone()));
             }
         }
 
         best_checkpoint
     }
 
-    fn lookup_continuation(
-        &mut self,
-        prompt_key: (usize, TranscriptHash),
-        continuation_key: ContinuationKey,
-    ) -> Option<Arc<[u32]>> {
+    fn lookup_continuation(&mut self, commitment_id: Cid<TextExecution>) -> Option<Arc<[u32]>> {
         let touch = self.next_touch();
-        self.nodes
-            .get_mut(&prompt_key)
-            .and_then(|node| node.continuations.get_mut(&continuation_key))
-            .map(|entry| {
-                entry.last_touch = touch;
-                entry.output_tokens.clone()
-            })
-    }
-
-    fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.continuations.get_mut(&commitment_id).map(|entry| {
+            entry.last_touch = touch;
+            entry.output_tokens.clone()
+        })
     }
 
     fn total_bytes(&self) -> usize {
@@ -291,12 +276,12 @@ impl ExecutionCache {
 
     fn insert_checkpoint(
         &mut self,
-        program_id: &str,
+        program_id: Cid<Program>,
         transcript_len: usize,
         transcript_hash: TranscriptHash,
         next_token: u32,
         snapshot_bytes: usize,
-        snapshot: Arc<Snapshot<ExecBackend>>,
+        snapshot: Arc<TextSnapshot<ExecBackend>>,
     ) {
         if transcript_len == 0 || snapshot_bytes == 0 || snapshot_bytes > self.max_bytes {
             debug!(
@@ -313,16 +298,11 @@ impl ExecutionCache {
         }
 
         let key = (transcript_len, transcript_hash);
-        let existing_bytes = self
-            .nodes
-            .get(&key)
-            .and_then(|node| node.checkpoint.as_ref())
-            .map_or(0, |entry| entry.bytes);
+        let existing_bytes = self.checkpoints.get(&key).map_or(0, |entry| entry.bytes);
         self.evict_until_fits(snapshot_bytes.saturating_sub(existing_bytes));
         let touch = self.next_touch();
-        let node = self.nodes.entry(key).or_default();
 
-        if let Some(entry) = node.checkpoint.as_mut() {
+        if let Some(entry) = self.checkpoints.get_mut(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             entry.snapshot = snapshot;
             entry.next_token = next_token;
@@ -332,7 +312,7 @@ impl ExecutionCache {
             debug!(
                 %program_id,
                 transcript_len,
-                cache_nodes = self.nodes.len(),
+                cache_checkpoints = self.checkpoints.len(),
                 cache_bytes = self.total_bytes,
                 snapshot_bytes,
                 "updated execution checkpoint"
@@ -340,17 +320,20 @@ impl ExecutionCache {
             return;
         }
 
-        node.checkpoint = Some(CheckpointEntry {
-            snapshot,
-            next_token,
-            bytes: snapshot_bytes,
-            last_touch: touch,
-        });
+        self.checkpoints.insert(
+            key,
+            CheckpointEntry {
+                snapshot,
+                next_token,
+                bytes: snapshot_bytes,
+                last_touch: touch,
+            },
+        );
         self.total_bytes = self.total_bytes.saturating_add(snapshot_bytes);
         debug!(
             %program_id,
             transcript_len,
-            cache_nodes = self.nodes.len(),
+            cache_checkpoints = self.checkpoints.len(),
             cache_bytes = self.total_bytes,
             snapshot_bytes,
             "inserted execution checkpoint"
@@ -359,10 +342,8 @@ impl ExecutionCache {
 
     fn insert_continuation(
         &mut self,
-        program_id: &str,
-        prompt_len: usize,
-        prompt_hash: TranscriptHash,
-        continuation_key: ContinuationKey,
+        program_id: Cid<Program>,
+        commitment_id: Cid<TextExecution>,
         output_tokens: Arc<[u32]>,
     ) {
         let continuation_bytes = output_tokens
@@ -371,7 +352,7 @@ impl ExecutionCache {
         if continuation_bytes > self.max_bytes {
             debug!(
                 %program_id,
-                prompt_len,
+                %commitment_id,
                 continuation_bytes,
                 max_bytes = self.max_bytes,
                 "skipping execution continuation insert"
@@ -379,16 +360,13 @@ impl ExecutionCache {
             return;
         }
 
-        let key = (prompt_len, prompt_hash);
         let existing_bytes = self
-            .nodes
-            .get(&key)
-            .and_then(|node| node.continuations.get(&continuation_key))
+            .continuations
+            .get(&commitment_id)
             .map_or(0, |entry| entry.bytes);
         self.evict_until_fits(continuation_bytes.saturating_sub(existing_bytes));
         let touch = self.next_touch();
-        let node = self.nodes.entry(key).or_default();
-        if let Some(entry) = node.continuations.get_mut(&continuation_key) {
+        if let Some(entry) = self.continuations.get_mut(&commitment_id) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             entry.output_tokens = output_tokens;
             entry.bytes = continuation_bytes;
@@ -396,9 +374,9 @@ impl ExecutionCache {
             self.total_bytes = self.total_bytes.saturating_add(continuation_bytes);
             debug!(
                 %program_id,
-                prompt_len,
+                %commitment_id,
                 output_tokens = entry.output_tokens.len(),
-                cache_nodes = self.nodes.len(),
+                cache_continuations = self.continuations.len(),
                 cache_bytes = self.total_bytes,
                 continuation_bytes,
                 "updated execution continuation"
@@ -406,8 +384,8 @@ impl ExecutionCache {
             return;
         }
 
-        node.continuations.insert(
-            continuation_key,
+        self.continuations.insert(
+            commitment_id,
             ContinuationEntry {
                 output_tokens,
                 bytes: continuation_bytes,
@@ -417,8 +395,8 @@ impl ExecutionCache {
         self.total_bytes = self.total_bytes.saturating_add(continuation_bytes);
         debug!(
             %program_id,
-            prompt_len,
-            cache_nodes = self.nodes.len(),
+            %commitment_id,
+            cache_continuations = self.continuations.len(),
             cache_bytes = self.total_bytes,
             continuation_bytes,
             "inserted execution continuation"
@@ -437,28 +415,22 @@ impl ExecutionCache {
     fn least_recently_used_item(&self) -> Option<CacheItemKey> {
         let mut best: Option<(u64, CacheItemKey)> = None;
 
-        for (&(transcript_len, transcript_hash), node) in &self.nodes {
-            if let Some(checkpoint) = &node.checkpoint {
-                let key = CacheItemKey::Checkpoint {
-                    transcript_len,
-                    transcript_hash,
-                };
-                match &best {
-                    Some((best_touch, _)) if checkpoint.last_touch >= *best_touch => {}
-                    _ => best = Some((checkpoint.last_touch, key)),
-                }
+        for (&(transcript_len, transcript_hash), checkpoint) in &self.checkpoints {
+            let key = CacheItemKey::Checkpoint {
+                transcript_len,
+                transcript_hash,
+            };
+            match &best {
+                Some((best_touch, _)) if checkpoint.last_touch >= *best_touch => {}
+                _ => best = Some((checkpoint.last_touch, key)),
             }
+        }
 
-            for (continuation, entry) in &node.continuations {
-                let key = CacheItemKey::Continuation {
-                    transcript_len,
-                    transcript_hash,
-                    continuation: continuation.clone(),
-                };
-                match &best {
-                    Some((best_touch, _)) if entry.last_touch >= *best_touch => {}
-                    _ => best = Some((entry.last_touch, key)),
-                }
+        for (&commitment, entry) in &self.continuations {
+            let key = CacheItemKey::Continuation { commitment };
+            match &best {
+                Some((best_touch, _)) if entry.last_touch >= *best_touch => {}
+                _ => best = Some((entry.last_touch, key)),
             }
         }
 
@@ -471,27 +443,13 @@ impl ExecutionCache {
                 transcript_len,
                 transcript_hash,
             } => {
-                if let Some(node) = self.nodes.get_mut(&(transcript_len, transcript_hash)) {
-                    if let Some(removed) = node.checkpoint.take() {
-                        self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
-                    }
-                    if node.checkpoint.is_none() && node.continuations.is_empty() {
-                        self.nodes.remove(&(transcript_len, transcript_hash));
-                    }
+                if let Some(removed) = self.checkpoints.remove(&(transcript_len, transcript_hash)) {
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
                 }
             }
-            CacheItemKey::Continuation {
-                transcript_len,
-                transcript_hash,
-                continuation,
-            } => {
-                if let Some(node) = self.nodes.get_mut(&(transcript_len, transcript_hash)) {
-                    if let Some(removed) = node.continuations.remove(&continuation) {
-                        self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
-                    }
-                    if node.checkpoint.is_none() && node.continuations.is_empty() {
-                        self.nodes.remove(&(transcript_len, transcript_hash));
-                    }
+            CacheItemKey::Continuation { commitment } => {
+                if let Some(removed) = self.continuations.remove(&commitment) {
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
                 }
             }
         }
@@ -506,8 +464,7 @@ impl ExecutionCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContinuationKey, ExecutionCache, TranscriptState};
-    use crate::state::Invocation;
+    use super::{Cid, ExecutionCache, Program, TextExecution, TranscriptState};
     use std::sync::Arc;
 
     #[test]
@@ -521,31 +478,35 @@ mod tests {
     }
 
     #[test]
-    fn exact_continuation_lookup_hits_without_checkpoint() {
+    fn exact_continuation_lookup_hits_by_commitment_id() {
         let mut cache = ExecutionCache::new(1024);
-        let prompt = [10_u32, 20, 30];
-        let prompt_state = TranscriptState::from_tokens(&prompt);
-        let invocation = Invocation {
-            input_ids: prompt.to_vec(),
-            max_new_tokens: 16,
-            stop_token_ids: vec![0, 1],
-        };
+        let commitment_id = Cid::<TextExecution>::from_bytes([7; 32]);
         let expected = Arc::<[u32]>::from(vec![4_u32, 5, 6]);
 
         cache.insert_continuation(
-            "program",
-            prompt_state.len(),
-            prompt_state.hash(),
-            ContinuationKey::from_invocation(&invocation),
+            Cid::<Program>::from_bytes([0; 32]),
+            commitment_id,
             expected.clone(),
         );
 
         let continuation = cache
-            .lookup_continuation(
-                cache.prompt_key(&invocation.input_ids),
-                ContinuationKey::from_invocation(&invocation),
-            )
+            .lookup_continuation(commitment_id)
             .expect("continuation should exist");
         assert_eq!(continuation, expected);
+    }
+
+    #[test]
+    fn continuation_lookup_misses_on_different_commitment() {
+        let mut cache = ExecutionCache::new(1024);
+        cache.insert_continuation(
+            Cid::<Program>::from_bytes([0; 32]),
+            Cid::<TextExecution>::from_bytes([1; 32]),
+            Arc::<[u32]>::from(vec![1_u32, 2, 3]),
+        );
+        assert!(
+            cache
+                .lookup_continuation(Cid::<TextExecution>::from_bytes([2; 32]))
+                .is_none()
+        );
     }
 }

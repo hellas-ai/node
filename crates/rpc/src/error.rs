@@ -63,6 +63,13 @@ pub enum ExecutorError {
     PolicyDenied(String),
     #[error("invalid token payload: {0}")]
     InvalidTokenPayload(String),
+    #[error(
+        "program was built for dtype {request:?} but this executor only supports {supported:?}; rebuild the program at one of the supported dtypes or run an executor with --dtype {request:?} in its supported set"
+    )]
+    DtypeNotSupported {
+        request: catgrad::prelude::Dtype,
+        supported: Vec<catgrad::prelude::Dtype>,
+    },
     #[error("no output from graph")]
     NoOutput,
     #[error("unexpected output value")]
@@ -80,13 +87,14 @@ impl From<ExecutorError> for Status {
                 tonic::Code::InvalidArgument
             }
 
+            ExecutorError::DtypeNotSupported { .. } => tonic::Code::FailedPrecondition,
+
             ExecutorError::ModelAssets(model_err) => match model_err {
                 ModelAssetsError::Spec(_)
                 | ModelAssetsError::ParseModelConfig { .. }
                 | ModelAssetsError::ConstructModelConfig { .. }
                 | ModelAssetsError::NegativePromptTokenId { .. }
-                | ModelAssetsError::NegativeStopTokenId { .. }
-                | ModelAssetsError::PromptTooLong { .. } => tonic::Code::InvalidArgument,
+                | ModelAssetsError::NegativeStopTokenId { .. } => tonic::Code::InvalidArgument,
                 _ => tonic::Code::Internal,
             },
 

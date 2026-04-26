@@ -1,7 +1,9 @@
 use crate::commands::CliResult;
 use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
 use crate::text_output::TextOutputDecoder;
+use catgrad::prelude::Dtype;
 use catgrad_llm::types::{Message, openai::ChatMessage};
+use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -15,67 +17,64 @@ pub struct ExecuteOptions {
     pub prompt: String,
     pub max_seq: u32,
     pub retries: usize,
+    #[cfg(feature = "hellas-executor")]
     pub local: bool,
+    #[cfg(feature = "hellas-executor")]
     pub verify_local: bool,
     pub raw: bool,
+    /// Ordered preference list. The first entry is what the client *first*
+    /// builds the program at; later entries are tried via fallback if the
+    /// remote executor refuses with `DtypeNotSupported`. For `--local` /
+    /// `--verify-local` the embedded executor's `supported_dtypes` is the
+    /// full list so no fallback occurs.
+    pub dtype: Vec<Dtype>,
+}
+
+/// Returns `true` if `err`'s chain carries an executor's
+/// `DtypeNotSupported` decision — either as a local `ExecutorError` (the
+/// `--local` route) or as a remote `tonic::Status` with `FailedPrecondition`
+/// and the canonical message prefix.
+fn is_dtype_not_supported(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(ExecutorError::DtypeNotSupported { .. }) =
+            cause.downcast_ref::<ExecutorError>()
+        {
+            return true;
+        }
+        if let Some(status) = cause.downcast_ref::<tonic::Status>()
+            && status.code() == tonic::Code::FailedPrecondition
+            && status
+                .message()
+                .starts_with("program was built for dtype")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
-    let assets = Arc::new(ModelAssets::load(&options.model)?);
-    let prepared = if options.raw || !assets.has_chat_template() {
+    if options.dtype.is_empty() {
+        anyhow::bail!("--dtype must list at least one of f32, f16, bf16");
+    }
+
+    // Pre-tokenize the prompt once. Tokenization is dtype-independent, so the
+    // `assets` we use here is throwaway; we reload per attempt below to get
+    // the dtype-specific program build_quote_request needs.
+    let bootstrap_assets = Arc::new(ModelAssets::load(&options.model, options.dtype[0])?);
+    let messages = vec![Message::openai(ChatMessage::user(&options.prompt))];
+    let prepared = if options.raw || !bootstrap_assets.has_chat_template() {
         if options.raw {
             info!("executing raw prompt without chat template");
         } else {
             info!("model has no chat template; using raw prompt");
         }
-        assets.prepare_plain(&options.prompt)?
+        bootstrap_assets.prepare_plain(&options.prompt)?
     } else {
         info!("executing prompt with model chat template");
-        let messages = vec![Message::openai(ChatMessage::user(&options.prompt))];
-        assets.prepare_chat(&messages)?
+        bootstrap_assets.prepare_chat(&messages)?
     };
-    let mut decoder = TextOutputDecoder::new(assets.clone(), &prepared.stop_token_ids);
-    let runtime = if options.local || options.verify_local {
-        #[cfg(feature = "_backend")]
-        {
-            ExecutionRuntime::spawn_default_local(hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY)?
-                .with_secret_key(secret_key)
-        }
-        #[cfg(not(feature = "_backend"))]
-        {
-            anyhow::bail!(
-                "this build has no backend; --local / --verify-local require e.g. --features candle-cpu"
-            );
-        }
-    } else {
-        ExecutionRuntime::default().with_secret_key(secret_key)
-    };
-    let request = ExecutionRequest::new(
-        runtime,
-        assets,
-        prepared,
-        options.max_seq,
-        if options.verify_local {
-            info!("executing remotely and verifying against local catgrad backend");
-            ExecutionStrategy::Verify {
-                primary: ExecutionRoute::remote(
-                    options.node_id,
-                    options.node_addrs.clone(),
-                    options.retries,
-                ),
-                shadow: ExecutionRoute::Local,
-            }
-        } else if options.local {
-            info!("executing locally with catgrad backend");
-            ExecutionStrategy::Run(ExecutionRoute::Local)
-        } else {
-            ExecutionStrategy::Run(ExecutionRoute::remote(
-                options.node_id,
-                options.node_addrs,
-                options.retries,
-            ))
-        },
-    )?;
+    let mut decoder = TextOutputDecoder::new(bootstrap_assets.clone(), &prepared.stop_token_ids);
 
     let mut stdout_sink = |output: &[u8]| {
         let delta = decoder.push_output(output)?;
@@ -86,15 +85,93 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         Ok(())
     };
 
-    if request.uses_remote_transport() {
-        let mut prepared = request.prepare().await?;
-        let result = prepared.run(&mut stdout_sink).await;
-        crate::tracing_config::suppress_execute_tail_logs();
-        drop(prepared);
-        let _ = result?;
-    } else {
-        let _ = request.run(&mut stdout_sink).await?;
-    }
+    let last_index = options.dtype.len() - 1;
+    for (idx, &dtype) in options.dtype.iter().enumerate() {
+        if idx > 0 {
+            info!(?dtype, "previous dtype rejected, retrying");
+        }
 
-    Ok(())
+        // Per-attempt assets: same tokenizer/template as bootstrap, but the
+        // build_quote_request below produces a Program at this dtype.
+        let assets = Arc::new(ModelAssets::load(&options.model, dtype)?);
+
+        #[cfg(feature = "hellas-executor")]
+        let runtime = if options.local || options.verify_local {
+            // Embedded executor accepts the full preference list so a future
+            // dialer can pin any of them. The CLI itself only ever builds
+            // the program at the first acceptable entry.
+            ExecutionRuntime::spawn_default_local(
+                hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+                options.dtype.clone(),
+            )?
+            .with_secret_key(secret_key.clone())
+        } else {
+            ExecutionRuntime::default().with_secret_key(secret_key.clone())
+        };
+        #[cfg(not(feature = "hellas-executor"))]
+        let runtime = ExecutionRuntime::default().with_secret_key(secret_key.clone());
+
+        #[cfg(feature = "hellas-executor")]
+        let strategy = if options.verify_local {
+            if idx == 0 {
+                info!("executing remotely and verifying against local catgrad backend");
+            }
+            ExecutionStrategy::Verify {
+                primary: ExecutionRoute::remote(
+                    options.node_id,
+                    options.node_addrs.clone(),
+                    options.retries,
+                ),
+                shadow: ExecutionRoute::Local,
+            }
+        } else if options.local {
+            if idx == 0 {
+                info!(?dtype, "executing locally with catgrad backend");
+            }
+            ExecutionStrategy::Run(ExecutionRoute::Local)
+        } else {
+            ExecutionStrategy::Run(ExecutionRoute::remote(
+                options.node_id,
+                options.node_addrs.clone(),
+                options.retries,
+            ))
+        };
+        #[cfg(not(feature = "hellas-executor"))]
+        let strategy = ExecutionStrategy::Run(ExecutionRoute::remote(
+            options.node_id,
+            options.node_addrs.clone(),
+            options.retries,
+        ));
+
+        let request = ExecutionRequest::new(
+            runtime,
+            assets,
+            prepared.clone(),
+            options.max_seq,
+            strategy,
+        )?;
+
+        let result: anyhow::Result<()> = if request.uses_remote_transport() {
+            match request.prepare().await {
+                Ok(mut prepared) => {
+                    let run_result = prepared.run(&mut stdout_sink).await;
+                    crate::tracing_config::suppress_execute_tail_logs();
+                    drop(prepared);
+                    run_result.map(|_| ())
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            request.run(&mut stdout_sink).await.map(|_| ())
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) if idx < last_index && is_dtype_not_supported(&err) => {
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("loop returns on Ok or last-index error")
 }

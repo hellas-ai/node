@@ -2,8 +2,8 @@ mod actor;
 mod handle;
 mod stream;
 
-use crate::ExecutorError;
 use crate::state::ExecutionStatus;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse, GetModelStatsRequest, GetModelStatsResponse,

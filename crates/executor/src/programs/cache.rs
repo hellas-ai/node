@@ -1,14 +1,12 @@
-use super::loader::{LoadedWeights, load_weights_bundle};
-use super::state::{CacheProgramOutcome, CacheRuntimeOutcome, EntryStatusSnapshot, WeightsState};
-use super::{
-    EnsureDisposition, ExecutionContext, WeightsBundle, WeightsError, WeightsLocator,
-    has_cached_weights,
+use super::ExecutionContext;
+use crate::inputs::{
+    self, Bundle, EnsureDisposition, HuggingFaceLocator, Loaded, Status, is_cached_locally,
+    load_bundle,
 };
-use crate::ExecutorError;
-use crate::backend::{ExecBackend, create_backend};
-use crate::policy::DownloadPolicy;
-use catgrad_llm::helpers::WeightPostProcess;
-use catgrad_llm::{Program, Runtime};
+use catgrad::cid::Cid;
+use catgrad::runtime::Program;
+use hellas_rpc::ExecutorError;
+use hellas_rpc::policy::DownloadPolicy;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,48 +16,42 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_WEIGHT_LOAD_PARALLELISM: usize = 1;
 
+/// Bound-program cache for the executor. See module docs for the two-level
+/// admission/load story.
 #[derive(Clone)]
-pub(crate) struct RuntimeManager {
-    inner: Arc<RuntimeManagerInner>,
+pub(crate) struct Cache {
+    inner: Arc<Inner>,
 }
 
-struct RuntimeManagerInner {
+struct Inner {
     download_policy: DownloadPolicy,
     max_concurrent_loads: usize,
-    state: Mutex<ManagerState>,
+    state: Mutex<CacheState>,
 }
 
 #[derive(Default)]
-struct ManagerState {
-    weights: WeightsState,
-    waiters: HashMap<WeightsLocator, Vec<oneshot::Sender<Result<(), WeightsError>>>>,
-    load_queue: VecDeque<WeightsLocator>,
-    loads_in_flight: HashSet<WeightsLocator>,
-    // These single-flight maps keep expensive runtime creation and program binding
-    // outside the main mutex while ensuring only one leader performs each build.
-    runtime_builds: HashMap<RuntimeBuildKey, Vec<oneshot::Sender<()>>>,
+struct CacheState {
+    inputs: inputs::State,
+    waiters: HashMap<HuggingFaceLocator, Vec<oneshot::Sender<Result<(), inputs::Error>>>>,
+    load_queue: VecDeque<HuggingFaceLocator>,
+    loads_in_flight: HashSet<HuggingFaceLocator>,
+    // Single-flight admission for program binding: keeps the (potentially
+    // expensive) `Inputs::bind` call outside the main mutex while ensuring
+    // only one leader performs each build.
     program_builds: HashMap<ProgramBuildKey, Vec<oneshot::Sender<()>>>,
 }
 
 struct EnsureAdmission {
     disposition: EnsureDisposition,
-    next_loads: Vec<WeightsLocator>,
-    waiter: Option<oneshot::Receiver<Result<(), WeightsError>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct RuntimeBuildKey {
-    locator: WeightsLocator,
-    generation: u64,
-    weight_post_process: WeightPostProcess,
+    next_loads: Vec<HuggingFaceLocator>,
+    waiter: Option<oneshot::Receiver<Result<(), inputs::Error>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramBuildKey {
-    locator: WeightsLocator,
+    locator: HuggingFaceLocator,
     generation: u64,
-    weight_post_process: WeightPostProcess,
-    program_id: String,
+    program_id: Cid<Program>,
 }
 
 enum BuildAdmission {
@@ -69,36 +61,31 @@ enum BuildAdmission {
 
 enum BoundProgramStep {
     Ready(Arc<ExecutionContext>),
-    BuildRuntime {
-        generation: u64,
-        bundle: Arc<WeightsBundle>,
-        build_key: RuntimeBuildKey,
-    },
     BuildProgram {
         generation: u64,
-        runtime: Arc<Runtime<ExecBackend>>,
+        bundle: Arc<Bundle>,
         build_key: ProgramBuildKey,
     },
     Wait(oneshot::Receiver<()>),
 }
 
-impl RuntimeManager {
+impl Cache {
     pub(crate) fn new(download_policy: DownloadPolicy) -> Self {
         Self {
-            inner: Arc::new(RuntimeManagerInner {
+            inner: Arc::new(Inner {
                 download_policy,
                 max_concurrent_loads: DEFAULT_WEIGHT_LOAD_PARALLELISM,
-                state: Mutex::new(ManagerState::default()),
+                state: Mutex::new(CacheState::default()),
             }),
         }
     }
 
-    pub(crate) async fn list_models(&self) -> Vec<(WeightsLocator, EntryStatusSnapshot)> {
+    pub(crate) async fn list_models(&self) -> Vec<(HuggingFaceLocator, Status)> {
         let state = self.inner.state.lock().await;
-        state.weights.list_models()
+        state.inputs.list_models()
     }
 
-    pub(crate) async fn ensure_ready(&self, locator: WeightsLocator) -> EnsureDisposition {
+    pub(crate) async fn ensure_ready(&self, locator: HuggingFaceLocator) -> EnsureDisposition {
         let admission = self.admit(locator, false, false).await;
         self.spawn_loads_if_needed(admission.next_loads);
         admission.disposition
@@ -106,15 +93,15 @@ impl RuntimeManager {
 
     pub(crate) async fn ensure_ready_wait(
         &self,
-        locator: WeightsLocator,
+        locator: HuggingFaceLocator,
         wait_timeout: Duration,
-    ) -> Result<(), WeightsError> {
+    ) -> Result<(), inputs::Error> {
         let admission = self.admit(locator, true, false).await;
         self.spawn_loads_if_needed(admission.next_loads);
 
         match admission.disposition {
             EnsureDisposition::Ready => Ok(()),
-            EnsureDisposition::Failed(error) => Err(WeightsError::Failed(error)),
+            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed(error)),
             EnsureDisposition::Queued | EnsureDisposition::InFlight => {
                 Self::wait_for_ready(
                     wait_timeout,
@@ -129,25 +116,25 @@ impl RuntimeManager {
 
     pub(crate) async fn ensure_preloaded(
         &self,
-        locator: WeightsLocator,
-    ) -> Result<(), WeightsError> {
+        locator: HuggingFaceLocator,
+    ) -> Result<(), inputs::Error> {
         let admission = self.admit(locator, true, true).await;
         self.spawn_loads_if_needed(admission.next_loads);
 
         match admission.disposition {
             EnsureDisposition::Ready => Ok(()),
-            EnsureDisposition::Failed(error) => Err(WeightsError::Failed(error)),
+            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed(error)),
             EnsureDisposition::Queued | EnsureDisposition::InFlight => admission
                 .waiter
                 .expect("queued or inflight preload must register a waiter")
                 .await
-                .unwrap_or(Err(WeightsError::NotReady)),
+                .unwrap_or(Err(inputs::Error::NotReady)),
         }
     }
 
     async fn admit(
         &self,
-        locator: WeightsLocator,
+        locator: HuggingFaceLocator,
         register_waiter: bool,
         bypass_download_policy: bool,
     ) -> EnsureAdmission {
@@ -155,12 +142,12 @@ impl RuntimeManager {
             .then(|| self.denied_error(&locator))
             .flatten();
         let mut state = self.inner.state.lock().await;
-        let disposition = match state.weights.status(&locator) {
-            Some(EntryStatusSnapshot::Ready) => EnsureDisposition::Ready,
-            Some(EntryStatusSnapshot::Failed(_)) => match denied_error {
+        let disposition = match state.inputs.status(&locator) {
+            Some(Status::Ready) => EnsureDisposition::Ready,
+            Some(Status::Failed(_)) => match denied_error {
                 Some(error) => EnsureDisposition::Failed(error),
                 None => {
-                    state.weights.mark_queued(locator.clone());
+                    state.inputs.mark_queued(locator.clone());
                     if Self::enqueue_load(&mut state, locator.clone()) {
                         EnsureDisposition::Queued
                     } else {
@@ -168,11 +155,11 @@ impl RuntimeManager {
                     }
                 }
             },
-            Some(EntryStatusSnapshot::Queued | EntryStatusSnapshot::Loading) => {
+            Some(Status::Queued | Status::Loading) => {
                 if Self::is_load_pending(&state, &locator) {
                     EnsureDisposition::InFlight
                 } else {
-                    state.weights.mark_queued(locator.clone());
+                    state.inputs.mark_queued(locator.clone());
                     let _ = Self::enqueue_load(&mut state, locator.clone());
                     EnsureDisposition::Queued
                 }
@@ -180,7 +167,7 @@ impl RuntimeManager {
             None => match denied_error {
                 Some(error) => EnsureDisposition::Failed(error),
                 None => {
-                    state.weights.mark_queued(locator.clone());
+                    state.inputs.mark_queued(locator.clone());
                     let _ = Self::enqueue_load(&mut state, locator.clone());
                     EnsureDisposition::Queued
                 }
@@ -206,56 +193,40 @@ impl RuntimeManager {
 
     async fn wait_for_ready(
         wait_timeout: Duration,
-        receiver: oneshot::Receiver<Result<(), WeightsError>>,
-    ) -> Result<(), WeightsError> {
+        receiver: oneshot::Receiver<Result<(), inputs::Error>>,
+    ) -> Result<(), inputs::Error> {
         match timeout(wait_timeout, receiver).await {
             Ok(Ok(result)) => result,
-            _ => Err(WeightsError::NotReady),
+            _ => Err(inputs::Error::NotReady),
         }
     }
 
     pub(crate) async fn bound_program(
         &self,
-        locator: &WeightsLocator,
-        program_id: &str,
+        locator: &HuggingFaceLocator,
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         let start = Instant::now();
-        let weight_post_process = program.weight_post_process;
+        let program_id = program.id();
 
         loop {
             let lookup_start = Instant::now();
             let next_step = {
                 let mut state = self.inner.state.lock().await;
                 let lookup = state
-                    .weights
-                    .lookup_program(locator, weight_post_process, program_id)
+                    .inputs
+                    .lookup_program(locator, program_id)
                     .map_err(|error| map_program_cache_error(locator, error))?;
                 if let Some(cached) = lookup.program {
                     BoundProgramStep::Ready(cached)
-                } else if let Some(runtime) = lookup.runtime {
+                } else {
                     let build_key = ProgramBuildKey {
                         locator: locator.clone(),
                         generation: lookup.generation,
-                        weight_post_process,
-                        program_id: program_id.to_string(),
+                        program_id,
                     };
                     match Self::admit_build(&mut state.program_builds, build_key.clone()) {
                         BuildAdmission::Leader => BoundProgramStep::BuildProgram {
-                            generation: lookup.generation,
-                            runtime,
-                            build_key,
-                        },
-                        BuildAdmission::Follower(receiver) => BoundProgramStep::Wait(receiver),
-                    }
-                } else {
-                    let build_key = RuntimeBuildKey {
-                        locator: locator.clone(),
-                        generation: lookup.generation,
-                        weight_post_process,
-                    };
-                    match Self::admit_build(&mut state.runtime_builds, build_key.clone()) {
-                        BuildAdmission::Leader => BoundProgramStep::BuildRuntime {
                             generation: lookup.generation,
                             bundle: lookup.bundle,
                             build_key,
@@ -282,67 +253,13 @@ impl RuntimeManager {
                     let _ = receiver.await;
                     continue;
                 }
-                BoundProgramStep::BuildRuntime {
+                BoundProgramStep::BuildProgram {
                     generation,
                     bundle,
                     build_key,
                 } => {
-                    let runtime_create_start = Instant::now();
-                    let runtime = match Self::build_runtime(&bundle) {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            let mut state = self.inner.state.lock().await;
-                            Self::finish_build(&mut state.runtime_builds, &build_key);
-                            return Err(error);
-                        }
-                    };
-                    let runtime_create_ms = runtime_create_start.elapsed().as_millis();
-                    let cache_start = Instant::now();
-                    let cache_result = {
-                        let mut state = self.inner.state.lock().await;
-                        let result = state
-                            .weights
-                            .cache_runtime(locator, generation, weight_post_process, runtime)
-                            .map_err(|error| map_program_cache_error(locator, error));
-                        Self::finish_build(&mut state.runtime_builds, &build_key);
-                        result?
-                    };
-                    debug!(
-                        model = %locator.model_id,
-                        requested_revision = %locator.revision,
-                        runtime_create_ms,
-                        "runtime cache miss"
-                    );
-                    match cache_result {
-                        CacheRuntimeOutcome::Cached => {
-                            debug!(
-                                model = %locator.model_id,
-                                requested_revision = %locator.revision,
-                                cache_lookup_ms,
-                                runtime_create_ms,
-                                cache_store_ms = cache_start.elapsed().as_millis(),
-                                total_ms = start.elapsed().as_millis(),
-                                "runtime phase timings"
-                            );
-                        }
-                        CacheRuntimeOutcome::Stale => {
-                            debug!(
-                                model = %locator.model_id,
-                                requested_revision = %locator.revision,
-                                generation,
-                                "runtime cache entry changed during build, retrying"
-                            );
-                        }
-                    }
-                    continue;
-                }
-                BoundProgramStep::BuildProgram {
-                    generation,
-                    runtime,
-                    build_key,
-                } => {
                     let bind_start = Instant::now();
-                    let bound_program = match Self::build_program(&runtime, program) {
+                    let bound_program = match Self::build_program(&bundle, program) {
                         Ok(bound_program) => bound_program,
                         Err(error) => {
                             let mut state = self.inner.state.lock().await;
@@ -350,20 +267,14 @@ impl RuntimeManager {
                             return Err(error);
                         }
                     };
-                    let runtime_bind_ms = bind_start.elapsed().as_millis();
+                    let bind_ms = bind_start.elapsed().as_millis();
 
                     let cache_start = Instant::now();
                     let cache_result = {
                         let mut state = self.inner.state.lock().await;
                         let result = state
-                            .weights
-                            .cache_program(
-                                locator,
-                                generation,
-                                weight_post_process,
-                                program_id.to_string(),
-                                bound_program,
-                            )
+                            .inputs
+                            .cache_program(locator, generation, bound_program)
                             .map_err(|error| map_program_cache_error(locator, error));
                         Self::finish_build(&mut state.program_builds, &build_key);
                         result?
@@ -371,12 +282,12 @@ impl RuntimeManager {
                     let cache_store_ms = cache_start.elapsed().as_millis();
 
                     match cache_result {
-                        CacheProgramOutcome::Cached(cached) => {
+                        inputs::CacheProgramOutcome::Cached(cached) => {
                             debug!(
                                 model = %locator.model_id,
                                 requested_revision = %locator.revision,
                                 cache_lookup_ms,
-                                runtime_bind_ms,
+                                bind_ms,
                                 cache_store_ms,
                                 total_ms = start.elapsed().as_millis(),
                                 "bound program phase timings"
@@ -389,7 +300,7 @@ impl RuntimeManager {
                             );
                             return Ok(cached);
                         }
-                        CacheProgramOutcome::Stale => {
+                        inputs::CacheProgramOutcome::Stale => {
                             debug!(
                                 model = %locator.model_id,
                                 requested_revision = %locator.revision,
@@ -404,8 +315,8 @@ impl RuntimeManager {
         }
     }
 
-    fn denied_error(&self, locator: &WeightsLocator) -> Option<String> {
-        if has_cached_weights(locator)
+    fn denied_error(&self, locator: &HuggingFaceLocator) -> Option<String> {
+        if is_cached_locally(locator)
             || self
                 .inner
                 .download_policy
@@ -421,9 +332,9 @@ impl RuntimeManager {
     }
 
     fn register_waiter(
-        state: &mut ManagerState,
-        locator: WeightsLocator,
-    ) -> oneshot::Receiver<Result<(), WeightsError>> {
+        state: &mut CacheState,
+        locator: HuggingFaceLocator,
+    ) -> oneshot::Receiver<Result<(), inputs::Error>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let waiters = state.waiters.entry(locator).or_default();
         waiters.retain(|waiter| !waiter.is_closed());
@@ -431,23 +342,15 @@ impl RuntimeManager {
         reply_rx
     }
 
-    fn build_runtime(
-        bundle: &Arc<WeightsBundle>,
-    ) -> Result<Arc<Runtime<ExecBackend>>, ExecutorError> {
-        Ok(Arc::new(Runtime::new(
-            create_backend()?,
-            bundle.parameter_values.clone(),
-            bundle.parameter_types.clone(),
-        )))
-    }
-
     fn build_program(
-        runtime: &Arc<Runtime<ExecBackend>>,
+        bundle: &Arc<Bundle>,
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
-        Ok(Arc::new(ExecutionContext::new(Arc::new(
-            runtime.bind(program.clone())?,
-        ))?))
+        let bound = bundle
+            .inputs
+            .bind(program.clone())
+            .map_err(catgrad_llm::LLMError::from)?;
+        Ok(Arc::new(ExecutionContext::new(Arc::new(bound))?))
     }
 
     fn admit_build<K>(inflight: &mut HashMap<K, Vec<oneshot::Sender<()>>>, key: K) -> BuildAdmission
@@ -475,7 +378,7 @@ impl RuntimeManager {
         }
     }
 
-    fn enqueue_load(state: &mut ManagerState, locator: WeightsLocator) -> bool {
+    fn enqueue_load(state: &mut CacheState, locator: HuggingFaceLocator) -> bool {
         if Self::is_load_pending(state, &locator) {
             return false;
         }
@@ -484,15 +387,15 @@ impl RuntimeManager {
         true
     }
 
-    fn is_load_pending(state: &ManagerState, locator: &WeightsLocator) -> bool {
+    fn is_load_pending(state: &CacheState, locator: &HuggingFaceLocator) -> bool {
         state.loads_in_flight.contains(locator)
             || state.load_queue.iter().any(|queued| queued == locator)
     }
 
     fn schedule_loads(
-        state: &mut ManagerState,
+        state: &mut CacheState,
         max_concurrent_loads: usize,
-    ) -> Vec<WeightsLocator> {
+    ) -> Vec<HuggingFaceLocator> {
         let available = max_concurrent_loads.saturating_sub(state.loads_in_flight.len());
         let mut next_loads = Vec::with_capacity(available);
 
@@ -500,7 +403,7 @@ impl RuntimeManager {
             let Some(locator) = state.load_queue.pop_front() else {
                 break;
             };
-            if state.weights.mark_loading(&locator).is_err() {
+            if state.inputs.mark_loading(&locator).is_err() {
                 continue;
             }
             state.loads_in_flight.insert(locator.clone());
@@ -510,13 +413,13 @@ impl RuntimeManager {
         next_loads
     }
 
-    fn spawn_loads_if_needed(&self, locators: Vec<WeightsLocator>) {
+    fn spawn_loads_if_needed(&self, locators: Vec<HuggingFaceLocator>) {
         for locator in locators {
             self.spawn_load(locator);
         }
     }
 
-    fn spawn_load(&self, locator: WeightsLocator) {
+    fn spawn_load(&self, locator: HuggingFaceLocator) {
         let manager = self.clone();
         info!(
             model = %locator.model_id,
@@ -527,7 +430,7 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let load_result = tokio::task::spawn_blocking({
                 let locator = locator.clone();
-                move || load_weights_bundle(&locator)
+                move || load_bundle(&locator)
             })
             .await
             .map_err(|error| format!("weights worker join error: {error}"))
@@ -539,8 +442,8 @@ impl RuntimeManager {
 
     async fn finish_load(
         &self,
-        locator: WeightsLocator,
-        load_result: Result<LoadedWeights, String>,
+        locator: HuggingFaceLocator,
+        load_result: Result<Loaded, String>,
     ) {
         let (waiters, next_loads, waiter_result) = {
             let mut state = self.inner.state.lock().await;
@@ -553,7 +456,7 @@ impl RuntimeManager {
                         resolved_revision = %loaded.resolved_revision,
                         "weights ready"
                     );
-                    state.weights.finish_ready(&locator, loaded.bundle);
+                    state.inputs.finish_ready(&locator, loaded.bundle);
                     Ok(())
                 }
                 Err(error) => {
@@ -563,8 +466,8 @@ impl RuntimeManager {
                         error = %error,
                         "weights failed"
                     );
-                    state.weights.finish_failed(&locator, error.clone());
-                    Err(WeightsError::Failed(error))
+                    state.inputs.finish_failed(&locator, error.clone());
+                    Err(inputs::Error::Failed(error))
                 }
             };
             let next_loads = Self::schedule_loads(&mut state, self.inner.max_concurrent_loads);
@@ -577,8 +480,8 @@ impl RuntimeManager {
     }
 
     fn notify_waiters(
-        waiters: Vec<oneshot::Sender<Result<(), WeightsError>>>,
-        waiter_result: &Result<(), WeightsError>,
+        waiters: Vec<oneshot::Sender<Result<(), inputs::Error>>>,
+        waiter_result: &Result<(), inputs::Error>,
     ) {
         for waiter in waiters {
             let _ = waiter.send(waiter_result.clone());
@@ -586,12 +489,12 @@ impl RuntimeManager {
     }
 }
 
-fn map_program_cache_error(locator: &WeightsLocator, error: WeightsError) -> ExecutorError {
+fn map_program_cache_error(locator: &HuggingFaceLocator, error: inputs::Error) -> ExecutorError {
     match error {
-        WeightsError::NotReady | WeightsError::UnknownKey => {
+        inputs::Error::NotReady | inputs::Error::UnknownKey => {
             ExecutorError::WeightsNotReady(locator.to_string())
         }
-        WeightsError::Failed(message) => ExecutorError::WeightsError(message),
+        inputs::Error::Failed(message) => ExecutorError::WeightsError(message),
     }
 }
 
@@ -599,41 +502,43 @@ fn map_program_cache_error(locator: &WeightsLocator, error: WeightsError) -> Exe
 mod tests {
     use super::*;
 
-    fn locator() -> WeightsLocator {
-        WeightsLocator {
-            model_id: "model".to_string(),
-            revision: "main".to_string(),
-        }
+    fn locator() -> HuggingFaceLocator {
+        HuggingFaceLocator::new(
+            "model".to_string(),
+            "main".to_string(),
+            catgrad::prelude::Dtype::F32,
+        )
     }
 
-    fn locator_with_suffix(suffix: u8) -> WeightsLocator {
-        WeightsLocator {
-            model_id: format!("model-{suffix}"),
-            revision: "main".to_string(),
-        }
+    fn locator_with_suffix(suffix: u8) -> HuggingFaceLocator {
+        HuggingFaceLocator::new(
+            format!("model-{suffix}"),
+            "main".to_string(),
+            catgrad::prelude::Dtype::F32,
+        )
     }
 
     #[test]
     fn enqueue_load_only_tracks_one_pending_entry() {
         let locator = locator();
-        let mut state = ManagerState::default();
-        state.weights.mark_queued(locator.clone());
+        let mut state = CacheState::default();
+        state.inputs.mark_queued(locator.clone());
 
-        assert!(RuntimeManager::enqueue_load(&mut state, locator.clone()));
-        assert!(!RuntimeManager::enqueue_load(&mut state, locator.clone()));
+        assert!(Cache::enqueue_load(&mut state, locator.clone()));
+        assert!(!Cache::enqueue_load(&mut state, locator.clone()));
         assert_eq!(state.load_queue.len(), 1);
     }
 
     #[test]
     fn schedule_loads_respects_parallelism_limit() {
-        let mut state = ManagerState::default();
+        let mut state = CacheState::default();
         for suffix in 0..3 {
             let locator = locator_with_suffix(suffix);
-            state.weights.mark_queued(locator.clone());
-            assert!(RuntimeManager::enqueue_load(&mut state, locator));
+            state.inputs.mark_queued(locator.clone());
+            assert!(Cache::enqueue_load(&mut state, locator));
         }
 
-        let started = RuntimeManager::schedule_loads(&mut state, 2);
+        let started = Cache::schedule_loads(&mut state, 2);
         assert_eq!(started.len(), 2);
         assert_eq!(state.loads_in_flight.len(), 2);
         assert_eq!(state.load_queue.len(), 1);
@@ -641,25 +546,24 @@ mod tests {
 
     #[tokio::test]
     async fn admit_build_allows_single_leader_and_wakes_followers() {
-        let key = RuntimeBuildKey {
+        let key = ProgramBuildKey {
             locator: locator(),
             generation: 1,
-            weight_post_process: WeightPostProcess::None,
+            program_id: Cid::<Program>::from_bytes([0; 32]),
         };
         let mut inflight = HashMap::new();
 
         assert!(matches!(
-            RuntimeManager::admit_build(&mut inflight, key.clone()),
+            Cache::admit_build(&mut inflight, key.clone()),
             BuildAdmission::Leader
         ));
-        let follower = match RuntimeManager::admit_build(&mut inflight, key.clone()) {
+        let follower = match Cache::admit_build(&mut inflight, key.clone()) {
             BuildAdmission::Follower(receiver) => receiver,
             BuildAdmission::Leader => panic!("second admission should follow"),
         };
 
-        RuntimeManager::finish_build(&mut inflight, &key);
+        Cache::finish_build(&mut inflight, &key);
         follower.await.expect("follower should be notified");
         assert!(inflight.is_empty());
     }
 }
-
