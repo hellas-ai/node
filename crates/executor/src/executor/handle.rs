@@ -158,8 +158,7 @@ impl Execute for ExecutorHandle {
         let first = stream
             .next()
             .await
-            .ok_or_else(|| Status::invalid_argument("empty stream"))?
-            .map_err(|e| Status::internal(format!("stream error: {e}")))?;
+            .ok_or_else(|| Status::invalid_argument("empty stream"))??;
 
         let model_spec = if first.huggingface_revision.is_empty() {
             first.huggingface_model_id.clone()
@@ -172,48 +171,36 @@ impl Execute for ExecutorHandle {
         // Tokenizer-only path. The dtype is irrelevant for `decode_tokens`;
         // F32 is just the cheapest valid value for the model-graph build that
         // `ModelAssets::load` does for EOS-id extraction.
-        let assets = ModelAssets::load(&model_spec, catgrad::prelude::Dtype::F32)
-            .map_err(|e| Status::internal(format!("failed to load model: {e}")))?;
+        let assets = ModelAssets::load(&model_spec, catgrad::prelude::Dtype::F32)?;
 
-        // Process the first message's tokens too.
         let output_stream = async_stream::stream! {
-            // Decode first message's tokens.
+            let decode = |bytes: &[u8]| -> Result<DecodeTokensResponse, Status> {
+                let ids = decode_token_ids(bytes)?;
+                let text = assets.decode_tokens(&ids)?;
+                Ok(DecodeTokensResponse { text })
+            };
+
             if !first.token_bytes.is_empty() {
-                match decode_token_ids(&first.token_bytes) {
-                    Ok(ids) => match assets.decode_tokens(&ids) {
-                        Ok(text) => yield Ok(DecodeTokensResponse { text }),
-                        Err(e) => yield Err(Status::internal(format!("decode error: {e}"))),
-                    },
-                    Err(e) => yield Err(Status::internal(format!("invalid token bytes: {e}"))),
-                }
+                yield decode(&first.token_bytes);
             }
 
-            // Process remaining messages.
             tokio::pin!(stream);
             while let Some(result) = stream.next().await {
-                match result {
-                    Ok(req) => {
-                        if req.token_bytes.is_empty() {
-                            continue;
-                        }
-                        match decode_token_ids(&req.token_bytes) {
-                            Ok(ids) => match assets.decode_tokens(&ids) {
-                                Ok(text) => yield Ok(DecodeTokensResponse { text }),
-                                Err(e) => {
-                                    yield Err(Status::internal(format!("decode error: {e}")));
-                                    break;
-                                }
-                            },
-                            Err(e) => {
-                                yield Err(Status::internal(format!("invalid token bytes: {e}")));
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(Status::internal(format!("stream error: {e}")));
+                let req = match result {
+                    Ok(req) => req,
+                    Err(status) => {
+                        yield Err(status);
                         break;
                     }
+                };
+                if req.token_bytes.is_empty() {
+                    continue;
+                }
+                let response = decode(&req.token_bytes);
+                let stop = response.is_err();
+                yield response;
+                if stop {
+                    break;
                 }
             }
         };
