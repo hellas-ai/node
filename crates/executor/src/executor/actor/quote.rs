@@ -1,7 +1,7 @@
 use crate::inputs::{EnsureDisposition, HuggingFaceLocator, Status, is_cached_locally};
 use crate::state::{QuotePlan, QuoteRecord};
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::{BoundProgramText, TextPolicy};
+use catgrad_llm::runtime::TextPolicy;
 use catgrad_llm::types;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
@@ -115,26 +115,36 @@ impl Executor {
             .bound_program(&plan.weights_key, &plan.program)
             .await?;
         let bind_program_ms = bind_start.elapsed().as_millis();
-        // Canonical request commitment: program CID + parameter tensor CIDs +
-        // prompt token tensor CID + policy CID, all hashed via DAG-CBOR. This
-        // is the audit anchor and the exact-replay cache key.
+        // Build the request commitment: a `Cid<TextExecution>` over
+        // (program, parameter tensor CIDs, prompt tokens, policy), hashed
+        // via canonical DAG-CBOR. The same 32 bytes serve two roles:
+        //   - audit anchor — the executor is committing to having run
+        //     exactly these inputs and no others.
+        //   - exact-replay cache key — two requests with the same
+        //     commitment hash are byte-identical and skip the model.
         let policy = TextPolicy::new(
             plan.invocation.max_new_tokens,
             plan.invocation.stop_token_ids.clone(),
         );
-        let commitment_id = execution
-            .bound_program()
-            .text_execution(&plan.invocation.input_ids, &policy)
-            .id();
+        // Cold-start: anchor on the bound program's genesis receipt.
+        // Anchored execution (later phase) will read this from the
+        // request wire field instead.
+        let initial_receipt_id = execution.genesis_receipt_id();
+        let commitment_id = crate::runner::build_text_execution(
+            &execution,
+            initial_receipt_id,
+            &plan.invocation,
+            &policy,
+        )?
+        .id();
         let cache_start = Instant::now();
-        let start = execution.execution_start(&plan.invocation, commitment_id);
+        let start = execution.execution_start(commitment_id, initial_receipt_id)?;
         let cache_lookup_ms = cache_start.elapsed().as_millis();
 
         let model_id = plan.weights_key.model_id.clone();
         let requested_revision = plan.weights_key.revision.clone();
         let prompt_tokens = plan.invocation.input_ids.len();
         let max_new_tokens = plan.invocation.max_new_tokens;
-        let cached_prompt_tokens = start.transcript.len();
         let cached_output_tokens = start
             .cached_output_tokens
             .as_ref()
@@ -155,7 +165,6 @@ impl Executor {
             model = model_id,
             requested_revision,
             prompt_tokens,
-            cached_prompt_tokens,
             cached_output_tokens,
             max_new_tokens,
             "quoted program execution"
@@ -164,7 +173,6 @@ impl Executor {
             %quote_id,
             %program_id,
             prompt_tokens,
-            cached_prompt_tokens,
             cached_output_tokens,
             plan_parse_ms,
             ensure_weights_ms,

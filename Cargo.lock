@@ -641,7 +641,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#0d6c9e2f2686e91163392772e9e0167aec0392b9"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#f4da35917bb70ef4dec656a7f9f9676e87c01464"
 dependencies = [
  "blake3",
  "candle-core",
@@ -655,7 +655,7 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#0d6c9e2f2686e91163392772e9e0167aec0392b9"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fruntime-primitives#f4da35917bb70ef4dec656a7f9f9676e87c01464"
 dependencies = [
  "catgrad",
  "chrono",
