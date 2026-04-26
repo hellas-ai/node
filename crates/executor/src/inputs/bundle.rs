@@ -1,11 +1,14 @@
 use crate::backend::ExecBackend;
-use catgrad::runtime::Inputs;
+use catgrad::interpreter;
 
-/// [`Inputs`] loaded for a [`super::HuggingFaceLocator`], with tensor CIDs
-/// already computed at load time (catgrad does this inside `Inputs::new`).
+/// Materialized parameter tensors loaded for a [`super::HuggingFaceLocator`].
 /// Reused across every quote that runs against this weight set; sharing
 /// via `Arc` avoids ever cloning the multi-GB tensor interior.
+///
+/// Per-tensor CIDs are derived at bind time inside
+/// [`catgrad::runtime::BoundProgram::bind`] and cached on the resulting
+/// [`catgrad::runtime::BoundProgram`] — the bundle itself is CID-free.
 #[derive(Clone)]
 pub(crate) struct Bundle {
-    pub inputs: Inputs<ExecBackend>,
+    pub inputs: interpreter::Parameters<ExecBackend>,
 }

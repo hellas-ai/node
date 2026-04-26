@@ -1,6 +1,5 @@
 use super::{Bundle, HuggingFaceLocator};
 use crate::backend::create_backend;
-use catgrad::runtime::Inputs;
 use catgrad_llm::utils::{get_model_files, load_model_weights};
 use hellas_rpc::ExecutorError;
 use hf_hub::{Cache, Repo, RepoType};
@@ -39,10 +38,8 @@ pub(crate) fn load_bundle(locator: &HuggingFaceLocator) -> Result<Loaded, Execut
         ))
     })?;
 
-    let (parameter_values, parameter_types, _total_params) =
+    let (inputs, _parameter_types, _total_params) =
         load_model_weights(model_paths, &backend, locator.dtype)?;
-    let inputs = Inputs::new(backend, parameter_values, parameter_types)
-        .map_err(catgrad_llm::LLMError::from)?;
     let bundle = Arc::new(Bundle { inputs });
 
     Ok(Loaded {

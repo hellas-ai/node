@@ -346,9 +346,8 @@ impl Cache {
         bundle: &Arc<Bundle>,
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
-        let bound = bundle
-            .inputs
-            .bind(program.clone())
+        let backend = crate::backend::create_backend()?;
+        let bound = catgrad::runtime::BoundProgram::bind(&bundle.inputs, &backend, program.clone())
             .map_err(catgrad_llm::LLMError::from)?;
         Ok(Arc::new(ExecutionContext::new(Arc::new(bound))?))
     }
