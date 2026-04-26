@@ -1,27 +1,26 @@
 mod anthropic;
 mod openai;
+mod pi;
 mod plain;
 mod state;
 
 use crate::commands::CliResult;
-use anyhow::Context;
-use catgrad::prelude::Dtype;
+use anyhow::{Context, anyhow, bail};
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use catgrad::prelude::Dtype;
+use futures::Stream;
 use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
 use self::state::{GatewayState, HttpError};
@@ -46,9 +45,11 @@ pub struct GatewayOptions {
     pub metrics_port: Option<u16>,
     pub dtype: Dtype,
     pub secret_key: SecretKey,
+    pub pi: bool,
+    pub pi_bin: String,
+    pub pi_api: String,
+    pub pi_args: Vec<String>,
 }
-
-type SseSender = mpsc::UnboundedSender<Result<Event, Infallible>>;
 
 pub async fn run(options: GatewayOptions) -> CliResult<()> {
     let state = Arc::new(GatewayState::from_options(&options)?);
@@ -63,6 +64,9 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind gateway on {addr}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .context("listener has no local address")?;
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
@@ -93,12 +97,69 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         info!("Forcing request model override to `{model}`");
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("gateway server failed")?;
+    let pi_handle = if options.pi {
+        let model = options.force_model.as_deref().ok_or_else(|| {
+            anyhow!("--pi requires --force-model so pi can advertise a concrete model id")
+        })?;
+        let host = if options.host == "0.0.0.0" || options.host == "::" {
+            "127.0.0.1"
+        } else {
+            options.host.as_str()
+        };
+        // openai SDKs append /chat/completions to baseUrl, so we need /v1 in
+        // the URL. anthropic SDKs append /v1/messages themselves, so baseUrl
+        // stays at the host root.
+        let path = match options.pi_api.as_str() {
+            "openai-completions" => "/v1",
+            "anthropic-messages" => "",
+            other => bail!("unsupported --pi-api: {other}"),
+        };
+        let base_url = format!("http://{host}:{}{path}", bound_addr.port());
+        info!("spawning pi with provider baseUrl {base_url} (api={})", options.pi_api);
+        Some(pi::spawn(
+            &base_url,
+            model,
+            &options.pi_api,
+            &options.pi_bin,
+            &options.pi_args,
+        )?)
+    } else {
+        None
+    };
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let server_shutdown = shutdown.clone();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = server_shutdown.notified() => {}
+            }
+        }),
+    );
+
+    match pi_handle {
+        Some(mut handle) => {
+            tokio::pin!(server);
+            tokio::select! {
+                res = &mut server => {
+                    // Gateway stopped (ctrl-c or error); pi dies via kill_on_drop.
+                    res.context("gateway server failed")?;
+                }
+                status = handle.child.wait() => {
+                    let status = status.context("waiting on pi failed")?;
+                    shutdown.notify_one();
+                    server.await.context("gateway server failed")?;
+                    if !status.success() {
+                        bail!("pi exited with status {status}");
+                    }
+                }
+            }
+        }
+        None => {
+            server.await.context("gateway server failed")?;
+        }
+    }
 
     Ok(())
 }
@@ -121,14 +182,15 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn sse_response<F, Fut>(task: F) -> Response
+/// Wrap an event stream as an SSE response. The stream IS the producer —
+/// no spawn, no channel. When axum drops the response body the stream is
+/// dropped, propagating drop-cancellation through every layer (decoder,
+/// inference, broadcast subscriber, executor's per-running cancel token).
+fn sse_response<S>(stream: S) -> Response
 where
-    F: FnOnce(SseSender) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
 {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(task(tx));
-    Sse::new(UnboundedReceiverStream::new(rx))
+    Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -153,4 +215,13 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// How many seconds remain until `deadline`, clamped to at least one
+/// second so timeout error messages don't report `0s`.
+fn timeout_secs_until(deadline: tokio::time::Instant) -> u64 {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_secs()
+        .max(1)
 }

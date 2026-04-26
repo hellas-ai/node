@@ -29,6 +29,7 @@
     cargo-outdated
     cargo-sort
     skopeo
+    pi-coding-agent
   ];
 
   envShellHook = ''

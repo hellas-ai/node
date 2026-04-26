@@ -1,31 +1,35 @@
 use super::{GatewayOptions, json_error};
 use crate::execution::{
-    ExecutionOutput, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy,
+    ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
     RemoteNodeTarget,
 };
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
+use async_stream::try_stream;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use catgrad_llm::types::Message;
-use catgrad_llm::types::{anthropic, openai, plain};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
+use catgrad_llm::types::Message;
+use catgrad_llm::types::{anthropic, openai, plain};
+use futures::Stream;
+use futures::StreamExt;
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::Executor;
+use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use hellas_rpc::model::ModelAssets;
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tonic_iroh_transport::iroh::EndpointId;
 
-const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
+/// End-to-end deadline applied at the consumer of `PreparedGeneration::stream`.
+/// Covers preparation (quote / discovery) AND the entire decode stream.
+pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
@@ -52,13 +56,17 @@ pub(super) struct PreparedGeneration {
     pub(super) prompt_tokens: u32,
     pub(super) stop_token_ids: Vec<i32>,
     pub(super) has_tools: bool,
-    assets: Arc<ModelAssets>,
-    inference_timeout: Duration,
+    pub(super) assets: Arc<ModelAssets>,
+    pub(super) inference_timeout: Duration,
 }
 
-pub(super) enum GenerationError {
-    Timeout(Duration),
-    Failed(anyhow::Error),
+/// One observation from a generation. The `Done` event is the authoritative
+/// terminal frame — its `Outcome::Completed.total_tokens` is what should
+/// be reported in protocol-level usage frames.
+#[derive(Debug, Clone)]
+pub(super) enum GenerationEvent {
+    Delta(String),
+    Done(Outcome),
 }
 
 pub(super) struct HttpError {
@@ -230,12 +238,7 @@ impl GatewayState {
         req: &openai::ChatCompletionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let messages: Vec<Message> = req
-            .messages
-            .iter()
-            .cloned()
-            .map(Message::from)
-            .collect();
+        let messages: Vec<Message> = req.messages.iter().cloned().map(Message::from).collect();
         let tools = req.tools.clone();
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let enable_thinking = req
@@ -246,7 +249,9 @@ impl GatewayState {
             max_tokens,
             "Failed to prepare chat request",
             has_tools,
-            move |assets| assets.prepare_chat_with_tools(&messages, tools.as_deref(), enable_thinking),
+            move |assets| {
+                assets.prepare_chat_with_tools(&messages, tools.as_deref(), enable_thinking)
+            },
         )
         .await
     }
@@ -259,10 +264,12 @@ impl GatewayState {
             .into_iter()
             .map(Message::from)
             .collect::<Vec<_>>();
-        let tools = req
-            .tools
-            .as_ref()
-            .map(|tools| tools.iter().map(anthropic_tool_to_openai).collect::<Vec<_>>());
+        let tools = req.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(anthropic_tool_to_openai)
+                .collect::<Vec<_>>()
+        });
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         self.prepare_generation(
             &req.model,
@@ -288,6 +295,53 @@ impl GatewayState {
             move |assets| assets.prepare_plain(&prompt),
         )
         .await
+    }
+}
+
+impl PreparedGeneration {
+    /// Drive the execution to completion as a stream of `GenerationEvent`s.
+    ///
+    /// Owning consumption: dropping the returned stream cancels everything
+    /// downstream (broadcast subscriber → executor's per-running cancel
+    /// token, or tonic stream → server-side close-monitor on remote).
+    ///
+    /// The `inference_timeout` field on `PreparedGeneration` is *not*
+    /// applied here — callers wrap the stream with `tokio::time::timeout_at`
+    /// against `Self::deadline()` so the protocol can shape the timeout
+    /// frame in its own format.
+    pub(super) fn stream(self) -> impl Stream<Item = anyhow::Result<GenerationEvent>> + Send {
+        let Self {
+            request,
+            assets,
+            stop_token_ids,
+            ..
+        } = self;
+        try_stream! {
+            let mut decoder = TextOutputDecoder::new(assets, &stop_token_ids);
+            let inner = request.stream();
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                match event? {
+                    ExecutionEvent::Chunk { tokens, .. } => {
+                        let delta = decoder.push_bytes(&tokens)?;
+                        if !delta.is_empty() {
+                            yield GenerationEvent::Delta(delta);
+                        }
+                    }
+                    ExecutionEvent::Done(outcome) => {
+                        yield GenerationEvent::Done(outcome);
+                        return;
+                    }
+                }
+            }
+            Err(anyhow::anyhow!("execution stream ended without terminal outcome"))?;
+        }
+    }
+
+    /// Absolute deadline for this generation's stream consumption.
+    /// Computed at call time; covers the whole lifecycle from this point on.
+    pub(super) fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.inference_timeout
     }
 }
 
@@ -349,10 +403,7 @@ fn anthropic_request_to_openai_messages(
     out
 }
 
-fn emit_user_turn(
-    out: &mut Vec<openai::ChatMessage>,
-    blocks: Vec<anthropic::ContentBlock>,
-) {
+fn emit_user_turn(out: &mut Vec<openai::ChatMessage>, blocks: Vec<anthropic::ContentBlock>) {
     let mut text_parts = Vec::new();
     let mut tool_results = Vec::new();
     for block in blocks {
@@ -382,10 +433,7 @@ fn emit_user_turn(
     }
 }
 
-fn emit_assistant_turn(
-    out: &mut Vec<openai::ChatMessage>,
-    blocks: Vec<anthropic::ContentBlock>,
-) {
+fn emit_assistant_turn(out: &mut Vec<openai::ChatMessage>, blocks: Vec<anthropic::ContentBlock>) {
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
@@ -472,87 +520,6 @@ fn format_error_causes(err: &(dyn StdError + 'static)) -> String {
         current = source;
     }
     parts.join(": ")
-}
-
-impl PreparedGeneration {
-    async fn run<F>(&self, mut on_output: F) -> Result<ExecutionOutput, GenerationError>
-    where
-        F: FnMut(&[u8]) -> anyhow::Result<()> + Send,
-    {
-        let output = timeout(self.inference_timeout, self.request.run(&mut on_output))
-            .await
-            .map_err(|_| GenerationError::Timeout(self.inference_timeout))??;
-        Ok(output)
-    }
-
-    pub(super) async fn run_to_text(&self) -> Result<(ExecutionOutput, String), GenerationError> {
-        let output = self.run(|_| Ok(())).await?;
-        let text = TextOutputDecoder::decode_output(self.assets.as_ref(), &output)?;
-        Ok((output, text))
-    }
-
-    pub(super) fn parse_tool_calls(
-        &self,
-        text: &str,
-    ) -> anyhow::Result<Option<catgrad_llm::helpers::ToolUseStep>> {
-        self.assets.parse_tool_calls(text).map_err(Into::into)
-    }
-
-    pub(super) async fn stream_text<F>(
-        &self,
-        mut on_text: F,
-    ) -> Result<ExecutionOutput, GenerationError>
-    where
-        F: FnMut(&str) -> anyhow::Result<()> + Send,
-    {
-        let mut decoder = TextOutputDecoder::new(self.assets.clone(), &self.stop_token_ids);
-        self.run(|output| {
-            let delta = decoder.push_output(output)?;
-            if delta.is_empty() {
-                return Ok(());
-            }
-            on_text(&delta)
-        })
-        .await
-    }
-}
-
-impl fmt::Display for GenerationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GenerationError::Timeout(duration) => {
-                write!(f, "inference timed out after {}s", duration.as_secs())
-            }
-            GenerationError::Failed(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl From<anyhow::Error> for GenerationError {
-    fn from(err: anyhow::Error) -> Self {
-        GenerationError::Failed(err)
-    }
-}
-
-impl IntoResponse for GenerationError {
-    fn into_response(self) -> Response {
-        let status = match self {
-            GenerationError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            GenerationError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        match &self {
-            GenerationError::Timeout(duration) => {
-                warn!(
-                    timeout_secs = duration.as_secs(),
-                    "gateway inference timed out"
-                );
-            }
-            GenerationError::Failed(err) => {
-                error!(error = %err, "gateway inference failed");
-            }
-        }
-        json_error(status, format!("Inference error: {self}"))
-    }
 }
 
 impl IntoResponse for HttpError {

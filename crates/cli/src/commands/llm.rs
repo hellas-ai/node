@@ -1,8 +1,11 @@
 use crate::commands::CliResult;
-use crate::execution::{ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy};
+use crate::execution::{
+    ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
+};
 use crate::text_output::TextOutputDecoder;
 use catgrad::prelude::Dtype;
 use catgrad_llm::types::{Message, openai::ChatMessage};
+use futures::StreamExt;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
 use std::io::{self, Write};
@@ -36,16 +39,13 @@ pub struct ExecuteOptions {
 /// and the canonical message prefix.
 fn is_dtype_not_supported(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(ExecutorError::DtypeNotSupported { .. }) =
-            cause.downcast_ref::<ExecutorError>()
+        if let Some(ExecutorError::DtypeNotSupported { .. }) = cause.downcast_ref::<ExecutorError>()
         {
             return true;
         }
         if let Some(status) = cause.downcast_ref::<tonic::Status>()
             && status.code() == tonic::Code::FailedPrecondition
-            && status
-                .message()
-                .starts_with("program was built for dtype")
+            && status.message().starts_with("program was built for dtype")
         {
             return true;
         }
@@ -75,15 +75,6 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         bootstrap_assets.prepare_chat(&messages)?
     };
     let mut decoder = TextOutputDecoder::new(bootstrap_assets.clone(), &prepared.stop_token_ids);
-
-    let mut stdout_sink = |output: &[u8]| {
-        let delta = decoder.push_output(output)?;
-        if !delta.is_empty() {
-            print!("{delta}");
-            io::stdout().flush()?;
-        }
-        Ok(())
-    };
 
     let last_index = options.dtype.len() - 1;
     for (idx, &dtype) in options.dtype.iter().enumerate() {
@@ -143,27 +134,42 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             options.retries,
         ));
 
-        let request = ExecutionRequest::new(
-            runtime,
-            assets,
-            prepared.clone(),
-            options.max_seq,
-            strategy,
-        )?;
+        let request =
+            ExecutionRequest::new(runtime, assets, prepared.clone(), options.max_seq, strategy)?;
+        let uses_remote = request.uses_remote_transport();
 
-        let result: anyhow::Result<()> = if request.uses_remote_transport() {
-            match request.prepare().await {
-                Ok(mut prepared) => {
-                    let run_result = prepared.run(&mut stdout_sink).await;
-                    crate::tracing_config::suppress_execute_tail_logs();
-                    drop(prepared);
-                    run_result.map(|_| ())
+        let result: anyhow::Result<()> = async {
+            let stream = request.stream();
+            tokio::pin!(stream);
+            let mut completed = false;
+            while let Some(event) = stream.next().await {
+                match event? {
+                    ExecutionEvent::Chunk { tokens, .. } => {
+                        let delta = decoder.push_bytes(&tokens)?;
+                        if !delta.is_empty() {
+                            print!("{delta}");
+                            io::stdout().flush()?;
+                        }
+                    }
+                    ExecutionEvent::Done(Outcome::Completed { .. }) => {
+                        completed = true;
+                        break;
+                    }
+                    ExecutionEvent::Done(Outcome::Failed { error, .. }) => {
+                        anyhow::bail!("execution failed: {error}");
+                    }
                 }
-                Err(err) => Err(err),
             }
-        } else {
-            request.run(&mut stdout_sink).await.map(|_| ())
-        };
+            if !completed {
+                anyhow::bail!("execution stream ended without terminal outcome");
+            }
+            Ok(())
+        }
+        .await;
+
+        if uses_remote {
+            crate::tracing_config::suppress_execute_tail_logs();
+        }
 
         match result {
             Ok(()) => return Ok(()),

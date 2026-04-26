@@ -2,17 +2,17 @@ use hellas_rpc::ExecutorError;
 use hellas_rpc::driver::{ExecuteDriver, ExecuteEventStream};
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
-    DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteResponse,
-    ExecuteResultRequest, ExecuteResultResponse, ExecuteStatusRequest, ExecuteStatusResponse,
-    ExecuteStreamEvent, GetModelStatsRequest, GetModelStatsResponse, GetQuoteRequest,
-    GetQuoteResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
+    DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteStreamEvent,
+    GetModelStatsRequest, GetModelStatsResponse, GetQuoteRequest, GetQuoteResponse,
+    GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use std::pin::Pin;
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::{ExecutorHandle, ExecutorMessage, LocalExecutionStream};
+use super::{ExecuteEventReceiver, ExecutorHandle, ExecutorMessage};
 
 impl ExecutorHandle {
     async fn send<T>(
@@ -57,27 +57,11 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn start_execution(
+    pub async fn execute(
         &self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteResponse, ExecutorError> {
+    ) -> Result<ExecuteEventReceiver, ExecutorError> {
         self.send(|reply| ExecutorMessage::Execute { request, reply })
-            .await
-    }
-
-    pub async fn execution_status(
-        &self,
-        request: ExecuteStatusRequest,
-    ) -> Result<ExecuteStatusResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Status { request, reply })
-            .await
-    }
-
-    pub async fn execution_result(
-        &self,
-        request: ExecuteResultRequest,
-    ) -> Result<ExecuteResultResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Result { request, reply })
             .await
     }
 
@@ -91,17 +75,6 @@ impl ExecutorHandle {
     ) -> Result<GetModelStatsResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::GetModelStats { request, reply })
             .await
-    }
-
-    async fn subscribe_execution(
-        &self,
-        execution_id: String,
-    ) -> Result<LocalExecutionStream, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Subscribe {
-            execution_id,
-            reply,
-        })
-        .await
     }
 }
 
@@ -155,42 +128,16 @@ impl Execute for ExecutorHandle {
         ))
     }
 
+    type ExecuteStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
+
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
-    ) -> Result<Response<ExecuteResponse>, Status> {
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let receiver = self.execute(request.into_inner()).await?;
         Ok(Response::new(
-            self.start_execution(request.into_inner()).await?,
-        ))
-    }
-
-    async fn execute_status(
-        &self,
-        request: Request<ExecuteStatusRequest>,
-    ) -> Result<Response<ExecuteStatusResponse>, Status> {
-        Ok(Response::new(
-            self.execution_status(request.into_inner()).await?,
-        ))
-    }
-
-    type ExecuteStreamStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
-
-    async fn execute_stream(
-        &self,
-        request: Request<ExecuteStatusRequest>,
-    ) -> Result<Response<Self::ExecuteStreamStream>, Status> {
-        let execution_id = request.into_inner().execution_id;
-        let stream = self.subscribe_execution(execution_id).await?;
-        Ok(Response::new(Box::pin(stream) as Self::ExecuteStreamStream))
-    }
-
-    async fn execute_result(
-        &self,
-        request: Request<ExecuteResultRequest>,
-    ) -> Result<Response<ExecuteResultResponse>, Status> {
-        Ok(Response::new(
-            self.execution_result(request.into_inner()).await?,
+            Box::pin(ReceiverStream::new(receiver)) as Self::ExecuteStream
         ))
     }
 
@@ -224,8 +171,7 @@ impl Execute for ExecutorHandle {
         };
         // Tokenizer-only path. The dtype is irrelevant for `decode_tokens`;
         // F32 is just the cheapest valid value for the model-graph build that
-        // `ModelAssets::load` does for EOS-id extraction. See PREFIX.md §3.5
-        // for the future no-model-build helper.
+        // `ModelAssets::load` does for EOS-id extraction.
         let assets = ModelAssets::load(&model_spec, catgrad::prelude::Dtype::F32)
             .map_err(|e| Status::internal(format!("failed to load model: {e}")))?;
 
@@ -288,8 +234,7 @@ impl ExecuteDriver for ExecutorHandle {
         &mut self,
         request: ExecuteRequest,
     ) -> Result<ExecuteEventStream, Status> {
-        let execution = self.start_execution(request).await?;
-        let stream = self.subscribe_execution(execution.execution_id).await?;
-        Ok(Box::pin(stream))
+        let receiver = self.execute(request).await?;
+        Ok(Box::pin(ReceiverStream::new(receiver)))
     }
 }

@@ -54,8 +54,6 @@ pub enum ModelAssetsError {
         #[source]
         source: TokenizerError,
     },
-    #[error("model does not expose a chat template")]
-    MissingChatTemplate,
     #[error("failed to prepare prompt request")]
     PreparePromptRequest {
         #[source]

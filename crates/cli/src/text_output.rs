@@ -1,10 +1,11 @@
-use crate::execution::ExecutionOutput;
 use anyhow::{Context, anyhow};
 use catgrad_llm::{Detokenizer, LLMError};
 use hellas_rpc::decode_token_ids;
 use hellas_rpc::model::ModelAssets;
 use std::sync::Arc;
 
+/// Streaming detokenizer. Stateful — buffers partial UTF-8 sequences
+/// across `push_bytes` calls so multi-byte glyphs aren't split mid-stream.
 pub struct TextOutputDecoder {
     decoder: Detokenizer<'static>,
 }
@@ -32,16 +33,11 @@ impl TextOutputDecoder {
         Self { decoder }
     }
 
-    pub fn decode_output(assets: &ModelAssets, output: &ExecutionOutput) -> anyhow::Result<String> {
-        let token_ids = decode_token_ids(&output.output)
-            .map_err(|err| anyhow!("failed to decode output token payload: {err}"))?;
-        assets
-            .decode_tokens(&token_ids)
-            .context("failed to decode output text")
-    }
-
-    pub fn push_output(&mut self, output: &[u8]) -> anyhow::Result<String> {
-        let token_ids: Vec<i32> = decode_token_ids(output)
+    /// Push a chunk of token bytes; returns the incremental text delta.
+    /// May return an empty string if the chunk only contained the leading
+    /// bytes of a multi-byte UTF-8 character.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<String> {
+        let token_ids: Vec<i32> = decode_token_ids(bytes)
             .map_err(|err| anyhow!("failed to decode streamed output batch: {err}"))?
             .into_iter()
             .map(|token| {
