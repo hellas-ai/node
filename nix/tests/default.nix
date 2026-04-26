@@ -160,12 +160,12 @@
   # Drives the gateway through pi-coding-agent and verifies the full agentic
   # loop. The model must call the bash tool to read a file whose contents it
   # could not otherwise know, then surface those contents in its final answer.
-  # Captured artifacts (always, even on failure): pi stdout, executor journal,
-  # gateway journal — named with the test suffix so both runs can coexist.
+  # Uses the gateway's built-in `--pi` switch: hellas-cli writes the provider
+  # extension itself and supervises the pi child, so no separate client node
+  # or hand-written extension is needed.
   mkToolUseTest = {
     suffix,
     api,
-    baseUrlPath,
   }:
     pkgs.testers.runNixOSTest {
       name = "hellas-gateway-tool-use-${suffix}";
@@ -178,66 +178,58 @@
         # Observed OOM kernel panic at 6 GB AND 8 GB (DHT thread alloc).
         memorySize = 12288;
       };
-      nodes.gateway = mkGatewayNode {hfHome = qwenHfHome;};
-      nodes.client = _: {
+      # Gateway node also runs pi (via `--pi`), so it needs pi-coding-agent.
+      nodes.gateway = _: {
         config = lib.mkMerge [
           baseNode
           {
             environment.systemPackages = [pkgs.pi-coding-agent];
             virtualisation.cores = 2;
-            virtualisation.memorySize = 2048;
+            virtualisation.memorySize = 3072;
           }
         ];
       };
 
       testScript = {nodes, ...}: let
         executorAddr = (lib.head nodes.executor.networking.interfaces.eth1.ipv4.addresses).address;
-        gatewayAddr = (lib.head nodes.gateway.networking.interfaces.eth1.ipv4.addresses).address;
-        piExtension = pkgs.writeText "hellas-pi-extension-${suffix}.js" ''
-          export default function (pi) {
-            pi.registerProvider("hellas", {
-              baseUrl: "http://${gatewayAddr}:${toString gatewayPort}${baseUrlPath}",
-              apiKey: "unused",
-              api: "${api}",
-              models: [{
-                id: "${qwenModel}",
-                name: "Qwen3 0.6B (Hellas)",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 32768,
-                maxTokens: 1024,
-              }],
-            });
-          }
-        '';
         marker = "hellas-tool-loop-works";
       in ''
         start_all()
-        ${bootGateway executorAddr}
+        executor.wait_for_unit("hellas.service")
+        gateway.wait_for_unit("multi-user.target")
 
-        # The prompt asks the model to run a specific bash command and relay
-        # exactly what it printed — the bash tool is the only way to surface
-        # the marker, and pass-through phrasing keeps small models on-rails.
-        # Run pi without raising on non-zero exit so we still capture logs below.
-        (pi_status, _) = client.execute(
-            "pi -e ${piExtension} --provider hellas --model ${qwenModel}"
-            " -p --no-session --no-extensions --offline --verbose"
-            " 'Use the bash tool to run: echo ${marker}. Then relay exactly what it printed.'"
-            " > /tmp/pi-out.txt 2>&1"
+        executor_node_id = executor.wait_until_succeeds(
+            "${package}/bin/hellas-cli --identity ${executorIdentityPath} identity show-node-id"
+        ).strip()
+
+        gateway.wait_until_succeeds(
+            f"${package}/bin/hellas-cli rpc {executor_node_id} --node-addr ${executorAddr}:${toString executorPort}"
+        )
+
+        # Run gateway with --pi: gateway binds, spawns pi, exits when pi exits.
+        # Trailing args after `--` are forwarded to pi.
+        (pi_status, _) = gateway.execute(
+            f"${package}/bin/hellas-cli gateway"
+            f" --host=127.0.0.1 --port=${toString gatewayPort}"
+            f" --retries=1"
+            f" --node-id {executor_node_id}"
+            f" --node-addr ${executorAddr}:${toString executorPort}"
+            f" --force-model ${qwenModel}"
+            f" --pi --pi-api ${api}"
+            f" -- -p --no-session --no-extensions --offline --verbose"
+            f" 'Use the bash tool to run: echo ${marker}. Then relay exactly what it printed.'"
+            f" > /tmp/pi-out.txt 2>&1"
         )
 
         # Always dump the transcripts into the build log; `nix log <drv>`
         # keeps them accessible whether the test passes or fails.
-        print("==== pi output (${suffix}) ====")
-        print(client.succeed("cat /tmp/pi-out.txt"))
+        print("==== pi+gateway output (${suffix}) ====")
+        print(gateway.succeed("cat /tmp/pi-out.txt"))
         print("==== executor journal (${suffix}) ====")
         print(executor.succeed("journalctl -u hellas.service --no-pager -o cat"))
-        print("==== gateway journal (${suffix}) ====")
-        print(gateway.succeed("journalctl -u hellas-gateway.service --no-pager -o cat"))
 
         assert pi_status == 0, f"pi exited with status {pi_status}"
-        client.succeed("grep -F ${marker} /tmp/pi-out.txt")
+        gateway.succeed("grep -F ${marker} /tmp/pi-out.txt")
       '';
     };
 in {
@@ -311,13 +303,9 @@ in {
   gateway-tool-use-openai = mkToolUseTest {
     suffix = "openai";
     api = "openai-completions";
-    # OpenAI SDK appends `/chat/completions` to baseUrl; we point it at our /v1 prefix.
-    baseUrlPath = "/v1";
   };
   gateway-tool-use-anthropic = mkToolUseTest {
     suffix = "anthropic";
     api = "anthropic-messages";
-    # Anthropic SDK appends `/v1/messages` itself; baseUrl stays at the host.
-    baseUrlPath = "";
   };
 }

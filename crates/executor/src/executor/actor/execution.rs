@@ -1,59 +1,75 @@
-use crate::state::ExecutionStatus;
-use crate::state::StateError;
+use crate::executor::ExecuteEventReceiver;
+use crate::state::new_execution_id;
 use crate::worker::{EnqueueError, ExecuteJob};
 use hellas_rpc::ExecutorError;
-use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
-    ExecuteStatusRequest, ExecuteStatusResponse,
-};
+use hellas_rpc::pb::hellas::ExecuteRequest;
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::Executor;
+
+/// Backpressure buffer for the per-execution event channel. Small enough
+/// that a slow consumer stalls the worker quickly (preventing unbounded
+/// memory growth); large enough to absorb minor jitter without blocking
+/// decode on every chunk.
+const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 
 impl Executor {
     pub(super) async fn handle_execute(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteResponse, ExecutorError> {
+    ) -> Result<ExecuteEventReceiver, ExecutorError> {
         let quote_id = request.quote_id;
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         self.store.prune_expired_quotes(Instant::now());
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;
-        let stat_cached_prompt = 0u64;
         let stat_cached_output = quote
             .start
-            .cached_output_tokens
+            .cached
             .as_ref()
-            .map_or(0, |t| t.len() as u64);
-        let stat_prefill = stat_prompt;
+            .map_or(0, |c| c.output_tokens.len() as u64);
 
         let model_id = quote.model_id.clone();
-        let execution_id = self.store.create_execution(&model_id);
+        let execution_id = new_execution_id();
+        let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
+            model_id: model_id.clone(),
             invocation: quote.invocation.clone(),
             execution: quote.execution.clone(),
             start: quote.start.clone(),
             stream_batch_size,
             accepted_at: Instant::now(),
+            cancel: CancellationToken::new(),
+            sender,
+            metrics: Arc::clone(&self.metrics),
         };
 
-        let queued = match self.accept_execution(job) {
-            Ok(queued) => queued,
-            Err(error) => {
-                let _ = self.store.remove_execution(&execution_id);
-                return Err(error);
+        let queued = match self.try_start_execution(job) {
+            Ok(()) => false,
+            Err(StartExecutionError::Busy(job)) => {
+                if self.pending_executions.len() >= self.queue_capacity {
+                    return Err(ExecutorError::QueueFull {
+                        capacity: self.queue_capacity,
+                    });
+                }
+                self.pending_executions.push_back(job);
+                true
             }
+            Err(StartExecutionError::Closed) => return Err(ExecutorError::ChannelClosed),
         };
+
         // Counters update after the queue accepts the job — no rollback path.
         self.metrics.record_execution_started(
             &model_id,
             stat_prompt,
-            stat_cached_prompt,
+            /* cached_prompt= */ 0,
             stat_cached_output,
-            stat_prefill,
+            /* prefill= */ stat_prompt,
         );
         let _ = self.store.remove_quote(&quote_id);
 
@@ -66,69 +82,29 @@ impl Executor {
             "accepted execution"
         );
 
-        Ok(ExecuteResponse {
-            execution_id,
-            quote_id,
-        })
-    }
-
-    pub(super) fn handle_status(
-        &self,
-        request: &ExecuteStatusRequest,
-    ) -> Result<ExecuteStatusResponse, ExecutorError> {
-        self.status_response(&request.execution_id)
-    }
-
-    pub(super) fn handle_result(
-        &self,
-        request: &ExecuteResultRequest,
-    ) -> Result<ExecuteResultResponse, ExecutorError> {
-        let output = self.store.output(&request.execution_id)?;
-        Ok(ExecuteResultResponse {
-            output: output.to_vec(),
-        })
-    }
-
-    fn accept_execution(&mut self, job: ExecuteJob) -> Result<bool, ExecutorError> {
-        match self.try_start_execution(job) {
-            Ok(()) => Ok(false),
-            Err(StartExecutionError::Busy(job)) => {
-                if self.pending_executions.len() >= self.queue_capacity {
-                    return Err(ExecutorError::QueueFull {
-                        capacity: self.queue_capacity,
-                    });
-                }
-                self.pending_executions.push_back(job);
-                Ok(true)
-            }
-            Err(StartExecutionError::Closed) => Err(ExecutorError::ChannelClosed),
-            Err(StartExecutionError::Other(error)) => Err(error),
-        }
+        Ok(receiver)
     }
 
     fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
-        let execution_id = job.execution_id.clone();
         match self.worker.try_enqueue(job) {
-            Ok(()) => {
-                self.store.mark_running(&execution_id)?;
-                self.send_status(&execution_id, ExecutionStatus::Running, None);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
-            Err(EnqueueError::Stopped(_job)) => {
-                self.handle_complete(
-                    &execution_id,
-                    None,
-                    ExecutionStatus::Failed,
-                    Some("executor worker channel closed".to_string()),
-                );
-                Err(StartExecutionError::Closed)
-            }
+            Err(EnqueueError::Stopped(_job)) => Err(StartExecutionError::Closed),
         }
     }
 
+    /// Pop pending jobs and dispatch the first one whose consumer is still
+    /// listening. Stale entries (consumer dropped while queued) are discarded
+    /// silently — the consumer already lost interest.
     pub(super) fn dispatch_next_execution(&mut self) {
         while let Some(job) = self.pending_executions.pop_front() {
+            if job.sender.is_closed() {
+                debug!(
+                    execution_id = %job.execution_id,
+                    "dropping queued execution: consumer disconnected before dispatch"
+                );
+                continue;
+            }
             match self.try_start_execution(job) {
                 Ok(()) => return,
                 Err(StartExecutionError::Busy(job)) => {
@@ -138,78 +114,12 @@ impl Executor {
                 Err(StartExecutionError::Closed) => {
                     warn!("failed to start queued execution: executor channel closed");
                 }
-                Err(StartExecutionError::Other(error)) => {
-                    warn!("failed to start queued execution: {error:#}");
-                }
             }
         }
-    }
-
-    pub(super) fn cancel_pending_execution(&mut self, execution_id: &str) {
-        let original_len = self.pending_executions.len();
-        self.pending_executions
-            .retain(|job| job.execution_id != execution_id);
-
-        if self.pending_executions.len() != original_len {
-            info!(%execution_id, "cancelled queued execution without active watchers");
-            self.handle_complete(
-                execution_id,
-                None,
-                ExecutionStatus::Failed,
-                Some("cancelled before start".to_string()),
-            );
-        }
-    }
-
-    pub(super) fn handle_complete(
-        &mut self,
-        execution_id: &str,
-        output: Option<Vec<u8>>,
-        status: ExecutionStatus,
-        error: Option<String>,
-    ) {
-        let success = matches!(status, ExecutionStatus::Completed);
-        debug!(%execution_id, success, "execution finished");
-
-        let generated = self.store.progress(execution_id).unwrap_or(0);
-        let model_id = self
-            .store
-            .model_id(execution_id)
-            .ok()
-            .map(str::to_owned)
-            .unwrap_or_default();
-        if success {
-            self.metrics
-                .record_execution_completed(&model_id, generated);
-        } else {
-            self.metrics.record_execution_failed(&model_id, generated);
-        }
-
-        if let Err(store_err) =
-            self.store
-                .complete_execution(execution_id, status, output, error.clone())
-        {
-            warn!("failed to update completion state for {execution_id}: {store_err}");
-        }
-
-        self.send_status(execution_id, status, error);
     }
 }
 
 enum StartExecutionError {
     Busy(ExecuteJob),
     Closed,
-    Other(ExecutorError),
-}
-
-impl From<ExecutorError> for StartExecutionError {
-    fn from(error: ExecutorError) -> Self {
-        StartExecutionError::Other(error)
-    }
-}
-
-impl From<StateError> for StartExecutionError {
-    fn from(error: StateError) -> Self {
-        ExecutorError::from(error).into()
-    }
 }

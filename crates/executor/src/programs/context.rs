@@ -1,7 +1,10 @@
 use crate::backend::ExecBackend;
+use crate::state::Invocation;
+use catgrad::category::core::Shape;
 use catgrad::cid::Cid;
+use catgrad::interpreter;
 use catgrad::runtime::{BoundProgram, Program};
-use catgrad_llm::runtime::{BoundProgramText, TextExecution, TextReceipt, TextState};
+use catgrad_llm::runtime::{BoundProgramText, TextExecution, TextPolicy, TextReceipt, TextState};
 use hellas_rpc::ExecutorError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,13 +39,26 @@ pub(crate) struct ExecutionContext {
     execution_cache: Arc<Mutex<ExecutionCache>>,
 }
 
+/// Cached output of a previous identical request — produced once by a
+/// real decode, reused on exact-replay hits. Carries everything needed
+/// to reconstruct the original execution's terminal outcome without
+/// re-running the model.
+#[derive(Clone)]
+pub(crate) struct CachedContinuation {
+    pub output_tokens: Arc<[u32]>,
+    /// Receipt CID the original real-decode produced. Replays advertise
+    /// the same receipt: it identifies the same outputs and the same
+    /// post-state by content.
+    pub receipt_id: Cid<TextReceipt>,
+}
+
 /// Pre-computed cache lookup result for a single quote, threaded into
 /// the worker via [`crate::state::QuoteRecord`].
 #[derive(Clone)]
 pub(crate) struct ExecutionStart {
-    /// Output tokens from a previous identical request, if any. When
-    /// `Some`, the runner streams these and skips the model entirely.
-    pub cached_output_tokens: Option<Arc<[u32]>>,
+    /// Cached output for an exact-replay hit. When `Some`, the runner
+    /// streams the cached tokens and skips the model entirely.
+    pub cached: Option<CachedContinuation>,
     /// Commitment for this request: a [`Cid<TextExecution>`] over
     /// `(program, parameters, initial_state, input_tokens, policy)`.
     /// Threaded into the worker so `cache_continuation` keys the
@@ -58,6 +74,7 @@ pub(crate) struct ExecutionStart {
 #[derive(Clone)]
 struct ContinuationEntry {
     output_tokens: Arc<[u32]>,
+    receipt_id: Cid<TextReceipt>,
     bytes: usize,
     last_touch: u64,
 }
@@ -107,6 +124,34 @@ impl ExecutionContext {
         self.genesis_receipt_id
     }
 
+    /// Build the request `TextExecution` commitment from this bound program
+    /// + invocation. Used at quote time to compute `commitment_id` before
+    /// the runner sees the request.
+    pub(crate) fn build_text_execution(
+        &self,
+        initial_state_receipt_id: Cid<TextReceipt>,
+        invocation: &Invocation,
+        policy: &TextPolicy,
+    ) -> Result<TextExecution, ExecutorError> {
+        let bound = &self.bound_program;
+        let input_tensor = interpreter::tensor(
+            &bound.interpreter().backend,
+            Shape(vec![1, invocation.input_ids.len()]),
+            invocation.input_ids.clone(),
+        )
+        .map_err(|error| {
+            ExecutorError::WeightsError(format!("failed to build input tensor: {error:?}"))
+        })?;
+        // The initial_state TextState is fetched at execution_start; here we
+        // only have its receipt id, which is all `TextExecution::new` needs.
+        Ok(TextExecution::new(
+            bound,
+            initial_state_receipt_id,
+            &input_tensor,
+            policy,
+        )?)
+    }
+
     /// Build the [`ExecutionStart`] for a request: resolve the starting
     /// state from the receipt store and look up the continuation cache.
     /// Returns `Err` if `initial_receipt_id` names a receipt the executor
@@ -129,19 +174,19 @@ impl ExecutionContext {
                     "initial receipt not found: {initial_receipt_id}"
                 ))
             })?;
-        let cached_output_tokens = cache.lookup_continuation(commitment_id);
+        let cached = cache.lookup_continuation(commitment_id);
         debug!(
             program_id = %self.bound_program.program().id(),
             %commitment_id,
             %initial_receipt_id,
-            cached_output_tokens = cached_output_tokens.as_ref().map_or(0, |entry| entry.len()),
+            cached_output_tokens = cached.as_ref().map_or(0, |c| c.output_tokens.len()),
             cache_continuations = cache.continuations.len(),
             cache_receipts = cache.receipts.len(),
             cache_bytes = cache.total_bytes(),
             "execution cache lookup"
         );
         Ok(ExecutionStart {
-            cached_output_tokens,
+            cached,
             commitment_id,
             initial_state,
         })
@@ -151,6 +196,7 @@ impl ExecutionContext {
         &self,
         commitment_id: Cid<TextExecution>,
         output_tokens: Vec<u32>,
+        receipt_id: Cid<TextReceipt>,
     ) {
         self.execution_cache
             .lock()
@@ -159,6 +205,7 @@ impl ExecutionContext {
                 self.bound_program.program().id(),
                 commitment_id,
                 Arc::<[u32]>::from(output_tokens),
+                receipt_id,
             );
     }
 
@@ -186,11 +233,17 @@ impl ExecutionCache {
         }
     }
 
-    fn lookup_continuation(&mut self, commitment_id: Cid<TextExecution>) -> Option<Arc<[u32]>> {
+    fn lookup_continuation(
+        &mut self,
+        commitment_id: Cid<TextExecution>,
+    ) -> Option<CachedContinuation> {
         let touch = self.next_touch();
         self.continuations.get_mut(&commitment_id).map(|entry| {
             entry.last_touch = touch;
-            entry.output_tokens.clone()
+            CachedContinuation {
+                output_tokens: entry.output_tokens.clone(),
+                receipt_id: entry.receipt_id,
+            }
         })
     }
 
@@ -203,6 +256,7 @@ impl ExecutionCache {
         program_id: Cid<Program>,
         commitment_id: Cid<TextExecution>,
         output_tokens: Arc<[u32]>,
+        receipt_id: Cid<TextReceipt>,
     ) {
         let continuation_bytes = output_tokens
             .len()
@@ -227,6 +281,7 @@ impl ExecutionCache {
         if let Some(entry) = self.continuations.get_mut(&commitment_id) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             entry.output_tokens = output_tokens;
+            entry.receipt_id = receipt_id;
             entry.bytes = continuation_bytes;
             entry.last_touch = touch;
             self.total_bytes = self.total_bytes.saturating_add(continuation_bytes);
@@ -246,6 +301,7 @@ impl ExecutionCache {
             commitment_id,
             ContinuationEntry {
                 output_tokens,
+                receipt_id,
                 bytes: continuation_bytes,
                 last_touch: touch,
             },
@@ -316,25 +372,28 @@ impl ExecutionCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cid, ExecutionCache, Program, TextExecution};
+    use super::{Cid, ExecutionCache, Program, TextExecution, TextReceipt};
     use std::sync::Arc;
 
     #[test]
     fn exact_continuation_lookup_hits_by_commitment_id() {
         let mut cache = ExecutionCache::new(1024);
         let commitment_id = Cid::<TextExecution>::from_bytes([7; 32]);
+        let receipt_id = Cid::<TextReceipt>::from_bytes([9; 32]);
         let expected = Arc::<[u32]>::from(vec![4_u32, 5, 6]);
 
         cache.insert_continuation(
             Cid::<Program>::from_bytes([0; 32]),
             commitment_id,
             expected.clone(),
+            receipt_id,
         );
 
         let continuation = cache
             .lookup_continuation(commitment_id)
             .expect("continuation should exist");
-        assert_eq!(continuation, expected);
+        assert_eq!(continuation.output_tokens, expected);
+        assert_eq!(continuation.receipt_id, receipt_id);
     }
 
     #[test]
@@ -344,6 +403,7 @@ mod tests {
             Cid::<Program>::from_bytes([0; 32]),
             Cid::<TextExecution>::from_bytes([1; 32]),
             Arc::<[u32]>::from(vec![1_u32, 2, 3]),
+            Cid::<TextReceipt>::from_bytes([2; 32]),
         );
         assert!(
             cache

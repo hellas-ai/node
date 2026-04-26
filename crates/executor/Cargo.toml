@@ -17,6 +17,7 @@ candle-metal = ["candle", "catgrad/metal"]
 hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = "0.7"
 thiserror = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

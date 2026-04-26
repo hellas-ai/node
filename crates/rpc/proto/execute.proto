@@ -23,47 +23,58 @@ message ExecuteRequest {
   string quote_id = 1;
   optional uint32 stream_batch_size = 2;
 }
-message ExecuteResponse {
-  string execution_id = 1;
-  string quote_id = 2;
-}
 
-message ExecuteStatusRequest { string execution_id = 1; }
-enum ExecutionStatus {
-  UNSPECIFIED = 0;
-  PENDING = 1;
-  RUNNING = 2;
-  COMPLETED = 3;
-  FAILED = 4;
-}
+// =====================================================================
+// Streaming execution events.
+//
+// Wire protocol: zero or more `Chunk` events, terminated by exactly one
+// `Outcome` event, after which the stream ends. There is no late-attach
+// snapshot — the stream IS the execution; clients hold the receiver from
+// `Execute` for the entire lifecycle and dropping it cancels the run.
+// =====================================================================
 
-message ExecuteStatusResponse {
-  ExecutionStatus status = 1;
-  uint64 progress = 2;
-}
-message ExecuteSnapshot {
-  ExecutionStatus status = 1;
-  uint64 progress = 2;
-  bytes output = 3;
-  // Populated when status is FAILED; empty otherwise.
-  string error = 4;
-}
-message ExecuteProgress {
-  ExecutionStatus status = 1;
-  uint64 progress = 2;
-  bytes output_chunk = 3;
-  // Populated when status is FAILED; empty otherwise.
-  string error = 4;
-}
 message ExecuteStreamEvent {
   oneof event {
-    ExecuteSnapshot snapshot = 1;
-    ExecuteProgress progress = 2;
+    Chunk chunk = 1;
+    Outcome outcome = 2;
   }
 }
 
-message ExecuteResultRequest { string execution_id = 1; }
-message ExecuteResultResponse { bytes output = 1; }
+// Incremental token chunk produced during decode.
+message Chunk {
+  // Cumulative position AFTER this chunk.
+  uint64 position = 1;
+  // Little-endian u32 token IDs.
+  bytes tokens = 2;
+}
+
+// Terminal outcome of an execution.
+message Outcome {
+  oneof kind {
+    Completed completed = 1;
+    Failed failed = 2;
+  }
+}
+
+message Completed {
+  uint64 total_tokens = 1;
+  StopReason stop_reason = 2;
+  // Cid<TextReceipt> — exactly 32 bytes. Receivers reject other lengths.
+  bytes receipt_cid = 3;
+}
+
+message Failed {
+  // Tokens emitted before failure (for honest usage reporting).
+  uint64 position = 1;
+  string error = 2;
+}
+
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  END_OF_SEQUENCE = 1;
+  MAX_NEW_TOKENS = 2;
+  CANCELLED = 3;
+}
 
 // Convenience RPC: the server handles tokenization and graph construction.
 // Intended for lightweight clients (browsers) that don't have the tokenizer.
@@ -149,7 +160,7 @@ message ListModelsResponse {
 message DecodeTokensRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
-  // Raw token bytes (little-endian u32 token IDs, same format as ExecuteStream output).
+  // Raw token bytes (little-endian u32 token IDs, same format as Execute output).
   bytes token_bytes = 3;
 }
 

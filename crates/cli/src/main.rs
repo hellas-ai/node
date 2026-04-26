@@ -59,7 +59,6 @@ fn default_llm_dtypes(is_local_mode: bool) -> Vec<Dtype> {
     }
 }
 
-
 #[derive(Parser)]
 #[command(name = "hellas")]
 #[command(version)]
@@ -189,6 +188,26 @@ enum Commands {
         /// and the dtype the client builds the quote program at: f32, f16, or bf16
         #[arg(long = "dtype", default_value = DEFAULT_DTYPE_STR, value_parser = parse_model_dtype)]
         dtype: Dtype,
+        /// Spawn `pi-coding-agent` once the gateway is listening. Args after
+        /// `--` are forwarded to pi; the gateway exits when pi exits.
+        /// Requires `--force-model` so pi can advertise a concrete model id.
+        #[arg(long = "pi", default_value_t = false, requires = "force_model")]
+        pi: bool,
+        /// Path to the `pi` binary (default: looked up on PATH)
+        #[arg(long = "pi-bin", default_value = "pi", requires = "pi")]
+        pi_bin: String,
+        /// Pi provider `api` kind. `openai-completions` hits `/v1/chat/completions`,
+        /// `anthropic-messages` hits `/v1/messages`.
+        #[arg(
+            long = "pi-api",
+            default_value = "openai-completions",
+            value_parser = ["openai-completions", "anthropic-messages"],
+            requires = "pi",
+        )]
+        pi_api: String,
+        /// Trailing args forwarded verbatim to `pi`. Use `--` to introduce them.
+        #[arg(last = true, allow_hyphen_values = true)]
+        pi_args: Vec<String>,
     },
     /// Query a remote node via RPC
     Rpc {
@@ -323,6 +342,10 @@ async fn main() {
             force_model,
             metrics_port,
             dtype,
+            pi,
+            pi_bin,
+            pi_api,
+            pi_args,
         } => {
             commands::gateway::run(commands::gateway::GatewayOptions {
                 host,
@@ -342,6 +365,10 @@ async fn main() {
                 metrics_port,
                 dtype,
                 secret_key,
+                pi,
+                pi_bin,
+                pi_api,
+                pi_args,
             })
             .await
         }
@@ -546,8 +573,7 @@ mod tests {
 
     #[test]
     fn llm_accepts_single_dtype() {
-        let cli =
-            Cli::try_parse_from(["hellas", "llm", "--dtype", "f16", "-p", "hi"]).unwrap();
+        let cli = Cli::try_parse_from(["hellas", "llm", "--dtype", "f16", "-p", "hi"]).unwrap();
         match cli.command {
             Commands::Llm { dtype, .. } => assert_eq!(dtype, vec![Dtype::F16]),
             _ => panic!("expected llm command"),
@@ -556,10 +582,8 @@ mod tests {
 
     #[test]
     fn llm_accepts_dtype_preference_list() {
-        let cli = Cli::try_parse_from([
-            "hellas", "llm", "--dtype", "bf16,f32,f16", "-p", "hi",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["hellas", "llm", "--dtype", "bf16,f32,f16", "-p", "hi"]).unwrap();
         match cli.command {
             Commands::Llm { dtype, .. } => {
                 assert_eq!(dtype, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
@@ -570,8 +594,7 @@ mod tests {
 
     #[test]
     fn default_llm_dtypes_local_cpu_skips_bf16() {
-        let cuda_or_metal =
-            cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
+        let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
         let prefs = default_llm_dtypes(/* is_local_mode = */ true);
         if cuda_or_metal {
             assert_eq!(prefs, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
@@ -595,6 +618,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gateway_pi_forwards_trailing_args() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "gateway",
+            "--force-model",
+            "Qwen/Qwen3-0.6B",
+            "--pi",
+            "--",
+            "-p",
+            "--no-session",
+            "say hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Gateway { pi, pi_args, .. } => {
+                assert!(pi);
+                assert_eq!(pi_args, vec!["-p", "--no-session", "say hello"]);
+            }
+            _ => panic!("expected gateway command"),
+        }
+    }
+
+    #[test]
+    fn gateway_pi_requires_force_model() {
+        let result = Cli::try_parse_from(["hellas", "gateway", "--pi"]);
+        assert!(result.is_err(), "--pi without --force-model should error");
+    }
+
     #[cfg(feature = "hellas-executor")]
     #[test]
     fn serve_accepts_dtype_f16() {
@@ -608,8 +660,7 @@ mod tests {
     #[cfg(feature = "hellas-executor")]
     #[test]
     fn serve_accepts_multi_dtype() {
-        let cli =
-            Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,f16,bf16"]).unwrap();
+        let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,f16,bf16"]).unwrap();
         match cli.command {
             Commands::Serve { dtype, .. } => {
                 assert_eq!(dtype, vec![Dtype::F32, Dtype::F16, Dtype::BF16]);

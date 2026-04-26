@@ -95,40 +95,49 @@ impl Cache {
         &self,
         locator: HuggingFaceLocator,
         wait_timeout: Duration,
-    ) -> Result<(), inputs::Error> {
-        let admission = self.admit(locator, true, false).await;
+    ) -> Result<(), ExecutorError> {
+        let admission = self.admit(locator.clone(), true, false).await;
         self.spawn_loads_if_needed(admission.next_loads);
 
         match admission.disposition {
             EnsureDisposition::Ready => Ok(()),
-            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed(error)),
-            EnsureDisposition::Queued | EnsureDisposition::InFlight => {
-                Self::wait_for_ready(
-                    wait_timeout,
-                    admission
-                        .waiter
-                        .expect("queued or inflight admissions must register a waiter"),
-                )
-                .await
+            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed {
+                locator,
+                message: error,
             }
+            .into()),
+            EnsureDisposition::Queued | EnsureDisposition::InFlight => Ok(Self::wait_for_ready(
+                locator,
+                wait_timeout,
+                admission
+                    .waiter
+                    .expect("queued or inflight admissions must register a waiter"),
+            )
+            .await?),
         }
     }
 
     pub(crate) async fn ensure_preloaded(
         &self,
         locator: HuggingFaceLocator,
-    ) -> Result<(), inputs::Error> {
-        let admission = self.admit(locator, true, true).await;
+    ) -> Result<(), ExecutorError> {
+        let admission = self.admit(locator.clone(), true, true).await;
         self.spawn_loads_if_needed(admission.next_loads);
 
         match admission.disposition {
             EnsureDisposition::Ready => Ok(()),
-            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed(error)),
-            EnsureDisposition::Queued | EnsureDisposition::InFlight => admission
+            EnsureDisposition::Failed(error) => Err(inputs::Error::Failed {
+                locator,
+                message: error,
+            }
+            .into()),
+            EnsureDisposition::Queued | EnsureDisposition::InFlight => Ok(admission
                 .waiter
                 .expect("queued or inflight preload must register a waiter")
                 .await
-                .unwrap_or(Err(inputs::Error::NotReady)),
+                .unwrap_or(Err(inputs::Error::NotReady {
+                    locator: locator.clone(),
+                }))?),
         }
     }
 
@@ -192,12 +201,13 @@ impl Cache {
     }
 
     async fn wait_for_ready(
+        locator: HuggingFaceLocator,
         wait_timeout: Duration,
         receiver: oneshot::Receiver<Result<(), inputs::Error>>,
     ) -> Result<(), inputs::Error> {
         match timeout(wait_timeout, receiver).await {
             Ok(Ok(result)) => result,
-            _ => Err(inputs::Error::NotReady),
+            _ => Err(inputs::Error::NotReady { locator }),
         }
     }
 
@@ -216,7 +226,7 @@ impl Cache {
                 let lookup = state
                     .inputs
                     .lookup_program(locator, program_id)
-                    .map_err(|error| map_program_cache_error(locator, error))?;
+?;
                 if let Some(cached) = lookup.program {
                     BoundProgramStep::Ready(cached)
                 } else {
@@ -272,10 +282,11 @@ impl Cache {
                     let cache_start = Instant::now();
                     let cache_result = {
                         let mut state = self.inner.state.lock().await;
-                        let result = state
-                            .inputs
-                            .cache_program(locator, generation, bound_program)
-                            .map_err(|error| map_program_cache_error(locator, error));
+                        let result = state.inputs.cache_program(
+                            locator,
+                            generation,
+                            bound_program,
+                        );
                         Self::finish_build(&mut state.program_builds, &build_key);
                         result?
                     };
@@ -439,11 +450,7 @@ impl Cache {
         });
     }
 
-    async fn finish_load(
-        &self,
-        locator: HuggingFaceLocator,
-        load_result: Result<Loaded, String>,
-    ) {
+    async fn finish_load(&self, locator: HuggingFaceLocator, load_result: Result<Loaded, String>) {
         let (waiters, next_loads, waiter_result) = {
             let mut state = self.inner.state.lock().await;
             state.loads_in_flight.remove(&locator);
@@ -466,7 +473,10 @@ impl Cache {
                         "weights failed"
                     );
                     state.inputs.finish_failed(&locator, error.clone());
-                    Err(inputs::Error::Failed(error))
+                    Err(inputs::Error::Failed {
+                        locator: locator.clone(),
+                        message: error,
+                    })
                 }
             };
             let next_loads = Self::schedule_loads(&mut state, self.inner.max_concurrent_loads);
@@ -485,15 +495,6 @@ impl Cache {
         for waiter in waiters {
             let _ = waiter.send(waiter_result.clone());
         }
-    }
-}
-
-fn map_program_cache_error(locator: &HuggingFaceLocator, error: inputs::Error) -> ExecutorError {
-    match error {
-        inputs::Error::NotReady | inputs::Error::UnknownKey => {
-            ExecutorError::WeightsNotReady(locator.to_string())
-        }
-        inputs::Error::Failed(message) => ExecutorError::WeightsError(message),
     }
 }
 
