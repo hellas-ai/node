@@ -60,7 +60,6 @@ impl PeerTracker {
             let peer = self.get_or_insert_peer(peer_id, now);
             peer.last_seen = now;
             peer.total_requests = peer.total_requests.saturating_add(1);
-            peer.register_kind(kind);
             peer.record_rtt(observed_rtt);
 
             let per_peer_ok = peer.bucket.take(cost, now);
@@ -87,10 +86,11 @@ impl PeerTracker {
         } else {
             true
         };
-        if throttleable && !global_ok {
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
-                peer.rate_limited = peer.rate_limited.saturating_add(1);
-            }
+        if throttleable
+            && !global_ok
+            && let Some(peer) = self.peers.get_mut(&peer_id)
+        {
+            peer.rate_limited = peer.rate_limited.saturating_add(1);
         }
 
         let allow = if throttleable {
@@ -106,6 +106,11 @@ impl PeerTracker {
     }
 
     /// Mark a peer as a known service provider (e.g. discovered via DHT).
+    ///
+    /// Service capability must be signalled explicitly here. Observing an
+    /// inbound RPC alone only proves the peer is a *client* — without this
+    /// distinction, ephemeral browser sessions would get shared as "known
+    /// peers" even though they can't serve anything.
     pub(super) fn mark_service_provider(&mut self, peer_id: EndpointId) {
         let now = Instant::now();
         let peer = self.get_or_insert_peer(peer_id, now);
@@ -157,15 +162,12 @@ impl PeerTracker {
     }
 
     fn get_or_insert_peer(&mut self, peer_id: EndpointId, now: Instant) -> &mut PeerStats {
-        if !self.peers.contains_key(&peer_id) {
-            if self.peers.len() >= MAX_TRACKED_PEERS {
-                self.evict_worst(now);
-            }
-            self.peers.insert(peer_id, PeerStats::new(now));
+        if !self.peers.contains_key(&peer_id) && self.peers.len() >= MAX_TRACKED_PEERS {
+            self.evict_worst(now);
         }
         self.peers
-            .get_mut(&peer_id)
-            .expect("peer must exist after insertion")
+            .entry(peer_id)
+            .or_insert_with(|| PeerStats::new(now))
     }
 
     fn evict_worst(&mut self, now: Instant) {
@@ -214,15 +216,6 @@ impl PeerStats {
             // Keep per-peer burst tolerance small to avoid "easy win" spam.
             bucket: TokenBucket::new(24.0, 2.0),
         }
-    }
-
-    fn register_kind(&mut self, _kind: RequestKind) {
-        // Intentionally does not set `seen_node_service`. Calling an RPC on
-        // this node only proves the peer is a *client*, not that it provides
-        // the Node service itself. Without this distinction, ephemeral browser
-        // sessions get shared as "known peers" even though they can't serve
-        // anything. Service capability should be signalled explicitly (e.g.
-        // via DHT publishing or a future RegisterPeer RPC).
     }
 
     fn record_rtt(&mut self, rtt: Option<Duration>) {

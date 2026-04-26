@@ -10,6 +10,8 @@ use tonic_iroh_transport::iroh::address_lookup::mdns::MdnsAddressLookup;
 use tonic_iroh_transport::iroh::address_lookup::pkarr::dht::DhtAddressLookup;
 use tonic_iroh_transport::iroh::endpoint::{BindError, EndpointError, presets};
 
+const MDNS_SERVICE_NAME: &str = "hellas";
+
 pub struct DiscoveryBindings {
     pub mdns: MdnsAddressLookup,
     pub dht: Arc<Dht>,
@@ -51,14 +53,10 @@ pub enum DiscoveryError {
 
 impl DiscoveryBindings {
     pub fn client(endpoint_id: EndpointId) -> Result<Self, DiscoveryError> {
-        let mdns = MdnsAddressLookup::builder()
-            .advertise(false)
-            .service_name("hellas")
-            .build(endpoint_id)
-            .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
-        let dht =
-            Arc::new(Dht::client().map_err(|source| DiscoveryError::BuildDhtClient { source })?);
-        Ok(Self { mdns, dht })
+        Ok(Self {
+            mdns: build_mdns(endpoint_id, false)?,
+            dht: build_dht()?,
+        })
     }
 
     pub fn attach(
@@ -69,17 +67,13 @@ impl DiscoveryBindings {
         let address_lookup = endpoint
             .address_lookup()
             .map_err(|source| DiscoveryError::AddressLookupUnavailable { source })?;
-        let mdns = MdnsAddressLookup::builder()
-            .advertise(advertise_mdns)
-            .service_name("hellas")
-            .build(endpoint.id())
-            .map_err(|source| DiscoveryError::BuildMdnsLookup { source })?;
+        let mdns = build_mdns(endpoint.id(), advertise_mdns)?;
         address_lookup.add(mdns.clone());
 
         // Standalone DHT handle for the sharded-service DhtBackend; iroh's
         // DhtAddressLookup builds its own Dht internally (0.98 changed the
         // constructor to take a DhtBuilder rather than a shared pkarr client).
-        let dht = Arc::new(Dht::client().map_err(|source| DiscoveryError::BuildDhtClient { source })?);
+        let dht = build_dht()?;
 
         let mut dht_lookup = DhtAddressLookup::builder();
         if !publish_pkarr {
@@ -92,6 +86,23 @@ impl DiscoveryBindings {
 
         Ok(Self { mdns, dht })
     }
+}
+
+fn build_mdns(
+    endpoint_id: EndpointId,
+    advertise: bool,
+) -> Result<MdnsAddressLookup, DiscoveryError> {
+    MdnsAddressLookup::builder()
+        .advertise(advertise)
+        .service_name(MDNS_SERVICE_NAME)
+        .build(endpoint_id)
+        .map_err(|source| DiscoveryError::BuildMdnsLookup { source })
+}
+
+fn build_dht() -> Result<Arc<Dht>, DiscoveryError> {
+    Dht::client()
+        .map(Arc::new)
+        .map_err(|source| DiscoveryError::BuildDhtClient { source })
 }
 
 impl DiscoveryEndpoint {
