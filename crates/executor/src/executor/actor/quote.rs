@@ -13,7 +13,7 @@ use hellas_rpc::spec::ModelSpec;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use super::{Executor, weights_not_ready_error};
+use super::Executor;
 
 const STATIC_QUOTE_AMOUNT: u64 = 1000;
 const QUOTE_TTL: Duration = Duration::from_secs(30);
@@ -39,10 +39,7 @@ impl Executor {
     ///
     /// Each entry must be `"f32"`, `"f16"`, or `"bf16"`. `"u32"` and
     /// unknown strings produce `InvalidQuoteRequest`.
-    pub(super) fn resolve_accept_dtypes(
-        &self,
-        prefs: &[String],
-    ) -> Result<Dtype, ExecutorError> {
+    pub(super) fn resolve_accept_dtypes(&self, prefs: &[String]) -> Result<Dtype, ExecutorError> {
         if prefs.is_empty() {
             return Ok(self.preferred_dtype());
         }
@@ -74,10 +71,7 @@ impl Executor {
     pub(super) async fn handle_preload(&mut self, model: String) -> Result<(), ExecutorError> {
         let spec = ModelSpec::parse(&model).map_err(hellas_rpc::ModelAssetsError::from)?;
         let locator = HuggingFaceLocator::from_spec(spec, self.preferred_dtype());
-        self.programs
-            .ensure_preloaded(locator.clone())
-            .await
-            .map_err(|error| super::map_weights_error(&locator, error))?;
+        self.programs.ensure_preloaded(locator.clone()).await?;
         info!(
             model = %locator.model_id,
             requested_revision = %locator.revision,
@@ -130,13 +124,9 @@ impl Executor {
         // Anchored execution (later phase) will read this from the
         // request wire field instead.
         let initial_receipt_id = execution.genesis_receipt_id();
-        let commitment_id = crate::runner::build_text_execution(
-            &execution,
-            initial_receipt_id,
-            &plan.invocation,
-            &policy,
-        )?
-        .id();
+        let commitment_id = execution
+            .build_text_execution(initial_receipt_id, &plan.invocation, &policy)?
+            .id();
         let cache_start = Instant::now();
         let start = execution.execution_start(commitment_id, initial_receipt_id)?;
         let cache_lookup_ms = cache_start.elapsed().as_millis();
@@ -145,10 +135,7 @@ impl Executor {
         let requested_revision = plan.weights_key.revision.clone();
         let prompt_tokens = plan.invocation.input_ids.len();
         let max_new_tokens = plan.invocation.max_new_tokens;
-        let cached_output_tokens = start
-            .cached_output_tokens
-            .as_ref()
-            .map_or(0, |tokens| tokens.len());
+        let cached_output_tokens = start.cached.as_ref().map_or(0, |c| c.output_tokens.len());
         let quote_id = self.store.create_quote(QuoteRecord {
             invocation: plan.invocation,
             execution,
@@ -194,16 +181,11 @@ impl Executor {
         request: QuotePromptRequest,
     ) -> Result<QuotePromptResponse, ExecutorError> {
         let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
-        let model_spec = format!(
-            "{}{}",
-            request.huggingface_model_id,
-            if request.huggingface_revision.is_empty() {
-                String::new()
-            } else {
-                format!("@{}", request.huggingface_revision)
-            }
-        );
-        let assets = ModelAssets::load(&model_spec, dtype)?;
+        let assets = load_assets(
+            &request.huggingface_model_id,
+            &request.huggingface_revision,
+            dtype,
+        )?;
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let full_request = assets.build_quote_request(&prepared, request.max_new_tokens)?;
@@ -223,16 +205,11 @@ impl Executor {
         request: QuoteChatPromptRequest,
     ) -> Result<QuoteChatPromptResponse, ExecutorError> {
         let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
-        let model_spec = format!(
-            "{}{}",
-            request.huggingface_model_id,
-            if request.huggingface_revision.is_empty() {
-                String::new()
-            } else {
-                format!("@{}", request.huggingface_revision)
-            }
-        );
-        let assets = ModelAssets::load(&model_spec, dtype)?;
+        let assets = load_assets(
+            &request.huggingface_model_id,
+            &request.huggingface_revision,
+            dtype,
+        )?;
 
         // Build ChatInput from proto messages + system_prompt.
         let mut messages: Vec<types::Message> = Vec::new();
@@ -292,15 +269,30 @@ impl Executor {
             EnsureDisposition::Ready => Ok(()),
             EnsureDisposition::Queued | EnsureDisposition::InFlight => {
                 if !is_cached_locally(locator) {
-                    return Err(weights_not_ready_error(locator));
+                    return Err(ExecutorError::WeightsNotReady(locator.to_string()));
                 }
-
                 self.programs
                     .ensure_ready_wait(locator.clone(), tokio::time::Duration::from_secs(2))
                     .await
-                    .map_err(|error| super::map_weights_error(locator, error))
             }
             EnsureDisposition::Failed(error) => Err(ExecutorError::WeightsError(error)),
         }
     }
 }
+
+/// Load `ModelAssets` for a `(model_id, revision)` pair, using the same
+/// `id[@revision]` parser the quote path uses. An empty revision means
+/// "default" (resolved by `ModelSpec::parse`).
+fn load_assets(
+    model_id: &str,
+    revision: &str,
+    dtype: Dtype,
+) -> Result<ModelAssets, hellas_rpc::ModelAssetsError> {
+    let spec = if revision.is_empty() {
+        model_id.to_string()
+    } else {
+        format!("{model_id}@{revision}")
+    };
+    ModelAssets::load(&spec, dtype)
+}
+

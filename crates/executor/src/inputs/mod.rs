@@ -27,6 +27,7 @@ pub(crate) use loader::{Loaded, is_cached_locally, load_bundle};
 pub(crate) use locator::HuggingFaceLocator;
 pub(crate) use state::{CacheProgramOutcome, State, Status};
 
+use hellas_rpc::ExecutorError;
 use thiserror::Error;
 
 /// Outcome of an `ensure_*` admission against [`State`]. Drives whether the
@@ -41,12 +42,34 @@ pub(crate) enum EnsureDisposition {
     Failed(String),
 }
 
+/// Errors that can arise while resolving inputs for a request. Every
+/// variant carries the originating [`HuggingFaceLocator`] so callers (and
+/// the `From<Error>` impl below) can render meaningful messages without
+/// re-attaching context manually.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum Error {
-    #[error("inputs not ready")]
-    NotReady,
-    #[error("inputs failed: {0}")]
-    Failed(String),
-    #[error("unknown locator")]
-    UnknownKey,
+    #[error("weights not ready: {locator}")]
+    NotReady { locator: HuggingFaceLocator },
+    #[error("weights load failed for {locator}: {message}")]
+    Failed {
+        locator: HuggingFaceLocator,
+        message: String,
+    },
+    #[error("unknown weights locator: {locator}")]
+    UnknownKey { locator: HuggingFaceLocator },
+}
+
+/// Bridge from the internal inputs-layer error to the canonical
+/// [`ExecutorError`] surfaced over RPC. Once this exists, every callsite
+/// that touches inputs/cache APIs can use `?` without an intermediate
+/// `.map_err(...)` to re-attach the locator.
+impl From<Error> for ExecutorError {
+    fn from(err: Error) -> Self {
+        match err {
+            Error::NotReady { locator } | Error::UnknownKey { locator } => {
+                ExecutorError::WeightsNotReady(locator.to_string())
+            }
+            Error::Failed { message, .. } => ExecutorError::WeightsError(message),
+        }
+    }
 }

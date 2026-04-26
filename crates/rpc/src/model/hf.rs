@@ -3,12 +3,10 @@ use std::path::PathBuf;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 
-use crate::spec::ModelSpec;
 use super::{ModelAssetsError, Result};
+use crate::spec::ModelSpec;
 
-pub(super) fn get_model_metadata_files(
-    model: &ModelSpec,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
+pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let mut builder = ApiBuilder::from_env();
     let env_token = std::env::var("HF_TOKEN")
         .ok()

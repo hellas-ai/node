@@ -86,10 +86,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_id() {
-        assert_eq!(
-            ModelSpec::parse("").unwrap_err(),
-            ModelSpecError::EmptyId,
-        );
+        assert_eq!(ModelSpec::parse("").unwrap_err(), ModelSpecError::EmptyId,);
         assert_eq!(
             ModelSpec::parse("@main").unwrap_err(),
             ModelSpecError::EmptyId,

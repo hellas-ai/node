@@ -1,3 +1,5 @@
+use crate::encode_token_ids;
+use crate::pb::hellas::GetQuoteRequest;
 use catgrad::prelude::Dtype;
 use catgrad_llm::helpers::{
     ToolUseStep, parse_lfm2_tool_calls, parse_olmo3_tool_calls, parse_qwen3_5_tool_calls,
@@ -7,16 +9,14 @@ use catgrad_llm::types::Message;
 use catgrad_llm::utils::{
     RenderChatTemplateOptions, get_model, get_model_architecture, get_model_chat_template,
 };
-use catgrad_llm::{Detokenizer, LLMError, PreparedPrompt};
-use crate::encode_token_ids;
-use crate::pb::hellas::GetQuoteRequest;
+use catgrad_llm::{LLMError, PreparedPrompt};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::config::{build_program_bytes, encode_i32_tokens};
 use super::hf::get_model_metadata_files;
-use crate::spec::ModelSpec;
 use super::{ModelAssetsError, Result};
+use crate::spec::ModelSpec;
 
 pub struct ModelAssets {
     model: ModelSpec,
@@ -71,10 +71,6 @@ impl ModelAssets {
             stop_token_ids,
             dtype,
         })
-    }
-
-    pub fn dtype(&self) -> Dtype {
-        self.dtype
     }
 
     pub fn build_quote_request(
@@ -155,10 +151,6 @@ impl ModelAssets {
     pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
         PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
             .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
-    }
-
-    pub fn create_detokenizer(&self, stop_token_ids: &[i32]) -> Detokenizer<'_> {
-        Detokenizer::from_tokenizer(&self.tokenizer, stop_token_ids)
     }
 
     pub fn decode_tokens(&self, token_ids: &[u32]) -> Result<String> {
