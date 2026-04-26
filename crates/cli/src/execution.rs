@@ -1,27 +1,58 @@
-use anyhow::Context;
+//! Stream-shaped CLI execution layer.
+//!
+//! The fundamental shape: every layer returns
+//! `impl Stream<Item = anyhow::Result<ExecutionEvent>>`. Drop-cancellation
+//! propagates naturally — when a consumer drops the stream, the generator
+//! is dropped, which drops every in-flight future, which drops every
+//! resource, which (for local executions) drops the per-execution
+//! `mpsc::Receiver` the worker pushes chunks into. The worker observes
+//! the closed channel on its next chunk send and converts it into a
+//! cancel that the runner sees between decode steps.
+//!
+//! ```text
+//! ExecutionRequest::stream  →  PreparedExecution::stream
+//!                                ├─ primary: PreparedRoute::stream
+//!                                │   ├─ Local:           execute_stream(executor)
+//!                                │   ├─ RemoteDirect:    execute_stream(remote)
+//!                                │   └─ RemoteDiscovery: retry loop wrapping execute_stream
+//!                                └─ shadow (verify):    same shape, run after primary
+//! ```
+//!
+//! Stream items separate two failure modes:
+//!   - `Err(_)` — transport error: we don't know the executor's verdict.
+//!   - `Ok(Done(Outcome::Failed))` — executor's explicit failure verdict.
+//!
+//! Discovery retry policy:
+//!   - Transport error before any chunk → try the next peer.
+//!   - Transport error after a chunk → propagate (committed work can't be retried).
+//!   - `Done(Failed)` (executor verdict) → propagate, never retry.
+
 #[cfg(feature = "hellas-executor")]
-use anyhow::anyhow;
+use anyhow::Error as AnyhowError;
+use anyhow::{Context, anyhow, bail};
+use async_stream::try_stream;
+use catgrad::cid::Cid;
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
+use catgrad_llm::runtime::TextReceipt;
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
-use std::collections::HashSet;
+use futures::stream::{BoxStream, FuturesUnordered, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
-#[cfg(feature = "hellas-executor")]
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use hellas_rpc::decode_token_ids;
-use hellas_rpc::model::ModelAssets;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{ExecuteDriver, RemoteExecuteDriver};
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteStreamEvent, ExecutionStatus, GetQuoteRequest, execute_stream_event,
+    self as pb, ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, execute_stream_event,
 };
+#[cfg(feature = "hellas-executor")]
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::service::ExecuteService;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tonic::service::interceptor::InterceptedService;
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
@@ -43,8 +74,6 @@ const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// peer), but low enough to avoid thundering-herd on the network.
 const MAX_CONCURRENT_QUOTES: usize = 8;
 
-type OutputSink<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + Send + 'a;
-
 // ---------------------------------------------------------------------------
 // Public configuration types
 // ---------------------------------------------------------------------------
@@ -54,7 +83,9 @@ pub enum ExecutionRoute {
     #[cfg(feature = "hellas-executor")]
     Local,
     RemoteDirect(RemoteNodeTarget),
-    RemoteDiscovery { retries: usize },
+    RemoteDiscovery {
+        retries: usize,
+    },
 }
 
 impl ExecutionRoute {
@@ -104,9 +135,54 @@ pub struct ExecutionRuntime {
     secret_key: Option<SecretKey>,
 }
 
-pub struct ExecutionOutput {
-    pub output: Vec<u8>,
-    pub completion_tokens: u32,
+// ---------------------------------------------------------------------------
+// Stream item types
+// ---------------------------------------------------------------------------
+
+/// One observation from a streaming execution. Stream protocol: zero or
+/// more `Chunk` events, terminated by exactly one `Done`.
+#[derive(Debug, Clone)]
+pub enum ExecutionEvent {
+    Chunk {
+        /// Cumulative tokens emitted *after* this chunk.
+        position: u64,
+        /// Little-endian u32 token IDs.
+        tokens: Vec<u8>,
+    },
+    Done(Outcome),
+}
+
+/// Terminal verdict of an execution.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Completed {
+        total_tokens: u64,
+        stop_reason: StopReason,
+        receipt_cid: Cid<TextReceipt>,
+    },
+    Failed {
+        /// Tokens emitted before the failure (for honest usage reporting).
+        position: u64,
+        error: String,
+    },
+}
+
+impl Outcome {
+    /// Cumulative token count at the moment the run terminated.
+    /// Authoritative for usage frames on both Completed and Failed.
+    pub fn position(&self) -> u64 {
+        match self {
+            Self::Completed { total_tokens, .. } => *total_tokens,
+            Self::Failed { position, .. } => *position,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndOfSequence,
+    MaxNewTokens,
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +219,7 @@ impl ExecutionRuntime {
     }
 
     #[cfg(feature = "hellas-executor")]
-    fn require_local_executor(&self) -> anyhow::Result<ExecutorHandle> {
+    fn require_local_executor(&self) -> Result<ExecutorHandle, AnyhowError> {
         self.local_executor
             .clone()
             .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
@@ -151,7 +227,7 @@ impl ExecutionRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// ExecutionRequest — thin construction + run wrapper
+// ExecutionRequest — public entry point
 // ---------------------------------------------------------------------------
 
 pub struct ExecutionRequest {
@@ -175,32 +251,7 @@ impl ExecutionRequest {
         })
     }
 
-    pub async fn run(&self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
-        let mut prepared = self.prepare().await?;
-        prepared.run(sink).await
-    }
-
-    pub(crate) async fn prepare(&self) -> anyhow::Result<PreparedExecution> {
-        match &self.strategy {
-            ExecutionStrategy::Run(route) => {
-                let primary = PreparedRoute::prepare(&self.runtime, &self.quote_req, route).await?;
-                Ok(PreparedExecution {
-                    primary,
-                    shadow: None,
-                })
-            }
-            ExecutionStrategy::Verify { primary, shadow } => {
-                let primary =
-                    PreparedRoute::prepare(&self.runtime, &self.quote_req, primary).await?;
-                let shadow = PreparedRoute::prepare(&self.runtime, &self.quote_req, shadow).await?;
-                Ok(PreparedExecution {
-                    primary,
-                    shadow: Some(shadow),
-                })
-            }
-        }
-    }
-
+    /// True if any leg of this strategy talks to a remote executor.
     pub fn uses_remote_transport(&self) -> bool {
         #[cfg(feature = "hellas-executor")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
@@ -213,34 +264,154 @@ impl ExecutionRequest {
             }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// PreparedExecution — owns prepared routes, orchestrates verify
-// ---------------------------------------------------------------------------
-
-pub(crate) struct PreparedExecution {
-    primary: PreparedRoute,
-    shadow: Option<PreparedRoute>,
-}
-
-impl PreparedExecution {
-    pub(crate) async fn run(
-        &mut self,
-        sink: &mut OutputSink<'_>,
-    ) -> anyhow::Result<ExecutionOutput> {
-        let primary_output = self.primary.run(sink).await?;
-        if let Some(shadow) = &mut self.shadow {
-            let shadow_output = shadow.run(&mut |_: &[u8]| Ok(())).await?;
-            verify_matching_output(&primary_output, &shadow_output)?;
+    /// Drive this request to completion as a stream of events.
+    ///
+    /// Owning consumption: dropping the returned stream cancels everything
+    /// downstream (broadcast subscribers, tonic streams, the executor's
+    /// per-running cancel token).
+    pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+        try_stream! {
+            let prepared = prepare_execution(&self.runtime, &self.quote_req, &self.strategy).await?;
+            let inner = prepared.stream();
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
         }
-        Ok(primary_output)
     }
 }
 
 // ---------------------------------------------------------------------------
-// PreparedRoute — carries real state: quoted drivers, endpoint lifetimes,
-// discovery retry tracking
+// PreparedExecution — primary + optional shadow for Verify
+// ---------------------------------------------------------------------------
+
+struct PreparedExecution {
+    primary: PreparedRoute,
+    shadow: Option<PreparedRoute>,
+}
+
+async fn prepare_execution(
+    runtime: &ExecutionRuntime,
+    quote_req: &GetQuoteRequest,
+    strategy: &ExecutionStrategy,
+) -> anyhow::Result<PreparedExecution> {
+    match strategy {
+        ExecutionStrategy::Run(route) => Ok(PreparedExecution {
+            primary: PreparedRoute::prepare(runtime, quote_req, route).await?,
+            shadow: None,
+        }),
+        ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
+            primary: PreparedRoute::prepare(runtime, quote_req, primary).await?,
+            shadow: Some(PreparedRoute::prepare(runtime, quote_req, shadow).await?),
+        }),
+    }
+}
+
+impl PreparedExecution {
+    /// Stream primary's events live. If a shadow is configured, run it
+    /// after primary completes and only emit primary's `Done` once the two
+    /// receipts agree. Mismatch is reported as a `Done(Failed)` so the
+    /// terminal frame is honest about the disagreement.
+    fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+        let Self { primary, shadow } = self;
+        try_stream! {
+            // Yield primary's chunks live; hold its Done back until shadow
+            // (if any) agrees.
+            let mut primary_done: Option<Outcome> = None;
+            {
+                let primary = primary.stream();
+                tokio::pin!(primary);
+                while let Some(event) = primary.next().await {
+                    match event? {
+                        ExecutionEvent::Chunk { position, tokens } => {
+                            yield ExecutionEvent::Chunk { position, tokens };
+                        }
+                        ExecutionEvent::Done(outcome) => {
+                            primary_done = Some(outcome);
+                            break;
+                        }
+                    }
+                }
+            }
+            let primary_outcome = primary_done
+                .ok_or_else(|| anyhow!("primary stream ended without terminal outcome"))?;
+
+            let final_outcome = match shadow {
+                None => primary_outcome,
+                Some(shadow_route) => verify_shadow(primary_outcome, shadow_route).await?,
+            };
+            yield ExecutionEvent::Done(final_outcome);
+        }
+    }
+}
+
+/// Run the shadow stream to completion (discarding its chunks), extract
+/// its terminal outcome, and return the reconciled outcome.
+///
+/// Cases:
+///   - Primary Failed → return primary unchanged. Shadow doesn't run; no
+///     point burning verification compute on a failure.
+///   - Primary Completed + shadow Completed + matching receipt CIDs →
+///     primary unchanged.
+///   - Primary Completed + shadow Completed + mismatched receipts →
+///     synthetic Failed describing the divergence.
+///   - Primary Completed + shadow Failed → synthetic Failed: the run is
+///     unverified, even though the bytes the user saw were real. The
+///     terminal frame is honest about that.
+///
+/// Transport errors from the shadow stream propagate via `?` and surface
+/// as stream-level errors (not Outcome::Failed) — they're also unverified
+/// situations but distinguished for diagnostics.
+async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
+    let primary_cid = match &primary {
+        Outcome::Completed { receipt_cid, .. } => *receipt_cid,
+        Outcome::Failed { .. } => return Ok(primary),
+    };
+
+    let shadow_outcome = drain_to_outcome(shadow.stream()).await?;
+    match shadow_outcome {
+        Outcome::Completed {
+            receipt_cid: shadow_cid,
+            ..
+        } => {
+            if primary_cid == shadow_cid {
+                Ok(primary)
+            } else {
+                Ok(Outcome::Failed {
+                    position: primary.position(),
+                    error: format!(
+                        "verify mismatch: primary receipt {primary_cid} ≠ shadow receipt {shadow_cid}"
+                    ),
+                })
+            }
+        }
+        Outcome::Failed {
+            error: shadow_error,
+            ..
+        } => Ok(Outcome::Failed {
+            position: primary.position(),
+            error: format!("shadow verification failed: {shadow_error}"),
+        }),
+    }
+}
+
+/// Consume a stream to its terminal `Done`, discarding chunks. Errors if
+/// the stream ends without a terminal event.
+async fn drain_to_outcome(
+    stream: impl Stream<Item = anyhow::Result<ExecutionEvent>>,
+) -> anyhow::Result<Outcome> {
+    tokio::pin!(stream);
+    while let Some(event) = stream.next().await {
+        if let ExecutionEvent::Done(outcome) = event? {
+            return Ok(outcome);
+        }
+    }
+    Err(anyhow!("shadow stream ended without terminal outcome"))
+}
+
+// ---------------------------------------------------------------------------
+// PreparedRoute — Local | RemoteDirect | RemoteDiscovery
 // ---------------------------------------------------------------------------
 
 enum PreparedRoute {
@@ -253,32 +424,8 @@ enum PreparedRoute {
     RemoteDiscovery {
         quote_req: GetQuoteRequest,
         retries: usize,
-        active: Option<RemoteExecution>,
         secret_key: Option<SecretKey>,
-        /// Peers that already failed in this request; re-discovery must skip them
-        /// so we actually try a different provider on retry instead of picking the
-        /// same mDNS-announced peer.
-        tried: HashSet<EndpointId>,
     },
-}
-
-struct RemoteExecution {
-    endpoint: Arc<Endpoint>,
-    peer_id: EndpointId,
-    quote_id: String,
-    driver: TracedDriver,
-}
-
-struct QuotedRemoteDriver {
-    peer_id: EndpointId,
-    quote: hellas_rpc::pb::hellas::GetQuoteResponse,
-    driver: TracedDriver,
-}
-
-#[derive(Debug)]
-enum QuoteCandidateError {
-    Declined(tonic::Status),
-    Connect(anyhow::Error),
 }
 
 impl PreparedRoute {
@@ -315,79 +462,108 @@ impl PreparedRoute {
             ExecutionRoute::RemoteDiscovery { retries } => Ok(Self::RemoteDiscovery {
                 quote_req: quote_req.clone(),
                 retries: *retries,
-                active: None,
                 secret_key: runtime.secret_key.clone(),
-                tried: HashSet::new(),
             }),
         }
     }
 
-    #[instrument(skip_all)]
-    async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
+    fn stream(self) -> BoxStream<'static, anyhow::Result<ExecutionEvent>> {
         match self {
             #[cfg(feature = "hellas-executor")]
             PreparedRoute::Local { executor, quote_id } => {
-                execute_with_driver(executor, quote_id.clone(), sink).await
+                execute_stream(executor, quote_id).boxed()
             }
-            PreparedRoute::RemoteDirect(remote) => remote.run(sink).await,
+            PreparedRoute::RemoteDirect(remote) => remote.stream().boxed(),
             PreparedRoute::RemoteDiscovery {
                 quote_req,
                 retries,
-                active,
                 secret_key,
-                tried,
-            } => {
-                let max_attempts = retries.saturating_add(1);
-                info!("No node ID provided, discovering executor");
+            } => discovery_stream(quote_req, retries, secret_key).boxed(),
+        }
+    }
+}
 
-                for attempt in 1..=max_attempts {
-                    if active.is_none() {
-                        *active = Some(
-                            prepare_discovered_remote(quote_req, secret_key.as_ref(), tried)
-                                .await?,
-                        );
-                    }
+/// Discovery+retry across providers.
+///
+/// Per-attempt rules (matched off the inner Result so the failure-mode
+/// distinction is visible):
+///   - `Ok(Chunk)` → forward; mark `committed`.
+///   - `Ok(Done)` → forward and finish (executor verdict, no retry).
+///   - `Err(_)` before any `committed` chunk → exclude this peer, retry.
+///   - `Err(_)` after `committed` chunks → propagate (can't retry committed work).
+///
+/// `prepare_discovered_remote` failure aborts immediately — that's a
+/// "couldn't find anyone" condition that retrying won't help with.
+fn discovery_stream(
+    quote_req: GetQuoteRequest,
+    retries: usize,
+    secret_key: Option<SecretKey>,
+) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    try_stream! {
+        let max_attempts = retries.saturating_add(1);
+        let mut tried: HashSet<EndpointId> = HashSet::new();
+        let mut last_peer_error: Option<anyhow::Error> = None;
+        info!("No node ID provided, discovering executor");
 
-                    let remote = active.as_mut().expect("active remote execution");
-                    let peer_id = remote.peer_id;
-                    let mut committed = false;
-                    let mut tracked_sink = |output: &[u8]| -> anyhow::Result<()> {
-                        if !output.is_empty() {
+        for attempt in 1..=max_attempts {
+            let remote = prepare_discovered_remote(&quote_req, secret_key.as_ref(), &tried).await?;
+            let peer_id = remote.peer_id;
+            let mut committed = false;
+            let mut transport_err: Option<anyhow::Error> = None;
+            let mut got_terminal = false;
+            {
+                let inner = remote.stream();
+                tokio::pin!(inner);
+                while let Some(event) = inner.next().await {
+                    match event {
+                        Ok(ExecutionEvent::Chunk { position, tokens }) => {
                             committed = true;
+                            yield ExecutionEvent::Chunk { position, tokens };
                         }
-                        sink(output)
-                    };
-
-                    let result = remote.run(&mut tracked_sink).await;
-
-                    match result {
-                        Ok(output) => return Ok(output),
-                        Err(err) => {
-                            if committed {
-                                return Err(err.context(format!(
-                                    "execution failed on {peer_id} after output was emitted"
-                                )));
-                            }
-                            tried.insert(peer_id);
-                            *active = None;
-                            if attempt == max_attempts {
-                                return Err(
-                                    err.context(format!("max retries ({retries}) exceeded"))
-                                );
-                            }
-                            warn!(
-                                attempt,
-                                %peer_id,
-                                "execution failed before output, rediscovering: {err:#}"
-                            );
+                        Ok(ExecutionEvent::Done(outcome)) => {
+                            got_terminal = true;
+                            yield ExecutionEvent::Done(outcome);
+                        }
+                        Err(e) => {
+                            transport_err = Some(e);
+                            break;
                         }
                     }
                 }
-
-                anyhow::bail!("max retries ({retries}) exceeded");
             }
+            if got_terminal { return; }
+
+            // No terminal — must be a transport error. The "stream ended
+            // without terminal" case manifests as None from the inner
+            // generator without an Err item; treat it the same way.
+            let err = transport_err
+                .unwrap_or_else(|| anyhow!("stream from {peer_id} ended without terminal outcome"));
+            if committed {
+                Err(err.context(format!(
+                    "execution failed on {peer_id} after output was emitted"
+                )))?;
+                unreachable!("Err(_)? always returns");
+            }
+            warn!(attempt, %peer_id, "execution failed before output, rediscovering: {err:#}");
+            tried.insert(peer_id);
+            last_peer_error = Some(err);
         }
+
+        let err = last_peer_error
+            .unwrap_or_else(|| anyhow!("no provider could serve the request"));
+        Err(err.context(format!("max retries ({retries}) exceeded")))?;
     }
+}
+
+// ---------------------------------------------------------------------------
+// RemoteExecution — owns one quoted remote driver + its endpoint
+// ---------------------------------------------------------------------------
+
+struct RemoteExecution {
+    endpoint: Arc<Endpoint>,
+    peer_id: EndpointId,
+    quote_id: String,
+    driver: TracedDriver,
 }
 
 impl RemoteExecution {
@@ -400,16 +576,138 @@ impl RemoteExecution {
         }
     }
 
-    #[instrument(skip_all, fields(peer_id = %self.peer_id, quote_id = %self.quote_id))]
-    async fn run(&mut self, sink: &mut OutputSink<'_>) -> anyhow::Result<ExecutionOutput> {
-        let _endpoint = &self.endpoint;
-        execute_with_driver(&mut self.driver, self.quote_id.clone(), sink).await
+    fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+        let Self {
+            endpoint,
+            peer_id: _,
+            quote_id,
+            driver,
+        } = self;
+        try_stream! {
+            // Hold the endpoint until the stream is dropped. Dropping the
+            // endpoint while the underlying QUIC connection is in-flight
+            // would tear down transport mid-execution.
+            let _endpoint = endpoint;
+            let inner = execute_stream(driver, quote_id);
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — quoting, transport setup, execution, verification
+// execute_stream — the bottom layer that maps wire events → ExecutionEvent
 // ---------------------------------------------------------------------------
+
+fn execute_stream<D: ExecuteDriver + Send + 'static>(
+    mut driver: D,
+    quote_id: String,
+) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    try_stream! {
+        let mut wire = driver
+            .execute_streaming(ExecuteRequest {
+                quote_id: quote_id.clone(),
+                stream_batch_size: Some(1),
+            })
+            .await
+            .context("failed to start execution stream")?;
+
+        let mut got_terminal = false;
+        while let Some(item) = wire.next().await {
+            let event = convert_wire_event(item.context("execution stream failed")?)?;
+            let is_done = matches!(event, ExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+
+        if !got_terminal {
+            Err(anyhow!("execution stream ended without terminal outcome"))?;
+        }
+        // Hold the driver until end of stream so the underlying transport
+        // (tonic streaming response) stays attached.
+        drop(driver);
+    }
+}
+
+/// Translate one wire `ExecuteStreamEvent` into one `ExecutionEvent`.
+fn convert_wire_event(event: ExecuteStreamEvent) -> anyhow::Result<ExecutionEvent> {
+    let Some(event) = event.event else {
+        bail!("wire event with no body");
+    };
+    match event {
+        execute_stream_event::Event::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
+            position: chunk.position,
+            tokens: chunk.tokens,
+        }),
+        execute_stream_event::Event::Outcome(outcome) => {
+            Ok(ExecutionEvent::Done(parse_outcome(Some(outcome))?))
+        }
+    }
+}
+
+fn parse_outcome(outcome: Option<pb::Outcome>) -> anyhow::Result<Outcome> {
+    let outcome = outcome.ok_or_else(|| anyhow!("outcome message with no body"))?;
+    let kind = outcome
+        .kind
+        .ok_or_else(|| anyhow!("outcome with no kind"))?;
+    match kind {
+        pb::outcome::Kind::Completed(c) => {
+            let receipt_cid = receipt_cid_from_bytes(&c.receipt_cid)?;
+            let stop_reason = stop_reason_from_pb(c.stop_reason)?;
+            Ok(Outcome::Completed {
+                total_tokens: c.total_tokens,
+                stop_reason,
+                receipt_cid,
+            })
+        }
+        pb::outcome::Kind::Failed(f) => Ok(Outcome::Failed {
+            position: f.position,
+            error: f.error,
+        }),
+    }
+}
+
+fn receipt_cid_from_bytes(bytes: &[u8]) -> anyhow::Result<Cid<TextReceipt>> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        anyhow!(
+            "receipt_cid wire length {} bytes (expected 32)",
+            bytes.len()
+        )
+    })?;
+    Ok(Cid::from_bytes(arr))
+}
+
+fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
+    let pb_value = pb::StopReason::try_from(value)
+        .with_context(|| format!("unknown stop_reason value {value}"))?;
+    match pb_value {
+        pb::StopReason::Unspecified => bail!("wire stop_reason is unspecified"),
+        pb::StopReason::EndOfSequence => Ok(StopReason::EndOfSequence),
+        pb::StopReason::MaxNewTokens => Ok(StopReason::MaxNewTokens),
+        pb::StopReason::Cancelled => Ok(StopReason::Cancelled),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quote / discovery / endpoint helpers (largely unchanged)
+// ---------------------------------------------------------------------------
+
+struct QuotedRemoteDriver {
+    peer_id: EndpointId,
+    quote: hellas_rpc::pb::hellas::GetQuoteResponse,
+    driver: TracedDriver,
+}
+
+#[derive(Debug)]
+enum QuoteCandidateError {
+    Declined(tonic::Status),
+    Connect(anyhow::Error),
+}
 
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
 async fn quote_with_driver<D>(
@@ -554,7 +852,7 @@ async fn discover_remote_quote(
     let pool = registry.pool::<ExecuteService>();
 
     let peers = Box::pin(registry.discover::<ExecuteService>());
-    timeout(DISCOVERY_TIMEOUT, async {
+    tokio::time::timeout(DISCOVERY_TIMEOUT, async {
         let mut last_decline: Option<tonic::Status> = None;
         let mut last_connect_error: Option<anyhow::Error> = None;
         let mut peers_done = false;
@@ -632,142 +930,6 @@ async fn prepare_discovered_remote(
     Ok(RemoteExecution::from_quoted(endpoint, quote))
 }
 
-#[instrument(skip_all, fields(%quote_id))]
-async fn execute_with_driver<D>(
-    driver: &mut D,
-    quote_id: String,
-    sink: &mut OutputSink<'_>,
-) -> anyhow::Result<ExecutionOutput>
-where
-    D: ExecuteDriver,
-{
-    let mut stream = driver
-        .execute_streaming(ExecuteRequest {
-            quote_id: quote_id.clone(),
-            stream_batch_size: Some(1),
-        })
-        .await
-        .context("failed to start execution stream")?;
-    let mut output = Vec::new();
-    let mut completion_tokens = 0u32;
-
-    while let Some(event) = stream.next().await {
-        let event = event.context("execution stream failed")?;
-        if let Some(update) =
-            consume_stream_event(event, &mut output, &mut completion_tokens, sink)?
-        {
-            if update.status == ExecutionStatus::Failed {
-                match update.error {
-                    Some(err) => anyhow::bail!("execution failed: {err}"),
-                    None => anyhow::bail!("execution failed (no error reported)"),
-                }
-            }
-            if update.status == ExecutionStatus::Completed {
-                break;
-            }
-        }
-    }
-
-    Ok(ExecutionOutput {
-        output,
-        completion_tokens,
-    })
-}
-
-fn verify_matching_output(
-    primary: &ExecutionOutput,
-    shadow: &ExecutionOutput,
-) -> anyhow::Result<()> {
-    if primary.output == shadow.output {
-        return Ok(());
-    }
-
-    if let (Ok(primary_tokens), Ok(shadow_tokens)) = (
-        decode_token_ids(&primary.output),
-        decode_token_ids(&shadow.output),
-    ) {
-        let mismatch_index = primary_tokens
-            .iter()
-            .zip(&shadow_tokens)
-            .position(|(primary, shadow)| primary != shadow)
-            .unwrap_or_else(|| primary_tokens.len().min(shadow_tokens.len()));
-        let primary_token = primary_tokens.get(mismatch_index).copied();
-        let shadow_token = shadow_tokens.get(mismatch_index).copied();
-        anyhow::bail!(
-            "primary/shadow outputs diverged at token {} (primary={:?}, shadow={:?}); primary_tokens={} shadow_tokens={}",
-            mismatch_index,
-            primary_token,
-            shadow_token,
-            primary_tokens.len(),
-            shadow_tokens.len(),
-        );
-    }
-
-    let mismatch_index = primary
-        .output
-        .iter()
-        .zip(&shadow.output)
-        .position(|(primary, shadow)| primary != shadow)
-        .unwrap_or_else(|| primary.output.len().min(shadow.output.len()));
-    let primary_byte = primary.output.get(mismatch_index).copied();
-    let shadow_byte = shadow.output.get(mismatch_index).copied();
-
-    anyhow::bail!(
-        "primary/shadow outputs diverged at byte {} (primary={:?}, shadow={:?}); primary_bytes={} shadow_bytes={}",
-        mismatch_index,
-        primary_byte,
-        shadow_byte,
-        primary.output.len(),
-        shadow.output.len(),
-    );
-}
-
-struct StreamUpdate {
-    status: ExecutionStatus,
-    error: Option<String>,
-}
-
-fn consume_stream_event(
-    event: ExecuteStreamEvent,
-    output: &mut Vec<u8>,
-    completion_tokens: &mut u32,
-    sink: &mut OutputSink<'_>,
-) -> anyhow::Result<Option<StreamUpdate>> {
-    let (status, progress, error) = match event.event {
-        Some(execute_stream_event::Event::Snapshot(snapshot)) => {
-            if let Some(output_chunk) = snapshot.output.get(output.len()..)
-                && !output_chunk.is_empty()
-            {
-                output.extend_from_slice(output_chunk);
-                sink(output_chunk)?;
-            }
-            (
-                ExecutionStatus::try_from(snapshot.status).unwrap_or(ExecutionStatus::Unspecified),
-                snapshot.progress,
-                snapshot.error,
-            )
-        }
-        Some(execute_stream_event::Event::Progress(progress)) => {
-            if !progress.output_chunk.is_empty() {
-                output.extend_from_slice(&progress.output_chunk);
-                sink(&progress.output_chunk)?;
-            }
-            (
-                ExecutionStatus::try_from(progress.status).unwrap_or(ExecutionStatus::Unspecified),
-                progress.progress,
-                progress.error,
-            )
-        }
-        None => return Ok(None),
-    };
-
-    *completion_tokens = u32::try_from(progress).unwrap_or(u32::MAX);
-    Ok(Some(StreamUpdate {
-        status,
-        error: (!error.is_empty()).then_some(error),
-    }))
-}
-
 #[cfg(feature = "hellas-executor")]
 fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
@@ -775,167 +937,5 @@ fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
         quote_req.huggingface_model_id.clone()
     } else {
         format!("{}@{revision}", quote_req.huggingface_model_id)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verify_matching_output_accepts_identical() {
-        let a = ExecutionOutput {
-            output: vec![1, 2, 3],
-            completion_tokens: 3,
-        };
-        let b = ExecutionOutput {
-            output: vec![1, 2, 3],
-            completion_tokens: 3,
-        };
-        verify_matching_output(&a, &b).unwrap();
-    }
-
-    #[test]
-    fn verify_matching_output_rejects_divergent() {
-        let a = ExecutionOutput {
-            output: vec![1, 2, 3],
-            completion_tokens: 3,
-        };
-        let b = ExecutionOutput {
-            output: vec![1, 2, 4],
-            completion_tokens: 3,
-        };
-        let err = verify_matching_output(&a, &b).unwrap_err();
-        assert!(format!("{err}").contains("diverged at byte 2"));
-    }
-
-    #[test]
-    fn verify_matching_output_rejects_different_lengths() {
-        let a = ExecutionOutput {
-            output: vec![1, 2],
-            completion_tokens: 2,
-        };
-        let b = ExecutionOutput {
-            output: vec![1, 2, 3],
-            completion_tokens: 3,
-        };
-        let err = verify_matching_output(&a, &b).unwrap_err();
-        assert!(format!("{err}").contains("diverged"));
-    }
-
-    #[test]
-    fn prepared_execution_without_shadow_skips_verify() {
-        // PreparedExecution { shadow: None } should just run primary.
-        // We can't easily test the async run() without a driver, but we can
-        // verify the struct shape is correct.
-        let exec = PreparedExecution {
-            primary: PreparedRoute::RemoteDiscovery {
-                quote_req: GetQuoteRequest::default(),
-                retries: 0,
-                active: None,
-                secret_key: None,
-                tried: HashSet::new(),
-            },
-            shadow: None,
-        };
-        assert!(exec.shadow.is_none());
-    }
-}
-
-#[cfg(all(test, feature = "hellas-executor"))]
-mod timing_tests {
-    use super::*;
-    use hellas_rpc::error::ExecutorError;
-    use hellas_rpc::model::ModelAssets;
-    use std::env;
-    use std::sync::Arc;
-    use std::time::Instant;
-    use tokio::time::{Duration, sleep};
-
-    fn required_env(name: &str) -> String {
-        env::var(name).unwrap_or_else(|_| panic!("set {name} to run this timing test"))
-    }
-
-    fn optional_env_u32(name: &str, default: u32) -> u32 {
-        env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(default)
-    }
-
-    #[test_log::test(tokio::test)]
-    #[ignore = "manual local timing harness"]
-    async fn local_two_job_timing() {
-        let model = required_env("HELLAS_TIMING_MODEL");
-        let prompt = env::var("HELLAS_TIMING_PROMPT")
-            .unwrap_or_else(|_| "tell me a story about a boy named billy".to_string());
-        let max_seq = optional_env_u32("HELLAS_TIMING_MAX_SEQ", 128);
-
-        let assets = Arc::new(
-            ModelAssets::load(&model, Dtype::F32)
-                .expect("failed to load model assets"),
-        );
-        let runtime = ExecutionRuntime::spawn_default_local(
-            hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
-            vec![Dtype::F32],
-        )
-        .expect("failed to start local executor");
-        let prepared = assets
-            .prepare_plain(&prompt)
-            .expect("failed to prepare prompt");
-        let quote_req = assets
-            .build_quote_request(&prepared, max_seq)
-            .expect("failed to build quote request");
-        let executor = runtime
-            .require_local_executor()
-            .expect("missing local executor");
-
-        for attempt in 1..=120 {
-            match executor.quote(quote_req.clone()).await {
-                Ok(_) => {
-                    eprintln!("weights ready after {attempt} quote attempt(s)");
-                    break;
-                }
-                Err(ExecutorError::WeightsNotReady(_)) if attempt < 120 => {
-                    sleep(Duration::from_millis(250)).await;
-                }
-                Err(err) => panic!("failed to ready local weights: {err}"),
-            }
-        }
-
-        for run_idx in 1..=2 {
-            let prepared = assets
-                .prepare_plain(&prompt)
-                .expect("failed to prepare prompt");
-            let request = ExecutionRequest::new(
-                runtime.clone(),
-                assets.clone(),
-                prepared,
-                max_seq,
-                ExecutionStrategy::Run(ExecutionRoute::Local),
-            )
-            .expect("failed to build execution request");
-
-            let start = Instant::now();
-            let mut first_output_ms = None;
-            let mut sink = |output: &[u8]| -> anyhow::Result<()> {
-                if first_output_ms.is_none() && !output.is_empty() {
-                    first_output_ms = Some(start.elapsed().as_millis());
-                }
-                Ok(())
-            };
-
-            let result = request.run(&mut sink).await.expect("execution failed");
-            eprintln!(
-                "run={run_idx} first_output_ms={} total_ms={} completion_tokens={}",
-                first_output_ms.unwrap_or(0),
-                start.elapsed().as_millis(),
-                result.completion_tokens,
-            );
-        }
     }
 }

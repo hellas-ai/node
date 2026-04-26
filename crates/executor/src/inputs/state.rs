@@ -49,12 +49,18 @@ pub(crate) enum CacheProgramOutcome {
 }
 
 /// Shared status check for callsites that only operate on `Ready` entries.
-/// Maps the non-ready statuses to the canonical [`Error`].
-fn require_ready(status: &Status) -> Result<(), Error> {
+/// Maps the non-ready statuses to the canonical [`Error`], stamping the
+/// caller's locator into each variant so the resulting message is useful.
+fn require_ready(locator: &HuggingFaceLocator, status: &Status) -> Result<(), Error> {
     match status {
         Status::Ready => Ok(()),
-        Status::Failed(error) => Err(Error::Failed(error.clone())),
-        Status::Queued | Status::Loading => Err(Error::NotReady),
+        Status::Failed(error) => Err(Error::Failed {
+            locator: locator.clone(),
+            message: error.clone(),
+        }),
+        Status::Queued | Status::Loading => Err(Error::NotReady {
+            locator: locator.clone(),
+        }),
     }
 }
 
@@ -81,9 +87,14 @@ impl State {
     }
 
     pub(crate) fn mark_loading(&mut self, locator: &HuggingFaceLocator) -> Result<(), Error> {
-        let entry = self.entries.get_mut(locator).ok_or(Error::UnknownKey)?;
+        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
+            locator: locator.clone(),
+        })?;
         if let Status::Failed(error) = &entry.status {
-            return Err(Error::Failed(error.clone()));
+            return Err(Error::Failed {
+                locator: locator.clone(),
+                message: error.clone(),
+            });
         }
         entry.status = Status::Loading;
         Ok(())
@@ -110,11 +121,15 @@ impl State {
         locator: &HuggingFaceLocator,
         program_id: Cid<Program>,
     ) -> Result<ProgramLookup, Error> {
-        let entry = self.entries.get(locator).ok_or(Error::UnknownKey)?;
-        require_ready(&entry.status)?;
+        let entry = self.entries.get(locator).ok_or_else(|| Error::UnknownKey {
+            locator: locator.clone(),
+        })?;
+        require_ready(locator, &entry.status)?;
         Ok(ProgramLookup {
             generation: entry.generation,
-            bundle: entry.bundle.clone().ok_or(Error::UnknownKey)?,
+            bundle: entry.bundle.clone().ok_or_else(|| Error::UnknownKey {
+                locator: locator.clone(),
+            })?,
             program: entry.programs.get(&program_id).cloned(),
         })
     }
@@ -125,8 +140,10 @@ impl State {
         generation: u64,
         program: Arc<ExecutionContext>,
     ) -> Result<CacheProgramOutcome, Error> {
-        let entry = self.entries.get_mut(locator).ok_or(Error::UnknownKey)?;
-        require_ready(&entry.status)?;
+        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
+            locator: locator.clone(),
+        })?;
+        require_ready(locator, &entry.status)?;
         if entry.generation != generation {
             return Ok(CacheProgramOutcome::Stale);
         }

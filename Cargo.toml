@@ -20,7 +20,7 @@ documentation = "https://docs.rs"
 catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/runtime-primitives", default-features = false, features = ["serde", "dag-cbor"] }
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/runtime-primitives", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.14", features = ["gzip"] }
 tonic-iroh-transport = { version = "0.9", default-features = false, features = ["otel", "native-defaults"] }

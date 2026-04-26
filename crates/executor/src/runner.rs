@@ -11,7 +11,9 @@
 //!
 //! 1. **Exact-output replay.** If the request commitment matches a
 //!    previously-served request, the cached output tokens are streamed
-//!    back without touching the model.
+//!    back without touching the model. The cached entry carries the
+//!    receipt CID the original real-decode produced; the runner reports
+//!    the same CID so replays are observationally identical.
 //!
 //! 2. **Prefill.** A single batched call against the bound program's
 //!    [`prefill`](catgrad_llm::runtime::BoundProgramText::prefill) on
@@ -26,8 +28,8 @@
 //! On completion the runner consumes the decoder into a
 //! [`TextState`](catgrad_llm::runtime::TextState), inserts that state
 //! into the receipt store (so future anchored requests can reference
-//! it), and stores the emitted token sequence in the exact-replay
-//! cache.
+//! it), and stores the emitted token sequence + receipt CID in the
+//! exact-replay cache.
 //!
 //! # Why no generic-over-stepper trait
 //!
@@ -40,100 +42,125 @@
 
 use crate::backend::ExecBackend;
 use crate::programs::{ExecutionContext, ExecutionStart};
-use crate::state::Invocation;
+use crate::state::{Invocation, StopReason};
 use catgrad::category::core::Shape;
+use catgrad::cid::Cid;
 use catgrad::interpreter;
-use catgrad_llm::runtime::{BoundProgramText, TextDecoder, TextExecution, TextPolicy};
+use catgrad_llm::runtime::{BoundProgramText, TextDecoder, TextReceipt};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
-struct FirstTokenLog {
-    prompt_tokens: usize,
-    cached_output_tokens: usize,
-    first_token_total_ms: u128,
-    exact_replay_hit: bool,
-    session_start_ms: u128,
-}
-
-fn log_first_token(m: FirstTokenLog) {
-    info!(
-        prompt_tokens = m.prompt_tokens,
-        cached_output_tokens = m.cached_output_tokens,
-        first_token_total_ms = m.first_token_total_ms,
-        "first token ready"
-    );
-    debug!(
-        prompt_tokens = m.prompt_tokens,
-        cached_output_tokens = m.cached_output_tokens,
-        exact_replay_hit = m.exact_replay_hit,
-        session_start_ms = m.session_start_ms,
-        first_token_total_ms = m.first_token_total_ms,
-        "execute first-token phases"
-    );
+/// Terminal output of a completed decode. Worker maps this onto a
+/// `Termination::Completed` for the actor.
+#[derive(Debug, Clone)]
+pub struct DecodeOutcome {
+    pub total_tokens: u64,
+    pub stop_reason: StopReason,
+    pub receipt_cid: Cid<TextReceipt>,
 }
 
 /// Public entry point. Wires the catgrad text decoder, runs the decode
 /// loop, and writes the result back to the [`ExecutionContext`] caches.
+///
+/// `cancel` is polled between decode iterations; when triggered, the
+/// loop exits with `StopReason::Cancelled` and the partial post-state is
+/// still receipt-aligned (every step ends with `commit_next` complete).
+/// Cancelled runs do NOT populate the exact-replay cache (they would
+/// poison future identical requests with a partial output) but they DO
+/// populate the receipt store so anchored requests can resume.
 pub fn run_cached_program_streaming(
     program: &ExecutionContext,
     start: &ExecutionStart,
     invocation: &Invocation,
     stream_batch_size: u32,
+    cancel: &CancellationToken,
     mut on_progress: impl FnMut(u64, &[u8]),
-) -> Result<(), ExecutorError> {
+) -> Result<DecodeOutcome, ExecutorError> {
     let started_at = Instant::now();
-    let batch_size = usize::try_from(stream_batch_size.max(1)).unwrap_or(usize::MAX);
+    let batch_size = usize::try_from(stream_batch_size.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
     let prompt_tokens = invocation.input_ids.len();
 
-    if let Some(cached_output_tokens) = start.cached_output_tokens.as_deref() {
-        log_first_token(FirstTokenLog {
+    if let Some(cached) = start.cached.as_ref() {
+        info!(
             prompt_tokens,
-            cached_output_tokens: cached_output_tokens.len(),
-            exact_replay_hit: true,
-            first_token_total_ms: started_at.elapsed().as_millis(),
-            ..Default::default()
+            cached_output_tokens = cached.output_tokens.len(),
+            first_token_total_ms = started_at.elapsed().as_millis(),
+            "first token ready (replay)"
+        );
+        let mut emitted = 0u64;
+        for chunk in cached.output_tokens.chunks(batch_size) {
+            emitted = emitted.saturating_add(chunk.len() as u64);
+            on_progress(emitted, &encode_token_ids(chunk));
+        }
+        return Ok(DecodeOutcome {
+            total_tokens: cached.output_tokens.len() as u64,
+            // Replay is observationally identical to a fresh decode that
+            // hit a stop token at the same position. We don't store the
+            // original stop reason; EndOfSequence is the only honest
+            // default given an exact-output match.
+            stop_reason: StopReason::EndOfSequence,
+            receipt_cid: cached.receipt_id,
         });
-        stream_cached_output(cached_output_tokens, batch_size, on_progress);
-        return Ok(());
     }
 
     let session_start = Instant::now();
     let bound = program.bound_program();
-    let input_tensor =
-        interpreter::tensor(&bound.interpreter().backend, Shape(vec![1, prompt_tokens]), invocation.input_ids.clone())
-            .map_err(|error| {
-                ExecutorError::WeightsError(format!("failed to build input tensor: {error:?}"))
-            })?;
+    let input_tensor = interpreter::tensor(
+        &bound.interpreter().backend,
+        Shape(vec![1, prompt_tokens]),
+        invocation.input_ids.clone(),
+    )
+    .map_err(|error| {
+        ExecutorError::WeightsError(format!("failed to build input tensor: {error:?}"))
+    })?;
     let mut decoder: TextDecoder<ExecBackend> =
         Arc::clone(bound).prefill(&start.initial_state, &input_tensor)?;
-    let session_start_ms = session_start.elapsed().as_millis();
 
-    log_first_token(FirstTokenLog {
+    info!(
         prompt_tokens,
-        first_token_total_ms: started_at.elapsed().as_millis(),
-        session_start_ms,
-        ..Default::default()
-    });
+        first_token_total_ms = started_at.elapsed().as_millis(),
+        session_start_ms = session_start.elapsed().as_millis(),
+        "first token ready"
+    );
 
-    let DecodeOutcome { output_tokens } = run_decode_loop(
+    let DecodeLoopOutput {
+        stop_reason,
+        output_tokens,
+    } = run_decode_loop(
         &mut decoder,
         invocation.max_new_tokens,
         &invocation.stop_token_ids,
         batch_size,
+        cancel,
         &mut on_progress,
     )?;
 
+    let total_tokens = output_tokens.len() as u64;
     let final_state = decoder.into_text_state(start.commitment_id, &output_tokens)?;
+    let receipt_cid = final_state.receipt_id();
     program.cache_receipt(Arc::new(final_state));
-    program.cache_continuation(start.commitment_id, output_tokens);
+    // Skip continuation cache on cancellation: an identical future request
+    // expects the deterministic full output, not a partial one. The
+    // receipt store is fine to populate — a real receipt for "we ran this
+    // far" is always honest.
+    if !matches!(stop_reason, StopReason::Cancelled) {
+        program.cache_continuation(start.commitment_id, output_tokens, receipt_cid);
+    }
 
-    Ok(())
+    Ok(DecodeOutcome {
+        total_tokens,
+        stop_reason,
+        receipt_cid,
+    })
 }
 
-struct DecodeOutcome {
+struct DecodeLoopOutput {
+    stop_reason: StopReason,
     output_tokens: Vec<u32>,
 }
 
@@ -146,18 +173,25 @@ fn run_decode_loop(
     max_new_tokens: u32,
     stop_token_ids: &[i32],
     batch_size: usize,
+    cancel: &CancellationToken,
     on_progress: &mut impl FnMut(u64, &[u8]),
-) -> Result<DecodeOutcome, ExecutorError> {
+) -> Result<DecodeLoopOutput, ExecutorError> {
     let mut output_tokens = Vec::new();
     let mut pending_batch = Vec::with_capacity(batch_size);
     let mut generated = 0u64;
+    let mut stop_reason = StopReason::MaxNewTokens;
 
     for _ in 0..max_new_tokens {
+        if cancel.is_cancelled() {
+            stop_reason = StopReason::Cancelled;
+            break;
+        }
         let predicted = decoder.next_token();
         if i32::try_from(predicted)
             .ok()
             .is_some_and(|token| stop_token_ids.contains(&token))
         {
+            stop_reason = StopReason::EndOfSequence;
             break;
         }
         let emitted = decoder.commit_next()?;
@@ -177,47 +211,8 @@ fn run_decode_loop(
         on_progress(generated, &chunk);
     }
 
-    Ok(DecodeOutcome { output_tokens })
-}
-
-/// Build the request [`TextExecution`] commitment from a bound program
-/// + invocation. Used at quote time to compute `commitment_id` before
-/// the runner sees the request.
-pub(crate) fn build_text_execution(
-    program: &ExecutionContext,
-    initial_state_receipt_id: catgrad::cid::Cid<catgrad_llm::runtime::TextReceipt>,
-    invocation: &Invocation,
-    policy: &TextPolicy,
-) -> Result<TextExecution, ExecutorError> {
-    let bound = program.bound_program();
-    let input_tensor = interpreter::tensor(
-        &bound.interpreter().backend,
-        Shape(vec![1, invocation.input_ids.len()]),
-        invocation.input_ids.clone(),
-    )
-    .map_err(|error| {
-        ExecutorError::WeightsError(format!("failed to build input tensor: {error:?}"))
-    })?;
-    // The initial_state TextState is fetched at execution_start; here we
-    // only have its receipt id, which is all `TextExecution::new` needs.
-    Ok(TextExecution::new(
-        bound,
-        initial_state_receipt_id,
-        &input_tensor,
-        policy,
-    )?)
-}
-
-fn stream_cached_output(
-    cached_output_tokens: &[u32],
-    batch_size: usize,
-    mut on_progress: impl FnMut(u64, &[u8]),
-) {
-    let batch_size = batch_size.max(1);
-    let mut emitted = 0u64;
-    for chunk in cached_output_tokens.chunks(batch_size) {
-        emitted = emitted.saturating_add(chunk.len() as u64);
-        let encoded = encode_token_ids(chunk);
-        on_progress(emitted, &encoded);
-    }
+    Ok(DecodeLoopOutput {
+        stop_reason,
+        output_tokens,
+    })
 }

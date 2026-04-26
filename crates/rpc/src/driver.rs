@@ -10,9 +10,7 @@ use tonic_iroh_transport::IrohChannel;
 
 use crate::GRPC_MESSAGE_LIMIT;
 use crate::pb::hellas::execute_client::ExecuteClient;
-use crate::pb::hellas::{
-    ExecuteRequest, ExecuteStatusRequest, ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse,
-};
+use crate::pb::hellas::{ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, GetQuoteResponse};
 
 pub type ExecuteEventStream =
     Pin<Box<dyn Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
@@ -81,17 +79,7 @@ where
         &mut self,
         request: ExecuteRequest,
     ) -> Result<ExecuteEventStream, Status> {
-        let execution_id = self
-            .client
-            .execute(request)
-            .await?
-            .into_inner()
-            .execution_id;
-        let stream = self
-            .client
-            .execute_stream(ExecuteStatusRequest { execution_id })
-            .await?
-            .into_inner();
+        let stream = self.client.execute(request).await?.into_inner();
         Ok(Box::pin(stream))
     }
 }

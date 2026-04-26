@@ -1,6 +1,4 @@
 use crate::model::ModelAssetsError;
-use catgrad::abstract_interpreter::types::InterpreterError;
-use catgrad::interpreter::backend::BackendError;
 use catgrad_llm::LLMError;
 use thiserror::Error;
 use tonic::Status;
@@ -31,10 +29,6 @@ pub enum StateError {
     QuoteNotFound(String),
     #[error("quote expired: {0}")]
     QuoteExpired(String),
-    #[error("execution not found: {0}")]
-    ExecutionNotFound(String),
-    #[error("output not available: {0}")]
-    OutputNotAvailable(String),
 }
 
 #[derive(Debug, Error)]
@@ -51,10 +45,6 @@ pub enum ExecutorError {
     ModelAssets(#[from] ModelAssetsError),
     #[error("LLM error: {0}")]
     Llm(#[from] LLMError),
-    #[error("interpreter error: {0}")]
-    Interpreter(#[from] InterpreterError),
-    #[error("backend error: {0:?}")]
-    Backend(BackendError),
     #[error("weights not ready for {0}")]
     WeightsNotReady(String),
     #[error("weights error: {0}")]
@@ -70,10 +60,6 @@ pub enum ExecutorError {
         request: catgrad::prelude::Dtype,
         supported: Vec<catgrad::prelude::Dtype>,
     },
-    #[error("no output from graph")]
-    NoOutput,
-    #[error("unexpected output value")]
-    UnexpectedOutput,
     #[error(transparent)]
     State(#[from] StateError),
 }
@@ -99,23 +85,16 @@ impl From<ExecutorError> for Status {
             },
 
             ExecutorError::WeightsNotReady(_)
-            | ExecutorError::State(StateError::OutputNotAvailable(_))
             | ExecutorError::State(StateError::QuoteExpired(_)) => tonic::Code::FailedPrecondition,
 
             ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
 
-            ExecutorError::State(
-                StateError::QuoteNotFound(_) | StateError::ExecutionNotFound(_),
-            ) => tonic::Code::NotFound,
+            ExecutorError::State(StateError::QuoteNotFound(_)) => tonic::Code::NotFound,
 
             ExecutorError::ChannelClosed
             | ExecutorError::BackendInit(_)
             | ExecutorError::Llm(_)
-            | ExecutorError::Interpreter(_)
-            | ExecutorError::Backend(_)
-            | ExecutorError::WeightsError(_)
-            | ExecutorError::NoOutput
-            | ExecutorError::UnexpectedOutput => tonic::Code::Internal,
+            | ExecutorError::WeightsError(_) => tonic::Code::Internal,
         };
         Status::new(code, err.to_string())
     }

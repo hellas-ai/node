@@ -16,10 +16,7 @@ service Execute {
   rpc QuoteChatPrompt(QuoteChatPromptRequest) returns (QuoteChatPromptResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc DecodeTokens(stream DecodeTokensRequest) returns (stream DecodeTokensResponse);
-  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-  rpc ExecuteStatus(ExecuteStatusRequest) returns (ExecuteStatusResponse);
-  rpc ExecuteStream(ExecuteStatusRequest) returns (stream ExecuteStreamEvent);
-  rpc ExecuteResult(ExecuteResultRequest) returns (ExecuteResultResponse);
+  rpc Execute(ExecuteRequest) returns (stream ExecuteStreamEvent);
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
   rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
 }

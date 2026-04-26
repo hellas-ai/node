@@ -1,19 +1,21 @@
 mod actor;
 mod handle;
-mod stream;
 
-use crate::state::ExecutionStatus;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
-    ExecuteStatusRequest, ExecuteStatusResponse, GetModelStatsRequest, GetModelStatsResponse,
+    ExecuteRequest, ExecuteStreamEvent, GetModelStatsRequest, GetModelStatsResponse,
     GetQuoteRequest, GetQuoteResponse, GetStatsResponse, ListModelsResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use tokio::sync::{mpsc, oneshot};
+use tonic::Status;
 
 pub use actor::Executor;
-pub(crate) use stream::{LocalExecutionStream, spawn_closed_monitor};
+
+/// Per-execution receiver returned to the streaming `Execute` consumer.
+/// Dropping it closes the matching sender held by the worker, which the
+/// worker observes on its next chunk send and converts into a cancel.
+pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<ExecuteStreamEvent, Status>>;
 
 pub(crate) enum ExecutorMessage {
     Quote {
@@ -32,36 +34,16 @@ pub(crate) enum ExecutorMessage {
         model: String,
         reply: oneshot::Sender<Result<(), ExecutorError>>,
     },
-    Subscribe {
-        execution_id: String,
-        reply: oneshot::Sender<Result<LocalExecutionStream, ExecutorError>>,
-    },
+    /// Single streaming entry point: validate the quote, accept the job
+    /// (queueing if the worker is busy), and return a Receiver wired to
+    /// the worker's per-execution sender.
     Execute {
         request: ExecuteRequest,
-        reply: oneshot::Sender<Result<ExecuteResponse, ExecutorError>>,
+        reply: oneshot::Sender<Result<ExecuteEventReceiver, ExecutorError>>,
     },
-    Status {
-        request: ExecuteStatusRequest,
-        reply: oneshot::Sender<Result<ExecuteStatusResponse, ExecutorError>>,
-    },
-    Result {
-        request: ExecuteResultRequest,
-        reply: oneshot::Sender<Result<ExecuteResultResponse, ExecutorError>>,
-    },
-    Progress {
-        execution_id: String,
-        output_chunk: Vec<u8>,
-        progress: u64,
-    },
-    Complete {
-        execution_id: String,
-        output: Option<Vec<u8>>,
-        status: ExecutionStatus,
-        error: Option<String>,
-    },
-    SubscriptionsClosed {
-        execution_id: String,
-    },
+    /// Worker → actor: this execution finished (or was cancelled).
+    /// Sole purpose is advancing the pending queue.
+    WorkerIdle,
     ListModels {
         reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
     },

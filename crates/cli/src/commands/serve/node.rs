@@ -1,16 +1,16 @@
 use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
+use catgrad::prelude::Dtype;
 use futures::StreamExt;
 use futures::future::try_join_all;
-use catgrad::prelude::Dtype;
 use hellas_executor::{ExecuteServer, Executor, ExecutorMetrics};
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
 use hellas_rpc::pb::hellas::{
     GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 };
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -226,7 +226,7 @@ pub(super) async fn spawn_node(
         supported_dtypes,
         metrics,
     )
-        .context("failed to initialize executor backend")?;
+    .context("failed to initialize executor backend")?;
 
     let execute_service = ExecuteServer::new(executor.clone())
         .accept_compressed(CompressionEncoding::Zstd)

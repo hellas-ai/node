@@ -52,15 +52,16 @@ tonic-iroh-transport = { workspace = true, default-features = false, features = 
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
 futures = "0.3"
+async-stream = "0.3"
 axum = "0.8"
 prometheus-client = "0.24"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 qrcode = { version = "0.14", default-features = false }
 rand = "0.9"
+tempfile = "3"
 
 # dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]
 # hellas-rpc = { workspace = true, features = ["compile"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
-tempfile = "3"

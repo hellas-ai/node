@@ -63,99 +63,6 @@ impl ::prost::Name for ExecuteRequest {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteResponse {
-    #[prost(string, tag = "1")]
-    pub execution_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub quote_id: ::prost::alloc::string::String,
-}
-impl ::prost::Name for ExecuteResponse {
-    const NAME: &'static str = "ExecuteResponse";
-    const PACKAGE: &'static str = "hellas";
-    fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteResponse".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteResponse".into()
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteStatusRequest {
-    #[prost(string, tag = "1")]
-    pub execution_id: ::prost::alloc::string::String,
-}
-impl ::prost::Name for ExecuteStatusRequest {
-    const NAME: &'static str = "ExecuteStatusRequest";
-    const PACKAGE: &'static str = "hellas";
-    fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteStatusRequest".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteStatusRequest".into()
-    }
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteStatusResponse {
-    #[prost(enumeration = "ExecutionStatus", tag = "1")]
-    pub status: i32,
-    #[prost(uint64, tag = "2")]
-    pub progress: u64,
-}
-impl ::prost::Name for ExecuteStatusResponse {
-    const NAME: &'static str = "ExecuteStatusResponse";
-    const PACKAGE: &'static str = "hellas";
-    fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteStatusResponse".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteStatusResponse".into()
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteSnapshot {
-    #[prost(enumeration = "ExecutionStatus", tag = "1")]
-    pub status: i32,
-    #[prost(uint64, tag = "2")]
-    pub progress: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub output: ::prost::alloc::vec::Vec<u8>,
-    /// Populated when status is FAILED; empty otherwise.
-    #[prost(string, tag = "4")]
-    pub error: ::prost::alloc::string::String,
-}
-impl ::prost::Name for ExecuteSnapshot {
-    const NAME: &'static str = "ExecuteSnapshot";
-    const PACKAGE: &'static str = "hellas";
-    fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteSnapshot".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteSnapshot".into()
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteProgress {
-    #[prost(enumeration = "ExecutionStatus", tag = "1")]
-    pub status: i32,
-    #[prost(uint64, tag = "2")]
-    pub progress: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub output_chunk: ::prost::alloc::vec::Vec<u8>,
-    /// Populated when status is FAILED; empty otherwise.
-    #[prost(string, tag = "4")]
-    pub error: ::prost::alloc::string::String,
-}
-impl ::prost::Name for ExecuteProgress {
-    const NAME: &'static str = "ExecuteProgress";
-    const PACKAGE: &'static str = "hellas";
-    fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteProgress".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteProgress".into()
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecuteStreamEvent {
     #[prost(oneof = "execute_stream_event::Event", tags = "1, 2")]
     pub event: ::core::option::Option<execute_stream_event::Event>,
@@ -165,9 +72,9 @@ pub mod execute_stream_event {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag = "1")]
-        Snapshot(super::ExecuteSnapshot),
+        Chunk(super::Chunk),
         #[prost(message, tag = "2")]
-        Progress(super::ExecuteProgress),
+        Outcome(super::Outcome),
     }
 }
 impl ::prost::Name for ExecuteStreamEvent {
@@ -180,34 +87,88 @@ impl ::prost::Name for ExecuteStreamEvent {
         "/hellas.ExecuteStreamEvent".into()
     }
 }
+/// Incremental token chunk produced during decode.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteResultRequest {
-    #[prost(string, tag = "1")]
-    pub execution_id: ::prost::alloc::string::String,
+pub struct Chunk {
+    /// Cumulative position AFTER this chunk.
+    #[prost(uint64, tag = "1")]
+    pub position: u64,
+    /// Little-endian u32 token IDs.
+    #[prost(bytes = "vec", tag = "2")]
+    pub tokens: ::prost::alloc::vec::Vec<u8>,
 }
-impl ::prost::Name for ExecuteResultRequest {
-    const NAME: &'static str = "ExecuteResultRequest";
+impl ::prost::Name for Chunk {
+    const NAME: &'static str = "Chunk";
     const PACKAGE: &'static str = "hellas";
     fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteResultRequest".into()
+        "hellas.Chunk".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteResultRequest".into()
+        "/hellas.Chunk".into()
+    }
+}
+/// Terminal outcome of an execution.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Outcome {
+    #[prost(oneof = "outcome::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<outcome::Kind>,
+}
+/// Nested message and enum types in `Outcome`.
+pub mod outcome {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Completed(super::Completed),
+        #[prost(message, tag = "2")]
+        Failed(super::Failed),
+    }
+}
+impl ::prost::Name for Outcome {
+    const NAME: &'static str = "Outcome";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.Outcome".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.Outcome".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecuteResultResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub output: ::prost::alloc::vec::Vec<u8>,
+pub struct Completed {
+    #[prost(uint64, tag = "1")]
+    pub total_tokens: u64,
+    #[prost(enumeration = "StopReason", tag = "2")]
+    pub stop_reason: i32,
+    /// Cid<TextReceipt> — exactly 32 bytes. Receivers reject other lengths.
+    #[prost(bytes = "vec", tag = "3")]
+    pub receipt_cid: ::prost::alloc::vec::Vec<u8>,
 }
-impl ::prost::Name for ExecuteResultResponse {
-    const NAME: &'static str = "ExecuteResultResponse";
+impl ::prost::Name for Completed {
+    const NAME: &'static str = "Completed";
     const PACKAGE: &'static str = "hellas";
     fn full_name() -> ::prost::alloc::string::String {
-        "hellas.ExecuteResultResponse".into()
+        "hellas.Completed".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.ExecuteResultResponse".into()
+        "/hellas.Completed".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Failed {
+    /// Tokens emitted before failure (for honest usage reporting).
+    #[prost(uint64, tag = "1")]
+    pub position: u64,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
+impl ::prost::Name for Failed {
+    const NAME: &'static str = "Failed";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.Failed".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.Failed".into()
     }
 }
 /// Convenience RPC: the server handles tokenization and graph construction.
@@ -398,7 +359,7 @@ pub struct DecodeTokensRequest {
     pub huggingface_model_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub huggingface_revision: ::prost::alloc::string::String,
-    /// Raw token bytes (little-endian u32 token IDs, same format as ExecuteStream output).
+    /// Raw token bytes (little-endian u32 token IDs, same format as Execute output).
     #[prost(bytes = "vec", tag = "3")]
     pub token_bytes: ::prost::alloc::vec::Vec<u8>,
 }
@@ -538,35 +499,32 @@ impl ::prost::Name for GetModelStatsResponse {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
-pub enum ExecutionStatus {
+pub enum StopReason {
     Unspecified = 0,
-    Pending = 1,
-    Running = 2,
-    Completed = 3,
-    Failed = 4,
+    EndOfSequence = 1,
+    MaxNewTokens = 2,
+    Cancelled = 3,
 }
-impl ExecutionStatus {
+impl StopReason {
     /// String value of the enum field names used in the ProtoBuf definition.
     ///
     /// The values are not transformed in any way and thus are considered stable
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::Unspecified => "UNSPECIFIED",
-            Self::Pending => "PENDING",
-            Self::Running => "RUNNING",
-            Self::Completed => "COMPLETED",
-            Self::Failed => "FAILED",
+            Self::Unspecified => "STOP_REASON_UNSPECIFIED",
+            Self::EndOfSequence => "END_OF_SEQUENCE",
+            Self::MaxNewTokens => "MAX_NEW_TOKENS",
+            Self::Cancelled => "CANCELLED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "UNSPECIFIED" => Some(Self::Unspecified),
-            "PENDING" => Some(Self::Pending),
-            "RUNNING" => Some(Self::Running),
-            "COMPLETED" => Some(Self::Completed),
-            "FAILED" => Some(Self::Failed),
+            "STOP_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "END_OF_SEQUENCE" => Some(Self::EndOfSequence),
+            "MAX_NEW_TOKENS" => Some(Self::MaxNewTokens),
+            "CANCELLED" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -1260,7 +1218,7 @@ pub mod execute_client {
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::ExecuteResponse>,
+            tonic::Response<tonic::codec::Streaming<super::ExecuteStreamEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -1275,79 +1233,7 @@ pub mod execute_client {
             let path = http::uri::PathAndQuery::from_static("/hellas.Execute/Execute");
             let mut req = request.into_request();
             req.extensions_mut().insert(GrpcMethod::new("hellas.Execute", "Execute"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn execute_status(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ExecuteStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExecuteStatusResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/hellas.Execute/ExecuteStatus",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("hellas.Execute", "ExecuteStatus"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn execute_stream(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ExecuteStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::ExecuteStreamEvent>>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/hellas.Execute/ExecuteStream",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("hellas.Execute", "ExecuteStream"));
             self.inner.server_streaming(req, path, codec).await
-        }
-        pub async fn execute_result(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ExecuteResultRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExecuteResultResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/hellas.Execute/ExecuteResult",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("hellas.Execute", "ExecuteResult"));
-            self.inner.unary(req, path, codec).await
         }
         pub async fn get_stats(
             &mut self,
@@ -1450,37 +1336,16 @@ pub mod execute_server {
             tonic::Response<Self::DecodeTokensStream>,
             tonic::Status,
         >;
-        async fn execute(
-            &self,
-            request: tonic::Request<super::ExecuteRequest>,
-        ) -> std::result::Result<tonic::Response<super::ExecuteResponse>, tonic::Status>;
-        async fn execute_status(
-            &self,
-            request: tonic::Request<super::ExecuteStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExecuteStatusResponse>,
-            tonic::Status,
-        >;
-        /// Server streaming response type for the ExecuteStream method.
-        type ExecuteStreamStream: tonic::codegen::tokio_stream::Stream<
+        /// Server streaming response type for the Execute method.
+        type ExecuteStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::ExecuteStreamEvent, tonic::Status>,
             >
             + std::marker::Send
             + 'static;
-        async fn execute_stream(
+        async fn execute(
             &self,
-            request: tonic::Request<super::ExecuteStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<Self::ExecuteStreamStream>,
-            tonic::Status,
-        >;
-        async fn execute_result(
-            &self,
-            request: tonic::Request<super::ExecuteResultRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExecuteResultResponse>,
-            tonic::Status,
-        >;
+            request: tonic::Request<super::ExecuteRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ExecuteStream>, tonic::Status>;
         async fn get_stats(
             &self,
             request: tonic::Request<super::GetStatsRequest>,
@@ -1801,11 +1666,14 @@ pub mod execute_server {
                 "/hellas.Execute/Execute" => {
                     #[allow(non_camel_case_types)]
                     struct ExecuteSvc<T: Execute>(pub Arc<T>);
-                    impl<T: Execute> tonic::server::UnaryService<super::ExecuteRequest>
+                    impl<
+                        T: Execute,
+                    > tonic::server::ServerStreamingService<super::ExecuteRequest>
                     for ExecuteSvc<T> {
-                        type Response = super::ExecuteResponse;
+                        type Response = super::ExecuteStreamEvent;
+                        type ResponseStream = T::ExecuteStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -1836,143 +1704,7 @@ pub mod execute_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/hellas.Execute/ExecuteStatus" => {
-                    #[allow(non_camel_case_types)]
-                    struct ExecuteStatusSvc<T: Execute>(pub Arc<T>);
-                    impl<
-                        T: Execute,
-                    > tonic::server::UnaryService<super::ExecuteStatusRequest>
-                    for ExecuteStatusSvc<T> {
-                        type Response = super::ExecuteStatusResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ExecuteStatusRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Execute>::execute_status(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ExecuteStatusSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/hellas.Execute/ExecuteStream" => {
-                    #[allow(non_camel_case_types)]
-                    struct ExecuteStreamSvc<T: Execute>(pub Arc<T>);
-                    impl<
-                        T: Execute,
-                    > tonic::server::ServerStreamingService<super::ExecuteStatusRequest>
-                    for ExecuteStreamSvc<T> {
-                        type Response = super::ExecuteStreamEvent;
-                        type ResponseStream = T::ExecuteStreamStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ExecuteStatusRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Execute>::execute_stream(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ExecuteStreamSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
                         let res = grpc.server_streaming(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/hellas.Execute/ExecuteResult" => {
-                    #[allow(non_camel_case_types)]
-                    struct ExecuteResultSvc<T: Execute>(pub Arc<T>);
-                    impl<
-                        T: Execute,
-                    > tonic::server::UnaryService<super::ExecuteResultRequest>
-                    for ExecuteResultSvc<T> {
-                        type Response = super::ExecuteResultResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ExecuteResultRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Execute>::execute_result(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ExecuteResultSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
