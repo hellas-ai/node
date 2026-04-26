@@ -11,13 +11,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
+use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn};
 use catgrad_llm::types::Message;
 use catgrad_llm::types::{anthropic, openai, plain};
 use futures::Stream;
 use futures::StreamExt;
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::Executor;
-use hellas_rpc::model::ModelAssets;
+use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::HashMap;
@@ -61,7 +62,13 @@ pub(super) struct PreparedGeneration {
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) stop_token_ids: Vec<i32>,
-    pub(super) has_tools: bool,
+    /// Bound chat-turn for chat surfaces (OpenAI / Anthropic). `None`
+    /// for the plain completion endpoint, which has no chat template
+    /// and no tool contract — see the P6 implementation contract in
+    /// the project plan. Chat surfaces use `chat_turn.make_parser()`
+    /// to drive the wire-event mapping; plain surface streams text
+    /// passthrough.
+    pub(super) chat_turn: Option<ChatTurn>,
     pub(super) assets: Arc<ModelAssets>,
     pub(super) inference_timeout: Duration,
 }
@@ -193,27 +200,20 @@ impl GatewayState {
         Ok(assets)
     }
 
-    async fn prepare_generation<F, E>(
+    /// Drive the executor quote step and assemble a `PreparedGeneration`
+    /// from already-prepared inputs. Surface-specific assembly
+    /// (`prepare_openai` / `prepare_anthropic` / `prepare_plain`)
+    /// produces the `PreparedPrompt` (and, for chat surfaces, the
+    /// `ChatTurn`) before calling here.
+    async fn finalize_generation(
         &self,
-        request_model: &str,
+        model: String,
+        assets: Arc<ModelAssets>,
+        prepared_prompt: PreparedPrompt,
         max_tokens: u32,
+        chat_turn: Option<ChatTurn>,
         prepare_error: &str,
-        has_tools: bool,
-        prepare: F,
-    ) -> Result<PreparedGeneration, HttpError>
-    where
-        F: FnOnce(&ModelAssets) -> Result<PreparedPrompt, E>,
-        E: StdError + Send + Sync + 'static,
-    {
-        let model = self.resolve_model(request_model);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
-        let prepared_prompt = prepare(assets.as_ref()).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("{prepare_error}: {}", format_error_causes(&err)),
-        })?;
+    ) -> Result<PreparedGeneration, HttpError> {
         let prompt_tokens = prepared_prompt.input_ids.len() as u32;
         let stop_token_ids = prepared_prompt.stop_token_ids.clone();
         let request = ExecutionRequest::new(
@@ -227,8 +227,6 @@ impl GatewayState {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to build execution request: {err}"),
         })?;
-        // Run the quote step up front so we can lift provenance off the
-        // prepared route before any response headers are flushed.
         let prepared = request.prepare().await.map_err(|err| HttpError {
             status: StatusCode::BAD_GATEWAY,
             message: format!("{prepare_error}: {}", format_error_causes(err.as_ref())),
@@ -242,7 +240,7 @@ impl GatewayState {
             provenance,
             prompt_tokens,
             stop_token_ids,
-            has_tools,
+            chat_turn,
             inference_timeout: self.inference_timeout,
         })
     }
@@ -254,18 +252,31 @@ impl GatewayState {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let messages: Vec<Message> = req.messages.iter().cloned().map(Message::from).collect();
         let tools = req.tools.clone();
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let enable_thinking = req
             .reasoning_effort
             .is_some_and(openai::ReasoningEffort::enables_thinking);
-        self.prepare_generation(
-            &req.model,
+        let model = self.resolve_model(&req.model);
+        let assets = self
+            .model_assets(&model)
+            .await
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("Failed to load local model assets for `{model}`: {err}"),
+            })?;
+        let chat_turn = assets
+            .chat_turn(tools.as_deref(), ChatOptions { enable_thinking })
+            .map_err(classify_chat_turn_error)?;
+        let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to prepare chat request: {err}"),
+        })?;
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
             max_tokens,
+            Some(chat_turn),
             "Failed to prepare chat request",
-            has_tools,
-            move |assets| {
-                assets.prepare_chat_with_tools(&messages, tools.as_deref(), enable_thinking)
-            },
         )
         .await
     }
@@ -284,13 +295,28 @@ impl GatewayState {
                 .map(anthropic_tool_to_openai)
                 .collect::<Vec<_>>()
         });
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-        self.prepare_generation(
-            &req.model,
+        let model = self.resolve_model(&req.model);
+        let assets = self
+            .model_assets(&model)
+            .await
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("Failed to load local model assets for `{model}`: {err}"),
+            })?;
+        let chat_turn = assets
+            .chat_turn(tools.as_deref(), ChatOptions::default())
+            .map_err(classify_chat_turn_error)?;
+        let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to prepare chat request: {err}"),
+        })?;
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
             req.max_tokens,
+            Some(chat_turn),
             "Failed to prepare chat request",
-            has_tools,
-            move |assets| assets.prepare_chat_with_tools(&messages, tools.as_deref(), false),
         )
         .await
     }
@@ -301,14 +327,51 @@ impl GatewayState {
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let prompt = req.prompt.clone();
-        self.prepare_generation(
-            &req.model,
+        let model = self.resolve_model(&req.model);
+        let assets = self
+            .model_assets(&model)
+            .await
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("Failed to load local model assets for `{model}`: {err}"),
+            })?;
+        let prepared_prompt = assets.prepare_plain(&prompt).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "Failed to prepare completion prompt: {}",
+                format_error_causes(&err)
+            ),
+        })?;
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
             max_tokens,
+            None,
             "Failed to prepare completion prompt",
-            false,
-            move |assets| assets.prepare_plain(&prompt),
         )
         .await
+    }
+}
+
+/// Map a `ModelAssets::chat_turn` failure to an HTTP status. Bad
+/// schemas and unsupported-tool-arch are **request errors** (400):
+/// the model never got to fail. Other failures (chat template
+/// missing, etc.) are also request-shaped here.
+fn classify_chat_turn_error(err: ModelAssetsError) -> HttpError {
+    match err {
+        ModelAssetsError::InvalidToolDirectory { source } => HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Invalid tool definitions: {source}"),
+        },
+        ModelAssetsError::ToolsUnsupportedForModel { arch } => HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Model architecture `{arch}` does not support tool calling"),
+        },
+        other => HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to prepare chat request: {other}"),
+        },
     }
 }
 
