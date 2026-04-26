@@ -1,7 +1,7 @@
-use crate::ExecutorError;
 use crate::state::ExecutionStatus;
 use crate::state::StateError;
 use crate::worker::{EnqueueError, ExecuteJob};
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{
     ExecuteRequest, ExecuteResponse, ExecuteResultRequest, ExecuteResultResponse,
     ExecuteStatusRequest, ExecuteStatusResponse,
@@ -30,20 +30,6 @@ impl Executor {
         let stat_prefill = stat_prompt.saturating_sub(stat_cached_prompt);
 
         let model_id = quote.model_id.clone();
-
-        self.stats.executions_started += 1;
-        self.stats.prompt_tokens += stat_prompt;
-        self.stats.cached_prompt_tokens += stat_cached_prompt;
-        self.stats.cached_output_tokens += stat_cached_output;
-        self.stats.prefill_tokens += stat_prefill;
-
-        let ms = self.model_stats.entry(model_id.clone()).or_default();
-        ms.executions_started += 1;
-        ms.prompt_tokens += stat_prompt;
-        ms.cached_prompt_tokens += stat_cached_prompt;
-        ms.cached_output_tokens += stat_cached_output;
-        ms.prefill_tokens += stat_prefill;
-
         let execution_id = self.store.create_execution(&model_id);
         let job = ExecuteJob {
             execution_id: execution_id.clone(),
@@ -58,26 +44,23 @@ impl Executor {
             Ok(queued) => queued,
             Err(error) => {
                 let _ = self.store.remove_execution(&execution_id);
-                self.stats.executions_started -= 1;
-                self.stats.prompt_tokens -= stat_prompt;
-                self.stats.cached_prompt_tokens -= stat_cached_prompt;
-                self.stats.cached_output_tokens -= stat_cached_output;
-                self.stats.prefill_tokens -= stat_prefill;
-                if let Some(ms) = self.model_stats.get_mut(&model_id) {
-                    ms.executions_started -= 1;
-                    ms.prompt_tokens -= stat_prompt;
-                    ms.cached_prompt_tokens -= stat_cached_prompt;
-                    ms.cached_output_tokens -= stat_cached_output;
-                    ms.prefill_tokens -= stat_prefill;
-                }
                 return Err(error);
             }
         };
+        // Counters update after the queue accepts the job — no rollback path.
+        self.metrics.record_execution_started(
+            &model_id,
+            stat_prompt,
+            stat_cached_prompt,
+            stat_cached_output,
+            stat_prefill,
+        );
         let _ = self.store.remove_quote(&quote_id);
 
         info!(
             %execution_id,
             %quote_id,
+            commitment_id = %quote.start.commitment_id,
             queued,
             queue_len = self.pending_executions.len(),
             "accepted execution"
@@ -189,21 +172,17 @@ impl Executor {
         debug!(%execution_id, success, "execution finished");
 
         let generated = self.store.progress(execution_id).unwrap_or(0);
-        let model_id = self.store.model_id(execution_id).ok().map(str::to_owned);
-        self.stats.generated_tokens += generated;
+        let model_id = self
+            .store
+            .model_id(execution_id)
+            .ok()
+            .map(str::to_owned)
+            .unwrap_or_default();
         if success {
-            self.stats.executions_completed += 1;
+            self.metrics
+                .record_execution_completed(&model_id, generated);
         } else {
-            self.stats.executions_failed += 1;
-        }
-        if let Some(model_id) = model_id {
-            let ms = self.model_stats.entry(model_id).or_default();
-            ms.generated_tokens += generated;
-            if success {
-                ms.executions_completed += 1;
-            } else {
-                ms.executions_failed += 1;
-            }
+            self.metrics.record_execution_failed(&model_id, generated);
         }
 
         if let Err(store_err) =

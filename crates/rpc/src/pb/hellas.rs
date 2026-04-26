@@ -222,6 +222,13 @@ pub struct QuotePromptRequest {
     pub prompt: ::prost::alloc::string::String,
     #[prost(uint32, tag = "4")]
     pub max_new_tokens: u32,
+    /// Ordered preference list (each one of "f32", "f16", "bf16"). The server
+    /// picks the first entry it supports. Empty list lets the server pick its
+    /// preferred dtype freely. None of the entries supported → request is
+    /// refused with FailedPrecondition. The chosen dtype is reported back in
+    /// QuotePromptResponse.dtype.
+    #[prost(string, repeated, tag = "5")]
+    pub accept_dtypes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 impl ::prost::Name for QuotePromptRequest {
     const NAME: &'static str = "QuotePromptRequest";
@@ -243,6 +250,9 @@ pub struct QuotePromptResponse {
     pub ttl_ms: u64,
     #[prost(uint32, tag = "4")]
     pub prompt_tokens: u32,
+    /// The dtype the server actually committed to running this quote at.
+    #[prost(string, tag = "5")]
+    pub dtype: ::prost::alloc::string::String,
 }
 impl ::prost::Name for QuotePromptResponse {
     const NAME: &'static str = "QuotePromptResponse";
@@ -287,6 +297,13 @@ pub struct QuoteChatPromptRequest {
     pub max_new_tokens: u32,
     #[prost(string, tag = "5")]
     pub system_prompt: ::prost::alloc::string::String,
+    /// Ordered preference list (each one of "f32", "f16", "bf16"). The server
+    /// picks the first entry it supports. Empty list lets the server pick its
+    /// preferred dtype freely. None of the entries supported → request is
+    /// refused with FailedPrecondition. The chosen dtype is reported back in
+    /// QuoteChatPromptResponse.dtype.
+    #[prost(string, repeated, tag = "6")]
+    pub accept_dtypes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 impl ::prost::Name for QuoteChatPromptRequest {
     const NAME: &'static str = "QuoteChatPromptRequest";
@@ -308,6 +325,9 @@ pub struct QuoteChatPromptResponse {
     pub ttl_ms: u64,
     #[prost(uint32, tag = "4")]
     pub prompt_tokens: u32,
+    /// The dtype the server actually committed to running this quote at.
+    #[prost(string, tag = "5")]
+    pub dtype: ::prost::alloc::string::String,
 }
 impl ::prost::Name for QuoteChatPromptResponse {
     const NAME: &'static str = "QuoteChatPromptResponse";

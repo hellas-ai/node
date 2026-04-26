@@ -72,6 +72,12 @@ message QuotePromptRequest {
   string huggingface_revision = 2;
   string prompt = 3;
   uint32 max_new_tokens = 4;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported → request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuotePromptResponse.dtype.
+  repeated string accept_dtypes = 5;
 }
 
 message QuotePromptResponse {
@@ -79,6 +85,8 @@ message QuotePromptResponse {
   uint64 amount = 2;
   uint64 ttl_ms = 3;
   uint32 prompt_tokens = 4;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 5;
 }
 
 // Convenience RPC: chat-style prompt quoting.
@@ -95,6 +103,12 @@ message QuoteChatPromptRequest {
   repeated ChatMessage messages = 3;
   uint32 max_new_tokens = 4;
   string system_prompt = 5;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported → request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuoteChatPromptResponse.dtype.
+  repeated string accept_dtypes = 6;
 }
 
 message QuoteChatPromptResponse {
@@ -102,6 +116,8 @@ message QuoteChatPromptResponse {
   uint64 amount = 2;
   uint64 ttl_ms = 3;
   uint32 prompt_tokens = 4;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 5;
 }
 
 // List models known to the executor and their readiness status.

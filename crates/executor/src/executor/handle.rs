@@ -1,4 +1,4 @@
-use crate::ExecutorError;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::driver::{ExecuteDriver, ExecuteEventStream};
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
@@ -201,8 +201,8 @@ impl Execute for ExecutorHandle {
         &self,
         request: Request<tonic::Streaming<DecodeTokensRequest>>,
     ) -> Result<Response<Self::DecodeTokensStream>, Status> {
-        use crate::model::ModelAssets;
         use hellas_rpc::decode_token_ids;
+        use hellas_rpc::model::ModelAssets;
         use tokio_stream::StreamExt;
 
         let mut stream = request.into_inner();
@@ -222,7 +222,11 @@ impl Execute for ExecutorHandle {
                 first.huggingface_model_id, first.huggingface_revision
             )
         };
-        let assets = ModelAssets::load(&model_spec)
+        // Tokenizer-only path. The dtype is irrelevant for `decode_tokens`;
+        // F32 is just the cheapest valid value for the model-graph build that
+        // `ModelAssets::load` does for EOS-id extraction. See PREFIX.md §3.5
+        // for the future no-model-build helper.
+        let assets = ModelAssets::load(&model_spec, catgrad::prelude::Dtype::F32)
             .map_err(|e| Status::internal(format!("failed to load model: {e}")))?;
 
         // Process the first message's tokens too.

@@ -2,7 +2,9 @@ use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
 use futures::StreamExt;
 use futures::future::try_join_all;
-use hellas_executor::{DownloadPolicy, ExecutePolicy, ExecuteServer, Executor};
+use catgrad::prelude::Dtype;
+use hellas_executor::{ExecuteServer, Executor, ExecutorMetrics};
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
@@ -40,10 +42,10 @@ struct ExecutePeerInterceptor {
 
 impl tonic::service::Interceptor for ExecutePeerInterceptor {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
-            if let Ok(mut tracker) = self.peer_tracker.lock() {
-                let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::ExecuteRpc);
-            }
+        if let Some((peer_id, observed_rtt)) = peer_observation(&request)
+            && let Ok(mut tracker) = self.peer_tracker.lock()
+        {
+            let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::ExecuteRpc);
         }
         Ok(request)
     }
@@ -55,10 +57,10 @@ impl Node for NodeService {
         &self,
         request: Request<GetNodeInfoRequest>,
     ) -> Result<Response<GetNodeInfoResponse>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
-            if let Ok(mut tracker) = self.peer_tracker.lock() {
-                let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::GetNodeInfo);
-            }
+        if let Some((peer_id, observed_rtt)) = peer_observation(&request)
+            && let Ok(mut tracker) = self.peer_tracker.lock()
+        {
+            let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::GetNodeInfo);
         }
 
         Ok(Response::new(GetNodeInfoResponse {
@@ -125,10 +127,25 @@ fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::
     Some((context.node_id, context.connection.rtt(PathId::ZERO)))
 }
 
+async fn bind_endpoint(
+    secret_key: tonic_iroh_transport::iroh::SecretKey,
+    port: u16,
+) -> anyhow::Result<Endpoint> {
+    Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .clear_address_lookup()
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?
+        .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))?
+        .bind()
+        .await
+        .map_err(Into::into)
+}
+
 pub(super) struct NodeHandle {
     node_id: EndpointId,
     guard: tonic_iroh_transport::TransportGuard,
-    pub executor: hellas_executor::ExecutorHandle,
 }
 
 impl NodeHandle {
@@ -152,21 +169,13 @@ pub(super) async fn spawn_node(
     preload_weights: Vec<String>,
     build: String,
     graffiti: Vec<u8>,
+    supported_dtypes: Vec<Dtype>,
     secret_key: tonic_iroh_transport::iroh::SecretKey,
+    metrics: Arc<ExecutorMetrics>,
 ) -> anyhow::Result<NodeHandle> {
-    let make_builder = || {
-        Endpoint::builder(presets::N0)
-            .secret_key(secret_key.clone())
-            .clear_address_lookup()
-            .address_lookup(PkarrPublisher::n0_dns())
-            .address_lookup(DnsAddressLookup::n0_dns())
-    };
     let endpoint = if let Some(port) = port {
         // Explicit port: fail if it can't bind.
-        make_builder()
-            .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?
-            .bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))?
-            .bind()
+        bind_endpoint(secret_key.clone(), port)
             .await
             .with_context(|| format!("failed to bind on port {port}"))?
     } else {
@@ -174,25 +183,15 @@ pub(super) async fn spawn_node(
         let mut endpoint = None;
         for offset in 0..MAX_PORT_RETRIES {
             let p = DEFAULT_PORT.wrapping_add(offset);
-            match make_builder()
-                .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))
-                .and_then(|b| b.bind_addr(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0)))
-            {
-                Ok(builder) => match builder.bind().await {
-                    Ok(ep) => {
-                        if offset > 0 {
-                            info!("port {DEFAULT_PORT} in use, bound to port {p}");
-                        }
-                        endpoint = Some(ep);
-                        break;
+            match bind_endpoint(secret_key.clone(), p).await {
+                Ok(ep) => {
+                    if offset > 0 {
+                        info!("port {DEFAULT_PORT} in use, bound to port {p}");
                     }
-                    Err(e) => {
-                        debug!("port {p} unavailable: {e:#}");
-                    }
-                },
-                Err(e) => {
-                    debug!("port {p} unavailable: {e:#}");
+                    endpoint = Some(ep);
+                    break;
                 }
+                Err(e) => debug!("port {p} unavailable: {e:#}"),
             }
         }
         endpoint.ok_or_else(|| {
@@ -220,7 +219,13 @@ pub(super) async fn spawn_node(
         peer_tracker: peer_tracker.clone(),
     };
 
-    let executor = Executor::spawn(download_policy, execute_policy, queue_size)
+    let executor = Executor::spawn_with_metrics(
+        download_policy,
+        execute_policy,
+        queue_size,
+        supported_dtypes,
+        metrics,
+    )
         .context("failed to initialize executor backend")?;
 
     let execute_service = ExecuteServer::new(executor.clone())
@@ -304,6 +309,5 @@ pub(super) async fn spawn_node(
     Ok(NodeHandle {
         node_id: endpoint.id(),
         guard,
-        executor,
     })
 }

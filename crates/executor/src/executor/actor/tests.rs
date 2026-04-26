@@ -1,13 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::DEFAULT_EXECUTION_QUEUE_CAPACITY;
-use crate::ExecutorError;
-use crate::policy::{DownloadPolicy, ExecutePolicy};
 use crate::state::{ExecutionStatus, ExecutorState};
-use crate::weights::RuntimeManager;
+use crate::programs;
 use crate::worker::ExecuteWorker;
+use hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::hellas::{ExecutionStatus as RpcExecutionStatus, execute_stream_event};
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -25,11 +25,11 @@ fn test_executor(
         subscriptions: HashMap::new(),
         pending_executions: VecDeque::new(),
         queue_capacity: DEFAULT_EXECUTION_QUEUE_CAPACITY,
-        runtime_manager: RuntimeManager::new(DownloadPolicy::default()),
+        programs: programs::Cache::new(DownloadPolicy::default()),
         worker: ExecuteWorker::stopped(),
         execute_policy: ExecutePolicy::default(),
-        stats: Default::default(),
-        model_stats: Default::default(),
+        metrics: std::sync::Arc::new(crate::metrics::ExecutorMetrics::default()),
+        supported_dtypes: vec![catgrad::prelude::Dtype::F32],
     }
 }
 
@@ -74,6 +74,7 @@ async fn quote_rejects_missing_model_id() {
         DownloadPolicy::default(),
         ExecutePolicy::default(),
         DEFAULT_EXECUTION_QUEUE_CAPACITY,
+        vec![catgrad::prelude::Dtype::F32],
     )
     .expect("executor should start");
 
@@ -93,6 +94,7 @@ async fn execute_with_invalid_quote_fails() {
         DownloadPolicy::default(),
         ExecutePolicy::default(),
         DEFAULT_EXECUTION_QUEUE_CAPACITY,
+        vec![catgrad::prelude::Dtype::F32],
     )
     .expect("executor should start");
 
@@ -251,16 +253,80 @@ async fn stats_accumulate_on_completion() {
 
     executor.handle_complete(&execution_id, None, ExecutionStatus::Completed, None);
 
-    assert_eq!(executor.stats.generated_tokens, 3);
-    assert_eq!(executor.stats.executions_completed, 1);
-    assert_eq!(executor.stats.executions_failed, 0);
+    let stats = executor.metrics.global_snapshot();
+    assert_eq!(stats.generated_tokens, 3);
+    assert_eq!(stats.executions_completed, 1);
+    assert_eq!(stats.executions_failed, 0);
 
     // A failed execution should increment the failed counter.
     let execution_id2 = executor.store.create_execution("");
     executor.store.mark_running(&execution_id2).unwrap();
     executor.handle_complete(&execution_id2, None, ExecutionStatus::Failed, None);
 
-    assert_eq!(executor.stats.generated_tokens, 3);
-    assert_eq!(executor.stats.executions_completed, 1);
-    assert_eq!(executor.stats.executions_failed, 1);
+    let stats = executor.metrics.global_snapshot();
+    assert_eq!(stats.generated_tokens, 3);
+    assert_eq!(stats.executions_completed, 1);
+    assert_eq!(stats.executions_failed, 1);
+}
+
+#[test]
+fn resolve_accept_dtypes_falls_back_to_preferred_on_empty() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut executor = test_executor(tx.downgrade(), rx);
+    executor.supported_dtypes = vec![catgrad::prelude::Dtype::BF16, catgrad::prelude::Dtype::F32];
+
+    assert_eq!(
+        executor.resolve_accept_dtypes(&[]).unwrap(),
+        catgrad::prelude::Dtype::BF16,
+    );
+}
+
+#[test]
+fn resolve_accept_dtypes_picks_first_supported_match() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut executor = test_executor(tx.downgrade(), rx);
+    executor.supported_dtypes = vec![catgrad::prelude::Dtype::F32, catgrad::prelude::Dtype::F16];
+
+    // Client prefers bf16 first but server doesn't have it; server picks f32.
+    let prefs = vec!["bf16".to_string(), "f32".to_string(), "f16".to_string()];
+    assert_eq!(
+        executor.resolve_accept_dtypes(&prefs).unwrap(),
+        catgrad::prelude::Dtype::F32,
+    );
+}
+
+#[test]
+fn resolve_accept_dtypes_rejects_when_no_overlap() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut executor = test_executor(tx.downgrade(), rx);
+    executor.supported_dtypes = vec![catgrad::prelude::Dtype::F32];
+
+    let prefs = vec!["bf16".to_string(), "f16".to_string()];
+    let err = executor
+        .resolve_accept_dtypes(&prefs)
+        .expect_err("no overlap");
+    match err {
+        ExecutorError::DtypeNotSupported { request, supported } => {
+            // Reports the client's first preference for diagnostic purposes.
+            assert_eq!(request, catgrad::prelude::Dtype::BF16);
+            assert_eq!(supported, vec![catgrad::prelude::Dtype::F32]);
+        }
+        other => panic!("expected DtypeNotSupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_accept_dtypes_rejects_u32_and_garbage() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut executor = test_executor(tx.downgrade(), rx);
+    executor.supported_dtypes = vec![catgrad::prelude::Dtype::F32];
+
+    assert!(matches!(
+        executor.resolve_accept_dtypes(&["u32".to_string()]),
+        Err(ExecutorError::InvalidQuoteRequest(_))
+    ));
+    assert!(matches!(
+        executor.resolve_accept_dtypes(&["not-a-dtype".to_string()]),
+        Err(ExecutorError::InvalidQuoteRequest(_))
+    ));
 }

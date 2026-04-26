@@ -18,14 +18,12 @@ pub mod policy;
 pub mod service;
 pub mod spec;
 
-pub use spec::{DEFAULT_MODEL_REVISION, ModelSpec, ModelSpecError};
+pub use spec::ModelSpec;
 
 #[cfg(feature = "node")]
-pub use error::{BackendInitError, ExecutorError, StateError};
+pub use error::ExecutorError;
 #[cfg(feature = "node")]
-pub use model::{ModelAssets, ModelAssetsError};
-#[cfg(feature = "node")]
-pub use policy::{DownloadPolicy, ExecutePattern, ExecutePolicy};
+pub use model::ModelAssetsError;
 
 /// Default bound on the in-memory execution queue carried by `hellas_executor::Executor`.
 #[cfg(feature = "node")]

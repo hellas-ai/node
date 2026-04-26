@@ -1,14 +1,16 @@
 use crate::commands::CliResult;
 use anyhow::Context;
-use hellas_executor::{DownloadPolicy, ExecutePolicy};
+use catgrad::prelude::Dtype;
+use hellas_executor::ExecutorMetrics;
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::SecretKey;
 use tracing::warn;
 
 mod node;
 mod peer_tracker;
-mod stats_metrics;
 
 pub async fn run(
     port: Option<u16>,
@@ -18,6 +20,7 @@ pub async fn run(
     preload_weights: Vec<String>,
     metrics_port: Option<u16>,
     graffiti: String,
+    dtype: Vec<Dtype>,
     secret_key: SecretKey,
 ) -> CliResult<()> {
     let preload_weights = dedupe_preload_weights(preload_weights);
@@ -29,6 +32,10 @@ pub async fn run(
         buf[..len].copy_from_slice(&src[..len]);
         buf.to_vec()
     };
+    // Counters live in the executor and are mutated inline; cloning the
+    // counter handles into a registry just adds a scrape view on the same
+    // underlying state.
+    let metrics = Arc::new(ExecutorMetrics::default());
     let node = node::spawn_node(
         port,
         download_policy.clone(),
@@ -37,15 +44,17 @@ pub async fn run(
         preload_weights.clone(),
         build,
         graffiti,
+        dtype,
         secret_key,
+        metrics.clone(),
     )
     .await
     .context("failed to start node server")?;
 
     if let Some(metrics_port) = metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();
-        stats_metrics::register_and_spawn(&mut registry, node.executor.clone());
-        crate::metrics::spawn_metrics_server(metrics_port, std::sync::Arc::new(registry));
+        metrics.register_with(&mut registry);
+        crate::metrics::spawn_metrics_server(metrics_port, Arc::new(registry));
     }
 
     let node_id = node.node_id();

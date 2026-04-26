@@ -26,6 +26,21 @@ pub fn load_or_create(path: Option<&Path>) -> anyhow::Result<SecretKey> {
     }
 }
 
+/// Load an existing identity file; error if missing.
+///
+/// Unlike `load_or_create`, this never creates a new key. Use this for
+/// read-only queries (e.g. printing the node ID of a running service) to avoid
+/// racing the file creator.
+pub fn load_existing(path: Option<&Path>) -> anyhow::Result<SecretKey> {
+    let path = match path {
+        Some(p) => p.to_owned(),
+        None => default_identity_path()?,
+    };
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read identity file {}", path.display()))?;
+    load_from_bytes(&path, &bytes)
+}
+
 fn default_identity_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME")
         .context("HOME environment variable not set; use --identity to specify path")?;
@@ -159,7 +174,7 @@ mod tests {
     fn rejects_wrong_size_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity");
-        fs::write(&path, &[0u8; 16]).unwrap();
+        fs::write(&path, [0u8; 16]).unwrap();
 
         let err = load_or_create(Some(&path)).unwrap_err();
         assert!(err.to_string().contains("invalid size"));
