@@ -19,7 +19,7 @@ struct Entry {
     /// Programs bound against this entry's [`Bundle::inputs`], keyed by
     /// canonical [`Cid<Program>`]. Lives here (not on
     /// [`crate::programs::Cache`]) because it's always scoped to a single
-    /// `Inputs` and a single `(model, revision, dtype)` cache generation —
+    /// `ParameterBundle` and a single `(model, revision, dtype)` cache generation —
     /// when the bundle reloads we need the program map to be invalidated
     /// atomically with it.
     programs: HashMap<Cid<Program>, Arc<ExecutionContext>>,
@@ -130,7 +130,7 @@ impl State {
         if entry.generation != generation {
             return Ok(CacheProgramOutcome::Stale);
         }
-        let program_id = program.bound_program().id();
+        let program_id = program.bound_program().program().id();
         let cached = entry.programs.entry(program_id).or_insert(program);
         Ok(CacheProgramOutcome::Cached(cached.clone()))
     }
@@ -140,8 +140,9 @@ impl State {
 mod tests {
     use super::*;
     use catgrad::category::lang::{Term, TypedTerm};
+    use catgrad::interpreter;
     use catgrad::path::Path;
-    use catgrad::runtime::{Inputs, Program};
+    use catgrad::runtime::{BoundProgram, Program};
 
     fn locator(index: u8) -> HuggingFaceLocator {
         HuggingFaceLocator::new(
@@ -152,8 +153,7 @@ mod tests {
     }
 
     fn empty_bundle() -> Arc<Bundle> {
-        let backend = crate::backend::create_backend().unwrap();
-        let inputs = Inputs::new(backend, Default::default(), Default::default()).unwrap();
+        let inputs = interpreter::Parameters::default();
         Arc::new(Bundle { inputs })
     }
 
@@ -172,11 +172,10 @@ mod tests {
     }
 
     fn dummy_execution_context(bundle: &Arc<Bundle>) -> Arc<ExecutionContext> {
+        let backend = crate::backend::create_backend().unwrap();
         Arc::new(
             ExecutionContext::new(Arc::new(
-                bundle
-                    .inputs
-                    .bind(dummy_spec())
+                BoundProgram::bind(&bundle.inputs, &backend, dummy_spec())
                     .map_err(catgrad_llm::LLMError::from)
                     .unwrap(),
             ))
