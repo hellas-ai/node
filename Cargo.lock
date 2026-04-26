@@ -2381,6 +2381,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-iroh-transport",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

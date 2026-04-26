@@ -1,8 +1,9 @@
 use super::{GatewayOptions, json_error};
 use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
-    RemoteNodeTarget,
+    PreparedExecution, RemoteNodeTarget,
 };
+use hellas_rpc::provenance::ExecutionProvenance;
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use async_stream::try_stream;
@@ -52,7 +53,12 @@ pub(super) struct GatewayState {
 
 pub(super) struct PreparedGeneration {
     pub(super) model: String,
-    pub(super) request: ExecutionRequest,
+    pub(super) prepared: PreparedExecution,
+    /// Pre-flight provenance the executor committed to. `None` for routes
+    /// that defer their quote until streaming starts (`RemoteDiscovery`);
+    /// in that case headers can't be set and clients must rely on the
+    /// in-band SSE `hellas-provenance` event.
+    pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) stop_token_ids: Vec<i32>,
     pub(super) has_tools: bool,
@@ -221,11 +227,19 @@ impl GatewayState {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to build execution request: {err}"),
         })?;
+        // Run the quote step up front so we can lift provenance off the
+        // prepared route before any response headers are flushed.
+        let prepared = request.prepare().await.map_err(|err| HttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("{prepare_error}: {}", format_error_causes(err.as_ref())),
+        })?;
+        let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
             model,
             assets,
-            request,
+            prepared,
+            provenance,
             prompt_tokens,
             stop_token_ids,
             has_tools,
@@ -311,14 +325,14 @@ impl PreparedGeneration {
     /// frame in its own format.
     pub(super) fn stream(self) -> impl Stream<Item = anyhow::Result<GenerationEvent>> + Send {
         let Self {
-            request,
+            prepared,
             assets,
             stop_token_ids,
             ..
         } = self;
         try_stream! {
             let mut decoder = TextOutputDecoder::new(assets, &stop_token_ids);
-            let inner = request.stream();
+            let inner = prepared.stream();
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
                 match event? {

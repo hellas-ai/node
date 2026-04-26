@@ -1,5 +1,8 @@
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{next_id, parse_json_body, sse_event_data, sse_response};
+use super::{
+    next_id, parse_json_body, provenance_sse_event, receipt_sse_event, sse_event_data,
+    sse_response,
+};
 use crate::execution::{Outcome, StopReason};
 use async_stream::stream;
 use axum::Json;
@@ -37,9 +40,15 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
     let assets = prepared.assets.clone();
     let prompt_tokens = prepared.prompt_tokens;
     let has_tools = prepared.has_tools;
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
-    sse_response(stream! {
+    let stream_provenance = provenance.clone();
+    let mut response = sse_response(stream! {
+        if let Some(prov) = stream_provenance.as_ref() {
+            yield Ok(provenance_sse_event(prov));
+        }
+
         // message_start always first.
         let message_start = anthropic::MessageStreamEvent::MessageStart {
             message: anthropic::MessageResponse::builder()
@@ -151,7 +160,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
             Outcome::Completed {
                 stop_reason,
                 total_tokens,
-                ..
+                receipt_cid,
             } => {
                 let final_stop_reason = if has_tools {
                     let parsed = assets.parse_tool_calls(&tool_buffer).unwrap_or_else(|err| {
@@ -190,13 +199,18 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                         ),
                     },
                 ));
+                yield Ok(receipt_sse_event(&receipt_cid));
                 yield Ok(sse_event_data(
                     "message_stop",
                     &anthropic::MessageStreamEvent::MessageStop,
                 ));
             }
         }
-    })
+    });
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response
 }
 
 fn text_block_events(index: u32, text: &str) -> Vec<Event> {
@@ -273,6 +287,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let model = prepared.model.clone();
     let assets = prepared.assets.clone();
     let prompt_tokens = prepared.prompt_tokens;
+    let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
     let stream = prepared.stream();
@@ -301,12 +316,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, stop_reason) = match outcome {
+    let (total_tokens, stop_reason, receipt_cid) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
-            ..
-        } => (total_tokens, stop_reason),
+            receipt_cid,
+        } => (total_tokens, stop_reason, receipt_cid),
         Outcome::Failed { position, error } => {
             warn!(position, %error, "anthropic message request failed");
             return super::json_error(
@@ -341,7 +356,12 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         ))
         .build();
 
-    Json(response).into_response()
+    let mut response = Json(response).into_response();
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response.extensions_mut().insert(receipt_cid);
+    response
 }
 
 /// Convert a parsed tool-use step into Anthropic content blocks.

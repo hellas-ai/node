@@ -1,5 +1,5 @@
 use hellas_rpc::ExecutorError;
-use hellas_rpc::driver::{ExecuteDriver, ExecuteEventStream};
+use hellas_rpc::driver::{ExecuteDriver, QuotedResponse, StreamedExecution};
 use hellas_rpc::pb::hellas::execute_server::Execute;
 use hellas_rpc::pb::hellas::{
     DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteStreamEvent,
@@ -7,12 +7,13 @@ use hellas_rpc::pb::hellas::{
     GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::provenance::write_provenance_metadata;
 use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::{ExecuteEventReceiver, ExecutorHandle, ExecutorMessage};
+use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, QuoteOutcome};
 
 impl ExecutorHandle {
     async fn send<T>(
@@ -26,7 +27,10 @@ impl ExecutorHandle {
         reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
     }
 
-    pub async fn quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse, ExecutorError> {
+    pub async fn quote(
+        &self,
+        request: GetQuoteRequest,
+    ) -> Result<QuoteOutcome<GetQuoteResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::Quote { request, reply })
             .await
     }
@@ -34,7 +38,7 @@ impl ExecutorHandle {
     pub async fn quote_prompt(
         &self,
         request: QuotePromptRequest,
-    ) -> Result<QuotePromptResponse, ExecutorError> {
+    ) -> Result<QuoteOutcome<QuotePromptResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
             .await
     }
@@ -42,7 +46,7 @@ impl ExecutorHandle {
     pub async fn quote_chat_prompt(
         &self,
         request: QuoteChatPromptRequest,
-    ) -> Result<QuoteChatPromptResponse, ExecutorError> {
+    ) -> Result<QuoteOutcome<QuoteChatPromptResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
             .await
     }
@@ -60,7 +64,7 @@ impl ExecutorHandle {
     pub async fn execute(
         &self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteEventReceiver, ExecutorError> {
+    ) -> Result<ExecuteOutcome, ExecutorError> {
         self.send(|reply| ExecutorMessage::Execute { request, reply })
             .await
     }
@@ -84,25 +88,30 @@ impl Execute for ExecutorHandle {
         &self,
         request: Request<GetQuoteRequest>,
     ) -> Result<Response<GetQuoteResponse>, Status> {
-        Ok(Response::new(self.quote(request.into_inner()).await?))
+        let outcome = self.quote(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
     }
 
     async fn quote_prompt(
         &self,
         request: Request<QuotePromptRequest>,
     ) -> Result<Response<QuotePromptResponse>, Status> {
-        Ok(Response::new(
-            self.quote_prompt(request.into_inner()).await?,
-        ))
+        let outcome = self.quote_prompt(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
     }
 
     async fn quote_chat_prompt(
         &self,
         request: Request<QuoteChatPromptRequest>,
     ) -> Result<Response<QuoteChatPromptResponse>, Status> {
-        Ok(Response::new(
-            self.quote_chat_prompt(request.into_inner()).await?,
-        ))
+        let outcome = self.quote_chat_prompt(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
     }
 
     async fn list_models(
@@ -135,10 +144,12 @@ impl Execute for ExecutorHandle {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
-        let receiver = self.execute(request.into_inner()).await?;
-        Ok(Response::new(
-            Box::pin(ReceiverStream::new(receiver)) as Self::ExecuteStream
-        ))
+        let outcome = self.execute(request.into_inner()).await?;
+        let mut response = Response::new(
+            Box::pin(ReceiverStream::new(outcome.events)) as Self::ExecuteStream,
+        );
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
     }
 
     type DecodeTokensStream =
@@ -213,15 +224,28 @@ impl Execute for ExecutorHandle {
 
 #[tonic::async_trait]
 impl ExecuteDriver for ExecutorHandle {
-    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<GetQuoteResponse, Status> {
-        self.quote(request).await.map_err(Into::into)
+    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<QuotedResponse, Status> {
+        let outcome = self
+            .quote(request)
+            .await
+            .map_err(<ExecutorError as Into<Status>>::into)?;
+        Ok(QuotedResponse {
+            response: outcome.response,
+            provenance: outcome.provenance,
+        })
     }
 
     async fn execute_streaming(
         &mut self,
         request: ExecuteRequest,
-    ) -> Result<ExecuteEventStream, Status> {
-        let receiver = self.execute(request).await?;
-        Ok(Box::pin(ReceiverStream::new(receiver)))
+    ) -> Result<StreamedExecution, Status> {
+        let outcome = self
+            .execute(request)
+            .await
+            .map_err(<ExecutorError as Into<Status>>::into)?;
+        Ok(StreamedExecution {
+            stream: Box::pin(ReceiverStream::new(outcome.events)),
+            provenance: outcome.provenance,
+        })
     }
 }
