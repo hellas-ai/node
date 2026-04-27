@@ -15,6 +15,46 @@
     rustToolchain
     ;
 
+  # Template for the pi provider extension. Substituted by piShim at runtime.
+  piExtensionTemplate = pkgs.writeText "hellas-pi-extension.template.js" ''
+    export default function (pi) {
+      pi.registerProvider("hellas", {
+        baseUrl: "@@BASE@@",
+        apiKey: "unused",
+        api: "@@API@@",
+        models: [{
+          id: "@@MODEL@@",
+          name: "@@MODEL@@ (Hellas)",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 32768,
+          maxTokens: 2048,
+        }],
+      });
+    }
+  '';
+
+  # Internal shim that runs as the gateway-wrapped child for pi: reads the
+  # gateway base URL from env (set by `gateway --wrap`), writes a one-shot
+  # extension to a tempfile, exec's pi against it. Never in PATH; hellas-run
+  # substitutes `pi` → this store path.
+  piShim = pkgs.writeShellScript "hellas-pi-shim" ''
+    set -eu
+    model="''${HELLAS_MODEL:-Qwen/Qwen3-0.6B}"
+    api="''${HELLAS_API:-anthropic-messages}"
+    case "$api" in
+      anthropic-messages) base="''${ANTHROPIC_BASE_URL:?ANTHROPIC_BASE_URL not set}" ;;
+      openai-completions) base="''${OPENAI_BASE_URL:?OPENAI_BASE_URL not set}" ;;
+      *) echo "hellas-pi-shim: unsupported HELLAS_API='$api'" >&2; exit 2 ;;
+    esac
+    ext=$(mktemp --suffix=.js -t hellas-pi-XXXXXX)
+    sed -e "s|@@BASE@@|$base|g" -e "s|@@API@@|$api|g" -e "s|@@MODEL@@|$model|g" \
+      ${piExtensionTemplate} > "$ext"
+    export ANTHROPIC_API_KEY=unused OPENAI_API_KEY=unused
+    exec ${pkgs.pi-coding-agent}/bin/pi -e "$ext" --provider hellas --model "$model" "$@"
+  '';
+
   devShellPackages = with pkgs; [
     rustToolchain
     openssl
@@ -30,6 +70,23 @@
     cargo-sort
     skopeo
     pi-coding-agent
+    (pkgs.writeShellScriptBin "hellas-run" ''
+      # Usage:  hellas-run [--gw-flag=value...] CMD [CMD-ARGS...]
+      # Leading flags (anything starting with `-`) go to `hellas-cli gateway`.
+      # First positional is the wrapped command; the rest are its args.
+      # Use `--flag=value` for gateway options that take a value.
+      set -eu
+      gw=()
+      while [ $# -gt 0 ]; do
+        case "$1" in -*) gw+=("$1"); shift ;; *) break ;; esac
+      done
+      [ $# -gt 0 ] || { echo "usage: hellas-run [--gw-flag=value...] CMD [args]" >&2; exit 2; }
+      cmd="$1"; shift
+      # `pi` doesn't honor *_BASE_URL env vars — route it through an internal
+      # shim that runs inside the wrap and registers a hellas provider.
+      case "$(basename "$cmd")" in pi) cmd=${piShim} ;; esac
+      exec cargo run --quiet --features "''${HELLAS_FEATURES:-candle}" --bin hellas-cli -- gateway "''${gw[@]}" --wrap "$cmd" -- "$@"
+    '')
   ];
 
   envShellHook = ''
@@ -44,7 +101,7 @@
     inherit pkgs lib rustToolchain;
   };
 
-  testsLib = import ./tests/lib.nix {
+  hfCaches = import ./tests/huggingface.nix {
     inherit pkgs lib;
   };
 
@@ -111,8 +168,8 @@
       shellHook = envShellHook;
       nativeBuildInputs = docker.defaultCudaEnv.nativeBuildInputs;
       buildInputs = docker.defaultCudaEnv.buildInputs;
-      inherit (docker.defaultCudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
       LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
+      inherit (docker.defaultCudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
     };
 
     inherit nixosTests;
@@ -123,8 +180,8 @@ in {
     // {
       default = nativePackages.cli;
       cross = crossOutputs;
-      "hf-cache-lfm2-350m" = testsLib.lfm2_350MCache;
-      "hf-cache-qwen3-0_6b" = testsLib.qwen3_0_6BCache;
+      "hf-cache-lfm2-350m" = hfCaches.lfm2_350MCache;
+      "hf-cache-qwen3-0_6b" = hfCaches.qwen3_0_6BCache;
     }
     // (linuxOutputs.packages or {});
 
