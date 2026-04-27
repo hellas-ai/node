@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::encode_token_ids;
 use crate::pb::hellas::GetQuoteRequest;
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory, ToolSpec};
+use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use catgrad_llm::types::Message;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{LLMError, PreparedPrompt};
@@ -131,23 +131,22 @@ impl ModelAssets {
 
     /// Build a `ChatTurn` for one chat-completion request.
     ///
-    /// `tools` is the wire-format tool list as both gateway surfaces
-    /// produce it after their own normalization (OpenAI passes the
-    /// request body through; Anthropic converts to OpenAI shape via
-    /// `anthropic_tool_to_openai`). Both arrive here as
-    /// `[{"type": "function", "function": {"name": "...",
-    /// "description": "...", "parameters": {...}}}, ...]`.
+    /// The caller supplies an already-built [`ToolDirectory`] (or
+    /// `None` for no tools) — wire-shape conversion happens at the
+    /// gateway edge via `ToolDirectory::from_openai_tools` /
+    /// `ToolDirectory::from_anthropic_tools`. This keeps `ModelAssets`
+    /// independent of any one wire surface.
     ///
-    /// Wire-conversion + protocol selection happens here at the
-    /// gateway edge:
-    ///
-    /// - `None` or empty list → `ChatTurn` with no tools bound
-    ///   (passthrough parser, no protocol required).
-    /// - Malformed schema or unsupported model → typed error variants
-    ///   the gateway maps to HTTP 400, never to a model-output error.
+    /// Errors:
+    /// - `PreparePromptRequest` if the model has no chat template or
+    ///   the architecture string can't be extracted.
+    /// - `ChatTurnConfig` if `ChatTurn::new` rejects the binding
+    ///   (e.g. tools bound for an arch with no tool-call protocol) —
+    ///   the variant carries the typed catgrad-llm error and the
+    ///   gateway maps to HTTP 400.
     pub fn chat_turn(
         &self,
-        tools: Option<&[Value]>,
+        tools: Option<Arc<ToolDirectory>>,
         options: ChatOptions,
     ) -> Result<ChatTurn> {
         let chat_template = self
@@ -162,75 +161,14 @@ impl ModelAssets {
             .map_err(|source| ModelAssetsError::PreparePromptRequest { source })?
             .to_string();
 
-        // Wire normalization: empty list is no tools. Doing this at the
-        // edge keeps the wire semantics ("user sent []") visible here
-        // rather than relying solely on ChatTurn::new's normalization.
-        let directory = match tools {
-            None => None,
-            Some(specs) if specs.is_empty() => None,
-            Some(specs) => {
-                let tool_specs = wire_tools_to_specs(specs)?;
-                let dir = ToolDirectory::new(tool_specs)
-                    .map_err(|source| ModelAssetsError::InvalidToolDirectory { source })?;
-                Some(Arc::new(dir))
-            }
-        };
-
-        ChatTurn::new(
-            arch.clone(),
+        Ok(ChatTurn::new(
+            arch,
             chat_template,
             Arc::clone(&self.tokenizer),
             Arc::clone(&self.tokenizer_config),
             Arc::clone(&self.stop_token_ids),
-            directory,
+            tools,
             options,
-        )
-        .map_err(|source| match source {
-            // ChatTurn::new returns this when tools were bound but the
-            // architecture has no registered protocol. It's a request
-            // error, not a model-output error.
-            LLMError::UnsupportedModel(_) => ModelAssetsError::ToolsUnsupportedForModel { arch },
-            other => ModelAssetsError::PreparePromptRequest { source: other },
-        })
+        )?)
     }
-}
-
-/// Translate the OpenAI-style wire tool shape (or, for the Anthropic
-/// surface, the post-conversion form produced by
-/// `anthropic_tool_to_openai`) into typed [`ToolSpec`]s.
-///
-/// Strictly expects each entry to have a `function` object containing
-/// `name` (string), optional `description`, and `parameters` (JSON
-/// Schema). A missing `name` is a request error — the schema is bad,
-/// not the model output.
-fn wire_tools_to_specs(wire_tools: &[Value]) -> Result<Vec<ToolSpec>> {
-    let mut out = Vec::with_capacity(wire_tools.len());
-    for (idx, entry) in wire_tools.iter().enumerate() {
-        let function = entry.get("function").ok_or_else(|| {
-            ModelAssetsError::InvalidToolDirectory {
-                source: LLMError::InvalidModelConfig(format!(
-                    "tool[{idx}] is missing the `function` wrapper"
-                )),
-            }
-        })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ModelAssetsError::InvalidToolDirectory {
-                source: LLMError::InvalidModelConfig(format!(
-                    "tool[{idx}].function is missing required `name`"
-                )),
-            })?
-            .to_string();
-        let description = function
-            .get("description")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        let parameters = function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        out.push(ToolSpec::new(name, description, parameters));
-    }
-    Ok(out)
 }
