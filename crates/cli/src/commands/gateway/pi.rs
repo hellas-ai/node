@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::Context;
@@ -28,6 +29,7 @@ pub fn spawn(
     api: &str,
     pi_bin: &str,
     pi_args: &[String],
+    log_path: Option<&Path>,
 ) -> CliResult<PiHandle> {
     let provider = json!({
         "baseUrl": base_url,
@@ -55,14 +57,29 @@ pub fn spawn(
         .context("failed to create pi extension tempfile")?;
     std::fs::write(extension.path(), body).context("failed to write pi extension")?;
 
+    // When log_path is given, both pi streams go there (pi has rich UI; mixing
+    // them is what users expect to see). Otherwise stay attached to the parent
+    // tty so interactive use keeps working.
+    let (stdout, stderr) = match log_path {
+        Some(path) => {
+            let log = std::fs::File::create(path)
+                .with_context(|| format!("failed to open pi log {}", path.display()))?;
+            (
+                Stdio::from(log.try_clone().context("dup pi log fd")?),
+                Stdio::from(log),
+            )
+        }
+        None => (Stdio::inherit(), Stdio::inherit()),
+    };
+
     let child = Command::new(pi_bin)
         .arg("-e")
         .arg(extension.path())
         .args(["--provider", "hellas", "--model", model])
         .args(pi_args)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(stdout)
+        .stderr(stderr)
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to spawn `{pi_bin}`"))?;

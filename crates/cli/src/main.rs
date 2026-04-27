@@ -205,6 +205,10 @@ enum Commands {
             requires = "pi",
         )]
         pi_api: String,
+        /// Redirect pi's stdout+stderr to this file (gateway's own logs are
+        /// untouched). Default: pi inherits the parent terminal.
+        #[arg(long = "pi-log", requires = "pi")]
+        pi_log: Option<std::path::PathBuf>,
         /// Trailing args forwarded verbatim to `pi`. Use `--` to introduce them.
         #[arg(last = true, allow_hyphen_values = true)]
         pi_args: Vec<String>,
@@ -345,6 +349,7 @@ async fn main() {
             pi,
             pi_bin,
             pi_api,
+            pi_log,
             pi_args,
         } => {
             commands::gateway::run(commands::gateway::GatewayOptions {
@@ -368,6 +373,7 @@ async fn main() {
                 pi,
                 pi_bin,
                 pi_api,
+                pi_log,
                 pi_args,
             })
             .await
