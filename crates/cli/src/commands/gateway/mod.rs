@@ -1,4 +1,5 @@
 mod anthropic;
+mod hellas_ext;
 mod openai;
 mod pi;
 mod plain;
@@ -13,10 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use catgrad::cid::Cid;
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::TextReceipt;
-use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 use futures::Stream;
 use serde::Serialize;
 use serde_json::json;
@@ -213,25 +211,6 @@ fn sse_data<T: Serialize>(payload: &T) -> Event {
 fn sse_event_data<T: Serialize>(event: &str, payload: &T) -> Event {
     let data = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     Event::default().event(event).data(data)
-}
-
-/// Initial in-band SSE event carrying the request commitment CID.
-/// Browser `EventSource` consumers pick this up via
-/// `addEventListener("hellas-provenance", …)` since they can't read
-/// HTTP response headers.
-fn provenance_sse_event(prov: &ExecutionProvenance) -> Event {
-    sse_event_data(
-        "hellas-provenance",
-        &json!({ "commitment_id": encode_hex(&prov.commitment_id) }),
-    )
-}
-
-/// Terminal in-band SSE event carrying the execution receipt CID. Emitted
-/// once per successful run, immediately before the protocol's terminal
-/// frame (`[DONE]` / `message_stop`). Skipped on `Outcome::Failed` since
-/// no verifiable receipt was produced.
-fn receipt_sse_event(cid: &Cid<TextReceipt>) -> Event {
-    sse_event_data("hellas-receipt", &json!({ "receipt_id": cid.to_string() }))
 }
 
 fn next_id(prefix: &str) -> String {
