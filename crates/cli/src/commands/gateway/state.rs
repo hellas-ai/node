@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn};
+use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use catgrad_llm::types::Message;
 use catgrad_llm::types::{anthropic, openai, plain};
 use futures::Stream;
@@ -251,10 +251,16 @@ impl GatewayState {
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let messages: Vec<Message> = req.messages.iter().cloned().map(Message::from).collect();
-        let tools = req.tools.clone();
         let enable_thinking = req
             .reasoning_effort
             .is_some_and(openai::ReasoningEffort::enables_thinking);
+        let tools_dir = ToolDirectory::from_openai_tools(
+            req.tools.as_deref().unwrap_or(&[]),
+        )
+        .map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Invalid tool definitions: {err}"),
+        })?;
         let model = self.resolve_model(&req.model);
         let assets = self
             .model_assets(&model)
@@ -264,7 +270,7 @@ impl GatewayState {
                 message: format!("Failed to load local model assets for `{model}`: {err}"),
             })?;
         let chat_turn = assets
-            .chat_turn(tools.as_deref(), ChatOptions { enable_thinking })
+            .chat_turn(tools_dir, ChatOptions { enable_thinking })
             .map_err(classify_chat_turn_error)?;
         let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -289,12 +295,13 @@ impl GatewayState {
             .into_iter()
             .map(Message::from)
             .collect::<Vec<_>>();
-        let tools = req.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(anthropic_tool_to_openai)
-                .collect::<Vec<_>>()
-        });
+        let tools_dir = ToolDirectory::from_anthropic_tools(
+            req.tools.as_deref().unwrap_or(&[]),
+        )
+        .map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Invalid tool definitions: {err}"),
+        })?;
         let model = self.resolve_model(&req.model);
         let assets = self
             .model_assets(&model)
@@ -304,7 +311,7 @@ impl GatewayState {
                 message: format!("Failed to load local model assets for `{model}`: {err}"),
             })?;
         let chat_turn = assets
-            .chat_turn(tools.as_deref(), ChatOptions::default())
+            .chat_turn(tools_dir, ChatOptions::default())
             .map_err(classify_chat_turn_error)?;
         let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -360,13 +367,9 @@ impl GatewayState {
 /// missing, etc.) are also request-shaped here.
 fn classify_chat_turn_error(err: ModelAssetsError) -> HttpError {
     match err {
-        ModelAssetsError::InvalidToolDirectory { source } => HttpError {
+        ModelAssetsError::ChatTurnConfig(inner) => HttpError {
             status: StatusCode::BAD_REQUEST,
-            message: format!("Invalid tool definitions: {source}"),
-        },
-        ModelAssetsError::ToolsUnsupportedForModel { arch } => HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Model architecture `{arch}` does not support tool calling"),
+            message: inner.to_string(),
         },
         other => HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -563,29 +566,6 @@ fn anthropic_tool_result_to_string(content: &serde_json::Value) -> String {
             .collect(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
-}
-
-/// Convert an Anthropic tool schema (`{name, description, input_schema}`) to
-/// the OpenAI shape (`{type:"function", function:{name, description, parameters}}`)
-/// that our chat templates consume.
-fn anthropic_tool_to_openai(tool: &serde_json::Value) -> serde_json::Value {
-    let Some(obj) = tool.as_object() else {
-        return tool.clone();
-    };
-    let mut function = serde_json::Map::new();
-    if let Some(name) = obj.get("name") {
-        function.insert("name".to_string(), name.clone());
-    }
-    if let Some(description) = obj.get("description") {
-        function.insert("description".to_string(), description.clone());
-    }
-    if let Some(schema) = obj.get("input_schema") {
-        function.insert("parameters".to_string(), schema.clone());
-    }
-    serde_json::json!({
-        "type": "function",
-        "function": serde_json::Value::Object(function),
-    })
 }
 
 fn format_error_causes(err: &(dyn StdError + 'static)) -> String {
@@ -872,27 +852,4 @@ mod anthropic_conversion_tests {
         assert_eq!(tool_calls[1]["id"], "toolu_2");
     }
 
-    #[test]
-    fn anthropic_tool_schema_converts_to_openai_function() {
-        let schema = json!({
-            "name": "get_weather",
-            "description": "Fetch the weather for a city.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
-            },
-        });
-        let converted = anthropic_tool_to_openai(&schema);
-        assert_eq!(converted["type"], "function");
-        assert_eq!(converted["function"]["name"], "get_weather");
-        assert_eq!(
-            converted["function"]["description"],
-            "Fetch the weather for a city."
-        );
-        assert_eq!(
-            converted["function"]["parameters"]["required"],
-            json!(["city"])
-        );
-    }
 }
