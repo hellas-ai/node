@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long = "identity", global = true)]
     identity: Option<PathBuf>,
 
+    /// Also append tracing output to this file.
+    #[arg(long = "log-file", global = true)]
+    log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -130,9 +134,9 @@ enum Commands {
         /// Host interface to bind
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Port to listen on
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
+        /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
+        #[arg(long)]
+        port: Option<u16>,
         /// Direct target node id (omit to use discovery)
         #[arg(long)]
         node_id: Option<EndpointId>,
@@ -188,30 +192,12 @@ enum Commands {
         /// and the dtype the client builds the quote program at: f32, f16, or bf16
         #[arg(long = "dtype", default_value = DEFAULT_DTYPE_STR, value_parser = parse_model_dtype)]
         dtype: Dtype,
-        /// Spawn `pi-coding-agent` once the gateway is listening. Args after
-        /// `--` are forwarded to pi; the gateway exits when pi exits.
-        /// Requires `--force-model` so pi can advertise a concrete model id.
-        #[arg(long = "pi", default_value_t = false, requires = "force_model")]
-        pi: bool,
-        /// Path to the `pi` binary (default: looked up on PATH)
-        #[arg(long = "pi-bin", default_value = "pi", requires = "pi")]
-        pi_bin: String,
-        /// Pi provider `api` kind. `openai-completions` hits `/v1/chat/completions`,
-        /// `anthropic-messages` hits `/v1/messages`.
-        #[arg(
-            long = "pi-api",
-            default_value = "openai-completions",
-            value_parser = ["openai-completions", "anthropic-messages"],
-            requires = "pi",
-        )]
-        pi_api: String,
-        /// Redirect pi's stdout+stderr to this file (gateway's own logs are
-        /// untouched). Default: pi inherits the parent terminal.
-        #[arg(long = "pi-log", requires = "pi")]
-        pi_log: Option<std::path::PathBuf>,
-        /// Trailing args forwarded verbatim to `pi`. Use `--` to introduce them.
-        #[arg(last = true, allow_hyphen_values = true)]
-        pi_args: Vec<String>,
+        /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
+        #[arg(long = "wrap")]
+        wrap: Option<String>,
+        /// Trailing args forwarded verbatim to the wrapped command (after `--`).
+        #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
+        wrap_args: Vec<String>,
     },
     /// Query a remote node via RPC
     Rpc {
@@ -284,9 +270,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    let tracer_provider = tracing_config::init_tracing();
-
+    // Parse the CLI first so we can honour the global `--log-file`
+    // flag in the subscriber setup. clap's parser is cheap; doing it
+    // before tracing init means very early subscriber-internal failures
+    // (which print to stderr regardless) are the only thing that
+    // bypasses the requested log file.
     let cli = Cli::parse();
+    let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
 
     // show-node-id is a read-only query; never create an identity file as a
     // side effect of it (would race with a running service's own creator).
@@ -346,11 +336,8 @@ async fn main() {
             force_model,
             metrics_port,
             dtype,
-            pi,
-            pi_bin,
-            pi_api,
-            pi_log,
-            pi_args,
+            wrap,
+            wrap_args,
         } => {
             commands::gateway::run(commands::gateway::GatewayOptions {
                 host,
@@ -370,11 +357,8 @@ async fn main() {
                 metrics_port,
                 dtype,
                 secret_key,
-                pi,
-                pi_bin,
-                pi_api,
-                pi_log,
-                pi_args,
+                wrap,
+                wrap_args,
             })
             .await
         }
@@ -625,13 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_pi_forwards_trailing_args() {
+    fn gateway_wrap_forwards_trailing_args() {
         let cli = Cli::try_parse_from([
             "hellas",
             "gateway",
-            "--force-model",
-            "Qwen/Qwen3-0.6B",
-            "--pi",
+            "--wrap",
+            "pi",
             "--",
             "-p",
             "--no-session",
@@ -639,18 +622,20 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Gateway { pi, pi_args, .. } => {
-                assert!(pi);
-                assert_eq!(pi_args, vec!["-p", "--no-session", "say hello"]);
+            Commands::Gateway {
+                wrap, wrap_args, ..
+            } => {
+                assert_eq!(wrap.as_deref(), Some("pi"));
+                assert_eq!(wrap_args, vec!["-p", "--no-session", "say hello"]);
             }
             _ => panic!("expected gateway command"),
         }
     }
 
     #[test]
-    fn gateway_pi_requires_force_model() {
-        let result = Cli::try_parse_from(["hellas", "gateway", "--pi"]);
-        assert!(result.is_err(), "--pi without --force-model should error");
+    fn gateway_wrap_args_require_wrap() {
+        let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
+        assert!(result.is_err(), "trailing args without --wrap should error");
     }
 
     #[cfg(feature = "hellas-executor")]

@@ -2420,6 +2420,7 @@ dependencies = [
  "futures",
  "hellas-executor",
  "hellas-rpc",
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "opentelemetry",

@@ -1,33 +1,27 @@
 {
   self,
-  common ? import ./default.nix {inherit self;},
-}:
-{
+  hellas ? import ./hellas.nix {inherit self;},
+}: {
   config,
   lib,
   pkgs,
   ...
 }: let
-  inherit (lib) mkEnableOption mkIf mkOption types;
+  inherit (lib) mkEnableOption mkIf mkMerge optionals;
   cfg = config.programs.hellas;
+  isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
-  otelEnv =
-    lib.optionalAttrs (cfg.otel.endpoint != null) {
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = cfg.otel.endpoint;
-      OTEL_SERVICE_NAME = cfg.otel.serviceName;
+  baseEnv =
+    hellas.mkOtelEnv {
+      inherit lib;
+      inherit (cfg) otel;
     }
-    // lib.optionalAttrs (cfg.otel.endpoint != null && cfg.otel.sampleRate != null) {
-      OTEL_TRACES_SAMPLER_ARG = toString cfg.otel.sampleRate;
-    }
-    // lib.optionalAttrs (cfg.otel.endpoint != null && cfg.otel.headers != {}) {
-      OTEL_EXPORTER_OTLP_HEADERS =
-        lib.concatStringsSep "," (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.otel.headers);
-    };
+    // cfg.environment;
 in {
   options.programs.hellas =
-    common.mkCommonOptions {
+    hellas.commonOptions {
       inherit lib;
-      package = common.pickCliPackage pkgs;
+      package = hellas.pickCliPackage pkgs;
       packageDescription = ''
         The hellas CLI package. Defaults to the best backend variant for
         the host: cli-candle-metal on Darwin, cli-candle-cuda when
@@ -37,43 +31,54 @@ in {
       '';
     }
     // {
-      enable = mkEnableOption "Hellas CLI";
-
-      otel = {
-        endpoint = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          example = "https://jaeger.example.com/v1/traces";
-          description = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT — OTLP collector URL. Enables trace export when set.";
-        };
-        serviceName = mkOption {
-          type = types.str;
-          default = "hellas-node";
-          description = "OTEL_SERVICE_NAME — service name attached to exported spans.";
-        };
-        sampleRate = mkOption {
-          type = types.nullOr (types.numbers.between 0.0 1.0);
-          default = null;
-          example = 0.5;
-          description = "OTEL_TRACES_SAMPLER_ARG — trace sample rate (0.0–1.0). Null uses the CLI default of 1.0.";
-        };
-        headers = mkOption {
-          type = types.attrsOf types.str;
-          default = {};
-          example = {
-            CF-Access-Client-Id = "abc123";
-            CF-Access-Client-Secret = "secret";
-          };
-          description = ''
-            OTEL_EXPORTER_OTLP_HEADERS — extra headers sent with each OTLP export request.
-            Useful for Cloudflare Access or other auth proxies.
-          '';
-        };
-      };
+      # User-space serve daemon. Currently darwin-only (uses HM's launchd
+      # integration). Linux users should use the NixOS module instead.
+      serve =
+        {
+          enable = mkEnableOption "Hellas serve daemon as a launchd user agent (darwin only)";
+        }
+        // hellas.serveOptions {inherit lib;};
     };
 
-  config = mkIf cfg.enable {
-    home.packages = [cfg.package];
-    home.sessionVariables = common.renderEnvironment (otelEnv // cfg.environment);
-  };
+  config = mkMerge [
+    (mkIf cfg.enable {
+      home.packages = [cfg.package];
+      home.sessionVariables = hellas.renderEnvironment baseEnv;
+    })
+
+    # Surface a clear assertion on Linux rather than a "no such option" error
+    # when the user enables `programs.hellas.serve` on the wrong platform.
+    (mkIf cfg.serve.enable {
+      assertions = optionals (!isDarwin) [
+        {
+          assertion = false;
+          message = ''
+            programs.hellas.serve is only supported on darwin (HM launchd).
+            On Linux, use the NixOS module `services.hellas` instead.
+          '';
+        }
+      ];
+    })
+
+    (mkIf (cfg.serve.enable && isDarwin) {
+      launchd.agents.hellas = {
+        enable = true;
+        config = {
+          ProgramArguments =
+            ["${cfg.package}/bin/hellas-cli"]
+            ++ hellas.mkServeArgs {
+              inherit lib;
+              serve = cfg.serve;
+            };
+          RunAtLoad = true;
+          KeepAlive = true;
+          EnvironmentVariables = hellas.renderEnvironment (
+            baseEnv // {HOME = config.home.homeDirectory;}
+          );
+          StandardOutPath = "${config.home.homeDirectory}/Library/Logs/hellas/stdout.log";
+          StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/hellas/stderr.log";
+        };
+      };
+    })
+  ];
 }

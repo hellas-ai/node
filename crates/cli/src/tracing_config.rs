@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::OnceLock;
 
 use opentelemetry::trace::TracerProvider;
@@ -29,7 +30,9 @@ fn base_env_filter() -> EnvFilter {
 ///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
 ///                                          (use for CF-Access-Client-Id / CF-Access-Client-Secret)
-pub fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+pub fn init_tracing(
+    log_file: Option<&Path>,
+) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     // Register W3C TraceContext propagator so trace IDs flow across RPC calls.
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
@@ -39,11 +42,28 @@ pub fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     let _ = LOG_FILTER.set(filter_handle);
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let file_layer = log_file.and_then(|path| {
+        // Open append-mode so successive runs accumulate; line-buffered
+        // happens naturally per-event because the fmt layer flushes
+        // after each record.
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(f))
+                    .with_ansi(false),
+            ),
+            Err(err) => {
+                eprintln!("warning: --log-file {} could not be opened: {err}", path.display());
+                None
+            }
+        }
+    });
     let (otel_layer, provider) = init_otlp_layer();
 
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
+        .with(file_layer)
         .with(otel_layer)
         .init();
 
