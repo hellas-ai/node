@@ -1,8 +1,6 @@
+use super::hellas_ext::{HellasExt, WithHellas};
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{
-    next_id, now_unix, parse_json_body, provenance_sse_event, receipt_sse_event, sse_data,
-    sse_response,
-};
+use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
 use crate::execution::{Outcome, StopReason};
 use async_stream::stream;
 use axum::Json;
@@ -42,15 +40,16 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
 
     let stream_provenance = provenance.clone();
     let mut response = sse_response(stream! {
-        if let Some(prov) = stream_provenance.as_ref() {
-            yield Ok(provenance_sse_event(prov));
-        }
-
         let inner = prepared.stream();
         tokio::pin!(inner);
 
         let mut completed: Option<(openai::FinishReason, Cid<TextReceipt>)> = None;
         let mut error_message: Option<String> = None;
+        // Track whether the commitment has been stamped on a chunk
+        // yet. The first per-delta chunk carries it; if the stream
+        // terminates with zero deltas, the terminal chunk carries
+        // both commitment_id and receipt_id.
+        let mut commitment_pending = stream_provenance.is_some();
 
         loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
@@ -67,7 +66,16 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                                 .build(),
                         ])
                         .build();
-                    yield Ok(sse_data(&chunk));
+                    let hellas = if commitment_pending {
+                        commitment_pending = false;
+                        match stream_provenance.as_ref() {
+                            Some(prov) => HellasExt::commitment(prov),
+                            None => HellasExt::default(),
+                        }
+                    } else {
+                        HellasExt::default()
+                    };
+                    yield Ok(sse_data(&WithHellas::new(chunk, hellas)));
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     stop_reason,
@@ -106,9 +114,25 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
         }
 
         if let Some(err) = error_message {
-            yield Ok(sse_data(&json!({
+            // Error path: receipt stays fenced inside the Completed
+            // arm. Commitment can still ride the error frame if it
+            // hasn't been stamped yet — the stream terminated before
+            // any delta carried it.
+            let mut error_value = json!({
                 "error": { "message": format!("Inference error: {err}") }
-            })));
+            });
+            if commitment_pending {
+                if let (Some(prov), Some(map)) = (
+                    stream_provenance.as_ref(),
+                    error_value.as_object_mut(),
+                ) {
+                    map.insert(
+                        "hellas".to_string(),
+                        serde_json::to_value(HellasExt::commitment(prov)).unwrap(),
+                    );
+                }
+            }
+            yield Ok(sse_data(&error_value));
         } else if let Some((reason, receipt_cid)) = completed {
             let final_chunk = plain::CompletionChunk::builder()
                 .id(id.clone())
@@ -123,8 +147,17 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                         .build(),
                 ])
                 .build();
-            yield Ok(sse_data(&final_chunk));
-            yield Ok(receipt_sse_event(&receipt_cid));
+            // Terminal chunk carries the receipt. If zero deltas ran,
+            // it ALSO carries the commitment.
+            let hellas = if commitment_pending {
+                match stream_provenance.as_ref() {
+                    Some(prov) => HellasExt::both(prov, &receipt_cid),
+                    None => HellasExt::receipt(&receipt_cid),
+                }
+            } else {
+                HellasExt::receipt(&receipt_cid)
+            };
+            yield Ok(sse_data(&WithHellas::new(final_chunk, hellas)));
         }
 
         yield Ok(axum::response::sse::Event::default().data("[DONE]"));
@@ -207,7 +240,13 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         )))
         .build();
 
-    let mut response = Json(response).into_response();
+    let hellas = match provenance.as_ref() {
+        Some(prov) => HellasExt::both(prov, &receipt_cid),
+        None => HellasExt::receipt(&receipt_cid),
+    };
+    let body = WithHellas::new(response, hellas);
+
+    let mut response = Json(body).into_response();
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }

@@ -1,8 +1,6 @@
+use super::hellas_ext::{HellasExt, WithHellas};
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{
-    next_id, now_unix, parse_json_body, provenance_sse_event, receipt_sse_event, sse_data,
-    sse_response,
-};
+use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
 use crate::execution::{Outcome, StopReason as ExecStopReason};
 use async_stream::stream;
 use axum::Json;
@@ -10,13 +8,15 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use catgrad_llm::runtime::chat::wire::openai::{OpenAiStreamFrame, OpenAiStreamMapper};
+use catgrad_llm::runtime::chat::wire::{PumpError, pump_finish, pump_text};
 use catgrad_llm::runtime::chat::{
-    DecodeEvent, IncrementalToolCallParser, StopReason as ParserStopReason,
+    DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
 };
 use catgrad_llm::types::openai;
 use futures::StreamExt;
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use hellas_rpc::provenance::ExecutionProvenance;
+use serde_json::json;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
@@ -41,131 +41,10 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     respond(prepared).await
 }
 
-/// One in-flight tool call, keyed by parser `index`. The wire ID is
-/// minted at `ToolCallStart` time and reused for the matching
-/// `ArgsDelta` / `End` events. See "Tool-call IDs" in the project
-/// plan's P6 implementation contract.
-struct CallInProgress {
-    wire_id: String,
-    name: String,
-    arguments: String,
-}
-
-/// Outcome of feeding one parser event into the response accumulator.
-enum EventOutcome {
-    /// Continue processing further events.
-    Continue,
-    /// Terminal protocol error; abort processing and return this 502
-    /// to the client without emitting any further frames or
-    /// `finish_reason`. Per the P6 contract, the trailing
-    /// `Stop { ProtocolError }` from the parser is intentionally
-    /// dropped — never translated into a "success" finish.
-    Terminal(super::HttpError),
-}
-
-/// Apply one `DecodeEvent` to the response accumulator. Returns
-/// `Terminal` for the three fatal parser variants; `Continue` for
-/// everything else (including the success-shaped `Stop`, which the
-/// caller maps to `finish_reason` based on `saw_tool_call`).
-fn apply_event(
-    event: DecodeEvent,
-    content: &mut String,
-    tool_calls: &mut Vec<Value>,
-    saw_tool_call: &mut bool,
-    in_progress: &mut HashMap<usize, CallInProgress>,
-) -> EventOutcome {
-    match event {
-        DecodeEvent::TextDelta(s) => content.push_str(&s),
-        DecodeEvent::ToolCallStart { index, name } => {
-            *saw_tool_call = true;
-            in_progress.insert(
-                index,
-                CallInProgress {
-                    wire_id: next_id("call"),
-                    name,
-                    arguments: String::new(),
-                },
-            );
-        }
-        DecodeEvent::ToolCallArgsDelta { index, delta } => {
-            if let Some(call) = in_progress.get_mut(&index) {
-                call.arguments.push_str(&delta);
-            }
-        }
-        DecodeEvent::ToolCallEnd { index, .. } => {
-            if let Some(call) = in_progress.remove(&index) {
-                tool_calls.push(json!({
-                    "id": call.wire_id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    },
-                }));
-            }
-        }
-        DecodeEvent::Stop { .. } => {
-            // Terminal frames are emitted by the caller based on
-            // `saw_tool_call` and the executor's StopReason; the
-            // parser's own `Stop` event is informational here.
-        }
-        DecodeEvent::UnknownTool { name, .. } => {
-            return EventOutcome::Terminal(super::HttpError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("model called unknown tool `{name}`"),
-            });
-        }
-        DecodeEvent::InvalidArgs { name, errors, .. } => {
-            let detail = errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return EventOutcome::Terminal(super::HttpError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!(
-                    "model called `{name}` with arguments that don't match the schema: {detail}"
-                ),
-            });
-        }
-        DecodeEvent::ParseError { sentinel, source } => {
-            return EventOutcome::Terminal(super::HttpError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!(
-                    "model emitted malformed tool call within `{sentinel}`: {source}"
-                ),
-            });
-        }
-    }
-    EventOutcome::Continue
-}
-
-/// Map executor `StopReason` to the parser's `StopReason`. The parser
-/// uses this in `finish()` to decide whether trailing buffered text
-/// is still being assembled or should be flushed.
-fn map_to_parser_stop(stop: ExecStopReason) -> ParserStopReason {
-    match stop {
-        ExecStopReason::EndOfSequence => ParserStopReason::EndOfText,
-        ExecStopReason::MaxNewTokens => ParserStopReason::MaxTokens,
-        // Cancelled: behave like a normal end so the parser flushes.
-        ExecStopReason::Cancelled => ParserStopReason::EndOfText,
-    }
-}
-
-/// Map executor `StopReason` + `saw_tool_call` to the OpenAI wire
-/// `finish_reason`. `tool_calls` wins over `stop` whenever any call
-/// was emitted — clients use this to decide whether to dispatch
-/// tools.
-fn map_finish_reason(stop: ExecStopReason, saw_tool_call: bool) -> openai::FinishReason {
-    if saw_tool_call {
-        return openai::FinishReason::ToolCalls;
-    }
-    match stop {
-        ExecStopReason::EndOfSequence | ExecStopReason::Cancelled => openai::FinishReason::Stop,
-        ExecStopReason::MaxNewTokens => openai::FinishReason::Length,
-    }
-}
-
+/// Non-streaming endpoint. Drives the same per-delta pipeline as the
+/// streaming endpoint; the only difference is the sink — frames are
+/// discarded, and the buffered assistant payload comes from
+/// `mapper.snapshot()` at the end.
 async fn respond(prepared: PreparedGeneration) -> Response {
     let id = next_id("chatcmpl");
     let created = now_unix();
@@ -173,21 +52,29 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let prompt_tokens = prepared.prompt_tokens;
     let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
-    // Build the parser before consuming `prepared` into `stream`.
-    // ChatTurn::make_parser is `'static` (owns Arc<ToolDirectory>),
-    // so this composes cleanly with the streaming await loop.
+
     let mut parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
         .expect("OpenAI surface always carries a ChatTurn")
         .make_parser();
+    let mut mapper = OpenAiStreamMapper::new(|prefix: &str| next_id(prefix));
 
     let stream = prepared.stream();
     tokio::pin!(stream);
-    let mut text = String::new();
+
     let outcome = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(GenerationEvent::Delta(d)))) => text.push_str(&d),
+            Ok(Some(Ok(GenerationEvent::Delta(d)))) => {
+                if let Err(PumpError { failure, .. }) =
+                    pump_text(&mut *parser, &mut mapper, &d)
+                {
+                    // Non-streaming: cleanup frames are wire-bracketing
+                    // and irrelevant when no wire stream exists. Discard.
+                    return failure_to_json_response(failure);
+                }
+                // Non-streaming: discard frames; snapshot at end.
+            }
             Ok(Some(Ok(GenerationEvent::Done(o)))) => break Ok(o),
             Ok(Some(Err(err))) => break Err(format!("Inference error: {err:#}")),
             Ok(None) => break Err("execution stream ended without terminal outcome".to_string()),
@@ -232,50 +119,17 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    // Feed the full output through the parser in one shot. The
-    // parser's `feed` + `finish` produce the structured event stream
-    // that the response builder consumes.
-    let mut content = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-    let mut saw_tool_call = false;
-    let mut in_progress: HashMap<usize, CallInProgress> = HashMap::new();
-
     let parser_stop = map_to_parser_stop(stop_reason);
-    let mut events = parser.feed(&text);
-    events.extend(parser.finish(parser_stop));
-
-    for event in events {
-        match apply_event(
-            event,
-            &mut content,
-            &mut tool_calls,
-            &mut saw_tool_call,
-            &mut in_progress,
-        ) {
-            EventOutcome::Continue => {}
-            EventOutcome::Terminal(err) => {
-                warn!(message = %err.message, "openai chat aborted with parser protocol error");
-                return err.into_response();
-            }
-        }
+    if let Err(PumpError { failure, .. }) =
+        pump_finish(&mut *parser, &mut mapper, parser_stop)
+    {
+        return failure_to_json_response(failure);
     }
 
-    let finish_reason = map_finish_reason(stop_reason, saw_tool_call);
-    let message_content = if content.is_empty() {
-        None
-    } else {
-        Some(openai::MessageContent::Text(content))
+    let snapshot = match mapper.snapshot() {
+        Ok(s) => s,
+        Err(failure) => return failure_to_json_response(failure),
     };
-    let message = openai::ChatMessage::builder()
-        .role("assistant".to_string())
-        .content(message_content)
-        .tool_calls(if tool_calls.is_empty() {
-            None
-        } else {
-            Some(tool_calls)
-        })
-        .build();
-
     let response = openai::ChatCompletionResponse::builder()
         .id(id)
         .object("chat.completion".to_string())
@@ -284,8 +138,8 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         .choices(vec![
             openai::ChatChoice::builder()
                 .index(0)
-                .message(message)
-                .finish_reason(Some(finish_reason))
+                .message(snapshot.message)
+                .finish_reason(Some(snapshot.finish_reason))
                 .build(),
         ])
         .usage(Some(openai::Usage::from_counts(
@@ -294,7 +148,13 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         )))
         .build();
 
-    let mut response = Json(response).into_response();
+    let hellas = match provenance.as_ref() {
+        Some(prov) => HellasExt::both(prov, &receipt_cid),
+        None => HellasExt::receipt(&receipt_cid),
+    };
+    let body = WithHellas::new(response, hellas);
+
+    let mut response = Json(body).into_response();
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
@@ -302,6 +162,16 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     response
 }
 
+/// Streaming endpoint. Per-event: feed parser → feed mapper → wrap
+/// frames in `ChatCompletionChunk` → SSE. On `Err(DecodeFailure)`,
+/// emit error frame and close immediately (no `[DONE]`); per the P6
+/// contract we do **not** call `mapper.finish()` after a `feed()`
+/// failure — terminal handling is fully synchronous with the error.
+///
+/// The actual stream-building lives in
+/// [`build_openai_sse_stream`] so the wire-output contract can be
+/// tested directly with synthetic upstream streams (no axum / no
+/// real executor required).
 fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Response {
     let id = next_id("chatcmpl");
     let created = now_unix();
@@ -309,69 +179,134 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
     let prompt_tokens = prepared.prompt_tokens;
     let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
-    // Build the parser before consuming `prepared` into the stream.
-    let mut parser: Box<dyn IncrementalToolCallParser> = prepared
+
+    let parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
         .expect("OpenAI surface always carries a ChatTurn")
         .make_parser();
+    let mapper = OpenAiStreamMapper::new(|prefix: &str| next_id(prefix));
 
     let stream_provenance = provenance.clone();
-    let mut response = sse_response(stream! {
-        // Initial in-band provenance frame for browser EventSource clients
-        // (which can't read response headers). Skipped when provenance is
-        // unknown pre-flight (e.g. RemoteDiscovery — quote happens lazily).
-        if let Some(prov) = stream_provenance.as_ref() {
-            yield Ok(provenance_sse_event(prov));
-        }
+    let upstream = prepared.stream();
+    let payloads = build_openai_sse_stream(
+        id,
+        created,
+        model,
+        prompt_tokens,
+        deadline,
+        include_usage,
+        parser,
+        mapper,
+        stream_provenance,
+        upstream,
+    );
+    let events = payloads.map(|payload| {
+        Ok::<_, std::convert::Infallible>(payload.into_event())
+    });
+    let mut response = sse_response(events);
+    if let Some(prov) = provenance {
+        response.extensions_mut().insert(prov);
+    }
+    response
+}
 
-        // Initial role frame.
-        yield Ok(sse_data(&build_chunk(
+/// One unit of wire output the OpenAI streaming endpoint emits.
+/// Tests assert on this directly; production maps each variant to
+/// an `axum::response::sse::Event` via `into_event`.
+#[cfg_attr(test, derive(Debug))]
+enum OpenAiSsePayload {
+    /// `data: <json>\n\n` — used for chunks and error frames.
+    Json(serde_json::Value),
+    /// `data: [DONE]\n\n` — terminates a successful completion.
+    /// Per the wire convention enforced by the regression tests
+    /// below, MUST NOT follow any error frame.
+    Done,
+}
+
+impl OpenAiSsePayload {
+    fn into_event(self) -> axum::response::sse::Event {
+        match self {
+            Self::Json(v) => sse_data(&v),
+            Self::Done => axum::response::sse::Event::default().data("[DONE]"),
+        }
+    }
+}
+
+/// Inner SSE-event generator, generic over the upstream
+/// `GenerationEvent` stream. Returns a stream of [`OpenAiSsePayload`]s
+/// (rather than opaque axum `Event`s) so tests can inspect the
+/// emitted wire shape directly. Production wraps via `into_event`.
+fn build_openai_sse_stream<S>(
+    id: String,
+    created: i64,
+    model: String,
+    prompt_tokens: u32,
+    deadline: tokio::time::Instant,
+    include_usage: bool,
+    mut parser: Box<dyn IncrementalToolCallParser>,
+    mut mapper: OpenAiStreamMapper,
+    provenance: Option<ExecutionProvenance>,
+    upstream: S,
+) -> impl futures::Stream<Item = OpenAiSsePayload> + Send
+where
+    S: futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static,
+{
+    stream! {
+        // Start frame: role:assistant chunk carrying hellas.commitment_id
+        // when provenance is available. Browser EventSource and many
+        // WASM HTTP wrappers swallow response headers, so the in-band
+        // JSON extension is the canonical commitment carrier here.
+        let start_frame = wrap_chunk(
             &id,
             created,
             &model,
-            openai::ChatDelta {
-                role: Some("assistant".to_string()),
-                ..Default::default()
+            OpenAiStreamFrame {
+                delta: openai::ChatDelta {
+                    role: Some("assistant".to_string()),
+                    ..Default::default()
+                },
+                finish_reason: None,
             },
-            None,
-        )));
+        );
+        let start_hellas = match provenance.as_ref() {
+            Some(prov) => HellasExt::commitment(prov),
+            None => HellasExt::default(),
+        };
+        yield OpenAiSsePayload::Json(
+            serde_json::to_value(WithHellas::new(start_frame, start_hellas)).unwrap(),
+        );
 
-        let inner = prepared.stream();
+        let inner = upstream;
         tokio::pin!(inner);
 
-        let mut saw_tool_call = false;
-        let mut in_progress: HashMap<usize, CallInProgress> = HashMap::new();
         let mut outcome: Option<Outcome> = None;
         let mut transport_error: Option<String> = None;
         let mut timed_out = false;
-        let mut protocol_error: Option<String> = None;
+        let mut protocol_failure: Option<PumpError<OpenAiStreamFrame>> = None;
 
-        // Per-token loop. Each delta is fed through the parser; the
-        // resulting events become OpenAI SSE chunks. Terminal parser
-        // errors emit an error frame and close the stream WITHOUT
-        // [DONE] (per the P6 contract).
         'outer: loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
                 Ok(Some(Ok(GenerationEvent::Delta(text)))) => {
-                    let events = parser.feed(&text);
-                    for event in events {
-                        match stream_apply_event(
-                            event,
-                            &id,
-                            created,
-                            &model,
-                            &mut saw_tool_call,
-                            &mut in_progress,
-                        ) {
-                            StreamOutcome::Yield(chunk) => {
-                                yield Ok(sse_data(&chunk));
+                    match pump_text(&mut *parser, &mut mapper, &text) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                yield OpenAiSsePayload::Json(
+                                    serde_json::to_value(wrap_chunk(&id, created, &model, frame))
+                                        .unwrap(),
+                                );
                             }
-                            StreamOutcome::Continue => {}
-                            StreamOutcome::Terminal(message) => {
-                                protocol_error = Some(message);
-                                break 'outer;
-                            }
+                        }
+                        Err(err) => {
+                            // `err` carries both `failure` (the
+                            // structured cause) and `cleanup` (any
+                            // wire-bracketing frames the pump
+                            // already drained from the mapper).
+                            // For OpenAI cleanup is always empty,
+                            // but we hold onto the value uniformly
+                            // and emit cleanup before the error frame.
+                            protocol_failure = Some(err);
+                            break 'outer;
                         }
                     }
                 }
@@ -395,46 +330,51 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
             }
         }
 
-        // Protocol error path: error frame, close, NO [DONE].
-        // Per the OpenAI streaming convention, the stream simply
-        // closes after an error frame. Sending [DONE] would tell
-        // strict clients the response was a successful empty
-        // completion.
-        if let Some(message) = protocol_error {
-            warn!(%message, "openai chat aborted with parser protocol error");
-            yield Ok(sse_data(&json!({
-                "error": {
-                    "message": message,
-                    "type": "invalid_response",
-                }
-            })));
+        // Protocol-error path: error frame, close, NO [DONE].
+        // Per the OpenAI streaming convention an error frame closes
+        // the stream — appending [DONE] would tell strict clients the
+        // response was a successful empty completion.
+        if let Some(PumpError { failure, cleanup }) = protocol_failure {
+            warn!(message = %failure, "openai chat aborted with parser protocol error");
+            // OpenAI cleanup is always empty (no wire bracketing) but
+            // emit uniformly so the pattern matches Anthropic.
+            for frame in cleanup {
+                yield OpenAiSsePayload::Json(
+                    serde_json::to_value(wrap_chunk(&id, created, &model, frame)).unwrap(),
+                );
+            }
+            yield OpenAiSsePayload::Json(error_frame(&failure));
             return;
         }
 
+        // Convention: NO `data: [DONE]` after any error frame
+        // (transport, timeout, executor failure, or parser-level
+        // protocol error above). Strict OpenAI clients treat `[DONE]`
+        // as "success terminator," so emitting it after an error
+        // would be read as a successful empty completion. The
+        // protocol-error branch above already follows this; the
+        // transport/timeout/Outcome::Failed branches now match.
         if let Some(error) = transport_error {
-            yield Ok(sse_data(&json!({
+            yield OpenAiSsePayload::Json(json!({
                 "error": { "message": format!("Inference error: {error}") }
-            })));
-            yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+            }));
             return;
         }
         if timed_out {
-            yield Ok(sse_data(&json!({
+            yield OpenAiSsePayload::Json(json!({
                 "error": { "message": format!(
                     "inference timed out after {}s",
                     super::timeout_secs_until(deadline)
                 )}
-            })));
-            yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+            }));
             return;
         }
         let outcome = outcome.expect("loop only breaks with a terminal observation");
         match outcome {
             Outcome::Failed { error, .. } => {
-                yield Ok(sse_data(&json!({
+                yield OpenAiSsePayload::Json(json!({
                     "error": { "message": format!("Inference error: {error}") }
-                })));
-                yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+                }));
                 return;
             }
             Outcome::Completed {
@@ -444,201 +384,101 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
             } => {
                 info!(
                     %receipt_cid,
-                    provenance = ?stream_provenance,
+                    provenance = ?provenance,
                     total_tokens,
                     ?stop_reason,
                     "openai chat completion ready"
                 );
 
-                // Drain the parser's terminal events.
+                // Drain parser tail + mapper.finish via the same pump.
+                // Any failure takes the error-frame-and-close path.
                 let parser_stop = map_to_parser_stop(stop_reason);
-                let mut tail = parser.finish(parser_stop);
-                let mut tail_protocol_error: Option<String> = None;
-                for event in tail.drain(..) {
-                    match stream_apply_event(
-                        event,
+                let finish_frames = match pump_finish(&mut *parser, &mut mapper, parser_stop) {
+                    Ok(frames) => frames,
+                    Err(PumpError { failure, cleanup }) => {
+                        warn!(message = %failure, "openai chat aborted with parser protocol error during finish");
+                        for frame in cleanup {
+                            yield OpenAiSsePayload::Json(
+                                serde_json::to_value(wrap_chunk(&id, created, &model, frame))
+                                    .unwrap(),
+                            );
+                        }
+                        yield OpenAiSsePayload::Json(error_frame(&failure));
+                        return;
+                    }
+                };
+
+                // Build all post-pump chunks (mapper finish output +
+                // optional usage chunk) into one ordered vec so we can
+                // tag the LAST one with hellas.receipt_id. Per the
+                // approved plan: receipt rides the SEMANTIC TERMINAL
+                // event — the last `data:` chunk before `[DONE]`. With
+                // include_usage that's the usage chunk; otherwise the
+                // finish-reason chunk.
+                let mut tail_chunks: Vec<openai::ChatCompletionChunk> = finish_frames
+                    .into_iter()
+                    .map(|frame| wrap_chunk(&id, created, &model, frame))
+                    .collect();
+
+                if include_usage {
+                    tail_chunks.push(
+                        openai::ChatCompletionChunk::builder()
+                            .id(id.clone())
+                            .object("chat.completion.chunk".to_string())
+                            .created(created)
+                            .model(model.clone())
+                            .choices(vec![])
+                            .usage(Some(openai::Usage::from_counts(
+                                prompt_tokens,
+                                u32::try_from(total_tokens).unwrap_or(u32::MAX),
+                            )))
+                            .build(),
+                    );
+                }
+
+                // Mapper-contract assertion: a successful Completed
+                // outcome must yield at least one tail chunk to ride
+                // the receipt. If empty, the mapper or this gateway
+                // has a bug and the receipt has no destination —
+                // synthesize a minimal finish-reason chunk to carry
+                // it rather than silently drop it on the floor.
+                if tail_chunks.is_empty() {
+                    error!(
+                        %receipt_cid,
+                        "openai chat finish produced zero tail chunks; synthesizing terminal frame to carry receipt"
+                    );
+                    tail_chunks.push(wrap_chunk(
                         &id,
                         created,
                         &model,
-                        &mut saw_tool_call,
-                        &mut in_progress,
-                    ) {
-                        StreamOutcome::Yield(chunk) => yield Ok(sse_data(&chunk)),
-                        StreamOutcome::Continue => {}
-                        StreamOutcome::Terminal(message) => {
-                            tail_protocol_error = Some(message);
-                            break;
-                        }
+                        OpenAiStreamFrame {
+                            delta: openai::ChatDelta::default(),
+                            finish_reason: Some(openai::FinishReason::Stop),
+                        },
+                    ));
+                }
+
+                let last_idx = tail_chunks.len() - 1;
+                for (idx, chunk) in tail_chunks.into_iter().enumerate() {
+                    if idx == last_idx {
+                        let wrapped = WithHellas::new(chunk, HellasExt::receipt(&receipt_cid));
+                        yield OpenAiSsePayload::Json(serde_json::to_value(wrapped).unwrap());
+                    } else {
+                        yield OpenAiSsePayload::Json(serde_json::to_value(chunk).unwrap());
                     }
                 }
-                if let Some(message) = tail_protocol_error {
-                    warn!(%message, "openai chat aborted with parser protocol error during finish");
-                    yield Ok(sse_data(&json!({
-                        "error": {
-                            "message": message,
-                            "type": "invalid_response",
-                        }
-                    })));
-                    return;
-                }
 
-                let finish = map_finish_reason(stop_reason, saw_tool_call);
-                yield Ok(sse_data(&build_chunk(
-                    &id,
-                    created,
-                    &model,
-                    openai::ChatDelta::default(),
-                    Some(finish),
-                )));
-
-                if include_usage {
-                    let usage_chunk = openai::ChatCompletionChunk::builder()
-                        .id(id.clone())
-                        .object("chat.completion.chunk".to_string())
-                        .created(created)
-                        .model(model.clone())
-                        .choices(vec![])
-                        .usage(Some(openai::Usage::from_counts(
-                            prompt_tokens,
-                            u32::try_from(total_tokens).unwrap_or(u32::MAX),
-                        )))
-                        .build();
-                    yield Ok(sse_data(&usage_chunk));
-                }
-
-                yield Ok(receipt_sse_event(&receipt_cid));
-                yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+                yield OpenAiSsePayload::Done;
             }
         }
-    });
-    if let Some(prov) = provenance {
-        response.extensions_mut().insert(prov);
     }
-    response
 }
 
-/// Outcome of mapping one parser event to a streaming SSE chunk.
-enum StreamOutcome {
-    /// Emit this chunk to the SSE stream.
-    Yield(openai::ChatCompletionChunk),
-    /// No frame to emit for this event (e.g. ToolCallEnd is
-    /// already covered by the preceding Start + ArgsDelta chunks).
-    Continue,
-    /// Terminal protocol error — the stream must close after an
-    /// error frame, NOT emit `[DONE]`. Caller renders the message.
-    Terminal(String),
-}
-
-fn stream_apply_event(
-    event: DecodeEvent,
+fn wrap_chunk(
     id: &str,
     created: i64,
     model: &str,
-    saw_tool_call: &mut bool,
-    in_progress: &mut HashMap<usize, CallInProgress>,
-) -> StreamOutcome {
-    match event {
-        DecodeEvent::TextDelta(s) => StreamOutcome::Yield(build_chunk(
-            id,
-            created,
-            model,
-            text_delta(s),
-            None,
-        )),
-        DecodeEvent::ToolCallStart { index, name } => {
-            *saw_tool_call = true;
-            let wire_id = next_id("call");
-            in_progress.insert(
-                index,
-                CallInProgress {
-                    wire_id: wire_id.clone(),
-                    name: name.clone(),
-                    arguments: String::new(),
-                },
-            );
-            // OpenAI streaming tool-call start chunk: a tool_call
-            // entry in the delta carrying index, id, type, and the
-            // initial function name. Subsequent ArgsDelta chunks
-            // carry only the index + function.arguments fragment.
-            StreamOutcome::Yield(build_chunk(
-                id,
-                created,
-                model,
-                openai::ChatDelta {
-                    tool_calls: Some(vec![json!({
-                        "index": index,
-                        "id": wire_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": "",
-                        },
-                    })]),
-                    ..Default::default()
-                },
-                None,
-            ))
-        }
-        DecodeEvent::ToolCallArgsDelta { index, delta } => {
-            if let Some(call) = in_progress.get_mut(&index) {
-                call.arguments.push_str(&delta);
-            }
-            StreamOutcome::Yield(build_chunk(
-                id,
-                created,
-                model,
-                openai::ChatDelta {
-                    tool_calls: Some(vec![json!({
-                        "index": index,
-                        "function": {
-                            "arguments": delta,
-                        },
-                    })]),
-                    ..Default::default()
-                },
-                None,
-            ))
-        }
-        DecodeEvent::ToolCallEnd { index, .. } => {
-            // No separate frame: the preceding Start + ArgsDelta
-            // chunks already carry the call to the wire. We just
-            // drop our in-progress bookkeeping for this index.
-            in_progress.remove(&index);
-            StreamOutcome::Continue
-        }
-        DecodeEvent::Stop { .. } => StreamOutcome::Continue,
-        DecodeEvent::UnknownTool { name, .. } => {
-            StreamOutcome::Terminal(format!("model called unknown tool `{name}`"))
-        }
-        DecodeEvent::InvalidArgs { name, errors, .. } => {
-            let detail = errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            StreamOutcome::Terminal(format!(
-                "model called `{name}` with arguments that don't match the schema: {detail}"
-            ))
-        }
-        DecodeEvent::ParseError { sentinel, source } => StreamOutcome::Terminal(format!(
-            "model emitted malformed tool call within `{sentinel}`: {source}"
-        )),
-    }
-}
-
-fn text_delta(content: String) -> openai::ChatDelta {
-    openai::ChatDelta {
-        content: Some(content),
-        ..Default::default()
-    }
-}
-
-fn build_chunk(
-    id: &str,
-    created: i64,
-    model: &str,
-    delta: openai::ChatDelta,
-    finish: Option<openai::FinishReason>,
+    frame: OpenAiStreamFrame,
 ) -> openai::ChatCompletionChunk {
     openai::ChatCompletionChunk::builder()
         .id(id.to_string())
@@ -648,331 +488,443 @@ fn build_chunk(
         .choices(vec![
             openai::ChatStreamChoice::builder()
                 .index(0)
-                .delta(delta)
-                .finish_reason(finish)
+                .delta(frame.delta)
+                .finish_reason(frame.finish_reason)
                 .build(),
         ])
         .build()
 }
 
+fn error_frame(failure: &DecodeFailure) -> serde_json::Value {
+    json!({
+        "error": {
+            "message": failure.to_string(),
+            "type": match failure {
+                DecodeFailure::InternalSequence { .. } => "internal_error",
+                _ => "invalid_response",
+            },
+        }
+    })
+}
+
+fn failure_to_json_response(failure: DecodeFailure) -> Response {
+    let status = match failure {
+        DecodeFailure::InternalSequence { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let message = failure.to_string();
+    warn!(%message, "openai chat aborted with parser protocol error");
+    super::json_error(status, message)
+}
+
+/// Map executor `StopReason` to the parser's `StopReason`. The parser
+/// uses this in `finish()` to decide whether trailing buffered text is
+/// still being assembled or should be flushed; the mapper consumes the
+/// same value to resolve its terminal `finish_reason`.
+fn map_to_parser_stop(stop: ExecStopReason) -> ParserStopReason {
+    match stop {
+        ExecStopReason::EndOfSequence => ParserStopReason::EndOfText,
+        ExecStopReason::MaxNewTokens => ParserStopReason::MaxTokens,
+        // Cancelled: behave like a normal end so the parser flushes.
+        ExecStopReason::Cancelled => ParserStopReason::EndOfText,
+    }
+}
+
 #[cfg(test)]
-mod tests {
-    //! Wire-mapping tests for the OpenAI surface. These exercise the
-    //! event-walking helpers (`apply_event` / `stream_apply_event`) with
-    //! synthetic `DecodeEvent` sequences — the same shape the per-arch
-    //! parsers produce. They're independent of HTTP transport, fake
-    //! executors, or any model.
+mod streaming_done_tests {
+    //! Regression tests for the "no `data: [DONE]` after any error
+    //! frame" convention plus the in-band hellas-extension wire shape.
     //!
-    //! Coverage maps to the P6 contract:
+    //! Each error path (transport, timeout, executor failure) is driven
+    //! via a synthetic upstream stream through `build_openai_sse_stream`.
+    //! The generator returns `OpenAiSsePayload` directly, so tests can
+    //! match on variants without inspecting opaque axum `Event`s.
     //!
-    //! - **No-tools sentinel passthrough.** When tools aren't bound,
-    //!   the per-arch parser is never instantiated; what feeds the
-    //!   wire-mapper is `TextDelta` events. Asserts that text flows
-    //!   through to `content` with no tool_calls and no Terminal.
-    //! - **Unknown tool.** A model output naming a tool not in the
-    //!   directory becomes a `Terminal` error, mapped to HTTP 502 (a
-    //!   model-output error, not a client request error).
-    //! - **Invalid args.** Schema-validation failure becomes a
-    //!   `Terminal` carrying the schema-error detail.
-    //! - **Per-call streaming after close sentinel.** A complete
-    //!   `Start`/`ArgsDelta`/`End` triple in one feed yields the
-    //!   expected wire chunks atomically. The `End` event itself
-    //!   yields no separate frame — the preceding chunks already
-    //!   carry the call.
+    //! A `[DONE]` after an error frame would tell strict OpenAI
+    //! clients the response was a successful empty completion.
+    //!
+    //! Positive-path coverage asserts:
+    //! - first chunk carries `hellas.commitment_id` when provenance is
+    //!   provided, and no `hellas` field otherwise;
+    //! - the SEMANTIC TERMINAL chunk (last `data:` before `[DONE]`)
+    //!   carries `hellas.receipt_id`. With `include_usage=true` that's
+    //!   the trailing usage chunk; without, the finish-reason chunk;
+    //! - error paths NEVER emit `hellas.receipt_id`;
+    //! - no separate `event: hellas-*` SSE events appear (the
+    //!   `OpenAiSsePayload` enum no longer has variants for them).
 
     use super::*;
-    use catgrad_llm::runtime::chat::{ParserError, SchemaError};
-    use serde_json::json;
+    use crate::execution::{Outcome, StopReason as ExecStopReason};
+    use catgrad::cid::Cid;
+    use catgrad_llm::runtime::TextReceipt;
+    use catgrad_llm::runtime::chat::PassthroughParser;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::Instant;
 
-    /// No-tools surface: `TextDelta` events accumulate into content;
-    /// no tool calls, no terminal.
-    #[test]
-    fn apply_event_text_passes_through_to_content() {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
-
-        // Pretend the parser emitted these events (would happen if a
-        // sentinel-shaped string came through the passthrough parser).
-        for s in ["hello ", "<tool_call>literal text</tool_call>", " world"] {
-            match apply_event(
-                DecodeEvent::TextDelta(s.to_string()),
-                &mut content,
-                &mut tool_calls,
-                &mut saw_tool_call,
-                &mut in_progress,
-            ) {
-                EventOutcome::Continue => {}
-                EventOutcome::Terminal(_) => panic!("text events must not be terminal"),
-            }
-        }
-        assert_eq!(content, "hello <tool_call>literal text</tool_call> world");
-        assert!(tool_calls.is_empty());
-        assert!(!saw_tool_call);
+    fn make_test_inputs() -> (
+        String,
+        i64,
+        String,
+        u32,
+        Box<dyn IncrementalToolCallParser>,
+        OpenAiStreamMapper,
+    ) {
+        (
+            "chatcmpl-test".into(),
+            0,
+            "test-model".into(),
+            0,
+            Box::new(PassthroughParser),
+            OpenAiStreamMapper::new(|prefix: &str| format!("{prefix}-test")),
+        )
     }
 
-    #[test]
-    fn apply_event_unknown_tool_is_terminal_502() {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
-
-        let outcome = apply_event(
-            DecodeEvent::UnknownTool {
-                name: "delete_db".to_string(),
-                raw_args: json!({}),
-            },
-            &mut content,
-            &mut tool_calls,
-            &mut saw_tool_call,
-            &mut in_progress,
-        );
-        match outcome {
-            EventOutcome::Terminal(err) => {
-                assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-                assert!(err.message.contains("delete_db"));
-                assert!(err.message.contains("unknown tool"));
-            }
-            EventOutcome::Continue => panic!("UnknownTool must be terminal"),
+    fn test_provenance() -> ExecutionProvenance {
+        ExecutionProvenance {
+            commitment_id: [0xab; 32],
         }
     }
 
-    #[test]
-    fn apply_event_invalid_args_is_terminal_with_schema_detail() {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
+    fn test_receipt() -> Cid<TextReceipt> {
+        Cid::<TextReceipt>::from_bytes([0xcd; 32])
+    }
 
-        let outcome = apply_event(
-            DecodeEvent::InvalidArgs {
-                name: "add".to_string(),
-                args: json!({ "a": "one" }),
-                errors: vec![SchemaError {
-                    path: "/a".to_string(),
-                    message: "is not of type \"number\"".to_string(),
-                }],
-            },
-            &mut content,
-            &mut tool_calls,
-            &mut saw_tool_call,
-            &mut in_progress,
-        );
-        match outcome {
-            EventOutcome::Terminal(err) => {
-                assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-                assert!(err.message.contains("add"));
-                assert!(err.message.contains("schema"));
-                assert!(err.message.contains("/a"));
-            }
-            EventOutcome::Continue => panic!("InvalidArgs must be terminal"),
+    /// Successful upstream: one delta then `Outcome::Completed`. The
+    /// receipt CID lands inside the terminal frame via the gateway's
+    /// `Outcome::Completed` arm.
+    fn happy_upstream(
+        receipt_cid: Cid<TextReceipt>,
+    ) -> impl futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static {
+        futures::stream::iter(vec![
+            Ok(GenerationEvent::Delta("hi".to_string())),
+            Ok(GenerationEvent::Done(Outcome::Completed {
+                total_tokens: 1,
+                stop_reason: ExecStopReason::EndOfSequence,
+                receipt_cid,
+            })),
+        ])
+    }
+
+    /// True iff the payload is a JSON value with an `error` field —
+    /// either an inference-side error frame or a parser-protocol one.
+    fn is_error_frame(p: &OpenAiSsePayload) -> bool {
+        matches!(p, OpenAiSsePayload::Json(v) if v.get("error").is_some())
+    }
+
+    fn is_done(p: &OpenAiSsePayload) -> bool {
+        matches!(p, OpenAiSsePayload::Done)
+    }
+
+    fn error_message(p: &OpenAiSsePayload) -> Option<&str> {
+        match p {
+            OpenAiSsePayload::Json(v) => v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str()),
+            _ => None,
         }
     }
 
-    #[test]
-    fn apply_event_parse_error_is_terminal() {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
-
-        let outcome = apply_event(
-            DecodeEvent::ParseError {
-                sentinel: "<tool_call>",
-                source: ParserError::MissingField("name"),
-            },
-            &mut content,
-            &mut tool_calls,
-            &mut saw_tool_call,
-            &mut in_progress,
-        );
-        assert!(matches!(outcome, EventOutcome::Terminal(_)));
+    /// Extract the JSON value out of a `Json` payload variant for
+    /// hellas-field inspection. Panics on non-JSON variants — tests
+    /// pre-filter to skip the trailing `Done`.
+    fn as_json(p: &OpenAiSsePayload) -> &serde_json::Value {
+        match p {
+            OpenAiSsePayload::Json(v) => v,
+            OpenAiSsePayload::Done => panic!("called as_json on Done payload"),
+        }
     }
 
-    #[test]
-    fn apply_event_complete_call_assembles_tool_calls_array() {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
+    /// `chunk.hellas.commitment_id` if present.
+    fn commitment_of(p: &OpenAiSsePayload) -> Option<&str> {
+        as_json(p)
+            .get("hellas")
+            .and_then(|h| h.get("commitment_id"))
+            .and_then(|v| v.as_str())
+    }
 
-        for event in [
-            DecodeEvent::ToolCallStart {
-                index: 0,
-                name: "add".to_string(),
-            },
-            DecodeEvent::ToolCallArgsDelta {
-                index: 0,
-                delta: r#"{"a":1,"b":2}"#.to_string(),
-            },
-            DecodeEvent::ToolCallEnd {
-                index: 0,
-                args: json!({"a": 1, "b": 2}),
-            },
-        ] {
-            let _ = apply_event(
-                event,
-                &mut content,
-                &mut tool_calls,
-                &mut saw_tool_call,
-                &mut in_progress,
-            );
-        }
+    /// `chunk.hellas.receipt_id` if present.
+    fn receipt_of(p: &OpenAiSsePayload) -> Option<&str> {
+        as_json(p)
+            .get("hellas")
+            .and_then(|h| h.get("receipt_id"))
+            .and_then(|v| v.as_str())
+    }
 
-        assert_eq!(content, "");
-        assert!(saw_tool_call);
-        assert!(in_progress.is_empty());
-        assert_eq!(tool_calls.len(), 1);
-        let call = &tool_calls[0];
-        assert_eq!(call["type"], "function");
-        assert_eq!(call["function"]["name"], "add");
-        // OpenAI wire convention: `arguments` is a JSON-encoded string.
-        assert_eq!(call["function"]["arguments"], r#"{"a":1,"b":2}"#);
+    fn has_finish_reason(p: &OpenAiSsePayload) -> bool {
+        as_json(p)
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("finish_reason"))
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+    }
+
+    fn is_usage_chunk(p: &OpenAiSsePayload) -> bool {
+        let v = as_json(p);
+        let choices_empty = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .map(|arr| arr.is_empty())
+            .unwrap_or(false);
+        let has_usage = v.get("usage").is_some_and(|u| !u.is_null());
+        choices_empty && has_usage
+    }
+
+    /// Drive with an upstream that yields a single transport `Err`.
+    /// Assert: error frame is emitted, no `[DONE]`, no receipt leaks.
+    #[tokio::test]
+    async fn transport_error_emits_error_frame_without_done() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let upstream = futures::stream::iter(vec![
+            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>,
+        ]);
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            Some(test_provenance()),
+            upstream,
+        )
+        .collect()
+        .await;
+
         assert!(
-            call["id"].as_str().is_some_and(|s| s.starts_with("call-")),
-            "expected process-unique id, got {}",
-            call["id"]
+            payloads
+                .iter()
+                .any(|p| is_error_frame(p)
+                    && error_message(p).is_some_and(|m| m.contains("upstream blew up"))),
+            "expected error frame, got: {payloads:#?}"
+        );
+        assert!(
+            !payloads.iter().any(is_done),
+            "must not emit [DONE] after transport error, got: {payloads:#?}"
+        );
+        // Error-path fence: no receipt anywhere in the stream.
+        assert!(
+            payloads
+                .iter()
+                .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+                .all(|p| receipt_of(p).is_none()),
+            "transport error must not leak hellas.receipt_id, got: {payloads:#?}"
         );
     }
 
-    /// Per-call streaming proof: a complete Start / ArgsDelta / End
-    /// triple in one feed yields exactly two wire chunks (Start emits
-    /// a chunk with name; ArgsDelta emits a chunk with arguments
-    /// fragment; End emits no separate chunk — its content is
-    /// already on the wire).
-    #[test]
-    fn stream_apply_event_emits_per_call_chunks_atomically() {
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
+    /// Drive with an upstream that never yields, deadline in the
+    /// past. Assert: timeout error frame, no `[DONE]`, no receipt leak.
+    #[tokio::test]
+    async fn timeout_emits_error_frame_without_done() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let upstream = futures::stream::pending::<anyhow::Result<GenerationEvent>>();
 
-        let start = stream_apply_event(
-            DecodeEvent::ToolCallStart {
-                index: 0,
-                name: "add".to_string(),
-            },
-            "chatcmpl-test",
-            42,
-            "test-model",
-            &mut saw_tool_call,
-            &mut in_progress,
-        );
-        let StreamOutcome::Yield(start_chunk) = start else {
-            panic!("ToolCallStart must yield a chunk");
-        };
-        let start_value = serde_json::to_value(&start_chunk).unwrap();
-        let tool_calls = &start_value["choices"][0]["delta"]["tool_calls"];
-        assert_eq!(tool_calls[0]["index"], 0);
-        assert_eq!(tool_calls[0]["function"]["name"], "add");
-        assert!(tool_calls[0]["id"].as_str().unwrap().starts_with("call-"));
-        assert!(saw_tool_call);
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            Some(test_provenance()),
+            upstream,
+        )
+        .collect()
+        .await;
 
-        let args = stream_apply_event(
-            DecodeEvent::ToolCallArgsDelta {
-                index: 0,
-                delta: r#"{"a":1,"b":2}"#.to_string(),
-            },
-            "chatcmpl-test",
-            42,
-            "test-model",
-            &mut saw_tool_call,
-            &mut in_progress,
+        assert!(
+            payloads
+                .iter()
+                .any(|p| is_error_frame(p)
+                    && error_message(p).is_some_and(|m| m.contains("timed out"))),
+            "expected timeout error frame, got: {payloads:#?}"
         );
-        let StreamOutcome::Yield(args_chunk) = args else {
-            panic!("ToolCallArgsDelta must yield a chunk");
-        };
-        let args_value = serde_json::to_value(&args_chunk).unwrap();
-        let arg_calls = &args_value["choices"][0]["delta"]["tool_calls"];
-        assert_eq!(arg_calls[0]["index"], 0);
-        assert_eq!(
-            arg_calls[0]["function"]["arguments"],
-            r#"{"a":1,"b":2}"#
+        assert!(
+            !payloads.iter().any(is_done),
+            "must not emit [DONE] after timeout, got: {payloads:#?}"
         );
-        // Start-chunk's `id` and `name` are NOT repeated on subsequent
-        // delta chunks (per OpenAI streaming convention).
-        assert!(arg_calls[0].get("id").is_none());
-
-        let end = stream_apply_event(
-            DecodeEvent::ToolCallEnd {
-                index: 0,
-                args: json!({"a": 1, "b": 2}),
-            },
-            "chatcmpl-test",
-            42,
-            "test-model",
-            &mut saw_tool_call,
-            &mut in_progress,
+        assert!(
+            payloads
+                .iter()
+                .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+                .all(|p| receipt_of(p).is_none()),
+            "timeout must not leak hellas.receipt_id, got: {payloads:#?}"
         );
-        // ToolCallEnd emits no separate frame — preceding chunks
-        // already carry the call to the wire.
-        assert!(matches!(end, StreamOutcome::Continue));
-        assert!(in_progress.is_empty());
     }
 
-    #[test]
-    fn stream_apply_event_text_yields_content_delta() {
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
-
-        let out = stream_apply_event(
-            DecodeEvent::TextDelta("hello".to_string()),
-            "chatcmpl-test",
-            42,
-            "test-model",
-            &mut saw_tool_call,
-            &mut in_progress,
-        );
-        let StreamOutcome::Yield(chunk) = out else {
-            panic!("TextDelta must yield a chunk");
-        };
-        let value = serde_json::to_value(&chunk).unwrap();
-        assert_eq!(value["choices"][0]["delta"]["content"], "hello");
-        assert!(value["choices"][0]["delta"].get("tool_calls").is_none());
-        assert!(!saw_tool_call);
-    }
-
-    #[test]
-    fn stream_apply_event_unknown_tool_is_terminal() {
-        let mut saw_tool_call = false;
-        let mut in_progress = HashMap::new();
-        let out = stream_apply_event(
-            DecodeEvent::UnknownTool {
-                name: "delete_db".to_string(),
-                raw_args: json!({}),
+    /// Drive with an upstream completing via `Outcome::Failed`.
+    /// Assert: error frame, no `[DONE]`, no receipt leak.
+    #[tokio::test]
+    async fn outcome_failed_emits_error_frame_without_done() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(
+            Outcome::Failed {
+                position: 0,
+                error: "executor exploded".to_string(),
             },
-            "chatcmpl-test",
-            42,
-            "test-model",
-            &mut saw_tool_call,
-            &mut in_progress,
+        ))
+            as anyhow::Result<GenerationEvent>]);
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            Some(test_provenance()),
+            upstream,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            payloads
+                .iter()
+                .any(|p| is_error_frame(p)
+                    && error_message(p).is_some_and(|m| m.contains("executor exploded"))),
+            "expected Outcome::Failed error frame, got: {payloads:#?}"
         );
-        let StreamOutcome::Terminal(message) = out else {
-            panic!("UnknownTool must be terminal");
-        };
-        assert!(message.contains("delete_db"));
-        assert!(message.contains("unknown tool"));
+        assert!(
+            !payloads.iter().any(is_done),
+            "must not emit [DONE] after Outcome::Failed, got: {payloads:#?}"
+        );
+        assert!(
+            payloads
+                .iter()
+                .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+                .all(|p| receipt_of(p).is_none()),
+            "Outcome::Failed must not leak hellas.receipt_id, got: {payloads:#?}"
+        );
     }
 
-    #[test]
-    fn map_finish_reason_tool_calls_wins_over_stop() {
-        // Per the P6 contract: tool_calls wins whenever any call was
-        // emitted, even if the executor stopped on EOS.
-        assert_eq!(
-            map_finish_reason(ExecStopReason::EndOfSequence, true),
-            openai::FinishReason::ToolCalls
+    /// Happy path with provenance: first chunk carries
+    /// `hellas.commitment_id`; the SEMANTIC TERMINAL chunk (the one
+    /// just before `[DONE]`) carries `hellas.receipt_id`; intermediate
+    /// chunks carry no hellas field.
+    #[tokio::test]
+    async fn commitment_on_first_chunk_receipt_on_terminal_chunk() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prov = test_provenance();
+        let receipt = test_receipt();
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            Some(prov.clone()),
+            happy_upstream(receipt),
+        )
+        .collect()
+        .await;
+
+        // [DONE] always last on success.
+        assert!(matches!(payloads.last(), Some(OpenAiSsePayload::Done)));
+
+        // First chunk has commitment.
+        let first = payloads.first().expect("non-empty");
+        assert_eq!(commitment_of(first), Some("ab".repeat(32).as_str()));
+        assert_eq!(receipt_of(first), None);
+
+        // Terminal data event = last payload before Done.
+        let json_payloads: Vec<&OpenAiSsePayload> = payloads
+            .iter()
+            .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+            .collect();
+        let terminal = json_payloads.last().expect("at least one json chunk");
+        assert!(
+            has_finish_reason(terminal),
+            "without include_usage, terminal chunk must carry finish_reason: {terminal:?}"
         );
-        assert_eq!(
-            map_finish_reason(ExecStopReason::MaxNewTokens, true),
-            openai::FinishReason::ToolCalls
+        assert_eq!(receipt_of(terminal), Some("cd".repeat(32).as_str()));
+
+        // Receipt appears EXACTLY once across the whole stream.
+        let receipts: Vec<_> = json_payloads
+            .iter()
+            .filter_map(|p| receipt_of(p))
+            .collect();
+        assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
+    }
+
+    /// Happy path WITHOUT provenance: first chunk has no hellas
+    /// field at all; receipt still rides the terminal chunk because
+    /// it's known regardless of whether commitment was set.
+    #[tokio::test]
+    async fn no_provenance_means_no_commitment_field() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            None,
+            happy_upstream(test_receipt()),
+        )
+        .collect()
+        .await;
+
+        let first = payloads.first().expect("non-empty");
+        assert_eq!(commitment_of(first), None);
+        // The first chunk's outer object must have no `hellas` key
+        // at all (skip_serializing_if applied to an empty HellasExt).
+        assert!(
+            as_json(first).get("hellas").is_none(),
+            "no provenance → no `hellas` field on first chunk: {first:?}"
         );
+
+        let json_last = payloads
+            .iter()
+            .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+            .last()
+            .unwrap();
+        assert_eq!(receipt_of(json_last), Some("cd".repeat(32).as_str()));
+    }
+
+    /// `include_usage=true`: receipt rides the trailing usage chunk
+    /// (semantic terminal in this mode), NOT the finish-reason chunk.
+    #[tokio::test]
+    async fn include_usage_routes_receipt_to_usage_chunk() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            true, // include_usage
+            parser,
+            mapper,
+            Some(test_provenance()),
+            happy_upstream(test_receipt()),
+        )
+        .collect()
+        .await;
+
+        let json_payloads: Vec<&OpenAiSsePayload> = payloads
+            .iter()
+            .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+            .collect();
+
+        // Find the usage chunk and the finish-reason chunk.
+        let usage = json_payloads
+            .iter()
+            .find(|p| is_usage_chunk(p))
+            .expect("include_usage emits a usage chunk");
+        let finish = json_payloads
+            .iter()
+            .find(|p| has_finish_reason(p))
+            .expect("finish-reason chunk always emitted on success");
+
+        // Usage chunk is the terminal event and carries the receipt.
+        assert_eq!(receipt_of(usage), Some("cd".repeat(32).as_str()));
+        // Finish-reason chunk is NO LONGER the terminal event when
+        // usage is enabled — it must NOT carry the receipt.
         assert_eq!(
-            map_finish_reason(ExecStopReason::EndOfSequence, false),
-            openai::FinishReason::Stop
+            receipt_of(finish),
+            None,
+            "with include_usage, finish-reason chunk must not carry receipt; got {finish:?}"
         );
-        assert_eq!(
-            map_finish_reason(ExecStopReason::MaxNewTokens, false),
-            openai::FinishReason::Length
+
+        // Usage chunk is positioned just before [DONE].
+        assert!(matches!(payloads.last(), Some(OpenAiSsePayload::Done)));
+        let last_json = json_payloads.last().unwrap();
+        assert!(
+            is_usage_chunk(last_json),
+            "with include_usage the last data event is the usage chunk: {last_json:?}"
         );
     }
 }
