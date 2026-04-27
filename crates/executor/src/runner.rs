@@ -46,7 +46,10 @@ use crate::state::{Invocation, StopReason};
 use catgrad::category::core::Shape;
 use catgrad::cid::Cid;
 use catgrad::interpreter;
-use catgrad_llm::runtime::{BoundProgramText, TextDecoder, TextReceipt};
+use catgrad_llm::runtime::{
+    BoundProgramText, BreakReason, DecodeLoopError, DecodeOutcome as DecoderOutcome, TextDecoder,
+    TextReceipt, run_decode,
+};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
 use std::sync::Arc;
@@ -164,10 +167,21 @@ struct DecodeLoopOutput {
     output_tokens: Vec<u32>,
 }
 
-/// Decode loop: peek-stop-or-commit, batched progress callback emission.
+/// Decode loop: drives [`run_decode`] over the decoder, layering
+/// cancellation + batched progress emission on top via the per-token
+/// callback.
+///
 /// After each `commit_next` the decoder is fully receipt-aligned, so
-/// breaking out (stop token or cap reached) leaves a consistent state
-/// for the trailing `into_text_state`.
+/// breaking out (stop token or cancellation) always leaves
+/// `decoder.position == output_tokens.len()` — the invariant
+/// `into_text_state` requires.
+///
+/// **Cancellation timing:** the cancel check happens *after* the
+/// current token has been committed and recorded. A cancelled
+/// response therefore includes the token that was already in flight
+/// when cancel fired. The previous bespoke loop checked cancel
+/// *before* peeking — net effect is up to one extra token in the
+/// cancelled output.
 fn run_decode_loop(
     decoder: &mut TextDecoder<ExecBackend>,
     max_new_tokens: u32,
@@ -176,40 +190,52 @@ fn run_decode_loop(
     cancel: &CancellationToken,
     on_progress: &mut impl FnMut(u64, &[u8]),
 ) -> Result<DecodeLoopOutput, ExecutorError> {
-    let mut output_tokens = Vec::new();
-    let mut pending_batch = Vec::with_capacity(batch_size);
-    let mut generated = 0u64;
-    let mut stop_reason = StopReason::MaxNewTokens;
+    let mut output_tokens: Vec<u32> = Vec::new();
+    let mut pending_batch: Vec<u32> = Vec::with_capacity(batch_size);
+    let mut generated: u64 = 0;
 
-    for _ in 0..max_new_tokens {
-        if cancel.is_cancelled() {
-            stop_reason = StopReason::Cancelled;
-            break;
-        }
-        let predicted = decoder.next_token();
-        if i32::try_from(predicted)
-            .ok()
-            .is_some_and(|token| stop_token_ids.contains(&token))
-        {
-            stop_reason = StopReason::EndOfSequence;
-            break;
-        }
-        let emitted = decoder.commit_next()?;
-        debug_assert_eq!(emitted, predicted);
-        generated += 1;
-        output_tokens.push(emitted);
-        pending_batch.push(emitted);
-        if pending_batch.len() >= batch_size {
-            let chunk = encode_token_ids(&pending_batch);
-            on_progress(generated, &chunk);
-            pending_batch.clear();
-        }
-    }
+    let (_, outcome) = run_decode::<_, _, std::convert::Infallible>(
+        decoder,
+        max_new_tokens,
+        stop_token_ids,
+        |token| {
+            // Push first so output_tokens length tracks decoder.position.
+            generated += 1;
+            output_tokens.push(token);
+            pending_batch.push(token);
+            if pending_batch.len() >= batch_size {
+                let chunk = encode_token_ids(&pending_batch);
+                on_progress(generated, &chunk);
+                pending_batch.clear();
+            }
+            // Then check cancellation: signals run_decode to stop AFTER
+            // this token is committed and reported.
+            if cancel.is_cancelled() {
+                Ok(std::ops::ControlFlow::Break(BreakReason::Cancelled))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
+        },
+    )
+    .map_err(|err| match err {
+        DecodeLoopError::Decoder(e) => ExecutorError::from(e),
+        DecodeLoopError::Sink(_) => unreachable!("Infallible sink"),
+    })?;
 
     if !pending_batch.is_empty() {
         let chunk = encode_token_ids(&pending_batch);
         on_progress(generated, &chunk);
     }
+
+    let stop_reason = match outcome {
+        DecoderOutcome::EndOfSequence => StopReason::EndOfSequence,
+        DecoderOutcome::MaxTokens => StopReason::MaxNewTokens,
+        DecoderOutcome::Cancelled => StopReason::Cancelled,
+        // Executor doesn't use the StopSequence break path — only the
+        // EndOfSequence (parser-level stop tokens) and Cancelled
+        // paths. Treat as EndOfSequence defensively if it ever fires.
+        DecoderOutcome::StopSequence => StopReason::EndOfSequence,
+    };
 
     Ok(DecodeLoopOutput {
         stop_reason,
