@@ -4,13 +4,13 @@
   lib,
   package,
 }: let
-  testsLib = import ./lib.nix {
+  hfCaches = import ./huggingface.nix {
     inherit pkgs lib;
   };
   lfm2Model = "LiquidAI/LFM2-350M";
-  lfm2HfHome = testsLib.lfm2_350MCache;
+  lfm2HfHome = hfCaches.lfm2_350MCache;
   qwenModel = "Qwen/Qwen3-0.6B";
-  qwenHfHome = testsLib.qwen3_0_6BCache;
+  qwenHfHome = hfCaches.qwen3_0_6BCache;
   # Combined HF cache so a single gateway can resolve config.json/tokenizer
   # for both models when routing via discovery.
   hfHomeBoth = pkgs.symlinkJoin {
@@ -71,22 +71,21 @@
     hfHome,
     cores ? 2,
     memorySize ? 4096,
-  }:
-    _: {
-      imports = [hellasModule];
-      config = lib.mkMerge [
-        baseNode
-        (mkHellasNode {
-          inherit model hfHome;
-          executePolicy = "eager";
-          preload = true;
-        })
-        {
-          virtualisation.cores = cores;
-          virtualisation.memorySize = memorySize;
-        }
-      ];
-    };
+  }: _: {
+    imports = [hellasModule];
+    config = lib.mkMerge [
+      baseNode
+      (mkHellasNode {
+        inherit model hfHome;
+        executePolicy = "eager";
+        preload = true;
+      })
+      {
+        virtualisation.cores = cores;
+        virtualisation.memorySize = memorySize;
+      }
+    ];
+  };
 
   clientNode = _: {
     config = lib.mkMerge [
@@ -121,34 +120,33 @@
     hfHome,
     cores ? 2,
     memorySize ? 3072,
-  }:
-    _: {
-      config = lib.mkMerge [
-        baseNode
-        {
-          networking.firewall.allowedTCPPorts = [gatewayPort];
-          systemd.services.hellas-gateway = {
-            description = "Hellas gateway";
-            after = ["network-online.target"];
-            wants = ["network-online.target"];
-            environment = {
-              HF_HOME = hfHome;
-              HOME = "/var/lib/hellas-gateway";
-              RUST_LOG = "info";
-            };
-            serviceConfig = {
-              DynamicUser = true;
-              Restart = "on-failure";
-              StateDirectory = "hellas-gateway";
-              WorkingDirectory = "/var/lib/hellas-gateway";
-              ExecStart = "${gatewayLauncher}";
-            };
+  }: _: {
+    config = lib.mkMerge [
+      baseNode
+      {
+        networking.firewall.allowedTCPPorts = [gatewayPort];
+        systemd.services.hellas-gateway = {
+          description = "Hellas gateway";
+          after = ["network-online.target"];
+          wants = ["network-online.target"];
+          environment = {
+            HF_HOME = hfHome;
+            HOME = "/var/lib/hellas-gateway";
+            RUST_LOG = "info";
           };
-          virtualisation.cores = cores;
-          virtualisation.memorySize = memorySize;
-        }
-      ];
-    };
+          serviceConfig = {
+            DynamicUser = true;
+            Restart = "on-failure";
+            StateDirectory = "hellas-gateway";
+            WorkingDirectory = "/var/lib/hellas-gateway";
+            ExecStart = "${gatewayLauncher}";
+          };
+        };
+        virtualisation.cores = cores;
+        virtualisation.memorySize = memorySize;
+      }
+    ];
+  };
 
   # Discovery-mode counterpart: gateway has no pinned executor; routes via
   # mDNS+DHT. Pkarr/iroh logs are tightened so structured log fields stay
@@ -157,34 +155,33 @@
     hfHome,
     cores ? 2,
     memorySize ? 4096,
-  }:
-    _: {
-      config = lib.mkMerge [
-        baseNode
-        {
-          networking.firewall.allowedTCPPorts = [gatewayPort];
-          systemd.services.hellas-gateway = {
-            description = "Hellas gateway (discovery)";
-            after = ["network-online.target"];
-            wants = ["network-online.target"];
-            environment = {
-              HF_HOME = hfHome;
-              HOME = "/var/lib/hellas-gateway";
-              RUST_LOG = "info,iroh=warn,iroh_relay=warn,pkarr=warn,iroh_dns=warn";
-            };
-            serviceConfig = {
-              DynamicUser = true;
-              Restart = "on-failure";
-              StateDirectory = "hellas-gateway";
-              WorkingDirectory = "/var/lib/hellas-gateway";
-              ExecStart = "${gatewayLauncherDiscovery}";
-            };
+  }: _: {
+    config = lib.mkMerge [
+      baseNode
+      {
+        networking.firewall.allowedTCPPorts = [gatewayPort];
+        systemd.services.hellas-gateway = {
+          description = "Hellas gateway (discovery)";
+          after = ["network-online.target"];
+          wants = ["network-online.target"];
+          environment = {
+            HF_HOME = hfHome;
+            HOME = "/var/lib/hellas-gateway";
+            RUST_LOG = "info,iroh=warn,iroh_relay=warn,pkarr=warn,iroh_dns=warn";
           };
-          virtualisation.cores = cores;
-          virtualisation.memorySize = memorySize;
-        }
-      ];
-    };
+          serviceConfig = {
+            DynamicUser = true;
+            Restart = "on-failure";
+            StateDirectory = "hellas-gateway";
+            WorkingDirectory = "/var/lib/hellas-gateway";
+            ExecStart = "${gatewayLauncherDiscovery}";
+          };
+        };
+        virtualisation.cores = cores;
+        virtualisation.memorySize = memorySize;
+      }
+    ];
+  };
 
   # Common Python lines to bring the executor + gateway pipeline up.
   # Defines `executor_node_id` and waits for the gateway HTTP port.
@@ -348,6 +345,7 @@ in {
       model = lfm2Model;
       hfHome = lfm2HfHome;
     };
+
     nodes.gateway = mkGatewayNode {hfHome = lfm2HfHome;};
     nodes.client = clientNode;
 
@@ -404,10 +402,10 @@ in {
     nodes.gateway = _: {
       config = lib.mkMerge [
         ((mkGatewayNodeDiscovery {
-            hfHome = hfHomeBoth;
-            cores = 2;
-            memorySize = 4096;
-          }) {})
+          hfHome = hfHomeBoth;
+          cores = 2;
+          memorySize = 4096;
+        }) {})
         .config
         {
           environment.systemPackages = [pkgs.pi-coding-agent];
