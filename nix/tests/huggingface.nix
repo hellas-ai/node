@@ -1,4 +1,7 @@
-{pkgs, lib}: let
+{
+  pkgs,
+  lib,
+}: rec {
   # Build a HuggingFace-shaped cache directory. `files` is an attrset mapping
   # in-snapshot file name → SRI hash; we fetch each one and symlink it into
   # the snapshot tree so HF_HOME=<out> behaves like a populated hub cache.
@@ -21,7 +24,14 @@
       '')
       files);
   in
-    pkgs.runCommand name {} ''
+    pkgs.runCommand name {
+      # Output is just symlinks to fetchurl FOD paths, byte-identical across
+      # systems. CA derivation → store path derived from the NAR hash, so a
+      # cache built on Linux substitutes cleanly into a Darwin closure.
+      __contentAddressed = true;
+      outputHashMode = "recursive";
+      outputHashAlgo = "sha256";
+    } ''
       mkdir -p "$out/hub/${repoPath}/refs" "${snapshotPath}"
       printf '%s' '${revision}' > "$out/hub/${repoPath}/refs/${ref}"
       ${linkCommands}
@@ -52,6 +62,4 @@
       "tokenizer_config.json" = "sha256-1dCfB7SMMIbFCLMNHJEUvRGJFFt06YKiZTUMkjrNgQE=";
     };
   };
-in {
-  inherit mkHuggingFaceCache lfm2_350MCache qwen3_0_6BCache;
 }

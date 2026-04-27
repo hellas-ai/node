@@ -1,13 +1,13 @@
 mod anthropic;
 mod hellas_ext;
 mod openai;
-mod pi;
 mod plain;
 mod provenance_layer;
 mod state;
+mod wrap;
 
 use crate::commands::CliResult;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -27,11 +27,13 @@ use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
 use self::state::{GatewayState, HttpError};
 
+const DEFAULT_HTTP_PORT: u16 = 8080;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayOptions {
     pub host: String,
-    pub port: u16,
+    pub port: Option<u16>,
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
     #[cfg(feature = "hellas-executor")]
@@ -47,11 +49,8 @@ pub struct GatewayOptions {
     pub metrics_port: Option<u16>,
     pub dtype: Dtype,
     pub secret_key: SecretKey,
-    pub pi: bool,
-    pub pi_bin: String,
-    pub pi_api: String,
-    pub pi_log: Option<std::path::PathBuf>,
-    pub pi_args: Vec<String>,
+    pub wrap: Option<String>,
+    pub wrap_args: Vec<String>,
 }
 
 pub async fn run(options: GatewayOptions) -> CliResult<()> {
@@ -64,13 +63,11 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         .with_state(state.clone())
         .layer(provenance_layer::ProvenanceLayer);
 
-    let addr = format!("{}:{}", options.host, options.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("failed to bind gateway on {addr}"))?;
+    let listener = bind_gateway(&options.host, options.port).await?;
     let bound_addr = listener
         .local_addr()
         .context("listener has no local address")?;
+    info!("gateway listening on {bound_addr}");
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
@@ -101,36 +98,17 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         info!("Forcing request model override to `{model}`");
     }
 
-    let pi_handle = if options.pi {
-        let model = options.force_model.as_deref().ok_or_else(|| {
-            anyhow!("--pi requires --force-model so pi can advertise a concrete model id")
-        })?;
+    let wrap_child = if let Some(cmd) = options.wrap.as_deref() {
+        // Wrapped commands talk to us over loopback, so an unspecified bind
+        // address (0.0.0.0 / ::) becomes 127.0.0.1 in the URLs they see.
         let host = if options.host == "0.0.0.0" || options.host == "::" {
             "127.0.0.1"
         } else {
             options.host.as_str()
         };
-        // openai SDKs append /chat/completions to baseUrl, so we need /v1 in
-        // the URL. anthropic SDKs append /v1/messages themselves, so baseUrl
-        // stays at the host root.
-        let path = match options.pi_api.as_str() {
-            "openai-completions" => "/v1",
-            "anthropic-messages" => "",
-            other => bail!("unsupported --pi-api: {other}"),
-        };
-        let base_url = format!("http://{host}:{}{path}", bound_addr.port());
-        info!("spawning pi with provider baseUrl {base_url} (api={})", options.pi_api);
-        if let Some(path) = options.pi_log.as_deref() {
-            info!("pi stdout/stderr -> {}", path.display());
-        }
-        Some(pi::spawn(
-            &base_url,
-            model,
-            &options.pi_api,
-            &options.pi_bin,
-            &options.pi_args,
-            options.pi_log.as_deref(),
-        )?)
+        let base = format!("http://{host}:{}", bound_addr.port());
+        info!("wrapping `{cmd}` with gateway base {base}");
+        Some(wrap::spawn(cmd, &options.wrap_args, &base)?)
     } else {
         None
     };
@@ -146,20 +124,21 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         }),
     );
 
-    match pi_handle {
-        Some(mut handle) => {
+    match wrap_child {
+        Some(mut child) => {
             tokio::pin!(server);
             tokio::select! {
                 res = &mut server => {
-                    // Gateway stopped (ctrl-c or error); pi dies via kill_on_drop.
+                    // Gateway stopped (ctrl-c or error); kill_on_drop tears the
+                    // wrapped child down too.
                     res.context("gateway server failed")?;
                 }
-                status = handle.child.wait() => {
-                    let status = status.context("waiting on pi failed")?;
+                status = child.wait() => {
+                    let status = status.context("waiting on wrapped child failed")?;
                     shutdown.notify_one();
                     server.await.context("gateway server failed")?;
                     if !status.success() {
-                        bail!("pi exited with status {status}");
+                        bail!("wrapped command exited with status {status}");
                     }
                 }
             }
@@ -170,6 +149,31 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+/// Bind the gateway listener. With `--port`, fail loud on conflict (the user
+/// asked for that exact port). Without it, try 8080 first and fall back to
+/// an OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
+/// fresh one.
+async fn bind_gateway(host: &str, port: Option<u16>) -> CliResult<tokio::net::TcpListener> {
+    if let Some(p) = port {
+        let addr = format!("{host}:{p}");
+        return tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("failed to bind gateway on {addr}"));
+    }
+    let preferred = format!("{host}:{DEFAULT_HTTP_PORT}");
+    match tokio::net::TcpListener::bind(&preferred).await {
+        Ok(listener) => Ok(listener),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            let fallback = format!("{host}:0");
+            info!("failed to bind {preferred}; attempting to bind {fallback}");
+            tokio::net::TcpListener::bind(&fallback)
+                .await
+                .with_context(|| format!("failed to bind gateway on {fallback}"))
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to bind gateway on {preferred}")),
+    }
 }
 
 fn parse_json_body<T: serde::de::DeserializeOwned>(

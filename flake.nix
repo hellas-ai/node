@@ -1,6 +1,10 @@
 {
   description = "Hellas Node";
 
+  # CA derivations let the HF cache packages (and any other system-independent
+  # outputs) substitute across Linux/Darwin from a shared binary cache.
+  nixConfig.extra-experimental-features = ["ca-derivations"];
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
