@@ -17,8 +17,8 @@ repository = "https://github.com/hellas-ai/node"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
-catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "grw/feat/megatooler", default-features = false, features = ["serde", "dag-cbor"] }
-catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "grw/feat/megatooler", default-features = false }
+catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/megatooler-merged", default-features = false, features = ["serde", "dag-cbor"] }
+catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/megatooler-merged", default-features = false }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
