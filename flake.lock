@@ -8,11 +8,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1777045359,
-        "narHash": "sha256-LWSm9EjAb6usIkBf7x38MNGaCx0GYWEKxst3EoGfvCY=",
+        "lastModified": 1777264080,
+        "narHash": "sha256-NomXRNsk7vVCFTkA3SnuG1RrEvwMoUmdZxhNu7fS6Ag=",
         "owner": "hellas-ai",
         "repo": "catgrad",
-        "rev": "d66374ba63aad25bb5c257b7fd5787380fd5a56b",
+        "rev": "5479fdf5c3a4eef0c747b002dd51408708fcf207",
         "type": "github"
       },
       "original": {
@@ -83,11 +83,11 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1777000482,
-        "narHash": "sha256-CZ5FKUSA8FCJf0h9GWdPJXoVVDL9H5yC74GkVc5ubIM=",
+        "lastModified": 1777259803,
+        "narHash": "sha256-fIb/EoVu/1U0qVrE6qZCJ2WCfprRpywNIAVzKEACIQc=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "403c09094a877e6c4816462d00b1a56ff8198e06",
+        "rev": "a6cb2224d975e16b5e67de688c6ad306f7203425",
         "type": "github"
       },
       "original": {
