@@ -95,23 +95,27 @@
       description = "Port for the Hellas node to listen on. Null lets the CLI auto-select.";
     };
     downloadPolicy = mkOption {
-      type = types.nullOr types.str;
+      type = types.nullOr (types.either types.str (types.listOf types.str));
       default = null;
+      example = ["Qwen3/*" "meta-llama/*"];
       description = ''
         Model download policy.
         "skip" (CLI default) never downloads,
         "eager" downloads any requested model,
         and "allow(pattern,...)" downloads only matching Hugging Face models.
+        A list of patterns is shorthand for "allow(p1,p2,...)".
       '';
     };
     executePolicy = mkOption {
-      type = types.nullOr types.str;
+      type = types.nullOr (types.either types.str (types.listOf types.str));
       default = null;
+      example = ["hf/Qwen/*" "graph/llm/*"];
       description = ''
         Graph execution policy.
         "skip" (CLI default) refuses all executions,
         "eager" executes any graph,
         and "allow(hf/pattern,...,graph/pattern,...)" executes only matching requests.
+        A list of patterns is shorthand for "allow(p1,p2,...)".
       '';
     };
     queueSize = mkOption {
@@ -169,11 +173,17 @@
     serve,
   }: let
     optArg = flag: value: lib.optionals (value != null) [flag (toString value)];
+    renderPolicy = value:
+      if value == null
+      then null
+      else if lib.isList value
+      then "allow(${lib.concatStringsSep "," value})"
+      else value;
   in
     ["serve"]
     ++ optArg "--port" serve.port
-    ++ optArg "--download-policy" serve.downloadPolicy
-    ++ optArg "--execute-policy" serve.executePolicy
+    ++ optArg "--download-policy" (renderPolicy serve.downloadPolicy)
+    ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
     ++ optArg "--metrics-port" serve.metricsPort
     ++ optArg "--graffiti" serve.graffiti
