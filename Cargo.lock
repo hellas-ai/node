@@ -653,7 +653,7 @@ dependencies = [
 [[package]]
 name = "catgrad"
 version = "0.2.1"
-source = "git+https://github.com/hellas-ai/catgrad?branch=grw%2Ffeat%2Fmegatooler#62aa3b146b8562fd2ea8bdd02af2eb304069441f"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fmegatooler-merged#ac0e4328a359320f142c7fc7f8b72a0204065f9f"
 dependencies = [
  "blake3",
  "candle-core",
@@ -667,7 +667,7 @@ dependencies = [
 [[package]]
 name = "catgrad-llm"
 version = "0.2.1"
-source = "git+https://github.com/hellas-ai/catgrad?branch=grw%2Ffeat%2Fmegatooler#62aa3b146b8562fd2ea8bdd02af2eb304069441f"
+source = "git+https://github.com/georgewhewell/catgrad?branch=grw%2Ffeat%2Fmegatooler-merged#ac0e4328a359320f142c7fc7f8b72a0204065f9f"
 dependencies = [
  "catgrad",
  "chrono",
