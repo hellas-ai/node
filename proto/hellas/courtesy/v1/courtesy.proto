@@ -13,7 +13,7 @@ service Courtesy {
   rpc QuotePreparedText(QuotePreparedTextRequest) returns (QuotePreparedTextResponse);
   rpc QuotePrompt(QuotePromptRequest) returns (QuotePromptResponse);
   rpc QuoteChatPrompt(QuoteChatPromptRequest) returns (QuoteChatPromptResponse);
-  rpc PublishArtifactBundle(PublishArtifactBundleRequest) returns (PublishArtifactBundleResponse);
+  rpc PutArtifact(PutArtifactRequest) returns (PutArtifactResponse);
   rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc DecodeTokens(stream DecodeTokensRequest) returns (stream DecodeTokensResponse);
@@ -112,36 +112,16 @@ message QuoteChatPromptResponse {
   .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
 }
 
-// Publish canonical catnix artifact bytes and the small symbolic metadata
-// index entries needed to materialize CID-only symbolic requests. This is a
-// courtesy transport for making artifacts available to a provider; the core
-// symbolic request remains only a TextExecution CID.
-message PublishArtifactBundleRequest {
-  repeated bytes canonical_artifacts = 1;
-  repeated SymbolicBoundTermMetadata symbolic_bound_terms = 2;
-  repeated SymbolicExecutionOutputMetadata symbolic_execution_outputs = 3;
+// Store one canonical catnix artifact by its BLAKE3 CID. This API does not
+// publish symbolic metadata such as model locators or lazy substitutions; those
+// are separate provider-local interpretation state.
+message PutArtifactRequest {
+  bytes canonical_artifact = 1;
 }
 
-message PublishArtifactBundleResponse {
-  // BLAKE3 digests of accepted canonical_artifacts, in request order.
-  repeated bytes artifact_cids = 1;
-  uint32 symbolic_bound_terms = 2;
-  uint32 symbolic_execution_outputs = 3;
-}
-
-message SymbolicBoundTermMetadata {
-  // catnix OutputId<BoundTerm>; exactly 32 bytes.
-  bytes bound_term_cid = 1;
-  string huggingface_model_id = 2;
-  string huggingface_revision = 3;
-  string dtype = 4;
-}
-
-message SymbolicExecutionOutputMetadata {
-  // catnix InputId<TextExecution>; exactly 32 bytes.
-  bytes text_execution_cid = 1;
-  // catnix OutputId<TextArtifact>; exactly 32 bytes.
-  bytes text_artifact_cid = 2;
+message PutArtifactResponse {
+  // BLAKE3 digest of canonical_artifact; exactly 32 bytes.
+  bytes cid = 1;
 }
 
 message GetArtifactRequest {

@@ -2,9 +2,9 @@ use hellas_pb::courtesy::courtesy_server::Courtesy;
 use hellas_pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
     GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
-    ListModelsRequest, ListModelsResponse, PublishArtifactBundleRequest,
-    PublishArtifactBundleResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
-    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    ListModelsRequest, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_pb::hellas::execute_server::Execute;
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
@@ -76,19 +76,11 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn publish_artifact_bundle(
+    pub async fn put_artifact(
         &self,
-        request: PublishArtifactBundleRequest,
-    ) -> Result<PublishArtifactBundleResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::PublishArtifactBundle { request, reply })
-            .await
-    }
-
-    pub async fn export_artifact_bundle(
-        &self,
-        request: PbSymbolicRequest,
-    ) -> Result<PublishArtifactBundleRequest, ExecutorError> {
-        self.send(|reply| ExecutorMessage::ExportArtifactBundle { request, reply })
+        request: PutArtifactRequest,
+    ) -> Result<PutArtifactResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::PutArtifact { request, reply })
             .await
     }
 
@@ -206,12 +198,12 @@ impl Courtesy for ExecutorHandle {
         Ok(response)
     }
 
-    async fn publish_artifact_bundle(
+    async fn put_artifact(
         &self,
-        request: Request<PublishArtifactBundleRequest>,
-    ) -> Result<Response<PublishArtifactBundleResponse>, Status> {
+        request: Request<PutArtifactRequest>,
+    ) -> Result<Response<PutArtifactResponse>, Status> {
         Ok(Response::new(
-            self.publish_artifact_bundle(request.into_inner()).await?,
+            self.put_artifact(request.into_inner()).await?,
         ))
     }
 

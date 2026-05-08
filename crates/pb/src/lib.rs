@@ -89,10 +89,9 @@ pub mod courtesy {
         ChatMessage, DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest,
         GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest,
         GetStatsResponse, ListModelsRequest, ListModelsResponse, ModelInfo, ModelStatus,
-        ModelTokenStats, PublishArtifactBundleRequest, PublishArtifactBundleResponse,
-        QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-        QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart,
-        SymbolicBoundTermMetadata, SymbolicExecutionOutputMetadata, SymbolicGenesisStart,
+        ModelTokenStats, PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest,
+        QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
+        QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart, SymbolicGenesisStart,
         SymbolicStart, TokenStats, symbolic_start,
     };
     service_exports!(

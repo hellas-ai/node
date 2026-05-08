@@ -3,9 +3,9 @@ mod handle;
 
 use hellas_pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
-    GetStatsResponse, ListModelsResponse, PublishArtifactBundleRequest,
-    PublishArtifactBundleResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
-    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
@@ -65,13 +65,9 @@ pub(crate) enum ExecutorMessage {
         request: QuoteChatPromptRequest,
         reply: oneshot::Sender<Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>>,
     },
-    PublishArtifactBundle {
-        request: PublishArtifactBundleRequest,
-        reply: oneshot::Sender<Result<PublishArtifactBundleResponse, ExecutorError>>,
-    },
-    ExportArtifactBundle {
-        request: PbSymbolicRequest,
-        reply: oneshot::Sender<Result<PublishArtifactBundleRequest, ExecutorError>>,
+    PutArtifact {
+        request: PutArtifactRequest,
+        reply: oneshot::Sender<Result<PutArtifactResponse, ExecutorError>>,
     },
     GetArtifact {
         request: GetArtifactRequest,
