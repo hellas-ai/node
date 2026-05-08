@@ -65,9 +65,7 @@ pub mod hellas {
 
 #[cfg(feature = "symbolic")]
 pub mod symbolic {
-    pub use crate::generated::hellas::symbolic::v1::{
-        SymbolicGenesisExecution, SymbolicRequest, SymbolicStepExecution, symbolic_request,
-    };
+    pub use crate::generated::hellas::symbolic::v1::SymbolicRequest;
     service_exports!(
         crate::generated::hellas::symbolic::v1,
         symbolic_client,
@@ -92,7 +90,7 @@ pub mod courtesy {
         GetModelStatsResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest,
         ListModelsResponse, ModelInfo, ModelStatus, ModelTokenStats, QuoteChatPromptRequest,
         QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
-        QuotePromptRequest, QuotePromptResponse, SymbolicGenesisStart, SymbolicReceiptStart,
+        QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart, SymbolicGenesisStart,
         SymbolicStart, TokenStats, symbolic_start,
     };
     service_exports!(

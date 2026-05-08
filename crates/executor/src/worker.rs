@@ -1,15 +1,17 @@
 use crate::executor::ExecutorMessage;
 use crate::metrics::ExecutorMetrics;
-use crate::programs::{ExecutionContext, ExecutionStart};
-use crate::runner;
-use crate::state::{Invocation, Termination};
+use crate::state::{Invocation, ModelLocator, StopReason, Termination};
+use catnix::OutputAddressed;
+use chatgrad::PreparedPrompt;
+use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
 use hellas_core::{
     Digest, ProducerSigningKey, SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput,
-    SymbolicRequest,
+    SymbolicRequest, hash_tuple,
 };
 use hellas_pb::hellas::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -32,21 +34,19 @@ pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub model_id: String,
     pub symbolic_request: SymbolicRequest,
+    pub locator: ModelLocator,
     pub invocation: Invocation,
-    pub execution: Arc<ExecutionContext>,
-    pub start: ExecutionStart,
     pub stream_batch_size: u32,
     pub accepted_at: Instant,
-    /// Cooperative cancel signal. The runner polls between decode steps.
-    /// The worker also fires it from inside the on_progress callback when
-    /// the per-execution sender returns Err (consumer dropped).
     pub cancel: CancellationToken,
-    /// Per-execution sender. Worker pushes Chunk frames here as decode
-    /// progresses, and the terminal Outcome at the end. Receiver lives
-    /// with the streaming-RPC consumer; dropping it is the cancel signal.
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
+}
+
+struct DecodeOutcome {
+    stop_reason: StopReason,
+    output_tokens: Vec<u32>,
 }
 
 impl ExecuteWorker {
@@ -66,19 +66,13 @@ impl ExecuteWorker {
             Err(TrySendError::Disconnected(job)) => Err(EnqueueError::Stopped(job)),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn stopped() -> Self {
-        let (tx, rx) = mpsc::sync_channel::<ExecuteJob>(0);
-        drop(rx);
-        Self { tx }
-    }
 }
 
 fn worker_loop(
     rx: Receiver<ExecuteJob>,
     executor_tx: tokio_mpsc::UnboundedSender<ExecutorMessage>,
 ) {
+    let mut engines: HashMap<ModelLocator, ModelEngine> = HashMap::new();
     while let Ok(job) = rx.recv() {
         let execution_id = job.execution_id.clone();
         let model_id = job.model_id.clone();
@@ -88,8 +82,6 @@ fn worker_loop(
         let symbolic_request = job.symbolic_request.clone();
         let producer_key = Arc::clone(&job.producer_key);
 
-        // Track the last reported position so a Failed termination can
-        // honestly report tokens emitted before the error.
         let position = Arc::new(AtomicU64::new(0));
         let on_progress = make_on_progress(
             Arc::clone(&position),
@@ -99,7 +91,7 @@ fn worker_loop(
         );
 
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_job(job, on_progress)
+            run_job(job, on_progress, &mut engines)
         })) {
             Ok(Ok(outcome)) => {
                 match completed_termination(&symbolic_request, &producer_key, outcome) {
@@ -134,8 +126,6 @@ fn worker_loop(
             }
         };
 
-        // Metrics fire on the worker thread — actor doesn't need to know
-        // success/failure, only that the slot is free.
         let generated = termination.position();
         if termination.is_completed() {
             metrics.record_execution_completed(&model_id, generated);
@@ -143,12 +133,7 @@ fn worker_loop(
             metrics.record_execution_failed(&model_id, generated);
         }
 
-        // Send the terminal frame; ignore Err (consumer already dropped).
         let _ = sender.blocking_send(Ok(termination.into_pb()));
-
-        // Signal the actor that the worker is free for the next pending
-        // job. Failure here means the actor is shutting down; nothing to
-        // recover.
         let _ = executor_tx.send(ExecutorMessage::WorkerIdle);
     }
 }
@@ -156,13 +141,12 @@ fn worker_loop(
 fn completed_termination(
     symbolic_request: &SymbolicRequest,
     producer_key: &ProducerSigningKey,
-    outcome: runner::DecodeOutcome,
+    outcome: DecodeOutcome,
 ) -> Result<Termination, hellas_rpc::ExecutorError> {
-    let receipt_bytes = *outcome.receipt_cid.as_bytes();
-    let symbolic_output = SymbolicOutput {
-        text_receipt_cid: Digest::from_bytes(receipt_bytes),
-    };
-    let evidence = SymbolicEvidence::TextReceiptCid(Digest::from_bytes(receipt_bytes));
+    let text_artifact_cid =
+        text_artifact_cid(symbolic_request.text_execution_cid, &outcome.output_tokens);
+    let symbolic_output = SymbolicOutput { text_artifact_cid };
+    let evidence = SymbolicEvidence::TextArtifactCid(text_artifact_cid);
     let receipt = SignedEvidenceReceipt::sign_symbolic(
         symbolic_request,
         &symbolic_output,
@@ -184,45 +168,134 @@ fn completed_termination(
     })
 }
 
+fn text_artifact_cid(text_execution_cid: Digest, output_tokens: &[u32]) -> Digest {
+    let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(text_execution_cid));
+    let generated_tokens_id = catnix::TokenIds::from(output_tokens.to_vec()).output_id();
+    // The text-state bytes will live in the artifact resolver. Until that
+    // lands, derive a stable local state id from the execution and generated
+    // token artifact so the TextArtifact identity has the right shape.
+    let state_digest = hash_tuple(
+        "hellas.executor.synthetic_text_state.v1",
+        &[
+            text_execution_cid.as_bytes(),
+            generated_tokens_id.as_bytes(),
+        ],
+    );
+    let state_id = catnix::TextStateId::from_digest(to_catnix_digest(state_digest));
+    let artifact = catnix::TextArtifact::output(
+        execution_id,
+        output_tokens.len() as u64,
+        state_id,
+        generated_tokens_id,
+    );
+    from_catnix_digest(artifact.output_id().digest())
+}
+
+fn to_catnix_digest(digest: Digest) -> catnix::Digest {
+    catnix::Digest::from_bytes(digest.into_bytes())
+}
+
+fn from_catnix_digest(digest: catnix::Digest) -> Digest {
+    Digest::from_bytes(*digest.as_bytes())
+}
+
 fn run_job(
     job: ExecuteJob,
-    on_progress: impl FnMut(u64, &[u8]),
-) -> Result<runner::DecodeOutcome, hellas_rpc::ExecutorError> {
+    mut on_progress: impl FnMut(u64, &[u8]),
+    engines: &mut HashMap<ModelLocator, ModelEngine>,
+) -> Result<DecodeOutcome, hellas_rpc::ExecutorError> {
     let ExecuteJob {
         execution_id,
+        locator,
         invocation,
-        execution,
-        start,
         stream_batch_size,
         accepted_at,
         cancel,
         ..
     } = job;
 
-    debug!(execution_id = %execution_id, "execute worker running plan");
+    debug!(execution_id = %execution_id, "execute worker running model");
     debug!(
         execution_id = %execution_id,
-        commitment_id = %start.commitment_id,
         queue_wait_ms = accepted_at.elapsed().as_millis(),
         prompt_tokens = invocation.input_ids.len(),
-        cached_output_tokens = start.cached.as_ref().map_or(0, |c| c.output_tokens.len()),
         "execute worker starting"
     );
 
-    runner::run_cached_program_streaming(
-        execution.as_ref(),
-        &start,
-        &invocation,
-        stream_batch_size,
-        &cancel,
-        on_progress,
-    )
+    let engine = match engines.get(&locator) {
+        Some(engine) => engine.clone(),
+        None => {
+            let backend = crate::backend::create_backend()?;
+            let engine = ModelEngine::new_with_backend(
+                &locator.model_id,
+                &locator.revision,
+                backend,
+                true,
+                locator.dtype,
+            )
+            .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
+            engines.insert(locator.clone(), engine.clone());
+            engine
+        }
+    };
+    let prepared = PreparedPrompt::new(
+        input_ids_to_i32(&invocation.input_ids)?,
+        invocation.stop_token_ids,
+    );
+    let batch_size = usize::try_from(stream_batch_size.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let mut output_tokens = Vec::new();
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut generated = 0u64;
+
+    let generated_output = engine
+        .generate_tokens_from_prepared(&prepared, invocation.max_new_tokens, |token| {
+            generated = generated.saturating_add(1);
+            output_tokens.push(token.token_id);
+            pending.push(token.token_id);
+            if pending.len() >= batch_size {
+                on_progress(generated, &hellas_rpc::encode_token_ids(&pending));
+                pending.clear();
+            }
+            if cancel.is_cancelled() {
+                Ok(GenerationControl::Cancel)
+            } else {
+                Ok(GenerationControl::Continue)
+            }
+        })
+        .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
+
+    if !pending.is_empty() {
+        on_progress(generated, &hellas_rpc::encode_token_ids(&pending));
+    }
+
+    let stop_reason = match generated_output.termination {
+        GenerationTermination::Stop => StopReason::EndOfSequence,
+        GenerationTermination::MaxTokens => StopReason::MaxNewTokens,
+        GenerationTermination::Cancelled => StopReason::Cancelled,
+    };
+
+    Ok(DecodeOutcome {
+        stop_reason,
+        output_tokens,
+    })
 }
 
-/// Build the per-chunk callback the runner invokes. It pushes a `Chunk`
-/// frame onto the per-execution sender and, on send failure (consumer
-/// dropped the receiver), fires the cancel token so the runner exits at
-/// the next decode boundary.
+fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, hellas_rpc::ExecutorError> {
+    input_ids
+        .iter()
+        .copied()
+        .map(|token| {
+            i32::try_from(token).map_err(|_| {
+                hellas_rpc::ExecutorError::InvalidTokenPayload(format!(
+                    "token id {token} exceeds i32 range"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn make_on_progress(
     position: Arc<AtomicU64>,
     sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,

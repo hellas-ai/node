@@ -22,14 +22,15 @@ service Courtesy {
 message SymbolicStart {
   oneof kind {
     SymbolicGenesisStart genesis = 1;
-    SymbolicReceiptStart receipt = 2;
+    SymbolicArtifactStart artifact = 2;
   }
 }
 
 message SymbolicGenesisStart {}
 
-message SymbolicReceiptStart {
-  bytes receipt_cid = 1; // exactly 32 bytes
+message SymbolicArtifactStart {
+  // catnix OutputId<TextArtifact>; exactly 32 bytes.
+  bytes artifact_cid = 1;
 }
 
 message QuotePreparedTextRequest {

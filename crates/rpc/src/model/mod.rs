@@ -5,7 +5,6 @@ mod hf;
 use std::path::PathBuf;
 
 use catgrad_llm::LLMError;
-use catgrad_llm::runtime::chat::ChatTurnConfigError;
 use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;
@@ -79,12 +78,4 @@ pub enum ModelAssetsError {
         #[source]
         source: TokenizerError,
     },
-    /// `ChatTurn::new` rejected the request — currently the only
-    /// such case is a tools-bound request against an architecture
-    /// with no registered tool-call protocol. Gateway maps to a
-    /// request error (400). Wire-tools shape errors are caught
-    /// earlier by `ToolDirectory::from_*_tools` at the surface edge,
-    /// so they never reach here.
-    #[error(transparent)]
-    ChatTurnConfig(#[from] ChatTurnConfigError),
 }

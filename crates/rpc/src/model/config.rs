@@ -1,7 +1,3 @@
-use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::text_program_from_config;
-use serde_json::Value;
-
 use super::{ModelAssetsError, Result};
 
 pub(super) fn encode_i32_tokens(
@@ -12,16 +8,4 @@ pub(super) fn encode_i32_tokens(
         .iter()
         .map(|&token| u32::try_from(token).map_err(|_| make_error(token)))
         .collect()
-}
-
-pub(super) fn build_program_bytes(
-    config: &Value,
-    max_sequence_length: usize,
-    dtype: Dtype,
-) -> Result<Vec<u8>> {
-    let spec = text_program_from_config(config, max_sequence_length, dtype)
-        .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
-    serde_json::to_vec(&spec).map_err(|source| ModelAssetsError::SerializeProgram {
-        source: catgrad_llm::LLMError::from(source),
-    })
 }

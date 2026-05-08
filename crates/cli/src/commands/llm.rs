@@ -4,7 +4,7 @@ use crate::execution::{
 };
 use crate::text_output::TextOutputDecoder;
 use catgrad::prelude::Dtype;
-use catgrad_llm::types::{Message, openai::ChatMessage};
+use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;

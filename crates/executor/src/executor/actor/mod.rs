@@ -1,14 +1,9 @@
 mod execution;
 mod quote;
 
-#[cfg(test)]
-mod tests;
-
-use crate::artifacts::InMemoryArtifactStore;
 use crate::backend;
 use crate::metrics::ExecutorMetrics;
-use crate::programs;
-use crate::state::ExecutorState;
+use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
@@ -26,12 +21,7 @@ pub struct Executor {
     pub(super) store: ExecutorState,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
-    pub(super) artifacts: InMemoryArtifactStore,
-    pub(super) symbolic_contexts: HashMap<
-        catgrad::cid::Cid<catgrad::runtime::ProgramBinding>,
-        Arc<programs::ExecutionContext>,
-    >,
-    pub(super) programs: programs::Cache,
+    pub(super) models: HashMap<ModelLocator, LocalModelStatus>,
     pub(super) worker: ExecuteWorker,
     pub(super) execute_policy: ExecutePolicy,
     pub(super) metrics: Arc<ExecutorMetrics>,
@@ -94,7 +84,7 @@ impl Executor {
     }
 
     pub fn spawn_with_metrics_and_producer_key(
-        download_policy: DownloadPolicy,
+        _download_policy: DownloadPolicy,
         execute_policy: ExecutePolicy,
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
@@ -112,9 +102,7 @@ impl Executor {
             store: ExecutorState::new(),
             pending_executions: VecDeque::new(),
             queue_capacity,
-            artifacts: InMemoryArtifactStore::default(),
-            symbolic_contexts: HashMap::new(),
-            programs: programs::Cache::new(download_policy),
+            models: HashMap::new(),
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
             metrics,

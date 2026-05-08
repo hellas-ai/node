@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
-use catgrad_llm::types::Message;
+use catgrad_llm::LLMError;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
-use catgrad_llm::{LLMError, PreparedPrompt};
+use chatgrad::types::Message;
+use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
 use hellas_pb::courtesy::{
     QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
 };
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::config::{build_program_bytes, encode_i32_tokens};
+use super::config::encode_i32_tokens;
 use super::hf::get_model_metadata_files;
 use super::{ModelAssetsError, Result};
 use crate::spec::ModelSpec;
@@ -98,10 +98,6 @@ impl ModelAssets {
         })
     }
 
-    pub fn build_program_bytes_for_sequence(&self, max_sequence_length: usize) -> Result<Vec<u8>> {
-        build_program_bytes(&self.config, max_sequence_length, self.dtype)
-    }
-
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
     }
@@ -122,6 +118,31 @@ impl ModelAssets {
         .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 
+    pub fn prepare_chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<PreparedPrompt> {
+        let template = self.chat_template.as_deref().ok_or_else(|| {
+            ModelAssetsError::PreparePromptRequest {
+                source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
+            }
+        })?;
+        PreparedPrompt::from_messages_with_options(
+            &self.tokenizer,
+            template,
+            &self.tokenizer_config,
+            messages,
+            &self.stop_token_ids,
+            RenderChatTemplateOptions {
+                enable_thinking,
+                tools,
+            },
+        )
+        .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+    }
+
     pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
         PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
             .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
@@ -133,47 +154,10 @@ impl ModelAssets {
             .map_err(|source| ModelAssetsError::DecodeTokens { source })
     }
 
-    /// Build a `ChatTurn` for one chat-completion request.
-    ///
-    /// The caller supplies an already-built [`ToolDirectory`] (or
-    /// `None` for no tools) — wire-shape conversion happens at the
-    /// gateway edge via `ToolDirectory::from_openai_tools` /
-    /// `ToolDirectory::from_anthropic_tools`. This keeps `ModelAssets`
-    /// independent of any one wire surface.
-    ///
-    /// Errors:
-    /// - `PreparePromptRequest` if the model has no chat template or
-    ///   the architecture string can't be extracted.
-    /// - `ChatTurnConfig` if `ChatTurn::new` rejects the binding
-    ///   (e.g. tools bound for an arch with no tool-call protocol) —
-    ///   the variant carries the typed catgrad-llm error and the
-    ///   gateway maps to HTTP 400.
-    pub fn chat_turn(
-        &self,
-        tools: Option<Arc<ToolDirectory>>,
-        options: ChatOptions,
-    ) -> Result<ChatTurn> {
-        let chat_template = self
-            .chat_template
-            .as_ref()
-            .ok_or_else(|| ModelAssetsError::PreparePromptRequest {
-                source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
-            })?
-            .clone();
-
-        let arch = get_model_architecture(&self.config)
-            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })?
-            .to_string();
-
-        Ok(ChatTurn::new(
-            arch,
-            chat_template,
-            Arc::clone(&self.tokenizer),
-            Arc::clone(&self.tokenizer_config),
-            Arc::clone(&self.stop_token_ids),
-            tools,
-            options,
-        )?)
+    pub fn architecture(&self) -> Result<String> {
+        get_model_architecture(&self.config)
+            .map(str::to_string)
+            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 }
 
@@ -182,6 +166,7 @@ fn dtype_to_wire(dtype: Dtype) -> &'static str {
         Dtype::F32 => "f32",
         Dtype::F16 => "f16",
         Dtype::BF16 => "bf16",
+        Dtype::F8 => "f8",
         Dtype::U32 => "u32",
     }
 }
