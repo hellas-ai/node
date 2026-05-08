@@ -93,20 +93,20 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, stop_reason, receipt_cid) = match outcome {
+    let (total_tokens, stop_reason, receipt) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
-            receipt_cid,
+            receipt,
         } => {
             info!(
-                %receipt_cid,
+                receipt = %receipt.encoded(),
                 ?provenance,
                 total_tokens,
                 ?stop_reason,
                 "openai chat completion ready"
             );
-            (total_tokens, stop_reason, receipt_cid)
+            (total_tokens, stop_reason, receipt)
         }
         Outcome::Failed { position, error } => {
             warn!(position, %error, "openai chat request failed");
@@ -145,8 +145,8 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         .build();
 
     let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt_cid),
-        None => HellasExt::receipt(&receipt_cid),
+        Some(prov) => HellasExt::both(prov, &receipt),
+        None => HellasExt::receipt(&receipt),
     };
     let body = WithHellas::new(response, hellas);
 
@@ -154,7 +154,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
-    response.extensions_mut().insert(receipt_cid);
+    response.extensions_mut().insert(receipt);
     response
 }
 
@@ -247,7 +247,7 @@ where
     S: futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static,
 {
     stream! {
-        // Start frame: role:assistant chunk carrying hellas.commitment_id
+        // Start frame: role:assistant chunk carrying hellas.commitment
         // when provenance is available. Browser EventSource and many
         // WASM HTTP wrappers swallow response headers, so the in-band
         // JSON extension is the canonical commitment carrier here.
@@ -374,10 +374,10 @@ where
             Outcome::Completed {
                 stop_reason,
                 total_tokens,
-                receipt_cid,
+                receipt,
             } => {
                 info!(
-                    %receipt_cid,
+                    receipt = %receipt.encoded(),
                     provenance = ?provenance,
                     total_tokens,
                     ?stop_reason,
@@ -404,7 +404,7 @@ where
 
                 // Build all post-pump chunks (mapper finish output +
                 // optional usage chunk) into one ordered vec so we can
-                // tag the LAST one with hellas.receipt_id. Per the
+                // tag the LAST one with hellas.receipt. Per the
                 // approved plan: receipt rides the SEMANTIC TERMINAL
                 // event — the last `data:` chunk before `[DONE]`. With
                 // include_usage that's the usage chunk; otherwise the
@@ -438,7 +438,7 @@ where
                 // it rather than silently drop it on the floor.
                 if tail_chunks.is_empty() {
                     error!(
-                        %receipt_cid,
+                        receipt = %receipt.encoded(),
                         "openai chat finish produced zero tail chunks; synthesizing terminal frame to carry receipt"
                     );
                     tail_chunks.push(wrap_chunk(
@@ -455,7 +455,7 @@ where
                 let last_idx = tail_chunks.len() - 1;
                 for (idx, chunk) in tail_chunks.into_iter().enumerate() {
                     if idx == last_idx {
-                        let wrapped = WithHellas::new(chunk, HellasExt::receipt(&receipt_cid));
+                        let wrapped = WithHellas::new(chunk, HellasExt::receipt(&receipt));
                         yield OpenAiSsePayload::Json(serde_json::to_value(wrapped).unwrap());
                     } else {
                         yield OpenAiSsePayload::Json(serde_json::to_value(chunk).unwrap());
@@ -538,19 +538,17 @@ mod streaming_done_tests {
     //! clients the response was a successful empty completion.
     //!
     //! Positive-path coverage asserts:
-    //! - first chunk carries `hellas.commitment_id` when provenance is
+    //! - first chunk carries `hellas.commitment` when provenance is
     //!   provided, and no `hellas` field otherwise;
     //! - the SEMANTIC TERMINAL chunk (last `data:` before `[DONE]`)
-    //!   carries `hellas.receipt_id`. With `include_usage=true` that's
+    //!   carries `hellas.receipt`. With `include_usage=true` that's
     //!   the trailing usage chunk; without, the finish-reason chunk;
-    //! - error paths NEVER emit `hellas.receipt_id`;
+    //! - error paths NEVER emit `hellas.receipt`;
     //! - no separate `event: hellas-*` SSE events appear (the
     //!   `OpenAiSsePayload` enum no longer has variants for them).
 
     use super::*;
-    use crate::execution::{Outcome, StopReason as ExecStopReason};
-    use catgrad::cid::Cid;
-    use catgrad_llm::runtime::TextReceipt;
+    use crate::execution::{Outcome, ReceiptArtifact, StopReason as ExecStopReason};
     use catgrad_llm::runtime::chat::PassthroughParser;
     use futures::StreamExt;
     use std::time::Duration;
@@ -580,22 +578,22 @@ mod streaming_done_tests {
         }
     }
 
-    fn test_receipt() -> Cid<TextReceipt> {
-        Cid::<TextReceipt>::from_bytes([0xcd; 32])
+    fn test_receipt() -> ReceiptArtifact {
+        ReceiptArtifact::from_test_bytes(vec![0xcd; 32])
     }
 
     /// Successful upstream: one delta then `Outcome::Completed`. The
     /// receipt CID lands inside the terminal frame via the gateway's
     /// `Outcome::Completed` arm.
     fn happy_upstream(
-        receipt_cid: Cid<TextReceipt>,
+        receipt: ReceiptArtifact,
     ) -> impl futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static {
         futures::stream::iter(vec![
             Ok(GenerationEvent::Delta("hi".to_string())),
             Ok(GenerationEvent::Done(Outcome::Completed {
                 total_tokens: 1,
                 stop_reason: ExecStopReason::EndOfSequence,
-                receipt_cid,
+                receipt,
             })),
         ])
     }
@@ -630,19 +628,19 @@ mod streaming_done_tests {
         }
     }
 
-    /// `chunk.hellas.commitment_id` if present.
+    /// `chunk.hellas.commitment` if present.
     fn commitment_of(p: &OpenAiSsePayload) -> Option<&str> {
         as_json(p)
             .get("hellas")
-            .and_then(|h| h.get("commitment_id"))
+            .and_then(|h| h.get("commitment"))
             .and_then(|v| v.as_str())
     }
 
-    /// `chunk.hellas.receipt_id` if present.
+    /// `chunk.hellas.receipt` if present.
     fn receipt_of(p: &OpenAiSsePayload) -> Option<&str> {
         as_json(p)
             .get("hellas")
-            .and_then(|h| h.get("receipt_id"))
+            .and_then(|h| h.get("receipt"))
             .and_then(|v| v.as_str())
     }
 
@@ -707,7 +705,7 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "transport error must not leak hellas.receipt_id, got: {payloads:#?}"
+            "transport error must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
@@ -752,7 +750,7 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "timeout must not leak hellas.receipt_id, got: {payloads:#?}"
+            "timeout must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
@@ -796,13 +794,13 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "Outcome::Failed must not leak hellas.receipt_id, got: {payloads:#?}"
+            "Outcome::Failed must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
     /// Happy path with provenance: first chunk carries
-    /// `hellas.commitment_id`; the SEMANTIC TERMINAL chunk (the one
-    /// just before `[DONE]`) carries `hellas.receipt_id`; intermediate
+    /// `hellas.commitment`; the SEMANTIC TERMINAL chunk (the one
+    /// just before `[DONE]`) carries `hellas.receipt`; intermediate
     /// chunks carry no hellas field.
     #[tokio::test]
     async fn commitment_on_first_chunk_receipt_on_terminal_chunk() {
@@ -810,6 +808,7 @@ mod streaming_done_tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         let prov = test_provenance();
         let receipt = test_receipt();
+        let expected_receipt = receipt.encoded();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
             id,
@@ -844,7 +843,7 @@ mod streaming_done_tests {
             has_finish_reason(terminal),
             "without include_usage, terminal chunk must carry finish_reason: {terminal:?}"
         );
-        assert_eq!(receipt_of(terminal), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(terminal), Some(expected_receipt.as_str()));
 
         // Receipt appears EXACTLY once across the whole stream.
         let receipts: Vec<_> = json_payloads.iter().filter_map(|p| receipt_of(p)).collect();
@@ -858,6 +857,8 @@ mod streaming_done_tests {
     async fn no_provenance_means_no_commitment_field() {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
+        let receipt = test_receipt();
+        let expected_receipt = receipt.encoded();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
             id,
@@ -869,7 +870,7 @@ mod streaming_done_tests {
             parser,
             mapper,
             None,
-            happy_upstream(test_receipt()),
+            happy_upstream(receipt),
         )
         .collect()
         .await;
@@ -888,7 +889,7 @@ mod streaming_done_tests {
             .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
             .last()
             .unwrap();
-        assert_eq!(receipt_of(json_last), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(json_last), Some(expected_receipt.as_str()));
     }
 
     /// `include_usage=true`: receipt rides the trailing usage chunk
@@ -898,6 +899,8 @@ mod streaming_done_tests {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
 
+        let receipt = test_receipt();
+        let expected_receipt = receipt.encoded();
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
             id,
             created,
@@ -908,7 +911,7 @@ mod streaming_done_tests {
             parser,
             mapper,
             Some(test_provenance()),
-            happy_upstream(test_receipt()),
+            happy_upstream(receipt),
         )
         .collect()
         .await;
@@ -929,7 +932,7 @@ mod streaming_done_tests {
             .expect("finish-reason chunk always emitted on success");
 
         // Usage chunk is the terminal event and carries the receipt.
-        assert_eq!(receipt_of(usage), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(usage), Some(expected_receipt.as_str()));
         // Finish-reason chunk is NO LONGER the terminal event when
         // usage is enabled — it must NOT carry the receipt.
         assert_eq!(

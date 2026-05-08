@@ -1,6 +1,6 @@
-//! Tower middleware that lifts `ExecutionProvenance` (and an optional
-//! terminal `Cid<TextReceipt>`) from response extensions into the
-//! `x-hellas-*` HTTP response headers.
+//! Tower middleware that lifts `ExecutionProvenance` and, when known before
+//! headers are sent, a terminal signed receipt envelope from response
+//! extensions into `x-hellas-*` HTTP response headers.
 //!
 //! Handlers stay free of header-attachment boilerplate: they insert the
 //! typed values into `response.extensions_mut()` and this layer renders
@@ -11,12 +11,12 @@
 
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
-use catgrad::cid::Cid;
-use catgrad_llm::runtime::TextReceipt;
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
+
+use crate::execution::ReceiptArtifact;
 
 #[derive(Clone, Default)]
 pub(super) struct ProvenanceLayer;
@@ -68,10 +68,10 @@ fn apply_provenance_headers(response: &mut Response<Body>) {
             .headers_mut()
             .insert(commitment_header(), header_value(&prov.commitment_id));
     }
-    if let Some(receipt) = extensions.get::<Cid<TextReceipt>>() {
+    if let Some(receipt) = extensions.get::<ReceiptArtifact>() {
         response
             .headers_mut()
-            .insert(receipt_header(), header_value(receipt.as_bytes()));
+            .insert(receipt_header(), receipt_header_value(receipt));
     }
 }
 
@@ -88,6 +88,11 @@ fn header_value(bytes: &[u8; 32]) -> HeaderValue {
         .expect("64-char lowercase hex is always a valid header value")
 }
 
+fn receipt_header_value(receipt: &ReceiptArtifact) -> HeaderValue {
+    HeaderValue::from_str(&receipt.encoded())
+        .expect("base64url receipt envelope is always a valid header value")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,7 +100,7 @@ mod tests {
 
     fn build_response_with_extensions(
         prov: Option<ExecutionProvenance>,
-        receipt: Option<Cid<TextReceipt>>,
+        receipt: Option<ReceiptArtifact>,
     ) -> Response<Body> {
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -115,7 +120,8 @@ mod tests {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
         };
-        let receipt = Cid::<TextReceipt>::from_bytes([0xef; 32]);
+        let receipt = ReceiptArtifact::from_test_bytes(vec![0xef; 32]);
+        let expected_receipt = receipt.encoded();
         let mut response = build_response_with_extensions(Some(prov.clone()), Some(receipt));
         apply_provenance_headers(&mut response);
         assert_eq!(
@@ -130,7 +136,7 @@ mod tests {
                 .headers()
                 .get(RECEIPT_HEADER)
                 .and_then(|v| v.to_str().ok()),
-            Some("ef".repeat(32).as_str())
+            Some(expected_receipt.as_str())
         );
     }
 
@@ -167,7 +173,7 @@ mod tests {
             let prov = ExecutionProvenance {
                 commitment_id: [0x12; 32],
             };
-            let receipt = Cid::<TextReceipt>::from_bytes([0x56; 32]);
+            let receipt = ReceiptArtifact::from_test_bytes(vec![0x56; 32]);
             let mut response = Response::new(Body::empty());
             response.extensions_mut().insert(prov);
             response.extensions_mut().insert(receipt);
@@ -186,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(RECEIPT_HEADER).unwrap(),
-            &"56".repeat(32)
+            &ReceiptArtifact::from_test_bytes(vec![0x56; 32]).encoded()
         );
     }
 }

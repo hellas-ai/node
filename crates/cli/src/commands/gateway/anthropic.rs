@@ -87,20 +87,20 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, exec_stop, receipt_cid) = match outcome {
+    let (total_tokens, exec_stop, receipt) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
-            receipt_cid,
+            receipt,
         } => {
             info!(
-                %receipt_cid,
+                receipt = %receipt.encoded(),
                 ?provenance,
                 total_tokens,
                 ?stop_reason,
                 "anthropic message completion ready"
             );
-            (total_tokens, stop_reason, receipt_cid)
+            (total_tokens, stop_reason, receipt)
         }
         Outcome::Failed { position, error } => {
             warn!(position, %error, "anthropic message request failed");
@@ -134,8 +134,8 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         .build();
 
     let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt_cid),
-        None => HellasExt::receipt(&receipt_cid),
+        Some(prov) => HellasExt::both(prov, &receipt),
+        None => HellasExt::receipt(&receipt),
     };
     let body = WithHellas::new(response, hellas);
 
@@ -143,7 +143,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
-    response.extensions_mut().insert(receipt_cid);
+    response.extensions_mut().insert(receipt);
     response
 }
 
@@ -222,10 +222,10 @@ where
     S: futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static,
 {
     stream! {
-        // Stamp hellas.commitment_id INSIDE message_start.message
+        // Stamp hellas.commitment INSIDE message_start.message
         // (on the MessageResponse), so the field path is identical
-        // between streaming (`message_start.message.hellas.commitment_id`)
-        // and non-streaming (`hellas.commitment_id` on MessageResponse).
+        // between streaming (`message_start.message.hellas.commitment`)
+        // and non-streaming (`hellas.commitment` on MessageResponse).
         // Browser EventSource consumers can't read response headers,
         // so this in-band placement is the canonical commitment carrier.
         let message = anthropic::MessageResponse::builder()
@@ -362,10 +362,10 @@ where
             Outcome::Completed {
                 stop_reason,
                 total_tokens,
-                receipt_cid,
+                receipt,
             } => {
                 info!(
-                    %receipt_cid,
+                    receipt = %receipt.encoded(),
                     provenance = ?provenance,
                     total_tokens,
                     ?stop_reason,
@@ -404,11 +404,11 @@ where
                 }
 
                 // message_stop is the SEMANTIC TERMINAL event.
-                // Wrapping it with hellas.receipt_id makes "receipt
+                // Wrapping it with hellas.receipt makes "receipt
                 // is on the terminal event" a testable invariant.
                 let stop_event = WithHellas::new(
                     anthropic::MessageStreamEvent::MessageStop,
-                    HellasExt::receipt(&receipt_cid),
+                    HellasExt::receipt(&receipt),
                 );
                 yield AnthropicSsePayload {
                     name: "message_stop",
@@ -507,20 +507,18 @@ mod streaming_tests {
     //! Drives `build_anthropic_sse_stream` with synthetic upstream
     //! streams and asserts the contract:
     //! - first event is `message_start` and its `.message` carries
-    //!   `hellas.commitment_id` (parity with non-streaming
+    //!   `hellas.commitment` (parity with non-streaming
     //!   `MessageResponse`);
     //! - on `Outcome::Completed`, `message_stop` is the SEMANTIC
-    //!   TERMINAL event and carries `hellas.receipt_id`;
+    //!   TERMINAL event and carries `hellas.receipt`;
     //! - error paths (transport / timeout / `Outcome::Failed`) emit
-    //!   NO `hellas.receipt_id` and the `error` event is the closer
+    //!   NO `hellas.receipt` and the `error` event is the closer
     //!   (no `message_stop` follows it).
     //! - `message_delta` does NOT carry the receipt — that lives on
     //!   `message_stop`.
 
     use super::*;
-    use crate::execution::{Outcome, StopReason as ExecStopReason};
-    use catgrad::cid::Cid;
-    use catgrad_llm::runtime::TextReceipt;
+    use crate::execution::{Outcome, ReceiptArtifact, StopReason as ExecStopReason};
     use catgrad_llm::runtime::chat::PassthroughParser;
     use futures::StreamExt;
     use std::time::Duration;
@@ -548,19 +546,19 @@ mod streaming_tests {
         }
     }
 
-    fn test_receipt() -> Cid<TextReceipt> {
-        Cid::<TextReceipt>::from_bytes([0xcd; 32])
+    fn test_receipt() -> ReceiptArtifact {
+        ReceiptArtifact::from_test_bytes(vec![0xcd; 32])
     }
 
     fn happy_upstream(
-        receipt_cid: Cid<TextReceipt>,
+        receipt: ReceiptArtifact,
     ) -> impl futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static {
         futures::stream::iter(vec![
             Ok(GenerationEvent::Delta("hi".to_string())),
             Ok(GenerationEvent::Done(Outcome::Completed {
                 total_tokens: 1,
                 stop_reason: ExecStopReason::EndOfSequence,
-                receipt_cid,
+                receipt,
             })),
         ])
     }
@@ -568,7 +566,7 @@ mod streaming_tests {
     fn receipt_of(p: &AnthropicSsePayload) -> Option<&str> {
         p.json
             .get("hellas")
-            .and_then(|h| h.get("receipt_id"))
+            .and_then(|h| h.get("receipt"))
             .and_then(|v| v.as_str())
     }
 
@@ -579,7 +577,7 @@ mod streaming_tests {
         p.json
             .get("message")
             .and_then(|m| m.get("hellas"))
-            .and_then(|h| h.get("commitment_id"))
+            .and_then(|h| h.get("commitment"))
             .and_then(|v| v.as_str())
     }
 
@@ -591,6 +589,8 @@ mod streaming_tests {
         let (id, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
 
+        let receipt = test_receipt();
+        let expected_receipt = receipt.encoded();
         let payloads: Vec<AnthropicSsePayload> = build_anthropic_sse_stream(
             id,
             model,
@@ -599,7 +599,7 @@ mod streaming_tests {
             parser,
             mapper,
             Some(test_provenance()),
-            happy_upstream(test_receipt()),
+            happy_upstream(receipt),
         )
         .collect()
         .await;
@@ -613,7 +613,7 @@ mod streaming_tests {
 
         let last = payloads.last().expect("non-empty");
         assert_eq!(last.name, "message_stop", "message_stop must be terminal");
-        assert_eq!(receipt_of(last), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(last), Some(expected_receipt.as_str()));
 
         // Receipt appears EXACTLY once and only on message_stop.
         let receipt_carriers: Vec<&'static str> = payloads
@@ -632,7 +632,7 @@ mod streaming_tests {
         for d in deltas {
             assert!(
                 receipt_of(d).is_none(),
-                "message_delta must not carry hellas.receipt_id: {d:?}"
+                "message_delta must not carry hellas.receipt: {d:?}"
             );
         }
     }
@@ -699,7 +699,7 @@ mod streaming_tests {
         );
         assert!(
             payloads.iter().all(|p| receipt_of(p).is_none()),
-            "transport error must not leak hellas.receipt_id: {payloads:#?}"
+            "transport error must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 

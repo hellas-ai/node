@@ -31,6 +31,8 @@
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use catgrad::cid::Cid;
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
@@ -168,13 +170,63 @@ pub enum Outcome {
     Completed {
         total_tokens: u64,
         stop_reason: StopReason,
-        receipt_cid: Cid<TextReceipt>,
+        receipt: ReceiptArtifact,
     },
     Failed {
         /// Tokens emitted before the failure (for honest usage reporting).
         position: u64,
         error: String,
     },
+}
+
+/// Verified signed receipt envelope bytes as delivered by the executor.
+///
+/// The gateway exposes these bytes directly as `hellas.receipt`. Symbolic
+/// callers that need catgrad's `TextReceipt` CID can project it from the
+/// verified envelope, but that CID is not the universal receipt identity.
+#[derive(Debug, Clone)]
+pub struct ReceiptArtifact {
+    dag_cbor: Vec<u8>,
+    symbolic_text_receipt_cid: Option<Cid<TextReceipt>>,
+}
+
+impl ReceiptArtifact {
+    pub fn from_pb(envelope: Option<pb::ReceiptEnvelope>) -> anyhow::Result<Self> {
+        let (dag_cbor, core) = decode_receipt_envelope(envelope)?;
+        verify_receipt(&core).context("receipt signature verification failed")?;
+        Ok(Self::from_verified_core(dag_cbor, &core))
+    }
+
+    pub fn encoded(&self) -> String {
+        URL_SAFE_NO_PAD.encode(&self.dag_cbor)
+    }
+
+    pub fn symbolic_text_receipt_cid(&self) -> Option<Cid<TextReceipt>> {
+        self.symbolic_text_receipt_cid
+    }
+
+    fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreReceiptEnvelope) -> Self {
+        let symbolic_text_receipt_cid = match core {
+            CoreReceiptEnvelope::Symbolic(receipt) => match receipt.evidence() {
+                SymbolicEvidence::TextReceiptCid(digest) => {
+                    Some(Cid::from_bytes(digest.into_bytes()))
+                }
+            },
+            CoreReceiptEnvelope::Opaque(_) => None,
+        };
+        Self {
+            dag_cbor,
+            symbolic_text_receipt_cid,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_bytes(dag_cbor: Vec<u8>) -> Self {
+        Self {
+            dag_cbor,
+            symbolic_text_receipt_cid: None,
+        }
+    }
 }
 
 impl Outcome {
@@ -439,16 +491,21 @@ impl PreparedExecution {
 /// situations but distinguished for diagnostics.
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
     let primary_cid = match &primary {
-        Outcome::Completed { receipt_cid, .. } => *receipt_cid,
+        Outcome::Completed { receipt, .. } => receipt
+            .symbolic_text_receipt_cid()
+            .ok_or_else(|| anyhow!("primary symbolic execution did not produce TextReceipt CID"))?,
         Outcome::Failed { .. } => return Ok(primary),
     };
 
     let shadow_outcome = drain_to_outcome(shadow.stream()).await?;
     match shadow_outcome {
         Outcome::Completed {
-            receipt_cid: shadow_cid,
+            receipt: shadow_receipt,
             ..
         } => {
+            let shadow_cid = shadow_receipt.symbolic_text_receipt_cid().ok_or_else(|| {
+                anyhow!("shadow symbolic execution did not produce TextReceipt CID")
+            })?;
             if primary_cid == shadow_cid {
                 Ok(primary)
             } else {
@@ -981,12 +1038,15 @@ fn convert_opaque_wire_event(
 }
 
 fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
-    let receipt_cid = receipt_cid_from_envelope(finished.receipt)?;
+    let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
+    if receipt.symbolic_text_receipt_cid().is_none() {
+        bail!("symbolic execution returned an opaque receipt");
+    }
     let stop_reason = stop_reason_from_pb(finished.status)?;
     Ok(Outcome::Completed {
         total_tokens: finished.total_units,
         stop_reason,
-        receipt_cid,
+        receipt,
     })
 }
 
@@ -998,11 +1058,7 @@ fn parse_opaque_finished(
     serde_json::from_slice::<serde_json::Value>(&finished.output)
         .context("opaque output must be UTF-8 JSON")?;
     let output = JsonBytes::new(finished.output.clone());
-    let envelope = finished
-        .receipt
-        .ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
-    let core: CoreReceiptEnvelope = decode_dag_cbor(&envelope.dag_cbor)
-        .context("failed to decode receipt envelope dag-cbor")?;
+    let (_dag_cbor, core) = decode_receipt_envelope(finished.receipt)?;
     verify_delivery(
         DeliveryRequest::Opaque(request),
         DeliveryOutput::Opaque(&output),
@@ -1033,19 +1089,13 @@ fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRe
     })
 }
 
-fn receipt_cid_from_envelope(
+fn decode_receipt_envelope(
     envelope: Option<pb::ReceiptEnvelope>,
-) -> anyhow::Result<Cid<TextReceipt>> {
+) -> anyhow::Result<(Vec<u8>, CoreReceiptEnvelope)> {
     let envelope = envelope.ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
     let core: CoreReceiptEnvelope = decode_dag_cbor(&envelope.dag_cbor)
         .context("failed to decode receipt envelope dag-cbor")?;
-    verify_receipt(&core).context("receipt signature verification failed")?;
-    match core {
-        CoreReceiptEnvelope::Symbolic(receipt) => match receipt.evidence() {
-            SymbolicEvidence::TextReceiptCid(digest) => Ok(Cid::from_bytes(digest.into_bytes())),
-        },
-        CoreReceiptEnvelope::Opaque(_) => bail!("symbolic execution returned an opaque receipt"),
-    }
+    Ok((envelope.dag_cbor, core))
 }
 
 fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
