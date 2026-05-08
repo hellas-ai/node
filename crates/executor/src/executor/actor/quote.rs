@@ -21,11 +21,13 @@ use hellas_core::{
     CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
     SymbolicRequest, SymbolicStepRequest,
 };
-use hellas_pb::hellas::{
-    CreateTicketRequest, ListModelsResponse, ModelInfo, ModelStatus, QuoteChatPromptRequest,
-    QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
-    QuotePromptRequest, QuotePromptResponse, Ticket, work_request,
+use hellas_pb::courtesy::{
+    ListModelsResponse, ModelInfo, ModelStatus, QuoteChatPromptRequest, QuoteChatPromptResponse,
+    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_pb::hellas::Ticket;
+use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -103,24 +105,26 @@ impl Executor {
         Ok(())
     }
 
-    pub(super) async fn handle_quote(
+    pub(super) async fn handle_quote_symbolic(
         &mut self,
-        request: CreateTicketRequest,
+        request: PbSymbolicRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        match work_request_from_ticket_request(request)? {
-            TicketWorkRequest::Symbolic(symbolic) => {
-                let symbolic = symbolic_request_from_pb(symbolic)?;
-                let missing = self.missing_for_symbolic_quote(&symbolic)?;
-                if !missing.is_empty() {
-                    return Err(ExecutorError::InvalidQuoteRequest(format!(
-                        "missing symbolic artifacts: {}",
-                        format_missing_artifacts(&missing)
-                    )));
-                }
-                self.quote_cid_only_symbolic(symbolic)
-            }
-            TicketWorkRequest::Opaque(opaque) => self.quote_opaque(opaque),
+        let symbolic = symbolic_request_from_pb(request)?;
+        let missing = self.missing_for_symbolic_quote(&symbolic)?;
+        if !missing.is_empty() {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "missing symbolic artifacts: {}",
+                format_missing_artifacts(&missing)
+            )));
         }
+        self.quote_cid_only_symbolic(symbolic)
+    }
+
+    pub(super) async fn handle_quote_opaque(
+        &mut self,
+        request: PbOpaqueRequest,
+    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
+        self.quote_opaque(request)
     }
 
     pub(super) async fn handle_quote_prepared_text(
@@ -401,7 +405,7 @@ impl Executor {
 
     fn quote_opaque(
         &mut self,
-        request: hellas_pb::hellas::OpaqueWorkRequest,
+        request: PbOpaqueRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.store.prune_expired_quotes(Instant::now());
 
@@ -720,23 +724,6 @@ fn read_u16_le(bytes: &[u8]) -> Result<Vec<u16>, ExecutorError> {
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("chunk size checked")))
         .collect())
-}
-
-enum TicketWorkRequest {
-    Symbolic(hellas_pb::hellas::SymbolicWorkRequest),
-    Opaque(hellas_pb::hellas::OpaqueWorkRequest),
-}
-
-fn work_request_from_ticket_request(
-    request: CreateTicketRequest,
-) -> Result<TicketWorkRequest, ExecutorError> {
-    match request.request.and_then(|request| request.kind) {
-        Some(work_request::Kind::Symbolic(symbolic)) => Ok(TicketWorkRequest::Symbolic(symbolic)),
-        Some(work_request::Kind::Opaque(opaque)) => Ok(TicketWorkRequest::Opaque(opaque)),
-        None => Err(ExecutorError::InvalidQuoteRequest(
-            "missing work request".to_string(),
-        )),
-    }
 }
 
 fn format_request_commitment(bytes: &[u8; 32]) -> String {

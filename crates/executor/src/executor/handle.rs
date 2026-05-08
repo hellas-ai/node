@@ -1,12 +1,16 @@
-use hellas_pb::hellas::courtesy_server::Courtesy;
-use hellas_pb::hellas::execute_server::Execute;
-use hellas_pb::hellas::{
-    CreateTicketRequest, DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest,
-    GetModelStatsResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest,
-    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, RunTicketRequest, Ticket,
-    WorkEvent,
+use hellas_pb::courtesy::courtesy_server::Courtesy;
+use hellas_pb::courtesy::{
+    DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest, GetModelStatsResponse,
+    GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_pb::hellas::execute_server::Execute;
+use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_pb::opaque::opaque_server::Opaque;
+use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
+use hellas_pb::symbolic::symbolic_server::Symbolic;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, StreamedExecution,
@@ -31,11 +35,19 @@ impl ExecutorHandle {
         reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
     }
 
-    pub async fn create_ticket(
+    pub async fn create_symbolic_ticket(
         &self,
-        request: CreateTicketRequest,
+        request: PbSymbolicRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Quote { request, reply })
+        self.send(|reply| ExecutorMessage::QuoteSymbolic { request, reply })
+            .await
+    }
+
+    pub async fn create_opaque_ticket(
+        &self,
+        request: PbOpaqueRequest,
+    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
+        self.send(|reply| ExecutorMessage::QuoteOpaque { request, reply })
             .await
     }
 
@@ -96,16 +108,6 @@ impl ExecutorHandle {
 
 #[tonic::async_trait]
 impl Execute for ExecutorHandle {
-    async fn create_ticket(
-        &self,
-        request: Request<CreateTicketRequest>,
-    ) -> Result<Response<Ticket>, Status> {
-        let outcome = self.create_ticket(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
-    }
-
     type RunTicketStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<WorkEvent, Status>> + Send>>;
 
@@ -116,6 +118,32 @@ impl Execute for ExecutorHandle {
         let outcome = self.run_ticket(request.into_inner()).await?;
         let mut response =
             Response::new(Box::pin(ReceiverStream::new(outcome.events)) as Self::RunTicketStream);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
+    }
+}
+
+#[tonic::async_trait]
+impl Symbolic for ExecutorHandle {
+    async fn create_ticket(
+        &self,
+        request: Request<PbSymbolicRequest>,
+    ) -> Result<Response<Ticket>, Status> {
+        let outcome = self.create_symbolic_ticket(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
+    }
+}
+
+#[tonic::async_trait]
+impl Opaque for ExecutorHandle {
+    async fn create_ticket(
+        &self,
+        request: Request<PbOpaqueRequest>,
+    ) -> Result<Response<Ticket>, Status> {
+        let outcome = self.create_opaque_ticket(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
         write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
         Ok(response)
     }
@@ -248,11 +276,24 @@ impl Courtesy for ExecutorHandle {
 
 #[tonic::async_trait]
 impl ExecuteDriver for ExecutorHandle {
-    async fn create_ticket(
+    async fn create_symbolic_ticket(
         &mut self,
-        request: CreateTicketRequest,
+        request: PbSymbolicRequest,
     ) -> Result<QuotedResponse, Status> {
-        let outcome = ExecutorHandle::create_ticket(self, request)
+        let outcome = ExecutorHandle::create_symbolic_ticket(self, request)
+            .await
+            .map_err(<ExecutorError as Into<Status>>::into)?;
+        Ok(QuotedResponse {
+            response: outcome.response,
+            provenance: outcome.provenance,
+        })
+    }
+
+    async fn create_opaque_ticket(
+        &mut self,
+        request: PbOpaqueRequest,
+    ) -> Result<QuotedResponse, Status> {
+        let outcome = ExecutorHandle::create_opaque_ticket(self, request)
             .await
             .map_err(<ExecutorError as Into<Status>>::into)?;
         Ok(QuotedResponse {

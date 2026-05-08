@@ -1,7 +1,7 @@
 use crate::commands::CliResult;
 use anyhow::Context;
-use hellas_pb::hellas::GetNodeInfoRequest;
-use hellas_pb::hellas::node_client::NodeClient;
+use hellas_pb::swarm::GetNodeInfoRequest;
+use hellas_pb::swarm::node_client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::service::NodeService;
 use std::net::SocketAddr;

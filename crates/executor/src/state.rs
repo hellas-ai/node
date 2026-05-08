@@ -13,12 +13,16 @@ use hellas_core::{
     Digest, JsonBytes, OpaqueRequest, RequestCommitment, SymbolicGenesisRequest, SymbolicPolicy,
     SymbolicRequest, SymbolicStepRequest,
 };
+use hellas_pb::courtesy::{
+    QuotePreparedTextRequest, SymbolicStart as PbSymbolicStart, symbolic_start,
+};
 use hellas_pb::hellas::{
-    self as pb, FinishStatus as PbFinishStatus, QuotePreparedTextRequest,
-    ReceiptEnvelope as PbReceiptEnvelope, SymbolicGenesisExecution as PbSymbolicGenesisExecution,
-    SymbolicStepExecution as PbSymbolicStepExecution, SymbolicWorkRequest,
-    WorkEvent as PbWorkEvent, WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished,
-    symbolic_work_request,
+    FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
+    WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
+};
+use hellas_pb::symbolic::{
+    SymbolicGenesisExecution as PbSymbolicGenesisExecution, SymbolicRequest as PbSymbolicRequest,
+    SymbolicStepExecution as PbSymbolicStepExecution, symbolic_request,
 };
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
@@ -179,38 +183,36 @@ pub(crate) fn symbolic_request_from_text_execution(execution: &TextExecution) ->
     }
 }
 
-pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> SymbolicWorkRequest {
+pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> PbSymbolicRequest {
     let execution = match request {
         SymbolicRequest::Genesis(genesis) => {
-            symbolic_work_request::Execution::Genesis(PbSymbolicGenesisExecution {
+            symbolic_request::Execution::Genesis(PbSymbolicGenesisExecution {
                 binding_cid: genesis.binding_cid.as_bytes().to_vec(),
             })
         }
-        SymbolicRequest::Step(step) => {
-            symbolic_work_request::Execution::Step(PbSymbolicStepExecution {
-                binding_cid: step.binding_cid.as_bytes().to_vec(),
-                previous_execution_cid: step.previous_execution_cid.as_bytes().to_vec(),
-                input_tokens_cid: step.input_tokens_cid.as_bytes().to_vec(),
-                max_new_tokens: step.policy.max_new_tokens,
-                stop_token_ids: step.policy.stop_token_ids.clone(),
-            })
-        }
+        SymbolicRequest::Step(step) => symbolic_request::Execution::Step(PbSymbolicStepExecution {
+            binding_cid: step.binding_cid.as_bytes().to_vec(),
+            previous_execution_cid: step.previous_execution_cid.as_bytes().to_vec(),
+            input_tokens_cid: step.input_tokens_cid.as_bytes().to_vec(),
+            max_new_tokens: step.policy.max_new_tokens,
+            stop_token_ids: step.policy.stop_token_ids.clone(),
+        }),
     };
-    SymbolicWorkRequest {
+    PbSymbolicRequest {
         execution: Some(execution),
     }
 }
 
 pub(crate) fn symbolic_request_from_pb(
-    request: SymbolicWorkRequest,
+    request: PbSymbolicRequest,
 ) -> Result<SymbolicRequest, ExecutorError> {
     match request.execution {
-        Some(symbolic_work_request::Execution::Genesis(genesis)) => {
+        Some(symbolic_request::Execution::Genesis(genesis)) => {
             Ok(SymbolicRequest::Genesis(SymbolicGenesisRequest {
                 binding_cid: Digest::from_bytes(bytes32(&genesis.binding_cid, "binding_cid")?),
             }))
         }
-        Some(symbolic_work_request::Execution::Step(step)) => {
+        Some(symbolic_request::Execution::Step(step)) => {
             Ok(SymbolicRequest::Step(SymbolicStepRequest {
                 binding_cid: Digest::from_bytes(bytes32(&step.binding_cid, "binding_cid")?),
                 previous_execution_cid: Digest::from_bytes(bytes32(
@@ -231,14 +233,14 @@ pub(crate) fn symbolic_request_from_pb(
 }
 
 fn parse_symbolic_start(
-    start: Option<pb::SymbolicStart>,
+    start: Option<PbSymbolicStart>,
 ) -> Result<Option<Cid<TextReceipt>>, ExecutorError> {
     let start = start
         .and_then(|start| start.kind)
         .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing symbolic start".to_string()))?;
     match start {
-        pb::symbolic_start::Kind::Genesis(_) => Ok(None),
-        pb::symbolic_start::Kind::Receipt(receipt) => {
+        symbolic_start::Kind::Genesis(_) => Ok(None),
+        symbolic_start::Kind::Receipt(receipt) => {
             let bytes = bytes32(&receipt.receipt_cid, "receipt_cid")?;
             Ok(Some(Cid::from_bytes(bytes)))
         }
@@ -412,7 +414,7 @@ impl Termination {
                 stop_reason,
                 output_tokens,
                 receipt_dag_cbor,
-            } => pb::work_event::Kind::Finished(PbWorkFinished {
+            } => work_event::Kind::Finished(PbWorkFinished {
                 total_units: output_tokens.len() as u64,
                 status: stop_reason.to_pb() as i32,
                 output: encode_token_ids(&output_tokens),
@@ -421,7 +423,7 @@ impl Termination {
                 }),
             }),
             Self::Failed { position, error } => {
-                pb::work_event::Kind::Failed(PbWorkFailed { position, error })
+                work_event::Kind::Failed(PbWorkFailed { position, error })
             }
         };
         PbWorkEvent { kind: Some(kind) }

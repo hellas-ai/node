@@ -3,9 +3,11 @@ use anyhow::Context;
 use catgrad::prelude::Dtype;
 use futures::StreamExt;
 use futures::future::try_join_all;
-use hellas_executor::{CourtesyServer, ExecuteServer, Executor, ExecutorMetrics};
-use hellas_pb::hellas::node_server::{Node, NodeServer};
-use hellas_pb::hellas::{
+use hellas_executor::{
+    CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, OpaqueServer, SymbolicServer,
+};
+use hellas_pb::swarm::node_server::{Node, NodeServer};
+use hellas_pb::swarm::{
     GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 };
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
@@ -233,6 +235,16 @@ pub(super) async fn spawn_node(
         .send_compressed(CompressionEncoding::Zstd)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+    let symbolic_service = SymbolicServer::new(executor.clone())
+        .accept_compressed(CompressionEncoding::Zstd)
+        .send_compressed(CompressionEncoding::Zstd)
+        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+    let opaque_service = OpaqueServer::new(executor.clone())
+        .accept_compressed(CompressionEncoding::Zstd)
+        .send_compressed(CompressionEncoding::Zstd)
+        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
     let courtesy_service = CourtesyServer::new(executor.clone())
         .accept_compressed(CompressionEncoding::Zstd)
         .send_compressed(CompressionEncoding::Zstd)
@@ -245,6 +257,14 @@ pub(super) async fn spawn_node(
         .add_rpc(trace_layer.layer(NodeServer::new(node_service)))
         .add_rpc(InterceptedService::new(
             trace_layer.layer(execute_service),
+            execute_interceptor.clone(),
+        ))
+        .add_rpc(InterceptedService::new(
+            trace_layer.layer(symbolic_service),
+            execute_interceptor.clone(),
+        ))
+        .add_rpc(InterceptedService::new(
+            trace_layer.layer(opaque_service),
             execute_interceptor,
         ))
         .add_rpc(trace_layer.layer(courtesy_service));
@@ -267,6 +287,7 @@ pub(super) async fn spawn_node(
         tokio::spawn(async move {
             use hellas_rpc::service::{
                 CourtesyService as CourtesySvc, ExecuteService as ExecSvc, NodeService as NodeSvc,
+                OpaqueService as OpaqueSvc, SymbolicService as SymbolicSvc,
             };
             let Ok(bindings) = DiscoveryBindings::client(disc_endpoint.id()) else {
                 warn!("failed to create discovery bindings for peer tracker");
@@ -278,11 +299,15 @@ pub(super) async fn spawn_node(
             registry.add(disc_dht);
             let mut node_peers = Box::pin(registry.discover::<NodeSvc>());
             let mut exec_peers = Box::pin(registry.discover::<ExecSvc>());
+            let mut symbolic_peers = Box::pin(registry.discover::<SymbolicSvc>());
+            let mut opaque_peers = Box::pin(registry.discover::<OpaqueSvc>());
             let mut courtesy_peers = Box::pin(registry.discover::<CourtesySvc>());
             loop {
                 let peer_id = tokio::select! {
                     Some(Ok(peer)) = node_peers.next() => peer.id(),
                     Some(Ok(peer)) = exec_peers.next() => peer.id(),
+                    Some(Ok(peer)) = symbolic_peers.next() => peer.id(),
+                    Some(Ok(peer)) = opaque_peers.next() => peer.id(),
                     Some(Ok(peer)) = courtesy_peers.next() => peer.id(),
                     else => break,
                 };

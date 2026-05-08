@@ -12,7 +12,7 @@ use crate::state::ExecutorState;
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
-use hellas_pb::hellas::{GetStatsResponse, ModelTokenStats};
+use hellas_pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::{HashMap, VecDeque};
@@ -100,8 +100,11 @@ impl Executor {
     async fn run(mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
-                ExecutorMessage::Quote { request, reply } => {
-                    let _ = reply.send(self.handle_quote(request).await);
+                ExecutorMessage::QuoteSymbolic { request, reply } => {
+                    let _ = reply.send(self.handle_quote_symbolic(request).await);
+                }
+                ExecutorMessage::QuoteOpaque { request, reply } => {
+                    let _ = reply.send(self.handle_quote_opaque(request).await);
                 }
                 ExecutorMessage::QuotePrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_prompt(request).await);
@@ -140,7 +143,7 @@ impl Executor {
                     }));
                 }
                 ExecutorMessage::GetModelStats { request, reply } => {
-                    let _ = reply.send(Ok(hellas_pb::hellas::GetModelStatsResponse {
+                    let _ = reply.send(Ok(GetModelStatsResponse {
                         stats: Some(self.metrics.model_snapshot(&request.model_id)),
                         model_id: request.model_id,
                     }));
