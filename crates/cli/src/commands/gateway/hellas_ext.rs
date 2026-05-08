@@ -10,42 +10,41 @@
 //! See `docs/GATEWAY_HELLAS_WIRE.md` (TODO) and the approved plan in
 //! `~/.claude/plans/yeah-lets-try-to-parallel-diffie.md`.
 
-use catgrad::cid::Cid;
-use catgrad_llm::runtime::TextReceipt;
+use crate::execution::ReceiptArtifact;
 use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 use serde::Serialize;
 
 #[derive(Serialize, Default, Debug, Clone)]
 pub(super) struct HellasExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub commitment_id: Option<String>,
+    pub commitment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_id: Option<String>,
+    pub receipt: Option<String>,
 }
 
 impl HellasExt {
     pub fn is_empty(&self) -> bool {
-        self.commitment_id.is_none() && self.receipt_id.is_none()
+        self.commitment.is_none() && self.receipt.is_none()
     }
 
     pub fn commitment(prov: &ExecutionProvenance) -> Self {
         Self {
-            commitment_id: Some(encode_hex(&prov.commitment_id)),
-            receipt_id: None,
+            commitment: Some(encode_hex(&prov.commitment_id)),
+            receipt: None,
         }
     }
 
-    pub fn receipt(cid: &Cid<TextReceipt>) -> Self {
+    pub fn receipt(receipt: &ReceiptArtifact) -> Self {
         Self {
-            commitment_id: None,
-            receipt_id: Some(cid.to_string()),
+            commitment: None,
+            receipt: Some(receipt.encoded()),
         }
     }
 
-    pub fn both(prov: &ExecutionProvenance, cid: &Cid<TextReceipt>) -> Self {
+    pub fn both(prov: &ExecutionProvenance, receipt: &ReceiptArtifact) -> Self {
         Self {
-            commitment_id: Some(encode_hex(&prov.commitment_id)),
-            receipt_id: Some(cid.to_string()),
+            commitment: Some(encode_hex(&prov.commitment_id)),
+            receipt: Some(receipt.encoded()),
         }
     }
 }
@@ -93,19 +92,17 @@ mod tests {
             commitment_id: [0xab; 32],
         };
         let hellas = HellasExt::commitment(&prov);
-        assert_eq!(
-            hellas.commitment_id.as_deref(),
-            Some("ab".repeat(32).as_str())
-        );
-        assert!(hellas.receipt_id.is_none());
+        assert_eq!(hellas.commitment.as_deref(), Some("ab".repeat(32).as_str()));
+        assert!(hellas.receipt.is_none());
     }
 
     #[test]
-    fn receipt_renders_as_lowercase_hex() {
-        let cid = Cid::<TextReceipt>::from_bytes([0xcd; 32]);
-        let hellas = HellasExt::receipt(&cid);
-        assert_eq!(hellas.receipt_id.as_deref(), Some("cd".repeat(32).as_str()));
-        assert!(hellas.commitment_id.is_none());
+    fn receipt_renders_as_base64url_envelope() {
+        let receipt = ReceiptArtifact::from_test_bytes(vec![0xcd; 32]);
+        let expected = receipt.encoded();
+        let hellas = HellasExt::receipt(&receipt);
+        assert_eq!(hellas.receipt.as_deref(), Some(expected.as_str()));
+        assert!(hellas.commitment.is_none());
     }
 
     #[test]
@@ -131,7 +128,7 @@ mod tests {
             json!({
                 "id": "chatcmpl-1",
                 "choices": [0],
-                "hellas": { "commitment_id": "12".repeat(32) },
+                "hellas": { "commitment": "12".repeat(32) },
             })
         );
     }
@@ -141,12 +138,10 @@ mod tests {
         let prov = ExecutionProvenance {
             commitment_id: [1; 32],
         };
-        let cid = Cid::<TextReceipt>::from_bytes([2; 32]);
-        let hellas = HellasExt::both(&prov, &cid);
-        assert_eq!(
-            hellas.commitment_id.as_deref(),
-            Some("01".repeat(32).as_str())
-        );
-        assert_eq!(hellas.receipt_id.as_deref(), Some("02".repeat(32).as_str()));
+        let receipt = ReceiptArtifact::from_test_bytes(vec![2; 32]);
+        let expected = receipt.encoded();
+        let hellas = HellasExt::both(&prov, &receipt);
+        assert_eq!(hellas.commitment.as_deref(), Some("01".repeat(32).as_str()));
+        assert_eq!(hellas.receipt.as_deref(), Some(expected.as_str()));
     }
 }
