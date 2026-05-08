@@ -1,3 +1,4 @@
+use crate::artifacts::{SymbolicArtifactBundle, SymbolicBoundTerm, SymbolicExecutionOutput};
 use crate::executor::TicketOutcome;
 use crate::state::{
     LocalModelStatus, ModelLocator, QuoteKind, QuotePlan, QuoteRecord, model_spec,
@@ -265,60 +266,31 @@ impl Executor {
         &mut self,
         request: PublishArtifactBundleRequest,
     ) -> Result<PublishArtifactBundleResponse, ExecutorError> {
-        let mut artifact_cids = Vec::with_capacity(request.canonical_artifacts.len());
-        for bytes in request.canonical_artifacts {
-            let digest = self.artifacts.publish_canonical_bytes(bytes).await?;
-            artifact_cids.push(digest.as_bytes().to_vec());
-        }
-
-        let symbolic_bound_terms = request.symbolic_bound_terms.len() as u32;
-        for metadata in request.symbolic_bound_terms {
-            let model_id = metadata.huggingface_model_id.trim();
-            if model_id.is_empty() {
-                return Err(ExecutorError::InvalidQuoteRequest(
-                    "missing symbolic bound term huggingface_model_id".to_string(),
-                ));
-            }
-            let revision = metadata.huggingface_revision.trim();
-            let revision = if revision.is_empty() {
-                DEFAULT_MODEL_REVISION
-            } else {
-                revision
-            };
-            let dtype = Dtype::from_str(&metadata.dtype).map_err(|err| {
-                ExecutorError::InvalidQuoteRequest(format!(
-                    "invalid symbolic bound term dtype {:?}: {err}",
-                    metadata.dtype
-                ))
-            })?;
-            if matches!(dtype, Dtype::U32) {
-                return Err(ExecutorError::InvalidQuoteRequest(
-                    "symbolic bound term dtype must be f32, f16, bf16, or f8".to_string(),
-                ));
-            }
-            self.artifacts.publish_bound_term_metadata(
-                digest_from_slice(&metadata.bound_term_cid, "bound_term_cid")?,
-                ModelLocator {
-                    model_id: model_id.to_string(),
-                    revision: revision.to_string(),
-                    dtype,
-                },
-            )?;
-        }
-
-        let symbolic_execution_outputs = request.symbolic_execution_outputs.len() as u32;
-        for metadata in request.symbolic_execution_outputs {
-            self.artifacts.publish_execution_output_metadata(
-                digest_from_slice(&metadata.text_execution_cid, "text_execution_cid")?,
-                digest_from_slice(&metadata.text_artifact_cid, "text_artifact_cid")?,
-            )?;
-        }
+        let bundle = artifact_bundle_from_pb(request)?;
+        let symbolic_bound_terms = bundle.bound_terms.len() as u32;
+        let symbolic_execution_outputs = bundle.execution_outputs.len() as u32;
+        let artifact_cids = self.artifacts.publish_symbolic_bundle(bundle).await?;
 
         Ok(PublishArtifactBundleResponse {
-            artifact_cids,
+            artifact_cids: artifact_cids
+                .into_iter()
+                .map(|digest| digest.as_bytes().to_vec())
+                .collect(),
             symbolic_bound_terms,
             symbolic_execution_outputs,
         })
+    }
+
+    pub(super) async fn handle_export_artifact_bundle(
+        &mut self,
+        request: PbSymbolicRequest,
+    ) -> Result<PublishArtifactBundleRequest, ExecutorError> {
+        let symbolic_request = symbolic_request_from_pb(request)?;
+        let bundle = self
+            .artifacts
+            .export_symbolic_closure(&symbolic_request)
+            .await?;
+        Ok(artifact_bundle_to_pb(bundle))
     }
 
     pub(super) async fn handle_get_artifact(
@@ -410,6 +382,96 @@ impl Executor {
             },
         })
     }
+}
+
+fn artifact_bundle_from_pb(
+    request: PublishArtifactBundleRequest,
+) -> Result<SymbolicArtifactBundle, ExecutorError> {
+    let mut bound_terms = Vec::with_capacity(request.symbolic_bound_terms.len());
+    for metadata in request.symbolic_bound_terms {
+        bound_terms.push(SymbolicBoundTerm {
+            bound_term: digest_from_slice(&metadata.bound_term_cid, "bound_term_cid")?,
+            locator: symbolic_bound_term_locator(
+                metadata.huggingface_model_id,
+                metadata.huggingface_revision,
+                metadata.dtype,
+            )?,
+        });
+    }
+
+    let mut execution_outputs = Vec::with_capacity(request.symbolic_execution_outputs.len());
+    for metadata in request.symbolic_execution_outputs {
+        execution_outputs.push(SymbolicExecutionOutput {
+            execution: digest_from_slice(&metadata.text_execution_cid, "text_execution_cid")?,
+            artifact: digest_from_slice(&metadata.text_artifact_cid, "text_artifact_cid")?,
+        });
+    }
+
+    Ok(SymbolicArtifactBundle {
+        canonical_artifacts: request.canonical_artifacts,
+        bound_terms,
+        execution_outputs,
+    })
+}
+
+fn artifact_bundle_to_pb(bundle: SymbolicArtifactBundle) -> PublishArtifactBundleRequest {
+    PublishArtifactBundleRequest {
+        canonical_artifacts: bundle.canonical_artifacts,
+        symbolic_bound_terms: bundle
+            .bound_terms
+            .into_iter()
+            .map(|metadata| hellas_pb::courtesy::SymbolicBoundTermMetadata {
+                bound_term_cid: metadata.bound_term.as_bytes().to_vec(),
+                huggingface_model_id: metadata.locator.model_id,
+                huggingface_revision: metadata.locator.revision,
+                dtype: dtype_to_wire(metadata.locator.dtype),
+            })
+            .collect(),
+        symbolic_execution_outputs: bundle
+            .execution_outputs
+            .into_iter()
+            .map(
+                |metadata| hellas_pb::courtesy::SymbolicExecutionOutputMetadata {
+                    text_execution_cid: metadata.execution.as_bytes().to_vec(),
+                    text_artifact_cid: metadata.artifact.as_bytes().to_vec(),
+                },
+            )
+            .collect(),
+    }
+}
+
+fn symbolic_bound_term_locator(
+    model_id: String,
+    revision: String,
+    dtype: String,
+) -> Result<ModelLocator, ExecutorError> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(ExecutorError::InvalidQuoteRequest(
+            "missing symbolic bound term huggingface_model_id".to_string(),
+        ));
+    }
+    let revision = revision.trim();
+    let revision = if revision.is_empty() {
+        DEFAULT_MODEL_REVISION
+    } else {
+        revision
+    };
+    let dtype = Dtype::from_str(&dtype).map_err(|err| {
+        ExecutorError::InvalidQuoteRequest(format!(
+            "invalid symbolic bound term dtype {dtype:?}: {err}"
+        ))
+    })?;
+    if matches!(dtype, Dtype::U32) {
+        return Err(ExecutorError::InvalidQuoteRequest(
+            "symbolic bound term dtype must be f32, f16, bf16, or f8".to_string(),
+        ));
+    }
+    Ok(ModelLocator {
+        model_id: model_id.to_string(),
+        revision: revision.to_string(),
+        dtype,
+    })
 }
 
 fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {

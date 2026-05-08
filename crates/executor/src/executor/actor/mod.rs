@@ -182,6 +182,9 @@ impl Executor {
                 ExecutorMessage::PublishArtifactBundle { request, reply } => {
                     let _ = reply.send(self.handle_publish_artifact_bundle(request).await);
                 }
+                ExecutorMessage::ExportArtifactBundle { request, reply } => {
+                    let _ = reply.send(self.handle_export_artifact_bundle(request).await);
+                }
                 ExecutorMessage::GetArtifact { request, reply } => {
                     let _ = reply.send(self.handle_get_artifact(request).await);
                 }
