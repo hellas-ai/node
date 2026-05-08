@@ -238,6 +238,123 @@ impl ::prost::Name for QuoteChatPromptResponse {
         "/hellas.courtesy.v1.QuoteChatPromptResponse".into()
     }
 }
+/// Publish canonical catnix artifact bytes and the small symbolic metadata
+/// index entries needed to materialize CID-only symbolic requests. This is a
+/// courtesy transport for making artifacts available to a provider; the core
+/// symbolic request remains only a TextExecution CID.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishArtifactBundleRequest {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub canonical_artifacts: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, repeated, tag = "2")]
+    pub symbolic_bound_terms: ::prost::alloc::vec::Vec<SymbolicBoundTermMetadata>,
+    #[prost(message, repeated, tag = "3")]
+    pub symbolic_execution_outputs: ::prost::alloc::vec::Vec<
+        SymbolicExecutionOutputMetadata,
+    >,
+}
+impl ::prost::Name for PublishArtifactBundleRequest {
+    const NAME: &'static str = "PublishArtifactBundleRequest";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.PublishArtifactBundleRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.PublishArtifactBundleRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PublishArtifactBundleResponse {
+    /// BLAKE3 digests of accepted canonical_artifacts, in request order.
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub artifact_cids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(uint32, tag = "2")]
+    pub symbolic_bound_terms: u32,
+    #[prost(uint32, tag = "3")]
+    pub symbolic_execution_outputs: u32,
+}
+impl ::prost::Name for PublishArtifactBundleResponse {
+    const NAME: &'static str = "PublishArtifactBundleResponse";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.PublishArtifactBundleResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.PublishArtifactBundleResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SymbolicBoundTermMetadata {
+    /// catnix OutputId<BoundTerm>; exactly 32 bytes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub bound_term_cid: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub huggingface_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub huggingface_revision: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub dtype: ::prost::alloc::string::String,
+}
+impl ::prost::Name for SymbolicBoundTermMetadata {
+    const NAME: &'static str = "SymbolicBoundTermMetadata";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.SymbolicBoundTermMetadata".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.SymbolicBoundTermMetadata".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SymbolicExecutionOutputMetadata {
+    /// catnix InputId<TextExecution>; exactly 32 bytes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub text_execution_cid: ::prost::alloc::vec::Vec<u8>,
+    /// catnix OutputId<TextArtifact>; exactly 32 bytes.
+    #[prost(bytes = "vec", tag = "2")]
+    pub text_artifact_cid: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for SymbolicExecutionOutputMetadata {
+    const NAME: &'static str = "SymbolicExecutionOutputMetadata";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.SymbolicExecutionOutputMetadata".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.SymbolicExecutionOutputMetadata".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetArtifactRequest {
+    /// BLAKE3 digest of canonical artifact bytes; exactly 32 bytes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub cid: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for GetArtifactRequest {
+    const NAME: &'static str = "GetArtifactRequest";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.GetArtifactRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.GetArtifactRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetArtifactResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub canonical_artifact: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for GetArtifactResponse {
+    const NAME: &'static str = "GetArtifactResponse";
+    const PACKAGE: &'static str = "hellas.courtesy.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.courtesy.v1.GetArtifactResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.courtesy.v1.GetArtifactResponse".into()
+    }
+}
 /// List models known to the executor and their readiness status.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListModelsRequest {}
@@ -626,6 +743,59 @@ pub mod courtesy_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn publish_artifact_bundle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PublishArtifactBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PublishArtifactBundleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.courtesy.v1.Courtesy/PublishArtifactBundle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "hellas.courtesy.v1.Courtesy",
+                        "PublishArtifactBundle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_artifact(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetArtifactRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetArtifactResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.courtesy.v1.Courtesy/GetArtifact",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.courtesy.v1.Courtesy", "GetArtifact"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_models(
             &mut self,
             request: impl tonic::IntoRequest<super::ListModelsRequest>,
@@ -758,6 +928,20 @@ pub mod courtesy_server {
             request: tonic::Request<super::QuoteChatPromptRequest>,
         ) -> std::result::Result<
             tonic::Response<super::QuoteChatPromptResponse>,
+            tonic::Status,
+        >;
+        async fn publish_artifact_bundle(
+            &self,
+            request: tonic::Request<super::PublishArtifactBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PublishArtifactBundleResponse>,
+            tonic::Status,
+        >;
+        async fn get_artifact(
+            &self,
+            request: tonic::Request<super::GetArtifactRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetArtifactResponse>,
             tonic::Status,
         >;
         async fn list_models(
@@ -991,6 +1175,97 @@ pub mod courtesy_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QuoteChatPromptSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.courtesy.v1.Courtesy/PublishArtifactBundle" => {
+                    #[allow(non_camel_case_types)]
+                    struct PublishArtifactBundleSvc<T: Courtesy>(pub Arc<T>);
+                    impl<
+                        T: Courtesy,
+                    > tonic::server::UnaryService<super::PublishArtifactBundleRequest>
+                    for PublishArtifactBundleSvc<T> {
+                        type Response = super::PublishArtifactBundleResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PublishArtifactBundleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Courtesy>::publish_artifact_bundle(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PublishArtifactBundleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.courtesy.v1.Courtesy/GetArtifact" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetArtifactSvc<T: Courtesy>(pub Arc<T>);
+                    impl<
+                        T: Courtesy,
+                    > tonic::server::UnaryService<super::GetArtifactRequest>
+                    for GetArtifactSvc<T> {
+                        type Response = super::GetArtifactResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetArtifactRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Courtesy>::get_artifact(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetArtifactSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

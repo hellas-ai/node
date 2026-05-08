@@ -86,11 +86,13 @@ pub mod opaque {
 #[cfg(feature = "courtesy")]
 pub mod courtesy {
     pub use crate::generated::hellas::courtesy::v1::{
-        ChatMessage, DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest,
-        GetModelStatsResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest,
-        ListModelsResponse, ModelInfo, ModelStatus, ModelTokenStats, QuoteChatPromptRequest,
-        QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
-        QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart, SymbolicGenesisStart,
+        ChatMessage, DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest,
+        GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest,
+        GetStatsResponse, ListModelsRequest, ListModelsResponse, ModelInfo, ModelStatus,
+        ModelTokenStats, PublishArtifactBundleRequest, PublishArtifactBundleResponse,
+        QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+        QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart,
+        SymbolicBoundTermMetadata, SymbolicExecutionOutputMetadata, SymbolicGenesisStart,
         SymbolicStart, TokenStats, symbolic_start,
     };
     service_exports!(

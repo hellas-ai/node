@@ -1,9 +1,10 @@
 use hellas_pb::courtesy::courtesy_server::Courtesy;
 use hellas_pb::courtesy::{
-    DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest, GetModelStatsResponse,
-    GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
+    GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
+    ListModelsRequest, ListModelsResponse, PublishArtifactBundleRequest,
+    PublishArtifactBundleResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
+    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_pb::hellas::execute_server::Execute;
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
@@ -72,6 +73,22 @@ impl ExecutorHandle {
         request: QuoteChatPromptRequest,
     ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
+            .await
+    }
+
+    pub async fn publish_artifact_bundle(
+        &self,
+        request: PublishArtifactBundleRequest,
+    ) -> Result<PublishArtifactBundleResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::PublishArtifactBundle { request, reply })
+            .await
+    }
+
+    pub async fn get_artifact(
+        &self,
+        request: GetArtifactRequest,
+    ) -> Result<GetArtifactResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::GetArtifact { request, reply })
             .await
     }
 
@@ -179,6 +196,24 @@ impl Courtesy for ExecutorHandle {
         let mut response = Response::new(outcome.response);
         write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
         Ok(response)
+    }
+
+    async fn publish_artifact_bundle(
+        &self,
+        request: Request<PublishArtifactBundleRequest>,
+    ) -> Result<Response<PublishArtifactBundleResponse>, Status> {
+        Ok(Response::new(
+            self.publish_artifact_bundle(request.into_inner()).await?,
+        ))
+    }
+
+    async fn get_artifact(
+        &self,
+        request: Request<GetArtifactRequest>,
+    ) -> Result<Response<GetArtifactResponse>, Status> {
+        Ok(Response::new(
+            self.get_artifact(request.into_inner()).await?,
+        ))
     }
 
     async fn list_models(
