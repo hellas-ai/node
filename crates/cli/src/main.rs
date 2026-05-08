@@ -220,6 +220,11 @@ enum Commands {
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
+    /// Store or fetch canonical artifact bytes on a provider
+    Artifact {
+        #[command(subcommand)]
+        command: commands::artifact::ArtifactCommand,
+    },
     /// Run LLM inference remotely or locally
     Llm {
         /// Node ID to run on remotely (omit to auto-discover)
@@ -447,6 +452,7 @@ async fn main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
+        Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
         Commands::Llm {
             node_id,
             node_addrs,
@@ -720,6 +726,65 @@ mod tests {
             Cli::try_parse_from(["hellas", "opaque", "--service", "echo", "--method", "run"]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn artifact_put_accepts_provider_and_path() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "artifact",
+            "put",
+            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+            "--node-addr",
+            "127.0.0.1:31145",
+            "/tmp/artifact.cbor",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Artifact {
+                command:
+                    commands::artifact::ArtifactCommand::Put {
+                        node_id: _,
+                        node_addrs,
+                        path,
+                    },
+            } => {
+                assert_eq!(node_addrs.len(), 1);
+                assert_eq!(path, std::path::Path::new("/tmp/artifact.cbor"));
+            }
+            _ => panic!("expected artifact put command"),
+        }
+    }
+
+    #[test]
+    fn artifact_get_accepts_cid_and_output() {
+        let cid = "00".repeat(32);
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "artifact",
+            "get",
+            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+            &cid,
+            "--output",
+            "/tmp/artifact.cbor",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Artifact {
+                command:
+                    commands::artifact::ArtifactCommand::Get {
+                        node_id: _,
+                        node_addrs,
+                        cid: parsed_cid,
+                        output,
+                    },
+            } => {
+                assert!(node_addrs.is_empty());
+                assert_eq!(parsed_cid, cid);
+                assert_eq!(output, std::path::Path::new("/tmp/artifact.cbor"));
+            }
+            _ => panic!("expected artifact get command"),
+        }
     }
 
     /// On CPU-only builds the default is `f32`; on CUDA/Metal builds it is
