@@ -1,16 +1,16 @@
 use crate::executor::ExecuteOutcome;
 use crate::state::{QuoteKind, new_execution_id};
-use crate::worker::{EnqueueError, ExecuteJob};
+use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use hellas_core::{
     Opaque, ReceiptBody, ReceiptEnvelope as CoreReceiptEnvelope, SignedReceipt, canonical_dag_cbor,
 };
+use hellas_core::{SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput};
 use hellas_pb::hellas::{
     FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
     work_event,
 };
 use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
-use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -61,8 +61,6 @@ impl Executor {
                     accepted_at: Instant::now(),
                     cancel: CancellationToken::new(),
                     sender,
-                    metrics: Arc::clone(&self.metrics),
-                    producer_key: Arc::clone(&self.producer_key),
                 };
 
                 let queued = match self.try_start_execution(job) {
@@ -167,6 +165,92 @@ impl Executor {
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
             Err(EnqueueError::Stopped(_job)) => Err(StartExecutionError::Closed),
         }
+    }
+
+    pub(super) async fn handle_worker_finished(&mut self, completion: WorkerCompletion) {
+        let WorkerCompletion {
+            execution_id,
+            model_id,
+            symbolic_request,
+            invocation,
+            sender,
+            result,
+        } = completion;
+
+        let generated = result.position();
+        let termination = match result {
+            WorkerCompletionResult::Completed {
+                stop_reason,
+                output_tokens,
+            } => {
+                match self
+                    .completed_symbolic_termination(
+                        &symbolic_request,
+                        &invocation,
+                        stop_reason,
+                        output_tokens,
+                    )
+                    .await
+                {
+                    Ok(termination) => termination,
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        warn!(
+                            "execute worker job {execution_id} failed while recording/signing receipt: {msg}"
+                        );
+                        crate::state::Termination::Failed {
+                            position: generated,
+                            error: msg,
+                        }
+                    }
+                }
+            }
+            WorkerCompletionResult::Failed { position, error } => {
+                crate::state::Termination::Failed { position, error }
+            }
+        };
+
+        if termination.is_completed() {
+            self.metrics
+                .record_execution_completed(&model_id, generated);
+        } else {
+            self.metrics.record_execution_failed(&model_id, generated);
+        }
+
+        let _ = sender.send(Ok(termination.into_pb())).await;
+        self.dispatch_next_execution();
+    }
+
+    async fn completed_symbolic_termination(
+        &mut self,
+        symbolic_request: &hellas_core::SymbolicRequest,
+        invocation: &crate::state::Invocation,
+        stop_reason: crate::state::StopReason,
+        output_tokens: Vec<u32>,
+    ) -> Result<crate::state::Termination, ExecutorError> {
+        let text_artifact_cid = self
+            .artifacts
+            .record_completed_text(symbolic_request, invocation, &output_tokens)
+            .await?;
+        let symbolic_output = SymbolicOutput { text_artifact_cid };
+        let evidence = SymbolicEvidence::TextArtifactCid(text_artifact_cid);
+        let receipt = SignedEvidenceReceipt::sign_symbolic(
+            symbolic_request,
+            &symbolic_output,
+            evidence,
+            &self.producer_key,
+        )
+        .map_err(|err| ExecutorError::WeightsError(format!("receipt signing failed: {err}")))?;
+        let envelope = CoreReceiptEnvelope::Symbolic(receipt);
+        let receipt_dag_cbor = canonical_dag_cbor(&envelope).map_err(|err| {
+            ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
+        })?;
+
+        Ok(crate::state::Termination::Completed {
+            stop_reason,
+            output_tokens,
+            receipt_dag_cbor,
+        })
     }
 
     /// Pop pending jobs and dispatch the first one whose consumer is still

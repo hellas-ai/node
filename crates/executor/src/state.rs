@@ -312,13 +312,6 @@ pub enum Termination {
 }
 
 impl Termination {
-    pub fn position(&self) -> u64 {
-        match self {
-            Self::Completed { output_tokens, .. } => output_tokens.len() as u64,
-            Self::Failed { position, .. } => *position,
-        }
-    }
-
     pub fn is_completed(&self) -> bool {
         matches!(self, Self::Completed { .. })
     }

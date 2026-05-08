@@ -14,6 +14,7 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
+use crate::worker::WorkerCompletion;
 pub use actor::Executor;
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
@@ -74,9 +75,10 @@ pub(crate) enum ExecutorMessage {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
-    /// Worker → actor: this execution finished (or was cancelled).
-    /// Sole purpose is advancing the pending queue.
-    WorkerIdle,
+    /// Worker → actor: this execution finished (or failed). The actor records
+    /// terminal artifacts, signs the receipt, sends the final event, and
+    /// advances the pending queue.
+    WorkerFinished(WorkerCompletion),
     ListModels {
         reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
     },
