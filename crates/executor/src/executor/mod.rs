@@ -1,12 +1,13 @@
 mod actor;
 mod handle;
 
-use hellas_rpc::ExecutorError;
-use hellas_rpc::pb::hellas::{
-    ExecuteRequest, ExecuteStreamEvent, GetModelStatsRequest, GetModelStatsResponse,
-    GetQuoteRequest, GetQuoteResponse, GetStatsResponse, ListModelsResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
+use hellas_pb::hellas::{
+    CreateTicketRequest, GetModelStatsRequest, GetModelStatsResponse, GetStatsResponse,
+    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, RunTicketRequest, Ticket,
+    WorkEvent,
 };
+use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -16,7 +17,7 @@ pub use actor::Executor;
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the
 /// worker observes on its next chunk send and converts into a cancel.
-pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<ExecuteStreamEvent, Status>>;
+pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, Status>>;
 
 /// Quote response paired with the provenance the executor committed to.
 /// `provenance` is the same value the executor logs at quote/accept time;
@@ -24,15 +25,15 @@ pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<ExecuteStreamEvent,
 /// metadata so gateways/clients can correlate the wire response with the
 /// commitment that produced it.
 #[derive(Debug)]
-pub struct QuoteOutcome<R> {
+pub struct TicketOutcome<R> {
     pub response: R,
     pub provenance: ExecutionProvenance,
 }
 
 /// Streaming execution paired with the provenance committed to at
-/// quote-acceptance time. The receipt CID is *terminal* and travels via
-/// the existing `Completed.receipt_cid` proto field on the stream's
-/// final event — it's not part of `ExecutionProvenance`.
+/// quote-acceptance time. The producer receipt is terminal and travels via
+/// the final `WorkFinished.receipt` event — it's not part of
+/// `ExecutionProvenance`.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
     pub provenance: ExecutionProvenance,
@@ -41,16 +42,20 @@ pub struct ExecuteOutcome {
 
 pub(crate) enum ExecutorMessage {
     Quote {
-        request: GetQuoteRequest,
-        reply: oneshot::Sender<Result<QuoteOutcome<GetQuoteResponse>, ExecutorError>>,
+        request: CreateTicketRequest,
+        reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
     QuotePrompt {
         request: QuotePromptRequest,
-        reply: oneshot::Sender<Result<QuoteOutcome<QuotePromptResponse>, ExecutorError>>,
+        reply: oneshot::Sender<Result<TicketOutcome<QuotePromptResponse>, ExecutorError>>,
+    },
+    QuotePreparedText {
+        request: QuotePreparedTextRequest,
+        reply: oneshot::Sender<Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError>>,
     },
     QuoteChatPrompt {
         request: QuoteChatPromptRequest,
-        reply: oneshot::Sender<Result<QuoteOutcome<QuoteChatPromptResponse>, ExecutorError>>,
+        reply: oneshot::Sender<Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>>,
     },
     Preload {
         model: String,
@@ -60,7 +65,7 @@ pub(crate) enum ExecutorMessage {
     /// (queueing if the worker is busy), and return a Receiver wired to
     /// the worker's per-execution sender.
     Execute {
-        request: ExecuteRequest,
+        request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
     /// Worker → actor: this execution finished (or was cancelled).

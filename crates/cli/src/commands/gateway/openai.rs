@@ -66,9 +66,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let outcome = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(GenerationEvent::Delta(d)))) => {
-                if let Err(PumpError { failure, .. }) =
-                    pump_text(&mut *parser, &mut mapper, &d)
-                {
+                if let Err(PumpError { failure, .. }) = pump_text(&mut *parser, &mut mapper, &d) {
                     // Non-streaming: cleanup frames are wire-bracketing
                     // and irrelevant when no wire stream exists. Discard.
                     return failure_to_json_response(failure);
@@ -120,9 +118,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     };
 
     let parser_stop = map_to_parser_stop(stop_reason);
-    if let Err(PumpError { failure, .. }) =
-        pump_finish(&mut *parser, &mut mapper, parser_stop)
-    {
+    if let Err(PumpError { failure, .. }) = pump_finish(&mut *parser, &mut mapper, parser_stop) {
         return failure_to_json_response(failure);
     }
 
@@ -201,9 +197,7 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
         stream_provenance,
         upstream,
     );
-    let events = payloads.map(|payload| {
-        Ok::<_, std::convert::Infallible>(payload.into_event())
-    });
+    let events = payloads.map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
     let mut response = sse_response(events);
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
@@ -680,11 +674,18 @@ mod streaming_done_tests {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
         let upstream = futures::stream::iter(vec![
-            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>,
+            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>
         ]);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -692,10 +693,8 @@ mod streaming_done_tests {
         .await;
 
         assert!(
-            payloads
-                .iter()
-                .any(|p| is_error_frame(p)
-                    && error_message(p).is_some_and(|m| m.contains("upstream blew up"))),
+            payloads.iter().any(|p| is_error_frame(p)
+                && error_message(p).is_some_and(|m| m.contains("upstream blew up"))),
             "expected error frame, got: {payloads:#?}"
         );
         assert!(
@@ -723,7 +722,14 @@ mod streaming_done_tests {
         let upstream = futures::stream::pending::<anyhow::Result<GenerationEvent>>();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -756,16 +762,20 @@ mod streaming_done_tests {
     async fn outcome_failed_emits_error_frame_without_done() {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(
-            Outcome::Failed {
-                position: 0,
-                error: "executor exploded".to_string(),
-            },
-        ))
-            as anyhow::Result<GenerationEvent>]);
+        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(Outcome::Failed {
+            position: 0,
+            error: "executor exploded".to_string(),
+        })) as anyhow::Result<GenerationEvent>]);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -773,10 +783,8 @@ mod streaming_done_tests {
         .await;
 
         assert!(
-            payloads
-                .iter()
-                .any(|p| is_error_frame(p)
-                    && error_message(p).is_some_and(|m| m.contains("executor exploded"))),
+            payloads.iter().any(|p| is_error_frame(p)
+                && error_message(p).is_some_and(|m| m.contains("executor exploded"))),
             "expected Outcome::Failed error frame, got: {payloads:#?}"
         );
         assert!(
@@ -804,7 +812,14 @@ mod streaming_done_tests {
         let receipt = test_receipt();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(prov.clone()),
             happy_upstream(receipt),
         )
@@ -832,10 +847,7 @@ mod streaming_done_tests {
         assert_eq!(receipt_of(terminal), Some("cd".repeat(32).as_str()));
 
         // Receipt appears EXACTLY once across the whole stream.
-        let receipts: Vec<_> = json_payloads
-            .iter()
-            .filter_map(|p| receipt_of(p))
-            .collect();
+        let receipts: Vec<_> = json_payloads.iter().filter_map(|p| receipt_of(p)).collect();
         assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
     }
 
@@ -848,7 +860,14 @@ mod streaming_done_tests {
         let deadline = Instant::now() + Duration::from_secs(60);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             None,
             happy_upstream(test_receipt()),
         )

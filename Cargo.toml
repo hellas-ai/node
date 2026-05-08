@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/pb",
+    "crates/core",
     "crates/cli",
     "crates/rpc",
     "crates/executor",
@@ -17,8 +19,8 @@ repository = "https://github.com/hellas-ai/node"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
-catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/megatooler-merged", default-features = false, features = ["serde", "dag-cbor"] }
-catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/megatooler-merged", default-features = false }
+catgrad = { path = "../catgrad/catgrad", default-features = false, features = ["serde", "dag-cbor"] }
+catgrad-llm = { path = "../catgrad/catgrad-llm", default-features = false }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -29,6 +31,14 @@ tonic-iroh-transport = { version = "0.9", default-features = false, features = [
 
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
+hellas-pb = { path = "crates/pb", default-features = false }
+hellas-core = { path = "crates/core", default-features = false }
+blake3 = "1"
+iroh-blobs = { version = "0.100", default-features = false }
+k256 = { version = "0.13", features = ["ecdsa"] }
+serde_bytes = "0.11"
+serde_ipld_dagcbor = "=0.6.4"
+half = "2.7.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"

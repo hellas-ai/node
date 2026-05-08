@@ -223,10 +223,7 @@ impl Cache {
             let lookup_start = Instant::now();
             let next_step = {
                 let mut state = self.inner.state.lock().await;
-                let lookup = state
-                    .inputs
-                    .lookup_program(locator, program_id)
-?;
+                let lookup = state.inputs.lookup_program(locator, program_id)?;
                 if let Some(cached) = lookup.program {
                     BoundProgramStep::Ready(cached)
                 } else {
@@ -282,11 +279,9 @@ impl Cache {
                     let cache_start = Instant::now();
                     let cache_result = {
                         let mut state = self.inner.state.lock().await;
-                        let result = state.inputs.cache_program(
-                            locator,
-                            generation,
-                            bound_program,
-                        );
+                        let result = state
+                            .inputs
+                            .cache_program(locator, generation, bound_program);
                         Self::finish_build(&mut state.program_builds, &build_key);
                         result?
                     };

@@ -46,14 +46,21 @@ pub fn init_tracing(
         // Open append-mode so successive runs accumulate; line-buffered
         // happens naturally per-event because the fmt layer flushes
         // after each record.
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             Ok(f) => Some(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::sync::Mutex::new(f))
                     .with_ansi(false),
             ),
             Err(err) => {
-                eprintln!("warning: --log-file {} could not be opened: {err}", path.display());
+                eprintln!(
+                    "warning: --log-file {} could not be opened: {err}",
+                    path.display()
+                );
                 None
             }
         }

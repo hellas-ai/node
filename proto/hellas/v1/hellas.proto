@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package hellas.v1;
+
+import "hellas/v1/node.proto";
+
+service Node {
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+  rpc GetKnownPeers(GetKnownPeersRequest) returns (GetKnownPeersResponse);
+}
+
+message Presence {
+  string hf_id = 1;
+  string req_id = 2;
+  string peer_id = 3;
+  uint64 ttl_ms = 4;
+  bool is_executor = 5;
+}

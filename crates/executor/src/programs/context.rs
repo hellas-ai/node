@@ -27,7 +27,7 @@ const DEFAULT_EXECUTION_CACHE_MAX_BYTES: usize = 8 << 30;
 /// ## Receipt store
 ///
 /// Keyed by [`Cid<TextReceipt>`] — the content commitment of a particular
-/// `(commitment, final state, output tokens, position)` tuple. Populated
+/// `(execution, final state, output tokens, position)` tuple. Populated
 /// at bind time with the program's *genesis receipt* (the cold-start
 /// anchor) and at end of every real execution with that execution's final
 /// receipt. Anchored requests look up the receipt store by their incoming
@@ -60,7 +60,7 @@ pub(crate) struct ExecutionStart {
     /// streams the cached tokens and skips the model entirely.
     pub cached: Option<CachedContinuation>,
     /// Commitment for this request: a [`Cid<TextExecution>`] over
-    /// `(program, parameters, initial_state, input_tokens, policy)`.
+    /// `(program binding, previous execution, input_tokens, policy)`.
     /// Threaded into the worker so `cache_continuation` keys the
     /// exact-output replay cache by this canonical commitment hash.
     /// Same 32 bytes are logged at quote / accept-execution / worker-start
@@ -86,6 +86,10 @@ struct ExecutionCache {
     /// bind time with the genesis receipt; populated at end of every real
     /// execution with the resulting [`TextState`].
     receipts: HashMap<Cid<TextReceipt>, Arc<TextState<ExecBackend>>>,
+    /// Live states keyed by their input-addressed execution commitment.
+    /// This is the protocol-facing anchor for direct CID-only symbolic
+    /// requests; receipt CIDs remain a courtesy API handle.
+    states_by_execution: HashMap<Cid<TextExecution>, Arc<TextState<ExecBackend>>>,
     max_bytes: usize,
     total_bytes: usize,
     touch_clock: u64,
@@ -105,7 +109,7 @@ impl ExecutionContext {
             "initialized execution cache"
         );
         let mut cache = ExecutionCache::new(DEFAULT_EXECUTION_CACHE_MAX_BYTES);
-        cache.receipts.insert(genesis_receipt_id, Arc::new(genesis));
+        cache.insert_genesis(Arc::new(genesis));
         Ok(Self {
             bound_program,
             genesis_receipt_id,
@@ -142,14 +146,10 @@ impl ExecutionContext {
         .map_err(|error| {
             ExecutorError::WeightsError(format!("failed to build input tensor: {error:?}"))
         })?;
-        // The initial_state TextState is fetched at execution_start; here we
-        // only have its receipt id, which is all `TextExecution::new` needs.
-        Ok(TextExecution::new(
-            bound,
-            initial_state_receipt_id,
-            &input_tensor,
-            policy,
-        )?)
+        let previous = self
+            .state_for_receipt(initial_state_receipt_id)?
+            .execution_id();
+        Ok(TextExecution::new(bound, previous, &input_tensor, policy)?)
     }
 
     /// Build the [`ExecutionStart`] for a request: resolve the starting
@@ -192,6 +192,60 @@ impl ExecutionContext {
         })
     }
 
+    /// Build an [`ExecutionStart`] from the protocol-level previous
+    /// execution commitment. Direct CID-only symbolic requests use this
+    /// path; they do not name a receipt.
+    pub(crate) fn execution_start_after(
+        &self,
+        commitment_id: Cid<TextExecution>,
+        previous_execution_id: Cid<TextExecution>,
+    ) -> Result<ExecutionStart, ExecutorError> {
+        let mut cache = self
+            .execution_cache
+            .lock()
+            .expect("execution cache mutex poisoned");
+        let initial_state = cache
+            .states_by_execution
+            .get(&previous_execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                ExecutorError::WeightsError(format!(
+                    "previous execution state not found: {previous_execution_id}"
+                ))
+            })?;
+        let cached = cache.lookup_continuation(commitment_id);
+        debug!(
+            program_id = %self.bound_program.program().id(),
+            %commitment_id,
+            %previous_execution_id,
+            cached_output_tokens = cached.as_ref().map_or(0, |c| c.output_tokens.len()),
+            cache_continuations = cache.continuations.len(),
+            cache_receipts = cache.receipts.len(),
+            cache_bytes = cache.total_bytes(),
+            "execution cache lookup by previous execution"
+        );
+        Ok(ExecutionStart {
+            cached,
+            commitment_id,
+            initial_state,
+        })
+    }
+
+    fn state_for_receipt(
+        &self,
+        receipt_id: Cid<TextReceipt>,
+    ) -> Result<Arc<TextState<ExecBackend>>, ExecutorError> {
+        self.execution_cache
+            .lock()
+            .expect("execution cache mutex poisoned")
+            .receipts
+            .get(&receipt_id)
+            .cloned()
+            .ok_or_else(|| {
+                ExecutorError::WeightsError(format!("initial receipt not found: {receipt_id}"))
+            })
+    }
+
     pub(crate) fn cache_continuation(
         &self,
         commitment_id: Cid<TextExecution>,
@@ -227,10 +281,16 @@ impl ExecutionCache {
         Self {
             continuations: HashMap::new(),
             receipts: HashMap::new(),
+            states_by_execution: HashMap::new(),
             max_bytes,
             total_bytes: 0,
             touch_clock: 0,
         }
+    }
+
+    fn insert_genesis(&mut self, state: Arc<TextState<ExecBackend>>) {
+        self.receipts.insert(state.receipt_id(), Arc::clone(&state));
+        self.states_by_execution.insert(state.execution_id(), state);
     }
 
     fn lookup_continuation(
@@ -324,6 +384,9 @@ impl ExecutionCache {
         bytes: usize,
         state: Arc<TextState<ExecBackend>>,
     ) {
+        self.states_by_execution
+            .entry(state.execution_id())
+            .or_insert_with(|| Arc::clone(&state));
         if self.receipts.contains_key(&receipt_id) {
             // Same content, already present; refresh nothing here (no LRU
             // eviction policy on receipts yet — TODO follow-up).

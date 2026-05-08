@@ -60,9 +60,9 @@ use tokio_util::sync::CancellationToken;
 /// `Termination::Completed` for the actor.
 #[derive(Debug, Clone)]
 pub struct DecodeOutcome {
-    pub total_tokens: u64,
     pub stop_reason: StopReason,
     pub receipt_cid: Cid<TextReceipt>,
+    pub output_tokens: Vec<u32>,
 }
 
 /// Public entry point. Wires the catgrad text decoder, runs the decode
@@ -101,13 +101,13 @@ pub fn run_cached_program_streaming(
             on_progress(emitted, &encode_token_ids(chunk));
         }
         return Ok(DecodeOutcome {
-            total_tokens: cached.output_tokens.len() as u64,
             // Replay is observationally identical to a fresh decode that
             // hit a stop token at the same position. We don't store the
             // original stop reason; EndOfSequence is the only honest
             // default given an exact-output match.
             stop_reason: StopReason::EndOfSequence,
             receipt_cid: cached.receipt_id,
+            output_tokens: cached.output_tokens.to_vec(),
         });
     }
 
@@ -143,7 +143,6 @@ pub fn run_cached_program_streaming(
         &mut on_progress,
     )?;
 
-    let total_tokens = output_tokens.len() as u64;
     let final_state = decoder.into_text_state(start.commitment_id, &output_tokens)?;
     let receipt_cid = final_state.receipt_id();
     program.cache_receipt(Arc::new(final_state));
@@ -152,13 +151,13 @@ pub fn run_cached_program_streaming(
     // receipt store is fine to populate — a real receipt for "we ran this
     // far" is always honest.
     if !matches!(stop_reason, StopReason::Cancelled) {
-        program.cache_continuation(start.commitment_id, output_tokens, receipt_cid);
+        program.cache_continuation(start.commitment_id, output_tokens.clone(), receipt_cid);
     }
 
     Ok(DecodeOutcome {
-        total_tokens,
         stop_reason,
         receipt_cid,
+        output_tokens,
     })
 }
 

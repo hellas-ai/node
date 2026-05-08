@@ -1,8 +1,8 @@
 use crate::commands::CliResult;
 use anyhow::Context;
+use hellas_pb::hellas::GetNodeInfoRequest;
+use hellas_pb::hellas::node_client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::pb::hellas::GetNodeInfoRequest;
-use hellas_rpc::pb::hellas::node_client::NodeClient;
 use hellas_rpc::service::NodeService;
 use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
