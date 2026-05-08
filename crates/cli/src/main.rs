@@ -119,6 +119,9 @@ enum Commands {
         /// Preload model weights on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
         #[arg(long = "preload", value_delimiter = ',')]
         preload_weights: Vec<String>,
+        /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
+        #[arg(long = "artifact-store-path")]
+        artifact_store_path: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
@@ -367,6 +370,7 @@ async fn main() {
             execute_policy,
             queue_size,
             preload_weights,
+            artifact_store_path,
             metrics_port,
             graffiti,
             dtype,
@@ -385,6 +389,7 @@ async fn main() {
                 execute_policy,
                 queue_size,
                 preload_weights,
+                artifact_store_path,
                 metrics_port,
                 graffiti,
                 dtype,
@@ -832,6 +837,28 @@ mod tests {
                 command: ProducerKeyCommand::Show,
             } => {}
             _ => panic!("expected producer-key show command"),
+        }
+    }
+
+    #[cfg(feature = "hellas-executor")]
+    #[test]
+    fn serve_accepts_artifact_store_path() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "serve",
+            "--artifact-store-path",
+            "/tmp/hellas-artifacts",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve {
+                artifact_store_path,
+                ..
+            } => assert_eq!(
+                artifact_store_path.as_deref(),
+                Some(std::path::Path::new("/tmp/hellas-artifacts"))
+            ),
+            _ => panic!("expected serve command"),
         }
     }
 

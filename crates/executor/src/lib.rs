@@ -8,6 +8,7 @@ mod metrics;
 mod state;
 mod worker;
 
+pub use artifacts::ArtifactStoreConfig;
 pub use executor::{Executor, ExecutorHandle};
 pub use hellas_pb::courtesy::courtesy_server::CourtesyServer;
 pub use hellas_pb::hellas::execute_server::ExecuteServer;

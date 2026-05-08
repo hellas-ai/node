@@ -5,6 +5,7 @@ use hellas_core::ProducerSigningKey;
 use hellas_executor::ExecutorMetrics;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::SecretKey;
@@ -19,6 +20,7 @@ pub async fn run(
     execute_policy: ExecutePolicy,
     queue_size: usize,
     preload_weights: Vec<String>,
+    artifact_store_path: Option<PathBuf>,
     metrics_port: Option<u16>,
     graffiti: String,
     dtype: Vec<Dtype>,
@@ -26,6 +28,9 @@ pub async fn run(
     producer_key: ProducerSigningKey,
 ) -> CliResult<()> {
     let preload_weights = dedupe_preload_weights(preload_weights);
+    let artifact_store_path = artifact_store_path
+        .map(Ok)
+        .unwrap_or_else(crate::identity::default_artifact_store_path)?;
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
         let mut buf = [0u8; 16];
@@ -47,6 +52,7 @@ pub async fn run(
         build,
         graffiti,
         dtype,
+        artifact_store_path,
         secret_key,
         producer_key,
         metrics.clone(),
