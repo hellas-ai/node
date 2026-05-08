@@ -42,8 +42,7 @@ use futures::stream::{BoxStream, FuturesUnordered, Stream};
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
     DeliveryOutput, DeliveryRequest, Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
-    ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_delivery,
-    verify_receipt,
+    SchemeId, SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_delivery, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
@@ -180,7 +179,7 @@ pub enum Outcome {
 /// Verified signed receipt envelope bytes as delivered by the executor.
 ///
 /// The gateway exposes these bytes directly as `hellas.receipt`. Symbolic
-/// callers that need the symbolic evidence digest can project it from
+/// callers that need the symbolic result artifact digest can project it from
 /// the verified envelope, but that digest is not the universal receipt
 /// identity.
 #[derive(Debug, Clone)]
@@ -204,12 +203,10 @@ impl ReceiptArtifact {
         self.symbolic_text_artifact
     }
 
-    fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreReceiptEnvelope) -> Self {
-        let symbolic_text_artifact = match core {
-            CoreReceiptEnvelope::Symbolic(receipt) => match receipt.evidence() {
-                SymbolicEvidence::TextArtifactCid(digest) => Some(*digest),
-            },
-            CoreReceiptEnvelope::Opaque(_) => None,
+    fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreSignedReceipt) -> Self {
+        let symbolic_text_artifact = match core.body().scheme() {
+            SchemeId::Symbolic => Some(core.body().result().digest()),
+            _ => None,
         };
         Self {
             dag_cbor,
@@ -1064,7 +1061,7 @@ fn parse_opaque_finished(
         &core,
     )
     .context("opaque receipt verification failed")?;
-    if !matches!(core, CoreReceiptEnvelope::Opaque(_)) {
+    if core.body().scheme() != SchemeId::Opaque {
         bail!("opaque execution returned a symbolic receipt");
     }
     Ok(OpaqueOutcome::Completed {
@@ -1090,9 +1087,9 @@ fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRe
 
 fn decode_receipt_envelope(
     envelope: Option<pb::ReceiptEnvelope>,
-) -> anyhow::Result<(Vec<u8>, CoreReceiptEnvelope)> {
+) -> anyhow::Result<(Vec<u8>, CoreSignedReceipt)> {
     let envelope = envelope.ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
-    let core: CoreReceiptEnvelope = decode_dag_cbor(&envelope.dag_cbor)
+    let core: CoreSignedReceipt = decode_dag_cbor(&envelope.dag_cbor)
         .context("failed to decode receipt envelope dag-cbor")?;
     Ok((envelope.dag_cbor, core))
 }

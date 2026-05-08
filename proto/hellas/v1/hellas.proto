@@ -61,7 +61,7 @@ enum FinishStatus {
   FINISH_STATUS_CANCELLED = 3;
 }
 
-// Canonical hellas-core ReceiptEnvelope encoded as strict dag-cbor.
+// Canonical hellas-core SignedReceipt encoded as strict dag-cbor.
 message ReceiptEnvelope {
   bytes dag_cbor = 1;
 }

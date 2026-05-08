@@ -230,7 +230,7 @@ impl ExecutorState {
     }
 
     pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
-        let key = *quote.request_commitment.0.as_bytes();
+        let key = *quote.request_commitment.as_bytes();
         self.quotes.insert(key, quote);
         key
     }

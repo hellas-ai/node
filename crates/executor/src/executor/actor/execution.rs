@@ -1,10 +1,8 @@
 use crate::executor::ExecuteOutcome;
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
-use hellas_core::{
-    Digest, Opaque, ReceiptEnvelope as CoreReceiptEnvelope, SignedReceipt, canonical_dag_cbor,
-};
-use hellas_core::{SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput};
+use hellas_core::{Digest, Opaque, SignedReceipt, canonical_dag_cbor};
+use hellas_core::{Symbolic, SymbolicOutput};
 use hellas_pb::hellas::{
     FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
     work_event,
@@ -42,7 +40,7 @@ impl Executor {
                 invocation,
             } => {
                 let provenance = ExecutionProvenance {
-                    commitment_id: *quote.request_commitment.0.as_bytes(),
+                    commitment_id: *quote.request_commitment.as_bytes(),
                 };
 
                 let stat_prompt = invocation.input_ids.len() as u64;
@@ -102,7 +100,7 @@ impl Executor {
             }
             QuoteKind::Opaque { request, output } => {
                 let provenance = ExecutionProvenance {
-                    commitment_id: *quote.request_commitment.0.as_bytes(),
+                    commitment_id: *quote.request_commitment.as_bytes(),
                 };
                 let model_id = quote.model_id.clone();
                 let execution_id = new_execution_id();
@@ -111,12 +109,9 @@ impl Executor {
                     .map_err(|err| {
                         ExecutorError::WeightsError(format!("opaque receipt signing failed: {err}"))
                     })?;
-                let receipt_dag_cbor = canonical_dag_cbor(&CoreReceiptEnvelope::Opaque(receipt))
-                    .map_err(|err| {
-                        ExecutorError::WeightsError(format!(
-                            "opaque receipt encoding failed: {err}"
-                        ))
-                    })?;
+                let receipt_dag_cbor = canonical_dag_cbor(&receipt).map_err(|err| {
+                    ExecutorError::WeightsError(format!("opaque receipt encoding failed: {err}"))
+                })?;
                 let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
                 sender
                     .send(Ok(WorkEvent {
@@ -229,16 +224,12 @@ impl Executor {
             .record_completed_text(symbolic_request, invocation, &output_tokens)
             .await?;
         let symbolic_output = SymbolicOutput { text_artifact_cid };
-        let evidence = SymbolicEvidence::TextArtifactCid(text_artifact_cid);
-        let receipt = SignedEvidenceReceipt::sign_symbolic(
-            symbolic_request,
-            &symbolic_output,
-            evidence,
-            &self.producer_key,
-        )
-        .map_err(|err| ExecutorError::WeightsError(format!("receipt signing failed: {err}")))?;
-        let envelope = CoreReceiptEnvelope::Symbolic(receipt);
-        let receipt_dag_cbor = canonical_dag_cbor(&envelope).map_err(|err| {
+        let receipt =
+            SignedReceipt::sign::<Symbolic>(symbolic_request, &symbolic_output, &self.producer_key)
+                .map_err(|err| {
+                    ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
+                })?;
+        let receipt_dag_cbor = canonical_dag_cbor(&receipt).map_err(|err| {
             ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
         })?;
 

@@ -5,9 +5,7 @@ use crate::state::{
 };
 use catgrad::prelude::Dtype;
 use chatgrad::types;
-use hellas_core::{
-    CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
-};
+use hellas_core::{CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, Symbolic};
 use hellas_pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
     PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
@@ -94,7 +92,7 @@ impl Executor {
                 resolved.locator.spec()
             )));
         }
-        let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
+        let request_commitment = Symbolic::commit_request(&symbolic_request);
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
@@ -146,7 +144,7 @@ impl Executor {
             payload: JsonBytes::new(request.payload),
         };
         let output = opaque_request.payload.clone();
-        let request_commitment = RequestCommitment(Opaque::commit_request(&opaque_request));
+        let request_commitment = Opaque::commit_request(&opaque_request);
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
@@ -198,8 +196,8 @@ impl Executor {
         let resolved = self.artifacts.record_prepared_text(&plan).await?;
         let symbolic_request = resolved.symbolic_request.clone();
         let symbolic_request_pb = symbolic_request_to_pb(&symbolic_request);
-        let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
-        let commitment_id = request_commitment.0.digest();
+        let request_commitment = Symbolic::commit_request(&symbolic_request);
+        let commitment_id = request_commitment.digest();
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
