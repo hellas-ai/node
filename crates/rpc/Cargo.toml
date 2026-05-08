@@ -30,6 +30,7 @@ server = ["tonic/server", "hellas-pb/server"]
 node = [
     "dep:catgrad",
     "dep:catgrad-llm",
+    "dep:chatgrad",
     "hellas-pb/hellas",
     "hellas-pb/symbolic",
     "hellas-pb/opaque",
@@ -50,6 +51,7 @@ thiserror = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
+chatgrad = { workspace = true, default-features = false, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }

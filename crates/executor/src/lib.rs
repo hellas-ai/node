@@ -1,13 +1,9 @@
 #[macro_use]
 extern crate tracing;
 
-mod artifacts;
 mod backend;
 mod executor;
-mod inputs;
 mod metrics;
-mod programs;
-mod runner;
 mod state;
 mod worker;
 

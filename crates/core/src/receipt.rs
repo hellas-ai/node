@@ -406,20 +406,17 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Digest, JsonBytes, SymbolicPolicy, SymbolicStepRequest};
+    use crate::{Digest, JsonBytes};
 
     fn symbolic_request() -> SymbolicRequest {
-        SymbolicRequest::Step(SymbolicStepRequest {
-            binding_cid: Digest::from_bytes([4; 32]),
-            previous_execution_cid: Digest::from_bytes([5; 32]),
-            input_tokens_cid: Digest::from_bytes([6; 32]),
-            policy: SymbolicPolicy::new(16, vec![7, 8]),
-        })
+        SymbolicRequest {
+            text_execution_cid: Digest::from_bytes([4; 32]),
+        }
     }
 
     fn symbolic_output() -> SymbolicOutput {
         SymbolicOutput {
-            text_receipt_cid: Digest::from_bytes([9; 32]),
+            text_artifact_cid: Digest::from_bytes([9; 32]),
         }
     }
 
@@ -449,7 +446,7 @@ mod tests {
         let key = ProducerSigningKey::deterministic_for_tests();
         let request = symbolic_request();
         let output = symbolic_output();
-        let evidence = SymbolicEvidence::TextReceiptCid(Digest::from_bytes([9; 32]));
+        let evidence = SymbolicEvidence::TextArtifactCid(Digest::from_bytes([9; 32]));
         let receipt =
             SignedEvidenceReceipt::<EvidencedReceiptBody, SymbolicEvidence>::sign_symbolic(
                 &request, &output, evidence, &key,

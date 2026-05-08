@@ -33,17 +33,15 @@ use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use catgrad::cid::Cid;
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
-use catgrad_llm::PreparedPrompt;
-use catgrad_llm::runtime::TextReceipt;
+use chatgrad::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    DeliveryOutput, DeliveryRequest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
+    DeliveryOutput, DeliveryRequest, Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
     ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_delivery,
     verify_receipt,
 };
@@ -182,12 +180,13 @@ pub enum Outcome {
 /// Verified signed receipt envelope bytes as delivered by the executor.
 ///
 /// The gateway exposes these bytes directly as `hellas.receipt`. Symbolic
-/// callers that need catgrad's `TextReceipt` CID can project it from the
-/// verified envelope, but that CID is not the universal receipt identity.
+/// callers that need the symbolic evidence digest can project it from
+/// the verified envelope, but that digest is not the universal receipt
+/// identity.
 #[derive(Debug, Clone)]
 pub struct ReceiptArtifact {
     dag_cbor: Vec<u8>,
-    symbolic_text_receipt_cid: Option<Cid<TextReceipt>>,
+    symbolic_text_artifact: Option<Digest>,
 }
 
 impl ReceiptArtifact {
@@ -201,22 +200,20 @@ impl ReceiptArtifact {
         URL_SAFE_NO_PAD.encode(&self.dag_cbor)
     }
 
-    pub fn symbolic_text_receipt_cid(&self) -> Option<Cid<TextReceipt>> {
-        self.symbolic_text_receipt_cid
+    pub fn symbolic_text_artifact(&self) -> Option<Digest> {
+        self.symbolic_text_artifact
     }
 
     fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreReceiptEnvelope) -> Self {
-        let symbolic_text_receipt_cid = match core {
+        let symbolic_text_artifact = match core {
             CoreReceiptEnvelope::Symbolic(receipt) => match receipt.evidence() {
-                SymbolicEvidence::TextReceiptCid(digest) => {
-                    Some(Cid::from_bytes(digest.into_bytes()))
-                }
+                SymbolicEvidence::TextArtifactCid(digest) => Some(*digest),
             },
             CoreReceiptEnvelope::Opaque(_) => None,
         };
         Self {
             dag_cbor,
-            symbolic_text_receipt_cid,
+            symbolic_text_artifact,
         }
     }
 
@@ -224,7 +221,7 @@ impl ReceiptArtifact {
     pub(crate) fn from_test_bytes(dag_cbor: Vec<u8>) -> Self {
         Self {
             dag_cbor,
-            symbolic_text_receipt_cid: None,
+            symbolic_text_artifact: None,
         }
     }
 }
@@ -490,10 +487,12 @@ impl PreparedExecution {
 /// as stream-level errors (not Outcome::Failed) — they're also unverified
 /// situations but distinguished for diagnostics.
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
-    let primary_cid = match &primary {
-        Outcome::Completed { receipt, .. } => receipt
-            .symbolic_text_receipt_cid()
-            .ok_or_else(|| anyhow!("primary symbolic execution did not produce TextReceipt CID"))?,
+    let primary_digest = match &primary {
+        Outcome::Completed { receipt, .. } => {
+            receipt.symbolic_text_artifact().ok_or_else(|| {
+                anyhow!("primary symbolic execution did not produce symbolic artifact digest")
+            })?
+        }
         Outcome::Failed { .. } => return Ok(primary),
     };
 
@@ -503,16 +502,16 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Resul
             receipt: shadow_receipt,
             ..
         } => {
-            let shadow_cid = shadow_receipt.symbolic_text_receipt_cid().ok_or_else(|| {
-                anyhow!("shadow symbolic execution did not produce TextReceipt CID")
+            let shadow_digest = shadow_receipt.symbolic_text_artifact().ok_or_else(|| {
+                anyhow!("shadow symbolic execution did not produce symbolic artifact digest")
             })?;
-            if primary_cid == shadow_cid {
+            if primary_digest == shadow_digest {
                 Ok(primary)
             } else {
                 Ok(Outcome::Failed {
                     position: primary.position(),
                     error: format!(
-                        "verify mismatch: primary receipt {primary_cid} ≠ shadow receipt {shadow_cid}"
+                        "verify mismatch: primary symbolic artifact {primary_digest} != shadow symbolic artifact {shadow_digest}"
                     ),
                 })
             }
@@ -1039,7 +1038,7 @@ fn convert_opaque_wire_event(
 
 fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
     let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
-    if receipt.symbolic_text_receipt_cid().is_none() {
+    if receipt.symbolic_text_artifact().is_none() {
         bail!("symbolic execution returned an opaque receipt");
     }
     let stop_reason = stop_reason_from_pb(finished.status)?;

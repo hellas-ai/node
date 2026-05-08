@@ -11,7 +11,7 @@ pub mod symbolic_start {
         #[prost(message, tag = "1")]
         Genesis(super::SymbolicGenesisStart),
         #[prost(message, tag = "2")]
-        Receipt(super::SymbolicReceiptStart),
+        Artifact(super::SymbolicArtifactStart),
     }
 }
 impl ::prost::Name for SymbolicStart {
@@ -37,19 +37,19 @@ impl ::prost::Name for SymbolicGenesisStart {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SymbolicReceiptStart {
-    /// exactly 32 bytes
+pub struct SymbolicArtifactStart {
+    /// catnix OutputId<TextArtifact>; exactly 32 bytes.
     #[prost(bytes = "vec", tag = "1")]
-    pub receipt_cid: ::prost::alloc::vec::Vec<u8>,
+    pub artifact_cid: ::prost::alloc::vec::Vec<u8>,
 }
-impl ::prost::Name for SymbolicReceiptStart {
-    const NAME: &'static str = "SymbolicReceiptStart";
+impl ::prost::Name for SymbolicArtifactStart {
+    const NAME: &'static str = "SymbolicArtifactStart";
     const PACKAGE: &'static str = "hellas.courtesy.v1";
     fn full_name() -> ::prost::alloc::string::String {
-        "hellas.courtesy.v1.SymbolicReceiptStart".into()
+        "hellas.courtesy.v1.SymbolicArtifactStart".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/hellas.courtesy.v1.SymbolicReceiptStart".into()
+        "/hellas.courtesy.v1.SymbolicArtifactStart".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

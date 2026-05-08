@@ -12,22 +12,6 @@ service Symbolic {
 }
 
 message SymbolicRequest {
-  oneof execution {
-    SymbolicGenesisExecution genesis = 1;
-    SymbolicStepExecution step = 2;
-  }
-}
-
-message SymbolicGenesisExecution {
-  bytes binding_cid = 1; // exactly 32 bytes
-}
-
-message SymbolicStepExecution {
-  bytes binding_cid = 1; // exactly 32 bytes
-  bytes previous_execution_cid = 2; // exactly 32 bytes
-  bytes input_tokens_cid = 3; // exactly 32 bytes
-  uint32 max_new_tokens = 4;
-  // Repeated field intentionally last so fast parsers can read the fixed
-  // execution header before walking the stop-token list.
-  repeated int32 stop_token_ids = 5;
+  // catnix InputId<TextExecution>; exactly 32 bytes.
+  bytes text_execution_cid = 1;
 }

@@ -15,13 +15,13 @@ mod metrics;
 mod text_output;
 mod tracing_config;
 
-/// `clap` value parser for `--dtype`. Accepts `f32`, `f16`, `bf16`. Rejects
-/// `u32`, which is the catgrad token-tensor dtype, never a model dtype.
+/// `clap` value parser for `--dtype`. Accepts model floating-point dtypes.
+/// Rejects `u32`, which is the catgrad token-tensor dtype, never a model dtype.
 fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
     let dtype = Dtype::from_str(s)?;
     match dtype {
-        Dtype::F32 | Dtype::F16 | Dtype::BF16 => Ok(dtype),
-        Dtype::U32 => Err("model dtype must be f32, f16, or bf16".to_string()),
+        Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F8 => Ok(dtype),
+        Dtype::U32 => Err("model dtype must be f32, f16, bf16, or f8".to_string()),
     }
 }
 
