@@ -1,9 +1,9 @@
 syntax = "proto3";
 
-package hellas.v1;
+package hellas.courtesy.v1;
 
-import "hellas/v1/symbolic.proto";
-import "hellas/v1/ticket.proto";
+import "hellas/symbolic/v1/symbolic.proto";
+import "hellas/v1/hellas.proto";
 
 // Non-core provider conveniences. These APIs are not settlement/protocol
 // objects: providers may offer Hugging Face resolution, tokenization, chat
@@ -48,11 +48,11 @@ message QuotePreparedTextRequest {
 }
 
 message QuotePreparedTextResponse {
-  Ticket ticket = 1;
+  .hellas.v1.Ticket ticket = 1;
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  SymbolicWorkRequest symbolic_request = 4;
+  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
 }
 
 // Convenience RPC: the server handles tokenization and symbolic request
@@ -72,11 +72,11 @@ message QuotePromptRequest {
 }
 
 message QuotePromptResponse {
-  Ticket ticket = 1;
+  .hellas.v1.Ticket ticket = 1;
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  SymbolicWorkRequest symbolic_request = 4;
+  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
 }
 
 // Convenience RPC: chat-style prompt quoting.
@@ -102,11 +102,11 @@ message QuoteChatPromptRequest {
 }
 
 message QuoteChatPromptResponse {
-  Ticket ticket = 1;
+  .hellas.v1.Ticket ticket = 1;
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  SymbolicWorkRequest symbolic_request = 4;
+  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
 }
 
 // List models known to the executor and their readiness status.

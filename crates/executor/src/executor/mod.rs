@@ -1,12 +1,14 @@
 mod actor;
 mod handle;
 
-use hellas_pb::hellas::{
-    CreateTicketRequest, GetModelStatsRequest, GetModelStatsResponse, GetStatsResponse,
-    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, RunTicketRequest, Ticket,
-    WorkEvent,
+use hellas_pb::courtesy::{
+    GetModelStatsRequest, GetModelStatsResponse, GetStatsResponse, ListModelsResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
 use tokio::sync::{mpsc, oneshot};
@@ -41,8 +43,12 @@ pub struct ExecuteOutcome {
 }
 
 pub(crate) enum ExecutorMessage {
-    Quote {
-        request: CreateTicketRequest,
+    QuoteSymbolic {
+        request: PbSymbolicRequest,
+        reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
+    },
+    QuoteOpaque {
+        request: PbOpaqueRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
     QuotePrompt {

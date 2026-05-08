@@ -1,6 +1,14 @@
 syntax = "proto3";
 
-package hellas.v1;
+package hellas.swarm.v1;
+
+// P2P/node-facing service. This is transport/discovery metadata, not the core
+// execution protocol.
+
+service Node {
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+  rpc GetKnownPeers(GetKnownPeersRequest) returns (GetKnownPeersResponse);
+}
 
 message GetNodeInfoRequest {}
 
@@ -23,4 +31,12 @@ message GetKnownPeersRequest {
 
 message GetKnownPeersResponse {
   repeated bytes peer_ids = 1;
+}
+
+message Presence {
+  string hf_id = 1;
+  string req_id = 2;
+  string peer_id = 3;
+  uint64 ttl_ms = 4;
+  bool is_executor = 5;
 }

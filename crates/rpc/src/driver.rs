@@ -10,12 +10,14 @@ use tonic_iroh_transport::IrohChannel;
 
 use crate::GRPC_MESSAGE_LIMIT;
 use crate::provenance::{ExecutionProvenance, read_provenance_metadata};
-use hellas_pb::hellas::courtesy_client::CourtesyClient;
+use hellas_pb::courtesy::courtesy_client::CourtesyClient;
+use hellas_pb::courtesy::{QuotePreparedTextRequest, QuotePreparedTextResponse};
 use hellas_pb::hellas::execute_client::ExecuteClient;
-use hellas_pb::hellas::{
-    CreateTicketRequest, QuotePreparedTextRequest, QuotePreparedTextResponse, RunTicketRequest,
-    Ticket, WorkEvent,
-};
+use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_pb::opaque::OpaqueRequest;
+use hellas_pb::opaque::opaque_client::OpaqueClient;
+use hellas_pb::symbolic::SymbolicRequest;
+use hellas_pb::symbolic::symbolic_client::SymbolicClient;
 
 pub type ExecuteEventStream = Pin<Box<dyn Stream<Item = Result<WorkEvent, Status>> + Send>>;
 
@@ -45,9 +47,13 @@ pub struct StreamedExecution {
 
 #[tonic::async_trait]
 pub trait ExecuteDriver: Send {
-    async fn create_ticket(
+    async fn create_symbolic_ticket(
         &mut self,
-        request: CreateTicketRequest,
+        request: SymbolicRequest,
+    ) -> Result<QuotedResponse, Status>;
+    async fn create_opaque_ticket(
+        &mut self,
+        request: OpaqueRequest,
     ) -> Result<QuotedResponse, Status>;
     async fn quote_prepared_text(
         &mut self,
@@ -61,6 +67,8 @@ pub trait ExecuteDriver: Send {
 
 pub struct RemoteExecuteDriver<T> {
     execute: ExecuteClient<T>,
+    symbolic: SymbolicClient<T>,
+    opaque: OpaqueClient<T>,
     courtesy: CourtesyClient<T>,
 }
 
@@ -79,21 +87,49 @@ where
     <T::ResponseBody as Body>::Error: Into<StdError> + Send,
 {
     pub fn with_service(service: T) -> Self {
+        let symbolic = service.clone();
+        let opaque = service.clone();
         let courtesy = service.clone();
         Self {
             execute: Self::configure_execute(ExecuteClient::new(service)),
+            symbolic: Self::configure_symbolic(SymbolicClient::new(symbolic)),
+            opaque: Self::configure_opaque(OpaqueClient::new(opaque)),
             courtesy: Self::configure_courtesy(CourtesyClient::new(courtesy)),
         }
     }
 
-    pub fn with_services(execute: T, courtesy: T) -> Self {
+    pub fn with_services(execute: T, symbolic: T, opaque: T, courtesy: T) -> Self {
         Self {
             execute: Self::configure_execute(ExecuteClient::new(execute)),
+            symbolic: Self::configure_symbolic(SymbolicClient::new(symbolic)),
+            opaque: Self::configure_opaque(OpaqueClient::new(opaque)),
             courtesy: Self::configure_courtesy(CourtesyClient::new(courtesy)),
         }
     }
 
     fn configure_execute(client: ExecuteClient<T>) -> ExecuteClient<T> {
+        let client = client
+            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+            .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+        #[cfg(feature = "compression")]
+        let client = client
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
+        client
+    }
+
+    fn configure_symbolic(client: SymbolicClient<T>) -> SymbolicClient<T> {
+        let client = client
+            .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
+            .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+        #[cfg(feature = "compression")]
+        let client = client
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
+        client
+    }
+
+    fn configure_opaque(client: OpaqueClient<T>) -> OpaqueClient<T> {
         let client = client
             .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
             .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
@@ -125,11 +161,23 @@ where
     <T::ResponseBody as Body>::Error: Into<StdError> + Send,
     T::Future: Send,
 {
-    async fn create_ticket(
+    async fn create_symbolic_ticket(
         &mut self,
-        request: CreateTicketRequest,
+        request: SymbolicRequest,
     ) -> Result<QuotedResponse, Status> {
-        let resp = self.execute.create_ticket(request).await?;
+        let resp = self.symbolic.create_ticket(request).await?;
+        let provenance = read_provenance_metadata(resp.metadata())?;
+        Ok(QuotedResponse {
+            response: resp.into_inner(),
+            provenance,
+        })
+    }
+
+    async fn create_opaque_ticket(
+        &mut self,
+        request: OpaqueRequest,
+    ) -> Result<QuotedResponse, Status> {
+        let resp = self.opaque.create_ticket(request).await?;
         let provenance = read_provenance_metadata(resp.metadata())?;
         Ok(QuotedResponse {
             response: resp.into_inner(),

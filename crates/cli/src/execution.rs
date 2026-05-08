@@ -43,16 +43,15 @@ use hellas_core::{
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
-use hellas_pb::hellas::{
-    self as pb, FinishStatus, QuotePreparedTextRequest, RunTicketRequest, WorkEvent, work_event,
-};
+use hellas_pb::courtesy::QuotePreparedTextRequest;
+use hellas_pb::hellas::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, work_event};
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{ExecuteDriver, QuotedPreparedTextResponse, RemoteExecuteDriver};
 use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::service::{CourtesyService, ExecuteService};
+use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService, SymbolicService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -831,10 +830,32 @@ fn bind_courtesy_pool(endpoint: &Endpoint) -> ConnectionPool {
     )
 }
 
+fn bind_symbolic_pool(endpoint: &Endpoint) -> ConnectionPool {
+    ConnectionPool::for_service::<SymbolicService>(
+        endpoint.clone(),
+        PoolOptions {
+            connect_timeout: REMOTE_CONNECT_TIMEOUT,
+            ..PoolOptions::default()
+        },
+    )
+}
+
+fn bind_opaque_pool(endpoint: &Endpoint) -> ConnectionPool {
+    ConnectionPool::for_service::<OpaqueService>(
+        endpoint.clone(),
+        PoolOptions {
+            connect_timeout: REMOTE_CONNECT_TIMEOUT,
+            ..PoolOptions::default()
+        },
+    )
+}
+
 #[instrument(skip_all, fields(%peer_id, model = %quote_req.huggingface_model_id))]
 async fn quote_remote_endpoint(
     quote_req: &QuotePreparedTextRequest,
     execute_pool: &ConnectionPool,
+    symbolic_pool: &ConnectionPool,
+    opaque_pool: &ConnectionPool,
     courtesy_pool: &ConnectionPool,
     peer_id: EndpointId,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
@@ -848,8 +869,20 @@ async fn quote_remote_endpoint(
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
+    let symbolic_channel = symbolic_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let opaque_channel = opaque_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
     let mut driver = RemoteExecuteDriver::with_services(
         InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(symbolic_channel, TraceContextInjector),
+        InterceptedService::new(opaque_channel, TraceContextInjector),
         InterceptedService::new(courtesy_channel, TraceContextInjector),
     );
     let quoted = match quote_with_driver(quote_req, &mut driver, || {
@@ -876,15 +909,22 @@ async fn quote_remote_peer(
     peer_id: EndpointId,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
+    let symbolic_pool = bind_symbolic_pool(endpoint);
+    let opaque_pool = bind_opaque_pool(endpoint);
     let courtesy_pool = bind_courtesy_pool(endpoint);
-    quote_remote_endpoint(quote_req, &execute_pool, &courtesy_pool, peer_id)
-        .await
-        .map_err(|err| match err {
-            QuoteCandidateError::Declined(err) => {
-                err.context(format!("node {peer_id} declined quote"))
-            }
-            QuoteCandidateError::Connect(err) => err,
-        })
+    quote_remote_endpoint(
+        quote_req,
+        &execute_pool,
+        &symbolic_pool,
+        &opaque_pool,
+        &courtesy_pool,
+        peer_id,
+    )
+    .await
+    .map_err(|err| match err {
+        QuoteCandidateError::Declined(err) => err.context(format!("node {peer_id} declined quote")),
+        QuoteCandidateError::Connect(err) => err,
+    })
 }
 
 async fn quote_remote_target(
@@ -904,8 +944,18 @@ async fn quote_remote_target(
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let symbolic_channel = SymbolicService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let opaque_channel = OpaqueService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
     let mut driver = RemoteExecuteDriver::with_services(
         InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(symbolic_channel, TraceContextInjector),
+        InterceptedService::new(opaque_channel, TraceContextInjector),
         InterceptedService::new(courtesy_channel, TraceContextInjector),
     );
     let quoted = quote_with_driver(quote_req, &mut driver, || {
@@ -939,6 +989,8 @@ async fn discover_remote_quote(
     registry.add(MdnsBackend::new(bindings.mdns));
     registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
     let execute_pool = registry.pool::<ExecuteService>();
+    let symbolic_pool = registry.pool::<SymbolicService>();
+    let opaque_pool = registry.pool::<OpaqueService>();
     let courtesy_pool = registry.pool::<CourtesyService>();
 
     let peers = Box::pin(registry.discover::<CourtesyService>());
@@ -979,10 +1031,19 @@ async fn discover_remote_quote(
                                 continue;
                             }
                             let execute_pool = execute_pool.clone();
+                            let symbolic_pool = symbolic_pool.clone();
+                            let opaque_pool = opaque_pool.clone();
                             let courtesy_pool = courtesy_pool.clone();
                             let req = quote_req.clone();
                             in_flight.push(async move {
-                                quote_remote_endpoint(&req, &execute_pool, &courtesy_pool, peer_id).await
+                                quote_remote_endpoint(
+                                    &req,
+                                    &execute_pool,
+                                    &symbolic_pool,
+                                    &opaque_pool,
+                                    &courtesy_pool,
+                                    peer_id,
+                                ).await
                             });
                         }
                         Some(Err(err)) => last_connect_error = Some(err.into()),

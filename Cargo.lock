@@ -2640,6 +2640,7 @@ dependencies = [
 name = "hellas-pb"
 version = "0.1.0"
 dependencies = [
+ "glob",
  "prost",
  "tonic",
  "tonic-prost",

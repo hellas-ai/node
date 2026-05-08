@@ -14,10 +14,9 @@ use hellas_core::{
     ProducerSigningKey, ReceiptEnvelope, RequestCommitment, Symbolic, decode_dag_cbor,
     verify_delivery,
 };
-use hellas_pb::hellas::{
-    CreateTicketRequest, FinishStatus, OpaqueWorkRequest, RunTicketRequest, SymbolicWorkRequest,
-    WorkRequest, work_event, work_request,
-};
+use hellas_pb::hellas::{FinishStatus, RunTicketRequest, work_event};
+use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
@@ -55,12 +54,8 @@ async fn create_ticket_rejects_malformed_symbolic_request() {
     .expect("executor should start");
 
     let err = handle
-        .create_ticket(CreateTicketRequest {
-            request: Some(WorkRequest {
-                kind: Some(work_request::Kind::Symbolic(SymbolicWorkRequest {
-                    ..Default::default()
-                })),
-            }),
+        .create_symbolic_ticket(PbSymbolicRequest {
+            ..Default::default()
         })
         .await
         .expect_err("quote should fail");
@@ -126,13 +121,7 @@ async fn create_ticket_accepts_cid_only_symbolic_step_from_artifacts() {
     let expected = RequestCommitment(Symbolic::commit_request(&symbolic_request));
 
     let outcome = executor
-        .handle_quote(CreateTicketRequest {
-            request: Some(WorkRequest {
-                kind: Some(work_request::Kind::Symbolic(symbolic_request_to_pb(
-                    &symbolic_request,
-                ))),
-            }),
-        })
+        .handle_quote_symbolic(symbolic_request_to_pb(&symbolic_request))
         .await
         .expect("CID-only quote should succeed");
 
@@ -146,14 +135,10 @@ async fn opaque_ticket_runs_with_signed_json_receipt() {
     let payload = br#"{"x":1}"#.to_vec();
 
     let outcome = executor
-        .handle_quote(CreateTicketRequest {
-            request: Some(WorkRequest {
-                kind: Some(work_request::Kind::Opaque(OpaqueWorkRequest {
-                    service: "echo".to_string(),
-                    method: "run".to_string(),
-                    payload: payload.clone(),
-                })),
-            }),
+        .handle_quote_opaque(PbOpaqueRequest {
+            service: "echo".to_string(),
+            method: "run".to_string(),
+            payload: payload.clone(),
         })
         .await
         .expect("opaque quote should succeed");

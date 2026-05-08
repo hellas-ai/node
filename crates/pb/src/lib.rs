@@ -2,49 +2,91 @@
 //!
 //! The source `.proto` files live under `proto/hellas` at the workspace root.
 
-#[cfg(any(
-    feature = "common",
-    feature = "symbolic",
-    feature = "opaque",
-    feature = "ticket",
-    feature = "execute",
-    feature = "courtesy",
-    feature = "node",
-))]
-#[allow(dead_code)]
-#[path = "hellas.v1.rs"]
-mod generated_hellas;
+mod generated {
+    pub mod hellas {
+        #[cfg(feature = "courtesy")]
+        #[allow(dead_code)]
+        pub mod courtesy {
+            pub mod v1 {
+                include!("hellas.courtesy.v1.rs");
+            }
+        }
 
+        #[cfg(feature = "hellas")]
+        #[allow(dead_code)]
+        pub mod v1 {
+            include!("hellas.v1.rs");
+        }
+
+        #[cfg(feature = "opaque")]
+        #[allow(dead_code)]
+        pub mod opaque {
+            pub mod v1 {
+                include!("hellas.opaque.v1.rs");
+            }
+        }
+
+        #[cfg(feature = "swarm")]
+        #[allow(dead_code)]
+        pub mod swarm {
+            pub mod v1 {
+                include!("hellas.swarm.v1.rs");
+            }
+        }
+
+        #[cfg(feature = "symbolic")]
+        #[allow(dead_code)]
+        pub mod symbolic {
+            pub mod v1 {
+                include!("hellas.symbolic.v1.rs");
+            }
+        }
+    }
+}
+
+macro_rules! service_exports {
+    ($($path:ident)::+, $client:ident, $server:ident) => {
+        #[cfg(feature = "client")]
+        pub use $($path)::+::$client;
+        #[cfg(feature = "server")]
+        pub use $($path)::+::$server;
+    };
+}
+
+#[cfg(feature = "hellas")]
 pub mod hellas {
-    #[cfg(feature = "common")]
-    pub use crate::generated_hellas::{
-        FinishStatus, ReceiptEnvelope, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
+    pub use crate::generated::hellas::v1::{
+        FinishStatus, ReceiptEnvelope, RunTicketRequest, Ticket, WorkChunk, WorkEvent, WorkFailed,
+        WorkFinished, work_event,
     };
+    service_exports!(crate::generated::hellas::v1, execute_client, execute_server);
+}
 
-    #[cfg(feature = "symbolic")]
-    pub use crate::generated_hellas::{
-        SymbolicGenesisExecution, SymbolicStepExecution, SymbolicWorkRequest, symbolic_work_request,
+#[cfg(feature = "symbolic")]
+pub mod symbolic {
+    pub use crate::generated::hellas::symbolic::v1::{
+        SymbolicGenesisExecution, SymbolicRequest, SymbolicStepExecution, symbolic_request,
     };
+    service_exports!(
+        crate::generated::hellas::symbolic::v1,
+        symbolic_client,
+        symbolic_server
+    );
+}
 
-    #[cfg(feature = "opaque")]
-    pub use crate::generated_hellas::OpaqueWorkRequest;
+#[cfg(feature = "opaque")]
+pub mod opaque {
+    pub use crate::generated::hellas::opaque::v1::OpaqueRequest;
+    service_exports!(
+        crate::generated::hellas::opaque::v1,
+        opaque_client,
+        opaque_server
+    );
+}
 
-    #[cfg(feature = "ticket")]
-    pub use crate::generated_hellas::{
-        CreateTicketRequest, RunTicketRequest, Ticket, WorkRequest, work_request,
-    };
-
-    #[cfg(all(feature = "execute", feature = "client"))]
-    pub use crate::generated_hellas::execute_client;
-    #[cfg(all(feature = "execute", feature = "server"))]
-    pub use crate::generated_hellas::execute_server;
-
-    #[cfg(all(feature = "courtesy", feature = "client"))]
-    pub use crate::generated_hellas::courtesy_client;
-    #[cfg(all(feature = "courtesy", feature = "server"))]
-    pub use crate::generated_hellas::courtesy_server;
-    #[cfg(feature = "courtesy")]
-    pub use crate::generated_hellas::{
+#[cfg(feature = "courtesy")]
+pub mod courtesy {
+    pub use crate::generated::hellas::courtesy::v1::{
         ChatMessage, DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest,
         GetModelStatsResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest,
         ListModelsResponse, ModelInfo, ModelStatus, ModelTokenStats, QuoteChatPromptRequest,
@@ -52,14 +94,22 @@ pub mod hellas {
         QuotePromptRequest, QuotePromptResponse, SymbolicGenesisStart, SymbolicReceiptStart,
         SymbolicStart, TokenStats, symbolic_start,
     };
+    service_exports!(
+        crate::generated::hellas::courtesy::v1,
+        courtesy_client,
+        courtesy_server
+    );
+}
 
-    #[cfg(all(feature = "node", feature = "client"))]
-    pub use crate::generated_hellas::node_client;
-    #[cfg(all(feature = "node", feature = "server"))]
-    pub use crate::generated_hellas::node_server;
-    #[cfg(feature = "node")]
-    pub use crate::generated_hellas::{
+#[cfg(feature = "swarm")]
+pub mod swarm {
+    pub use crate::generated::hellas::swarm::v1::{
         GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
         Presence,
     };
+    service_exports!(
+        crate::generated::hellas::swarm::v1,
+        node_client,
+        node_server
+    );
 }

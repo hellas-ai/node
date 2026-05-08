@@ -206,8 +206,8 @@ impl ExecutorMetrics {
     }
 
     /// Snapshot the global counters for the GetStats RPC.
-    pub(crate) fn global_snapshot(&self) -> hellas_pb::hellas::TokenStats {
-        hellas_pb::hellas::TokenStats {
+    pub(crate) fn global_snapshot(&self) -> hellas_pb::courtesy::TokenStats {
+        hellas_pb::courtesy::TokenStats {
             executions_started: self.executions_started.get(),
             executions_completed: self.executions_completed.get(),
             executions_failed: self.executions_failed.get(),
@@ -221,11 +221,11 @@ impl ExecutorMetrics {
 
     /// Snapshot a per-model row for the GetStats RPC. Only counters that have
     /// observed events for this model are nonzero.
-    pub(crate) fn model_snapshot(&self, model_id: &str) -> hellas_pb::hellas::TokenStats {
+    pub(crate) fn model_snapshot(&self, model_id: &str) -> hellas_pb::courtesy::TokenStats {
         let label = ModelLabel {
             model_id: model_id.to_string(),
         };
-        hellas_pb::hellas::TokenStats {
+        hellas_pb::courtesy::TokenStats {
             executions_started: self.by_model_executions_started.get_or_create(&label).get(),
             executions_completed: self
                 .by_model_executions_completed
