@@ -91,12 +91,15 @@ impl GatewayState {
     pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
+            let producer_key =
+                crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
             ExecutionRuntime::with_local_executor(
-                Executor::spawn(
+                Executor::spawn_with_producer_key(
                     DownloadPolicy::Eager,
                     ExecutePolicy::Eager,
                     options.queue_size,
                     vec![options.dtype],
+                    producer_key,
                 )
                 .context("failed to initialize local execution backend")?,
             )

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use hellas_core::ProducerSigningKey;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use tonic_iroh_transport::iroh::SecretKey;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
+const PRODUCER_KEY_FILE: &str = "signing-key.secp256k1";
 const KEY_LEN: usize = 32;
 
 /// Resolve the identity file path and load or create the secret key.
@@ -26,6 +28,21 @@ pub fn load_or_create(path: Option<&Path>) -> anyhow::Result<SecretKey> {
     }
 }
 
+#[cfg(feature = "hellas-executor")]
+pub fn load_or_create_producer_key(path: Option<&Path>) -> anyhow::Result<ProducerSigningKey> {
+    let path = match path {
+        Some(p) => p.to_owned(),
+        None => default_producer_key_path()?,
+    };
+    match fs::read(&path) {
+        Ok(bytes) => load_producer_key_from_bytes(&path, &bytes),
+        Err(e) if e.kind() == ErrorKind::NotFound => create_new_producer_key(&path),
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to read producer key file {}", path.display()))
+        }
+    }
+}
+
 /// Load an existing identity file; error if missing.
 ///
 /// Unlike `load_or_create`, this never creates a new key. Use this for
@@ -41,10 +58,29 @@ pub fn load_existing(path: Option<&Path>) -> anyhow::Result<SecretKey> {
     load_from_bytes(&path, &bytes)
 }
 
+pub fn load_existing_producer_key(path: Option<&Path>) -> anyhow::Result<ProducerSigningKey> {
+    let path = match path {
+        Some(p) => p.to_owned(),
+        None => default_producer_key_path()?,
+    };
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read producer key file {}", path.display()))?;
+    load_producer_key_from_bytes(&path, &bytes)
+}
+
 fn default_identity_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .context("HOME environment variable not set; use --identity to specify path")?;
-    Ok(PathBuf::from(home).join(IDENTITY_DIR).join(IDENTITY_FILE))
+    default_hellas_path(IDENTITY_FILE, "--identity")
+}
+
+fn default_producer_key_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path(PRODUCER_KEY_FILE, "--producer-key-path")
+}
+
+fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").with_context(|| {
+        format!("HOME environment variable not set; use {flag} to specify path")
+    })?;
+    Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
 fn load_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<SecretKey> {
@@ -97,6 +133,73 @@ fn create_new(path: &Path) -> anyhow::Result<SecretKey> {
             } else {
                 Err(e)
                     .with_context(|| format!("failed to persist identity file {}", path.display()))
+            }
+        }
+    }
+}
+
+fn load_producer_key_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<ProducerSigningKey> {
+    let bytes: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "producer key file at {} has invalid size ({} bytes, expected {KEY_LEN})",
+            path.display(),
+            bytes.len(),
+        )
+    })?;
+    let key = ProducerSigningKey::from_secret_bytes(bytes)
+        .with_context(|| format!("producer key file {} is invalid", path.display()))?;
+    info!(
+        producer_id = ?key.producer_id(),
+        path = %path.display(),
+        "loaded producer signing key"
+    );
+    Ok(key)
+}
+
+#[cfg(feature = "hellas-executor")]
+fn create_new_producer_key(path: &Path) -> anyhow::Result<ProducerSigningKey> {
+    let dir = path
+        .parent()
+        .context("producer key path has no parent directory")?;
+
+    create_dir_restricted(dir)
+        .with_context(|| format!("failed to create producer key directory {}", dir.display()))?;
+
+    let key = ProducerSigningKey::generate();
+    let bytes = key.to_secret_bytes();
+
+    let tmp_path = dir.join(format!(
+        ".signing-key.secp256k1.tmp.{}.{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    write_file_restricted(&tmp_path, &bytes).with_context(|| {
+        format!(
+            "failed to write temp producer key file {}",
+            tmp_path.display()
+        )
+    })?;
+
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => {
+            info!(
+                producer_id = ?key.producer_id(),
+                path = %path.display(),
+                "created new producer signing key"
+            );
+            Ok(key)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            if path.exists() {
+                let bytes = fs::read(path).with_context(|| {
+                    format!("failed to read producer key file {}", path.display())
+                })?;
+                load_producer_key_from_bytes(path, &bytes)
+            } else {
+                Err(e).with_context(|| {
+                    format!("failed to persist producer key file {}", path.display())
+                })
             }
         }
     }
@@ -159,6 +262,35 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hellas-executor")]
+    #[test]
+    fn creates_new_producer_key_in_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signing-key.secp256k1");
+
+        let key = load_or_create_producer_key(Some(&path)).unwrap();
+
+        assert!(path.exists());
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), KEY_LEN);
+        let reloaded =
+            ProducerSigningKey::from_secret_bytes(<[u8; 32]>::try_from(bytes.as_slice()).unwrap())
+                .unwrap();
+        assert_eq!(reloaded.producer_id(), key.producer_id());
+    }
+
+    #[cfg(feature = "hellas-executor")]
+    #[test]
+    fn reloads_existing_producer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signing-key.secp256k1");
+
+        let key1 = load_or_create_producer_key(Some(&path)).unwrap();
+        let key2 = load_or_create_producer_key(Some(&path)).unwrap();
+
+        assert_eq!(key1.producer_id(), key2.producer_id());
+    }
+
     #[test]
     fn reloads_existing_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -200,6 +332,12 @@ mod tests {
 
         let path = default_identity_path().unwrap();
         assert_eq!(path, dir.path().join(".hellas").join("identity"));
+
+        let path = default_producer_key_path().unwrap();
+        assert_eq!(
+            path,
+            dir.path().join(".hellas").join("signing-key.secp256k1")
+        );
 
         unsafe { env::remove_var("HOME") };
     }

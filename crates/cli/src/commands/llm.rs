@@ -10,6 +10,8 @@ use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(feature = "hellas-executor")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
@@ -24,6 +26,8 @@ pub struct ExecuteOptions {
     pub local: bool,
     #[cfg(feature = "hellas-executor")]
     pub verify_local: bool,
+    #[cfg(feature = "hellas-executor")]
+    pub producer_key_path: Option<PathBuf>,
     pub raw: bool,
     /// Ordered preference list. The first entry is what the client *first*
     /// builds the program at; later entries are tried via fallback if the
@@ -88,12 +92,15 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
+            let producer_key =
+                crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
             // the program at the first acceptable entry.
-            ExecutionRuntime::spawn_default_local(
+            ExecutionRuntime::spawn_default_local_with_producer_key(
                 hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
                 options.dtype.clone(),
+                producer_key,
             )?
             .with_secret_key(secret_key.clone())
         } else {

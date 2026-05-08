@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long = "identity", global = true)]
     identity: Option<PathBuf>,
 
+    /// Path to producer signing key (default: $HOME/.hellas/signing-key.secp256k1)
+    #[arg(long = "producer-key-path", global = true)]
+    producer_key_path: Option<PathBuf>,
+
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
     log_file: Option<PathBuf>,
@@ -80,6 +84,12 @@ struct Cli {
 enum IdentityCommand {
     /// Print the node ID (hex public key) derived from the identity file
     ShowNodeId,
+}
+
+#[derive(Subcommand)]
+enum ProducerKeyCommand {
+    /// Print the producer public key and derived producer id
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -288,6 +298,11 @@ enum Commands {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Inspect the local producer signing key
+    ProducerKey {
+        #[command(subcommand)]
+        command: ProducerKeyCommand,
+    },
     /// Discover peers and log network events
     Monitor {
         /// Stop monitoring after N seconds (default: run until Ctrl+C)
@@ -308,6 +323,25 @@ async fn main() {
     // bypasses the requested log file.
     let cli = Cli::parse();
     let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
+    let producer_key_path = cli.producer_key_path.clone();
+
+    if let Commands::ProducerKey {
+        command: ProducerKeyCommand::Show,
+    } = &cli.command
+    {
+        let result = identity::load_existing_producer_key(producer_key_path.as_deref())
+            .and_then(|key| commands::identity::show_producer_key(&key));
+        if let Some(provider) = tracer_provider
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("warning: failed to flush traces: {err}");
+        }
+        if let Err(err) = result {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // show-node-id is a read-only query; never create an identity file as a
     // side effect of it (would race with a running service's own creator).
@@ -337,6 +371,14 @@ async fn main() {
             graffiti,
             dtype,
         } => {
+            let producer_key =
+                match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        eprintln!("error: {err:#}");
+                        std::process::exit(1);
+                    }
+                };
             commands::serve::run(
                 port,
                 download_policy,
@@ -347,6 +389,7 @@ async fn main() {
                 graffiti,
                 dtype,
                 secret_key,
+                producer_key,
             )
             .await
         }
@@ -387,6 +430,8 @@ async fn main() {
                 force_model,
                 metrics_port,
                 dtype,
+                #[cfg(feature = "hellas-executor")]
+                producer_key_path: producer_key_path.clone(),
                 secret_key,
                 wrap,
                 wrap_args,
@@ -434,6 +479,8 @@ async fn main() {
                     #[cfg(feature = "hellas-executor")]
                     verify_local,
                     dtype,
+                    #[cfg(feature = "hellas-executor")]
+                    producer_key_path: producer_key_path.clone(),
                 },
                 secret_key,
             )
@@ -470,6 +517,8 @@ async fn main() {
                             retries,
                             #[cfg(feature = "hellas-executor")]
                             local,
+                            #[cfg(feature = "hellas-executor")]
+                            producer_key_path: producer_key_path.clone(),
                         },
                         secret_key,
                     )
@@ -481,6 +530,7 @@ async fn main() {
         Commands::Identity { command } => match command {
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
         },
+        Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
         Commands::Monitor {
             timeout_secs,
             no_interrogate,
@@ -761,6 +811,28 @@ mod tests {
     fn gateway_wrap_args_require_wrap() {
         let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
         assert!(result.is_err(), "trailing args without --wrap should error");
+    }
+
+    #[test]
+    fn producer_key_show_accepts_global_key_path() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "--producer-key-path",
+            "/tmp/hellas-producer-key",
+            "producer-key",
+            "show",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.producer_key_path.as_deref(),
+            Some(std::path::Path::new("/tmp/hellas-producer-key"))
+        );
+        match cli.command {
+            Commands::ProducerKey {
+                command: ProducerKeyCommand::Show,
+            } => {}
+            _ => panic!("expected producer-key show command"),
+        }
     }
 
     #[cfg(feature = "hellas-executor")]

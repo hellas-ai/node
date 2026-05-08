@@ -8,6 +8,8 @@ use futures::StreamExt;
 use hellas_pb::opaque::OpaqueRequest;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(feature = "hellas-executor")]
+use std::path::PathBuf;
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
@@ -19,6 +21,8 @@ pub struct ExecuteOptions {
     pub retries: usize,
     #[cfg(feature = "hellas-executor")]
     pub local: bool,
+    #[cfg(feature = "hellas-executor")]
+    pub producer_key_path: Option<PathBuf>,
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
@@ -37,9 +41,12 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     #[cfg(feature = "hellas-executor")]
     let runtime = if options.local {
-        ExecutionRuntime::spawn_default_local(
+        let producer_key =
+            crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
+        ExecutionRuntime::spawn_default_local_with_producer_key(
             hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
             vec![Dtype::F32],
+            producer_key,
         )?
         .with_secret_key(secret_key)
     } else {
