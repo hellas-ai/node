@@ -67,9 +67,9 @@ pub trait ExecuteDriver: Send {
 
 pub struct RemoteExecuteDriver<T> {
     execute: ExecuteClient<T>,
-    symbolic: SymbolicClient<T>,
-    opaque: OpaqueClient<T>,
-    courtesy: CourtesyClient<T>,
+    symbolic: Option<SymbolicClient<T>>,
+    opaque: Option<OpaqueClient<T>>,
+    courtesy: Option<CourtesyClient<T>>,
 }
 
 #[cfg(feature = "discovery")]
@@ -92,18 +92,36 @@ where
         let courtesy = service.clone();
         Self {
             execute: Self::configure_execute(ExecuteClient::new(service)),
-            symbolic: Self::configure_symbolic(SymbolicClient::new(symbolic)),
-            opaque: Self::configure_opaque(OpaqueClient::new(opaque)),
-            courtesy: Self::configure_courtesy(CourtesyClient::new(courtesy)),
+            symbolic: Some(Self::configure_symbolic(SymbolicClient::new(symbolic))),
+            opaque: Some(Self::configure_opaque(OpaqueClient::new(opaque))),
+            courtesy: Some(Self::configure_courtesy(CourtesyClient::new(courtesy))),
         }
     }
 
     pub fn with_services(execute: T, symbolic: T, opaque: T, courtesy: T) -> Self {
         Self {
             execute: Self::configure_execute(ExecuteClient::new(execute)),
-            symbolic: Self::configure_symbolic(SymbolicClient::new(symbolic)),
-            opaque: Self::configure_opaque(OpaqueClient::new(opaque)),
-            courtesy: Self::configure_courtesy(CourtesyClient::new(courtesy)),
+            symbolic: Some(Self::configure_symbolic(SymbolicClient::new(symbolic))),
+            opaque: Some(Self::configure_opaque(OpaqueClient::new(opaque))),
+            courtesy: Some(Self::configure_courtesy(CourtesyClient::new(courtesy))),
+        }
+    }
+
+    pub fn with_execute_and_courtesy(execute: T, courtesy: T) -> Self {
+        Self {
+            execute: Self::configure_execute(ExecuteClient::new(execute)),
+            symbolic: None,
+            opaque: None,
+            courtesy: Some(Self::configure_courtesy(CourtesyClient::new(courtesy))),
+        }
+    }
+
+    pub fn with_execute_and_opaque(execute: T, opaque: T) -> Self {
+        Self {
+            execute: Self::configure_execute(ExecuteClient::new(execute)),
+            symbolic: None,
+            opaque: Some(Self::configure_opaque(OpaqueClient::new(opaque))),
+            courtesy: None,
         }
     }
 
@@ -165,7 +183,11 @@ where
         &mut self,
         request: SymbolicRequest,
     ) -> Result<QuotedResponse, Status> {
-        let resp = self.symbolic.create_ticket(request).await?;
+        let symbolic = self
+            .symbolic
+            .as_mut()
+            .ok_or_else(|| Status::unimplemented("symbolic service is not configured"))?;
+        let resp = symbolic.create_ticket(request).await?;
         let provenance = read_provenance_metadata(resp.metadata())?;
         Ok(QuotedResponse {
             response: resp.into_inner(),
@@ -177,7 +199,11 @@ where
         &mut self,
         request: OpaqueRequest,
     ) -> Result<QuotedResponse, Status> {
-        let resp = self.opaque.create_ticket(request).await?;
+        let opaque = self
+            .opaque
+            .as_mut()
+            .ok_or_else(|| Status::unimplemented("opaque service is not configured"))?;
+        let resp = opaque.create_ticket(request).await?;
         let provenance = read_provenance_metadata(resp.metadata())?;
         Ok(QuotedResponse {
             response: resp.into_inner(),
@@ -189,7 +215,11 @@ where
         &mut self,
         request: QuotePreparedTextRequest,
     ) -> Result<QuotedPreparedTextResponse, Status> {
-        let resp = self.courtesy.quote_prepared_text(request).await?;
+        let courtesy = self
+            .courtesy
+            .as_mut()
+            .ok_or_else(|| Status::unimplemented("courtesy service is not configured"))?;
+        let resp = courtesy.quote_prepared_text(request).await?;
         let provenance = read_provenance_metadata(resp.metadata())?;
         Ok(QuotedPreparedTextResponse {
             response: resp.into_inner(),
