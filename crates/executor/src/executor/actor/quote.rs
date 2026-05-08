@@ -4,11 +4,9 @@ use crate::state::{
     resolve_accept_dtypes, symbolic_request_from_pb, symbolic_request_to_pb,
 };
 use catgrad::prelude::Dtype;
-use catnix::{InputAddressed, OutputAddressed};
 use chatgrad::types;
 use hellas_core::{
-    CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
-    SymbolicRequest, hash_tuple,
+    CommitmentScheme, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
 };
 use hellas_pb::courtesy::{
     ListModelsResponse, ModelInfo, ModelStatus, QuoteChatPromptRequest, QuoteChatPromptResponse,
@@ -74,11 +72,33 @@ impl Executor {
         &mut self,
         request: PbSymbolicRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        let _ = symbolic_request_from_pb(request)?;
-        Err(ExecutorError::InvalidQuoteRequest(
-            "CID-only symbolic execution needs an artifact resolver; use courtesy quote_prepared_text for local execution"
-                .to_string(),
-        ))
+        self.store.prune_expired_quotes(Instant::now());
+        let symbolic_request = symbolic_request_from_pb(request)?;
+        let resolved = self
+            .artifacts
+            .resolve_symbolic_request(symbolic_request.clone())?;
+        let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
+        let request_commitment_bytes = self.store.create_quote(QuoteRecord {
+            request_commitment,
+            expires_at: Instant::now() + QUOTE_TTL,
+            model_id: resolved.locator.spec(),
+            kind: QuoteKind::Symbolic {
+                symbolic_request,
+                locator: resolved.locator,
+                invocation: resolved.invocation,
+            },
+        });
+
+        Ok(TicketOutcome {
+            response: Ticket {
+                request_commitment: request_commitment_bytes.to_vec(),
+                amount: STATIC_QUOTE_AMOUNT,
+                ttl_ms: QUOTE_TTL.as_millis() as u64,
+            },
+            provenance: ExecutionProvenance {
+                commitment_id: request_commitment_bytes,
+            },
+        })
     }
 
     pub(super) async fn handle_quote_opaque(
@@ -106,7 +126,8 @@ impl Executor {
             )));
         }
 
-        let symbolic_request = symbolic_request_from_plan(&plan)?;
+        let resolved = self.artifacts.record_prepared_text(&plan).await?;
+        let symbolic_request = resolved.symbolic_request.clone();
         let symbolic_request_pb = symbolic_request_to_pb(&symbolic_request);
         let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
         let commitment_id = request_commitment.0.digest();
@@ -116,8 +137,8 @@ impl Executor {
             model_id: plan.locator.spec(),
             kind: QuoteKind::Symbolic {
                 symbolic_request,
-                locator: plan.locator.clone(),
-                invocation: plan.invocation.clone(),
+                locator: resolved.locator,
+                invocation: resolved.invocation,
             },
         });
 
@@ -299,63 +320,6 @@ impl Executor {
             },
         })
     }
-}
-
-fn symbolic_request_from_plan(plan: &QuotePlan) -> Result<SymbolicRequest, ExecutorError> {
-    // Courtesy requests still enter through Hugging Face model metadata.
-    // The core symbolic protocol sees only the catnix TextExecution CID.
-    // Until the artifact resolver lands, the courtesy path derives the
-    // referenced catnix objects locally and stores only the executable plan.
-    let bound_term_id =
-        catnix::BoundTermId::from_digest(to_catnix_digest(binding_digest(&plan.locator)));
-    let from = match plan.initial_artifact_id {
-        Some(artifact_id) => catnix::SourceRef::output(catnix::TextArtifactId::from_digest(
-            to_catnix_digest(artifact_id),
-        )),
-        None => {
-            let identity = catnix::TextArtifact::identity(bound_term_id);
-            catnix::SourceRef::output(identity.output_id())
-        }
-    };
-    let prompt_tokens_id = catnix::TokenIds::from(plan.invocation.input_ids.clone()).output_id();
-    let policy = text_policy(&plan.invocation)?;
-    let execution = catnix::TextExecution::new(from, prompt_tokens_id, policy.output_id());
-    Ok(SymbolicRequest {
-        text_execution_cid: from_catnix_digest(execution.input_id().digest()),
-    })
-}
-
-fn text_policy(invocation: &crate::state::Invocation) -> Result<catnix::TextPolicy, ExecutorError> {
-    let stop_token_ids = invocation
-        .stop_token_ids
-        .iter()
-        .copied()
-        .map(catnix::TokenId::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| ExecutorError::InvalidTokenPayload(err.to_string()))?;
-    Ok(catnix::TextPolicy::new(
-        invocation.max_new_tokens,
-        stop_token_ids,
-    ))
-}
-
-fn binding_digest(locator: &ModelLocator) -> Digest {
-    hash_tuple(
-        "hellas.executor.synthetic_binding.v1",
-        &[
-            locator.model_id.as_bytes(),
-            locator.revision.as_bytes(),
-            dtype_to_wire(locator.dtype).as_bytes(),
-        ],
-    )
-}
-
-fn to_catnix_digest(digest: Digest) -> catnix::Digest {
-    catnix::Digest::from_bytes(digest.into_bytes())
-}
-
-fn from_catnix_digest(digest: catnix::Digest) -> Digest {
-    Digest::from_bytes(*digest.as_bytes())
 }
 
 fn format_request_commitment(bytes: &[u8; 32]) -> String {
