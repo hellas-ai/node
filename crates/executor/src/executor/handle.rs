@@ -84,6 +84,14 @@ impl ExecutorHandle {
             .await
     }
 
+    pub async fn export_artifact_bundle(
+        &self,
+        request: PbSymbolicRequest,
+    ) -> Result<PublishArtifactBundleRequest, ExecutorError> {
+        self.send(|reply| ExecutorMessage::ExportArtifactBundle { request, reply })
+            .await
+    }
+
     pub async fn get_artifact(
         &self,
         request: GetArtifactRequest,

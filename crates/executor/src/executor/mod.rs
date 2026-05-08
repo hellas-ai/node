@@ -69,6 +69,10 @@ pub(crate) enum ExecutorMessage {
         request: PublishArtifactBundleRequest,
         reply: oneshot::Sender<Result<PublishArtifactBundleResponse, ExecutorError>>,
     },
+    ExportArtifactBundle {
+        request: PbSymbolicRequest,
+        reply: oneshot::Sender<Result<PublishArtifactBundleRequest, ExecutorError>>,
+    },
     GetArtifact {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
