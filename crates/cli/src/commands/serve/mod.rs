@@ -1,6 +1,7 @@
 use crate::commands::CliResult;
 use anyhow::Context;
 use catgrad::prelude::Dtype;
+use hellas_core::ProducerSigningKey;
 use hellas_executor::ExecutorMetrics;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::HashSet;
@@ -22,6 +23,7 @@ pub async fn run(
     graffiti: String,
     dtype: Vec<Dtype>,
     secret_key: SecretKey,
+    producer_key: ProducerSigningKey,
 ) -> CliResult<()> {
     let preload_weights = dedupe_preload_weights(preload_weights);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
@@ -46,6 +48,7 @@ pub async fn run(
         graffiti,
         dtype,
         secret_key,
+        producer_key,
         metrics.clone(),
     )
     .await

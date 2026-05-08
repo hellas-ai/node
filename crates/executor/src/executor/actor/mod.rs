@@ -59,12 +59,47 @@ impl Executor {
         )
     }
 
+    pub fn spawn_with_producer_key(
+        download_policy: DownloadPolicy,
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        producer_key: ProducerSigningKey,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        Self::spawn_with_metrics_and_producer_key(
+            download_policy,
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            Arc::new(ExecutorMetrics::default()),
+            Arc::new(producer_key),
+        )
+    }
+
     pub fn spawn_with_metrics(
         download_policy: DownloadPolicy,
         execute_policy: ExecutePolicy,
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         metrics: Arc<ExecutorMetrics>,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        Self::spawn_with_metrics_and_producer_key(
+            download_policy,
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            metrics,
+            Arc::new(ProducerSigningKey::generate()),
+        )
+    }
+
+    pub fn spawn_with_metrics_and_producer_key(
+        download_policy: DownloadPolicy,
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        metrics: Arc<ExecutorMetrics>,
+        producer_key: Arc<ProducerSigningKey>,
     ) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
             !supported_dtypes.is_empty(),
@@ -83,7 +118,7 @@ impl Executor {
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
             metrics,
-            producer_key: Arc::new(ProducerSigningKey::generate()),
+            producer_key,
             supported_dtypes,
         };
         tokio::spawn(executor.run());

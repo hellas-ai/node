@@ -252,6 +252,10 @@ impl ProducerSigningKey {
         Ok(Self { inner })
     }
 
+    pub fn to_secret_bytes(&self) -> [u8; 32] {
+        self.inner.to_bytes().into()
+    }
+
     pub fn public_key(&self) -> PublicKey {
         let verifying_key = self.inner.verifying_key();
         let point = verifying_key.to_encoded_point(true);

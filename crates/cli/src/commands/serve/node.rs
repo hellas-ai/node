@@ -3,6 +3,7 @@ use anyhow::Context;
 use catgrad::prelude::Dtype;
 use futures::StreamExt;
 use futures::future::try_join_all;
+use hellas_core::ProducerSigningKey;
 use hellas_executor::{
     CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, OpaqueServer, SymbolicServer,
 };
@@ -173,6 +174,7 @@ pub(super) async fn spawn_node(
     graffiti: Vec<u8>,
     supported_dtypes: Vec<Dtype>,
     secret_key: tonic_iroh_transport::iroh::SecretKey,
+    producer_key: ProducerSigningKey,
     metrics: Arc<ExecutorMetrics>,
 ) -> anyhow::Result<NodeHandle> {
     let endpoint = if let Some(port) = port {
@@ -221,12 +223,13 @@ pub(super) async fn spawn_node(
         peer_tracker: peer_tracker.clone(),
     };
 
-    let executor = Executor::spawn_with_metrics(
+    let executor = Executor::spawn_with_metrics_and_producer_key(
         download_policy,
         execute_policy,
         queue_size,
         supported_dtypes,
         metrics,
+        Arc::new(producer_key),
     )
     .context("failed to initialize executor backend")?;
 
