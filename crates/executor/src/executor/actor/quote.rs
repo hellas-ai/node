@@ -76,7 +76,8 @@ impl Executor {
         let symbolic_request = symbolic_request_from_pb(request)?;
         let resolved = self
             .artifacts
-            .resolve_symbolic_request(symbolic_request.clone())?;
+            .resolve_symbolic_request(symbolic_request.clone())
+            .await?;
         let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
