@@ -12,8 +12,8 @@ use crate::GRPC_MESSAGE_LIMIT;
 use crate::provenance::{ExecutionProvenance, read_provenance_metadata};
 use hellas_pb::courtesy::courtesy_client::CourtesyClient;
 use hellas_pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, PublishArtifactBundleRequest,
-    PublishArtifactBundleResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
+    GetArtifactRequest, GetArtifactResponse, PutArtifactRequest, PutArtifactResponse,
+    QuotePreparedTextRequest, QuotePreparedTextResponse,
 };
 use hellas_pb::hellas::execute_client::ExecuteClient;
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
@@ -172,10 +172,10 @@ where
         client
     }
 
-    pub async fn publish_artifact_bundle(
+    pub async fn put_artifact(
         &mut self,
-        request: PublishArtifactBundleRequest,
-    ) -> Result<PublishArtifactBundleResponse, Status>
+        request: PutArtifactRequest,
+    ) -> Result<PutArtifactResponse, Status>
     where
         T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
         T::Error: Into<StdError>,
@@ -187,10 +187,7 @@ where
             .courtesy
             .as_mut()
             .ok_or_else(|| Status::unimplemented("courtesy service is not configured"))?;
-        Ok(courtesy
-            .publish_artifact_bundle(request)
-            .await?
-            .into_inner())
+        Ok(courtesy.put_artifact(request).await?.into_inner())
     }
 
     pub async fn get_artifact(
