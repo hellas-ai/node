@@ -10,7 +10,12 @@ documentation.workspace = true
 [features]
 default = []
 compression = ["tonic/gzip", "tonic/zstd"]
-client = ["tonic/channel"]
+client = [
+    "tonic/channel",
+    "hellas-pb/client",
+    "hellas-pb/execute",
+    "hellas-pb/courtesy",
+]
 discovery = [
     "client",
     "dep:futures",
@@ -19,11 +24,11 @@ discovery = [
     "tonic-iroh-transport/discovery-mdns",
     "tonic-iroh-transport/discovery-dht",
 ]
-server = ["tonic/server"]
-compile = ["dep:tonic-prost-build"]
+server = ["tonic/server", "hellas-pb/server"]
 node = [
     "dep:catgrad",
     "dep:catgrad-llm",
+    "hellas-pb/courtesy",
     "dep:serde",
     "dep:serde_json",
     "dep:tokenizers",
@@ -31,9 +36,8 @@ node = [
 ]
 
 [dependencies]
+hellas-pb.workspace = true
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-tonic-prost = "0.14"
-prost = "0.14"
 futures-core = "0.3"
 futures = { version = "0.3", optional = true }
 mainline = { version = "6", optional = true }
@@ -48,9 +52,6 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optio
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
 tokenizers = { version = "0.21", features = ["onig", "esaxx_fast"], optional = true }
-
-[build-dependencies]
-tonic-prost-build = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

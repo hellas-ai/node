@@ -2,10 +2,10 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
+use hellas_pb::hellas::node_client::NodeClient;
+use hellas_pb::hellas::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::pb::hellas::node_client::NodeClient;
-use hellas_rpc::pb::hellas::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
 use std::future;

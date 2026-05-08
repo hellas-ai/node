@@ -4,16 +4,18 @@ mod quote;
 #[cfg(test)]
 mod tests;
 
+use crate::artifacts::InMemoryArtifactStore;
 use crate::backend;
 use crate::metrics::ExecutorMetrics;
 use crate::programs;
 use crate::state::ExecutorState;
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
+use hellas_core::ProducerSigningKey;
+use hellas_pb::hellas::{GetStatsResponse, ModelTokenStats};
 use hellas_rpc::ExecutorError;
-use hellas_rpc::pb::hellas::{GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -24,15 +26,20 @@ pub struct Executor {
     pub(super) store: ExecutorState,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
+    pub(super) artifacts: InMemoryArtifactStore,
+    pub(super) symbolic_contexts: HashMap<
+        catgrad::cid::Cid<catgrad::runtime::ProgramBinding>,
+        Arc<programs::ExecutionContext>,
+    >,
     pub(super) programs: programs::Cache,
     pub(super) worker: ExecuteWorker,
     pub(super) execute_policy: ExecutePolicy,
     pub(super) metrics: Arc<ExecutorMetrics>,
+    pub(super) producer_key: Arc<ProducerSigningKey>,
     /// Dtypes this executor will accept. The first entry is the *preferred*
     /// dtype, used whenever the executor itself constructs a program (e.g.
     /// the `QuotePromptRequest` convenience path or `handle_preload`, which
-    /// don't carry a wire dtype). Other entries are also accepted for any
-    /// `GetQuoteRequest` whose program bytes name them.
+    /// don't carry a wire dtype).
     pub(super) supported_dtypes: Vec<Dtype>,
 }
 
@@ -70,10 +77,13 @@ impl Executor {
             store: ExecutorState::new(),
             pending_executions: VecDeque::new(),
             queue_capacity,
+            artifacts: InMemoryArtifactStore::default(),
+            symbolic_contexts: HashMap::new(),
             programs: programs::Cache::new(download_policy),
             worker: ExecuteWorker::spawn(tx.clone()),
             execute_policy,
             metrics,
+            producer_key: Arc::new(ProducerSigningKey::generate()),
             supported_dtypes,
         };
         tokio::spawn(executor.run());
@@ -95,6 +105,9 @@ impl Executor {
                 }
                 ExecutorMessage::QuotePrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_prompt(request).await);
+                }
+                ExecutorMessage::QuotePreparedText { request, reply } => {
+                    let _ = reply.send(self.handle_quote_prepared_text(request).await);
                 }
                 ExecutorMessage::QuoteChatPrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_chat_prompt(request).await);
@@ -127,7 +140,7 @@ impl Executor {
                     }));
                 }
                 ExecutorMessage::GetModelStats { request, reply } => {
-                    let _ = reply.send(Ok(hellas_rpc::pb::hellas::GetModelStatsResponse {
+                    let _ = reply.send(Ok(hellas_pb::hellas::GetModelStatsResponse {
                         stats: Some(self.metrics.model_snapshot(&request.model_id)),
                         model_id: request.model_id,
                     }));

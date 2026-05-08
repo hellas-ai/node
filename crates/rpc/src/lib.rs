@@ -12,7 +12,6 @@ pub mod driver;
 pub mod error;
 #[cfg(feature = "node")]
 pub mod model;
-pub mod pb;
 #[cfg(feature = "node")]
 pub mod policy;
 pub mod provenance;

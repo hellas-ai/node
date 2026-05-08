@@ -38,18 +38,21 @@ use catgrad_llm::PreparedPrompt;
 use catgrad_llm::runtime::TextReceipt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered, Stream};
-#[cfg(feature = "hellas-executor")]
-use hellas_executor::{Executor, ExecutorHandle};
-use hellas_rpc::discovery::DiscoveryBindings;
-use hellas_rpc::driver::{ExecuteDriver, QuotedResponse, RemoteExecuteDriver};
-use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::model::ModelAssets;
-use hellas_rpc::pb::hellas::{
-    self as pb, ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, execute_stream_event,
+use hellas_core::{
+    ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
+use hellas_executor::{Executor, ExecutorHandle};
+use hellas_pb::hellas::{
+    self as pb, FinishStatus, QuotePreparedTextRequest, RunTicketRequest, WorkEvent, work_event,
+};
+use hellas_rpc::discovery::DiscoveryBindings;
+use hellas_rpc::driver::{ExecuteDriver, QuotedPreparedTextResponse, RemoteExecuteDriver};
+use hellas_rpc::model::ModelAssets;
+#[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use hellas_rpc::service::ExecuteService;
+use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::service::{CourtesyService, ExecuteService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -233,7 +236,7 @@ impl ExecutionRuntime {
 
 pub struct ExecutionRequest {
     runtime: ExecutionRuntime,
-    quote_req: GetQuoteRequest,
+    quote_req: QuotePreparedTextRequest,
     strategy: ExecutionStrategy,
 }
 
@@ -247,7 +250,7 @@ impl ExecutionRequest {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             runtime,
-            quote_req: assets.build_quote_request(&prepared_prompt, max_seq)?,
+            quote_req: assets.build_quote_prepared_text_request(&prepared_prompt, max_seq)?,
             strategy,
         })
     }
@@ -303,7 +306,7 @@ pub struct PreparedExecution {
 
 async fn prepare_execution(
     runtime: &ExecutionRuntime,
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     strategy: &ExecutionStrategy,
 ) -> anyhow::Result<PreparedExecution> {
     match strategy {
@@ -435,12 +438,12 @@ enum PreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
         executor: ExecutorHandle,
-        quote_id: String,
+        request_commitment: Vec<u8>,
         provenance: ExecutionProvenance,
     },
     RemoteDirect(RemoteExecution),
     RemoteDiscovery {
-        quote_req: GetQuoteRequest,
+        quote_req: QuotePreparedTextRequest,
         retries: usize,
         secret_key: Option<SecretKey>,
     },
@@ -465,7 +468,7 @@ impl PreparedRoute {
     #[instrument(skip_all, fields(?route))]
     async fn prepare(
         runtime: &ExecutionRuntime,
-        quote_req: &GetQuoteRequest,
+        quote_req: &QuotePreparedTextRequest,
         route: &ExecutionRoute,
     ) -> anyhow::Result<Self> {
         match route {
@@ -480,9 +483,13 @@ impl PreparedRoute {
                     "local quote failed".to_string()
                 })
                 .await?;
+                let ticket = quoted
+                    .response
+                    .ticket
+                    .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?;
                 Ok(Self::Local {
                     executor,
-                    quote_id: quoted.response.quote_id,
+                    request_commitment: ticket.request_commitment,
                     provenance: quoted.provenance,
                 })
             }
@@ -506,9 +513,9 @@ impl PreparedRoute {
             #[cfg(feature = "hellas-executor")]
             PreparedRoute::Local {
                 executor,
-                quote_id,
+                request_commitment,
                 provenance: _,
-            } => execute_stream(executor, quote_id).boxed(),
+            } => execute_stream(executor, request_commitment).boxed(),
             PreparedRoute::RemoteDirect(remote) => remote.stream().boxed(),
             PreparedRoute::RemoteDiscovery {
                 quote_req,
@@ -531,7 +538,7 @@ impl PreparedRoute {
 /// `prepare_discovered_remote` failure aborts immediately — that's a
 /// "couldn't find anyone" condition that retrying won't help with.
 fn discovery_stream(
-    quote_req: GetQuoteRequest,
+    quote_req: QuotePreparedTextRequest,
     retries: usize,
     secret_key: Option<SecretKey>,
 ) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
@@ -598,7 +605,7 @@ fn discovery_stream(
 struct RemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
-    quote_id: String,
+    request_commitment: Vec<u8>,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
 }
@@ -608,7 +615,7 @@ impl RemoteExecution {
         Self {
             endpoint,
             peer_id: quoted.peer_id,
-            quote_id: quoted.quote.quote_id,
+            request_commitment: quoted.quote.request_commitment,
             provenance: quoted.provenance,
             driver: quoted.driver,
         }
@@ -618,7 +625,7 @@ impl RemoteExecution {
         let Self {
             endpoint,
             peer_id: _,
-            quote_id,
+            request_commitment,
             provenance: _,
             driver,
         } = self;
@@ -627,7 +634,7 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
-            let inner = execute_stream(driver, quote_id);
+            let inner = execute_stream(driver, request_commitment);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
                 yield event?;
@@ -642,16 +649,15 @@ impl RemoteExecution {
 
 fn execute_stream<D: ExecuteDriver + Send + 'static>(
     mut driver: D,
-    quote_id: String,
+    request_commitment: Vec<u8>,
 ) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
     try_stream! {
         // Provenance arrives in `streamed.provenance` (from response
         // metadata server-side) but the gateway already has it from the
         // quote step, so we drop it here and only forward the event stream.
         let mut wire = driver
-            .execute_streaming(ExecuteRequest {
-                quote_id: quote_id.clone(),
-                stream_batch_size: Some(1),
+            .execute_streaming(RunTicketRequest {
+                request_commitment,
             })
             .await
             .context("failed to start execution stream")?
@@ -677,62 +683,57 @@ fn execute_stream<D: ExecuteDriver + Send + 'static>(
     }
 }
 
-/// Translate one wire `ExecuteStreamEvent` into one `ExecutionEvent`.
-fn convert_wire_event(event: ExecuteStreamEvent) -> anyhow::Result<ExecutionEvent> {
-    let Some(event) = event.event else {
+/// Translate one wire `WorkEvent` into one `ExecutionEvent`.
+fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
+    let Some(event) = event.kind else {
         bail!("wire event with no body");
     };
     match event {
-        execute_stream_event::Event::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
+        work_event::Kind::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
             position: chunk.position,
-            tokens: chunk.tokens,
+            tokens: chunk.bytes,
         }),
-        execute_stream_event::Event::Outcome(outcome) => {
-            Ok(ExecutionEvent::Done(parse_outcome(Some(outcome))?))
-        }
+        work_event::Kind::Finished(finished) => Ok(ExecutionEvent::Done(parse_finished(finished)?)),
+        work_event::Kind::Failed(failed) => Ok(ExecutionEvent::Done(Outcome::Failed {
+            position: failed.position,
+            error: failed.error,
+        })),
     }
 }
 
-fn parse_outcome(outcome: Option<pb::Outcome>) -> anyhow::Result<Outcome> {
-    let outcome = outcome.ok_or_else(|| anyhow!("outcome message with no body"))?;
-    let kind = outcome
-        .kind
-        .ok_or_else(|| anyhow!("outcome with no kind"))?;
-    match kind {
-        pb::outcome::Kind::Completed(c) => {
-            let receipt_cid = receipt_cid_from_bytes(&c.receipt_cid)?;
-            let stop_reason = stop_reason_from_pb(c.stop_reason)?;
-            Ok(Outcome::Completed {
-                total_tokens: c.total_tokens,
-                stop_reason,
-                receipt_cid,
-            })
-        }
-        pb::outcome::Kind::Failed(f) => Ok(Outcome::Failed {
-            position: f.position,
-            error: f.error,
-        }),
-    }
+fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
+    let receipt_cid = receipt_cid_from_envelope(finished.receipt)?;
+    let stop_reason = stop_reason_from_pb(finished.status)?;
+    Ok(Outcome::Completed {
+        total_tokens: finished.total_units,
+        stop_reason,
+        receipt_cid,
+    })
 }
 
-fn receipt_cid_from_bytes(bytes: &[u8]) -> anyhow::Result<Cid<TextReceipt>> {
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        anyhow!(
-            "receipt_cid wire length {} bytes (expected 32)",
-            bytes.len()
-        )
-    })?;
-    Ok(Cid::from_bytes(arr))
+fn receipt_cid_from_envelope(
+    envelope: Option<pb::ReceiptEnvelope>,
+) -> anyhow::Result<Cid<TextReceipt>> {
+    let envelope = envelope.ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
+    let core: CoreReceiptEnvelope = decode_dag_cbor(&envelope.dag_cbor)
+        .context("failed to decode receipt envelope dag-cbor")?;
+    verify_receipt(&core).context("receipt signature verification failed")?;
+    match core {
+        CoreReceiptEnvelope::Symbolic(receipt) => match receipt.evidence() {
+            SymbolicEvidence::TextReceiptCid(digest) => Ok(Cid::from_bytes(digest.into_bytes())),
+        },
+        CoreReceiptEnvelope::Opaque(_) => bail!("symbolic execution returned an opaque receipt"),
+    }
 }
 
 fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
-    let pb_value = pb::StopReason::try_from(value)
-        .with_context(|| format!("unknown stop_reason value {value}"))?;
+    let pb_value =
+        FinishStatus::try_from(value).with_context(|| format!("unknown finish status {value}"))?;
     match pb_value {
-        pb::StopReason::Unspecified => bail!("wire stop_reason is unspecified"),
-        pb::StopReason::EndOfSequence => Ok(StopReason::EndOfSequence),
-        pb::StopReason::MaxNewTokens => Ok(StopReason::MaxNewTokens),
-        pb::StopReason::Cancelled => Ok(StopReason::Cancelled),
+        FinishStatus::Unspecified => bail!("wire finish status is unspecified"),
+        FinishStatus::EndOfSequence => Ok(StopReason::EndOfSequence),
+        FinishStatus::MaxOutput => Ok(StopReason::MaxNewTokens),
+        FinishStatus::Cancelled => Ok(StopReason::Cancelled),
     }
 }
 
@@ -742,32 +743,39 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 
 struct QuotedRemoteDriver {
     peer_id: EndpointId,
-    quote: hellas_rpc::pb::hellas::GetQuoteResponse,
+    quote: hellas_pb::hellas::Ticket,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
 }
 
 #[derive(Debug)]
 enum QuoteCandidateError {
-    Declined(tonic::Status),
+    Declined(anyhow::Error),
     Connect(anyhow::Error),
 }
 
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
 async fn quote_with_driver<D>(
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     driver: &mut D,
     context: impl FnOnce() -> String,
-) -> anyhow::Result<QuotedResponse>
+) -> anyhow::Result<QuotedPreparedTextResponse>
 where
     D: ExecuteDriver,
 {
     let quoted = driver
-        .get_quote(quote_req.clone())
+        .quote_prepared_text(quote_req.clone())
         .await
         .with_context(context)?;
-    tracing::Span::current()
-        .record("quote_id", tracing::field::display(&quoted.response.quote_id));
+    let ticket = quoted
+        .response
+        .ticket
+        .as_ref()
+        .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?;
+    tracing::Span::current().record(
+        "request_commitment",
+        tracing::field::display(format_hex(&ticket.request_commitment)),
+    );
     Ok(quoted)
 }
 
@@ -813,49 +821,74 @@ fn bind_remote_pool(endpoint: &Endpoint) -> ConnectionPool {
     )
 }
 
+fn bind_courtesy_pool(endpoint: &Endpoint) -> ConnectionPool {
+    ConnectionPool::for_service::<CourtesyService>(
+        endpoint.clone(),
+        PoolOptions {
+            connect_timeout: REMOTE_CONNECT_TIMEOUT,
+            ..PoolOptions::default()
+        },
+    )
+}
+
 #[instrument(skip_all, fields(%peer_id, model = %quote_req.huggingface_model_id))]
 async fn quote_remote_endpoint(
-    quote_req: &GetQuoteRequest,
-    pool: &ConnectionPool,
+    quote_req: &QuotePreparedTextRequest,
+    execute_pool: &ConnectionPool,
+    courtesy_pool: &ConnectionPool,
     peer_id: EndpointId,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let channel = pool
+    let courtesy_channel = courtesy_pool
         .channel(peer_id)
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let mut driver =
-        RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
-    let quoted = match driver.get_quote(quote_req.clone()).await {
+    let execute_channel = execute_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let mut driver = RemoteExecuteDriver::with_services(
+        InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(courtesy_channel, TraceContextInjector),
+    );
+    let quoted = match quote_with_driver(quote_req, &mut driver, || {
+        format!("node {peer_id} declined ticket")
+    })
+    .await
+    {
         Ok(quoted) => quoted,
-        Err(status) => return Err(QuoteCandidateError::Declined(status)),
+        Err(err) => return Err(QuoteCandidateError::Declined(err)),
     };
     Ok(QuotedRemoteDriver {
         peer_id,
-        quote: quoted.response,
+        quote: quoted.response.ticket.ok_or_else(|| {
+            QuoteCandidateError::Declined(anyhow!("quote_prepared_text response missing ticket"))
+        })?,
         provenance: quoted.provenance,
         driver,
     })
 }
 
 async fn quote_remote_peer(
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let pool = bind_remote_pool(endpoint);
-    quote_remote_endpoint(quote_req, &pool, peer_id)
+    let execute_pool = bind_remote_pool(endpoint);
+    let courtesy_pool = bind_courtesy_pool(endpoint);
+    quote_remote_endpoint(quote_req, &execute_pool, &courtesy_pool, peer_id)
         .await
         .map_err(|err| match err {
-            QuoteCandidateError::Declined(status) => {
-                anyhow::Error::from(status).context(format!("node {peer_id} declined quote"))
+            QuoteCandidateError::Declined(err) => {
+                err.context(format!("node {peer_id} declined quote"))
             }
             QuoteCandidateError::Connect(err) => err,
         })
 }
 
 async fn quote_remote_target(
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     target: &RemoteNodeTarget,
 ) -> anyhow::Result<QuotedRemoteDriver> {
@@ -863,12 +896,18 @@ async fn quote_remote_target(
         return quote_remote_peer(quote_req, endpoint, target.node_id).await;
     }
 
-    let channel = ExecuteService::connect(endpoint, target.endpoint_addr())
+    let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let mut driver =
-        RemoteExecuteDriver::with_service(InterceptedService::new(channel, TraceContextInjector));
+    let courtesy_channel = CourtesyService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let mut driver = RemoteExecuteDriver::with_services(
+        InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(courtesy_channel, TraceContextInjector),
+    );
     let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {} declined quote", target.node_id)
     })
@@ -876,7 +915,10 @@ async fn quote_remote_target(
 
     Ok(QuotedRemoteDriver {
         peer_id: target.node_id,
-        quote: quoted.response,
+        quote: quoted
+            .response
+            .ticket
+            .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?,
         provenance: quoted.provenance,
         driver,
     })
@@ -884,7 +926,7 @@ async fn quote_remote_target(
 
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id, excluded = exclude.len()))]
 async fn discover_remote_quote(
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
@@ -896,11 +938,12 @@ async fn discover_remote_quote(
     });
     registry.add(MdnsBackend::new(bindings.mdns));
     registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
-    let pool = registry.pool::<ExecuteService>();
+    let execute_pool = registry.pool::<ExecuteService>();
+    let courtesy_pool = registry.pool::<CourtesyService>();
 
-    let peers = Box::pin(registry.discover::<ExecuteService>());
+    let peers = Box::pin(registry.discover::<CourtesyService>());
     tokio::time::timeout(DISCOVERY_TIMEOUT, async {
-        let mut last_decline: Option<tonic::Status> = None;
+        let mut last_decline: Option<anyhow::Error> = None;
         let mut last_connect_error: Option<anyhow::Error> = None;
         let mut peers_done = false;
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
@@ -914,9 +957,9 @@ async fn discover_remote_quote(
                 Some(result) = in_flight.next(), if !in_flight.is_empty() => {
                     match result {
                         Ok(accepted) => return Ok(accepted),
-                        Err(QuoteCandidateError::Declined(status)) => {
-                            info!("provider declined quote: {status}");
-                            last_decline = Some(status);
+                        Err(QuoteCandidateError::Declined(err)) => {
+                            info!("provider declined quote: {err:#}");
+                            last_decline = Some(err);
                         }
                         Err(QuoteCandidateError::Connect(err)) => {
                             debug!("candidate connect error: {err:#}");
@@ -935,10 +978,11 @@ async fn discover_remote_quote(
                                 debug!(%peer_id, "skipping previously-failed peer");
                                 continue;
                             }
-                            let pool = pool.clone();
+                            let execute_pool = execute_pool.clone();
+                            let courtesy_pool = courtesy_pool.clone();
                             let req = quote_req.clone();
                             in_flight.push(async move {
-                                quote_remote_endpoint(&req, &pool, peer_id).await
+                                quote_remote_endpoint(&req, &execute_pool, &courtesy_pool, peer_id).await
                             });
                         }
                         Some(Err(err)) => last_connect_error = Some(err.into()),
@@ -955,7 +999,7 @@ async fn discover_remote_quote(
         }
 
         if let Some(status) = last_decline {
-            anyhow::bail!("all discovered providers declined the quote: {status}");
+            return Err(status).context("all discovered providers declined the quote");
         }
         if let Some(err) = last_connect_error {
             return Err(err).context("failed to connect to discovered providers");
@@ -968,7 +1012,7 @@ async fn discover_remote_quote(
 }
 
 async fn prepare_discovered_remote(
-    quote_req: &GetQuoteRequest,
+    quote_req: &QuotePreparedTextRequest,
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
 ) -> anyhow::Result<RemoteExecution> {
@@ -978,11 +1022,20 @@ async fn prepare_discovered_remote(
 }
 
 #[cfg(feature = "hellas-executor")]
-fn local_model_spec(quote_req: &GetQuoteRequest) -> String {
+fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {
         quote_req.huggingface_model_id.clone()
     } else {
         format!("{}@{revision}", quote_req.huggingface_model_id)
     }
+}
+
+fn format_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }

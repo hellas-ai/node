@@ -70,9 +70,7 @@ pub enum ProvenanceError {
     Missing { key: &'static str },
     #[error("provenance metadata key `{key}` is not printable ASCII")]
     NotAscii { key: &'static str },
-    #[error(
-        "provenance metadata key `{key}` is not 64-char lowercase hex (got {len} chars)"
-    )]
+    #[error("provenance metadata key `{key}` is not 64-char lowercase hex (got {len} chars)")]
     BadLength { key: &'static str, len: usize },
     #[error("provenance metadata key `{key}` contains a non-hex character")]
     BadHex { key: &'static str },
@@ -137,7 +135,10 @@ pub fn read_provenance_metadata(md: &MetadataMap) -> Result<ExecutionProvenance,
 /// server-side on `Response::metadata_mut()` for both unary and
 /// streaming RPCs.
 pub fn write_provenance_metadata(md: &mut MetadataMap, prov: &ExecutionProvenance) {
-    md.insert(COMMITMENT_HEADER, cid_bytes_to_metadata(&prov.commitment_id));
+    md.insert(
+        COMMITMENT_HEADER,
+        cid_bytes_to_metadata(&prov.commitment_id),
+    );
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -162,7 +163,10 @@ mod tests {
     fn encode_hex_renders_lowercase_hex() {
         let s = encode_hex(&[0xab; 32]);
         assert_eq!(s.len(), 64);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(s, "ab".repeat(32));
     }
 
@@ -179,7 +183,12 @@ mod tests {
     fn missing_key_reports_which_key() {
         let md = MetadataMap::new();
         let err = read_provenance_metadata(&md).expect_err("empty metadata must fail");
-        assert_eq!(err, ProvenanceError::Missing { key: COMMITMENT_HEADER });
+        assert_eq!(
+            err,
+            ProvenanceError::Missing {
+                key: COMMITMENT_HEADER
+            }
+        );
     }
 
     #[test]
@@ -187,7 +196,13 @@ mod tests {
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "deadbeef".parse().unwrap());
         let err = read_provenance_metadata(&md).expect_err("too-short value must fail");
-        assert_eq!(err, ProvenanceError::BadLength { key: COMMITMENT_HEADER, len: 8 });
+        assert_eq!(
+            err,
+            ProvenanceError::BadLength {
+                key: COMMITMENT_HEADER,
+                len: 8
+            }
+        );
     }
 
     #[test]
@@ -195,7 +210,12 @@ mod tests {
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "z".repeat(64).parse().unwrap());
         let err = read_provenance_metadata(&md).expect_err("non-hex value must fail");
-        assert_eq!(err, ProvenanceError::BadHex { key: COMMITMENT_HEADER });
+        assert_eq!(
+            err,
+            ProvenanceError::BadHex {
+                key: COMMITMENT_HEADER
+            }
+        );
     }
 
     #[test]
@@ -204,6 +224,11 @@ mod tests {
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "AB".repeat(32).parse().unwrap());
         let err = read_provenance_metadata(&md).expect_err("uppercase hex must fail");
-        assert_eq!(err, ProvenanceError::BadHex { key: COMMITMENT_HEADER });
+        assert_eq!(
+            err,
+            ProvenanceError::BadHex {
+                key: COMMITMENT_HEADER
+            }
+        );
     }
 }

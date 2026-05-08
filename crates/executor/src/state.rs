@@ -8,21 +8,30 @@ use crate::programs::{ExecutionContext, ExecutionStart};
 use catgrad::cid::Cid;
 use catgrad::prelude::Dtype;
 use catgrad::runtime::Program;
-use catgrad_llm::runtime::TextReceipt;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::decode_token_ids;
-use hellas_rpc::pb::hellas::{
-    self as pb, Completed as PbCompleted, Failed as PbFailed, GetQuoteRequest,
-    Outcome as PbOutcome, StopReason as PbStopReason,
+use catgrad_llm::runtime::{TextExecution, TextReceipt};
+use hellas_core::{
+    Digest, JsonBytes, OpaqueRequest, RequestCommitment, SymbolicGenesisRequest, SymbolicPolicy,
+    SymbolicRequest, SymbolicStepRequest,
 };
+use hellas_pb::hellas::{
+    self as pb, FinishStatus as PbFinishStatus, QuotePreparedTextRequest,
+    ReceiptEnvelope as PbReceiptEnvelope, SymbolicGenesisExecution as PbSymbolicGenesisExecution,
+    SymbolicStepExecution as PbSymbolicStepExecution, SymbolicWorkRequest,
+    WorkEvent as PbWorkEvent, WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished,
+    symbolic_work_request,
+};
+use hellas_rpc::ExecutorError;
+use hellas_rpc::encode_token_ids;
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
+use std::str::FromStr;
 use uuid::Uuid;
 
 pub use hellas_rpc::error::StateError;
 
 // =====================================================================
-// Quote validation: turn an incoming `GetQuoteRequest` into the typed
-// inputs the executor needs (program, weights locator, invocation).
+// Courtesy ticket validation: turn an incoming Hugging Face text request into
+// the typed inputs the executor needs (program, weights locator, invocation).
 // =====================================================================
 
 #[derive(Clone)]
@@ -36,11 +45,12 @@ pub(crate) struct QuotePlan {
     pub program: Program,
     pub weights_key: HuggingFaceLocator,
     pub invocation: Invocation,
+    pub initial_receipt_id: Option<Cid<TextReceipt>>,
 }
 
 impl QuotePlan {
-    pub(crate) fn from_quote_request(
-        request: GetQuoteRequest,
+    pub(crate) fn from_prepared_text_request(
+        request: QuotePreparedTextRequest,
         supported_dtypes: &[Dtype],
     ) -> Result<Self, ExecutorError> {
         let model_id = request.huggingface_model_id.trim();
@@ -58,42 +68,15 @@ impl QuotePlan {
         }
         .to_string();
 
-        if request.program.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "missing program bytes".to_string(),
-            ));
-        }
+        let request_dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
 
         let max_new_tokens = if request.max_new_tokens == 0 {
             DEFAULT_MAX_SEQ
         } else {
             request.max_new_tokens
         };
-        let program: Program = serde_json::from_slice(&request.program)
-            .map_err(|e| ExecutorError::InvalidQuoteRequest(format!("invalid program: {e}")))?;
 
-        // Detect requests whose program was built for a dtype this executor
-        // doesn't accept. Every shipped text model tags `empty_state_type`
-        // entries with the model's dtype, so we read the first state tensor's
-        // dtype as the program's dtype. Programs with no state (vision-only
-        // graphs, not part of node's text path today) are accepted: there's
-        // nothing to mismatch on.
-        let program_dtype = program.empty_state_type().first().map(|&(dtype, _)| dtype);
-        if let Some(program_dtype) = program_dtype
-            && !supported_dtypes.contains(&program_dtype)
-        {
-            return Err(ExecutorError::DtypeNotSupported {
-                request: program_dtype,
-                supported: supported_dtypes.to_vec(),
-            });
-        }
-        // The cache is scoped per-(model, revision, dtype) via HuggingFaceLocator,
-        // so a multi-dtype executor holds an independent bundle for each
-        // dtype it has been asked to serve. Use the program's actual dtype
-        // here, not the executor's preferred default.
-        let request_dtype = program_dtype.unwrap_or_else(|| supported_dtypes[0]);
-
-        let input_ids = decode_token_ids(&request.input)?;
+        let input_ids = request.prompt_token_ids.clone();
         if input_ids.is_empty() {
             return Err(ExecutorError::InvalidTokenPayload(
                 "prompt is empty after decoding".to_string(),
@@ -111,21 +94,19 @@ impl QuotePlan {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let expected_prompt_tokens = usize::try_from(request.prompt_tokens).unwrap_or(usize::MAX);
-        if input_ids.len() != expected_prompt_tokens {
-            return Err(ExecutorError::InvalidTokenPayload(format!(
-                "prompt token count mismatch: request says {}, input decodes to {}",
-                request.prompt_tokens,
-                input_ids.len()
-            )));
-        }
         let expected_max_sequence_length = input_ids.len().saturating_add(max_new_tokens as usize);
+        let assets = ModelAssets::load(&model_spec(model_id, &requested_revision), request_dtype)?;
+        let program_bytes =
+            assets.build_program_bytes_for_sequence(expected_max_sequence_length)?;
+        let program: Program = serde_json::from_slice(&program_bytes)
+            .map_err(|e| ExecutorError::InvalidQuoteRequest(format!("invalid program: {e}")))?;
         if program.max_sequence_length() != expected_max_sequence_length {
             return Err(ExecutorError::InvalidQuoteRequest(format!(
                 "program max_sequence_length mismatch: request implies {expected_max_sequence_length}, program declares {}",
                 program.max_sequence_length()
             )));
         }
+        let initial_receipt_id = parse_symbolic_start(request.start)?;
 
         Ok(Self {
             program,
@@ -139,7 +120,151 @@ impl QuotePlan {
                 max_new_tokens,
                 stop_token_ids,
             },
+            initial_receipt_id,
         })
+    }
+}
+
+fn resolve_accept_dtypes(
+    prefs: &[String],
+    supported_dtypes: &[Dtype],
+) -> Result<Dtype, ExecutorError> {
+    if supported_dtypes.is_empty() {
+        return Err(ExecutorError::InvalidQuoteRequest(
+            "executor must support at least one dtype".to_string(),
+        ));
+    }
+    if prefs.is_empty() {
+        return Ok(supported_dtypes[0]);
+    }
+    let mut parsed = Vec::with_capacity(prefs.len());
+    for raw in prefs {
+        let dtype = Dtype::from_str(raw).map_err(|e| {
+            ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
+        })?;
+        if matches!(dtype, Dtype::U32) {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "model dtype must be f32, f16, or bf16".to_string(),
+            ));
+        }
+        parsed.push(dtype);
+    }
+    for dtype in &parsed {
+        if supported_dtypes.contains(dtype) {
+            return Ok(*dtype);
+        }
+    }
+    Err(ExecutorError::DtypeNotSupported {
+        request: parsed[0],
+        supported: supported_dtypes.to_vec(),
+    })
+}
+
+pub(crate) fn symbolic_request_from_text_execution(execution: &TextExecution) -> SymbolicRequest {
+    match execution {
+        TextExecution::Genesis { binding } => SymbolicRequest::Genesis(SymbolicGenesisRequest {
+            binding_cid: Digest::from_bytes(*binding.as_bytes()),
+        }),
+        TextExecution::Step {
+            binding,
+            previous,
+            input_tokens,
+            policy,
+        } => SymbolicRequest::Step(SymbolicStepRequest {
+            binding_cid: Digest::from_bytes(*binding.as_bytes()),
+            previous_execution_cid: Digest::from_bytes(*previous.as_bytes()),
+            input_tokens_cid: Digest::from_bytes(*input_tokens.as_bytes()),
+            policy: SymbolicPolicy::new(policy.max_new_tokens(), policy.stop_token_ids().to_vec()),
+        }),
+    }
+}
+
+pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> SymbolicWorkRequest {
+    let execution = match request {
+        SymbolicRequest::Genesis(genesis) => {
+            symbolic_work_request::Execution::Genesis(PbSymbolicGenesisExecution {
+                binding_cid: genesis.binding_cid.as_bytes().to_vec(),
+            })
+        }
+        SymbolicRequest::Step(step) => {
+            symbolic_work_request::Execution::Step(PbSymbolicStepExecution {
+                binding_cid: step.binding_cid.as_bytes().to_vec(),
+                previous_execution_cid: step.previous_execution_cid.as_bytes().to_vec(),
+                input_tokens_cid: step.input_tokens_cid.as_bytes().to_vec(),
+                max_new_tokens: step.policy.max_new_tokens,
+                stop_token_ids: step.policy.stop_token_ids.clone(),
+            })
+        }
+    };
+    SymbolicWorkRequest {
+        execution: Some(execution),
+    }
+}
+
+pub(crate) fn symbolic_request_from_pb(
+    request: SymbolicWorkRequest,
+) -> Result<SymbolicRequest, ExecutorError> {
+    match request.execution {
+        Some(symbolic_work_request::Execution::Genesis(genesis)) => {
+            Ok(SymbolicRequest::Genesis(SymbolicGenesisRequest {
+                binding_cid: Digest::from_bytes(bytes32(&genesis.binding_cid, "binding_cid")?),
+            }))
+        }
+        Some(symbolic_work_request::Execution::Step(step)) => {
+            Ok(SymbolicRequest::Step(SymbolicStepRequest {
+                binding_cid: Digest::from_bytes(bytes32(&step.binding_cid, "binding_cid")?),
+                previous_execution_cid: Digest::from_bytes(bytes32(
+                    &step.previous_execution_cid,
+                    "previous_execution_cid",
+                )?),
+                input_tokens_cid: Digest::from_bytes(bytes32(
+                    &step.input_tokens_cid,
+                    "input_tokens_cid",
+                )?),
+                policy: SymbolicPolicy::new(step.max_new_tokens, step.stop_token_ids),
+            }))
+        }
+        None => Err(ExecutorError::InvalidQuoteRequest(
+            "missing symbolic execution".to_string(),
+        )),
+    }
+}
+
+fn parse_symbolic_start(
+    start: Option<pb::SymbolicStart>,
+) -> Result<Option<Cid<TextReceipt>>, ExecutorError> {
+    let start = start
+        .and_then(|start| start.kind)
+        .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing symbolic start".to_string()))?;
+    match start {
+        pb::symbolic_start::Kind::Genesis(_) => Ok(None),
+        pb::symbolic_start::Kind::Receipt(receipt) => {
+            let bytes = bytes32(&receipt.receipt_cid, "receipt_cid")?;
+            Ok(Some(Cid::from_bytes(bytes)))
+        }
+    }
+}
+
+fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
+    bytes.try_into().map_err(|_| {
+        ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
+    })
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn model_spec(model_id: &str, revision: &str) -> String {
+    if revision.is_empty() {
+        model_id.to_string()
+    } else {
+        format!("{model_id}@{revision}")
     }
 }
 
@@ -152,16 +277,29 @@ impl QuotePlan {
 
 #[derive(Clone)]
 pub struct QuoteRecord {
-    pub invocation: Invocation,
-    pub execution: Arc<ExecutionContext>,
-    pub start: ExecutionStart,
+    pub request_commitment: RequestCommitment,
     pub expires_at: Instant,
     pub model_id: String,
+    pub kind: QuoteKind,
+}
+
+#[derive(Clone)]
+pub enum QuoteKind {
+    Symbolic {
+        symbolic_request: SymbolicRequest,
+        invocation: Invocation,
+        execution: Arc<ExecutionContext>,
+        start: ExecutionStart,
+    },
+    Opaque {
+        request: OpaqueRequest,
+        output: JsonBytes,
+    },
 }
 
 #[derive(Default)]
 pub struct ExecutorState {
-    quotes: HashMap<String, QuoteRecord>,
+    quotes: HashMap<[u8; 32], QuoteRecord>,
 }
 
 impl ExecutorState {
@@ -169,25 +307,36 @@ impl ExecutorState {
         Self::default()
     }
 
-    pub fn create_quote(&mut self, quote: QuoteRecord) -> String {
-        let quote_id = make_id("quote");
-        self.quotes.insert(quote_id.clone(), quote);
-        quote_id
+    pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
+        let key = *quote.request_commitment.0.as_bytes();
+        self.quotes.insert(key, quote);
+        key
     }
 
-    pub fn get_quote(&self, quote_id: &str, now: Instant) -> Result<&QuoteRecord, StateError> {
+    pub fn get_quote(
+        &self,
+        request_commitment: &[u8],
+        now: Instant,
+    ) -> Result<&QuoteRecord, StateError> {
+        let key: [u8; 32] = request_commitment.try_into().map_err(|_| {
+            StateError::QuoteNotFound(format!(
+                "invalid request_commitment length {}",
+                request_commitment.len()
+            ))
+        })?;
         let quote = self
             .quotes
-            .get(quote_id)
-            .ok_or_else(|| StateError::QuoteNotFound(quote_id.to_string()))?;
+            .get(&key)
+            .ok_or_else(|| StateError::QuoteNotFound(hex32(&key)))?;
         if quote.expires_at <= now {
-            return Err(StateError::QuoteExpired(quote_id.to_string()));
+            return Err(StateError::QuoteExpired(hex32(&key)));
         }
         Ok(quote)
     }
 
-    pub fn remove_quote(&mut self, quote_id: &str) -> Option<QuoteRecord> {
-        self.quotes.remove(quote_id)
+    pub fn remove_quote(&mut self, request_commitment: &[u8]) -> Option<QuoteRecord> {
+        let key: [u8; 32] = request_commitment.try_into().ok()?;
+        self.quotes.remove(&key)
     }
 
     pub fn prune_expired_quotes(&mut self, now: Instant) -> usize {
@@ -223,11 +372,11 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub fn to_pb(self) -> PbStopReason {
+    pub fn to_pb(self) -> PbFinishStatus {
         match self {
-            Self::EndOfSequence => PbStopReason::EndOfSequence,
-            Self::MaxNewTokens => PbStopReason::MaxNewTokens,
-            Self::Cancelled => PbStopReason::Cancelled,
+            Self::EndOfSequence => PbFinishStatus::EndOfSequence,
+            Self::MaxNewTokens => PbFinishStatus::MaxOutput,
+            Self::Cancelled => PbFinishStatus::Cancelled,
         }
     }
 }
@@ -235,9 +384,9 @@ impl StopReason {
 #[derive(Debug, Clone)]
 pub enum Termination {
     Completed {
-        total_tokens: u64,
         stop_reason: StopReason,
-        receipt_cid: Cid<TextReceipt>,
+        output_tokens: Vec<u32>,
+        receipt_dag_cbor: Vec<u8>,
     },
     Failed {
         position: u64,
@@ -248,7 +397,7 @@ pub enum Termination {
 impl Termination {
     pub fn position(&self) -> u64 {
         match self {
-            Self::Completed { total_tokens, .. } => *total_tokens,
+            Self::Completed { output_tokens, .. } => output_tokens.len() as u64,
             Self::Failed { position, .. } => *position,
         }
     }
@@ -257,21 +406,24 @@ impl Termination {
         matches!(self, Self::Completed { .. })
     }
 
-    pub fn into_pb(self) -> PbOutcome {
+    pub fn into_pb(self) -> PbWorkEvent {
         let kind = match self {
             Self::Completed {
-                total_tokens,
                 stop_reason,
-                receipt_cid,
-            } => pb::outcome::Kind::Completed(PbCompleted {
-                total_tokens,
-                stop_reason: stop_reason.to_pb() as i32,
-                receipt_cid: receipt_cid.as_bytes().to_vec(),
+                output_tokens,
+                receipt_dag_cbor,
+            } => pb::work_event::Kind::Finished(PbWorkFinished {
+                total_units: output_tokens.len() as u64,
+                status: stop_reason.to_pb() as i32,
+                output: encode_token_ids(&output_tokens),
+                receipt: Some(PbReceiptEnvelope {
+                    dag_cbor: receipt_dag_cbor,
+                }),
             }),
             Self::Failed { position, error } => {
-                pb::outcome::Kind::Failed(PbFailed { position, error })
+                pb::work_event::Kind::Failed(PbWorkFailed { position, error })
             }
         };
-        PbOutcome { kind: Some(kind) }
+        PbWorkEvent { kind: Some(kind) }
     }
 }

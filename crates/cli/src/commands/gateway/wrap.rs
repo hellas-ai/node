@@ -44,4 +44,3 @@ pub fn spawn(cmd: &str, args: &[String], base_url: &str) -> CliResult<Child> {
         .spawn()
         .with_context(|| format!("failed to spawn `{cmd}`"))
 }
-

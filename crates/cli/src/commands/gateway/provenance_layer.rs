@@ -14,9 +14,7 @@ use axum::http::{HeaderName, HeaderValue, Request, Response};
 use catgrad::cid::Cid;
 use catgrad_llm::runtime::TextReceipt;
 use futures::future::BoxFuture;
-use hellas_rpc::provenance::{
-    COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex,
-};
+use hellas_rpc::provenance::{COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
@@ -180,10 +178,7 @@ mod tests {
             .route("/", get(handler))
             .layer(ProvenanceLayer);
 
-        let request = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(
             response.headers().get(COMMITMENT_HEADER).unwrap(),

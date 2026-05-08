@@ -4,12 +4,19 @@
 pub struct NodeService;
 
 impl tonic::server::NamedService for NodeService {
-    const NAME: &'static str = "hellas.Node";
+    const NAME: &'static str = "hellas.v1.Node";
 }
 
 /// Service marker for the execute RPC service.
 pub struct ExecuteService;
 
 impl tonic::server::NamedService for ExecuteService {
-    const NAME: &'static str = "hellas.Execute";
+    const NAME: &'static str = "hellas.v1.Execute";
+}
+
+/// Service marker for the provider courtesy RPC service.
+pub struct CourtesyService;
+
+impl tonic::server::NamedService for CourtesyService {
+    const NAME: &'static str = "hellas.v1.Courtesy";
 }

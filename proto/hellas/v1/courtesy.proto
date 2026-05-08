@@ -1,83 +1,63 @@
 syntax = "proto3";
 
-package hellas;
+package hellas.v1;
 
-message GetQuoteRequest {
+import "hellas/v1/symbolic.proto";
+import "hellas/v1/ticket.proto";
+
+// Non-core provider conveniences. These APIs are not settlement/protocol
+// objects: providers may offer Hugging Face resolution, tokenization, chat
+// templates, model listing, and metrics, or decline to serve them.
+
+service Courtesy {
+  rpc QuotePreparedText(QuotePreparedTextRequest) returns (QuotePreparedTextResponse);
+  rpc QuotePrompt(QuotePromptRequest) returns (QuotePromptResponse);
+  rpc QuoteChatPrompt(QuoteChatPromptRequest) returns (QuoteChatPromptResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc DecodeTokens(stream DecodeTokensRequest) returns (stream DecodeTokensResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
+}
+
+message SymbolicStart {
+  oneof kind {
+    SymbolicGenesisStart genesis = 1;
+    SymbolicReceiptStart receipt = 2;
+  }
+}
+
+message SymbolicGenesisStart {}
+
+message SymbolicReceiptStart {
+  bytes receipt_cid = 1; // exactly 32 bytes
+}
+
+message QuotePreparedTextRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
-  bytes input = 5;
-  uint32 prompt_tokens = 6;
-  uint32 max_new_tokens = 7;
-  repeated uint32 stop_token_ids = 8;
-  reserved 3, 4;
-  bytes program = 9;
+  repeated uint32 prompt_token_ids = 3;
+  uint32 max_new_tokens = 4;
+  repeated uint32 stop_token_ids = 5;
+  SymbolicStart start = 6;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported -> request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuotePreparedTextResponse.dtype.
+  repeated string accept_dtypes = 7;
 }
 
-message GetQuoteResponse {
-  string quote_id = 1;
-  uint64 amount = 2;
-  uint64 ttl_ms = 3;
+message QuotePreparedTextResponse {
+  Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 3;
+  SymbolicWorkRequest symbolic_request = 4;
 }
 
-message ExecuteRequest {
-  string quote_id = 1;
-  optional uint32 stream_batch_size = 2;
-}
-
-// =====================================================================
-// Streaming execution events.
-//
-// Wire protocol: zero or more `Chunk` events, terminated by exactly one
-// `Outcome` event, after which the stream ends. There is no late-attach
-// snapshot — the stream IS the execution; clients hold the receiver from
-// `Execute` for the entire lifecycle and dropping it cancels the run.
-// =====================================================================
-
-message ExecuteStreamEvent {
-  oneof event {
-    Chunk chunk = 1;
-    Outcome outcome = 2;
-  }
-}
-
-// Incremental token chunk produced during decode.
-message Chunk {
-  // Cumulative position AFTER this chunk.
-  uint64 position = 1;
-  // Little-endian u32 token IDs.
-  bytes tokens = 2;
-}
-
-// Terminal outcome of an execution.
-message Outcome {
-  oneof kind {
-    Completed completed = 1;
-    Failed failed = 2;
-  }
-}
-
-message Completed {
-  uint64 total_tokens = 1;
-  StopReason stop_reason = 2;
-  // Cid<TextReceipt> — exactly 32 bytes. Receivers reject other lengths.
-  bytes receipt_cid = 3;
-}
-
-message Failed {
-  // Tokens emitted before failure (for honest usage reporting).
-  uint64 position = 1;
-  string error = 2;
-}
-
-enum StopReason {
-  STOP_REASON_UNSPECIFIED = 0;
-  END_OF_SEQUENCE = 1;
-  MAX_NEW_TOKENS = 2;
-  CANCELLED = 3;
-}
-
-// Convenience RPC: the server handles tokenization and graph construction.
-// Intended for lightweight clients (browsers) that don't have the tokenizer.
+// Convenience RPC: the server handles tokenization and symbolic request
+// construction. Intended for lightweight clients (browsers) that don't have
+// the tokenizer.
 message QuotePromptRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
@@ -85,26 +65,25 @@ message QuotePromptRequest {
   uint32 max_new_tokens = 4;
   // Ordered preference list (each one of "f32", "f16", "bf16"). The server
   // picks the first entry it supports. Empty list lets the server pick its
-  // preferred dtype freely. None of the entries supported → request is
+  // preferred dtype freely. None of the entries supported -> request is
   // refused with FailedPrecondition. The chosen dtype is reported back in
   // QuotePromptResponse.dtype.
   repeated string accept_dtypes = 5;
 }
 
 message QuotePromptResponse {
-  string quote_id = 1;
-  uint64 amount = 2;
-  uint64 ttl_ms = 3;
-  uint32 prompt_tokens = 4;
+  Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
-  string dtype = 5;
+  string dtype = 3;
+  SymbolicWorkRequest symbolic_request = 4;
 }
 
 // Convenience RPC: chat-style prompt quoting.
 // Like QuotePrompt but accepts a message array + system prompt.
 // The server applies the model's chat template to produce the prompt.
 message ChatMessage {
-  string role = 1;    // "user", "assistant"
+  string role = 1; // "user", "assistant"
   string content = 2;
 }
 
@@ -116,19 +95,18 @@ message QuoteChatPromptRequest {
   string system_prompt = 5;
   // Ordered preference list (each one of "f32", "f16", "bf16"). The server
   // picks the first entry it supports. Empty list lets the server pick its
-  // preferred dtype freely. None of the entries supported → request is
+  // preferred dtype freely. None of the entries supported -> request is
   // refused with FailedPrecondition. The chosen dtype is reported back in
   // QuoteChatPromptResponse.dtype.
   repeated string accept_dtypes = 6;
 }
 
 message QuoteChatPromptResponse {
-  string quote_id = 1;
-  uint64 amount = 2;
-  uint64 ttl_ms = 3;
-  uint32 prompt_tokens = 4;
+  Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
-  string dtype = 5;
+  string dtype = 3;
+  SymbolicWorkRequest symbolic_request = 4;
 }
 
 // List models known to the executor and their readiness status.
@@ -160,12 +138,12 @@ message ListModelsResponse {
 message DecodeTokensRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
-  // Raw token bytes (little-endian u32 token IDs, same format as Execute output).
+  // Raw token bytes (little-endian u32 token IDs, same format as Symbolic output).
   bytes token_bytes = 3;
 }
 
 message DecodeTokensResponse {
-  // Decoded text (incremental delta — concatenate all responses for full output).
+  // Decoded text (incremental delta; concatenate all responses for full output).
   string text = 1;
 }
 

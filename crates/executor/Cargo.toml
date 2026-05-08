@@ -14,6 +14,8 @@ candle-cuda = ["candle", "catgrad/cuda"]
 candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
+hellas-core.workspace = true
+hellas-pb = { workspace = true, features = ["execute", "courtesy", "server"] }
 hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -25,8 +27,13 @@ catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
 hf-hub = "0.5"
 blake3 = "1"
+iroh-blobs = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
+half = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true }
 prometheus-client = "0.24"
 

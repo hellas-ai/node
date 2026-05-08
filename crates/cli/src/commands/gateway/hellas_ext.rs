@@ -93,7 +93,10 @@ mod tests {
             commitment_id: [0xab; 32],
         };
         let hellas = HellasExt::commitment(&prov);
-        assert_eq!(hellas.commitment_id.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(
+            hellas.commitment_id.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
         assert!(hellas.receipt_id.is_none());
     }
 
@@ -140,7 +143,10 @@ mod tests {
         };
         let cid = Cid::<TextReceipt>::from_bytes([2; 32]);
         let hellas = HellasExt::both(&prov, &cid);
-        assert_eq!(hellas.commitment_id.as_deref(), Some("01".repeat(32).as_str()));
+        assert_eq!(
+            hellas.commitment_id.as_deref(),
+            Some("01".repeat(32).as_str())
+        );
         assert_eq!(hellas.receipt_id.as_deref(), Some("02".repeat(32).as_str()));
     }
 }
