@@ -21,7 +21,13 @@ pub(crate) struct SymbolicArtifactStore {
     token_ids: HashMap<catnix::TokenIdsId, catnix::TokenIds>,
     policies: HashMap<catnix::TextPolicyId, catnix::TextPolicy>,
     text_executions: HashMap<catnix::TextExecutionId, catnix::TextExecution>,
+    text_states: HashMap<catnix::TextStateId, catnix::TextState>,
     text_artifacts: HashMap<catnix::TextArtifactId, catnix::TextArtifact>,
+}
+
+struct MaterializedTextSource {
+    locator: ModelLocator,
+    tokens: Vec<u32>,
 }
 
 impl SymbolicArtifactStore {
@@ -39,7 +45,7 @@ impl SymbolicArtifactStore {
             Some(artifact_id) => {
                 let artifact_id =
                     catnix::TextArtifactId::from_digest(to_catnix_digest(artifact_id));
-                self.ensure_supported_start(artifact_id)?;
+                let _ = self.materialize_artifact(artifact_id)?;
                 catnix::SourceRef::output(artifact_id)
             }
             None => {
@@ -80,7 +86,7 @@ impl SymbolicArtifactStore {
                 symbolic_request.text_execution_cid
             ))
         })?;
-        let locator = self.resolve_start_locator(execution.from())?;
+        let source = self.materialize_source(execution.from())?;
         let prompt_tokens = self
             .token_ids
             .get(&execution.prompt_tokens())
@@ -96,11 +102,8 @@ impl SymbolicArtifactStore {
                 execution.policy()
             ))
         })?;
-        let input_ids = prompt_tokens
-            .as_slice()
-            .iter()
-            .map(|token| token.as_u32())
-            .collect();
+        let mut input_ids = source.tokens;
+        input_ids.extend(token_ids_to_u32(prompt_tokens));
         let stop_token_ids = policy
             .stop_token_ids()
             .iter()
@@ -116,7 +119,7 @@ impl SymbolicArtifactStore {
 
         Ok(ResolvedSymbolicExecution {
             symbolic_request,
-            locator,
+            locator: source.locator,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens: policy.max_new_tokens(),
@@ -125,49 +128,102 @@ impl SymbolicArtifactStore {
         })
     }
 
-    fn ensure_supported_start(
-        &self,
-        artifact_id: catnix::TextArtifactId,
-    ) -> Result<(), ExecutorError> {
-        let artifact = self.text_artifacts.get(&artifact_id).ok_or_else(|| {
-            ExecutorError::InvalidQuoteRequest(format!(
-                "unknown starting TextArtifact CID {artifact_id}"
-            ))
-        })?;
-        match artifact {
-            catnix::TextArtifact::Identity { .. } => Ok(()),
-            catnix::TextArtifact::Output(_) => Err(ExecutorError::InvalidQuoteRequest(
-                "continuation from a prior TextArtifact output needs persisted text state"
-                    .to_string(),
-            )),
+    pub async fn record_completed_text(
+        &mut self,
+        symbolic_request: &SymbolicRequest,
+        invocation: &Invocation,
+        output_tokens: &[u32],
+    ) -> Result<Digest, ExecutorError> {
+        let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(
+            symbolic_request.text_execution_cid,
+        ));
+        if !self.text_executions.contains_key(&execution_id) {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "unknown completed text execution CID {}",
+                symbolic_request.text_execution_cid
+            )));
         }
+
+        let generated_tokens_id = self
+            .insert_token_ids(catnix::TokenIds::from(output_tokens.to_vec()))
+            .await?;
+        let mut state_tokens = invocation.input_ids.clone();
+        state_tokens.extend_from_slice(output_tokens);
+        let state_tokens_id = self
+            .insert_token_ids(catnix::TokenIds::from(state_tokens))
+            .await?;
+        let state_id = self
+            .insert_text_state(catnix::TextState::new(state_tokens_id))
+            .await?;
+        let artifact = catnix::TextArtifact::output(
+            execution_id,
+            output_tokens.len() as u64,
+            state_id,
+            generated_tokens_id,
+        );
+        let artifact_id = self.insert_text_artifact(artifact).await?;
+        Ok(from_catnix_digest(artifact_id.digest()))
     }
 
-    fn resolve_start_locator(
+    fn materialize_source(
         &self,
         source: &catnix::TextSource,
-    ) -> Result<ModelLocator, ExecutorError> {
+    ) -> Result<MaterializedTextSource, ExecutorError> {
         match source {
             catnix::SourceRef::Input(id) => Err(ExecutorError::InvalidQuoteRequest(format!(
                 "lazy symbolic source {id} needs recursive artifact resolution"
             ))),
-            catnix::SourceRef::Output(id) => {
-                let artifact = self.text_artifacts.get(id).ok_or_else(|| {
-                    ExecutorError::InvalidQuoteRequest(format!("missing source TextArtifact {id}"))
+            catnix::SourceRef::Output(id) => self.materialize_artifact(*id),
+        }
+    }
+
+    fn materialize_artifact(
+        &self,
+        artifact_id: catnix::TextArtifactId,
+    ) -> Result<MaterializedTextSource, ExecutorError> {
+        let artifact = self.text_artifacts.get(&artifact_id).ok_or_else(|| {
+            ExecutorError::InvalidQuoteRequest(format!("missing source TextArtifact {artifact_id}"))
+        })?;
+        match artifact {
+            catnix::TextArtifact::Identity { bound_term } => {
+                let locator = self.bound_terms.get(bound_term).cloned().ok_or_else(|| {
+                    ExecutorError::InvalidQuoteRequest(format!(
+                        "missing bound term metadata {bound_term}"
+                    ))
                 })?;
-                match artifact {
-                    catnix::TextArtifact::Identity { bound_term } => {
-                        self.bound_terms.get(bound_term).cloned().ok_or_else(|| {
-                            ExecutorError::InvalidQuoteRequest(format!(
-                                "missing bound term metadata {bound_term}"
-                            ))
-                        })
-                    }
-                    catnix::TextArtifact::Output(_) => Err(ExecutorError::InvalidQuoteRequest(
-                        "continuation from a prior TextArtifact output needs persisted text state"
-                            .to_string(),
-                    )),
-                }
+                Ok(MaterializedTextSource {
+                    locator,
+                    tokens: Vec::new(),
+                })
+            }
+            catnix::TextArtifact::Output(output) => {
+                let execution = self
+                    .text_executions
+                    .get(&output.execution())
+                    .ok_or_else(|| {
+                        ExecutorError::InvalidQuoteRequest(format!(
+                            "missing TextExecution {} for artifact {artifact_id}",
+                            output.execution()
+                        ))
+                    })?;
+                let locator = self.materialize_source(execution.from())?.locator;
+                let state = self.text_states.get(&output.state()).ok_or_else(|| {
+                    ExecutorError::InvalidQuoteRequest(format!(
+                        "missing TextState {} for artifact {artifact_id}",
+                        output.state()
+                    ))
+                })?;
+                let tokens = self.token_ids.get(&state.tokens()).ok_or_else(|| {
+                    ExecutorError::InvalidQuoteRequest(format!(
+                        "missing TokenIds artifact {} for state {}",
+                        state.tokens(),
+                        output.state()
+                    ))
+                })?;
+                Ok(MaterializedTextSource {
+                    locator,
+                    tokens: token_ids_to_u32(tokens),
+                })
             }
         }
     }
@@ -199,6 +255,16 @@ impl SymbolicArtifactStore {
         let id = value.input_id();
         self.insert_canonical(id.digest(), &value).await?;
         self.text_executions.entry(id).or_insert(value);
+        Ok(id)
+    }
+
+    async fn insert_text_state(
+        &mut self,
+        value: catnix::TextState,
+    ) -> Result<catnix::TextStateId, ExecutorError> {
+        let id = value.output_id();
+        self.insert_canonical(id.digest(), &value).await?;
+        self.text_states.entry(id).or_insert(value);
         Ok(id)
     }
 
@@ -238,6 +304,14 @@ impl SymbolicArtifactStore {
         self.canonical_blobs.insert(digest, bytes);
         Ok(())
     }
+}
+
+fn token_ids_to_u32(tokens: &catnix::TokenIds) -> Vec<u32> {
+    tokens
+        .as_slice()
+        .iter()
+        .map(|token| token.as_u32())
+        .collect()
 }
 
 fn text_policy(invocation: &Invocation) -> Result<catnix::TextPolicy, ExecutorError> {
@@ -327,6 +401,25 @@ mod tests {
             resolved.invocation.stop_token_ids,
             recorded.invocation.stop_token_ids
         );
+    }
+
+    #[tokio::test]
+    async fn completed_text_artifact_can_start_a_followup() {
+        let mut store = SymbolicArtifactStore::default();
+        let first = store.record_prepared_text(&plan()).await.unwrap();
+        let first_artifact = store
+            .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+            .await
+            .unwrap();
+        let mut next_plan = plan();
+        next_plan.invocation.input_ids = vec![20];
+        next_plan.initial_artifact_id = Some(first_artifact);
+        let next = store.record_prepared_text(&next_plan).await.unwrap();
+        let resolved = store
+            .resolve_symbolic_request(next.symbolic_request)
+            .unwrap();
+
+        assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
     }
 
     #[tokio::test]

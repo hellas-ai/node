@@ -147,8 +147,8 @@ impl Executor {
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
-                ExecutorMessage::WorkerIdle => {
-                    self.dispatch_next_execution();
+                ExecutorMessage::WorkerFinished(completion) => {
+                    self.handle_worker_finished(completion).await;
                 }
                 ExecutorMessage::ListModels { reply } => {
                     let _ = reply.send(Ok(self.handle_list_models().await));
