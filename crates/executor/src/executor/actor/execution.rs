@@ -38,19 +38,15 @@ impl Executor {
         match quote.kind {
             QuoteKind::Symbolic {
                 symbolic_request,
+                locator,
                 invocation,
-                execution,
-                start,
             } => {
                 let provenance = ExecutionProvenance {
-                    commitment_id: *start.commitment_id.as_bytes(),
+                    commitment_id: *quote.request_commitment.0.as_bytes(),
                 };
 
                 let stat_prompt = invocation.input_ids.len() as u64;
-                let stat_cached_output = start
-                    .cached
-                    .as_ref()
-                    .map_or(0, |c| c.output_tokens.len() as u64);
+                let stat_cached_output = 0;
 
                 let model_id = quote.model_id.clone();
                 let execution_id = new_execution_id();
@@ -59,9 +55,8 @@ impl Executor {
                     execution_id: execution_id.clone(),
                     model_id: model_id.clone(),
                     symbolic_request,
+                    locator,
                     invocation,
-                    execution,
-                    start: start.clone(),
                     stream_batch_size,
                     accepted_at: Instant::now(),
                     cancel: CancellationToken::new(),
@@ -97,7 +92,6 @@ impl Executor {
                 info!(
                     %execution_id,
                     request_commitment = %format_request_commitment(&request_commitment),
-                    commitment_id = %start.commitment_id,
                     queued,
                     queue_len = self.pending_executions.len(),
                     "accepted symbolic execution"

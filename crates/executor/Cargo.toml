@@ -25,6 +25,8 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
+chatgrad = { workspace = true, default-features = false }
+catnix.workspace = true
 hf-hub = "0.5"
 blake3 = "1"
 iroh-blobs = { workspace = true }

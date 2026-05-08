@@ -1,18 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::str::FromStr;
 use std::time::Instant;
 
 use crate::DEFAULT_MAX_SEQ;
-use crate::inputs::HuggingFaceLocator;
-use crate::programs::{ExecutionContext, ExecutionStart};
-use catgrad::cid::Cid;
 use catgrad::prelude::Dtype;
-use catgrad::runtime::Program;
-use catgrad_llm::runtime::{TextExecution, TextReceipt};
-use hellas_core::{
-    Digest, JsonBytes, OpaqueRequest, RequestCommitment, SymbolicGenesisRequest, SymbolicPolicy,
-    SymbolicRequest, SymbolicStepRequest,
-};
+use hellas_core::{Digest, JsonBytes, OpaqueRequest, RequestCommitment, SymbolicRequest};
 use hellas_pb::courtesy::{
     QuotePreparedTextRequest, SymbolicStart as PbSymbolicStart, symbolic_start,
 };
@@ -20,23 +12,26 @@ use hellas_pb::hellas::{
     FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
     WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
 };
-use hellas_pb::symbolic::{
-    SymbolicGenesisExecution as PbSymbolicGenesisExecution, SymbolicRequest as PbSymbolicRequest,
-    SymbolicStepExecution as PbSymbolicStepExecution, symbolic_request,
-};
+use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
-use hellas_rpc::model::ModelAssets;
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-use std::str::FromStr;
 use uuid::Uuid;
 
 pub use hellas_rpc::error::StateError;
 
-// =====================================================================
-// Courtesy ticket validation: turn an incoming Hugging Face text request into
-// the typed inputs the executor needs (program, weights locator, invocation).
-// =====================================================================
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ModelLocator {
+    pub model_id: String,
+    pub revision: String,
+    pub dtype: Dtype,
+}
+
+impl ModelLocator {
+    pub(crate) fn spec(&self) -> String {
+        model_spec(&self.model_id, &self.revision)
+    }
+}
 
 #[derive(Clone)]
 pub struct Invocation {
@@ -46,10 +41,9 @@ pub struct Invocation {
 }
 
 pub(crate) struct QuotePlan {
-    pub program: Program,
-    pub weights_key: HuggingFaceLocator,
+    pub locator: ModelLocator,
     pub invocation: Invocation,
-    pub initial_receipt_id: Option<Cid<TextReceipt>>,
+    pub initial_artifact_id: Option<Digest>,
 }
 
 impl QuotePlan {
@@ -64,16 +58,15 @@ impl QuotePlan {
             ));
         }
 
-        let requested_revision = request.huggingface_revision.trim();
-        let requested_revision = if requested_revision.is_empty() {
+        let revision = request.huggingface_revision.trim();
+        let revision = if revision.is_empty() {
             DEFAULT_MODEL_REVISION
         } else {
-            requested_revision
+            revision
         }
         .to_string();
 
-        let request_dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
-
+        let dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
         let max_new_tokens = if request.max_new_tokens == 0 {
             DEFAULT_MAX_SEQ
         } else {
@@ -98,38 +91,25 @@ impl QuotePlan {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let expected_max_sequence_length = input_ids.len().saturating_add(max_new_tokens as usize);
-        let assets = ModelAssets::load(&model_spec(model_id, &requested_revision), request_dtype)?;
-        let program_bytes =
-            assets.build_program_bytes_for_sequence(expected_max_sequence_length)?;
-        let program: Program = serde_json::from_slice(&program_bytes)
-            .map_err(|e| ExecutorError::InvalidQuoteRequest(format!("invalid program: {e}")))?;
-        if program.max_sequence_length() != expected_max_sequence_length {
-            return Err(ExecutorError::InvalidQuoteRequest(format!(
-                "program max_sequence_length mismatch: request implies {expected_max_sequence_length}, program declares {}",
-                program.max_sequence_length()
-            )));
-        }
-        let initial_receipt_id = parse_symbolic_start(request.start)?;
+        let initial_artifact_id = parse_symbolic_start(request.start)?;
 
         Ok(Self {
-            program,
-            weights_key: HuggingFaceLocator::new(
-                model_id.to_string(),
-                requested_revision,
-                request_dtype,
-            ),
+            locator: ModelLocator {
+                model_id: model_id.to_string(),
+                revision,
+                dtype,
+            },
             invocation: Invocation {
                 input_ids,
                 max_new_tokens,
                 stop_token_ids,
             },
-            initial_receipt_id,
+            initial_artifact_id,
         })
     }
 }
 
-fn resolve_accept_dtypes(
+pub(crate) fn resolve_accept_dtypes(
     prefs: &[String],
     supported_dtypes: &[Dtype],
 ) -> Result<Dtype, ExecutorError> {
@@ -148,7 +128,7 @@ fn resolve_accept_dtypes(
         })?;
         if matches!(dtype, Dtype::U32) {
             return Err(ExecutorError::InvalidQuoteRequest(
-                "model dtype must be f32, f16, or bf16".to_string(),
+                "model dtype must be f32, f16, bf16, or f8".to_string(),
             ));
         }
         parsed.push(dtype);
@@ -164,86 +144,33 @@ fn resolve_accept_dtypes(
     })
 }
 
-pub(crate) fn symbolic_request_from_text_execution(execution: &TextExecution) -> SymbolicRequest {
-    match execution {
-        TextExecution::Genesis { binding } => SymbolicRequest::Genesis(SymbolicGenesisRequest {
-            binding_cid: Digest::from_bytes(*binding.as_bytes()),
-        }),
-        TextExecution::Step {
-            binding,
-            previous,
-            input_tokens,
-            policy,
-        } => SymbolicRequest::Step(SymbolicStepRequest {
-            binding_cid: Digest::from_bytes(*binding.as_bytes()),
-            previous_execution_cid: Digest::from_bytes(*previous.as_bytes()),
-            input_tokens_cid: Digest::from_bytes(*input_tokens.as_bytes()),
-            policy: SymbolicPolicy::new(policy.max_new_tokens(), policy.stop_token_ids().to_vec()),
-        }),
-    }
-}
-
 pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> PbSymbolicRequest {
-    let execution = match request {
-        SymbolicRequest::Genesis(genesis) => {
-            symbolic_request::Execution::Genesis(PbSymbolicGenesisExecution {
-                binding_cid: genesis.binding_cid.as_bytes().to_vec(),
-            })
-        }
-        SymbolicRequest::Step(step) => symbolic_request::Execution::Step(PbSymbolicStepExecution {
-            binding_cid: step.binding_cid.as_bytes().to_vec(),
-            previous_execution_cid: step.previous_execution_cid.as_bytes().to_vec(),
-            input_tokens_cid: step.input_tokens_cid.as_bytes().to_vec(),
-            max_new_tokens: step.policy.max_new_tokens,
-            stop_token_ids: step.policy.stop_token_ids.clone(),
-        }),
-    };
     PbSymbolicRequest {
-        execution: Some(execution),
+        text_execution_cid: request.text_execution_cid.as_bytes().to_vec(),
     }
 }
 
 pub(crate) fn symbolic_request_from_pb(
     request: PbSymbolicRequest,
 ) -> Result<SymbolicRequest, ExecutorError> {
-    match request.execution {
-        Some(symbolic_request::Execution::Genesis(genesis)) => {
-            Ok(SymbolicRequest::Genesis(SymbolicGenesisRequest {
-                binding_cid: Digest::from_bytes(bytes32(&genesis.binding_cid, "binding_cid")?),
-            }))
-        }
-        Some(symbolic_request::Execution::Step(step)) => {
-            Ok(SymbolicRequest::Step(SymbolicStepRequest {
-                binding_cid: Digest::from_bytes(bytes32(&step.binding_cid, "binding_cid")?),
-                previous_execution_cid: Digest::from_bytes(bytes32(
-                    &step.previous_execution_cid,
-                    "previous_execution_cid",
-                )?),
-                input_tokens_cid: Digest::from_bytes(bytes32(
-                    &step.input_tokens_cid,
-                    "input_tokens_cid",
-                )?),
-                policy: SymbolicPolicy::new(step.max_new_tokens, step.stop_token_ids),
-            }))
-        }
-        None => Err(ExecutorError::InvalidQuoteRequest(
-            "missing symbolic execution".to_string(),
-        )),
-    }
+    Ok(SymbolicRequest {
+        text_execution_cid: Digest::from_bytes(bytes32(
+            &request.text_execution_cid,
+            "text_execution_cid",
+        )?),
+    })
 }
 
-fn parse_symbolic_start(
-    start: Option<PbSymbolicStart>,
-) -> Result<Option<Cid<TextReceipt>>, ExecutorError> {
+fn parse_symbolic_start(start: Option<PbSymbolicStart>) -> Result<Option<Digest>, ExecutorError> {
     let start = start
         .and_then(|start| start.kind)
         .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing symbolic start".to_string()))?;
     match start {
         symbolic_start::Kind::Genesis(_) => Ok(None),
-        symbolic_start::Kind::Receipt(receipt) => {
-            let bytes = bytes32(&receipt.receipt_cid, "receipt_cid")?;
-            Ok(Some(Cid::from_bytes(bytes)))
-        }
+        symbolic_start::Kind::Artifact(artifact) => Ok(Some(Digest::from_bytes(bytes32(
+            &artifact.artifact_cid,
+            "artifact_cid",
+        )?))),
     }
 }
 
@@ -262,7 +189,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
-fn model_spec(model_id: &str, revision: &str) -> String {
+pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
     if revision.is_empty() {
         model_id.to_string()
     } else {
@@ -270,12 +197,11 @@ fn model_spec(model_id: &str, revision: &str) -> String {
     }
 }
 
-// =====================================================================
-// In-memory store of issued quotes. Quotes are short-lived
-// (TTL ~30s); after the matching `Execute` consumes one it's removed.
-// Executions themselves are not tracked — the streaming `Execute` RPC
-// owns everything needed for the request lifecycle.
-// =====================================================================
+#[derive(Clone, Debug)]
+pub(crate) enum LocalModelStatus {
+    Ready,
+    Failed(String),
+}
 
 #[derive(Clone)]
 pub struct QuoteRecord {
@@ -289,9 +215,8 @@ pub struct QuoteRecord {
 pub enum QuoteKind {
     Symbolic {
         symbolic_request: SymbolicRequest,
+        locator: ModelLocator,
         invocation: Invocation,
-        execution: Arc<ExecutionContext>,
-        start: ExecutionStart,
     },
     Opaque {
         request: OpaqueRequest,
@@ -348,9 +273,6 @@ impl ExecutorState {
     }
 }
 
-/// Mint a fresh execution id. Not registered anywhere — under the unified
-/// streaming `Execute` RPC the id only matters for logging/tracing within
-/// the lifetime of one request, never for cross-RPC lookup.
 pub fn new_execution_id() -> String {
     make_id("exec")
 }
@@ -359,13 +281,6 @@ fn make_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
-// =====================================================================
-// Termination — the worker's authoritative result for one execution.
-// Mirrors the wire `Outcome` shape but keeps the receipt CID typed and
-// the stop reason native.
-// =====================================================================
-
-/// Why the runner stopped emitting tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndOfSequence,

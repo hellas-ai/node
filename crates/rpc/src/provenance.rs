@@ -77,8 +77,7 @@ impl From<ProvenanceError> for tonic::Status {
     }
 }
 
-/// Render a 32-byte CID as 64-char lowercase hex. Matches
-/// `catgrad::cid::Cid<T>::Display`.
+/// Render a 32-byte digest as 64-char lowercase hex.
 pub fn encode_hex(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in bytes {
@@ -87,7 +86,7 @@ pub fn encode_hex(bytes: &[u8; 32]) -> String {
     s
 }
 
-/// Build an ASCII-typed tonic metadata value from a CID's bytes.
+/// Build an ASCII-typed tonic metadata value from digest bytes.
 pub fn cid_bytes_to_metadata(bytes: &[u8; 32]) -> MetadataValue<Ascii> {
     encode_hex(bytes)
         .parse()

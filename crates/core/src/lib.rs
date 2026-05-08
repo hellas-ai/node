@@ -18,10 +18,7 @@ pub use receipt::{
 };
 pub use scheme::{CommitmentScheme, EvidencedScheme};
 pub use schemes::opaque::{Opaque, OpaqueRequest};
-pub use schemes::symbolic::{
-    Symbolic, SymbolicEvidence, SymbolicGenesisRequest, SymbolicOutput, SymbolicPolicy,
-    SymbolicRequest, SymbolicStepRequest,
-};
+pub use schemes::symbolic::{Symbolic, SymbolicEvidence, SymbolicOutput, SymbolicRequest};
 pub use signature::{
     ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,
 };
