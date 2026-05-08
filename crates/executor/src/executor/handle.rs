@@ -24,6 +24,8 @@ use tonic::{Request, Response, Status};
 
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
 
+type ExecuteStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<WorkEvent, Status>> + Send>>;
+
 impl ExecutorHandle {
     async fn send<T>(
         &self,
@@ -123,20 +125,29 @@ impl ExecutorHandle {
     }
 }
 
+fn response_with_provenance<R>(outcome: TicketOutcome<R>) -> Response<R> {
+    let mut response = Response::new(outcome.response);
+    write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+    response
+}
+
+fn stream_response_with_provenance(outcome: ExecuteOutcome) -> Response<ExecuteStream> {
+    let mut response =
+        Response::new(Box::pin(ReceiverStream::new(outcome.events)) as ExecuteStream);
+    write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+    response
+}
+
 #[tonic::async_trait]
 impl Execute for ExecutorHandle {
-    type RunTicketStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<WorkEvent, Status>> + Send>>;
+    type RunTicketStream = ExecuteStream;
 
     async fn run_ticket(
         &self,
         request: Request<RunTicketRequest>,
     ) -> Result<Response<Self::RunTicketStream>, Status> {
         let outcome = self.run_ticket(request.into_inner()).await?;
-        let mut response =
-            Response::new(Box::pin(ReceiverStream::new(outcome.events)) as Self::RunTicketStream);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(stream_response_with_provenance(outcome))
     }
 }
 
@@ -147,9 +158,7 @@ impl Symbolic for ExecutorHandle {
         request: Request<PbSymbolicRequest>,
     ) -> Result<Response<Ticket>, Status> {
         let outcome = self.create_symbolic_ticket(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(response_with_provenance(outcome))
     }
 }
 
@@ -160,9 +169,7 @@ impl Opaque for ExecutorHandle {
         request: Request<PbOpaqueRequest>,
     ) -> Result<Response<Ticket>, Status> {
         let outcome = self.create_opaque_ticket(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(response_with_provenance(outcome))
     }
 }
 
@@ -173,9 +180,7 @@ impl Courtesy for ExecutorHandle {
         request: Request<QuotePromptRequest>,
     ) -> Result<Response<QuotePromptResponse>, Status> {
         let outcome = self.quote_prompt(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(response_with_provenance(outcome))
     }
 
     async fn quote_prepared_text(
@@ -183,9 +188,7 @@ impl Courtesy for ExecutorHandle {
         request: Request<QuotePreparedTextRequest>,
     ) -> Result<Response<QuotePreparedTextResponse>, Status> {
         let outcome = self.quote_prepared_text(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(response_with_provenance(outcome))
     }
 
     async fn quote_chat_prompt(
@@ -193,9 +196,7 @@ impl Courtesy for ExecutorHandle {
         request: Request<QuoteChatPromptRequest>,
     ) -> Result<Response<QuoteChatPromptResponse>, Status> {
         let outcome = self.quote_chat_prompt(request.into_inner()).await?;
-        let mut response = Response::new(outcome.response);
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
+        Ok(response_with_provenance(outcome))
     }
 
     async fn put_artifact(
