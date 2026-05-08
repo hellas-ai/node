@@ -5,7 +5,6 @@ pub const PRODUCER_ID_V1: &str = "hellas.producer_id.v1";
 pub const OPAQUE_REQUEST_V1: &str = "hellas.opaque.request.v1";
 pub const OPAQUE_RESULT_V1: &str = "hellas.opaque.result.v1";
 pub const RECEIPT_BODY_V1: &str = "hellas.receipt.body.v1";
-pub const EVIDENCED_RECEIPT_BODY_V1: &str = "hellas.receipt.evidenced_body.v1";
 
 pub const SCHEME_SYMBOLIC: u8 = 0x00;
 pub const SCHEME_OPAQUE: u8 = 0x01;

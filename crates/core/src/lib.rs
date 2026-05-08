@@ -9,16 +9,15 @@ pub mod signature;
 pub mod tags;
 pub mod value;
 
-pub use commitment::{Commitment, EvidenceCommitment, ReceiptCommitment, SchemeId};
+pub use commitment::{ReceiptCommitment, RequestCommitment, ResultCommitment, SchemeId};
 pub use digest::{Digest, hash_tuple};
 pub use receipt::{
-    DeliveryOutput, DeliveryRequest, EvidencedReceiptBody, ReceiptBody, ReceiptEnvelope,
-    RequestCommitment, ResultCommitment, SignedEvidenceReceipt, SignedReceipt, VerifyError,
-    verify_delivery, verify_receipt,
+    DeliveryOutput, DeliveryRequest, ReceiptBody, SignedReceipt, VerifyError, verify_delivery,
+    verify_receipt,
 };
-pub use scheme::{CommitmentScheme, EvidencedScheme};
+pub use scheme::CommitmentScheme;
 pub use schemes::opaque::{Opaque, OpaqueRequest};
-pub use schemes::symbolic::{Symbolic, SymbolicEvidence, SymbolicOutput, SymbolicRequest};
+pub use schemes::symbolic::{Symbolic, SymbolicOutput, SymbolicRequest};
 pub use signature::{
     ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,
 };

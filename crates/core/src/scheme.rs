@@ -1,4 +1,4 @@
-use crate::{Commitment, SchemeId};
+use crate::{RequestCommitment, ResultCommitment, SchemeId};
 
 pub trait CommitmentScheme {
     type Request;
@@ -6,12 +6,6 @@ pub trait CommitmentScheme {
 
     const SCHEME: SchemeId;
 
-    fn commit_request(request: &Self::Request) -> Commitment;
-    fn commit_output(output: &Self::Output) -> Commitment;
-}
-
-pub trait EvidencedScheme: CommitmentScheme {
-    type Evidence;
-
-    fn commit_evidence(evidence: &Self::Evidence) -> Commitment;
+    fn commit_request(request: &Self::Request) -> RequestCommitment;
+    fn commit_output(output: &Self::Output) -> ResultCommitment;
 }

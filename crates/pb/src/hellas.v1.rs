@@ -125,7 +125,7 @@ impl ::prost::Name for WorkFailed {
         "/hellas.v1.WorkFailed".into()
     }
 }
-/// Canonical hellas-core ReceiptEnvelope encoded as strict dag-cbor.
+/// Canonical hellas-core SignedReceipt encoded as strict dag-cbor.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReceiptEnvelope {
     #[prost(bytes = "vec", tag = "1")]

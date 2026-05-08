@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Commitment, CommitmentScheme, Digest, EvidencedScheme, SchemeId};
+use crate::{CommitmentScheme, Digest, RequestCommitment, ResultCommitment, SchemeId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolicRequest {
@@ -14,11 +14,6 @@ pub struct SymbolicOutput {
     pub text_artifact_cid: Digest,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SymbolicEvidence {
-    TextArtifactCid(Digest),
-}
-
 pub struct Symbolic;
 
 impl CommitmentScheme for Symbolic {
@@ -27,21 +22,11 @@ impl CommitmentScheme for Symbolic {
 
     const SCHEME: SchemeId = SchemeId::Symbolic;
 
-    fn commit_request(request: &Self::Request) -> Commitment {
-        Commitment::from_digest(request.text_execution_cid)
+    fn commit_request(request: &Self::Request) -> RequestCommitment {
+        RequestCommitment::from_digest(request.text_execution_cid)
     }
 
-    fn commit_output(output: &Self::Output) -> Commitment {
-        Commitment::from_digest(output.text_artifact_cid)
-    }
-}
-
-impl EvidencedScheme for Symbolic {
-    type Evidence = SymbolicEvidence;
-
-    fn commit_evidence(evidence: &Self::Evidence) -> Commitment {
-        match evidence {
-            SymbolicEvidence::TextArtifactCid(cid) => Commitment::from_digest(*cid),
-        }
+    fn commit_output(output: &Self::Output) -> ResultCommitment {
+        ResultCommitment::from_digest(output.text_artifact_cid)
     }
 }
