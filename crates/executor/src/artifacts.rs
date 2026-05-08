@@ -23,6 +23,7 @@ pub(crate) struct SymbolicArtifactStore {
     text_executions: HashMap<catnix::TextExecutionId, catnix::TextExecution>,
     text_states: HashMap<catnix::TextStateId, catnix::TextState>,
     text_artifacts: HashMap<catnix::TextArtifactId, catnix::TextArtifact>,
+    outputs_by_execution: HashMap<catnix::TextExecutionId, catnix::TextArtifactId>,
 }
 
 struct MaterializedTextSource {
@@ -162,6 +163,9 @@ impl SymbolicArtifactStore {
             generated_tokens_id,
         );
         let artifact_id = self.insert_text_artifact(artifact).await?;
+        self.outputs_by_execution
+            .entry(execution_id)
+            .or_insert(artifact_id);
         Ok(from_catnix_digest(artifact_id.digest()))
     }
 
@@ -170,9 +174,14 @@ impl SymbolicArtifactStore {
         source: &catnix::TextSource,
     ) -> Result<MaterializedTextSource, ExecutorError> {
         match source {
-            catnix::SourceRef::Input(id) => Err(ExecutorError::InvalidQuoteRequest(format!(
-                "lazy symbolic source {id} needs recursive artifact resolution"
-            ))),
+            catnix::SourceRef::Input(id) => {
+                let artifact_id = self.outputs_by_execution.get(id).ok_or_else(|| {
+                    ExecutorError::InvalidQuoteRequest(format!(
+                        "lazy symbolic source {id} has no cached output artifact"
+                    ))
+                })?;
+                self.materialize_artifact(*artifact_id)
+            }
             catnix::SourceRef::Output(id) => self.materialize_artifact(*id),
         }
     }
@@ -417,6 +426,40 @@ mod tests {
         let next = store.record_prepared_text(&next_plan).await.unwrap();
         let resolved = store
             .resolve_symbolic_request(next.symbolic_request)
+            .unwrap();
+
+        assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
+    }
+
+    #[tokio::test]
+    async fn lazy_input_source_uses_cached_output_artifact() {
+        let mut store = SymbolicArtifactStore::default();
+        let first = store.record_prepared_text(&plan()).await.unwrap();
+        store
+            .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+            .await
+            .unwrap();
+        let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
+            first.symbolic_request.text_execution_cid,
+        ));
+        let prompt_tokens = store
+            .insert_token_ids(catnix::TokenIds::from([20]))
+            .await
+            .unwrap();
+        let policy = store
+            .insert_policy(catnix::TextPolicy::from_u32_stop_tokens(4, []))
+            .await
+            .unwrap();
+        let lazy = catnix::TextExecution::new(
+            catnix::SourceRef::input(first_execution),
+            prompt_tokens,
+            policy,
+        );
+        let lazy_id = store.insert_text_execution(lazy).await.unwrap();
+        let resolved = store
+            .resolve_symbolic_request(SymbolicRequest {
+                text_execution_cid: from_catnix_digest(lazy_id.digest()),
+            })
             .unwrap();
 
         assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
