@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Commitment, CommitmentScheme, DagCborEncoder, JsonBytes, SchemeId, tags};
+use crate::{
+    CommitmentScheme, DagCborEncoder, JsonBytes, RequestCommitment, ResultCommitment, SchemeId,
+    tags,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueRequest {
@@ -17,12 +20,12 @@ impl CommitmentScheme for Opaque {
 
     const SCHEME: SchemeId = SchemeId::Opaque;
 
-    fn commit_request(request: &Self::Request) -> Commitment {
-        Commitment::from_canonical_bytes(&Self::request_bytes(request))
+    fn commit_request(request: &Self::Request) -> RequestCommitment {
+        RequestCommitment::from_canonical_bytes(&Self::request_bytes(request))
     }
 
-    fn commit_output(output: &Self::Output) -> Commitment {
-        Commitment::from_canonical_bytes(&Self::output_bytes(output))
+    fn commit_output(output: &Self::Output) -> ResultCommitment {
+        ResultCommitment::from_canonical_bytes(&Self::output_bytes(output))
     }
 }
 
@@ -67,8 +70,8 @@ mod tests {
         };
 
         assert_ne!(
-            Opaque::commit_request(&request),
-            Opaque::commit_output(&payload)
+            Opaque::commit_request(&request).digest(),
+            Opaque::commit_output(&payload).digest()
         );
     }
 }

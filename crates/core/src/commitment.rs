@@ -83,48 +83,46 @@ macro_rules! impl_u8_serde {
 
 impl_u8_serde!(SchemeId, SchemeId::from_byte);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Commitment(Digest);
+macro_rules! digest_commitment {
+    ($ty:ident) => {
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        pub struct $ty(pub Digest);
 
-impl Commitment {
-    pub fn from_canonical_bytes(canonical_bytes: &[u8]) -> Self {
-        Self(Digest::hash(canonical_bytes))
-    }
+        impl $ty {
+            pub fn from_canonical_bytes(canonical_bytes: &[u8]) -> Self {
+                Self(Digest::hash(canonical_bytes))
+            }
 
-    pub const fn from_digest(digest: Digest) -> Self {
-        Self(digest)
-    }
+            pub const fn from_digest(digest: Digest) -> Self {
+                Self(digest)
+            }
 
-    pub const fn digest(&self) -> Digest {
-        self.0
-    }
+            pub const fn digest(&self) -> Digest {
+                self.0
+            }
 
-    pub const fn as_bytes(&self) -> &[u8; Digest::LEN] {
-        self.0.as_bytes()
-    }
+            pub const fn as_bytes(&self) -> &[u8; Digest::LEN] {
+                self.0.as_bytes()
+            }
+        }
+    };
 }
 
-impl fmt::Debug for Commitment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Commitment").field(&self.0).finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EvidenceCommitment(pub Commitment);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ReceiptCommitment(pub Commitment);
+digest_commitment!(RequestCommitment);
+digest_commitment!(ResultCommitment);
+digest_commitment!(ReceiptCommitment);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn commitment_is_hash_of_exact_canonical_bytes() {
+    fn commitment_newtypes_hash_exact_canonical_bytes() {
         let bytes = b"\x82x\x19hellas.example.object.v1Ddata";
         assert_eq!(
-            Commitment::from_canonical_bytes(bytes).as_bytes(),
+            RequestCommitment::from_canonical_bytes(bytes).as_bytes(),
             Digest::hash(bytes).as_bytes()
         );
     }
