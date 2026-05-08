@@ -6,11 +6,13 @@ use crate::state::{
 use catgrad::prelude::Dtype;
 use chatgrad::types;
 use hellas_core::{
-    CommitmentScheme, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
+    CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, RequestCommitment, Symbolic,
 };
 use hellas_pb::courtesy::{
-    ListModelsResponse, ModelInfo, ModelStatus, QuoteChatPromptRequest, QuoteChatPromptResponse,
-    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
+    PublishArtifactBundleRequest, PublishArtifactBundleResponse, QuoteChatPromptRequest,
+    QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
+    QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_pb::hellas::Ticket;
 use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
@@ -18,7 +20,8 @@ use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::spec::ModelSpec;
+use hellas_rpc::spec::{DEFAULT_MODEL_REVISION, ModelSpec};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use super::Executor;
@@ -78,6 +81,21 @@ impl Executor {
             .artifacts
             .resolve_symbolic_request(symbolic_request.clone())
             .await?;
+        if !self.supported_dtypes.contains(&resolved.locator.dtype) {
+            return Err(ExecutorError::DtypeNotSupported {
+                request: resolved.locator.dtype,
+                supported: self.supported_dtypes.clone(),
+            });
+        }
+        if !self.execute_policy.allows_execute(
+            &resolved.locator.spec(),
+            Some(resolved.locator.model_id.as_str()),
+        ) {
+            return Err(ExecutorError::PolicyDenied(format!(
+                "execute policy denied model {}",
+                resolved.locator.spec()
+            )));
+        }
         let request_commitment = RequestCommitment(Symbolic::commit_request(&symbolic_request));
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
@@ -243,6 +261,77 @@ impl Executor {
         })
     }
 
+    pub(super) async fn handle_publish_artifact_bundle(
+        &mut self,
+        request: PublishArtifactBundleRequest,
+    ) -> Result<PublishArtifactBundleResponse, ExecutorError> {
+        let mut artifact_cids = Vec::with_capacity(request.canonical_artifacts.len());
+        for bytes in request.canonical_artifacts {
+            let digest = self.artifacts.publish_canonical_bytes(bytes).await?;
+            artifact_cids.push(digest.as_bytes().to_vec());
+        }
+
+        let symbolic_bound_terms = request.symbolic_bound_terms.len() as u32;
+        for metadata in request.symbolic_bound_terms {
+            let model_id = metadata.huggingface_model_id.trim();
+            if model_id.is_empty() {
+                return Err(ExecutorError::InvalidQuoteRequest(
+                    "missing symbolic bound term huggingface_model_id".to_string(),
+                ));
+            }
+            let revision = metadata.huggingface_revision.trim();
+            let revision = if revision.is_empty() {
+                DEFAULT_MODEL_REVISION
+            } else {
+                revision
+            };
+            let dtype = Dtype::from_str(&metadata.dtype).map_err(|err| {
+                ExecutorError::InvalidQuoteRequest(format!(
+                    "invalid symbolic bound term dtype {:?}: {err}",
+                    metadata.dtype
+                ))
+            })?;
+            if matches!(dtype, Dtype::U32) {
+                return Err(ExecutorError::InvalidQuoteRequest(
+                    "symbolic bound term dtype must be f32, f16, bf16, or f8".to_string(),
+                ));
+            }
+            self.artifacts.publish_bound_term_metadata(
+                digest_from_slice(&metadata.bound_term_cid, "bound_term_cid")?,
+                ModelLocator {
+                    model_id: model_id.to_string(),
+                    revision: revision.to_string(),
+                    dtype,
+                },
+            )?;
+        }
+
+        let symbolic_execution_outputs = request.symbolic_execution_outputs.len() as u32;
+        for metadata in request.symbolic_execution_outputs {
+            self.artifacts.publish_execution_output_metadata(
+                digest_from_slice(&metadata.text_execution_cid, "text_execution_cid")?,
+                digest_from_slice(&metadata.text_artifact_cid, "text_artifact_cid")?,
+            )?;
+        }
+
+        Ok(PublishArtifactBundleResponse {
+            artifact_cids,
+            symbolic_bound_terms,
+            symbolic_execution_outputs,
+        })
+    }
+
+    pub(super) async fn handle_get_artifact(
+        &mut self,
+        request: GetArtifactRequest,
+    ) -> Result<GetArtifactResponse, ExecutorError> {
+        let canonical_artifact = self
+            .artifacts
+            .get_canonical_bytes(digest_from_slice(&request.cid, "cid")?)
+            .await?;
+        Ok(GetArtifactResponse { canonical_artifact })
+    }
+
     pub(super) async fn handle_list_models(&self) -> ListModelsResponse {
         let models = self
             .models
@@ -321,6 +410,12 @@ impl Executor {
             },
         })
     }
+}
+
+fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {
+    Digest::from_slice(bytes).map_err(|_| {
+        ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
+    })
 }
 
 fn format_request_commitment(bytes: &[u8; 32]) -> String {

@@ -50,6 +50,8 @@ pub enum ExecutorError {
     WeightsNotReady(String),
     #[error("weights error: {0}")]
     WeightsError(String),
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(String),
     #[error("artifact store error: {0}")]
     ArtifactStore(String),
     #[error("policy denied: {0}")]
@@ -92,7 +94,9 @@ fn executor_status_code(err: &ExecutorError) -> tonic::Code {
             tonic::Code::FailedPrecondition
         }
         ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
-        ExecutorError::State(StateError::QuoteNotFound(_)) => tonic::Code::NotFound,
+        ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
+            tonic::Code::NotFound
+        }
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::Llm(_)

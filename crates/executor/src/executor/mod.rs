@@ -2,9 +2,10 @@ mod actor;
 mod handle;
 
 use hellas_pb::courtesy::{
-    GetModelStatsRequest, GetModelStatsResponse, GetStatsResponse, ListModelsResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
+    GetStatsResponse, ListModelsResponse, PublishArtifactBundleRequest,
+    PublishArtifactBundleResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
+    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
@@ -63,6 +64,14 @@ pub(crate) enum ExecutorMessage {
     QuoteChatPrompt {
         request: QuoteChatPromptRequest,
         reply: oneshot::Sender<Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>>,
+    },
+    PublishArtifactBundle {
+        request: PublishArtifactBundleRequest,
+        reply: oneshot::Sender<Result<PublishArtifactBundleResponse, ExecutorError>>,
+    },
+    GetArtifact {
+        request: GetArtifactRequest,
+        reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
     },
     Preload {
         model: String,
