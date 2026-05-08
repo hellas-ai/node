@@ -50,6 +50,8 @@ pub enum ExecutorError {
     WeightsNotReady(String),
     #[error("weights error: {0}")]
     WeightsError(String),
+    #[error("artifact store error: {0}")]
+    ArtifactStore(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
     #[error("invalid token payload: {0}")]
@@ -94,7 +96,8 @@ fn executor_status_code(err: &ExecutorError) -> tonic::Code {
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::Llm(_)
-        | ExecutorError::WeightsError(_) => tonic::Code::Internal,
+        | ExecutorError::WeightsError(_)
+        | ExecutorError::ArtifactStore(_) => tonic::Code::Internal,
     }
 }
 

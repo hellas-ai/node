@@ -1,7 +1,7 @@
 mod execution;
 mod quote;
 
-use crate::artifacts::SymbolicArtifactStore;
+use crate::artifacts::{ArtifactStoreConfig, SymbolicArtifactStore};
 use crate::backend;
 use crate::metrics::ExecutorMetrics;
 use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
@@ -93,6 +93,44 @@ impl Executor {
         metrics: Arc<ExecutorMetrics>,
         producer_key: Arc<ProducerSigningKey>,
     ) -> Result<ExecutorHandle, ExecutorError> {
+        Self::spawn_with_metrics_producer_key_and_artifacts(
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            metrics,
+            producer_key,
+            SymbolicArtifactStore::memory(),
+        )
+    }
+
+    pub async fn spawn_with_metrics_and_producer_key_and_artifact_store(
+        _download_policy: DownloadPolicy,
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        metrics: Arc<ExecutorMetrics>,
+        producer_key: Arc<ProducerSigningKey>,
+        artifact_store: ArtifactStoreConfig,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        let artifacts = SymbolicArtifactStore::open(artifact_store).await?;
+        Self::spawn_with_metrics_producer_key_and_artifacts(
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            metrics,
+            producer_key,
+            artifacts,
+        )
+    }
+
+    fn spawn_with_metrics_producer_key_and_artifacts(
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        metrics: Arc<ExecutorMetrics>,
+        producer_key: Arc<ProducerSigningKey>,
+        artifacts: SymbolicArtifactStore,
+    ) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
             !supported_dtypes.is_empty(),
             "executor must support at least one dtype"
@@ -102,7 +140,7 @@ impl Executor {
         let executor = Self {
             rx,
             store: ExecutorState::new(),
-            artifacts: SymbolicArtifactStore::default(),
+            artifacts,
             pending_executions: VecDeque::new(),
             queue_capacity,
             models: HashMap::new(),

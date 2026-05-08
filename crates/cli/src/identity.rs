@@ -8,6 +8,8 @@ use tonic_iroh_transport::iroh::SecretKey;
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
 const PRODUCER_KEY_FILE: &str = "signing-key.secp256k1";
+#[cfg(feature = "hellas-executor")]
+const ARTIFACT_STORE_DIR: &str = "artifacts";
 const KEY_LEN: usize = 32;
 
 /// Resolve the identity file path and load or create the secret key.
@@ -74,6 +76,11 @@ fn default_identity_path() -> anyhow::Result<PathBuf> {
 
 fn default_producer_key_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(PRODUCER_KEY_FILE, "--producer-key-path")
+}
+
+#[cfg(feature = "hellas-executor")]
+pub fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")
 }
 
 fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
@@ -338,6 +345,12 @@ mod tests {
             path,
             dir.path().join(".hellas").join("signing-key.secp256k1")
         );
+
+        #[cfg(feature = "hellas-executor")]
+        {
+            let path = default_artifact_store_path().unwrap();
+            assert_eq!(path, dir.path().join(".hellas").join("artifacts"));
+        }
 
         unsafe { env::remove_var("HOME") };
     }

@@ -1,10 +1,80 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use catnix::{Canonical, InputAddressed, OutputAddressed};
 use hellas_core::{Digest, SymbolicRequest, hash_tuple};
 use hellas_rpc::ExecutorError;
 
 use crate::state::{Invocation, ModelLocator, QuotePlan};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreConfig {
+    Memory,
+    Fs(PathBuf),
+}
+
+impl ArtifactStoreConfig {
+    pub fn memory() -> Self {
+        Self::Memory
+    }
+
+    pub fn fs(path: impl Into<PathBuf>) -> Self {
+        Self::Fs(path.into())
+    }
+}
+
+enum ArtifactBlobStore {
+    Memory(iroh_blobs::store::mem::MemStore),
+    Fs(iroh_blobs::store::fs::FsStore),
+}
+
+impl Default for ArtifactBlobStore {
+    fn default() -> Self {
+        Self::memory()
+    }
+}
+
+impl ArtifactBlobStore {
+    fn memory() -> Self {
+        Self::Memory(iroh_blobs::store::mem::MemStore::default())
+    }
+
+    async fn fs(path: impl AsRef<Path>) -> Result<Self, ExecutorError> {
+        let path = path.as_ref();
+        let store = iroh_blobs::store::fs::FsStore::load(path)
+            .await
+            .map_err(|err| {
+                ExecutorError::ArtifactStore(format!(
+                    "failed to open artifact blob store {}: {err}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self::Fs(store))
+    }
+
+    async fn insert_canonical(
+        &self,
+        digest: catnix::Digest,
+        bytes: &[u8],
+    ) -> Result<(), ExecutorError> {
+        let expected = iroh_hash(digest);
+        let tag = match self {
+            Self::Memory(store) => store.add_slice(bytes).await,
+            Self::Fs(store) => store.add_slice(bytes).await,
+        }
+        .map_err(|err| ExecutorError::ArtifactStore(format!("blob insert failed: {err}")))?;
+
+        if tag.hash != expected {
+            return Err(ExecutorError::ArtifactStore(format!(
+                "blob store hash mismatch: expected {}, got {}",
+                expected.to_hex(),
+                tag.hash.to_hex()
+            )));
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedSymbolicExecution {
@@ -13,9 +83,8 @@ pub(crate) struct ResolvedSymbolicExecution {
     pub invocation: Invocation,
 }
 
-#[derive(Default)]
 pub(crate) struct SymbolicArtifactStore {
-    blob_store: iroh_blobs::store::mem::MemStore,
+    blob_store: ArtifactBlobStore,
     canonical_blobs: HashMap<catnix::Digest, Vec<u8>>,
     bound_terms: HashMap<catnix::BoundTermId, ModelLocator>,
     token_ids: HashMap<catnix::TokenIdsId, catnix::TokenIds>,
@@ -31,7 +100,38 @@ struct MaterializedTextSource {
     tokens: Vec<u32>,
 }
 
+impl Default for SymbolicArtifactStore {
+    fn default() -> Self {
+        Self::memory()
+    }
+}
+
 impl SymbolicArtifactStore {
+    pub(crate) fn memory() -> Self {
+        Self::new(ArtifactBlobStore::memory())
+    }
+
+    pub(crate) async fn open(config: ArtifactStoreConfig) -> Result<Self, ExecutorError> {
+        match config {
+            ArtifactStoreConfig::Memory => Ok(Self::memory()),
+            ArtifactStoreConfig::Fs(path) => Ok(Self::new(ArtifactBlobStore::fs(path).await?)),
+        }
+    }
+
+    fn new(blob_store: ArtifactBlobStore) -> Self {
+        Self {
+            blob_store,
+            canonical_blobs: HashMap::new(),
+            bound_terms: HashMap::new(),
+            token_ids: HashMap::new(),
+            policies: HashMap::new(),
+            text_executions: HashMap::new(),
+            text_states: HashMap::new(),
+            text_artifacts: HashMap::new(),
+            outputs_by_execution: HashMap::new(),
+        }
+    }
+
     pub async fn record_prepared_text(
         &mut self,
         plan: &QuotePlan,
@@ -297,19 +397,7 @@ impl SymbolicArtifactStore {
         }
 
         let bytes = value.canonical_bytes();
-        let expected = iroh_hash(digest);
-        let tag = self
-            .blob_store
-            .add_slice(&bytes)
-            .await
-            .map_err(|err| ExecutorError::WeightsError(format!("blob insert failed: {err}")))?;
-        if tag.hash != expected {
-            return Err(ExecutorError::WeightsError(format!(
-                "blob store hash mismatch: expected {}, got {}",
-                expected.to_hex(),
-                tag.hash.to_hex()
-            )));
-        }
+        self.blob_store.insert_canonical(digest, &bytes).await?;
         self.canonical_blobs.insert(digest, bytes);
         Ok(())
     }

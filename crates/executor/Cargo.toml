@@ -29,7 +29,7 @@ chatgrad = { workspace = true, default-features = false }
 catnix.workspace = true
 hf-hub = "0.5"
 blake3 = "1"
-iroh-blobs = { workspace = true }
+iroh-blobs = { workspace = true, features = ["fs-store"] }
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 half = { workspace = true }
