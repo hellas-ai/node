@@ -9,18 +9,16 @@ documentation.workspace = true
 
 [features]
 default = []
-common = []
-symbolic = []
-opaque = []
-ticket = ["symbolic", "opaque"]
-execute = ["common", "ticket"]
-node = ["common"]
-courtesy = ["symbolic", "ticket"]
-settlement = ["common"]
+hellas = []
+symbolic = ["hellas"]
+opaque = ["hellas"]
+swarm = []
+courtesy = ["hellas", "symbolic"]
+settlement = ["hellas"]
 client = []
 server = []
-all = ["execute", "courtesy", "node", "client", "server"]
-compile = ["dep:tonic-prost-build", "all"]
+all = ["hellas", "symbolic", "opaque", "swarm", "courtesy", "client", "server"]
+compile = ["dep:glob", "dep:tonic-prost-build", "all"]
 
 [dependencies]
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
@@ -28,4 +26,5 @@ tonic-prost = "0.14"
 prost = "0.14"
 
 [build-dependencies]
+glob = { version = "0.3", optional = true }
 tonic-prost-build = { version = "0.14", optional = true }

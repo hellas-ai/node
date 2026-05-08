@@ -13,7 +13,9 @@ compression = ["tonic/gzip", "tonic/zstd"]
 client = [
     "tonic/channel",
     "hellas-pb/client",
-    "hellas-pb/execute",
+    "hellas-pb/hellas",
+    "hellas-pb/symbolic",
+    "hellas-pb/opaque",
     "hellas-pb/courtesy",
 ]
 discovery = [
@@ -28,6 +30,9 @@ server = ["tonic/server", "hellas-pb/server"]
 node = [
     "dep:catgrad",
     "dep:catgrad-llm",
+    "hellas-pb/hellas",
+    "hellas-pb/symbolic",
+    "hellas-pb/opaque",
     "hellas-pb/courtesy",
     "dep:serde",
     "dep:serde_json",

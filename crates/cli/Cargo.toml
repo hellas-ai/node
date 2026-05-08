@@ -39,7 +39,7 @@ serde_json.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hellas-core.workspace = true
-hellas-pb = { workspace = true, features = ["execute", "courtesy", "node", "client"] }
+hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "swarm", "client"] }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "node",
     "client",

@@ -15,7 +15,7 @@ candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
 hellas-core.workspace = true
-hellas-pb = { workspace = true, features = ["execute", "courtesy", "server"] }
+hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "server"] }
 hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
