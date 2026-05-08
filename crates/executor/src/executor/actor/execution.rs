@@ -2,7 +2,7 @@ use crate::executor::ExecuteOutcome;
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use hellas_core::{
-    Opaque, ReceiptBody, ReceiptEnvelope as CoreReceiptEnvelope, SignedReceipt, canonical_dag_cbor,
+    Digest, Opaque, ReceiptEnvelope as CoreReceiptEnvelope, SignedReceipt, canonical_dag_cbor,
 };
 use hellas_core::{SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput};
 use hellas_pb::hellas::{
@@ -107,14 +107,10 @@ impl Executor {
                 let model_id = quote.model_id.clone();
                 let execution_id = new_execution_id();
                 let total_units = output.as_bytes().len() as u64;
-                let receipt = SignedReceipt::<ReceiptBody>::sign::<Opaque>(
-                    &request,
-                    &output,
-                    &self.producer_key,
-                )
-                .map_err(|err| {
-                    ExecutorError::WeightsError(format!("opaque receipt signing failed: {err}"))
-                })?;
+                let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &self.producer_key)
+                    .map_err(|err| {
+                        ExecutorError::WeightsError(format!("opaque receipt signing failed: {err}"))
+                    })?;
                 let receipt_dag_cbor = canonical_dag_cbor(&CoreReceiptEnvelope::Opaque(receipt))
                     .map_err(|err| {
                         ExecutorError::WeightsError(format!(
@@ -280,12 +276,9 @@ impl Executor {
 }
 
 fn format_request_commitment(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    Digest::from_slice(bytes)
+        .map(|digest| digest.to_string())
+        .unwrap_or_else(|_| format!("invalid:{}bytes", bytes.len()))
 }
 
 enum StartExecutionError {

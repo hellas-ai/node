@@ -181,12 +181,7 @@ fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    Digest::from_bytes(*bytes).to_string()
 }
 
 pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {

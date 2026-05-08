@@ -127,13 +127,13 @@ impl EvidencedReceiptBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedReceipt<B> {
-    body: B,
+pub struct SignedReceipt {
+    body: ReceiptBody,
     signature: Signature,
     public_key: PublicKey,
 }
 
-impl SignedReceipt<ReceiptBody> {
+impl SignedReceipt {
     pub fn sign<S>(
         request: &S::Request,
         output: &S::Output,
@@ -199,14 +199,14 @@ impl SignedReceipt<ReceiptBody> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedEvidenceReceipt<B, E> {
-    body: B,
+pub struct SignedEvidenceReceipt<E> {
+    body: EvidencedReceiptBody,
     signature: Signature,
     public_key: PublicKey,
     evidence: E,
 }
 
-impl<E> SignedEvidenceReceipt<EvidencedReceiptBody, E> {
+impl<E> SignedEvidenceReceipt<E> {
     pub const fn body(&self) -> &EvidencedReceiptBody {
         &self.body
     }
@@ -222,9 +222,36 @@ impl<E> SignedEvidenceReceipt<EvidencedReceiptBody, E> {
     pub const fn evidence(&self) -> &E {
         &self.evidence
     }
+
+    pub fn sign<S>(
+        request: &S::Request,
+        output: &S::Output,
+        evidence: E,
+        key: &ProducerSigningKey,
+    ) -> Result<Self, VerifyError>
+    where
+        S: EvidencedScheme<Evidence = E>,
+    {
+        let public_key = key.public_key();
+        let base = ReceiptBody::new(
+            S::SCHEME,
+            RequestCommitment(S::commit_request(request)),
+            ResultCommitment(S::commit_output(output)),
+            ProducerId::from_public_key(&public_key),
+        );
+        let body =
+            EvidencedReceiptBody::new(base, EvidenceCommitment(S::commit_evidence(&evidence)));
+        let signature = key.sign_digest(body.signature_preimage()?)?;
+        Ok(Self {
+            body,
+            signature,
+            public_key,
+            evidence,
+        })
+    }
 }
 
-impl SignedEvidenceReceipt<EvidencedReceiptBody, SymbolicEvidence> {
+impl SignedEvidenceReceipt<SymbolicEvidence> {
     pub fn sign_symbolic(
         request: &SymbolicRequest,
         output: &SymbolicOutput,
@@ -274,39 +301,10 @@ impl SignedEvidenceReceipt<EvidencedReceiptBody, SymbolicEvidence> {
     }
 }
 
-impl<B, E> SignedEvidenceReceipt<B, E> {
-    pub fn sign<S>(
-        request: &S::Request,
-        output: &S::Output,
-        evidence: S::Evidence,
-        key: &ProducerSigningKey,
-    ) -> Result<SignedEvidenceReceipt<EvidencedReceiptBody, S::Evidence>, VerifyError>
-    where
-        S: EvidencedScheme,
-    {
-        let public_key = key.public_key();
-        let base = ReceiptBody::new(
-            S::SCHEME,
-            RequestCommitment(S::commit_request(request)),
-            ResultCommitment(S::commit_output(output)),
-            ProducerId::from_public_key(&public_key),
-        );
-        let body =
-            EvidencedReceiptBody::new(base, EvidenceCommitment(S::commit_evidence(&evidence)));
-        let signature = key.sign_digest(body.signature_preimage()?)?;
-        Ok(SignedEvidenceReceipt {
-            body,
-            signature,
-            public_key,
-            evidence,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiptEnvelope {
-    Symbolic(SignedEvidenceReceipt<EvidencedReceiptBody, SymbolicEvidence>),
-    Opaque(SignedReceipt<ReceiptBody>),
+    Symbolic(SignedEvidenceReceipt<SymbolicEvidence>),
+    Opaque(SignedReceipt),
 }
 
 impl ReceiptEnvelope {
@@ -429,8 +427,7 @@ mod tests {
             payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
         };
         let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt =
-            SignedReceipt::<ReceiptBody>::sign::<Opaque>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
         let envelope = ReceiptEnvelope::Opaque(receipt);
 
         verify_delivery(
@@ -447,11 +444,10 @@ mod tests {
         let request = symbolic_request();
         let output = symbolic_output();
         let evidence = SymbolicEvidence::TextArtifactCid(Digest::from_bytes([9; 32]));
-        let receipt =
-            SignedEvidenceReceipt::<EvidencedReceiptBody, SymbolicEvidence>::sign_symbolic(
-                &request, &output, evidence, &key,
-            )
-            .unwrap();
+        let receipt = SignedEvidenceReceipt::<SymbolicEvidence>::sign_symbolic(
+            &request, &output, evidence, &key,
+        )
+        .unwrap();
         let envelope = ReceiptEnvelope::Symbolic(receipt);
 
         verify_delivery(
@@ -472,8 +468,7 @@ mod tests {
         };
         let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
         let wrong = JsonBytes::new(br#"{"text":"bye"}"#.to_vec());
-        let receipt =
-            SignedReceipt::<ReceiptBody>::sign::<Opaque>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
         let envelope = ReceiptEnvelope::Opaque(receipt);
 
         assert_eq!(
@@ -496,15 +491,14 @@ mod tests {
             payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
         };
         let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt =
-            SignedReceipt::<ReceiptBody>::sign::<Opaque>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
 
         let body_commitment = receipt.body().receipt_commitment().unwrap();
         let mut changed_signature = *receipt.signature();
         let mut bytes = *changed_signature.bytes();
         bytes[0] ^= 0x01;
         changed_signature = Signature::from_compact_secp256k1(bytes);
-        let rebuilt = SignedReceipt::<ReceiptBody> {
+        let rebuilt = SignedReceipt {
             body: receipt.body().clone(),
             signature: changed_signature,
             public_key: *receipt.public_key(),
@@ -526,8 +520,7 @@ mod tests {
             payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
         };
         let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt =
-            SignedReceipt::<ReceiptBody>::sign::<Opaque>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
         let envelope = ReceiptEnvelope::Opaque(receipt);
 
         let bytes = crate::canonical_dag_cbor(&envelope).unwrap();

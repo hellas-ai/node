@@ -122,7 +122,59 @@ impl Executor {
         &mut self,
         request: PbOpaqueRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.quote_opaque(request)
+        self.store.prune_expired_quotes(Instant::now());
+
+        let service = request.service;
+        if service.is_empty() {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "opaque service must not be empty".to_string(),
+            ));
+        }
+        let method = request.method;
+        if method.is_empty() {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "opaque method must not be empty".to_string(),
+            ));
+        }
+        serde_json::from_slice::<serde_json::Value>(&request.payload).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!("opaque payload must be UTF-8 JSON: {err}"))
+        })?;
+
+        let opaque_request = OpaqueRequest {
+            service: service.clone(),
+            method: method.clone(),
+            payload: JsonBytes::new(request.payload),
+        };
+        let output = opaque_request.payload.clone();
+        let request_commitment = RequestCommitment(Opaque::commit_request(&opaque_request));
+        let request_commitment_bytes = self.store.create_quote(QuoteRecord {
+            request_commitment,
+            expires_at: Instant::now() + QUOTE_TTL,
+            model_id: format!("opaque:{service}/{method}"),
+            kind: QuoteKind::Opaque {
+                request: opaque_request,
+                output,
+            },
+        });
+
+        info!(
+            request_commitment = %format_request_commitment(&request_commitment_bytes),
+            service,
+            method,
+            amount = STATIC_QUOTE_AMOUNT,
+            "quoted opaque execution"
+        );
+
+        Ok(TicketOutcome {
+            response: Ticket {
+                request_commitment: request_commitment_bytes.to_vec(),
+                amount: STATIC_QUOTE_AMOUNT,
+                ttl_ms: QUOTE_TTL.as_millis() as u64,
+            },
+            provenance: ExecutionProvenance {
+                commitment_id: request_commitment_bytes,
+            },
+        })
     }
 
     pub(super) async fn handle_quote_prepared_text(
@@ -302,65 +354,6 @@ impl Executor {
             .collect();
         ListModelsResponse { models }
     }
-
-    fn quote_opaque(
-        &mut self,
-        request: PbOpaqueRequest,
-    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.store.prune_expired_quotes(Instant::now());
-
-        let service = request.service;
-        if service.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "opaque service must not be empty".to_string(),
-            ));
-        }
-        let method = request.method;
-        if method.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "opaque method must not be empty".to_string(),
-            ));
-        }
-        serde_json::from_slice::<serde_json::Value>(&request.payload).map_err(|err| {
-            ExecutorError::InvalidQuoteRequest(format!("opaque payload must be UTF-8 JSON: {err}"))
-        })?;
-
-        let opaque_request = OpaqueRequest {
-            service: service.clone(),
-            method: method.clone(),
-            payload: JsonBytes::new(request.payload),
-        };
-        let output = opaque_request.payload.clone();
-        let request_commitment = RequestCommitment(Opaque::commit_request(&opaque_request));
-        let request_commitment_bytes = self.store.create_quote(QuoteRecord {
-            request_commitment,
-            expires_at: Instant::now() + QUOTE_TTL,
-            model_id: format!("opaque:{service}/{method}"),
-            kind: QuoteKind::Opaque {
-                request: opaque_request,
-                output,
-            },
-        });
-
-        info!(
-            request_commitment = %format_request_commitment(&request_commitment_bytes),
-            service,
-            method,
-            amount = STATIC_QUOTE_AMOUNT,
-            "quoted opaque execution"
-        );
-
-        Ok(TicketOutcome {
-            response: Ticket {
-                request_commitment: request_commitment_bytes.to_vec(),
-                amount: STATIC_QUOTE_AMOUNT,
-                ttl_ms: QUOTE_TTL.as_millis() as u64,
-            },
-            provenance: ExecutionProvenance {
-                commitment_id: request_commitment_bytes,
-            },
-        })
-    }
 }
 
 fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {
@@ -370,12 +363,7 @@ fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError>
 }
 
 fn format_request_commitment(bytes: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    Digest::from_bytes(*bytes).to_string()
 }
 
 fn load_assets(
