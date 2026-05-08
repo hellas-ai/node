@@ -33,7 +33,7 @@ impl ModelLocator {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Invocation {
     pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,

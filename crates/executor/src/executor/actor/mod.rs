@@ -1,6 +1,7 @@
 mod execution;
 mod quote;
 
+use crate::artifacts::SymbolicArtifactStore;
 use crate::backend;
 use crate::metrics::ExecutorMetrics;
 use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
@@ -19,6 +20,7 @@ use super::{ExecutorHandle, ExecutorMessage};
 pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
     pub(super) store: ExecutorState,
+    pub(super) artifacts: SymbolicArtifactStore,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
     pub(super) models: HashMap<ModelLocator, LocalModelStatus>,
@@ -100,6 +102,7 @@ impl Executor {
         let executor = Self {
             rx,
             store: ExecutorState::new(),
+            artifacts: SymbolicArtifactStore::default(),
             pending_executions: VecDeque::new(),
             queue_capacity,
             models: HashMap::new(),
