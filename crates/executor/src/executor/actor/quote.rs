@@ -409,13 +409,13 @@ impl Executor {
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.store.prune_expired_quotes(Instant::now());
 
-        let service = request.service.trim().to_string();
+        let service = request.service;
         if service.is_empty() {
             return Err(ExecutorError::InvalidQuoteRequest(
                 "opaque service must not be empty".to_string(),
             ));
         }
-        let method = request.method.trim().to_string();
+        let method = request.method;
         if method.is_empty() {
             return Err(ExecutorError::InvalidQuoteRequest(
                 "opaque method must not be empty".to_string(),

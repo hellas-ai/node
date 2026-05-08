@@ -252,6 +252,37 @@ enum Commands {
         #[arg(long = "dtype", value_delimiter = ',', value_parser = parse_model_dtype)]
         dtype: Vec<Dtype>,
     },
+    /// Run trust-based opaque JSON work
+    Opaque {
+        /// Node ID to run on remotely (omit to auto-discover)
+        node_id: Option<EndpointId>,
+        /// Direct UDP address hint for the target node. Repeat or use commas.
+        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        node_addrs: Vec<SocketAddr>,
+        /// Opaque service label. The protocol records it but does not interpret it.
+        #[arg(long)]
+        service: String,
+        /// Opaque method label. The protocol records it but does not interpret it.
+        #[arg(long)]
+        method: String,
+        /// Exact UTF-8 JSON payload bytes.
+        #[arg(
+            long,
+            conflicts_with = "payload_file",
+            required_unless_present = "payload_file"
+        )]
+        payload: Option<String>,
+        /// Read exact UTF-8 JSON payload bytes from a file.
+        #[arg(long = "payload-file")]
+        payload_file: Option<PathBuf>,
+        /// Max execution retries on failure (discovery path only)
+        #[arg(long = "retries", default_value_t = 2)]
+        retries: usize,
+        /// Run locally with the in-process executor instead of the Hellas network
+        #[cfg(feature = "hellas-executor")]
+        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
+        local: bool,
+    },
     /// Inspect the local identity file
     Identity {
         #[command(subcommand)]
@@ -408,6 +439,45 @@ async fn main() {
             )
             .await
         }
+        Commands::Opaque {
+            node_id,
+            node_addrs,
+            service,
+            method,
+            payload,
+            payload_file,
+            retries,
+            #[cfg(feature = "hellas-executor")]
+            local,
+        } => {
+            let payload = match (payload, payload_file) {
+                (Some(payload), None) => Ok(payload.into_bytes()),
+                (None, Some(path)) => tokio::fs::read(&path).await.map_err(|err| {
+                    anyhow::anyhow!("failed to read --payload-file {}: {err}", path.display())
+                }),
+                (None, None) => unreachable!("clap requires --payload or --payload-file"),
+                (Some(_), Some(_)) => unreachable!("clap rejects both payload sources"),
+            };
+            match payload {
+                Ok(payload) => {
+                    commands::opaque::run(
+                        commands::opaque::ExecuteOptions {
+                            node_id,
+                            node_addrs,
+                            service,
+                            method,
+                            payload,
+                            retries,
+                            #[cfg(feature = "hellas-executor")]
+                            local,
+                        },
+                        secret_key,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        }
         Commands::Identity { command } => match command {
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
         },
@@ -543,9 +613,64 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn opaque_accepts_payload() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "opaque",
+            "--service",
+            "echo",
+            "--method",
+            "run",
+            "--payload",
+            r#"{"x":1}"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Opaque {
+                service,
+                method,
+                payload,
+                ..
+            } => {
+                assert_eq!(service, "echo");
+                assert_eq!(method, "run");
+                assert_eq!(payload.as_deref(), Some(r#"{"x":1}"#));
+            }
+            _ => panic!("expected opaque command"),
+        }
+    }
+
+    #[test]
+    fn opaque_rejects_node_addr_without_node_id() {
+        let result = Cli::try_parse_from([
+            "hellas",
+            "opaque",
+            "--service",
+            "echo",
+            "--method",
+            "run",
+            "--payload",
+            r#"{"x":1}"#,
+            "--node-addr",
+            "127.0.0.1:31145",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn opaque_rejects_missing_payload() {
+        let result =
+            Cli::try_parse_from(["hellas", "opaque", "--service", "echo", "--method", "run"]);
+
+        assert!(result.is_err());
+    }
+
     /// On CPU-only builds the default is `f32`; on CUDA/Metal builds it is
     /// `bf16`. See [`DEFAULT_DTYPE_STR`]. Used for `serve` / `gateway`,
     /// which still take a single dtype.
+    #[cfg(feature = "hellas-executor")]
     fn expected_default_dtype() -> Dtype {
         parse_model_dtype(DEFAULT_DTYPE_STR).unwrap()
     }

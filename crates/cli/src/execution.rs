@@ -39,19 +39,24 @@ use catgrad_llm::runtime::TextReceipt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered, Stream};
 use hellas_core::{
-    ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_receipt,
+    DeliveryOutput, DeliveryRequest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
+    ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_delivery,
+    verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
 use hellas_pb::courtesy::QuotePreparedTextRequest;
 use hellas_pb::hellas::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, work_event};
+use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::discovery::DiscoveryBindings;
-use hellas_rpc::driver::{ExecuteDriver, QuotedPreparedTextResponse, RemoteExecuteDriver};
+use hellas_rpc::driver::{
+    ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
+};
 use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService, SymbolicService};
+use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -188,6 +193,18 @@ pub enum StopReason {
     Cancelled,
 }
 
+#[derive(Debug, Clone)]
+pub enum OpaqueExecutionEvent {
+    Chunk { position: u64, bytes: Vec<u8> },
+    Done(OpaqueOutcome),
+}
+
+#[derive(Debug, Clone)]
+pub enum OpaqueOutcome {
+    Completed { output: Vec<u8> },
+    Failed { error: String },
+}
+
 // ---------------------------------------------------------------------------
 // ExecutionRuntime
 // ---------------------------------------------------------------------------
@@ -285,6 +302,40 @@ impl ExecutionRequest {
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         try_stream! {
             let prepared = self.prepare().await?;
+            let inner = prepared.stream();
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
+        }
+    }
+}
+
+pub struct OpaqueExecutionRequest {
+    runtime: ExecutionRuntime,
+    request: PbOpaqueRequest,
+    route: ExecutionRoute,
+}
+
+impl OpaqueExecutionRequest {
+    pub fn new(runtime: ExecutionRuntime, request: PbOpaqueRequest, route: ExecutionRoute) -> Self {
+        Self {
+            runtime,
+            request,
+            route,
+        }
+    }
+
+    pub fn uses_remote_transport(&self) -> bool {
+        #[cfg(feature = "hellas-executor")]
+        return !matches!(self.route, ExecutionRoute::Local);
+        #[cfg(not(feature = "hellas-executor"))]
+        return true;
+    }
+
+    pub fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+        try_stream! {
+            let prepared = prepare_opaque_route(&self.runtime, &self.request, &self.route).await?;
             let inner = prepared.stream();
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -525,6 +576,132 @@ impl PreparedRoute {
     }
 }
 
+enum OpaquePreparedRoute {
+    #[cfg(feature = "hellas-executor")]
+    Local {
+        executor: ExecutorHandle,
+        request: PbOpaqueRequest,
+        request_commitment: Vec<u8>,
+    },
+    RemoteDirect(OpaqueRemoteExecution),
+    RemoteDiscovery {
+        request: PbOpaqueRequest,
+        retries: usize,
+        secret_key: Option<SecretKey>,
+    },
+}
+
+async fn prepare_opaque_route(
+    runtime: &ExecutionRuntime,
+    request: &PbOpaqueRequest,
+    route: &ExecutionRoute,
+) -> anyhow::Result<OpaquePreparedRoute> {
+    match route {
+        #[cfg(feature = "hellas-executor")]
+        ExecutionRoute::Local => {
+            let mut executor = runtime.require_local_executor()?;
+            let quoted = quote_opaque_with_driver(request, &mut executor, || {
+                "local opaque quote failed".to_string()
+            })
+            .await?;
+            Ok(OpaquePreparedRoute::Local {
+                executor,
+                request: request.clone(),
+                request_commitment: quoted.response.request_commitment,
+            })
+        }
+        ExecutionRoute::RemoteDirect(target) => {
+            let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
+            let quote = quote_opaque_remote_target(request, &endpoint, target).await?;
+            Ok(OpaquePreparedRoute::RemoteDirect(
+                OpaqueRemoteExecution::from_quoted(endpoint, request.clone(), quote),
+            ))
+        }
+        ExecutionRoute::RemoteDiscovery { retries } => Ok(OpaquePreparedRoute::RemoteDiscovery {
+            request: request.clone(),
+            retries: *retries,
+            secret_key: runtime.secret_key.clone(),
+        }),
+    }
+}
+
+impl OpaquePreparedRoute {
+    fn stream(self) -> BoxStream<'static, anyhow::Result<OpaqueExecutionEvent>> {
+        match self {
+            #[cfg(feature = "hellas-executor")]
+            Self::Local {
+                executor,
+                request,
+                request_commitment,
+            } => execute_opaque_stream(executor, request_commitment, request).boxed(),
+            Self::RemoteDirect(remote) => remote.stream().boxed(),
+            Self::RemoteDiscovery {
+                request,
+                retries,
+                secret_key,
+            } => opaque_discovery_stream(request, retries, secret_key).boxed(),
+        }
+    }
+}
+
+fn opaque_discovery_stream(
+    request: PbOpaqueRequest,
+    retries: usize,
+    secret_key: Option<SecretKey>,
+) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+    try_stream! {
+        let max_attempts = retries.saturating_add(1);
+        let mut tried: HashSet<EndpointId> = HashSet::new();
+        let mut last_peer_error: Option<anyhow::Error> = None;
+        info!("No node ID provided, discovering opaque executor");
+
+        for attempt in 1..=max_attempts {
+            let remote = prepare_discovered_opaque_remote(&request, secret_key.as_ref(), &tried).await?;
+            let peer_id = remote.peer_id;
+            let mut committed = false;
+            let mut transport_err: Option<anyhow::Error> = None;
+            let mut got_terminal = false;
+            {
+                let inner = remote.stream();
+                tokio::pin!(inner);
+                while let Some(event) = inner.next().await {
+                    match event {
+                        Ok(OpaqueExecutionEvent::Chunk { position, bytes }) => {
+                            committed = true;
+                            yield OpaqueExecutionEvent::Chunk { position, bytes };
+                        }
+                        Ok(OpaqueExecutionEvent::Done(outcome)) => {
+                            got_terminal = true;
+                            yield OpaqueExecutionEvent::Done(outcome);
+                        }
+                        Err(e) => {
+                            transport_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            if got_terminal { return; }
+
+            let err = transport_err
+                .unwrap_or_else(|| anyhow!("stream from {peer_id} ended without terminal outcome"));
+            if committed {
+                Err(err.context(format!(
+                    "opaque execution failed on {peer_id} after output was emitted"
+                )))?;
+                unreachable!("Err(_)? always returns");
+            }
+            warn!(attempt, %peer_id, "opaque execution failed before output, rediscovering: {err:#}");
+            tried.insert(peer_id);
+            last_peer_error = Some(err);
+        }
+
+        let err = last_peer_error
+            .unwrap_or_else(|| anyhow!("no opaque provider could serve the request"));
+        Err(err.context(format!("max retries ({retries}) exceeded")))?;
+    }
+}
+
 /// Discovery+retry across providers.
 ///
 /// Per-attempt rules (matched off the inner Result so the failure-mode
@@ -642,6 +819,48 @@ impl RemoteExecution {
     }
 }
 
+struct OpaqueRemoteExecution {
+    endpoint: Arc<Endpoint>,
+    peer_id: EndpointId,
+    request: PbOpaqueRequest,
+    request_commitment: Vec<u8>,
+    driver: TracedDriver,
+}
+
+impl OpaqueRemoteExecution {
+    fn from_quoted(
+        endpoint: Arc<Endpoint>,
+        request: PbOpaqueRequest,
+        quoted: QuotedRemoteDriver,
+    ) -> Self {
+        Self {
+            endpoint,
+            peer_id: quoted.peer_id,
+            request,
+            request_commitment: quoted.quote.request_commitment,
+            driver: quoted.driver,
+        }
+    }
+
+    fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+        let Self {
+            endpoint,
+            peer_id: _,
+            request,
+            request_commitment,
+            driver,
+        } = self;
+        try_stream! {
+            let _endpoint = endpoint;
+            let inner = execute_opaque_stream(driver, request_commitment, request);
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // execute_stream — the bottom layer that maps wire events → ExecutionEvent
 // ---------------------------------------------------------------------------
@@ -682,6 +901,42 @@ fn execute_stream<D: ExecuteDriver + Send + 'static>(
     }
 }
 
+fn execute_opaque_stream<D: ExecuteDriver + Send + 'static>(
+    mut driver: D,
+    request_commitment: Vec<u8>,
+    request: PbOpaqueRequest,
+) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+    try_stream! {
+        let core_request = core_opaque_request(&request)?;
+        let mut wire = driver
+            .execute_streaming(RunTicketRequest {
+                request_commitment,
+            })
+            .await
+            .context("failed to start opaque execution stream")?
+            .stream;
+
+        let mut got_terminal = false;
+        while let Some(item) = wire.next().await {
+            let event = convert_opaque_wire_event(
+                item.context("opaque execution stream failed")?,
+                &core_request,
+            )?;
+            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+
+        if !got_terminal {
+            Err(anyhow!("opaque execution stream ended without terminal outcome"))?;
+        }
+        drop(driver);
+    }
+}
+
 /// Translate one wire `WorkEvent` into one `ExecutionEvent`.
 fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
     let Some(event) = event.kind else {
@@ -700,6 +955,27 @@ fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
     }
 }
 
+fn convert_opaque_wire_event(
+    event: WorkEvent,
+    request: &CoreOpaqueRequest,
+) -> anyhow::Result<OpaqueExecutionEvent> {
+    let Some(event) = event.kind else {
+        bail!("wire event with no body");
+    };
+    match event {
+        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
+            position: chunk.position,
+            bytes: chunk.bytes,
+        }),
+        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
+            parse_opaque_finished(finished, request)?,
+        )),
+        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+            error: failed.error,
+        })),
+    }
+}
+
 fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
     let receipt_cid = receipt_cid_from_envelope(finished.receipt)?;
     let stop_reason = stop_reason_from_pb(finished.status)?;
@@ -707,6 +983,49 @@ fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
         total_tokens: finished.total_units,
         stop_reason,
         receipt_cid,
+    })
+}
+
+fn parse_opaque_finished(
+    finished: pb::WorkFinished,
+    request: &CoreOpaqueRequest,
+) -> anyhow::Result<OpaqueOutcome> {
+    stop_reason_from_pb(finished.status)?;
+    serde_json::from_slice::<serde_json::Value>(&finished.output)
+        .context("opaque output must be UTF-8 JSON")?;
+    let output = JsonBytes::new(finished.output.clone());
+    let envelope = finished
+        .receipt
+        .ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
+    let core: CoreReceiptEnvelope = decode_dag_cbor(&envelope.dag_cbor)
+        .context("failed to decode receipt envelope dag-cbor")?;
+    verify_delivery(
+        DeliveryRequest::Opaque(request),
+        DeliveryOutput::Opaque(&output),
+        &core,
+    )
+    .context("opaque receipt verification failed")?;
+    if !matches!(core, CoreReceiptEnvelope::Opaque(_)) {
+        bail!("opaque execution returned a symbolic receipt");
+    }
+    Ok(OpaqueOutcome::Completed {
+        output: output.into_bytes(),
+    })
+}
+
+fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRequest> {
+    if request.service.is_empty() {
+        bail!("opaque service must not be empty");
+    }
+    if request.method.is_empty() {
+        bail!("opaque method must not be empty");
+    }
+    serde_json::from_slice::<serde_json::Value>(&request.payload)
+        .context("opaque payload must be UTF-8 JSON")?;
+    Ok(CoreOpaqueRequest {
+        service: request.service.clone(),
+        method: request.method.clone(),
+        payload: JsonBytes::new(request.payload.clone()),
     })
 }
 
@@ -778,6 +1097,27 @@ where
     Ok(quoted)
 }
 
+#[instrument(skip_all, fields(service = %request.service, method = %request.method))]
+async fn quote_opaque_with_driver<D>(
+    request: &PbOpaqueRequest,
+    driver: &mut D,
+    context: impl FnOnce() -> String,
+) -> anyhow::Result<QuotedResponse>
+where
+    D: ExecuteDriver,
+{
+    core_opaque_request(request)?;
+    let quoted = driver
+        .create_opaque_ticket(request.clone())
+        .await
+        .with_context(context)?;
+    tracing::Span::current().record(
+        "request_commitment",
+        tracing::field::display(format_hex(&quoted.response.request_commitment)),
+    );
+    Ok(quoted)
+}
+
 async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
     let (endpoint, _bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
     Ok(endpoint)
@@ -830,16 +1170,6 @@ fn bind_courtesy_pool(endpoint: &Endpoint) -> ConnectionPool {
     )
 }
 
-fn bind_symbolic_pool(endpoint: &Endpoint) -> ConnectionPool {
-    ConnectionPool::for_service::<SymbolicService>(
-        endpoint.clone(),
-        PoolOptions {
-            connect_timeout: REMOTE_CONNECT_TIMEOUT,
-            ..PoolOptions::default()
-        },
-    )
-}
-
 fn bind_opaque_pool(endpoint: &Endpoint) -> ConnectionPool {
     ConnectionPool::for_service::<OpaqueService>(
         endpoint.clone(),
@@ -850,12 +1180,47 @@ fn bind_opaque_pool(endpoint: &Endpoint) -> ConnectionPool {
     )
 }
 
+#[instrument(skip_all, fields(%peer_id, service = %request.service, method = %request.method))]
+async fn quote_opaque_remote_endpoint(
+    request: &PbOpaqueRequest,
+    execute_pool: &ConnectionPool,
+    opaque_pool: &ConnectionPool,
+    peer_id: EndpointId,
+) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
+    let opaque_channel = opaque_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let execute_channel = execute_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(opaque_channel, TraceContextInjector),
+    );
+    let quoted = match quote_opaque_with_driver(request, &mut driver, || {
+        format!("node {peer_id} declined opaque ticket")
+    })
+    .await
+    {
+        Ok(quoted) => quoted,
+        Err(err) => return Err(QuoteCandidateError::Declined(err)),
+    };
+    Ok(QuotedRemoteDriver {
+        peer_id,
+        quote: quoted.response,
+        provenance: quoted.provenance,
+        driver,
+    })
+}
+
 #[instrument(skip_all, fields(%peer_id, model = %quote_req.huggingface_model_id))]
 async fn quote_remote_endpoint(
     quote_req: &QuotePreparedTextRequest,
     execute_pool: &ConnectionPool,
-    symbolic_pool: &ConnectionPool,
-    opaque_pool: &ConnectionPool,
     courtesy_pool: &ConnectionPool,
     peer_id: EndpointId,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
@@ -869,20 +1234,8 @@ async fn quote_remote_endpoint(
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let symbolic_channel = symbolic_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let opaque_channel = opaque_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let mut driver = RemoteExecuteDriver::with_services(
+    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
         InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(symbolic_channel, TraceContextInjector),
-        InterceptedService::new(opaque_channel, TraceContextInjector),
         InterceptedService::new(courtesy_channel, TraceContextInjector),
     );
     let quoted = match quote_with_driver(quote_req, &mut driver, || {
@@ -903,27 +1256,71 @@ async fn quote_remote_endpoint(
     })
 }
 
+async fn quote_opaque_remote_peer(
+    request: &PbOpaqueRequest,
+    endpoint: &Endpoint,
+    peer_id: EndpointId,
+) -> anyhow::Result<QuotedRemoteDriver> {
+    let execute_pool = bind_remote_pool(endpoint);
+    let opaque_pool = bind_opaque_pool(endpoint);
+    quote_opaque_remote_endpoint(request, &execute_pool, &opaque_pool, peer_id)
+        .await
+        .map_err(|err| match err {
+            QuoteCandidateError::Declined(err) => {
+                err.context(format!("node {peer_id} declined opaque quote"))
+            }
+            QuoteCandidateError::Connect(err) => err,
+        })
+}
+
 async fn quote_remote_peer(
     quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
-    let symbolic_pool = bind_symbolic_pool(endpoint);
-    let opaque_pool = bind_opaque_pool(endpoint);
     let courtesy_pool = bind_courtesy_pool(endpoint);
-    quote_remote_endpoint(
-        quote_req,
-        &execute_pool,
-        &symbolic_pool,
-        &opaque_pool,
-        &courtesy_pool,
-        peer_id,
-    )
-    .await
-    .map_err(|err| match err {
-        QuoteCandidateError::Declined(err) => err.context(format!("node {peer_id} declined quote")),
-        QuoteCandidateError::Connect(err) => err,
+    quote_remote_endpoint(quote_req, &execute_pool, &courtesy_pool, peer_id)
+        .await
+        .map_err(|err| match err {
+            QuoteCandidateError::Declined(err) => {
+                err.context(format!("node {peer_id} declined quote"))
+            }
+            QuoteCandidateError::Connect(err) => err,
+        })
+}
+
+async fn quote_opaque_remote_target(
+    request: &PbOpaqueRequest,
+    endpoint: &Endpoint,
+    target: &RemoteNodeTarget,
+) -> anyhow::Result<QuotedRemoteDriver> {
+    if target.node_addrs.is_empty() {
+        return quote_opaque_remote_peer(request, endpoint, target.node_id).await;
+    }
+
+    let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let opaque_channel = OpaqueService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
+    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        InterceptedService::new(execute_channel, TraceContextInjector),
+        InterceptedService::new(opaque_channel, TraceContextInjector),
+    );
+    let quoted = quote_opaque_with_driver(request, &mut driver, || {
+        format!("node {} declined opaque quote", target.node_id)
+    })
+    .await?;
+
+    Ok(QuotedRemoteDriver {
+        peer_id: target.node_id,
+        quote: quoted.response,
+        provenance: quoted.provenance,
+        driver,
     })
 }
 
@@ -944,18 +1341,8 @@ async fn quote_remote_target(
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let symbolic_channel = SymbolicService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let opaque_channel = OpaqueService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let mut driver = RemoteExecuteDriver::with_services(
+    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
         InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(symbolic_channel, TraceContextInjector),
-        InterceptedService::new(opaque_channel, TraceContextInjector),
         InterceptedService::new(courtesy_channel, TraceContextInjector),
     );
     let quoted = quote_with_driver(quote_req, &mut driver, || {
@@ -974,6 +1361,95 @@ async fn quote_remote_target(
     })
 }
 
+#[instrument(skip_all, fields(service = %request.service, method = %request.method, excluded = exclude.len()))]
+async fn discover_opaque_remote_quote(
+    request: &PbOpaqueRequest,
+    endpoint: &Endpoint,
+    bindings: DiscoveryBindings,
+    exclude: &HashSet<EndpointId>,
+) -> anyhow::Result<QuotedRemoteDriver> {
+    let mut registry = ServiceRegistry::new(endpoint);
+    registry.with_pool_options(PoolOptions {
+        connect_timeout: REMOTE_CONNECT_TIMEOUT,
+        ..PoolOptions::default()
+    });
+    registry.add(MdnsBackend::new(bindings.mdns));
+    registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
+    let execute_pool = registry.pool::<ExecuteService>();
+    let opaque_pool = registry.pool::<OpaqueService>();
+
+    let peers = Box::pin(registry.discover::<OpaqueService>());
+    tokio::time::timeout(DISCOVERY_TIMEOUT, async {
+        let mut last_decline: Option<anyhow::Error> = None;
+        let mut last_connect_error: Option<anyhow::Error> = None;
+        let mut peers_done = false;
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        futures::pin_mut!(peers);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                    match result {
+                        Ok(accepted) => return Ok(accepted),
+                        Err(QuoteCandidateError::Declined(err)) => {
+                            info!("opaque provider declined quote: {err:#}");
+                            last_decline = Some(err);
+                        }
+                        Err(QuoteCandidateError::Connect(err)) => {
+                            debug!("opaque candidate connect error: {err:#}");
+                            last_connect_error = Some(err);
+                        }
+                    }
+                }
+
+                peer = peers.next(), if !peers_done && in_flight.len() < MAX_CONCURRENT_QUOTES => {
+                    match peer {
+                        Some(Ok(peer)) => {
+                            let peer_id = peer.id();
+                            if exclude.contains(&peer_id) {
+                                debug!(%peer_id, "skipping previously-failed opaque peer");
+                                continue;
+                            }
+                            let execute_pool = execute_pool.clone();
+                            let opaque_pool = opaque_pool.clone();
+                            let req = request.clone();
+                            in_flight.push(async move {
+                                quote_opaque_remote_endpoint(
+                                    &req,
+                                    &execute_pool,
+                                    &opaque_pool,
+                                    peer_id,
+                                ).await
+                            });
+                        }
+                        Some(Err(err)) => last_connect_error = Some(err.into()),
+                        None => peers_done = true,
+                    }
+                }
+
+                else => {
+                    if peers_done && in_flight.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(status) = last_decline {
+            return Err(status).context("all discovered opaque providers declined the quote");
+        }
+        if let Some(err) = last_connect_error {
+            return Err(err).context("failed to connect to discovered opaque providers");
+        }
+
+        anyhow::bail!("no opaque provider could serve the request");
+    })
+    .await
+    .context("opaque discovery timed out")?
+}
+
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id, excluded = exclude.len()))]
 async fn discover_remote_quote(
     quote_req: &QuotePreparedTextRequest,
@@ -989,8 +1465,6 @@ async fn discover_remote_quote(
     registry.add(MdnsBackend::new(bindings.mdns));
     registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
     let execute_pool = registry.pool::<ExecuteService>();
-    let symbolic_pool = registry.pool::<SymbolicService>();
-    let opaque_pool = registry.pool::<OpaqueService>();
     let courtesy_pool = registry.pool::<CourtesyService>();
 
     let peers = Box::pin(registry.discover::<CourtesyService>());
@@ -1031,16 +1505,12 @@ async fn discover_remote_quote(
                                 continue;
                             }
                             let execute_pool = execute_pool.clone();
-                            let symbolic_pool = symbolic_pool.clone();
-                            let opaque_pool = opaque_pool.clone();
                             let courtesy_pool = courtesy_pool.clone();
                             let req = quote_req.clone();
                             in_flight.push(async move {
                                 quote_remote_endpoint(
                                     &req,
                                     &execute_pool,
-                                    &symbolic_pool,
-                                    &opaque_pool,
                                     &courtesy_pool,
                                     peer_id,
                                 ).await
@@ -1070,6 +1540,20 @@ async fn discover_remote_quote(
     })
     .await
     .context("discovery timed out")?
+}
+
+async fn prepare_discovered_opaque_remote(
+    request: &PbOpaqueRequest,
+    secret_key: Option<&SecretKey>,
+    exclude: &HashSet<EndpointId>,
+) -> anyhow::Result<OpaqueRemoteExecution> {
+    let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
+    let quote = discover_opaque_remote_quote(request, &endpoint, bindings, exclude).await?;
+    Ok(OpaqueRemoteExecution::from_quoted(
+        endpoint,
+        request.clone(),
+        quote,
+    ))
 }
 
 async fn prepare_discovered_remote(
