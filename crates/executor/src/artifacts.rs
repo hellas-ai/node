@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -155,6 +155,25 @@ pub(crate) struct ResolvedSymbolicExecution {
     pub invocation: Invocation,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SymbolicArtifactBundle {
+    pub canonical_artifacts: Vec<Vec<u8>>,
+    pub bound_terms: Vec<SymbolicBoundTerm>,
+    pub execution_outputs: Vec<SymbolicExecutionOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SymbolicBoundTerm {
+    pub bound_term: Digest,
+    pub locator: ModelLocator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SymbolicExecutionOutput {
+    pub execution: Digest,
+    pub artifact: Digest,
+}
+
 pub(crate) struct SymbolicArtifactStore {
     blob_store: ArtifactBlobStore,
     index_path: Option<PathBuf>,
@@ -171,6 +190,15 @@ pub(crate) struct SymbolicArtifactStore {
 struct MaterializedTextSource {
     locator: ModelLocator,
     tokens: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ClosureNode {
+    TokenIds(catnix::TokenIdsId),
+    TextPolicy(catnix::TextPolicyId),
+    TextExecution(catnix::TextExecutionId),
+    TextState(catnix::TextStateId),
+    TextArtifact(catnix::TextArtifactId),
 }
 
 impl Default for SymbolicArtifactStore {
@@ -314,6 +342,23 @@ impl SymbolicArtifactStore {
         Ok(from_catnix_digest(digest))
     }
 
+    pub async fn publish_symbolic_bundle(
+        &mut self,
+        bundle: SymbolicArtifactBundle,
+    ) -> Result<Vec<Digest>, ExecutorError> {
+        let mut artifact_cids = Vec::with_capacity(bundle.canonical_artifacts.len());
+        for bytes in bundle.canonical_artifacts {
+            artifact_cids.push(self.publish_canonical_bytes(bytes).await?);
+        }
+        for metadata in bundle.bound_terms {
+            self.publish_bound_term_metadata(metadata.bound_term, metadata.locator)?;
+        }
+        for metadata in bundle.execution_outputs {
+            self.publish_execution_output_metadata(metadata.execution, metadata.artifact)?;
+        }
+        Ok(artifact_cids)
+    }
+
     pub async fn get_canonical_bytes(&mut self, digest: Digest) -> Result<Vec<u8>, ExecutorError> {
         let digest = to_catnix_digest(digest);
         if let Some(bytes) = self.canonical_blobs.get(&digest) {
@@ -368,6 +413,114 @@ impl SymbolicArtifactStore {
         }
     }
 
+    pub async fn export_symbolic_closure(
+        &mut self,
+        symbolic_request: &SymbolicRequest,
+    ) -> Result<SymbolicArtifactBundle, ExecutorError> {
+        let root = catnix::TextExecutionId::from_digest(to_catnix_digest(
+            symbolic_request.text_execution_cid,
+        ));
+        let mut bundle = SymbolicArtifactBundle::default();
+        let mut stack = vec![ClosureNode::TextExecution(root)];
+        let mut seen_nodes = HashSet::new();
+        let mut seen_canonical = HashSet::new();
+        let mut seen_bound_terms = HashSet::new();
+        let mut seen_execution_outputs = HashSet::new();
+
+        while let Some(node) = stack.pop() {
+            if !seen_nodes.insert(node) {
+                continue;
+            }
+
+            match node {
+                ClosureNode::TokenIds(id) => {
+                    let value = self.token_ids(id).await?;
+                    if value.output_id() != id {
+                        return Err(canonical_type_mismatch("TokenIds", id.digest()));
+                    }
+                    self.export_canonical(id.digest(), &mut seen_canonical, &mut bundle)
+                        .await?;
+                }
+                ClosureNode::TextPolicy(id) => {
+                    let value = self.text_policy(id).await?;
+                    if value.output_id() != id {
+                        return Err(canonical_type_mismatch("TextPolicy", id.digest()));
+                    }
+                    self.export_canonical(id.digest(), &mut seen_canonical, &mut bundle)
+                        .await?;
+                }
+                ClosureNode::TextExecution(id) => {
+                    let execution = self.text_execution(id).await?;
+                    if execution.input_id() != id {
+                        return Err(canonical_type_mismatch("TextExecution", id.digest()));
+                    }
+                    self.export_canonical(id.digest(), &mut seen_canonical, &mut bundle)
+                        .await?;
+                    stack.push(ClosureNode::TextPolicy(execution.policy()));
+                    stack.push(ClosureNode::TokenIds(execution.prompt_tokens()));
+                    match execution.from() {
+                        catnix::SourceRef::Input(input_id) => {
+                            let artifact_id = self.output_artifact_for_execution(*input_id)?;
+                            let artifact = self.text_artifact(artifact_id).await?;
+                            validate_execution_output_mapping(*input_id, artifact_id, &artifact)?;
+                            if seen_execution_outputs.insert((*input_id, artifact_id)) {
+                                bundle.execution_outputs.push(SymbolicExecutionOutput {
+                                    execution: from_catnix_digest(input_id.digest()),
+                                    artifact: from_catnix_digest(artifact_id.digest()),
+                                });
+                            }
+                            stack.push(ClosureNode::TextArtifact(artifact_id));
+                        }
+                        catnix::SourceRef::Output(artifact_id) => {
+                            stack.push(ClosureNode::TextArtifact(*artifact_id));
+                        }
+                    }
+                }
+                ClosureNode::TextState(id) => {
+                    let state = self.text_state(id).await?;
+                    if state.output_id() != id {
+                        return Err(canonical_type_mismatch("TextState", id.digest()));
+                    }
+                    self.export_canonical(id.digest(), &mut seen_canonical, &mut bundle)
+                        .await?;
+                    stack.push(ClosureNode::TokenIds(state.tokens()));
+                }
+                ClosureNode::TextArtifact(id) => {
+                    let artifact = self.text_artifact(id).await?;
+                    if artifact.output_id() != id {
+                        return Err(canonical_type_mismatch("TextArtifact", id.digest()));
+                    }
+                    self.export_canonical(id.digest(), &mut seen_canonical, &mut bundle)
+                        .await?;
+                    match artifact {
+                        catnix::TextArtifact::Identity { bound_term } => {
+                            let locator = self.bound_term_locator(bound_term)?;
+                            if seen_bound_terms.insert(bound_term) {
+                                bundle.bound_terms.push(SymbolicBoundTerm {
+                                    bound_term: from_catnix_digest(bound_term.digest()),
+                                    locator,
+                                });
+                            }
+                        }
+                        catnix::TextArtifact::Output(output) => {
+                            if seen_execution_outputs.insert((output.execution(), id)) {
+                                bundle.execution_outputs.push(SymbolicExecutionOutput {
+                                    execution: from_catnix_digest(output.execution().digest()),
+                                    artifact: from_catnix_digest(id.digest()),
+                                });
+                            }
+                            stack.push(ClosureNode::TextExecution(output.execution()));
+                            stack.push(ClosureNode::TextState(output.state()));
+                            stack.push(ClosureNode::TokenIds(output.generated_tokens()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(bundle)
+    }
+
     pub async fn record_completed_text(
         &mut self,
         symbolic_request: &SymbolicRequest,
@@ -408,11 +561,14 @@ impl SymbolicArtifactStore {
         &mut self,
         source: &catnix::TextSource,
     ) -> Result<MaterializedTextSource, ExecutorError> {
-        let artifact_id = match source {
-            catnix::SourceRef::Input(id) => self.output_artifact_for_execution(*id)?,
-            catnix::SourceRef::Output(id) => *id,
-        };
-        self.materialize_artifact(artifact_id).await
+        match source {
+            catnix::SourceRef::Input(execution_id) => {
+                let artifact_id = self.output_artifact_for_execution(*execution_id)?;
+                self.materialize_execution_output(*execution_id, artifact_id)
+                    .await
+            }
+            catnix::SourceRef::Output(artifact_id) => self.materialize_artifact(*artifact_id).await,
+        }
     }
 
     async fn materialize_artifact(
@@ -420,6 +576,23 @@ impl SymbolicArtifactStore {
         artifact_id: catnix::TextArtifactId,
     ) -> Result<MaterializedTextSource, ExecutorError> {
         let artifact = self.text_artifact(artifact_id).await?;
+        self.materialize_decoded_artifact(artifact).await
+    }
+
+    async fn materialize_execution_output(
+        &mut self,
+        execution_id: catnix::TextExecutionId,
+        artifact_id: catnix::TextArtifactId,
+    ) -> Result<MaterializedTextSource, ExecutorError> {
+        let artifact = self.text_artifact(artifact_id).await?;
+        validate_execution_output_mapping(execution_id, artifact_id, &artifact)?;
+        self.materialize_decoded_artifact(artifact).await
+    }
+
+    async fn materialize_decoded_artifact(
+        &mut self,
+        artifact: catnix::TextArtifact,
+    ) -> Result<MaterializedTextSource, ExecutorError> {
         match artifact {
             catnix::TextArtifact::Identity { bound_term } => {
                 let locator = self.bound_term_locator(bound_term)?;
@@ -447,11 +620,15 @@ impl SymbolicArtifactStore {
     ) -> Result<ModelLocator, ExecutorError> {
         let mut source = source;
         loop {
-            let artifact_id = match source {
-                catnix::SourceRef::Input(id) => self.output_artifact_for_execution(id)?,
-                catnix::SourceRef::Output(id) => id,
+            let (artifact_id, expected_execution) = match source {
+                catnix::SourceRef::Input(id) => (self.output_artifact_for_execution(id)?, Some(id)),
+                catnix::SourceRef::Output(id) => (id, None),
             };
-            match self.text_artifact(artifact_id).await? {
+            let artifact = self.text_artifact(artifact_id).await?;
+            if let Some(expected_execution) = expected_execution {
+                validate_execution_output_mapping(expected_execution, artifact_id, &artifact)?;
+            }
+            match artifact {
                 catnix::TextArtifact::Identity { bound_term } => {
                     return self.bound_term_locator(bound_term);
                 }
@@ -604,6 +781,20 @@ impl SymbolicArtifactStore {
         Ok(bytes)
     }
 
+    async fn export_canonical(
+        &mut self,
+        digest: catnix::Digest,
+        seen: &mut HashSet<catnix::Digest>,
+        bundle: &mut SymbolicArtifactBundle,
+    ) -> Result<(), ExecutorError> {
+        if seen.insert(digest) {
+            bundle
+                .canonical_artifacts
+                .push(self.get_canonical_bytes(from_catnix_digest(digest)).await?);
+        }
+        Ok(())
+    }
+
     async fn insert_token_ids(
         &mut self,
         value: catnix::TokenIds,
@@ -686,6 +877,23 @@ fn canonical_type_mismatch(kind: &str, digest: catnix::Digest) -> ExecutorError 
     ExecutorError::ArtifactStore(format!(
         "decoded {kind} artifact does not re-address to requested digest {digest}"
     ))
+}
+
+fn validate_execution_output_mapping(
+    execution_id: catnix::TextExecutionId,
+    artifact_id: catnix::TextArtifactId,
+    artifact: &catnix::TextArtifact,
+) -> Result<(), ExecutorError> {
+    match artifact {
+        catnix::TextArtifact::Output(output) if output.execution() == execution_id => Ok(()),
+        catnix::TextArtifact::Output(output) => Err(ExecutorError::InvalidQuoteRequest(format!(
+            "lazy symbolic source {execution_id} maps to artifact {artifact_id}, but that artifact realizes {}",
+            output.execution()
+        ))),
+        catnix::TextArtifact::Identity { .. } => Err(ExecutorError::InvalidQuoteRequest(format!(
+            "lazy symbolic source {execution_id} maps to identity artifact {artifact_id}"
+        ))),
+    }
 }
 
 fn load_symbolic_index(path: &Path) -> Result<SymbolicIndexData, ExecutorError> {
@@ -999,32 +1207,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_artifact_bundle_resolves_symbolic_request() {
-        let plan = plan();
-        let mut source = SymbolicArtifactStore::default();
-        let recorded = source.record_prepared_text(&plan).await.unwrap();
-        let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            recorded.symbolic_request.text_execution_cid,
+    async fn lazy_input_rejects_metadata_that_does_not_realize_execution() {
+        let mut store = SymbolicArtifactStore::default();
+        let first = store.record_prepared_text(&plan()).await.unwrap();
+        let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
+            first.symbolic_request.text_execution_cid,
         ));
-        let execution = source.text_execution(execution_id).await.unwrap();
-        let identity_id = match execution.from() {
+        let first_execution_value = store.text_execution(first_execution).await.unwrap();
+        let identity_id = match first_execution_value.from() {
             catnix::SourceRef::Output(id) => *id,
             catnix::SourceRef::Input(_) => panic!("prepared genesis text should start at output"),
         };
-        let identity = source.text_artifact(identity_id).await.unwrap();
-        let bound_term = match identity {
-            catnix::TextArtifact::Identity { bound_term } => bound_term,
-            catnix::TextArtifact::Output(_) => panic!("prepared genesis text should use identity"),
-        };
+        store
+            .publish_execution_output_metadata(
+                first.symbolic_request.text_execution_cid,
+                from_catnix_digest(identity_id.digest()),
+            )
+            .unwrap();
+        let prompt_tokens = store
+            .insert_token_ids(catnix::TokenIds::from([20]))
+            .await
+            .unwrap();
+        let policy = store
+            .insert_policy(catnix::TextPolicy::from_u32_stop_tokens(4, []))
+            .await
+            .unwrap();
+        let lazy = catnix::TextExecution::new(
+            catnix::SourceRef::input(first_execution),
+            prompt_tokens,
+            policy,
+        );
+        let lazy_id = store.insert_text_execution(lazy).await.unwrap();
+        let err = store
+            .resolve_symbolic_request(SymbolicRequest {
+                text_execution_cid: from_catnix_digest(lazy_id.digest()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("maps to identity artifact"));
+    }
+
+    #[tokio::test]
+    async fn published_artifact_bundle_resolves_symbolic_request() {
+        let mut source = SymbolicArtifactStore::default();
+        let recorded = source.record_prepared_text(&plan()).await.unwrap();
+        let bundle = source
+            .export_symbolic_closure(&recorded.symbolic_request)
+            .await
+            .unwrap();
+        assert_eq!(bundle.bound_terms.len(), 1);
 
         let mut target = SymbolicArtifactStore::default();
-        publish_from_source(&mut source, &mut target, execution_id.digest()).await;
-        publish_from_source(&mut source, &mut target, execution.prompt_tokens().digest()).await;
-        publish_from_source(&mut source, &mut target, execution.policy().digest()).await;
-        publish_from_source(&mut source, &mut target, identity_id.digest()).await;
-        target
-            .publish_bound_term_metadata(from_catnix_digest(bound_term.digest()), plan.locator)
-            .unwrap();
+        let artifact_cids = target.publish_symbolic_bundle(bundle).await.unwrap();
+        assert_eq!(artifact_cids.len(), 4);
 
         let resolved = target
             .resolve_symbolic_request(recorded.symbolic_request)
@@ -1035,34 +1271,15 @@ mod tests {
 
     #[tokio::test]
     async fn published_execution_output_metadata_resolves_lazy_input() {
-        let plan = plan();
         let mut source = SymbolicArtifactStore::default();
-        let first = source.record_prepared_text(&plan).await.unwrap();
-        let first_artifact = source
+        let first = source.record_prepared_text(&plan()).await.unwrap();
+        source
             .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
             .await
             .unwrap();
         let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
             first.symbolic_request.text_execution_cid,
         ));
-        let first_execution_value = source.text_execution(first_execution).await.unwrap();
-        let identity_id = match first_execution_value.from() {
-            catnix::SourceRef::Output(id) => *id,
-            catnix::SourceRef::Input(_) => panic!("prepared genesis text should start at output"),
-        };
-        let identity = source.text_artifact(identity_id).await.unwrap();
-        let bound_term = match identity {
-            catnix::TextArtifact::Identity { bound_term } => bound_term,
-            catnix::TextArtifact::Output(_) => panic!("prepared genesis text should use identity"),
-        };
-        let output_id = catnix::TextArtifactId::from_digest(to_catnix_digest(first_artifact));
-        let output = source.text_artifact(output_id).await.unwrap();
-        let output = match output {
-            catnix::TextArtifact::Output(output) => output,
-            catnix::TextArtifact::Identity { .. } => panic!("completed text must produce output"),
-        };
-        let state = source.text_state(output.state()).await.unwrap();
-
         let prompt_tokens = source
             .insert_token_ids(catnix::TokenIds::from([20]))
             .await
@@ -1077,38 +1294,17 @@ mod tests {
             policy,
         );
         let lazy_id = source.insert_text_execution(lazy).await.unwrap();
+        let lazy_request = SymbolicRequest {
+            text_execution_cid: from_catnix_digest(lazy_id.digest()),
+        };
+        let bundle = source.export_symbolic_closure(&lazy_request).await.unwrap();
+        assert_eq!(bundle.bound_terms.len(), 1);
+        assert_eq!(bundle.execution_outputs.len(), 1);
 
         let mut target = SymbolicArtifactStore::default();
-        for digest in [
-            first_execution.digest(),
-            first_execution_value.prompt_tokens().digest(),
-            first_execution_value.policy().digest(),
-            identity_id.digest(),
-            output_id.digest(),
-            output.state().digest(),
-            state.tokens().digest(),
-            lazy_id.digest(),
-            prompt_tokens.digest(),
-            policy.digest(),
-        ] {
-            publish_from_source(&mut source, &mut target, digest).await;
-        }
-        target
-            .publish_bound_term_metadata(from_catnix_digest(bound_term.digest()), plan.locator)
-            .unwrap();
-        target
-            .publish_execution_output_metadata(
-                first.symbolic_request.text_execution_cid,
-                first_artifact,
-            )
-            .unwrap();
+        target.publish_symbolic_bundle(bundle).await.unwrap();
 
-        let resolved = target
-            .resolve_symbolic_request(SymbolicRequest {
-                text_execution_cid: from_catnix_digest(lazy_id.digest()),
-            })
-            .await
-            .unwrap();
+        let resolved = target.resolve_symbolic_request(lazy_request).await.unwrap();
         assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
     }
 
@@ -1229,18 +1425,5 @@ mod tests {
             "hellas-executor-artifacts-{test}-{}-{nanos}",
             std::process::id()
         ))
-    }
-
-    async fn publish_from_source(
-        source: &mut SymbolicArtifactStore,
-        target: &mut SymbolicArtifactStore,
-        digest: catnix::Digest,
-    ) {
-        let bytes = source
-            .get_canonical_bytes(from_catnix_digest(digest))
-            .await
-            .unwrap();
-        let published = target.publish_canonical_bytes(bytes).await.unwrap();
-        assert_eq!(published, from_catnix_digest(digest));
     }
 }
