@@ -20,6 +20,8 @@ use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+#[cfg(feature = "hellas-executor")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +50,8 @@ pub struct GatewayOptions {
     pub force_model: Option<String>,
     pub metrics_port: Option<u16>,
     pub dtype: Dtype,
+    #[cfg(feature = "hellas-executor")]
+    pub producer_key_path: Option<PathBuf>,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
     pub wrap_args: Vec<String>,

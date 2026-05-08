@@ -38,6 +38,8 @@ use catgrad_llm::PreparedPrompt;
 use catgrad_llm::runtime::TextReceipt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered, Stream};
+#[cfg(feature = "hellas-executor")]
+use hellas_core::ProducerSigningKey;
 use hellas_core::{
     DeliveryOutput, DeliveryRequest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
     ReceiptEnvelope as CoreReceiptEnvelope, SymbolicEvidence, decode_dag_cbor, verify_delivery,
@@ -224,15 +226,17 @@ impl ExecutionRuntime {
     }
 
     #[cfg(feature = "hellas-executor")]
-    pub fn spawn_default_local(
+    pub fn spawn_default_local_with_producer_key(
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
+        producer_key: ProducerSigningKey,
     ) -> anyhow::Result<Self> {
-        let local_executor = Executor::spawn(
+        let local_executor = Executor::spawn_with_producer_key(
             DownloadPolicy::Eager,
             ExecutePolicy::Eager,
             queue_capacity,
             supported_dtypes,
+            producer_key,
         )
         .context("failed to initialize local execution backend")?;
         Ok(Self::with_local_executor(local_executor))
