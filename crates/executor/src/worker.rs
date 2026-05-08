@@ -1,13 +1,8 @@
 use crate::executor::ExecutorMessage;
-use crate::metrics::ExecutorMetrics;
-use crate::state::{Invocation, ModelLocator, StopReason, Termination};
-use catnix::OutputAddressed;
+use crate::state::{Invocation, ModelLocator, StopReason};
 use chatgrad::PreparedPrompt;
 use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
-use hellas_core::{
-    Digest, ProducerSigningKey, SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput,
-    SymbolicRequest, hash_tuple,
-};
+use hellas_core::SymbolicRequest;
 use hellas_pb::hellas::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
@@ -40,13 +35,40 @@ pub(crate) struct ExecuteJob {
     pub accepted_at: Instant,
     pub cancel: CancellationToken,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
-    pub metrics: Arc<ExecutorMetrics>,
-    pub producer_key: Arc<ProducerSigningKey>,
 }
 
 struct DecodeOutcome {
     stop_reason: StopReason,
     output_tokens: Vec<u32>,
+}
+
+pub(crate) struct WorkerCompletion {
+    pub execution_id: String,
+    pub model_id: String,
+    pub symbolic_request: SymbolicRequest,
+    pub invocation: Invocation,
+    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
+    pub result: WorkerCompletionResult,
+}
+
+pub(crate) enum WorkerCompletionResult {
+    Completed {
+        stop_reason: StopReason,
+        output_tokens: Vec<u32>,
+    },
+    Failed {
+        position: u64,
+        error: String,
+    },
+}
+
+impl WorkerCompletionResult {
+    pub(crate) fn position(&self) -> u64 {
+        match self {
+            Self::Completed { output_tokens, .. } => output_tokens.len() as u64,
+            Self::Failed { position, .. } => *position,
+        }
+    }
 }
 
 impl ExecuteWorker {
@@ -76,11 +98,10 @@ fn worker_loop(
     while let Ok(job) = rx.recv() {
         let execution_id = job.execution_id.clone();
         let model_id = job.model_id.clone();
-        let metrics = Arc::clone(&job.metrics);
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
         let symbolic_request = job.symbolic_request.clone();
-        let producer_key = Arc::clone(&job.producer_key);
+        let invocation = job.invocation.clone();
 
         let position = Arc::new(AtomicU64::new(0));
         let on_progress = make_on_progress(
@@ -93,25 +114,14 @@ fn worker_loop(
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(job, on_progress, &mut engines)
         })) {
-            Ok(Ok(outcome)) => {
-                match completed_termination(&symbolic_request, &producer_key, outcome) {
-                    Ok(termination) => termination,
-                    Err(err) => {
-                        let msg = format!("{err:#}");
-                        warn!(
-                            "execute worker job {execution_id} failed while signing receipt: {msg}"
-                        );
-                        Termination::Failed {
-                            position: position.load(Ordering::Relaxed),
-                            error: msg,
-                        }
-                    }
-                }
-            }
+            Ok(Ok(outcome)) => WorkerCompletionResult::Completed {
+                stop_reason: outcome.stop_reason,
+                output_tokens: outcome.output_tokens,
+            },
             Ok(Err(err)) => {
                 let msg = format!("{err:#}");
                 warn!("execute worker job {execution_id} failed: {msg}");
-                Termination::Failed {
+                WorkerCompletionResult::Failed {
                     position: position.load(Ordering::Relaxed),
                     error: msg,
                 }
@@ -119,84 +129,22 @@ fn worker_loop(
             Err(panic) => {
                 let msg = format!("worker panicked: {}", crate::backend::panic_message(&panic));
                 warn!("execute worker job {execution_id} {msg}");
-                Termination::Failed {
+                WorkerCompletionResult::Failed {
                     position: position.load(Ordering::Relaxed),
                     error: msg,
                 }
             }
         };
 
-        let generated = termination.position();
-        if termination.is_completed() {
-            metrics.record_execution_completed(&model_id, generated);
-        } else {
-            metrics.record_execution_failed(&model_id, generated);
-        }
-
-        let _ = sender.blocking_send(Ok(termination.into_pb()));
-        let _ = executor_tx.send(ExecutorMessage::WorkerIdle);
+        let _ = executor_tx.send(ExecutorMessage::WorkerFinished(WorkerCompletion {
+            execution_id,
+            model_id,
+            symbolic_request,
+            invocation,
+            sender,
+            result: termination,
+        }));
     }
-}
-
-fn completed_termination(
-    symbolic_request: &SymbolicRequest,
-    producer_key: &ProducerSigningKey,
-    outcome: DecodeOutcome,
-) -> Result<Termination, hellas_rpc::ExecutorError> {
-    let text_artifact_cid =
-        text_artifact_cid(symbolic_request.text_execution_cid, &outcome.output_tokens);
-    let symbolic_output = SymbolicOutput { text_artifact_cid };
-    let evidence = SymbolicEvidence::TextArtifactCid(text_artifact_cid);
-    let receipt = SignedEvidenceReceipt::sign_symbolic(
-        symbolic_request,
-        &symbolic_output,
-        evidence,
-        producer_key,
-    )
-    .map_err(|err| {
-        hellas_rpc::ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
-    })?;
-    let envelope = hellas_core::ReceiptEnvelope::Symbolic(receipt);
-    let receipt_dag_cbor = hellas_core::canonical_dag_cbor(&envelope).map_err(|err| {
-        hellas_rpc::ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
-    })?;
-
-    Ok(Termination::Completed {
-        stop_reason: outcome.stop_reason,
-        output_tokens: outcome.output_tokens,
-        receipt_dag_cbor,
-    })
-}
-
-fn text_artifact_cid(text_execution_cid: Digest, output_tokens: &[u32]) -> Digest {
-    let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(text_execution_cid));
-    let generated_tokens_id = catnix::TokenIds::from(output_tokens.to_vec()).output_id();
-    // The text-state bytes will live in the artifact resolver. Until that
-    // lands, derive a stable local state id from the execution and generated
-    // token artifact so the TextArtifact identity has the right shape.
-    let state_digest = hash_tuple(
-        "hellas.executor.synthetic_text_state.v1",
-        &[
-            text_execution_cid.as_bytes(),
-            generated_tokens_id.as_bytes(),
-        ],
-    );
-    let state_id = catnix::TextStateId::from_digest(to_catnix_digest(state_digest));
-    let artifact = catnix::TextArtifact::output(
-        execution_id,
-        output_tokens.len() as u64,
-        state_id,
-        generated_tokens_id,
-    );
-    from_catnix_digest(artifact.output_id().digest())
-}
-
-fn to_catnix_digest(digest: Digest) -> catnix::Digest {
-    catnix::Digest::from_bytes(digest.into_bytes())
-}
-
-fn from_catnix_digest(digest: catnix::Digest) -> Digest {
-    Digest::from_bytes(*digest.as_bytes())
 }
 
 fn run_job(
