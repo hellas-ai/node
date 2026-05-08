@@ -7,8 +7,8 @@
 //! `WithHellas<T>` adds a sibling `"hellas"` field at the gateway
 //! emission boundary via `#[serde(flatten)]`.
 //!
-//! See `docs/GATEWAY_HELLAS_WIRE.md` (TODO) and the approved plan in
-//! `~/.claude/plans/yeah-lets-try-to-parallel-diffie.md`.
+//! The public shape is `hellas.commitment` plus `hellas.receipt`; HTTP uses
+//! the matching `x-hellas-commitment` and `x-hellas-receipt` headers.
 
 use crate::execution::ReceiptArtifact;
 use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
