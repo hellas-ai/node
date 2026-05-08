@@ -3,8 +3,12 @@ use crate::metrics::ExecutorMetrics;
 use crate::programs::{ExecutionContext, ExecutionStart};
 use crate::runner;
 use crate::state::{Invocation, Termination};
-use hellas_rpc::pb::hellas::{
-    Chunk as PbChunk, ExecuteStreamEvent, execute_stream_event::Event as PbEvent,
+use hellas_core::{
+    Digest, ProducerSigningKey, SignedEvidenceReceipt, SymbolicEvidence, SymbolicOutput,
+    SymbolicRequest,
+};
+use hellas_pb::hellas::{
+    WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +31,7 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub model_id: String,
+    pub symbolic_request: SymbolicRequest,
     pub invocation: Invocation,
     pub execution: Arc<ExecutionContext>,
     pub start: ExecutionStart,
@@ -39,8 +44,9 @@ pub(crate) struct ExecuteJob {
     /// Per-execution sender. Worker pushes Chunk frames here as decode
     /// progresses, and the terminal Outcome at the end. Receiver lives
     /// with the streaming-RPC consumer; dropping it is the cancel signal.
-    pub sender: tokio_mpsc::Sender<Result<ExecuteStreamEvent, Status>>,
+    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
     pub metrics: Arc<ExecutorMetrics>,
+    pub producer_key: Arc<ProducerSigningKey>,
 }
 
 impl ExecuteWorker {
@@ -79,6 +85,8 @@ fn worker_loop(
         let metrics = Arc::clone(&job.metrics);
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
+        let symbolic_request = job.symbolic_request.clone();
+        let producer_key = Arc::clone(&job.producer_key);
 
         // Track the last reported position so a Failed termination can
         // honestly report tokens emitted before the error.
@@ -93,11 +101,21 @@ fn worker_loop(
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(job, on_progress)
         })) {
-            Ok(Ok(outcome)) => Termination::Completed {
-                total_tokens: outcome.total_tokens,
-                stop_reason: outcome.stop_reason,
-                receipt_cid: outcome.receipt_cid,
-            },
+            Ok(Ok(outcome)) => {
+                match completed_termination(&symbolic_request, &producer_key, outcome) {
+                    Ok(termination) => termination,
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        warn!(
+                            "execute worker job {execution_id} failed while signing receipt: {msg}"
+                        );
+                        Termination::Failed {
+                            position: position.load(Ordering::Relaxed),
+                            error: msg,
+                        }
+                    }
+                }
+            }
             Ok(Err(err)) => {
                 let msg = format!("{err:#}");
                 warn!("execute worker job {execution_id} failed: {msg}");
@@ -126,15 +144,44 @@ fn worker_loop(
         }
 
         // Send the terminal frame; ignore Err (consumer already dropped).
-        let _ = sender.blocking_send(Ok(ExecuteStreamEvent {
-            event: Some(PbEvent::Outcome(termination.into_pb())),
-        }));
+        let _ = sender.blocking_send(Ok(termination.into_pb()));
 
         // Signal the actor that the worker is free for the next pending
         // job. Failure here means the actor is shutting down; nothing to
         // recover.
         let _ = executor_tx.send(ExecutorMessage::WorkerIdle);
     }
+}
+
+fn completed_termination(
+    symbolic_request: &SymbolicRequest,
+    producer_key: &ProducerSigningKey,
+    outcome: runner::DecodeOutcome,
+) -> Result<Termination, hellas_rpc::ExecutorError> {
+    let receipt_bytes = *outcome.receipt_cid.as_bytes();
+    let symbolic_output = SymbolicOutput {
+        text_receipt_cid: Digest::from_bytes(receipt_bytes),
+    };
+    let evidence = SymbolicEvidence::TextReceiptCid(Digest::from_bytes(receipt_bytes));
+    let receipt = SignedEvidenceReceipt::sign_symbolic(
+        symbolic_request,
+        &symbolic_output,
+        evidence,
+        producer_key,
+    )
+    .map_err(|err| {
+        hellas_rpc::ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
+    })?;
+    let envelope = hellas_core::ReceiptEnvelope::Symbolic(receipt);
+    let receipt_dag_cbor = hellas_core::canonical_dag_cbor(&envelope).map_err(|err| {
+        hellas_rpc::ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
+    })?;
+
+    Ok(Termination::Completed {
+        stop_reason: outcome.stop_reason,
+        output_tokens: outcome.output_tokens,
+        receipt_dag_cbor,
+    })
 }
 
 fn run_job(
@@ -178,16 +225,16 @@ fn run_job(
 /// the next decode boundary.
 fn make_on_progress(
     position: Arc<AtomicU64>,
-    sender: tokio_mpsc::Sender<Result<ExecuteStreamEvent, Status>>,
+    sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
     cancel: CancellationToken,
     execution_id: String,
 ) -> impl FnMut(u64, &[u8]) + Send {
     move |progress: u64, chunk: &[u8]| {
         position.store(progress, Ordering::Relaxed);
-        let event = ExecuteStreamEvent {
-            event: Some(PbEvent::Chunk(PbChunk {
+        let event = PbWorkEvent {
+            kind: Some(PbEvent::Chunk(PbChunk {
                 position: progress,
-                tokens: chunk.to_vec(),
+                bytes: chunk.to_vec(),
             })),
         };
         if sender.blocking_send(Ok(event)).is_err() {

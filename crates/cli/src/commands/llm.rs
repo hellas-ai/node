@@ -60,7 +60,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     // Pre-tokenize the prompt once. Tokenization is dtype-independent, so the
     // `assets` we use here is throwaway; we reload per attempt below to get
-    // the dtype-specific program build_quote_request needs.
+    // the dtype-specific courtesy request construction needs.
     let bootstrap_assets = Arc::new(ModelAssets::load(&options.model, options.dtype[0])?);
     let messages = vec![Message::openai(ChatMessage::user(&options.prompt))];
     let prepared = if options.raw || !bootstrap_assets.has_chat_template() {
@@ -83,7 +83,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         }
 
         // Per-attempt assets: same tokenizer/template as bootstrap, but the
-        // build_quote_request below produces a Program at this dtype.
+        // courtesy request below asks the provider for this dtype.
         let assets = Arc::new(ModelAssets::load(&options.model, dtype)?);
 
         #[cfg(feature = "hellas-executor")]

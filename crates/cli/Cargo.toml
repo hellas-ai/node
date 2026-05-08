@@ -15,6 +15,7 @@ default = []
 # feature that cargo creates from the optional dep (no `dep:` prefix used).
 candle = [
     "hellas-executor/candle",
+    "hellas-pb/server",
     "hellas-rpc/server",
     "tonic-iroh-transport/server",
 ]
@@ -37,6 +38,8 @@ serde_json.workspace = true
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+hellas-core.workspace = true
+hellas-pb = { workspace = true, features = ["execute", "courtesy", "node", "client"] }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "node",
     "client",
@@ -65,7 +68,7 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# dev-dependencies- add 'compile' feature to hellas-rpc
+# dev-dependencies: enable `hellas-pb/compile` when regenerating checked-in protos.
 [dev-dependencies]
-# hellas-rpc = { workspace = true, features = ["compile"] }
+# hellas-pb = { workspace = true, features = ["compile"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }

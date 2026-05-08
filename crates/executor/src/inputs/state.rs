@@ -87,9 +87,12 @@ impl State {
     }
 
     pub(crate) fn mark_loading(&mut self, locator: &HuggingFaceLocator) -> Result<(), Error> {
-        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
-            locator: locator.clone(),
-        })?;
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or_else(|| Error::UnknownKey {
+                locator: locator.clone(),
+            })?;
         if let Status::Failed(error) = &entry.status {
             return Err(Error::Failed {
                 locator: locator.clone(),
@@ -140,9 +143,12 @@ impl State {
         generation: u64,
         program: Arc<ExecutionContext>,
     ) -> Result<CacheProgramOutcome, Error> {
-        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
-            locator: locator.clone(),
-        })?;
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or_else(|| Error::UnknownKey {
+                locator: locator.clone(),
+            })?;
         require_ready(locator, &entry.status)?;
         if entry.generation != generation {
             return Ok(CacheProgramOutcome::Stale);

@@ -1,11 +1,15 @@
+use hellas_pb::hellas::courtesy_server::Courtesy;
+use hellas_pb::hellas::execute_server::Execute;
+use hellas_pb::hellas::{
+    CreateTicketRequest, DecodeTokensRequest, DecodeTokensResponse, GetModelStatsRequest,
+    GetModelStatsResponse, GetStatsRequest, GetStatsResponse, ListModelsRequest,
+    ListModelsResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, RunTicketRequest, Ticket,
+    WorkEvent,
+};
 use hellas_rpc::ExecutorError;
-use hellas_rpc::driver::{ExecuteDriver, QuotedResponse, StreamedExecution};
-use hellas_rpc::pb::hellas::execute_server::Execute;
-use hellas_rpc::pb::hellas::{
-    DecodeTokensRequest, DecodeTokensResponse, ExecuteRequest, ExecuteStreamEvent,
-    GetModelStatsRequest, GetModelStatsResponse, GetQuoteRequest, GetQuoteResponse,
-    GetStatsRequest, GetStatsResponse, ListModelsRequest, ListModelsResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
+use hellas_rpc::driver::{
+    ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, StreamedExecution,
 };
 use hellas_rpc::provenance::write_provenance_metadata;
 use std::pin::Pin;
@@ -13,7 +17,7 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, QuoteOutcome};
+use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
 
 impl ExecutorHandle {
     async fn send<T>(
@@ -27,10 +31,10 @@ impl ExecutorHandle {
         reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
     }
 
-    pub async fn quote(
+    pub async fn create_ticket(
         &self,
-        request: GetQuoteRequest,
-    ) -> Result<QuoteOutcome<GetQuoteResponse>, ExecutorError> {
+        request: CreateTicketRequest,
+    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.send(|reply| ExecutorMessage::Quote { request, reply })
             .await
     }
@@ -38,15 +42,23 @@ impl ExecutorHandle {
     pub async fn quote_prompt(
         &self,
         request: QuotePromptRequest,
-    ) -> Result<QuoteOutcome<QuotePromptResponse>, ExecutorError> {
+    ) -> Result<TicketOutcome<QuotePromptResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
+            .await
+    }
+
+    pub async fn quote_prepared_text(
+        &self,
+        request: QuotePreparedTextRequest,
+    ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError> {
+        self.send(|reply| ExecutorMessage::QuotePreparedText { request, reply })
             .await
     }
 
     pub async fn quote_chat_prompt(
         &self,
         request: QuoteChatPromptRequest,
-    ) -> Result<QuoteOutcome<QuoteChatPromptResponse>, ExecutorError> {
+    ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
             .await
     }
@@ -61,9 +73,9 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn execute(
+    pub async fn run_ticket(
         &self,
-        request: ExecuteRequest,
+        request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
         self.send(|reply| ExecutorMessage::Execute { request, reply })
             .await
@@ -84,21 +96,48 @@ impl ExecutorHandle {
 
 #[tonic::async_trait]
 impl Execute for ExecutorHandle {
-    async fn get_quote(
+    async fn create_ticket(
         &self,
-        request: Request<GetQuoteRequest>,
-    ) -> Result<Response<GetQuoteResponse>, Status> {
-        let outcome = self.quote(request.into_inner()).await?;
+        request: Request<CreateTicketRequest>,
+    ) -> Result<Response<Ticket>, Status> {
+        let outcome = self.create_ticket(request.into_inner()).await?;
         let mut response = Response::new(outcome.response);
         write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
         Ok(response)
     }
 
+    type RunTicketStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<WorkEvent, Status>> + Send>>;
+
+    async fn run_ticket(
+        &self,
+        request: Request<RunTicketRequest>,
+    ) -> Result<Response<Self::RunTicketStream>, Status> {
+        let outcome = self.run_ticket(request.into_inner()).await?;
+        let mut response =
+            Response::new(Box::pin(ReceiverStream::new(outcome.events)) as Self::RunTicketStream);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
+    }
+}
+
+#[tonic::async_trait]
+impl Courtesy for ExecutorHandle {
     async fn quote_prompt(
         &self,
         request: Request<QuotePromptRequest>,
     ) -> Result<Response<QuotePromptResponse>, Status> {
         let outcome = self.quote_prompt(request.into_inner()).await?;
+        let mut response = Response::new(outcome.response);
+        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
+        Ok(response)
+    }
+
+    async fn quote_prepared_text(
+        &self,
+        request: Request<QuotePreparedTextRequest>,
+    ) -> Result<Response<QuotePreparedTextResponse>, Status> {
+        let outcome = self.quote_prepared_text(request.into_inner()).await?;
         let mut response = Response::new(outcome.response);
         write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
         Ok(response)
@@ -135,21 +174,6 @@ impl Execute for ExecutorHandle {
         Ok(Response::new(
             self.get_model_stats(request.into_inner()).await?,
         ))
-    }
-
-    type ExecuteStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecuteStreamEvent, Status>> + Send>>;
-
-    async fn execute(
-        &self,
-        request: Request<ExecuteRequest>,
-    ) -> Result<Response<Self::ExecuteStream>, Status> {
-        let outcome = self.execute(request.into_inner()).await?;
-        let mut response = Response::new(
-            Box::pin(ReceiverStream::new(outcome.events)) as Self::ExecuteStream,
-        );
-        write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-        Ok(response)
     }
 
     type DecodeTokensStream =
@@ -224,9 +248,11 @@ impl Execute for ExecutorHandle {
 
 #[tonic::async_trait]
 impl ExecuteDriver for ExecutorHandle {
-    async fn get_quote(&mut self, request: GetQuoteRequest) -> Result<QuotedResponse, Status> {
-        let outcome = self
-            .quote(request)
+    async fn create_ticket(
+        &mut self,
+        request: CreateTicketRequest,
+    ) -> Result<QuotedResponse, Status> {
+        let outcome = ExecutorHandle::create_ticket(self, request)
             .await
             .map_err(<ExecutorError as Into<Status>>::into)?;
         Ok(QuotedResponse {
@@ -235,12 +261,24 @@ impl ExecuteDriver for ExecutorHandle {
         })
     }
 
+    async fn quote_prepared_text(
+        &mut self,
+        request: QuotePreparedTextRequest,
+    ) -> Result<QuotedPreparedTextResponse, Status> {
+        let outcome = ExecutorHandle::quote_prepared_text(self, request)
+            .await
+            .map_err(<ExecutorError as Into<Status>>::into)?;
+        Ok(QuotedPreparedTextResponse {
+            response: outcome.response,
+            provenance: outcome.provenance,
+        })
+    }
+
     async fn execute_streaming(
         &mut self,
-        request: ExecuteRequest,
+        request: RunTicketRequest,
     ) -> Result<StreamedExecution, Status> {
-        let outcome = self
-            .execute(request)
+        let outcome = ExecutorHandle::run_ticket(self, request)
             .await
             .map_err(<ExecutorError as Into<Status>>::into)?;
         Ok(StreamedExecution {

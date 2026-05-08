@@ -1,8 +1,14 @@
 use crate::executor::ExecuteOutcome;
-use crate::state::new_execution_id;
+use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob};
+use hellas_core::{
+    Opaque, ReceiptBody, ReceiptEnvelope as CoreReceiptEnvelope, SignedReceipt, canonical_dag_cbor,
+};
+use hellas_pb::hellas::{
+    FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
+    work_event,
+};
 use hellas_rpc::ExecutorError;
-use hellas_rpc::pb::hellas::ExecuteRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,76 +26,145 @@ const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 impl Executor {
     pub(super) async fn handle_execute(
         &mut self,
-        request: ExecuteRequest,
+        request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        let quote_id = request.quote_id;
-        let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
+        let request_commitment = request.request_commitment;
+        let stream_batch_size = 1;
         self.store.prune_expired_quotes(Instant::now());
-        let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
-        let provenance = ExecutionProvenance {
-            commitment_id: *quote.start.commitment_id.as_bytes(),
-        };
+        let quote = self
+            .store
+            .get_quote(&request_commitment, Instant::now())?
+            .clone();
+        match quote.kind {
+            QuoteKind::Symbolic {
+                symbolic_request,
+                invocation,
+                execution,
+                start,
+            } => {
+                let provenance = ExecutionProvenance {
+                    commitment_id: *start.commitment_id.as_bytes(),
+                };
 
-        let stat_prompt = quote.invocation.input_ids.len() as u64;
-        let stat_cached_output = quote
-            .start
-            .cached
-            .as_ref()
-            .map_or(0, |c| c.output_tokens.len() as u64);
+                let stat_prompt = invocation.input_ids.len() as u64;
+                let stat_cached_output = start
+                    .cached
+                    .as_ref()
+                    .map_or(0, |c| c.output_tokens.len() as u64);
 
-        let model_id = quote.model_id.clone();
-        let execution_id = new_execution_id();
-        let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
-        let job = ExecuteJob {
-            execution_id: execution_id.clone(),
-            model_id: model_id.clone(),
-            invocation: quote.invocation.clone(),
-            execution: quote.execution.clone(),
-            start: quote.start.clone(),
-            stream_batch_size,
-            accepted_at: Instant::now(),
-            cancel: CancellationToken::new(),
-            sender,
-            metrics: Arc::clone(&self.metrics),
-        };
+                let model_id = quote.model_id.clone();
+                let execution_id = new_execution_id();
+                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+                let job = ExecuteJob {
+                    execution_id: execution_id.clone(),
+                    model_id: model_id.clone(),
+                    symbolic_request,
+                    invocation,
+                    execution,
+                    start: start.clone(),
+                    stream_batch_size,
+                    accepted_at: Instant::now(),
+                    cancel: CancellationToken::new(),
+                    sender,
+                    metrics: Arc::clone(&self.metrics),
+                    producer_key: Arc::clone(&self.producer_key),
+                };
 
-        let queued = match self.try_start_execution(job) {
-            Ok(()) => false,
-            Err(StartExecutionError::Busy(job)) => {
-                if self.pending_executions.len() >= self.queue_capacity {
-                    return Err(ExecutorError::QueueFull {
-                        capacity: self.queue_capacity,
-                    });
-                }
-                self.pending_executions.push_back(job);
-                true
+                let queued = match self.try_start_execution(job) {
+                    Ok(()) => false,
+                    Err(StartExecutionError::Busy(job)) => {
+                        if self.pending_executions.len() >= self.queue_capacity {
+                            return Err(ExecutorError::QueueFull {
+                                capacity: self.queue_capacity,
+                            });
+                        }
+                        self.pending_executions.push_back(job);
+                        true
+                    }
+                    Err(StartExecutionError::Closed) => return Err(ExecutorError::ChannelClosed),
+                };
+
+                // Counters update after the queue accepts the job — no rollback path.
+                self.metrics.record_execution_started(
+                    &model_id,
+                    stat_prompt,
+                    /* cached_prompt= */ 0,
+                    stat_cached_output,
+                    /* prefill= */ stat_prompt,
+                );
+                let _ = self.store.remove_quote(&request_commitment);
+
+                info!(
+                    %execution_id,
+                    request_commitment = %format_request_commitment(&request_commitment),
+                    commitment_id = %start.commitment_id,
+                    queued,
+                    queue_len = self.pending_executions.len(),
+                    "accepted symbolic execution"
+                );
+
+                Ok(ExecuteOutcome {
+                    provenance,
+                    events: receiver,
+                })
             }
-            Err(StartExecutionError::Closed) => return Err(ExecutorError::ChannelClosed),
-        };
+            QuoteKind::Opaque { request, output } => {
+                let provenance = ExecutionProvenance {
+                    commitment_id: *quote.request_commitment.0.as_bytes(),
+                };
+                let model_id = quote.model_id.clone();
+                let execution_id = new_execution_id();
+                let total_units = output.as_bytes().len() as u64;
+                let receipt = SignedReceipt::<ReceiptBody>::sign::<Opaque>(
+                    &request,
+                    &output,
+                    &self.producer_key,
+                )
+                .map_err(|err| {
+                    ExecutorError::WeightsError(format!("opaque receipt signing failed: {err}"))
+                })?;
+                let receipt_dag_cbor = canonical_dag_cbor(&CoreReceiptEnvelope::Opaque(receipt))
+                    .map_err(|err| {
+                        ExecutorError::WeightsError(format!(
+                            "opaque receipt encoding failed: {err}"
+                        ))
+                    })?;
+                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+                sender
+                    .send(Ok(WorkEvent {
+                        kind: Some(work_event::Kind::Finished(WorkFinished {
+                            output: output.into_bytes(),
+                            receipt: Some(PbReceiptEnvelope {
+                                dag_cbor: receipt_dag_cbor,
+                            }),
+                            status: FinishStatus::EndOfSequence as i32,
+                            total_units,
+                        })),
+                    }))
+                    .await
+                    .map_err(|_| ExecutorError::ChannelClosed)?;
 
-        // Counters update after the queue accepts the job — no rollback path.
-        self.metrics.record_execution_started(
-            &model_id,
-            stat_prompt,
-            /* cached_prompt= */ 0,
-            stat_cached_output,
-            /* prefill= */ stat_prompt,
-        );
-        let _ = self.store.remove_quote(&quote_id);
+                self.metrics.record_execution_started(
+                    &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
+                    /* cached_output= */ 0, /* prefill= */ 0,
+                );
+                self.metrics
+                    .record_execution_completed(&model_id, total_units);
+                let _ = self.store.remove_quote(&request_commitment);
 
-        info!(
-            %execution_id,
-            %quote_id,
-            commitment_id = %quote.start.commitment_id,
-            queued,
-            queue_len = self.pending_executions.len(),
-            "accepted execution"
-        );
+                info!(
+                    %execution_id,
+                    request_commitment = %format_request_commitment(&request_commitment),
+                    total_units,
+                    "accepted opaque execution"
+                );
 
-        Ok(ExecuteOutcome {
-            provenance,
-            events: receiver,
-        })
+                Ok(ExecuteOutcome {
+                    provenance,
+                    events: receiver,
+                })
+            }
+        }
     }
 
     fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
@@ -124,6 +199,15 @@ impl Executor {
             }
         }
     }
+}
+
+fn format_request_commitment(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 enum StartExecutionError {

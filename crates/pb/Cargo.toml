@@ -1,0 +1,31 @@
+[package]
+name = "hellas-pb"
+description = "Generated protobuf types for the Hellas protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+common = []
+symbolic = []
+opaque = []
+ticket = ["symbolic", "opaque"]
+execute = ["common", "ticket"]
+node = ["common"]
+courtesy = ["symbolic", "ticket"]
+settlement = ["common"]
+client = []
+server = []
+all = ["execute", "courtesy", "node", "client", "server"]
+compile = ["dep:tonic-prost-build", "all"]
+
+[dependencies]
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14", optional = true }

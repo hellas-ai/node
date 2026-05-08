@@ -60,9 +60,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let outcome = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(GenerationEvent::Delta(d)))) => {
-                if let Err(PumpError { failure, .. }) =
-                    pump_text(&mut *parser, &mut mapper, &d)
-                {
+                if let Err(PumpError { failure, .. }) = pump_text(&mut *parser, &mut mapper, &d) {
                     // Non-streaming: cleanup frames are wire-bracketing
                     // and irrelevant when no wire stream exists. Discard.
                     return failure_to_json_response(failure);
@@ -114,9 +112,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     };
 
     let parser_stop = map_to_parser_stop(exec_stop);
-    if let Err(PumpError { failure, .. }) =
-        pump_finish(&mut *parser, &mut mapper, parser_stop)
-    {
+    if let Err(PumpError { failure, .. }) = pump_finish(&mut *parser, &mut mapper, parser_stop) {
         return failure_to_json_response(failure);
     }
 
@@ -200,8 +196,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
         stream_provenance,
         upstream,
     );
-    let events = payloads
-        .map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
+    let events = payloads.map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
     let mut response = sse_response(events);
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
@@ -629,8 +624,10 @@ mod streaming_tests {
         assert_eq!(receipt_carriers, vec!["message_stop"]);
 
         // message_delta exists in the stream but doesn't carry receipt.
-        let deltas: Vec<&AnthropicSsePayload> =
-            payloads.iter().filter(|p| p.name == "message_delta").collect();
+        let deltas: Vec<&AnthropicSsePayload> = payloads
+            .iter()
+            .filter(|p| p.name == "message_delta")
+            .collect();
         assert!(!deltas.is_empty(), "expected at least one message_delta");
         for d in deltas {
             assert!(
@@ -678,7 +675,7 @@ mod streaming_tests {
         let (id, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
         let upstream = futures::stream::iter(vec![
-            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>,
+            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>
         ]);
 
         let payloads: Vec<AnthropicSsePayload> = build_anthropic_sse_stream(
@@ -739,13 +736,10 @@ mod streaming_tests {
     async fn outcome_failed_emits_error_no_message_stop_no_receipt() {
         let (id, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(
-            Outcome::Failed {
-                position: 0,
-                error: "executor exploded".to_string(),
-            },
-        ))
-            as anyhow::Result<GenerationEvent>]);
+        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(Outcome::Failed {
+            position: 0,
+            error: "executor exploded".to_string(),
+        })) as anyhow::Result<GenerationEvent>]);
 
         let payloads: Vec<AnthropicSsePayload> = build_anthropic_sse_stream(
             id,

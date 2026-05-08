@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package hellas.v1;
+
+import "hellas/v1/common.proto";
+import "hellas/v1/ticket.proto";
+
+// Core execution service. This service only handles generic ticket creation
+// and running a ticket to its terminal receipt. Courtesy quote/tokenizer/model
+// helpers live in `courtesy.proto`.
+
+service Execute {
+  rpc CreateTicket(CreateTicketRequest) returns (Ticket);
+  rpc RunTicket(RunTicketRequest) returns (stream WorkEvent);
+}

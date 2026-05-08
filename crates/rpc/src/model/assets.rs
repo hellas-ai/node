@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use crate::encode_token_ids;
-use crate::pb::hellas::GetQuoteRequest;
 use catgrad::prelude::Dtype;
 use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use catgrad_llm::types::Message;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{LLMError, PreparedPrompt};
+use hellas_pb::hellas::{
+    QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
+};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -72,13 +73,11 @@ impl ModelAssets {
         })
     }
 
-    pub fn build_quote_request(
+    pub fn build_quote_prepared_text_request(
         &self,
         prepared_prompt: &PreparedPrompt,
         max_seq: u32,
-    ) -> Result<GetQuoteRequest> {
-        let max_sequence_length = prepared_prompt.input_ids.len() + max_seq as usize;
-        let program = build_program_bytes(&self.config, max_sequence_length, self.dtype)?;
+    ) -> Result<QuotePreparedTextRequest> {
         let input_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
             ModelAssetsError::NegativePromptTokenId { token }
         })?;
@@ -86,15 +85,21 @@ impl ModelAssets {
             ModelAssetsError::NegativeStopTokenId { token }
         })?;
 
-        Ok(GetQuoteRequest {
+        Ok(QuotePreparedTextRequest {
             huggingface_model_id: self.model.id.clone(),
             huggingface_revision: self.model.revision.clone(),
-            program,
-            input: encode_token_ids(&input_ids),
-            prompt_tokens: prepared_prompt.input_ids.len() as u32,
+            prompt_token_ids: input_ids,
             max_new_tokens: max_seq,
             stop_token_ids,
+            start: Some(SymbolicStart {
+                kind: Some(symbolic_start::Kind::Genesis(SymbolicGenesisStart {})),
+            }),
+            accept_dtypes: vec![dtype_to_wire(self.dtype).to_string()],
         })
+    }
+
+    pub fn build_program_bytes_for_sequence(&self, max_sequence_length: usize) -> Result<Vec<u8>> {
+        build_program_bytes(&self.config, max_sequence_length, self.dtype)
     }
 
     pub fn has_chat_template(&self) -> bool {
@@ -102,12 +107,11 @@ impl ModelAssets {
     }
 
     pub fn prepare_chat(&self, messages: &[Message]) -> Result<PreparedPrompt> {
-        let template = self
-            .chat_template
-            .as_deref()
-            .ok_or_else(|| ModelAssetsError::PreparePromptRequest {
+        let template = self.chat_template.as_deref().ok_or_else(|| {
+            ModelAssetsError::PreparePromptRequest {
                 source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
-            })?;
+            }
+        })?;
         PreparedPrompt::from_messages(
             &self.tokenizer,
             template,
@@ -170,5 +174,14 @@ impl ModelAssets {
             tools,
             options,
         )?)
+    }
+}
+
+fn dtype_to_wire(dtype: Dtype) -> &'static str {
+    match dtype {
+        Dtype::F32 => "f32",
+        Dtype::F16 => "f16",
+        Dtype::BF16 => "bf16",
+        Dtype::U32 => "u32",
     }
 }

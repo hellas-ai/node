@@ -3,7 +3,6 @@ use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
     PreparedExecution, RemoteNodeTarget,
 };
-use hellas_rpc::provenance::ExecutionProvenance;
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use async_stream::try_stream;
@@ -21,6 +20,7 @@ use hellas_executor::Executor;
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::provenance::ExecutionProvenance;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -254,21 +254,16 @@ impl GatewayState {
         let enable_thinking = req
             .reasoning_effort
             .is_some_and(openai::ReasoningEffort::enables_thinking);
-        let tools_dir = ToolDirectory::from_openai_tools(
-            req.tools.as_deref().unwrap_or(&[]),
-        )
-        .map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Invalid tool definitions: {err}"),
-        })?;
-        let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
+        let tools_dir = ToolDirectory::from_openai_tools(req.tools.as_deref().unwrap_or(&[]))
             .map_err(|err| HttpError {
                 status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
+                message: format!("Invalid tool definitions: {err}"),
             })?;
+        let model = self.resolve_model(&req.model);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let chat_turn = assets
             .chat_turn(tools_dir, ChatOptions { enable_thinking })
             .map_err(classify_chat_turn_error)?;
@@ -295,21 +290,16 @@ impl GatewayState {
             .into_iter()
             .map(Message::from)
             .collect::<Vec<_>>();
-        let tools_dir = ToolDirectory::from_anthropic_tools(
-            req.tools.as_deref().unwrap_or(&[]),
-        )
-        .map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Invalid tool definitions: {err}"),
-        })?;
-        let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
+        let tools_dir = ToolDirectory::from_anthropic_tools(req.tools.as_deref().unwrap_or(&[]))
             .map_err(|err| HttpError {
                 status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
+                message: format!("Invalid tool definitions: {err}"),
             })?;
+        let model = self.resolve_model(&req.model);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let chat_turn = assets
             .chat_turn(tools_dir, ChatOptions::default())
             .map_err(classify_chat_turn_error)?;
@@ -335,13 +325,10 @@ impl GatewayState {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let prompt = req.prompt.clone();
         let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
-            .map_err(|err| HttpError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
-            })?;
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let prepared_prompt = assets.prepare_plain(&prompt).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!(
@@ -851,5 +838,4 @@ mod anthropic_conversion_tests {
         assert_eq!(tool_calls[0]["id"], "toolu_1");
         assert_eq!(tool_calls[1]["id"], "toolu_2");
     }
-
 }
