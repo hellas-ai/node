@@ -179,6 +179,12 @@ impl Executor {
                 ExecutorMessage::QuoteChatPrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_chat_prompt(request).await);
                 }
+                ExecutorMessage::PublishArtifactBundle { request, reply } => {
+                    let _ = reply.send(self.handle_publish_artifact_bundle(request).await);
+                }
+                ExecutorMessage::GetArtifact { request, reply } => {
+                    let _ = reply.send(self.handle_get_artifact(request).await);
+                }
                 ExecutorMessage::Preload { model, reply } => {
                     let _ = reply.send(self.handle_preload(model).await);
                 }

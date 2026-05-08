@@ -11,7 +11,10 @@ use tonic_iroh_transport::IrohChannel;
 use crate::GRPC_MESSAGE_LIMIT;
 use crate::provenance::{ExecutionProvenance, read_provenance_metadata};
 use hellas_pb::courtesy::courtesy_client::CourtesyClient;
-use hellas_pb::courtesy::{QuotePreparedTextRequest, QuotePreparedTextResponse};
+use hellas_pb::courtesy::{
+    GetArtifactRequest, GetArtifactResponse, PublishArtifactBundleRequest,
+    PublishArtifactBundleResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
+};
 use hellas_pb::hellas::execute_client::ExecuteClient;
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_pb::opaque::OpaqueRequest;
@@ -167,6 +170,45 @@ where
             .send_compressed(CompressionEncoding::Zstd)
             .accept_compressed(CompressionEncoding::Zstd);
         client
+    }
+
+    pub async fn publish_artifact_bundle(
+        &mut self,
+        request: PublishArtifactBundleRequest,
+    ) -> Result<PublishArtifactBundleResponse, Status>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+        T::Future: Send,
+    {
+        let courtesy = self
+            .courtesy
+            .as_mut()
+            .ok_or_else(|| Status::unimplemented("courtesy service is not configured"))?;
+        Ok(courtesy
+            .publish_artifact_bundle(request)
+            .await?
+            .into_inner())
+    }
+
+    pub async fn get_artifact(
+        &mut self,
+        request: GetArtifactRequest,
+    ) -> Result<GetArtifactResponse, Status>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+        T::Future: Send,
+    {
+        let courtesy = self
+            .courtesy
+            .as_mut()
+            .ok_or_else(|| Status::unimplemented("courtesy service is not configured"))?;
+        Ok(courtesy.get_artifact(request).await?.into_inner())
     }
 }
 
