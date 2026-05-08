@@ -44,6 +44,7 @@ mod generated {
     }
 }
 
+#[allow(unused_macros)]
 macro_rules! service_exports {
     ($($path:ident)::+, $client:ident, $server:ident) => {
         #[cfg(feature = "client")]

@@ -8,33 +8,28 @@
 //!   SSE events. Translation happens in the gateway's tower layer and SSE
 //!   handlers, not here.
 //!
-//! Wire form everywhere: 64-char lowercase hex of the underlying 32-byte
-//! CID. Matches `catgrad::cid::Cid<T>::Display` so a single value renders
-//! identically in tracing logs, headers, and metadata. We carry raw bytes
-//! in `ExecutionProvenance` rather than typed `Cid<T>` so this module
-//! doesn't pull catgrad into the rpc crate's `client` feature; callers
-//! reconstitute typed CIDs via `Cid::from_bytes` at their boundary.
+//! Commitment wire form everywhere: 64-char lowercase hex of the underlying
+//! 32-byte digest. We carry raw bytes in `ExecutionProvenance` rather than
+//! typed CIDs so this module doesn't pull catgrad into the rpc crate's
+//! `client` feature; callers reconstitute typed values at their boundary.
 
 use std::fmt::Write;
 use thiserror::Error;
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
-/// HTTP header / tonic metadata key for the request commitment
-/// (`Cid<TextExecution>` — hash over program, parameter CIDs, prompt
-/// tokens, policy). The commitment transitively names the program, so we
-/// don't expose the program CID separately.
-pub const COMMITMENT_HEADER: &str = "x-hellas-commitment-id";
+/// HTTP header / tonic metadata key for the work commitment. The commitment
+/// transitively names the request, so we don't expose scheme-specific inputs
+/// separately.
+pub const COMMITMENT_HEADER: &str = "x-hellas-commitment";
 
-/// HTTP header / tonic metadata key for the terminal execution receipt
-/// (`Cid<TextReceipt>`). On streaming responses this only appears as an
-/// SSE in-band event, not as a header (the receipt is unknown at
-/// header-flush time).
-pub const RECEIPT_HEADER: &str = "x-hellas-receipt-id";
+/// HTTP header key for the terminal signed receipt envelope. On streaming
+/// responses this only appears in-band on the terminal semantic event because
+/// the receipt is unknown at header-flush time.
+pub const RECEIPT_HEADER: &str = "x-hellas-receipt";
 
-/// Pre-flight provenance for a single execution. The receipt CID is
-/// terminal and not part of this struct — it travels via the streaming
-/// `Outcome::Completed` payload (and from there into a separate
-/// `Cid<TextReceipt>` extension on the HTTP response when applicable).
+/// Pre-flight provenance for a single execution. The signed receipt envelope
+/// is terminal and not part of this struct — it travels via the streaming
+/// `Outcome::Completed` payload.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],

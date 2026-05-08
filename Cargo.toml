@@ -34,6 +34,7 @@ hellas-executor = { path = "crates/executor", default-features = false }
 hellas-pb = { path = "crates/pb", default-features = false }
 hellas-core = { path = "crates/core", default-features = false }
 blake3 = "1"
+base64 = "0.22"
 iroh-blobs = { version = "0.100", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 serde_bytes = "0.11"
