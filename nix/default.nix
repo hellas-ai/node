@@ -57,7 +57,6 @@
 
   devShellPackages = with pkgs; [
     rustToolchain
-    openssl
     pkg-config
     protobuf
     llvmPackages.lld
@@ -85,7 +84,7 @@
       # `pi` doesn't honor *_BASE_URL env vars — route it through an internal
       # shim that runs inside the wrap and registers a hellas provider.
       case "$(basename "$cmd")" in pi) cmd=${piShim} ;; esac
-      exec cargo run --quiet --features "''${HELLAS_FEATURES:-candle}" --bin hellas-cli -- gateway "''${gw[@]}" --wrap "$cmd" -- "$@"
+      exec cargo run --quiet --features candle --bin hellas-cli -- gateway "''${gw[@]}" --wrap "$cmd" -- "$@"
     '')
   ];
 

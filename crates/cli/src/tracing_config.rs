@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
+#[cfg(feature = "otel")]
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -19,25 +21,40 @@ fn base_env_filter() -> EnvFilter {
         .add_directive("netlink_packet_route=error".parse().unwrap())
 }
 
+/// Holds the OTLP tracer provider (when the `otel` feature is on) so the CLI
+/// can flush spans on shutdown. With the feature off this is a zero-sized type
+/// and `shutdown()` is a no-op.
+pub struct TracerGuard {
+    #[cfg(feature = "otel")]
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl TracerGuard {
+    pub fn shutdown(self) {
+        #[cfg(feature = "otel")]
+        if let Some(provider) = self.provider
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("warning: failed to flush traces: {err}");
+        }
+    }
+}
+
 /// Initialise the tracing subscriber.
 ///
-/// When `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set (and non-empty), an
-/// OpenTelemetry OTLP layer is added that exports traces over HTTP/protobuf.
+/// When the `otel` feature is enabled and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+/// is set (and non-empty), an OpenTelemetry OTLP layer is added that exports
+/// traces over HTTP/protobuf. With the feature off, only the fmt + optional
+/// file layers are registered.
 ///
-/// Supported environment variables (all standard OTEL):
+/// Supported environment variables (all standard OTEL, only consulted when
+/// `otel` is enabled):
 ///   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT  — collector URL (e.g. https://jaeger.lsd-ag.ch/v1/traces)
 ///   OTEL_SERVICE_NAME                    — service name  (default: hellas-node)
 ///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
 ///                                          (use for CF-Access-Client-Id / CF-Access-Client-Secret)
-pub fn init_tracing(
-    log_file: Option<&Path>,
-) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    // Register W3C TraceContext propagator so trace IDs flow across RPC calls.
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
-
+pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
     let (filter_layer, filter_handle) = reload::Layer::new(base_env_filter());
     let _ = LOG_FILTER.set(filter_handle);
 
@@ -65,16 +82,13 @@ pub fn init_tracing(
             }
         }
     });
-    let (otel_layer, provider) = init_otlp_layer();
 
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
-        .with(file_layer)
-        .with(otel_layer)
-        .init();
+        .with(file_layer);
 
-    provider
+    install_with_otel(registry)
 }
 
 /// Suppress known one-shot transport tail logs after CLI execute has already finished.
@@ -92,7 +106,37 @@ pub fn suppress_execute_tail_logs() {
     let _ = handle.reload(filter);
 }
 
-fn init_otlp_layer<S>() -> (
+#[cfg(feature = "otel")]
+fn install_with_otel<S>(registry: S) -> TracerGuard
+where
+    S: tracing::Subscriber
+        + Send
+        + Sync
+        + 'static
+        + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    // Register W3C TraceContext propagator so trace IDs flow across RPC calls.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let (otel_layer, provider) = build_otlp_layer::<S>();
+    registry.with(otel_layer).init();
+
+    TracerGuard { provider }
+}
+
+#[cfg(not(feature = "otel"))]
+fn install_with_otel<S>(registry: S) -> TracerGuard
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    registry.init();
+    TracerGuard {}
+}
+
+#[cfg(feature = "otel")]
+fn build_otlp_layer<S>() -> (
     Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
     Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 )

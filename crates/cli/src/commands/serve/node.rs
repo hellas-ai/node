@@ -25,9 +25,22 @@ use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
-use tonic_iroh_transport::otel::TraceContextLayer;
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::{IrohContext, PoolOptions, TransportBuilder};
+
+// `traced_service` wraps a tonic service with W3C trace context extraction when
+// the `otel` feature is on; with the feature off it returns the service
+// unchanged so the trace layer compiles to nothing.
+#[cfg(feature = "otel")]
+fn traced_service<S>(
+    svc: S,
+) -> tonic_iroh_transport::otel::TraceContextService<S> {
+    tower::Layer::layer(&tonic_iroh_transport::otel::TraceContextLayer, svc)
+}
+#[cfg(not(feature = "otel"))]
+fn traced_service<S>(svc: S) -> S {
+    svc
+}
 
 const DEFAULT_PORT: u16 = 31145;
 const MAX_PORT_RETRIES: u16 = 100;
@@ -158,6 +171,14 @@ impl NodeHandle {
         self.node_id
     }
 
+    /// Snapshot of iroh's internal metrics. The returned `EndpointMetrics`
+    /// contains `Arc`s into the live metric storage, so values continue to
+    /// update as iroh records them.
+    #[cfg(feature = "otel")]
+    pub(super) fn iroh_metrics(&self) -> tonic_iroh_transport::iroh::metrics::EndpointMetrics {
+        self.guard.endpoint().metrics().clone()
+    }
+
     pub(super) async fn shutdown(self) -> anyhow::Result<()> {
         let Self { guard, .. } = self;
         guard.endpoint().close().await;
@@ -263,23 +284,21 @@ pub(super) async fn spawn_node(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let trace_layer = TraceContextLayer;
-
     let mut transport = TransportBuilder::new(endpoint.clone())
-        .add_rpc(trace_layer.layer(NodeServer::new(node_service)))
+        .add_rpc(traced_service(NodeServer::new(node_service)))
         .add_rpc(InterceptedService::new(
-            trace_layer.layer(execute_service),
+            traced_service(execute_service),
             execute_interceptor.clone(),
         ))
         .add_rpc(InterceptedService::new(
-            trace_layer.layer(symbolic_service),
+            traced_service(symbolic_service),
             execute_interceptor.clone(),
         ))
         .add_rpc(InterceptedService::new(
-            trace_layer.layer(opaque_service),
+            traced_service(opaque_service),
             execute_interceptor,
         ))
-        .add_rpc(trace_layer.layer(courtesy_service));
+        .add_rpc(traced_service(courtesy_service));
 
     let dht = DhtBackend::with_dht(&endpoint, Arc::clone(&shared_dht));
     let publisher = dht.create_publisher(Default::default());

@@ -62,18 +62,38 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tonic::service::interceptor::InterceptedService;
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
 };
-use tonic_iroh_transport::otel::TraceContextInjector;
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
 use tracing::instrument;
 
-type TracedChannel = InterceptedService<IrohChannel, TraceContextInjector>;
+// `TracedChannel` swaps under the `otel` feature: with otel on it wraps the
+// channel in an interceptor that injects W3C traceparent headers; with otel
+// off it's the bare channel. Construction sites use `traced(channel)`.
+#[cfg(feature = "otel")]
+type TracedChannel = tonic::service::interceptor::InterceptedService<
+    IrohChannel,
+    tonic_iroh_transport::otel::TraceContextInjector,
+>;
+#[cfg(not(feature = "otel"))]
+type TracedChannel = IrohChannel;
+
 type TracedDriver = RemoteExecuteDriver<TracedChannel>;
+
+#[cfg(feature = "otel")]
+fn traced(channel: IrohChannel) -> TracedChannel {
+    tonic::service::interceptor::InterceptedService::new(
+        channel,
+        tonic_iroh_transport::otel::TraceContextInjector,
+    )
+}
+#[cfg(not(feature = "otel"))]
+fn traced(channel: IrohChannel) -> TracedChannel {
+    channel
+}
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1248,8 +1268,8 @@ async fn quote_opaque_remote_endpoint(
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
     let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(opaque_channel, TraceContextInjector),
+        traced(execute_channel),
+        traced(opaque_channel),
     );
     let quoted = match quote_opaque_with_driver(request, &mut driver, || {
         format!("node {peer_id} declined opaque ticket")
@@ -1285,8 +1305,8 @@ async fn quote_remote_endpoint(
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
     let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
-        InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(courtesy_channel, TraceContextInjector),
+        traced(execute_channel),
+        traced(courtesy_channel),
     );
     let quoted = match quote_with_driver(quote_req, &mut driver, || {
         format!("node {peer_id} declined ticket")
@@ -1358,8 +1378,8 @@ async fn quote_opaque_remote_target(
         .await
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
     let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(opaque_channel, TraceContextInjector),
+        traced(execute_channel),
+        traced(opaque_channel),
     );
     let quoted = quote_opaque_with_driver(request, &mut driver, || {
         format!("node {} declined opaque quote", target.node_id)
@@ -1392,8 +1412,8 @@ async fn quote_remote_target(
         .await
         .with_context(|| format!("failed to connect to node {}", target.node_id))?;
     let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
-        InterceptedService::new(execute_channel, TraceContextInjector),
-        InterceptedService::new(courtesy_channel, TraceContextInjector),
+        traced(execute_channel),
+        traced(courtesy_channel),
     );
     let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {} declined quote", target.node_id)
