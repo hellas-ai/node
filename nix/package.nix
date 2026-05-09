@@ -38,7 +38,7 @@
   # (.direnv, target, result-*, etc.) ever lands here in the first place.
   buildSrc = self;
 
-  workspaceBuildInputs = with pkgs; [openssl];
+  workspaceBuildInputs = [];
   workspaceNativeBuildInputs = with pkgs.buildPackages; [pkg-config protobuf llvmPackages.lld];
 
   rev = self.rev or self.dirtyRev or "unknown";

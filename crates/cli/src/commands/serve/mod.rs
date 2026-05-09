@@ -63,7 +63,10 @@ pub async fn run(
     if let Some(metrics_port) = metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();
         metrics.register_with(&mut registry);
-        crate::metrics::spawn_metrics_server(metrics_port, Arc::new(registry));
+        let bundle = crate::metrics::MetricsBundle::new(Arc::new(registry));
+        #[cfg(feature = "otel")]
+        let bundle = bundle.with_iroh(node.iroh_metrics());
+        crate::metrics::spawn_metrics_server(metrics_port, bundle);
     }
 
     let node_id = node.node_id();

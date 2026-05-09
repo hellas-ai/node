@@ -8,7 +8,7 @@
   cliCandle,
 }: let
   imageRepository = "ghcr.io/hellas-ai/node";
-  runtimeCoreLibs = with pkgs; [stdenv.cc.cc.lib openssl glibc];
+  runtimeCoreLibs = with pkgs; [stdenv.cc.cc.lib glibc];
 
   # Each variant maps to exactly one CUDA toolkit × SM architecture build.
   # bindgen_cuda compiles kernels for a single --gpu-architecture, so we need
@@ -108,7 +108,7 @@
       nativeBuildInputs =
         (with pkgs.buildPackages; [pkg-config protobuf llvmPackages.lld makeWrapper])
         ++ cudaEnv.nativeBuildInputs;
-      buildInputs = [pkgs.openssl] ++ cudaEnv.buildInputs;
+      buildInputs = cudaEnv.buildInputs;
       inherit (cudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
       postInstall = ''
         for bin in $out/bin/*; do

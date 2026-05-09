@@ -75,7 +75,8 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
-        crate::metrics::spawn_metrics_server(metrics_port, registry);
+        let bundle = crate::metrics::MetricsBundle::new(registry);
+        crate::metrics::spawn_metrics_server(metrics_port, bundle);
     }
 
     #[cfg(feature = "hellas-executor")]
