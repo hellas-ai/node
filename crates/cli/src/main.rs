@@ -339,11 +339,7 @@ async fn main() {
     {
         let result = identity::load_existing_producer_key(producer_key_path.as_deref())
             .and_then(|key| commands::identity::show_producer_key(&key));
-        if let Some(provider) = tracer_provider
-            && let Err(err) = provider.shutdown()
-        {
-            eprintln!("warning: failed to flush traces: {err}");
-        }
+        tracer_provider.shutdown();
         if let Err(err) = result {
             eprintln!("error: {err:#}");
             std::process::exit(1);
@@ -548,11 +544,7 @@ async fn main() {
         } => commands::monitor::run(timeout_secs, !no_interrogate, secret_key).await,
     };
 
-    if let Some(provider) = tracer_provider
-        && let Err(err) = provider.shutdown()
-    {
-        eprintln!("warning: failed to flush traces: {err}");
-    }
+    tracer_provider.shutdown();
 
     if let Err(err) = result {
         eprintln!("error: {err:#}");
