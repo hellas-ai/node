@@ -8,7 +8,7 @@ use crate::{
     event::Change,
     list::List,
     object::{Coin, Edge, Parties},
-    primitive::{CoinId, Digest, EdgeId, Party, TermsHash},
+    primitive::{CoinId, Digest, EdgeId, TermsHash},
     store::Tx,
     terms::Terms,
 };
@@ -171,19 +171,15 @@ impl Open {
 
     fn id(funding: &Funding, terms: &Terms) -> EdgeId {
         let mut digest = Digest::new(crate::domain::EDGE_OPEN);
-        let parties = (*terms).parties();
 
-        digest.bytes((*terms).hash().as_bytes());
-        digest.bytes(parties.maker().as_bytes());
-        digest.bytes(parties.taker().as_bytes());
-        Self::ids(&mut digest, Party::Maker, &funding.maker);
-        Self::ids(&mut digest, Party::Taker, &funding.taker);
+        digest.bytes(terms.hash().as_bytes());
+        Self::ids(&mut digest, &funding.maker);
+        Self::ids(&mut digest, &funding.taker);
 
         EdgeId::from_digest(digest)
     }
 
-    fn ids(digest: &mut Digest, party: Party, ids: &PartyCoins) {
-        digest.u8(party.tag());
+    fn ids(digest: &mut Digest, ids: &PartyCoins) {
         digest.usize(ids.len());
 
         for id in ids.iter() {

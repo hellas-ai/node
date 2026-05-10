@@ -217,6 +217,13 @@ pub(crate) fn bad_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
     payouts_with(MAKER_PAYOUT, BAD_PAYOUT)
 }
 
+/// Value-conserving payouts that drain the entire edge to the maker. Used to
+/// expose proof-binding holes: any kind that does not bind payouts will accept
+/// these instead of the canonical (`MAKER_PAYOUT`, `TAKER_PAYOUT`) split.
+pub(crate) fn maker_grab_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    payouts_with(EDGE_VALUE, 0)
+}
+
 pub(crate) fn payouts_with(maker: u64, taker: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
     let Some(outputs) = List::new(
         [
