@@ -106,6 +106,13 @@ impl Edge {
         Ok(Self::new(value, reserve, parties, terms))
     }
 
+    /// Validates a resolve against the edge's locked principal and reserve.
+    ///
+    /// Payouts must sum to exactly `self.value` (the principal locked at
+    /// open). The reserve covers the resolve fee; any unspent reserve
+    /// (`self.reserve - fee`) is *burned*, not refunded — this is the
+    /// protocol's deflationary tip, modelled by the `paid` accumulator
+    /// in `models/fees.qnt`.
     pub(super) fn resolves<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,

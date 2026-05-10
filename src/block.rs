@@ -68,19 +68,8 @@ impl<const N: usize> Block<N> {
     #[must_use]
     pub fn conflicts(&self) -> bool {
         let ops = self.ops.as_slice();
-        let mut left = 0;
-
-        while left < ops.len() {
-            let mut right = left + 1;
-            while right < ops.len() {
-                if ops[left].conflicts(&ops[right]) {
-                    return true;
-                }
-                right += 1;
-            }
-            left += 1;
-        }
-
-        false
+        ops.iter()
+            .enumerate()
+            .any(|(i, op)| ops[i + 1..].iter().any(|other| op.conflicts(other)))
     }
 }

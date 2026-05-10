@@ -54,11 +54,7 @@ impl Funding {
     }
 
     fn first(&self) -> Option<CoinId> {
-        self.maker()
-            .as_slice()
-            .first()
-            .or_else(|| self.taker().as_slice().first())
-            .copied()
+        self.iter().next()
     }
 
     fn iter(&self) -> impl Iterator<Item = CoinId> + '_ {
@@ -122,10 +118,7 @@ impl Open {
             ids[index] = id;
         }
 
-        let Some(ids) = List::new(ids, self.funding.len()) else {
-            return List::all(ids);
-        };
-        ids
+        List::take(ids, self.funding.len())
     }
 
     /// Returns the open terms commitment for the produced edge.
@@ -211,20 +204,11 @@ impl Open {
     }
 
     fn coins<T: Tx>(&self, tx: &T) -> KernelResult<OpenCoins> {
-        let Some(first) = self.funding.first() else {
-            return Ok(List::empty((CoinId::ZERO, Coin::ZERO)));
-        };
-        let first_coin = tx
-            .coin(first)
-            .ok_or(ApplyError::MissingCoin { id: first })?;
-        let mut coins = [(first, first_coin); MAX_EDGE_INPUTS];
-
+        let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
         for (index, id) in self.funding.iter().enumerate() {
             let coin = tx.coin(id).ok_or(ApplyError::MissingCoin { id })?;
             coins[index] = (id, coin);
         }
-
-        List::new(coins, self.funding.len())
-            .ok_or_else(|| self.invalid(InvalidOpenReason::BoundsExceeded))
+        Ok(List::take(coins, self.funding.len()))
     }
 }
