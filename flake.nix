@@ -30,6 +30,8 @@
           llvmPackages.lld
           nodejs_24
           pkg-config
+          temurin-bin   # JVM for Apalache (auto-downloaded by `quint verify`)
+          stdenv.cc.cc.lib   # libstdc++ for Apalache's bundled native Z3
 
           cargo-audit
           cargo-deny
@@ -48,6 +50,9 @@
         ];
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+        # Quint downloads the Apalache JAR + bundled native Z3 to ~/.quint;
+        # Z3's libz3java.so dlopens libstdc++ at runtime, so expose it.
+        LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
       };
     });
 
