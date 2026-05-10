@@ -3,26 +3,23 @@ use super::*;
 #[test]
 fn resolve_zero_edge_without_outputs() {
     let terms = terms_with(no_payouts());
-    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), terms);
+    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), terms.clone());
+    let edge = open.output();
     let mut state = funded_state_for(&open);
     let _event = apply(&mut state, &Op::Open(open));
     let event = apply(
         &mut state,
-        &Op::Resolve(Resolve::new(
-            open.output(),
-            Proof::timeout(terms),
-            no_payouts(),
-        )),
+        &Op::Resolve(Resolve::new(edge, Proof::timeout(terms), no_payouts())),
     );
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
-            input: open.output(),
+        &EventKind::EdgeResolved {
+            input: edge,
             outputs: output_ids0(),
         },
     );
-    assert_eq!(state.store().edge(open.output()), None);
+    assert_eq!(state.store().edge(edge), None);
     assert_eq!(
         state.store().coin(MAKER_COIN).map(coin_view),
         Some((MAKER, 10)),
@@ -47,7 +44,7 @@ fn resolve_spends_edge_into_two_payout_coins() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -78,7 +75,7 @@ fn resolve_accepts_basic_witness_with_fake_crypto() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -113,12 +110,13 @@ fn resolve_rejects_basic_witness_without_fake_crypto() {
 #[test]
 fn resolve_uses_prepaid_reserve() {
     let outputs = payouts(Payout::new(MAKER, 12), Payout::new(TAKER, 12));
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let resolve = Resolve::new(open.output(), Proof::timeout(terms), outputs);
+    let terms = terms_with(outputs.clone());
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
     let output_ids = resolve.output_ids();
-    let maker_out = nth(output_ids, 0);
-    let taker_out = nth(output_ids, 1);
+    let maker_out = nth(&output_ids, 0);
+    let taker_out = nth(&output_ids, 1);
     let mut state = state(
         store_for_resolve(&open, outputs),
         [
@@ -137,12 +135,12 @@ fn resolve_uses_prepaid_reserve() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
-            input: open.output(),
+        &EventKind::EdgeResolved {
+            input: edge,
             outputs: output_ids2(maker_out, taker_out),
         },
     );
-    assert_eq!(state.store().edge(open.output()), None);
+    assert_eq!(state.store().edge(edge), None);
     assert_eq!(
         state.store().coin(maker_out).map(coin_view),
         Some((MAKER, 12)),
@@ -190,10 +188,13 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
         Fees::new(0, 0, 3),
     );
     let outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
+    let terms = terms_with(outputs.clone());
+    let terms_hash = terms.hash();
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let reserve_cost = open.reserve_cost();
     let mut state = state(
-        store_for_resolve(&open, outputs),
+        store_for_resolve(&open, outputs.clone()),
         [
             Genesis::coin(MAKER_COIN, MAKER, 20),
             Genesis::coin(TAKER_COIN, TAKER, 10),
@@ -201,18 +202,19 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
     );
     let _event = apply_with(&mut state, cheap, &Op::Open(open));
     let store = *state.store();
-    let resolve = Resolve::new(open.output(), Proof::timeout(terms), outputs);
+    let resolve = Resolve::new(edge, Proof::timeout(terms), outputs);
+    let resolve_cost = resolve.cost();
 
-    assert_eq!(cheap.fee(open.reserve_cost()), Some(2));
+    assert_eq!(cheap.fee(reserve_cost), Some(2));
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
-        Some((28, 2, PARTIES, terms.hash())),
+        state.store().edge(edge).map(edge_view),
+        Some((28, 2, PARTIES, terms_hash)),
     );
-    assert_eq!(expensive.fee(resolve.cost()), Some(3));
+    assert_eq!(expensive.fee(resolve_cost), Some(3));
     assert_eq!(
         state.apply(expensive, &FAKE_VERIFIER, &Op::Resolve(resolve)),
         Err(ApplyError::InvalidResolve {
-            input: open.output(),
+            input: edge,
             reason: InvalidResolveReason::ReserveTooSmall,
         }),
     );
@@ -235,7 +237,7 @@ fn resolve_accepts_agreement_witness() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -294,7 +296,7 @@ fn resolve_accepts_timeout_witness_at_deadline() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -387,7 +389,7 @@ fn resolve_accepts_claimant_wins_witness() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -411,7 +413,7 @@ fn resolve_accepts_challenger_wins_witness() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
+        &EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         },
@@ -498,32 +500,33 @@ fn resolve_spends_edge_into_three_payout_coins() {
         Payout::new(TAKER, 5),
         Payout::new(MAKER, 4),
     );
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let resolve = Resolve::new(open.output(), Proof::timeout(terms), outputs);
+    let terms = terms_with(outputs.clone());
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
     let output_ids = resolve.output_ids();
-    let maker_out = nth(output_ids, 0);
-    let taker_out = nth(output_ids, 1);
-    let extra_out = nth(output_ids, 2);
+    let maker_out = nth(&output_ids, 0);
+    let taker_out = nth(&output_ids, 1);
+    let extra_out = nth(&output_ids, 2);
     let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
     let event = apply(&mut state, &Op::Open(open));
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
-            output: open.output(),
+            output: edge,
         },
     );
     let event = apply(&mut state, &Op::Resolve(resolve));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
-            input: open.output(),
+        &EventKind::EdgeResolved {
+            input: edge,
             outputs: output_ids3(maker_out, taker_out, extra_out),
         },
     );
-    assert_eq!(state.store().edge(open.output()), None);
+    assert_eq!(state.store().edge(edge), None);
     assert_eq!(
         state.store().coin(extra_out).map(coin_view),
         Some((MAKER, 4))
@@ -533,20 +536,21 @@ fn resolve_spends_edge_into_three_payout_coins() {
 #[test]
 fn resolve_allows_zero_value_payout_coin() {
     let outputs = payouts(Payout::new(MAKER, 0), Payout::new(TAKER, 15));
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let resolve = Resolve::new(open.output(), Proof::timeout(terms), outputs);
+    let terms = terms_with(outputs.clone());
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
     let output_ids = resolve.output_ids();
-    let maker_out = nth(output_ids, 0);
-    let taker_out = nth(output_ids, 1);
+    let maker_out = nth(&output_ids, 0);
+    let taker_out = nth(&output_ids, 1);
     let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &Op::Open(open));
     let event = apply(&mut state, &Op::Resolve(resolve));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeResolved {
-            input: open.output(),
+        &EventKind::EdgeResolved {
+            input: edge,
             outputs: output_ids2(maker_out, taker_out),
         },
     );
@@ -563,9 +567,13 @@ fn resolve_allows_zero_value_payout_coin() {
 #[test]
 fn resolve_rejects_non_conserving_payouts_without_mutation() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
+    let terms = terms_with(outputs.clone());
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let mut state = state(
+        store_for_resolve(&open, outputs.clone()),
+        [MAKER_SEED, TAKER_SEED],
+    );
     let _event = apply(&mut state, &Op::Open(open));
     let store = *state.store();
 
@@ -573,10 +581,10 @@ fn resolve_rejects_non_conserving_payouts_without_mutation() {
         state.apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &Op::Resolve(Resolve::new(open.output(), Proof::timeout(terms), outputs,)),
+            &Op::Resolve(Resolve::new(edge, Proof::timeout(terms), outputs,)),
         ),
         Err(ApplyError::InvalidResolve {
-            input: open.output(),
+            input: edge,
             reason: InvalidResolveReason::ValueMismatch,
         }),
     );

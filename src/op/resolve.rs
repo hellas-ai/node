@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Resolve one edge into bounded owner-only coin payouts.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Resolve {
     input: EdgeId,
     proof: Proof,
@@ -48,8 +48,8 @@ impl Resolve {
 
     /// Returns the resolve proof.
     #[must_use]
-    pub const fn proof(&self) -> Proof {
-        self.proof
+    pub const fn proof(&self) -> &Proof {
+        &self.proof
     }
 
     /// Returns the coin payouts produced by the resolve.
@@ -64,7 +64,7 @@ impl Resolve {
         let mut ids = [CoinId::ZERO; MAX_EDGE_OUTPUTS];
 
         for (index, payout) in self.outputs.iter().enumerate() {
-            ids[index] = self.output_id(index, payout);
+            ids[index] = self.output_id(index, *payout);
         }
 
         List::take(ids, self.outputs.len())
@@ -149,7 +149,7 @@ impl Resolve {
         digest.u8(kind.tag());
         digest.bytes(terms.as_bytes());
         digest.usize(outputs.len());
-        for output in outputs.iter() {
+        for output in outputs {
             digest.bytes(output.owner().as_bytes());
             digest.u64(output.value());
         }
@@ -159,7 +159,7 @@ impl Resolve {
 
     fn check_outputs<T: Tx>(&self, tx: &T) -> KernelResult<()> {
         for (index, output) in self.outputs.iter().enumerate() {
-            let id = self.output_id(index, output);
+            let id = self.output_id(index, *output);
             if tx.coin(id).is_some() {
                 return Err(ApplyError::OutputExists { id });
             }

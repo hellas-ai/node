@@ -10,7 +10,7 @@ use super::{EdgeList, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, overlaps};
 use crate::{list::List, primitive::CoinId};
 
 /// Deterministic state slots consumed and created by one operation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Access {
     pub(super) coins: List<CoinId, MAX_EDGE_INPUTS>,
     pub(super) edges: EdgeList,

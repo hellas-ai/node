@@ -22,15 +22,15 @@ fn apply_all_opens_and_resolves_one_batch() {
 
     assert_eq!(diff.len(), 2);
     assert_eq!(
-        diff.event(0).map(|event| event.kind()),
-        Some(EventKind::EdgeOpened {
+        diff.event(0).map(Event::kind),
+        Some(&EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
             output: edge(),
         }),
     );
     assert_eq!(
-        diff.event(1).map(|event| event.kind()),
-        Some(EventKind::EdgeResolved {
+        diff.event(1).map(Event::kind),
+        Some(&EventKind::EdgeResolved {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         }),
@@ -64,13 +64,14 @@ fn apply_all_allows_empty_batch() {
 #[test]
 fn apply_all_rolls_back_on_error() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms = terms_with(outputs);
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
+    let terms = terms_with(outputs.clone());
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
+    let edge = open.output();
+    let mut state = state(store_for_resolve(&open, outputs.clone()), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
     let ops = List::all([
         Op::Open(open),
-        Op::Resolve(Resolve::new(open.output(), Proof::timeout(terms), outputs)),
+        Op::Resolve(Resolve::new(edge, Proof::timeout(terms), outputs)),
     ]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
@@ -81,7 +82,7 @@ fn apply_all_rolls_back_on_error() {
     assert_eq!(
         error.source(),
         ApplyError::InvalidResolve {
-            input: open.output(),
+            input: edge,
             reason: InvalidResolveReason::ValueMismatch,
         },
     );

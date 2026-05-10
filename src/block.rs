@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Ordered kernel operation batch with explicit block context.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Block<const N: usize> {
     context: Context,
     ops: List<Op, N>,
@@ -44,7 +44,7 @@ impl<const N: usize> Block<N> {
     pub fn cost(&self) -> Option<Cost> {
         let mut cost = Cost::ZERO;
 
-        for op in self.ops.iter() {
+        for op in &self.ops {
             cost = cost.checked_add(op.cost())?;
         }
 

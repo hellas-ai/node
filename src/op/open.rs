@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Funding consumed by an edge open.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Funding {
     maker: PartyCoins,
     taker: PartyCoins,
@@ -58,7 +58,7 @@ impl Funding {
     }
 
     fn iter(&self) -> impl Iterator<Item = CoinId> + '_ {
-        self.maker().iter().chain(self.taker().iter())
+        self.maker().iter().chain(self.taker().iter()).copied()
     }
 }
 
@@ -68,7 +68,7 @@ impl Funding {
 /// apply, and recomputing the BLAKE3 each time is the dominant per-op cost in
 /// benchmarks; one extra 32 bytes per `Open` saves roughly half the apply
 /// time at the largest batch sizes.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Open {
     funding: Funding,
     terms: Terms,
@@ -98,13 +98,13 @@ impl Open {
 
     /// Returns the parties committed by the produced edge.
     #[must_use]
-    pub const fn parties(self) -> Parties {
+    pub const fn parties(&self) -> Parties {
         self.terms.parties()
     }
 
     /// Returns the edge produced by the open.
     #[must_use]
-    pub const fn output(self) -> EdgeId {
+    pub const fn output(&self) -> EdgeId {
         self.output
     }
 
@@ -123,7 +123,7 @@ impl Open {
 
     /// Returns the open terms commitment for the produced edge.
     #[must_use]
-    pub const fn terms(self) -> TermsHash {
+    pub const fn terms(&self) -> TermsHash {
         self.terms_hash
     }
 
@@ -194,7 +194,7 @@ impl Open {
     fn ids(digest: &mut Digest, ids: &PartyCoins) {
         digest.usize(ids.len());
 
-        for id in ids.iter() {
+        for id in ids {
             digest.bytes(id.as_bytes());
         }
     }

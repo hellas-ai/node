@@ -149,7 +149,7 @@ impl Seal {
 /// build the resolve hash for seal verification, and recomputing the BLAKE3
 /// per call dominates the apply cost in benchmarks. One extra 32 bytes per
 /// `Timeout` / `ClaimantWins` / `ChallengerWins` saves the hash entirely.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Proof {
     /// Degenerate modelling witness.
     Basic {
@@ -238,7 +238,7 @@ impl Proof {
 
     /// Returns the resolve witness kind.
     #[must_use]
-    pub const fn kind(self) -> ResolveKind {
+    pub const fn kind(&self) -> ResolveKind {
         match self {
             Self::Basic { .. } => ResolveKind::Basic,
             Self::Agreement { .. } => ResolveKind::Agreement,
@@ -250,23 +250,23 @@ impl Proof {
 
     /// Returns the terms commitment this proof opens under.
     #[must_use]
-    pub const fn terms(self) -> TermsHash {
+    pub const fn terms(&self) -> TermsHash {
         match self {
-            Self::Basic { terms } | Self::Agreement { terms, .. } => terms,
+            Self::Basic { terms } | Self::Agreement { terms, .. } => *terms,
             Self::Timeout { terms_hash, .. }
             | Self::ClaimantWins { terms_hash, .. }
-            | Self::ChallengerWins { terms_hash, .. } => terms_hash,
+            | Self::ChallengerWins { terms_hash, .. } => *terms_hash,
         }
     }
 
     /// Returns the deterministic resource cost of checking this proof.
     #[must_use]
-    pub const fn cost(self) -> Cost {
+    pub const fn cost(&self) -> Cost {
         Cost::new(0, 0, self.kind().proofs())
     }
 
     pub(super) fn accepts<V: Verifier + ?Sized>(
-        self,
+        &self,
         context: Context,
         verifier: &V,
         resolve: &Resolve,
@@ -276,7 +276,7 @@ impl Proof {
             Self::Basic { terms } => {
                 #[cfg(feature = "fake-crypto")]
                 {
-                    if terms == edge.terms() {
+                    if *terms == edge.terms() {
                         Ok(())
                     } else {
                         Err(InvalidProofReason::TermsMismatch)
@@ -290,7 +290,7 @@ impl Proof {
                 }
             }
             Self::Agreement { terms, agreement } => {
-                if terms != edge.terms() {
+                if *terms != edge.terms() {
                     return Err(InvalidProofReason::TermsMismatch);
                 }
                 agreement.accepts(
@@ -300,13 +300,13 @@ impl Proof {
                 )
             }
             Self::Timeout { terms, terms_hash } => {
-                if terms_hash != edge.terms() {
+                if *terms_hash != edge.terms() {
                     return Err(InvalidProofReason::TermsMismatch);
                 }
                 if context.block_height() < terms.timeout() {
                     return Err(InvalidProofReason::TimeoutNotReached);
                 }
-                if *resolve.outputs() != terms.timeout_outputs() {
+                if resolve.outputs() != terms.timeout_outputs() {
                     return Err(InvalidProofReason::PayoutMismatch);
                 }
                 Ok(())
@@ -320,8 +320,8 @@ impl Proof {
                 resolve,
                 edge,
                 terms.protocol(),
-                terms_hash,
-                seal,
+                *terms_hash,
+                *seal,
                 ResolveKind::ClaimantWins,
             ),
             Self::ChallengerWins {
@@ -333,8 +333,8 @@ impl Proof {
                 resolve,
                 edge,
                 terms.protocol(),
-                terms_hash,
-                seal,
+                *terms_hash,
+                *seal,
                 ResolveKind::ChallengerWins,
             ),
         }

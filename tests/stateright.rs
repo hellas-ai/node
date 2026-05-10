@@ -82,8 +82,8 @@ impl Model for ChannelModel {
             return Self::invalid_state(&mut state, last_state, context, &op, error);
         }
 
-        let event = state.apply(context, &FAKE_VERIFIER, &op).ok()?.kind();
-        Self::valid_state(&state, action, context, &op, &event)
+        let event = state.apply(context, &FAKE_VERIFIER, &op).ok()?;
+        Self::valid_state(&state, action, context, &op, event.kind())
     }
 
     fn properties(&self) -> Vec<Property<Self>> {

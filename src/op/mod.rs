@@ -55,7 +55,7 @@ type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 type EdgeList = List<EdgeId, 1>;
 
 /// A protocol operation submitted to the Hellas kernel.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Op {
     /// Open one edge by locking bounded bilateral funding.
     Open(Open),
