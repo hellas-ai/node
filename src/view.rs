@@ -1,4 +1,10 @@
 //! Allocation-free state snapshots for models and refinement checks.
+//!
+//! Abstract counterpart: the live `coins` / `edges` / `liveCoins` /
+//! `liveEdges` projections in `models/l1.qnt`. ITF replay (`tests/itf.rs`)
+//! reads each abstract step and asserts the kernel's [`View`] matches; the
+//! model's `valueConserved`, `noNegativeValue`, and shape rules
+//! (`models/rules/invariants.qnt`) are checked against this same view.
 
 use crate::{
     object::{Coin, Edge},

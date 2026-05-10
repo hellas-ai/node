@@ -1,3 +1,10 @@
+//! Open: lock bilateral funding into one edge.
+//!
+//! Abstract counterpart: `models/l1.qnt::openEdge` action. Funding inputs
+//! must be live coins; the action consumes them and creates an edge with
+//! their summed value, matching the `coins'` / `edges'` / `liveCoins'` /
+//! `liveEdges'` updates in the model.
+
 use super::{
     Access, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, OpenCoins, PartyCoins, Resolve,
     ResolveKind, duplicate, empty_coins, empty_edges, one_edge, units,

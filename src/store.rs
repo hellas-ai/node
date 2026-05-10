@@ -3,6 +3,11 @@
 //! The store presents a typed transactional view over coin and edge slots.
 //! Storage representation is left to the implementation; the kernel only ever
 //! addresses slots through their typed identifier.
+//!
+//! Abstract counterpart: the store atomicity / read-isolation assumptions
+//! in `models/deps/assumptions.qnt`. The Quint model captures atomicity by
+//! updating all primed variables in one `action` block; this trait is the
+//! Rust contract callers must honor for that abstraction to hold.
 
 use crate::{
     error::{InsertError, KernelResult},

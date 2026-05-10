@@ -1,4 +1,11 @@
 //! Ordered operation batches.
+//!
+//! Abstract counterpart: the sequential `step` execution in
+//! `models/l1.qnt`. The model has no explicit "block" — sequential action
+//! application is the model. [`Block`] is the kernel's concrete carrier
+//! for one such ordered batch plus the [`Context`] under which it applies,
+//! and `models/deps/assumptions.qnt` documents the consensus assumption
+//! that finalized blocks arrive in a deterministic order.
 
 use crate::{
     context::{Context, Cost},
