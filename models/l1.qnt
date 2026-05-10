@@ -165,13 +165,13 @@ module l1 {
       and AllEdges.forall(id => edges.get(id) >= 0)
   val liveEdgesAreKnown = liveEdges.subseteq(AllEdges)
 
-  run basicTrace =
+  run basicTraceTest =
     init
       .then(openEdge(Edge1))
       .then(resolveEdge(Edge1, Basic))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  run agreementTimeoutTrace =
+  run agreementTimeoutTraceTest =
     init
       .then(openEdge(Edge1))
       .then(resolveEdge(Edge1, Agreement))
@@ -180,7 +180,7 @@ module l1 {
       .then(resolveEdge(Edge2, Timeout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  run disputeTrace =
+  run disputeTraceTest =
     init
       .then(openEdge(Edge1))
       .then(resolveEdge(Edge1, ClaimantWins))
@@ -188,7 +188,7 @@ module l1 {
       .then(resolveEdge(Edge2, ChallengerWins))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  run earlyTimeoutRejected =
+  run earlyTimeoutRejectedTest =
     init
       .then(openEdge(Edge1))
       .expect(not(canResolve(Edge1, Timeout)))
