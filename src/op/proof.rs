@@ -134,6 +134,12 @@ impl Seal {
 }
 
 /// Bounded proof carried by an edge resolve.
+///
+/// Variants that reveal concrete `Terms` cache the `TermsHash` alongside —
+/// the kernel uses it once to verify the edge's commitment and once more to
+/// build the resolve hash for seal verification, and recomputing the BLAKE3
+/// per call dominates the apply cost in benchmarks. One extra 32 bytes per
+/// `Timeout` / `ClaimantWins` / `ChallengerWins` saves the hash entirely.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum Proof {
     /// Degenerate modelling witness.
@@ -154,12 +160,16 @@ pub enum Proof {
     Timeout {
         /// Concrete terms revealed to check the timeout.
         terms: Terms,
+        /// Cached `terms.hash()`.
+        terms_hash: TermsHash,
     },
 
     /// Correctness witness resolving for the claimant.
     ClaimantWins {
         /// Concrete terms revealed to select the mode verifier.
         terms: Terms,
+        /// Cached `terms.hash()`.
+        terms_hash: TermsHash,
         /// Compact mode-specific verifier result.
         seal: Seal,
     },
@@ -168,6 +178,8 @@ pub enum Proof {
     ChallengerWins {
         /// Concrete terms revealed to select the mode verifier.
         terms: Terms,
+        /// Cached `terms.hash()`.
+        terms_hash: TermsHash,
         /// Compact mode-specific verifier result.
         seal: Seal,
     },
@@ -188,20 +200,31 @@ impl Proof {
 
     /// Creates a timeout resolve witness.
     #[must_use]
-    pub const fn timeout(terms: Terms) -> Self {
-        Self::Timeout { terms }
+    pub fn timeout(terms: Terms) -> Self {
+        Self::Timeout {
+            terms_hash: terms.hash(),
+            terms,
+        }
     }
 
     /// Creates a claimant-wins resolve witness.
     #[must_use]
-    pub const fn claimant_wins(terms: Terms, seal: Seal) -> Self {
-        Self::ClaimantWins { terms, seal }
+    pub fn claimant_wins(terms: Terms, seal: Seal) -> Self {
+        Self::ClaimantWins {
+            terms_hash: terms.hash(),
+            terms,
+            seal,
+        }
     }
 
     /// Creates a challenger-wins resolve witness.
     #[must_use]
-    pub const fn challenger_wins(terms: Terms, seal: Seal) -> Self {
-        Self::ChallengerWins { terms, seal }
+    pub fn challenger_wins(terms: Terms, seal: Seal) -> Self {
+        Self::ChallengerWins {
+            terms_hash: terms.hash(),
+            terms,
+            seal,
+        }
     }
 
     /// Returns the resolve witness kind.
@@ -218,12 +241,12 @@ impl Proof {
 
     /// Returns the terms commitment this proof opens under.
     #[must_use]
-    pub fn terms(self) -> TermsHash {
+    pub const fn terms(self) -> TermsHash {
         match self {
             Self::Basic { terms } | Self::Agreement { terms, .. } => terms,
-            Self::Timeout { terms }
-            | Self::ClaimantWins { terms, .. }
-            | Self::ChallengerWins { terms, .. } => terms.hash(),
+            Self::Timeout { terms_hash, .. }
+            | Self::ClaimantWins { terms_hash, .. }
+            | Self::ChallengerWins { terms_hash, .. } => terms_hash,
         }
     }
 
@@ -267,8 +290,8 @@ impl Proof {
                     resolve.hash(ResolveKind::Agreement),
                 )
             }
-            Self::Timeout { terms } => {
-                if terms.hash() != edge.terms() {
+            Self::Timeout { terms, terms_hash } => {
+                if terms_hash != edge.terms() {
                     return Err(InvalidProofReason::TermsMismatch);
                 }
                 if context.block_height() < terms.timeout() {
@@ -279,19 +302,29 @@ impl Proof {
                 }
                 Ok(())
             }
-            Self::ClaimantWins { terms, seal } => Self::accepts_seal(
+            Self::ClaimantWins {
+                terms,
+                terms_hash,
+                seal,
+            } => Self::accepts_seal(
                 verifier,
                 resolve,
                 edge,
-                &terms,
+                terms.protocol(),
+                terms_hash,
                 seal,
                 ResolveKind::ClaimantWins,
             ),
-            Self::ChallengerWins { terms, seal } => Self::accepts_seal(
+            Self::ChallengerWins {
+                terms,
+                terms_hash,
+                seal,
+            } => Self::accepts_seal(
                 verifier,
                 resolve,
                 edge,
-                &terms,
+                terms.protocol(),
+                terms_hash,
                 seal,
                 ResolveKind::ChallengerWins,
             ),
@@ -302,14 +335,15 @@ impl Proof {
         verifier: &V,
         resolve: &Resolve,
         edge: Edge,
-        terms: &Terms,
+        protocol: ProtocolCode,
+        terms_hash: TermsHash,
         seal: Seal,
         kind: ResolveKind,
     ) -> Result<(), InvalidProofReason> {
-        if terms.hash() != edge.terms() {
+        if terms_hash != edge.terms() {
             return Err(InvalidProofReason::TermsMismatch);
         }
-        if verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind)) {
+        if verifier.verify_seal(seal, protocol, kind, resolve.hash(kind)) {
             Ok(())
         } else {
             Err(InvalidProofReason::BadSeal)

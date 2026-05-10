@@ -73,11 +73,11 @@ const fn terms_with(outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
     Terms::basic(PROTOCOL, PARTIES, TIMEOUT, outputs)
 }
 
-const fn proof() -> Proof {
+fn proof() -> Proof {
     Proof::timeout(BASIC_TERMS)
 }
 
-const fn other_proof() -> Proof {
+fn other_proof() -> Proof {
     Proof::timeout(OTHER_TERMS_VALUE)
 }
 
