@@ -247,7 +247,9 @@ Access { coins, edges, new_coins, new_edges }
 `Open` declares its funding coins and produced edge. `Resolve` declares its
 input edge and produced payout coins. The kernel still validates against the
 transactional store, but schedulers and model checkers do not need to discover
-hot-path state dynamically.
+hot-path state dynamically. `Access::conflicts` is the static pairwise predicate
+used to build execution waves: two operations conflict if their consumed or
+created coin/edge IDs overlap.
 
 ## L1 Model
 
