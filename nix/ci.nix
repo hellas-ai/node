@@ -97,10 +97,20 @@
           else lib.attrNames (lib.filterAttrs (_: c: c ? fix) allChecks)
         );
     };
+  # Extended (post-gate) builds run only on push. Each value is an attribute
+  # path under `packages.<system>` consumed by the GitHub Actions matrix as
+  # `nix build .#packages.<system>.<attr>`.
+  ciBuilds = {
+    static-x86_64 = "cross.x86_64-linux-musl.cli";
+    static-aarch64 = "cross.aarch64-linux-musl.cli";
+    docker-cpu = "docker-cpu";
+    docker-cuda = "docker-cuda";
+  };
 in {
   # Flat { name → command } exposed to the CI matrix. Keep this stable;
   # adding a key here adds a CI job (no workflow edit needed).
   commands = lib.mapAttrs (_: c: c.check) ciChecks;
+  builds = ciBuilds;
   checkAll = mkRunner "check";
   fixAll = mkRunner "fix";
 }

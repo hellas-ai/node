@@ -163,7 +163,8 @@
   };
   cudaCliPackages = lib.mapAttrs (_: v: v.cli) cudaImages;
   defaultCudaCli = defaultCuda.cli;
+  defaultCudaImage = defaultCuda.image;
 in {
   defaultCudaEnv = defaultCuda.cudaEnv;
-  inherit dockerImages pushAll cudaCliPackages defaultCudaCli;
+  inherit dockerImages pushAll cudaCliPackages defaultCudaCli defaultCudaImage;
 }
