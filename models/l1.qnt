@@ -130,33 +130,56 @@ module l1 {
     height' = height,
   }
 
-  // Proof validity is deliberately abstract here. Timeout is the only witness
-  // with a state-dependent guard. Basic remains enabled so the fake-crypto Rust
-  // path and starter traces stay modelled explicitly.
+  // FakeCrypto toggles the modelling/fake-crypto witness path. Set true to
+  // explore the adversary surface that exists when the fake-crypto feature is
+  // built in; set false to model production semantics where the kernel rejects
+  // Basic. The `payoutsHonorBindings` invariant holds iff FakeCrypto is false.
+  pure val FakeCrypto = false
+
+  // Proof validity. Timeout has a height guard. Basic is the modelling witness
+  // and is enabled only under FakeCrypto, mirroring the Rust kernel's
+  // cfg(feature = "fake-crypto") gate on Proof::Basic.
   def proofOk(p: Proof): bool =
     match p {
-      | Basic => true
+      | Basic => FakeCrypto
       | Agreement => true
       | Timeout => height >= TimeoutHeight
       | ClaimantWins => true
       | ChallengerWins => true
     }
 
-  def canResolve(e: Edge, p: Proof): bool =
+  // Per-proof payout binding. Agreement is bound by signature; Timeout is
+  // bound by terms.timeout_outputs; ClaimantWins/ChallengerWins are bound by
+  // the dispute seal. Basic carries no binding — it is the adversary surface
+  // gated by FakeCrypto via proofOk.
+  def payoutsBound(p: Proof, makerPay: int, takerPay: int): bool =
+    match p {
+      | Basic => true
+      | Agreement => makerPay == MakerPayout and takerPay == TakerPayout
+      | Timeout => makerPay == MakerPayout and takerPay == TakerPayout
+      | ClaimantWins => makerPay == MakerPayout and takerPay == TakerPayout
+      | ChallengerWins => makerPay == MakerPayout and takerPay == TakerPayout
+    }
+
+  def canResolve(e: Edge, p: Proof, makerPay: int, takerPay: int): bool =
     liveEdges.contains(e)
       and edges.get(e) == EdgeValue
       and proofOk(p)
+      and makerPay >= 0
+      and takerPay >= 0
+      and makerPay + takerPay == EdgeValue
+      and payoutsBound(p, makerPay, takerPay)
       and not(liveCoins.contains(makerOutput(e)))
       and not(liveCoins.contains(takerOutput(e)))
 
-  // Resolve consumes one live edge and materializes its deterministic payout
-  // coins. Payout values are fixed in this model, matching the timeout payout
-  // shape used by the Rust test terms.
-  action resolveEdge(e, p) = all {
-    canResolve(e, p),
+  // Resolve consumes one live edge and materializes payout coins. Payouts are
+  // explicit so the model can explore adversarial choices under Basic and
+  // confirm bound proofs reject anything but the canonical split.
+  action resolveEdge(e, p, makerPay, takerPay) = all {
+    canResolve(e, p, makerPay, takerPay),
     coins' = coins
-      .set(makerOutput(e), MakerPayout)
-      .set(takerOutput(e), TakerPayout),
+      .set(makerOutput(e), makerPay)
+      .set(takerOutput(e), takerPay),
     edges' = edges.set(e, 0),
     liveCoins' = liveCoins.union(Set(makerOutput(e), takerOutput(e))),
     liveEdges' = liveEdges.exclude(Set(e)),
@@ -182,20 +205,34 @@ module l1 {
     height' = height,
   }
 
-  // The nondeterministic transition relation checked by `quint run`.
+  // The nondeterministic transition relation checked by `quint run`. Each
+  // proof kind appears with the canonical (MakerPayout, TakerPayout) split,
+  // and Basic also appears with adversarial splits. Adversarial splits under
+  // bound proofs are listed below to document that they are rejected by
+  // payoutsBound; canResolve will never enable them.
   action step = any {
     openEdge(Edge1),
     openEdge(Edge2),
-    resolveEdge(Edge1, Basic),
-    resolveEdge(Edge1, Agreement),
-    resolveEdge(Edge1, Timeout),
-    resolveEdge(Edge1, ClaimantWins),
-    resolveEdge(Edge1, ChallengerWins),
-    resolveEdge(Edge2, Basic),
-    resolveEdge(Edge2, Agreement),
-    resolveEdge(Edge2, Timeout),
-    resolveEdge(Edge2, ClaimantWins),
-    resolveEdge(Edge2, ChallengerWins),
+    // Canonical-split resolves under each proof kind.
+    resolveEdge(Edge1, Basic, MakerPayout, TakerPayout),
+    resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout),
+    resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout),
+    resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout),
+    resolveEdge(Edge1, ChallengerWins, MakerPayout, TakerPayout),
+    resolveEdge(Edge2, Basic, MakerPayout, TakerPayout),
+    resolveEdge(Edge2, Agreement, MakerPayout, TakerPayout),
+    resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout),
+    resolveEdge(Edge2, ClaimantWins, MakerPayout, TakerPayout),
+    resolveEdge(Edge2, ChallengerWins, MakerPayout, TakerPayout),
+    // Adversarial Basic splits. Reachable iff FakeCrypto is true; this is the
+    // surface that the production kernel closes by gating Basic. Adversarial
+    // splits under bound proofs are not listed because canResolve rejects them
+    // through payoutsBound — Quint's exploration covers this by never
+    // enabling those actions, regardless of whether they appear here.
+    resolveEdge(Edge1, Basic, EdgeValue, 0),
+    resolveEdge(Edge1, Basic, 0, EdgeValue),
+    resolveEdge(Edge2, Basic, EdgeValue, 0),
+    resolveEdge(Edge2, Basic, 0, EdgeValue),
     tick,
     idle,
   }
@@ -215,33 +252,49 @@ module l1 {
   val liveEdgesAreKnown = liveEdges.subseteq(AllEdges)
   val liveCoinsAreKnown = liveCoins.subseteq(AllCoins)
 
+  // Every live payout coin carries the canonical (MakerPayout, TakerPayout)
+  // split. Holds when FakeCrypto is false because the only enabled resolves
+  // are bound proofs. Becomes reachable-violation when FakeCrypto is true and
+  // a Basic adversary path resolves with a non-canonical split. This is the
+  // invariant that catches the original "timeout payouts unconstrained" class
+  // of bug: any binding that fails to fix the (m, t) shape will trip this.
+  val payoutsHonorBindings =
+    AllEdges.forall(e =>
+      not(liveCoins.contains(makerOutput(e)))
+        or (coins.get(makerOutput(e)) == MakerPayout
+              and coins.get(takerOutput(e)) == TakerPayout))
+
   // Deterministic smoke traces used to generate ITF fixtures and pin obvious
-  // lifecycle paths.
+  // lifecycle paths. All resolve steps use the canonical split; the Rust
+  // kernel checks Agreement/Timeout/Dispute payouts are bound. The state
+  // sequence in each fixture is what matters, not the proof kind — Rust
+  // replays may use any kernel-accepted proof that produces the same state
+  // transitions.
   run basicTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, Basic))
+      .then(resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   run agreementTimeoutTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, Agreement))
+      .then(resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
       .then(tick)
-      .then(resolveEdge(Edge2, Timeout))
+      .then(resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   run disputeTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, ClaimantWins))
+      .then(resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
-      .then(resolveEdge(Edge2, ChallengerWins))
+      .then(resolveEdge(Edge2, ChallengerWins, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   run earlyTimeoutRejectedTest =
     init
       .then(openEdge(Edge1))
-      .expect(not(canResolve(Edge1, Timeout)))
+      .expect(not(canResolve(Edge1, Timeout, MakerPayout, TakerPayout)))
 }

@@ -2,7 +2,7 @@
   "private": true,
   "scripts": {
     "quint:run": "npm run quint:run:l1 && npm run quint:run:fees",
-    "quint:run:l1": "quint run models/l1.qnt --max-samples=500 --max-steps=8 --invariants=valueConserved --invariants=atMostOneLiveEdge --invariants=noNegativeValue --invariants=liveEdgesAreKnown --invariants=liveCoinsAreKnown --verbosity=1",
+    "quint:run:l1": "quint run models/l1.qnt --max-samples=500 --max-steps=8 --invariants=valueConserved --invariants=atMostOneLiveEdge --invariants=noNegativeValue --invariants=liveEdgesAreKnown --invariants=liveCoinsAreKnown --invariants=payoutsHonorBindings --verbosity=1",
     "quint:run:fees": "quint run models/fees.qnt --max-samples=500 --max-steps=8 --invariants=valueAccounted --invariants=reserveCoversResolve --invariants=paidWithinBounds --invariants=atMostOneLiveEdge --invariants=liveCoinsAreKnown --invariants=noNegativeValue --verbosity=1",
     "quint:fixtures": "rm -f models/traces/*.itf.json && mkdir -p models/traces && quint test models/l1.qnt --out-itf 'models/traces/l1_{test}.itf.json' --verbosity=0",
     "quint:test": "npm run quint:test:l1 && npm run quint:test:fees",
