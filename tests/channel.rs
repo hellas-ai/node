@@ -335,6 +335,8 @@ fn operations_report_deterministic_cost() {
     assert_eq!(Op::Open(open).cost(), open.cost());
     assert_eq!(resolve.cost(), Cost::new(1, 3, 3, 1));
     assert_eq!(Op::Resolve(resolve).cost(), resolve.cost());
+    assert_eq!(open.reserve_cost(), Cost::new(1, 5, 5, 2));
+    assert!(resolve.cost().fits(open.reserve_cost()));
     assert_eq!(
         agreement_proof(edge(), resolve.outputs()).cost(),
         Cost::new(0, 0, 0, 2)
@@ -351,6 +353,17 @@ fn operations_report_deterministic_cost() {
         challenger_proof(edge(), resolve.outputs()).kind(),
         ResolveKind::ChallengerWins,
     );
+}
+
+#[test]
+fn open_reserves_worst_case_resolve_cost() {
+    let open = open_op();
+    let outputs = payouts4();
+    let claimant = Resolve::new(edge(), claimant_proof(edge(), &outputs), outputs);
+    let challenger = Resolve::new(edge(), challenger_proof(edge(), &outputs), outputs);
+
+    assert_eq!(claimant.cost(), open.reserve_cost());
+    assert_eq!(challenger.cost(), open.reserve_cost());
 }
 
 #[test]
@@ -579,6 +592,7 @@ fn resolve_rejects_unpaid_fee_without_mutation() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn resolve_accepts_agreement_witness() {
     let mut state = open_state();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
@@ -692,6 +706,7 @@ fn resolve_rejects_wrong_timeout_terms_without_mutation() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn resolve_accepts_claimant_wins_witness() {
     let mut state = open_state();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
@@ -715,6 +730,7 @@ fn resolve_accepts_claimant_wins_witness() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn resolve_accepts_challenger_wins_witness() {
     let mut state = open_state();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
@@ -735,6 +751,27 @@ fn resolve_accepts_challenger_wins_witness() {
         },
     );
     assert_eq!(state.store().edge(edge()), None);
+}
+
+#[test]
+#[cfg(not(feature = "fake-crypto"))]
+fn placeholder_witnesses_do_not_verify_without_fake_crypto() {
+    let mut state = open_state();
+    let store = *state.store();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+
+    assert_eq!(
+        state.apply(
+            CONTEXT,
+            &Op::Resolve(Resolve::new(
+                edge(),
+                agreement_proof(edge(), &outputs),
+                outputs,
+            )),
+        ),
+        Err(ApplyError::InvalidProof { input: edge() }),
+    );
+    assert_eq!(*state.store(), store);
 }
 
 #[test]
@@ -1120,6 +1157,15 @@ fn payouts3(first: Payout, second: Payout, third: Payout) -> List<Payout, MAX_ED
         panic!("invalid test payout list");
     };
     outputs
+}
+
+const fn payouts4() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    List::all([
+        Payout::new(MAKER, 4),
+        Payout::new(TAKER, 4),
+        Payout::new(MAKER, 4),
+        Payout::new(TAKER, 3),
+    ])
 }
 
 fn no_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {

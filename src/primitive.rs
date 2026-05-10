@@ -202,9 +202,8 @@ impl Sig {
 
     /// Creates a deterministic signature placeholder for modelling.
     ///
-    /// This is not a cryptographic signature. It is the no-allocation stand-in
-    /// for the preverified settlement signature cache described in the
-    /// performance notes.
+    /// This is forgeable and not a cryptographic signature. The kernel accepts
+    /// this shape only when built with the `fake-crypto` feature.
     #[must_use]
     pub fn placeholder(key: Key, hash: ResolveHash) -> Self {
         let mut out = [0_u8; Self::LENGTH];
@@ -218,7 +217,16 @@ impl Sig {
     }
 
     pub(crate) fn verifies(self, key: Key, hash: ResolveHash) -> bool {
-        self == Self::placeholder(key, hash)
+        #[cfg(feature = "fake-crypto")]
+        {
+            self == Self::placeholder(key, hash)
+        }
+
+        #[cfg(not(feature = "fake-crypto"))]
+        {
+            let _ = (self, key, hash);
+            false
+        }
     }
 
     fn half(key: Key, hash: ResolveHash, index: u8) -> [u8; ResolveHash::LENGTH] {
@@ -233,6 +241,10 @@ impl Sig {
 }
 
 /// Compact chain-version-local protocol code.
+///
+/// This is deliberately one byte in v1: protocol tags are scarce, governed hot
+/// path identifiers. Widening it changes terms commitments and requires a chain
+/// version boundary.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ProtocolCode(u8);
 

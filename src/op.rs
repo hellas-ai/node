@@ -13,13 +13,21 @@ use crate::{
 
 const SEAL_LENGTH: usize = 32;
 
-/// Maximum coins that can fund one party in an edge open.
+/// Maximum coins that can fund one party in a v1 edge open.
+///
+/// Four inputs per party covers the expected one-or-two-coin channel open while
+/// keeping validation fully bounded. Raising this changes operation shape,
+/// resource costs, and model bounds, so it is a chain-version change.
 pub const MAX_PARTY_INPUTS: usize = 4;
 
-/// Maximum coins that can fund one edge open.
+/// Maximum coins that can fund one v1 edge open.
 pub const MAX_EDGE_INPUTS: usize = MAX_PARTY_INPUTS * 2;
 
-/// Maximum coins that can be produced by one edge resolve.
+/// Maximum coins that can be produced by one v1 edge resolve.
+///
+/// Four outputs leaves room for maker, taker, and small protocol-defined splits
+/// without making every resolve pay for an unbounded payout fanout. Raising this
+/// is also a chain-version change.
 pub const MAX_EDGE_OUTPUTS: usize = 4;
 
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
@@ -273,7 +281,10 @@ impl Open {
         Ok(Change::open(&coins, (self.output, edge)))
     }
 
-    /// Returns the deterministic resource cost reserved for a future resolve.
+    /// Returns the pessimistic resource cost prepaid for a future resolve.
+    ///
+    /// V1 opens reserve for the worst bounded resolve path so the protocol can
+    /// always be paid at resolve time.
     #[must_use]
     pub fn reserve_cost(&self) -> Cost {
         Resolve::cost_for_kind(MAX_EDGE_OUTPUTS, ResolveKind::ClaimantWins)
@@ -653,8 +664,8 @@ impl Seal {
 
     /// Creates a deterministic dispute seal placeholder for modelling.
     ///
-    /// This is not a cryptographic proof. It is the no-allocation stand-in for a
-    /// compact mode-specific verifier result.
+    /// This is forgeable and not a cryptographic proof. The kernel accepts this
+    /// shape only when built with the `fake-crypto` feature.
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
         let mut digest = Digest::new(b"hellas.seal.placeholder.v1");
@@ -667,7 +678,16 @@ impl Seal {
     }
 
     fn accepts(self, protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> bool {
-        self == Self::placeholder(protocol, kind, hash)
+        #[cfg(feature = "fake-crypto")]
+        {
+            self == Self::placeholder(protocol, kind, hash)
+        }
+
+        #[cfg(not(feature = "fake-crypto"))]
+        {
+            let _ = (self, protocol, kind, hash);
+            false
+        }
     }
 }
 

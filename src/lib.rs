@@ -2,6 +2,13 @@
 #![forbid(unsafe_code)]
 //! Deterministic settlement kernel for Hellas.
 //!
+//! # Warning: Fake Crypto
+//!
+//! The `fake-crypto` feature enables deterministic, forgeable placeholder
+//! signature and seal verification for modelling and tests. It must not be used
+//! in production. Without that feature, placeholder signatures and seals do not
+//! verify.
+//!
 //! State objects and events are not directly constructible outside the crate.
 //!
 //! ```compile_fail
@@ -29,6 +36,11 @@
 //!     },
 //! };
 //! ```
+
+#[cfg(all(feature = "fake-crypto", not(debug_assertions), not(doc)))]
+compile_error!(
+    "hellas-kernel fake-crypto is for modelling only; do not build optimized artifacts with forgeable placeholder verification"
+);
 
 mod block;
 mod context;

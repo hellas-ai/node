@@ -207,15 +207,17 @@ maker and taker signature-shaped witnesses over the same `ResolveHash`, which
 commits to the input edge, witness kind, terms, and ordered payouts. The current
 `Sig::placeholder` path is deterministic and non-cryptographic; it stands in
 for the preverified settlement-signature cache until real signature verification
-is wired in outside the hot reducer. `Timeout` reveals the concrete basic terms,
-checks that their commitment equals the edge's `TermsHash`, and accepts only
-when `Context::block_height() >= Terms::timeout()`. `ClaimantWins` and
-`ChallengerWins` reveal the same concrete terms and carry a fixed-size `Seal`.
-The seal is the compact mode-specific verifier result; the hot reducer only
-checks that it binds to the protocol code, outcome kind, terms commitment, input
-edge, and ordered payouts. The current `Seal::placeholder` path is deterministic
-and non-cryptographic, matching the placeholder signature path until a real
-verifier or preverification cache is wired in.
+is wired in outside the hot reducer. It verifies only under the `fake-crypto`
+feature, which is for models and tests and is blocked for optimized builds.
+`Timeout` reveals the concrete basic terms, checks that their commitment equals
+the edge's `TermsHash`, and accepts only when `Context::block_height() >=
+Terms::timeout()`. `ClaimantWins` and `ChallengerWins` reveal the same concrete
+terms and carry a fixed-size `Seal`. The seal is the compact mode-specific
+verifier result; the hot reducer only checks that it binds to the protocol code,
+outcome kind, terms commitment, input edge, and ordered payouts. The current
+`Seal::placeholder` path is deterministic and non-cryptographic, matching the
+placeholder signature path until a real verifier or preverification cache is
+wired in. It also verifies only under `fake-crypto`.
 Empty resolve output is valid exactly for a zero-value edge. A resolve is valid
 only when the edge reserve covers `context.fee(resolve.cost())`; the reserve is
 consumed by the resolve and does not appear in payout coins.
@@ -232,10 +234,13 @@ Cost { base, reads, writes, proofs }
 `Context` carries the active `Fees` schedule and prices costs with
 `context.fee(op.cost())`. The L1 open path burns the priced open cost from
 funding before creating the edge, and locks a separate resolution reserve priced
-from the maximum basic resolve shape. Resolve checks that the edge reserve can
-pay the current priced resolve cost, then consumes the reserve and pays out only
-edge principal. `Block::fits` checks the summed block cost against a
-multi-dimensional resource budget before admission.
+from the pessimistic worst-case bounded resolve shape: `MAX_EDGE_OUTPUTS` plus
+`ResolveKind::ClaimantWins`. This is deliberate. V1 does not refund unused
+reserve and does not price resolves optimistically; the protocol should always
+be paid. Resolve checks that the edge reserve can pay the current priced resolve
+cost, then consumes the reserve and pays out only edge principal. `Block::fits`
+checks the summed block cost against a multi-dimensional resource budget before
+admission.
 
 ### Access Sets
 
@@ -285,6 +290,8 @@ The basic invariants are:
   derived reserve, and creates the edge atomically
 - resolving an edge deletes the edge, consumes the reserve, and creates payout
   coins atomically
+- protocol costs are paid before a mutation commits; an operation that cannot
+  pay its context-priced cost is invalid
 - resolve output coins exist after the resolve event
 - resolve output coins may later be spent or escrowed into a new edge
 - block height is monotonic
@@ -792,6 +799,9 @@ The first synchronous L1 model lives in `models/l1.qnt`. It mirrors the Rust
 operation vocabulary at an abstract level: `OpenEdge`, `ResolveEdge`, bounded
 resolve proof kinds, explicit block height for timeout, live coins, live edges,
 and a finite state universe suitable for simulation and trace export.
+When the Rust operation vocabulary grows, update this model in the same change:
+add the abstract transition, extend the named `*Test` traces, regenerate the ITF
+fixtures with `npm run quint:fixtures`, and keep the Rust replay tests aligned.
 
 ### Choreo Or P
 
