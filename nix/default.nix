@@ -153,7 +153,10 @@
     };
   in {
     packages =
-      {cli-candle-cuda = docker.defaultCudaCli;}
+      {
+        cli-candle-cuda = docker.defaultCudaCli;
+        docker-cuda = docker.defaultCudaImage;
+      }
       // lib.mapAttrs' (name: value: lib.nameValuePair "docker-${name}" value) docker.dockerImages
       // lib.mapAttrs' (name: value: lib.nameValuePair "cli-candle-cuda-${name}" value) docker.cudaCliPackages;
 
@@ -208,9 +211,10 @@ in {
     }
     // (linuxOutputs.devShells or {});
 
-  # Data exposed for the GitHub Actions matrix. `nix eval .#ci.<system>.commands`
-  # returns { name → command } drawn from nix/ci.nix.
-  ci = {inherit (ci) commands;};
+  # Data exposed for the GitHub Actions matrix:
+  #   .commands → { name → cmdString }  (quick CI checks)
+  #   .builds   → { name → attrPath }   (extended post-gate builds)
+  ci = {inherit (ci) commands builds;};
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
   checks = linuxOutputs.nixosTests or {};
