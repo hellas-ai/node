@@ -92,6 +92,15 @@ impl Cost {
             proofs: self.proofs.checked_add(other.proofs)?,
         })
     }
+
+    /// Returns true if every cost dimension is within `budget`.
+    #[must_use]
+    pub const fn fits(self, budget: Self) -> bool {
+        self.base <= budget.base
+            && self.reads <= budget.reads
+            && self.writes <= budget.writes
+            && self.proofs <= budget.proofs
+    }
 }
 
 /// Deterministic fee schedule for kernel operation costs.
