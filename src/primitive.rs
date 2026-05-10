@@ -45,6 +45,8 @@ impl CoinId {
     /// Encoded length of a coin identifier.
     pub const LENGTH: usize = ID_LENGTH;
 
+    pub(crate) const ZERO: Self = Self([0; Self::LENGTH]);
+
     /// Creates a coin id from canonical bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
@@ -70,7 +72,7 @@ impl CoinId {
 
     /// Derives the canonical id for one resolve payout coin.
     pub(crate) fn payout(edge: EdgeId, index: usize, owner: Key) -> Self {
-        let mut digest = Digest::new(b"hellas.edge.coin.v1");
+        let mut digest = Digest::new(crate::domain::COIN_PAYOUT);
 
         digest.bytes(edge.as_bytes());
         digest.usize(index);
@@ -90,6 +92,8 @@ pub struct EdgeId([u8; Self::LENGTH]);
 impl EdgeId {
     /// Encoded length of an edge identifier.
     pub const LENGTH: usize = ID_LENGTH;
+
+    pub(crate) const ZERO: Self = Self([0; Self::LENGTH]);
 
     /// Creates an edge id from canonical bytes.
     #[must_use]
@@ -230,7 +234,7 @@ impl Sig {
     }
 
     fn half(key: Key, hash: ResolveHash, index: u8) -> [u8; ResolveHash::LENGTH] {
-        let mut digest = Digest::new(b"hellas.sig.placeholder.v1");
+        let mut digest = Digest::new(crate::domain::SIG_PLACEHOLDER);
 
         digest.u8(index);
         digest.bytes(key.as_bytes());

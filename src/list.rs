@@ -36,6 +36,15 @@ impl<T, const N: usize> List<T, N> {
 }
 
 impl<T: Copy, const N: usize> List<T, N> {
+    /// Creates an empty bounded list using `fill` for inactive slots.
+    #[must_use]
+    pub const fn empty(fill: T) -> Self {
+        Self {
+            items: [fill; N],
+            len: 0,
+        }
+    }
+
     /// Creates a bounded list from a backing array and live length.
     #[must_use]
     pub const fn new(items: [T; N], len: usize) -> Option<Self> {
@@ -63,22 +72,6 @@ impl<T: Copy, const N: usize> List<T, N> {
     /// Iterates over copied live entries.
     pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
         self.as_slice().iter().copied()
-    }
-
-    pub(crate) fn resize<const M: usize>(self, fill: T) -> Option<List<T, M>> {
-        if self.len > M {
-            return None;
-        }
-
-        let mut items = [fill; M];
-        for (index, item) in self.iter().enumerate() {
-            items[index] = item;
-        }
-
-        Some(List {
-            items,
-            len: self.len,
-        })
     }
 }
 

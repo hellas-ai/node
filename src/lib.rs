@@ -5,8 +5,9 @@
 //! # Warning: Fake Crypto
 //!
 //! The `fake-crypto` feature enables deterministic, forgeable placeholder
-//! signature and seal verification for modelling and tests. It must not be used
-//! in production. Without that feature, placeholder signatures and seals do not
+//! signature/seal verification and the degenerate `Proof::basic` witness for
+//! modelling and tests. It must not be used in production. Without that
+//! feature, placeholder signatures, placeholder seals, and basic proofs do not
 //! verify.
 //!
 //! State objects and events are not directly constructible outside the crate.
@@ -44,6 +45,7 @@ compile_error!(
 
 mod block;
 mod context;
+pub(crate) mod domain;
 mod error;
 mod event;
 mod list;

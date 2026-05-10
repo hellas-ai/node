@@ -15,6 +15,8 @@ pub struct Coin {
 }
 
 impl Coin {
+    pub(super) const ZERO: Self = Self::new(Key::from_bytes([0; Key::LENGTH]), 0);
+
     const fn new(owner: Key, value: u64) -> Self {
         Self { owner, value }
     }
@@ -22,10 +24,6 @@ impl Coin {
     /// Issues a coin from raw operation payload.
     pub(super) const fn issue(owner: Key, value: u64) -> Self {
         Self::new(owner, value)
-    }
-
-    pub(super) const fn zero() -> Self {
-        Self::new(Key::from_bytes([0; Key::LENGTH]), 0)
     }
 
     /// Returns the owner settlement key.

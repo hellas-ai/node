@@ -20,8 +20,6 @@ pub(crate) const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 pub(crate) const PARTIES: Parties = Parties::new(MAKER, TAKER);
 pub(crate) const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 pub(crate) const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
-pub(crate) const TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT);
-pub(crate) const OTHER_TERMS: Terms = Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT);
 pub(crate) const MAKER_ID: CoinId = coin_id(1);
 pub(crate) const TAKER_ID: CoinId = coin_id(2);
 pub(crate) const MAKER_VALUE: u64 = 10;
@@ -30,6 +28,11 @@ pub(crate) const EDGE_VALUE: u64 = MAKER_VALUE + TAKER_VALUE;
 pub(crate) const MAKER_PAYOUT: u64 = 7;
 pub(crate) const TAKER_PAYOUT: u64 = 8;
 pub(crate) const BAD_PAYOUT: u64 = TAKER_PAYOUT + 1;
+pub(crate) const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> =
+    payouts_const(MAKER_PAYOUT, TAKER_PAYOUT);
+pub(crate) const TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
+pub(crate) const OTHER_TERMS: Terms =
+    Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
 
 pub(crate) type TraceState = State<FixedStore<6, 2>>;
 pub(crate) type TraceView = View<6, 2>;
@@ -215,6 +218,21 @@ pub(crate) fn bad_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
 }
 
 pub(crate) fn payouts_with(maker: u64, taker: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let Some(outputs) = List::new(
+        [
+            Payout::new(MAKER, maker),
+            Payout::new(TAKER, taker),
+            Payout::new(MAKER, maker),
+            Payout::new(MAKER, maker),
+        ],
+        2,
+    ) else {
+        panic!("invalid trace payout list");
+    };
+    outputs
+}
+
+const fn payouts_const(maker: u64, taker: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
     let Some(outputs) = List::new(
         [
             Payout::new(MAKER, maker),

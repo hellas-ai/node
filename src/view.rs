@@ -17,8 +17,8 @@ impl<const C: usize, const E: usize> View<C, E> {
     #[must_use]
     pub fn new(coins: [Option<(CoinId, Coin)>; C], edges: [Option<(EdgeId, Edge)>; E]) -> Self {
         Self {
-            coins: Self::pack(coins),
-            edges: Self::pack(edges),
+            coins: Self::pack_coins(coins),
+            edges: Self::pack_edges(edges),
         }
     }
 
@@ -65,6 +65,44 @@ impl<const C: usize, const E: usize> View<C, E> {
         }
 
         packed
+    }
+
+    fn pack_coins(items: [Option<(CoinId, Coin)>; C]) -> [Option<(CoinId, Coin)>; C] {
+        let mut packed = Self::pack(items);
+        Self::sort(&mut packed, |left, right| {
+            left.0.as_bytes() > right.0.as_bytes()
+        });
+        packed
+    }
+
+    fn pack_edges(items: [Option<(EdgeId, Edge)>; E]) -> [Option<(EdgeId, Edge)>; E] {
+        let mut packed = Self::pack(items);
+        Self::sort(&mut packed, |left, right| {
+            left.0.as_bytes() > right.0.as_bytes()
+        });
+        packed
+    }
+
+    fn sort<T: Copy, const N: usize>(items: &mut [Option<T>; N], gt: fn(T, T) -> bool) {
+        let mut index = 1;
+        while index < N {
+            let Some(item) = items[index] else {
+                return;
+            };
+            let mut insert = index;
+            while insert > 0 {
+                let Some(previous) = items[insert - 1] else {
+                    break;
+                };
+                if !gt(previous, item) {
+                    break;
+                }
+                items[insert] = items[insert - 1];
+                insert -= 1;
+            }
+            items[insert] = Some(item);
+            index += 1;
+        }
     }
 }
 

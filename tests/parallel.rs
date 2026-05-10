@@ -14,11 +14,10 @@ const CONTEXT: Context = Context::new(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
-const TIMEOUT: BlockHeight = BlockHeight::new(2);
+const TIMEOUT: BlockHeight = BlockHeight::new(1);
 const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 const PARTIES: Parties = Parties::new(MAKER, TAKER);
-const TERMS: Terms = Terms::basic(ProtocolCode::new(1), PARTIES, TIMEOUT);
 const A_MAKER: CoinId = coin_id(1);
 const A_TAKER: CoinId = coin_id(2);
 const B_MAKER: CoinId = coin_id(3);
@@ -27,6 +26,8 @@ const MAKER_VALUE: u64 = 10;
 const TAKER_VALUE: u64 = 5;
 const MAKER_PAYOUT: u64 = 7;
 const TAKER_PAYOUT: u64 = 8;
+const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> = payouts_const(MAKER_PAYOUT, TAKER_PAYOUT);
+const TERMS: Terms = Terms::basic(ProtocolCode::new(1), PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
 
 type TestState = State<FixedStore<8, 2>>;
 type TestView = View<8, 2>;
@@ -183,7 +184,7 @@ fn open(edge: EdgeKey) -> Open {
 }
 
 fn resolve(edge: EdgeKey) -> Resolve {
-    Resolve::new(edge_id(edge), Proof::basic(TERMS.hash()), payouts())
+    Resolve::new(edge_id(edge), Proof::timeout(TERMS), payouts())
 }
 
 fn edge_id(edge: EdgeKey) -> EdgeId {
@@ -199,7 +200,7 @@ fn taker_out(edge: EdgeKey) -> CoinId {
 }
 
 fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Resolve::new(edge_id(edge), Proof::basic(TERMS.hash()), payouts()).output_ids()
+    Resolve::new(edge_id(edge), Proof::timeout(TERMS), payouts()).output_ids()
 }
 
 fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
@@ -209,6 +210,21 @@ fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
             Payout::new(TAKER, TAKER_PAYOUT),
             Payout::new(MAKER, MAKER_PAYOUT),
             Payout::new(MAKER, MAKER_PAYOUT),
+        ],
+        2,
+    ) else {
+        panic!("invalid parallel payout list");
+    };
+    outputs
+}
+
+const fn payouts_const(maker: u64, taker: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let Some(outputs) = List::new(
+        [
+            Payout::new(MAKER, maker),
+            Payout::new(TAKER, taker),
+            Payout::new(MAKER, maker),
+            Payout::new(MAKER, maker),
         ],
         2,
     ) else {
