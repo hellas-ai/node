@@ -67,14 +67,14 @@ fn resolve_uses_prepaid_reserve() {
             Genesis::coin(TAKER_COIN, TAKER, 20),
         ],
     );
-    let _event = apply_with(
-        &mut state,
-        RESOURCE_CONTEXT,
-        &Op::Open(Open::from_terms(
-            funding(MAKER_COIN, TAKER_COIN),
-            BASIC_TERMS,
-        )),
-    );
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), BASIC_TERMS);
+    let Some(open_fee) = RESOURCE_CONTEXT.fee(open.cost()) else {
+        panic!("open fee overflow");
+    };
+    let Some(reserve) = RESOURCE_CONTEXT.fee(open.reserve_cost()) else {
+        panic!("reserve fee overflow");
+    };
+    let _event = apply_with(&mut state, RESOURCE_CONTEXT, &Op::Open(open));
     let event = apply_with(
         &mut state,
         RESOURCE_CONTEXT,
@@ -101,6 +101,7 @@ fn resolve_uses_prepaid_reserve() {
         state.store().coin(taker_out()).map(coin_view),
         Some((TAKER, 12)),
     );
+    assert_eq!(12 + 12 + open_fee + reserve, 50);
 }
 
 #[test]
@@ -117,6 +118,47 @@ fn resolve_rejects_unpaid_fee_without_mutation() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
+        Err(ApplyError::InvalidResolve { input: edge() }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
+    let cheap = Context::with_fees(
+        BlockHeight::new(1),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+        Fees::new(0, 0, 0, 1),
+    );
+    let expensive = Context::with_fees(
+        BlockHeight::new(1),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+        Fees::new(0, 0, 0, 3),
+    );
+    let mut state = state(
+        empty_store(),
+        [
+            Genesis::coin(MAKER_COIN, MAKER, 20),
+            Genesis::coin(TAKER_COIN, TAKER, 10),
+        ],
+    );
+    let open = open_op();
+    let _event = apply_with(&mut state, cheap, &Op::Open(open));
+    let store = *state.store();
+    let resolve = Resolve::new(
+        edge(),
+        proof(),
+        payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14)),
+    );
+
+    assert_eq!(cheap.fee(open.reserve_cost()), Some(2));
+    assert_eq!(
+        state.store().edge(edge()).map(edge_view),
+        Some((28, 2, PARTIES, terms())),
+    );
+    assert_eq!(expensive.fee(resolve.cost()), Some(3));
+    assert_eq!(
+        state.apply(expensive, &Op::Resolve(resolve)),
         Err(ApplyError::InvalidResolve { input: edge() }),
     );
     assert_eq!(*state.store(), store);
