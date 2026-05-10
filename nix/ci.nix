@@ -82,16 +82,20 @@
         + lib.concatMapStrings (
           name: let
             c = allChecks.${name};
-            cmd =
-              if mode == "check"
-              then c.check
-              else c.fix or c.check;
           in ''
 
             echo "== ${mode}-${name}"
-            ${cmd}
+            ${
+              if mode == "check"
+              then c.check
+              else c.fix
+            }
           ''
-        ) (lib.attrNames allChecks);
+        ) (
+          if mode == "check"
+          then lib.attrNames allChecks
+          else lib.attrNames (lib.filterAttrs (_: c: c ? fix) allChecks)
+        );
     };
 in {
   # Flat { name → command } exposed to the CI matrix. Keep this stable;
