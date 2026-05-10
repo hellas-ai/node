@@ -30,10 +30,7 @@ impl MetricsBundle {
     /// `Endpoint` handle to expose.
     #[cfg(feature = "otel")]
     #[allow(dead_code)] // unused in `--features otel` without `candle`
-    pub fn with_iroh(
-        mut self,
-        iroh: tonic_iroh_transport::iroh::metrics::EndpointMetrics,
-    ) -> Self {
+    pub fn with_iroh(mut self, iroh: tonic_iroh_transport::iroh::metrics::EndpointMetrics) -> Self {
         self.iroh = Some(iroh);
         self
     }
@@ -56,8 +53,11 @@ pub fn spawn_metrics_server(port: u16, bundle: MetricsBundle) {
             .route(
                 "/metrics",
                 axum::routing::get(
-                    move |axum::extract::State(bundle): axum::extract::State<Arc<MetricsBundle>>| async move {
-                        encode_metrics(&bundle).map(|buf| (axum::http::StatusCode::OK, buf))
+                    move |axum::extract::State(bundle): axum::extract::State<
+                        Arc<MetricsBundle>,
+                    >| async move {
+                        encode_metrics(&bundle)
+                            .map(|buf| (axum::http::StatusCode::OK, buf))
                             .unwrap_or((
                                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                 "failed to encode metrics".to_string(),
