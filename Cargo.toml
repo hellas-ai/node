@@ -30,6 +30,10 @@ stateright = "0.31"
 name = "apply"
 harness = false
 
+[[example]]
+name = "end_to_end"
+required-features = ["secp256k1"]
+
 [lints.rust]
 elided-lifetimes-in-paths = "deny"
 missing-copy-implementations = "deny"
