@@ -4,7 +4,10 @@ use super::*;
 fn apply_all_opens_and_resolves_one_batch() {
     let mut state = funded_state();
     let ops = List::all([
-        Op::Open(Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())),
+        Op::Open(Open::from_terms(
+            funding(MAKER_COIN, TAKER_COIN),
+            BASIC_TERMS,
+        )),
         Op::Resolve(Resolve::new(
             edge(),
             proof(),
@@ -60,15 +63,14 @@ fn apply_all_allows_empty_batch() {
 
 #[test]
 fn apply_all_rolls_back_on_error() {
-    let mut state = funded_state();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
+    let terms = terms_with(outputs);
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
+    let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
     let ops = List::all([
-        Op::Open(Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())),
-        Op::Resolve(Resolve::new(
-            edge(),
-            proof(),
-            payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9)),
-        )),
+        Op::Open(open),
+        Op::Resolve(Resolve::new(open.output(), Proof::timeout(terms), outputs)),
     ]);
 
     let Err(error) = state.apply_all(CONTEXT, &ops) else {
@@ -76,6 +78,11 @@ fn apply_all_rolls_back_on_error() {
     };
 
     assert_eq!(error.index(), 1);
-    assert_eq!(error.source(), ApplyError::InvalidResolve { input: edge() });
+    assert_eq!(
+        error.source(),
+        ApplyError::InvalidResolve {
+            input: open.output(),
+        },
+    );
     assert_eq!(*state.store(), store);
 }

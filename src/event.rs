@@ -11,7 +11,6 @@ use crate::{
 
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
-type EffectCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 
 /// Deterministic event diff produced by an ordered operation batch.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -30,10 +29,8 @@ impl<const N: usize> Diff<N> {
 
     pub(crate) fn push(&mut self, event: &Event) {
         debug_assert!(self.len < N);
-        if self.len < N {
-            self.events[self.len] = Some(*event);
-            self.len += 1;
-        }
+        self.events[self.len] = Some(*event);
+        self.len += 1;
     }
 
     /// Returns the number of committed events in the diff.
@@ -60,7 +57,7 @@ impl<const N: usize> Diff<N> {
 
     /// Iterates over committed events.
     pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
-        self.events[..self.len].iter().copied().flatten()
+        self.events[..self.len].iter().filter_map(|event| *event)
     }
 }
 
@@ -122,7 +119,7 @@ impl Change {
         }
     }
 
-    pub(super) fn resolve(input: (EdgeId, Edge), outputs: &ResolveCoins) -> KernelResult<Self> {
+    pub(super) fn resolve(input: (EdgeId, Edge), outputs: &ResolveCoins) -> Self {
         let outputs = *outputs;
         let event = Event {
             kind: EventKind::EdgeResolved {
@@ -130,10 +127,9 @@ impl Change {
                 outputs: Self::ids(outputs),
             },
         };
-        let effect = Effect::resolve(input, &outputs)
-            .ok_or(ApplyError::InvalidResolve { input: input.0 })?;
+        let effect = Effect::resolve(input, &outputs);
 
-        Ok(Self { event, effect })
+        Self { event, effect }
     }
 
     pub(super) const fn event(&self) -> Event {
@@ -145,15 +141,13 @@ impl Change {
     }
 
     fn ids<const N: usize>(coins: List<(CoinId, Coin), N>) -> List<CoinId, N> {
-        let fill = coins
-            .as_slice()
-            .first()
-            .map_or(CoinId::from_bytes([0; CoinId::LENGTH]), |&(id, _)| id);
+        let fill = coins.as_slice().first().map_or(CoinId::ZERO, |&(id, _)| id);
         coins.map(fill, |(id, _)| id)
     }
 }
 
 /// Private store mutation carried by a [`Change`].
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 enum Effect {
     Open {
@@ -162,7 +156,7 @@ enum Effect {
     },
     Resolve {
         edge: (EdgeId, Edge),
-        coins: EffectCoins,
+        coins: ResolveCoins,
     },
 }
 
@@ -174,16 +168,11 @@ impl Effect {
         }
     }
 
-    fn resolve(edge: (EdgeId, Edge), coins: &ResolveCoins) -> Option<Self> {
-        let fill = coins
-            .as_slice()
-            .first()
-            .copied()
-            .unwrap_or((CoinId::from_bytes([0; CoinId::LENGTH]), Coin::zero()));
-        Some(Self::Resolve {
+    const fn resolve(edge: (EdgeId, Edge), coins: &ResolveCoins) -> Self {
+        Self::Resolve {
             edge,
-            coins: (*coins).resize(fill)?,
-        })
+            coins: *coins,
+        }
     }
 
     fn fold<T: Tx>(&self, tx: &mut T) -> KernelResult<()> {

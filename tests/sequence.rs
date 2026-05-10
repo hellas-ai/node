@@ -111,9 +111,7 @@ fn assert_event_matches(
             prop_assert_eq!(*output, l1::edge_id(edge));
         }
         (Step::Resolve(edge, proof), EventKind::EdgeResolved { input, outputs })
-            if proof != ProofKey::EarlyTimeout
-                && proof != ProofKey::WrongTerms
-                && proof != ProofKey::BadSeal =>
+            if proof_accepts(proof) =>
         {
             prop_assert_eq!(*input, l1::edge_id(edge));
             prop_assert_eq!(*outputs, l1::output_ids(edge));
@@ -126,4 +124,14 @@ fn assert_event_matches(
     }
 
     Ok(())
+}
+
+const fn proof_accepts(proof: ProofKey) -> bool {
+    match proof {
+        ProofKey::Timeout => true,
+        ProofKey::Basic | ProofKey::Agreement | ProofKey::Claimant | ProofKey::Challenger => {
+            cfg!(feature = "fake-crypto")
+        }
+        ProofKey::EarlyTimeout | ProofKey::WrongTerms | ProofKey::BadSeal => false,
+    }
 }

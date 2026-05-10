@@ -52,7 +52,7 @@ impl Resolve {
     /// Returns the canonical ids of the payout coins this resolve creates.
     #[must_use]
     pub fn output_ids(&self) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-        let mut ids = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_OUTPUTS];
+        let mut ids = [CoinId::ZERO; MAX_EDGE_OUTPUTS];
 
         for (index, payout) in self.outputs.iter().enumerate() {
             ids[index] = self.output_id(index, payout);
@@ -67,11 +67,11 @@ impl Resolve {
     /// Returns the deterministic resource cost of this resolve.
     #[must_use]
     pub fn cost(&self) -> Cost {
-        Self::cost_for(self.outputs.len(), self.proof)
+        Self::cost_for(self.outputs.len(), &self.proof)
     }
 
-    fn cost_for(outputs: usize, proof: Proof) -> Cost {
-        Self::cost_for_kind(outputs, proof.kind())
+    fn cost_for(outputs: usize, proof: &Proof) -> Cost {
+        Self::cost_for_kind(outputs, (*proof).kind())
     }
 
     pub(super) fn cost_for_kind(outputs: usize, kind: ResolveKind) -> Cost {
@@ -104,7 +104,7 @@ impl Resolve {
             return Err(ApplyError::InvalidResolve { input: self.input });
         }
 
-        Change::resolve((self.input, edge), &coins)
+        Ok(Change::resolve((self.input, edge), &coins))
     }
 
     pub(super) fn access(&self) -> Access {
@@ -130,7 +130,7 @@ impl Resolve {
         terms: TermsHash,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> ResolveHash {
-        let mut digest = Digest::new(b"hellas.edge.resolve.v1");
+        let mut digest = Digest::new(crate::domain::RESOLVE);
 
         digest.bytes(input.as_bytes());
         digest.u8(kind.tag());
@@ -161,9 +161,7 @@ impl Resolve {
     fn coins(&self) -> KernelResult<ResolveCoins> {
         let outputs = self.outputs.as_slice();
         let Some(first) = outputs.first().copied() else {
-            let fill = (CoinId::from_bytes([0; CoinId::LENGTH]), Coin::zero());
-            return List::new([fill; MAX_EDGE_OUTPUTS], 0)
-                .ok_or(ApplyError::InvalidResolve { input: self.input });
+            return Ok(List::empty((CoinId::ZERO, Coin::ZERO)));
         };
         let mut coins = [first.coin(self.input, 0); MAX_EDGE_OUTPUTS];
 

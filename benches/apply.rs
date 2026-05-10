@@ -19,7 +19,13 @@ const TAKER_KEY: Key = Key::from_bytes([8; Key::LENGTH]);
 const PARTIES: Parties = Parties::new(MAKER_KEY, TAKER_KEY);
 const MAKER: CoinId = CoinId::from_bytes([1; CoinId::LENGTH]);
 const TAKER: CoinId = CoinId::from_bytes([2; CoinId::LENGTH]);
-const TERMS: Terms = Terms::basic(ProtocolCode::new(1), PARTIES, BlockHeight::new(2));
+const NO_PAYOUTS: List<Payout, MAX_EDGE_OUTPUTS> = List::empty(Payout::new(MAKER_KEY, 0));
+const TERMS: Terms = Terms::basic(
+    ProtocolCode::new(1),
+    PARTIES,
+    BlockHeight::new(1),
+    NO_PAYOUTS,
+);
 const CONTEXT: Context = Context::new(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
@@ -29,8 +35,8 @@ fn edge() -> EdgeId {
     Open::from_terms(empty_funding(), TERMS).output()
 }
 
-fn proof() -> Proof {
-    Proof::basic(TERMS.hash())
+const fn proof() -> Proof {
+    Proof::timeout(TERMS)
 }
 
 fn apply(c: &mut Criterion) {
@@ -86,11 +92,8 @@ fn empty_party() -> List<CoinId, MAX_PARTY_INPUTS> {
     inputs
 }
 
-fn no_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let Some(outputs) = List::new([Payout::new(MAKER_KEY, 0); MAX_EDGE_OUTPUTS], 0) else {
-        panic!("invalid benchmark payout list");
-    };
-    outputs
+const fn no_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    NO_PAYOUTS
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]

@@ -5,7 +5,10 @@ fn open_locks_two_coins_into_one_edge() {
     let mut state = funded_state();
     let event = apply(
         &mut state,
-        &Op::Open(Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())),
+        &Op::Open(Open::from_terms(
+            funding(MAKER_COIN, TAKER_COIN),
+            BASIC_TERMS,
+        )),
     );
 
     assert_eq!(
@@ -25,10 +28,9 @@ fn open_locks_two_coins_into_one_edge() {
 
 #[test]
 fn open_locks_three_coins_into_one_edge() {
-    let open = Open::new(
+    let open = Open::from_terms(
         maker2_funding(MAKER_COIN, EXTRA_COIN, TAKER_COIN),
-        PARTIES,
-        terms(),
+        BASIC_TERMS,
     );
     let mut state = state(
         store_for(&open),
@@ -52,11 +54,7 @@ fn open_locks_three_coins_into_one_edge() {
 
 #[test]
 fn open_allows_maker_only_funding() {
-    let open = Open::new(
-        Funding::new(party1(MAKER_COIN), empty_party()),
-        PARTIES,
-        terms(),
-    );
+    let open = Open::from_terms(Funding::new(party1(MAKER_COIN), empty_party()), BASIC_TERMS);
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
@@ -80,11 +78,7 @@ fn open_allows_maker_only_funding() {
 
 #[test]
 fn open_allows_taker_only_funding() {
-    let open = Open::new(
-        Funding::new(empty_party(), party1(TAKER_COIN)),
-        PARTIES,
-        terms(),
-    );
+    let open = Open::from_terms(Funding::new(empty_party(), party1(TAKER_COIN)), BASIC_TERMS);
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
@@ -107,8 +101,30 @@ fn open_allows_taker_only_funding() {
 }
 
 #[test]
+fn open_allows_same_maker_and_taker_party() {
+    let parties = Parties::new(MAKER, MAKER);
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(MAKER, 8));
+    let terms = Terms::basic(PROTOCOL, parties, TIMEOUT, outputs);
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
+    let mut state = funded_state_for(&open);
+    let event = apply(&mut state, &Op::Open(open));
+
+    assert_eq!(
+        event.kind(),
+        EventKind::EdgeOpened {
+            inputs: input_ids2(MAKER_COIN, TAKER_COIN),
+            output: open.output(),
+        },
+    );
+    assert_eq!(
+        state.store().edge(open.output()).map(edge_view),
+        Some((15, 0, parties, terms.hash())),
+    );
+}
+
+#[test]
 fn open_allows_empty_funding_when_fee_is_zero() {
-    let open = Open::new(Funding::new(empty_party(), empty_party()), PARTIES, terms());
+    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
@@ -240,7 +256,7 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
 
 #[test]
 fn open_rejects_funding_below_fee_without_mutation() {
-    let open = Open::new(Funding::new(empty_party(), empty_party()), PARTIES, terms());
+    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
     let mut state = funded_state();
     let store = *state.store();
 
@@ -261,10 +277,9 @@ fn open_rejects_duplicate_funding_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
-            &Op::Open(Open::new(
+            &Op::Open(Open::from_terms(
                 Funding::new(party1(MAKER_COIN), party1(MAKER_COIN)),
-                PARTIES,
-                terms()
+                BASIC_TERMS
             )),
         ),
         Err(ApplyError::DuplicateInput { id: MAKER_COIN }),
@@ -280,7 +295,10 @@ fn open_rejects_unavailable_edge_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
-            &Op::Open(Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())),
+            &Op::Open(Open::from_terms(
+                funding(MAKER_COIN, TAKER_COIN),
+                BASIC_TERMS,
+            )),
         ),
         Err(ApplyError::EdgeInsertRejected {
             id: edge(),
@@ -304,7 +322,10 @@ fn open_rejects_overflow_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
-            &Op::Open(Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())),
+            &Op::Open(Open::from_terms(
+                funding(MAKER_COIN, TAKER_COIN),
+                BASIC_TERMS,
+            )),
         ),
         Err(ApplyError::InvalidOpen { output: edge() }),
     );

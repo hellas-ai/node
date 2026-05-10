@@ -22,15 +22,12 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let parties = Parties::new(maker_key, taker_key);
     let maker = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker = CoinId::from_bytes([2; CoinId::LENGTH]);
-    let terms = Terms::basic(ProtocolCode::new(1), parties, BlockHeight::new(2));
-    let proof = Proof::basic(terms.hash());
+    let outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
+    let terms = Terms::basic(ProtocolCode::new(1), parties, BlockHeight::new(1), outputs);
+    let proof = Proof::timeout(terms);
     let expected_open = Open::from_terms(funding(maker, taker), terms);
     let edge = expected_open.output();
-    let expected_resolve = Resolve::new(
-        edge,
-        proof,
-        payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
-    );
+    let expected_resolve = Resolve::new(edge, proof, outputs);
     let maker_out = nth(expected_resolve.output_ids(), 0);
     let taker_out = nth(expected_resolve.output_ids(), 1);
     let maker_seed = Genesis::coin(maker, maker_key, 10);
@@ -43,11 +40,7 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         let open = Op::Open(Open::from_terms(funding(maker, taker), terms));
         assert_eq!(open, Op::Open(expected_open));
         let is_open = matches!(open, Op::Open(_));
-        let resolve = Op::Resolve(Resolve::new(
-            edge,
-            proof,
-            payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
-        ));
+        let resolve = Op::Resolve(Resolve::new(edge, proof, outputs));
         assert_eq!(resolve, Op::Resolve(expected_resolve));
         let is_resolve = matches!(resolve, Op::Resolve(_));
         let Ok(mut chain) = State::genesis(store, &[maker_seed, taker_seed]) else {

@@ -27,8 +27,6 @@ pub trait Store {
 /// transaction and become visible to the backing store only on [`Tx::commit`].
 /// A dropped (uncommitted) transaction rolls back.
 ///
-/// The edge methods have coin-only defaults for narrow test stores. A real L1
-/// object store must implement coin and edge access together.
 pub trait Tx {
     /// Returns the coin stored under `id`, if any.
     fn coin(&self, id: CoinId) -> Option<Coin>;
@@ -45,9 +43,7 @@ pub trait Tx {
     fn remove_coin(&mut self, id: CoinId) -> Option<Coin>;
 
     /// Returns the edge stored under `id`, if any.
-    fn edge(&self, _id: EdgeId) -> Option<Edge> {
-        None
-    }
+    fn edge(&self, id: EdgeId) -> Option<Edge>;
 
     /// Inserts `edge` under `id`.
     ///
@@ -55,14 +51,10 @@ pub trait Tx {
     ///
     /// Returns [`InsertError::Exists`] if `id` is already occupied, or
     /// [`InsertError::Unavailable`] if the store cannot accept `id`.
-    fn insert_edge(&mut self, _id: EdgeId, _edge: Edge) -> KernelResult<(), InsertError> {
-        Err(InsertError::Unavailable)
-    }
+    fn insert_edge(&mut self, id: EdgeId, edge: Edge) -> KernelResult<(), InsertError>;
 
     /// Removes and returns the edge stored under `id`, if any.
-    fn remove_edge(&mut self, _id: EdgeId) -> Option<Edge> {
-        None
-    }
+    fn remove_edge(&mut self, id: EdgeId) -> Option<Edge>;
 
     /// Commits staged mutations to the backing store.
     fn commit(self);

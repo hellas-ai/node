@@ -19,7 +19,7 @@ fn operations_report_deterministic_cost() {
         agreement_proof(edge(), resolve.outputs()).cost(),
         Cost::new(0, 0, 0, 2)
     );
-    assert_eq!(proof().kind(), ResolveKind::Basic);
+    assert_eq!(proof().kind(), ResolveKind::Timeout);
     assert_eq!(proof().terms(), terms());
     assert_eq!(Proof::timeout(BASIC_TERMS).terms(), terms());
     assert_eq!(Proof::timeout(BASIC_TERMS).cost(), Cost::new(0, 0, 0, 1));
@@ -97,7 +97,7 @@ fn operations_report_access_conflicts() {
         proof(),
         payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
     );
-    let other_open = Open::new(funding(coin_id(20), coin_id(21)), PARTIES, terms());
+    let other_open = Open::from_terms(funding(coin_id(20), coin_id(21)), BASIC_TERMS);
     let open_op = Op::Open(open);
     let resolve_op = Op::Resolve(resolve);
     let other_op = Op::Open(other_open);
@@ -139,7 +139,7 @@ fn block_reports_access_conflicts() {
         proof(),
         payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
     );
-    let other_open = Open::new(funding(coin_id(20), coin_id(21)), PARTIES, terms());
+    let other_open = Open::from_terms(funding(coin_id(20), coin_id(21)), BASIC_TERMS);
     let serial = Block::new(CONTEXT, List::all([Op::Open(open), Op::Resolve(resolve)]));
     let disjoint = Block::new(CONTEXT, List::all([Op::Open(open), Op::Open(other_open)]));
 

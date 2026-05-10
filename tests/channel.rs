@@ -34,7 +34,11 @@ const RESOURCE_CONTEXT: Context = Context::with_fees(
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 2, 1, 0),
 );
-const TIMEOUT: BlockHeight = BlockHeight::new(2);
+const TIMEOUT: BlockHeight = BlockHeight::new(1);
+const EARLY_CONTEXT: Context = Context::new(
+    BlockHeight::new(0),
+    BlockHash::from_bytes([0; BlockHash::LENGTH]),
+);
 const TIMEOUT_CONTEXT: Context =
     Context::new(TIMEOUT, BlockHash::from_bytes([0; BlockHash::LENGTH]));
 
@@ -43,12 +47,15 @@ const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 const PARTIES: Parties = Parties::new(MAKER, TAKER);
 const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
-const BASIC_TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT);
-const OTHER_TERMS_VALUE: Terms = Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT);
 
 const MAKER_COIN: CoinId = coin_id(1);
 const TAKER_COIN: CoinId = coin_id(2);
 const EXTRA_COIN: CoinId = coin_id(7);
+
+const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> =
+    payouts_const(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+const BASIC_TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
+const OTHER_TERMS_VALUE: Terms = Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
 
 const MAKER_SEED: Genesis = Genesis::coin(MAKER_COIN, MAKER, 10);
 const TAKER_SEED: Genesis = Genesis::coin(TAKER_COIN, TAKER, 5);
@@ -61,12 +68,16 @@ fn other_terms() -> TermsHash {
     OTHER_TERMS_VALUE.hash()
 }
 
-fn proof() -> Proof {
-    Proof::basic(terms())
+const fn terms_with(outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, outputs)
 }
 
-fn other_proof() -> Proof {
-    Proof::basic(other_terms())
+const fn proof() -> Proof {
+    Proof::timeout(BASIC_TERMS)
+}
+
+const fn other_proof() -> Proof {
+    Proof::timeout(OTHER_TERMS_VALUE)
 }
 
 fn agreement_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
@@ -158,7 +169,7 @@ fn open_state() -> State<FixedStore<6, 1>> {
 }
 
 fn open_op() -> Open {
-    Open::new(funding(MAKER_COIN, TAKER_COIN), PARTIES, terms())
+    Open::from_terms(funding(MAKER_COIN, TAKER_COIN), BASIC_TERMS)
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {
@@ -211,6 +222,13 @@ const fn payouts4() -> List<Payout, MAX_EDGE_OUTPUTS> {
         Payout::new(MAKER, 4),
         Payout::new(TAKER, 3),
     ])
+}
+
+const fn payouts_const(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let Some(outputs) = List::new([first, second, first, first], 2) else {
+        panic!("invalid test payout list");
+    };
+    outputs
 }
 
 fn no_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
@@ -339,6 +357,18 @@ fn store_for(open: &Open) -> FixedStore<6, 1> {
             taker_out(),
             extra_out(),
         ],
+        [open.output()],
+    )
+}
+
+fn store_for_resolve(open: &Open, outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
+    let ids = Resolve::new(open.output(), proof(), outputs).output_ids();
+    let first = ids.as_slice().first().copied().unwrap_or_else(maker_out);
+    let second = ids.as_slice().get(1).copied().unwrap_or_else(taker_out);
+    let third = ids.as_slice().get(2).copied().unwrap_or_else(extra_out);
+
+    FixedStore::empty(
+        [MAKER_COIN, TAKER_COIN, EXTRA_COIN, first, second, third],
         [open.output()],
     )
 }
