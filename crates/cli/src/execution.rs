@@ -561,6 +561,10 @@ async fn drain_to_outcome(
 // PreparedRoute — Local | RemoteDirect | RemoteDiscovery
 // ---------------------------------------------------------------------------
 
+// `RemoteDirect` is boxed; `RemoteDiscovery` carries the full quote request and
+// stays sizeable. The variant is short-lived (one per execution setup), so the
+// remaining disparity isn't worth more boxing.
+#[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
@@ -568,7 +572,7 @@ enum PreparedRoute {
         request_commitment: Vec<u8>,
         provenance: ExecutionProvenance,
     },
-    RemoteDirect(RemoteExecution),
+    RemoteDirect(Box<RemoteExecution>),
     RemoteDiscovery {
         quote_req: QuotePreparedTextRequest,
         retries: usize,
@@ -623,9 +627,9 @@ impl PreparedRoute {
             ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
                 let quote = quote_remote_target(quote_req, &endpoint, target).await?;
-                Ok(Self::RemoteDirect(RemoteExecution::from_quoted(
+                Ok(Self::RemoteDirect(Box::new(RemoteExecution::from_quoted(
                     endpoint, quote,
-                )))
+                ))))
             }
             ExecutionRoute::RemoteDiscovery { retries } => Ok(Self::RemoteDiscovery {
                 quote_req: quote_req.clone(),
@@ -653,6 +657,7 @@ impl PreparedRoute {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // see PreparedRoute
 enum OpaquePreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
@@ -660,7 +665,7 @@ enum OpaquePreparedRoute {
         request: PbOpaqueRequest,
         request_commitment: Vec<u8>,
     },
-    RemoteDirect(OpaqueRemoteExecution),
+    RemoteDirect(Box<OpaqueRemoteExecution>),
     RemoteDiscovery {
         request: PbOpaqueRequest,
         retries: usize,
@@ -690,9 +695,9 @@ async fn prepare_opaque_route(
         ExecutionRoute::RemoteDirect(target) => {
             let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
             let quote = quote_opaque_remote_target(request, &endpoint, target).await?;
-            Ok(OpaquePreparedRoute::RemoteDirect(
+            Ok(OpaquePreparedRoute::RemoteDirect(Box::new(
                 OpaqueRemoteExecution::from_quoted(endpoint, request.clone(), quote),
-            ))
+            )))
         }
         ExecutionRoute::RemoteDiscovery { retries } => Ok(OpaquePreparedRoute::RemoteDiscovery {
             request: request.clone(),
