@@ -55,6 +55,7 @@ impl Model for ChannelModel {
             #[cfg(feature = "fake-crypto")]
             actions.push(Action::InvalidResolve);
             actions.push(Action::InvalidProof);
+            actions.push(Action::AdversarialTimeout);
         }
     }
 
@@ -62,6 +63,18 @@ impl Model for ChannelModel {
         let mut state = *last_state;
         let context = action.context();
         let op = action.op();
+
+        if matches!(action, Action::AdversarialTimeout) {
+            // Soft application: ignore Ok/Err distinction. If the kernel
+            // correctly rejects, atomic rollback leaves state == last_state
+            // and the model adds no new state. If the kernel ever started
+            // accepting adversarial timeouts, the new state would have
+            // non-canonical payouts and `channel_shape` would fail — the
+            // bug surfaces as a property violation rather than a silently
+            // disabled action.
+            let _ = state.apply(context, &op);
+            return Some(state);
+        }
 
         if let Some(error) = action.error() {
             return Self::invalid_state(&mut state, last_state, context, &op, error);
@@ -170,12 +183,16 @@ enum Action {
     #[cfg(feature = "fake-crypto")]
     InvalidResolve,
     InvalidProof,
+    /// Submit a Timeout resolve with a value-conserving but non-canonical
+    /// payout split. The kernel must reject because the edge's terms commit a
+    /// specific `timeout_outputs` shape; any divergence is `InvalidProof`.
+    AdversarialTimeout,
 }
 
 impl Action {
     const fn context(self) -> Context {
         match self {
-            Self::Resolve(ProofKey::Timeout) => l1::TIMEOUT_CONTEXT,
+            Self::Resolve(ProofKey::Timeout) | Self::AdversarialTimeout => l1::TIMEOUT_CONTEXT,
             _ => l1::CONTEXT,
         }
     }
@@ -191,6 +208,11 @@ impl Action {
                 l1::bad_payouts(),
             )),
             Self::InvalidProof => Op::Resolve(l1::resolve(EdgeKey::First, ProofKey::WrongTerms)),
+            Self::AdversarialTimeout => Op::Resolve(l1::resolve_with(
+                EdgeKey::First,
+                ProofKey::Timeout,
+                l1::maker_grab_payouts(),
+            )),
         }
     }
 
@@ -205,7 +227,7 @@ impl Action {
                     input: l1::edge_id(EdgeKey::First),
                 })
             }
-            Self::Open(_) | Self::Resolve(_) => None,
+            Self::Open(_) | Self::Resolve(_) | Self::AdversarialTimeout => None,
         }
     }
 }
