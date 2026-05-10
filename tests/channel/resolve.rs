@@ -182,12 +182,12 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
     let cheap = Context::with_fees(
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
-        Fees::new(0, 0, 0, 1),
+        Fees::new(0, 0, 1),
     );
     let expensive = Context::with_fees(
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
-        Fees::new(0, 0, 0, 3),
+        Fees::new(0, 0, 3),
     );
     let outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
     let terms = terms_with(outputs);

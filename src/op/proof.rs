@@ -230,7 +230,7 @@ impl Proof {
     /// Returns the deterministic resource cost of checking this proof.
     #[must_use]
     pub const fn cost(self) -> Cost {
-        Cost::new(0, 0, 0, self.kind().proofs())
+        Cost::new(0, 0, self.kind().proofs())
     }
 
     pub(super) fn accepts<V: Verifier + ?Sized>(
