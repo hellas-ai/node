@@ -51,7 +51,7 @@ fn edge() -> EdgeId {
     Open::from_terms(empty_funding(), TERMS).output()
 }
 
-const fn proof() -> Proof {
+fn proof() -> Proof {
     Proof::timeout(TERMS)
 }
 
