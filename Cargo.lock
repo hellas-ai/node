@@ -494,6 +494,7 @@ dependencies = [
  "criterion",
  "itf",
  "proptest",
+ "proptest-state-machine",
  "serde",
  "serde_json",
  "stateright",
@@ -804,6 +805,15 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "proptest-state-machine"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53f556db2c446aa1f554a94938ea54bf16a37742bbb984dc5d8dcf6866b1dd5a"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
