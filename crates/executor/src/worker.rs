@@ -21,8 +21,8 @@ pub(crate) struct ExecuteWorker {
 }
 
 pub(crate) enum EnqueueError {
-    Busy(ExecuteJob),
-    Stopped(ExecuteJob),
+    Busy(Box<ExecuteJob>),
+    Stopped(Box<ExecuteJob>),
 }
 
 pub(crate) struct ExecuteJob {
@@ -84,8 +84,8 @@ impl ExecuteWorker {
     pub(crate) fn try_enqueue(&self, job: ExecuteJob) -> Result<(), EnqueueError> {
         match self.tx.try_send(job) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(job)) => Err(EnqueueError::Busy(job)),
-            Err(TrySendError::Disconnected(job)) => Err(EnqueueError::Stopped(job)),
+            Err(TrySendError::Full(job)) => Err(EnqueueError::Busy(Box::new(job))),
+            Err(TrySendError::Disconnected(job)) => Err(EnqueueError::Stopped(Box::new(job))),
         }
     }
 }
