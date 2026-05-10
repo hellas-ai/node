@@ -108,31 +108,16 @@ fn units(value: usize) -> u64 {
 }
 
 fn duplicate<T: Copy + Eq>(items: &[T]) -> Option<T> {
-    let mut outer = 0;
-    while outer < items.len() {
-        let mut inner = outer + 1;
-        while inner < items.len() {
-            if items[outer] == items[inner] {
-                return Some(items[outer]);
-            }
-            inner += 1;
-        }
-        outer += 1;
-    }
-
-    None
+    items
+        .iter()
+        .enumerate()
+        .find_map(|(i, item)| items[i + 1..].contains(item).then_some(*item))
 }
 
 fn overlaps<T: Eq, const A: usize, const B: usize>(left: &List<T, A>, right: &List<T, B>) -> bool {
-    for item in left.as_slice() {
-        for other in right.as_slice() {
-            if item == other {
-                return true;
-            }
-        }
-    }
-
-    false
+    left.as_slice()
+        .iter()
+        .any(|item| right.as_slice().contains(item))
 }
 
 const fn empty_coins<const N: usize>() -> List<CoinId, N> {

@@ -65,6 +65,17 @@ impl<T: Copy, const N: usize> List<T, N> {
         Some(Self { items, len })
     }
 
+    /// Creates a bounded list from a backing array and live length,
+    /// saturating at the array capacity. Use this when the caller can
+    /// statically prove `len <= N` (typically because `len` came from
+    /// another `List<_, N>`); the saturation is a no-op in that case
+    /// and avoids a fallible-but-impossible `List::new` call.
+    #[must_use]
+    pub const fn take(items: [T; N], len: usize) -> Self {
+        let live = if len > N { N } else { len };
+        Self { items, len: live }
+    }
+
     /// Maps live entries into another bounded list.
     #[must_use]
     pub fn map<U: Copy>(self, fill: U, mut f: impl FnMut(T) -> U) -> List<U, N> {
