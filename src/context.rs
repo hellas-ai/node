@@ -30,11 +30,19 @@ impl BlockHash {
 }
 
 /// Deterministic resource units consumed by one operation.
+///
+/// Three dimensions:
+///
+///   - `base`: fixed per-op overhead (always 1 for kernel ops; 0 for the
+///     proof contribution alone).
+///   - `slots`: each touched store slot. The kernel reads each slot for an
+///     existence check and writes it for the insert/remove that follows, so
+///     reads and writes always match — they are folded into one dimension.
+///   - `proofs`: signature/seal verifications.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Cost {
     base: u64,
-    reads: u64,
-    writes: u64,
+    slots: u64,
     proofs: u64,
 }
 
@@ -42,18 +50,16 @@ impl Cost {
     /// Zero resource cost.
     pub const ZERO: Self = Self {
         base: 0,
-        reads: 0,
-        writes: 0,
+        slots: 0,
         proofs: 0,
     };
 
     /// Creates a resource cost.
     #[must_use]
-    pub const fn new(base: u64, reads: u64, writes: u64, proofs: u64) -> Self {
+    pub const fn new(base: u64, slots: u64, proofs: u64) -> Self {
         Self {
             base,
-            reads,
-            writes,
+            slots,
             proofs,
         }
     }
@@ -64,16 +70,10 @@ impl Cost {
         self.base
     }
 
-    /// Returns the state-read unit count.
+    /// Returns the touched-slot unit count.
     #[must_use]
-    pub const fn reads(self) -> u64 {
-        self.reads
-    }
-
-    /// Returns the state-write unit count.
-    #[must_use]
-    pub const fn writes(self) -> u64 {
-        self.writes
+    pub const fn slots(self) -> u64 {
+        self.slots
     }
 
     /// Returns the proof-verification unit count.
@@ -87,8 +87,7 @@ impl Cost {
     pub fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             base: self.base.checked_add(other.base)?,
-            reads: self.reads.checked_add(other.reads)?,
-            writes: self.writes.checked_add(other.writes)?,
+            slots: self.slots.checked_add(other.slots)?,
             proofs: self.proofs.checked_add(other.proofs)?,
         })
     }
@@ -96,19 +95,17 @@ impl Cost {
     /// Returns true if every cost dimension is within `budget`.
     #[must_use]
     pub const fn fits(self, budget: Self) -> bool {
-        self.base <= budget.base
-            && self.reads <= budget.reads
-            && self.writes <= budget.writes
-            && self.proofs <= budget.proofs
+        self.base <= budget.base && self.slots <= budget.slots && self.proofs <= budget.proofs
     }
 }
 
 /// Deterministic fee schedule for kernel operation costs.
+///
+/// One price per [`Cost`] dimension.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Fees {
     base: u64,
-    read: u64,
-    write: u64,
+    slot: u64,
     proof: u64,
 }
 
@@ -116,20 +113,14 @@ impl Fees {
     /// Zero-fee schedule for tests and local models.
     pub const ZERO: Self = Self {
         base: 0,
-        read: 0,
-        write: 0,
+        slot: 0,
         proof: 0,
     };
 
     /// Creates a fee schedule.
     #[must_use]
-    pub const fn new(base: u64, read: u64, write: u64, proof: u64) -> Self {
-        Self {
-            base,
-            read,
-            write,
-            proof,
-        }
+    pub const fn new(base: u64, slot: u64, proof: u64) -> Self {
+        Self { base, slot, proof }
     }
 
     /// Returns the price per fixed operation unit.
@@ -138,16 +129,10 @@ impl Fees {
         self.base
     }
 
-    /// Returns the price per state-read unit.
+    /// Returns the price per touched-slot unit.
     #[must_use]
-    pub const fn read(self) -> u64 {
-        self.read
-    }
-
-    /// Returns the price per state-write unit.
-    #[must_use]
-    pub const fn write(self) -> u64 {
-        self.write
+    pub const fn slot(self) -> u64 {
+        self.slot
     }
 
     /// Returns the price per proof-verification unit.
@@ -160,12 +145,9 @@ impl Fees {
     #[must_use]
     pub fn charge(self, cost: Cost) -> Option<u64> {
         let base = self.base.checked_mul(cost.base())?;
-        let reads = self.read.checked_mul(cost.reads())?;
-        let writes = self.write.checked_mul(cost.writes())?;
+        let slots = self.slot.checked_mul(cost.slots())?;
         let proofs = self.proof.checked_mul(cost.proofs())?;
-        base.checked_add(reads)?
-            .checked_add(writes)?
-            .checked_add(proofs)
+        base.checked_add(slots)?.checked_add(proofs)
     }
 }
 
