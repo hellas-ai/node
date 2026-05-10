@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::FixedStore;
+use support::{FAKE_VERIFIER, FixedStore};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EventKind, Funding, Genesis, Key, List,
@@ -47,7 +47,7 @@ fn open_resolve_and_operation_match_do_not_allocate() {
             panic!("genesis rejected test seed");
         };
         let ops = List::all([open, resolve]);
-        let diff = chain.apply_all(CONTEXT, &ops);
+        let diff = chain.apply_all(CONTEXT, &FAKE_VERIFIER, &ops);
 
         assert_eq!(
             diff.map(|diff| (

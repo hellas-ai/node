@@ -20,6 +20,7 @@ use crate::{
     object::Coin,
     primitive::{CoinId, EdgeId},
     store::Tx,
+    verifier::Verifier,
 };
 
 const SEAL_LENGTH: usize = 32;
@@ -58,10 +59,15 @@ pub enum Op {
 }
 
 impl Op {
-    pub(crate) fn apply<T: Tx>(&self, context: Context, tx: &T) -> KernelResult<Change> {
+    pub(crate) fn apply<T: Tx, V: Verifier + ?Sized>(
+        &self,
+        context: Context,
+        verifier: &V,
+        tx: &T,
+    ) -> KernelResult<Change> {
         match self {
             Self::Open(op) => op.apply(context, tx),
-            Self::Resolve(op) => op.apply(context, tx),
+            Self::Resolve(op) => op.apply(context, verifier, tx),
         }
     }
 

@@ -10,7 +10,7 @@ mod support;
 use serde::Deserialize;
 
 use support::{
-    coin_view,
+    FAKE_VERIFIER, coin_view,
     l1::{
         EdgeKey, MAKER, MAKER_ID, ProofKey, Step, TAKER, TAKER_ID, TraceState, TraceView, edge_id,
         edge_value, initial_state, maker_out, taker_out,
@@ -46,7 +46,7 @@ impl<const N: usize> Fixture<N> {
                 let Some(op) = step.op() else {
                     panic!("fixture step has no operation");
                 };
-                let Ok(event) = state.apply(step.context(), &op) else {
+                let Ok(event) = state.apply(step.context(), &FAKE_VERIFIER, &op) else {
                     panic!("fixture operation rejected");
                 };
                 step.check(&event.kind());

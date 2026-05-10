@@ -4,6 +4,7 @@ use crate::{
     object::{Edge, Parties},
     primitive::{Digest, ProtocolCode, ResolveHash, Sig, TermsHash},
     terms::Terms,
+    verifier::Verifier,
 };
 
 /// Universal resolve witness kind.
@@ -72,8 +73,14 @@ impl Agreement {
         self.taker
     }
 
-    fn accepts(self, parties: Parties, hash: ResolveHash) -> bool {
-        self.maker.verifies(parties.maker(), hash) && self.taker.verifies(parties.taker(), hash)
+    fn accepts<V: Verifier + ?Sized>(
+        self,
+        verifier: &V,
+        parties: Parties,
+        hash: ResolveHash,
+    ) -> bool {
+        verifier.verify_sig(self.maker, parties.maker(), hash)
+            && verifier.verify_sig(self.taker, parties.taker(), hash)
     }
 }
 
@@ -105,8 +112,9 @@ impl Seal {
 
     /// Creates a deterministic dispute seal placeholder for modelling.
     ///
-    /// This is forgeable and not a cryptographic proof. The kernel accepts this
-    /// shape only when built with the `fake-crypto` feature.
+    /// This is forgeable and not a cryptographic proof. Whether the kernel
+    /// accepts this shape is decided by the [`crate::Verifier`] passed at
+    /// apply time.
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
         let mut digest = Digest::new(crate::domain::SEAL_PLACEHOLDER);
@@ -116,19 +124,6 @@ impl Seal {
         digest.bytes(hash.as_bytes());
 
         Self(digest.finish())
-    }
-
-    fn accepts(self, protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> bool {
-        #[cfg(feature = "fake-crypto")]
-        {
-            self == Self::placeholder(protocol, kind, hash)
-        }
-
-        #[cfg(not(feature = "fake-crypto"))]
-        {
-            let _ = (self, protocol, kind, hash);
-            false
-        }
     }
 }
 
@@ -232,7 +227,13 @@ impl Proof {
         Cost::new(0, 0, 0, self.kind().proofs())
     }
 
-    pub(super) fn accepts(self, context: Context, resolve: &Resolve, edge: Edge) -> bool {
+    pub(super) fn accepts<V: Verifier + ?Sized>(
+        self,
+        context: Context,
+        verifier: &V,
+        resolve: &Resolve,
+        edge: Edge,
+    ) -> bool {
         match self {
             Self::Basic { terms } => {
                 #[cfg(feature = "fake-crypto")]
@@ -248,7 +249,11 @@ impl Proof {
             }
             Self::Agreement { terms, agreement } => {
                 terms == edge.terms()
-                    && agreement.accepts(edge.parties(), resolve.hash(ResolveKind::Agreement))
+                    && agreement.accepts(
+                        verifier,
+                        edge.parties(),
+                        resolve.hash(ResolveKind::Agreement),
+                    )
             }
             Self::Timeout { terms } => {
                 terms.hash() == edge.terms()
@@ -258,12 +263,12 @@ impl Proof {
             Self::ClaimantWins { terms, seal } => {
                 let kind = ResolveKind::ClaimantWins;
                 terms.hash() == edge.terms()
-                    && seal.accepts(terms.protocol(), kind, resolve.hash(kind))
+                    && verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind))
             }
             Self::ChallengerWins { terms, seal } => {
                 let kind = ResolveKind::ChallengerWins;
                 terms.hash() == edge.terms()
-                    && seal.accepts(terms.protocol(), kind, resolve.hash(kind))
+                    && verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind))
             }
         }
     }

@@ -11,8 +11,24 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hellas_kernel::{
     Block, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId, Funding, Genesis,
     InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties,
-    Payout, Proof, ProtocolCode, Resolve, State, Store, Terms, Tx,
+    Payout, Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State, Store, Terms,
+    Tx, Verifier,
 };
+
+/// Bench-only verifier: rejects every signature and seal. The benchmark uses
+/// only Timeout proofs (no signatures or seals), so the reject answers are
+/// never observed.
+struct RejectAllVerifier;
+
+impl Verifier for RejectAllVerifier {
+    fn verify_sig(&self, _: Sig, _: Key, _: ResolveHash) -> bool {
+        false
+    }
+
+    fn verify_seal(&self, _: Seal, _: ProtocolCode, _: ResolveKind, _: ResolveHash) -> bool {
+        false
+    }
+}
 
 const MAKER_KEY: Key = Key::from_bytes([7; Key::LENGTH]);
 const TAKER_KEY: Key = Key::from_bytes([8; Key::LENGTH]);
@@ -62,7 +78,7 @@ fn apply(c: &mut Criterion) {
 }
 
 fn apply_block(state: &mut State<FixedStore>, block: &Block<2>) {
-    let Ok(diff) = state.apply_block(block) else {
+    let Ok(diff) = state.apply_block(&RejectAllVerifier, block) else {
         panic!("benchmark operation batch rejected");
     };
     core::hint::black_box(diff.len());
