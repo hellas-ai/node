@@ -69,8 +69,8 @@ fn other_terms() -> TermsHash {
     OTHER_TERMS_VALUE.hash()
 }
 
-const fn terms_with(outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
-    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, outputs)
+fn terms_with(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, outputs.clone())
 }
 
 fn proof() -> Proof {
@@ -362,8 +362,8 @@ fn store_for(open: &Open) -> FixedStore<6, 1> {
     )
 }
 
-fn store_for_resolve(open: &Open, outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
-    let ids = Resolve::new(open.output(), proof(), outputs).output_ids();
+fn store_for_resolve(open: &Open, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
+    let ids = Resolve::new(open.output(), proof(), outputs.clone()).output_ids();
     let first = ids.as_slice().first().copied().unwrap_or_else(maker_out);
     let second = ids.as_slice().get(1).copied().unwrap_or_else(taker_out);
     let third = ids.as_slice().get(2).copied().unwrap_or_else(extra_out);
