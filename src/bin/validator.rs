@@ -204,6 +204,9 @@ enum Command {
         /// in index order). When omitted, all peers default to 127.0.0.1.
         #[arg(long, value_delimiter = ',')]
         addresses: Option<Vec<String>>,
+        /// WebSocket gRPC bind address (e.g. [::]:31130). Baked into the TOML.
+        #[arg(long)]
+        ws_bind: Option<String>,
         /// Explorer WebSocket URL for pushing activity events and serving queries
         #[arg(long)]
         ws_push: Option<String>,
@@ -216,12 +219,6 @@ enum Command {
         /// Path to the TOML config file
         #[arg(long)]
         config: PathBuf,
-        /// WebSocket gRPC bind address (e.g. [::]:31130)
-        #[arg(long)]
-        ws_bind: Option<String>,
-        /// Explorer WebSocket URL for pushing activity events and serving queries
-        #[arg(long)]
-        ws_push: Option<String>,
     },
     /// Validate a TOML config without running the node
     CheckConfig {
@@ -320,6 +317,7 @@ fn main() {
             start_port,
             seed,
             addresses,
+            ws_bind,
             ws_push,
             metrics_port,
         } => setup(
@@ -328,14 +326,11 @@ fn main() {
             start_port,
             seed,
             addresses,
+            ws_bind,
             ws_push,
             metrics_port,
         ),
-        Command::Run {
-            config,
-            ws_bind,
-            ws_push,
-        } => run(config, ws_bind, ws_push),
+        Command::Run { config } => run(config),
         Command::CheckConfig { config } => check_config(config),
         Command::Query { rpc, query } => do_query(rpc, query),
         Command::Wallet { wallet } => do_wallet(wallet),
@@ -399,6 +394,7 @@ fn setup(
     start_port: u16,
     seed: Option<u64>,
     addresses: Option<Vec<String>>,
+    ws_bind: Option<String>,
     ws_push: Option<String>,
     metrics_port: Option<u16>,
 ) -> Result<(), ValidatorError> {
@@ -470,7 +466,7 @@ fn setup(
         threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
         listen_port: start_port + node as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
-        ws_bind: None,
+        ws_bind,
         explorer_url: ws_push,
         genesis_allocations: Vec::new(),
         peers,
@@ -1059,19 +1055,9 @@ fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     Ok(())
 }
 
-fn run(
-    config_path: PathBuf,
-    ws_bind: Option<String>,
-    ws_push: Option<String>,
-) -> Result<(), ValidatorError> {
+fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut node_config: NodeConfig = toml::from_str(&config_str)?;
-    if ws_bind.is_some() {
-        node_config.ws_bind = ws_bind;
-    }
-    if ws_push.is_some() {
-        node_config.explorer_url = ws_push;
-    }
 
     // Prefer systemd-supplied credentials; otherwise keys come from the TOML — fine for dev/test,
     // never for production. eprintln! because tracing isn't initialized yet at this point.
