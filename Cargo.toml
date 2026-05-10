@@ -10,9 +10,11 @@ path = "src/lib.rs"
 [features]
 default = []
 fake-crypto = []
+secp256k1 = ["dep:secp256k1"]
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
+secp256k1 = { version = "0.31", default-features = false, optional = true, features = ["alloc"] }
 
 [dev-dependencies]
 allocation-counter = "0.8"

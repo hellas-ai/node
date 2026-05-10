@@ -58,6 +58,8 @@ mod list;
 mod object;
 mod op;
 mod primitive;
+#[cfg(feature = "secp256k1")]
+mod secp256k1;
 mod state;
 mod store;
 mod terms;
@@ -78,6 +80,8 @@ pub use op::{
     Payout, Proof, Resolve, ResolveKind, Seal,
 };
 pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, TermsHash};
+#[cfg(feature = "secp256k1")]
+pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
 pub use store::{Store, Tx};
 pub use terms::Terms;
