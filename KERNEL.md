@@ -247,6 +247,16 @@ cost, then consumes the reserve and pays out only edge principal. `Block::fits`
 checks the summed block cost against a multi-dimensional resource budget before
 admission.
 
+Resolve fees are charged under the *current* block's fee schedule, not the
+schedule active when the edge opened. If a fee increase pushes the priced
+resolve cost above the locked reserve, the edge becomes unresolvable through
+the normal path. Principal stays conserved inside the live edge — it is not
+redistributed and not lost from the global accounting — but it cannot be paid
+out under that schedule. This asymmetry is intentional: it gives the protocol a
+stale-edge collection knob. Lifting fees is the eviction mechanism for edges
+nobody bothered to resolve under the original prices. Pinning fees at open
+time would close that knob and is explicitly not v1 semantics.
+
 ### Access Sets
 
 Every operation exposes a deterministic `Access` set before execution:
