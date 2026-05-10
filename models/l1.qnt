@@ -224,4 +224,39 @@ module l1 {
     init
       .then(openEdge(Edge1))
       .expect(not(canResolve(Edge1, Timeout, MakerPayout, TakerPayout)))
+
+  // Both edges resolved by Timeout. Demonstrates the timeout-only path
+  // without any cooperative or dispute witness — production Rust uses
+  // exactly this path when no one signed and no one disputed.
+  run bothEdgesTimeoutTraceTest =
+    init
+      .then(openEdge(Edge1))
+      .then(tick)
+      .then(resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout))
+      .then(openEdge(Edge2))
+      .then(resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout))
+      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+
+  // Mixed proof kinds across edges: cooperative agreement on the first,
+  // dispute outcome on the second. Catches kernel paths that assume the
+  // same proof kind across an entire trace.
+  run mixedProofsTraceTest =
+    init
+      .then(openEdge(Edge1))
+      .then(resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout))
+      .then(openEdge(Edge2))
+      .then(resolveEdge(Edge2, Agreement, MakerPayout, TakerPayout))
+      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+
+  // Height accumulates across multiple ticks; idle stutter does not
+  // disturb live state. The Rust runner advances its tracked height on
+  // tick and asserts the model's height matches at every step.
+  run heightAccumulationTraceTest =
+    init
+      .then(tick)
+      .then(idle)
+      .then(tick)
+      .then(openEdge(Edge1))
+      .then(resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout))
+      .expect(valueConserved and noNegativeValue and height == 3)
 }
