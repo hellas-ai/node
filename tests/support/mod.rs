@@ -4,9 +4,59 @@
 pub(crate) mod l1;
 
 use hellas_kernel::{
-    Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, Snapshot, State,
-    Store, TermsHash, Tx, View,
+    Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, ProtocolCode,
+    ResolveHash, ResolveKind, Seal, Sig, Snapshot, State, Store, TermsHash, Tx, Verifier, View,
 };
+
+/// Forgeable verifier used by every test in this crate. Accepts any signature
+/// or seal whose bytes match the deterministic placeholder shape, mirroring
+/// the behaviour the kernel previously hardwired behind
+/// `cfg(feature = "fake-crypto")`. Production callers must wire a verifier
+/// backed by real cryptography or a preverified-cache lookup.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct FakeVerifier;
+
+pub(crate) const FAKE_VERIFIER: FakeVerifier = FakeVerifier;
+
+impl Verifier for FakeVerifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool {
+        sig == Sig::placeholder(key, hash)
+    }
+
+    fn verify_seal(
+        &self,
+        seal: Seal,
+        protocol: ProtocolCode,
+        kind: ResolveKind,
+        hash: ResolveHash,
+    ) -> bool {
+        seal == Seal::placeholder(protocol, kind, hash)
+    }
+}
+
+/// Production-shaped verifier stub: rejects every signature and seal. Tests
+/// that exercise "what happens without an accepting verifier" use this to
+/// stand in for the unconfigured production case.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct RejectVerifier;
+
+pub(crate) const REJECT_VERIFIER: RejectVerifier = RejectVerifier;
+
+impl Verifier for RejectVerifier {
+    fn verify_sig(&self, _sig: Sig, _key: Key, _hash: ResolveHash) -> bool {
+        false
+    }
+
+    fn verify_seal(
+        &self,
+        _seal: Seal,
+        _protocol: ProtocolCode,
+        _kind: ResolveKind,
+        _hash: ResolveHash,
+    ) -> bool {
+        false
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct CoinSlot {

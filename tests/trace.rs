@@ -3,7 +3,7 @@
 mod support;
 
 use support::{
-    coin_view,
+    FAKE_VERIFIER, coin_view,
     l1::{
         EDGE_VALUE, EdgeKey, MAKER, MAKER_ID, MAKER_PAYOUT, MAKER_VALUE, ProofKey, Step, TAKER,
         TAKER_ID, TAKER_PAYOUT, TAKER_VALUE, TraceState, TraceView, edge_id, edge_value,
@@ -61,7 +61,7 @@ impl Frame {
 
         match self.out {
             Out::Accept(shape) => {
-                let Ok(event) = state.apply(self.step.context(), &op) else {
+                let Ok(event) = state.apply(self.step.context(), &FAKE_VERIFIER, &op) else {
                     panic!("trace move rejected");
                 };
                 self.step.check(&event.kind());
@@ -69,7 +69,10 @@ impl Frame {
             }
             Out::Reject(error, shape) => {
                 let before = *state;
-                assert_eq!(state.apply(self.step.context(), &op), Err(error));
+                assert_eq!(
+                    state.apply(self.step.context(), &FAKE_VERIFIER, &op),
+                    Err(error),
+                );
                 assert_eq!(*state, before);
                 shape.check(state);
             }

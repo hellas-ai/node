@@ -11,7 +11,7 @@ mod open;
 #[path = "channel/resolve.rs"]
 mod resolve;
 
-use support::{FixedStore, coin_id, coin_view, edge_view, state};
+use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 
 use hellas_kernel::{
     Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, EventKind,
@@ -337,7 +337,7 @@ fn apply_with<const C: usize, const E: usize>(
     context: Context,
     op: &Op,
 ) -> hellas_kernel::Event {
-    let Ok(event) = state.apply(context, op) else {
+    let Ok(event) = state.apply(context, &FAKE_VERIFIER, op) else {
         panic!("operation rejected");
     };
     event

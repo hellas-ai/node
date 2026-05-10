@@ -7,7 +7,7 @@
 mod support;
 
 use support::{
-    FixedStore,
+    FAKE_VERIFIER, FixedStore,
     l1::{self, EdgeKey, OpenKey, ProofKey},
 };
 
@@ -72,7 +72,7 @@ impl Model for ChannelModel {
             // non-canonical payouts and `channel_shape` would fail — the
             // bug surfaces as a property violation rather than a silently
             // disabled action.
-            let _ = state.apply(context, &op);
+            let _ = state.apply(context, &FAKE_VERIFIER, &op);
             return Some(state);
         }
 
@@ -80,7 +80,7 @@ impl Model for ChannelModel {
             return Self::invalid_state(&mut state, last_state, context, &op, error);
         }
 
-        let event = state.apply(context, &op).ok()?.kind();
+        let event = state.apply(context, &FAKE_VERIFIER, &op).ok()?.kind();
         Self::valid_state(&state, action, context, &op, &event)
     }
 
@@ -88,9 +88,7 @@ impl Model for ChannelModel {
         vec![
             Property::always(
                 "channel value is conserved",
-                |_, state: &State<ChannelStore>| {
-                    l1::live_value(&state.view()) == l1::EDGE_VALUE
-                },
+                |_, state: &State<ChannelStore>| l1::live_value(&state.view()) == l1::EDGE_VALUE,
             ),
             Property::always(
                 "channel objects have one live shape",
@@ -108,7 +106,7 @@ impl ChannelModel {
         op: &Op,
         error: ApplyError,
     ) -> Option<State<ChannelStore>> {
-        let rejected = state.apply(context, op).err()?;
+        let rejected = state.apply(context, &FAKE_VERIFIER, op).err()?;
 
         if rejected == error && *state == *last_state {
             Some(*state)

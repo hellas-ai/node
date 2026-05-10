@@ -2,13 +2,19 @@
 #![forbid(unsafe_code)]
 //! Deterministic settlement kernel for Hellas.
 //!
+//! # Verifier Boundary
+//!
+//! The kernel implements no cryptography. Signature and dispute-seal
+//! verification go through a [`Verifier`] passed by the caller, typically a
+//! preverified-cache lookup populated off the apply critical path. Tests wire
+//! their own forgeable verifier; production wires real cryptography. The
+//! kernel does not see the difference.
+//!
 //! # Warning: Fake Crypto
 //!
-//! The `fake-crypto` feature enables deterministic, forgeable placeholder
-//! signature/seal verification and the degenerate `Proof::basic` witness for
-//! modelling and tests. It must not be used in production. Without that
-//! feature, placeholder signatures, placeholder seals, and basic proofs do not
-//! verify.
+//! The `fake-crypto` feature enables the degenerate [`Proof::basic`] witness
+//! for modelling and tests. It must not be used in production. Without that
+//! feature, basic proofs do not verify regardless of the verifier supplied.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!
@@ -55,6 +61,7 @@ mod primitive;
 mod state;
 mod store;
 mod terms;
+mod verifier;
 mod view;
 
 pub use block::Block;
@@ -71,4 +78,5 @@ pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, 
 pub use state::State;
 pub use store::{Store, Tx};
 pub use terms::Terms;
+pub use verifier::Verifier;
 pub use view::{Snapshot, View};
