@@ -189,6 +189,56 @@ fn open_fee_uses_resource_cost() {
 }
 
 #[test]
+fn open_allows_exact_fee_and_reserve_funding() {
+    let open = open_op();
+    let mut state = state(
+        empty_store(),
+        [
+            Genesis::coin(MAKER_COIN, MAKER, 20),
+            Genesis::coin(TAKER_COIN, TAKER, 6),
+        ],
+    );
+    let event = apply_with(&mut state, RESOURCE_CONTEXT, &Op::Open(open));
+
+    assert_eq!(
+        event.kind(),
+        EventKind::EdgeOpened {
+            inputs: input_ids2(MAKER_COIN, TAKER_COIN),
+            output: edge(),
+        },
+    );
+    assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
+    assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
+    assert_eq!(
+        state.store().edge(edge()).map(edge_view),
+        Some((0, 16, PARTIES, terms())),
+    );
+}
+
+#[test]
+fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
+    let open = open_op();
+    let mut state = state(
+        empty_store(),
+        [
+            Genesis::coin(MAKER_COIN, MAKER, 20),
+            Genesis::coin(TAKER_COIN, TAKER, 5),
+        ],
+    );
+    let store = *state.store();
+
+    assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
+    assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
+    assert_eq!(
+        state.apply(RESOURCE_CONTEXT, &Op::Open(open)),
+        Err(ApplyError::InvalidOpen {
+            output: open.output(),
+        }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
 fn open_rejects_funding_below_fee_without_mutation() {
     let open = Open::new(Funding::new(empty_party(), empty_party()), PARTIES, terms());
     let mut state = funded_state();
