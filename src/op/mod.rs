@@ -1,4 +1,10 @@
 //! Operation vocabulary, events, and the validate-then-fold transition machinery.
+//!
+//! Abstract counterpart: the actions in `models/l1.qnt` (`openEdge`,
+//! `resolveEdge`, `tick`, `idle`) and the `step` relation that dispatches
+//! over them. Each concrete [`Op`] variant lines up with one Quint action;
+//! `apply` here implements the same validate-then-fold discipline the model
+//! captures by primed-variable assignments inside an `action` block.
 
 mod access;
 mod open;

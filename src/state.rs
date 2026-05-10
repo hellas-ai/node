@@ -1,4 +1,9 @@
 //! Kernel state surface: the apply driver over a concrete [`Store`].
+//!
+//! Abstract counterpart: `models/l1.qnt`. The Quint module owns the same state
+//! vars (`coins`, `edges`, `liveCoins`, `liveEdges`, `height`) and dispatches
+//! through a `step` relation; here `apply` / `apply_all` / `apply_block` play
+//! the same role over a concrete [`Store`].
 
 use crate::{
     block::Block,

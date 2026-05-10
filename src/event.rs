@@ -1,4 +1,10 @@
 //! Public events and private store effects.
+//!
+//! Abstract counterpart: `models/types.qnt::Event` (the public events
+//! `EdgeOpenedEvent` / `EdgeResolvedEvent`) and the `lastEvent` recording
+//! var in `models/l1.qnt`. ITF replay (`tests/itf.rs`) drives the kernel
+//! and asserts each emitted [`EventKind`] against the abstract event the
+//! producing action recorded.
 
 use crate::{
     error::{ApplyError, KernelResult},

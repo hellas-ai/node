@@ -2,6 +2,23 @@
 #![forbid(unsafe_code)]
 //! Deterministic settlement kernel for Hellas.
 //!
+//! # Abstract model
+//!
+//! Every kernel module has a counterpart under `models/`. Reading the abstract
+//! Quint module first is often the fastest way to understand a Rust module's
+//! shape.
+//!
+//! | Concern              | Rust                       | Quint                                |
+//! |----------------------|----------------------------|--------------------------------------|
+//! | Apply driver         | [`State`]                  | `models/l1.qnt`                      |
+//! | Op vocabulary + step | [`Op`]                     | `models/l1.qnt` (`step` action)      |
+//! | Proof witnesses      | [`Proof`]                  | `models/verifier.qnt`                |
+//! | Verification policy  | [`Verifier`]               | `models/verifier.qnt`                |
+//! | Live objects         | [`Coin`] / [`Edge`] / ids  | `models/types.qnt`                   |
+//! | Block context        | [`Context`]                | `models/l1.qnt` (`height` var)       |
+//! | Established rules    | [`Diff`], [`View`]         | `models/rules/invariants.qnt`        |
+//! | Assumed dependencies | [`Store`], [`Verifier`]    | `models/deps/assumptions.qnt`        |
+//!
 //! # Verifier Boundary
 //!
 //! The kernel implements no cryptography. Signature and dispute-seal

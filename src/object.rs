@@ -1,4 +1,10 @@
 //! On-chain object payloads: coins, edges, and initial coin seeds.
+//!
+//! Abstract counterpart: `models/types.qnt` (the closed-universe `Coin` /
+//! `Edge` ADTs and their canonical wiring) plus the conservation, shape,
+//! and binding rules in `models/rules/invariants.qnt`. Genesis seeding
+//! mirrors the assumed `genesisFunded` predicate in
+//! `models/deps/assumptions.qnt`.
 
 use crate::{
     error::{InsertError, InvalidOpenReason, InvalidResolveReason, KernelResult},

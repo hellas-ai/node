@@ -1,3 +1,12 @@
+//! Resolve witnesses and the verifier-driven payout-binding policy.
+//!
+//! Abstract counterpart: `models/types.qnt::Proof` (witness ADT) and
+//! `models/verifier.qnt` (`proofOk`, `payoutsBound`). The Quint module
+//! treats these as pure predicates over an opaque verifier; the kernel
+//! defers the same check by calling [`crate::Verifier::verify_sig`] /
+//! [`crate::Verifier::verify_seal`] and enforcing per-kind payout binding
+//! inline.
+
 use super::{Resolve, SEAL_LENGTH};
 use crate::{
     context::{Context, Cost},

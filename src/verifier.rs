@@ -10,6 +10,11 @@
 //! Tests provide their own [`Verifier`] that accepts the deterministic
 //! placeholder shapes built by [`crate::Sig::placeholder`] and
 //! [`crate::Seal::placeholder`].
+//!
+//! Abstract counterpart: `models/verifier.qnt`. The Quint module's
+//! `proofOk` / `payoutsBound` predicates are pure — the abstract model
+//! takes the verifier on faith. The corresponding determinism and
+//! soundness assumptions are documented in `models/deps/assumptions.qnt`.
 
 use crate::op::{ResolveKind, Seal};
 use crate::primitive::{Key, ProtocolCode, ResolveHash, Sig};
