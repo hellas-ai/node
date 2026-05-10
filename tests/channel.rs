@@ -399,6 +399,25 @@ fn operations_report_access_sets() {
 }
 
 #[test]
+fn operations_report_access_conflicts() {
+    let open = open_op();
+    let resolve = Resolve::new(
+        open.output(),
+        proof(),
+        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
+    );
+    let other_open = Open::new(funding(coin_id(20), coin_id(21)), PARTIES, terms());
+    let open_op = Op::Open(open);
+    let resolve_op = Op::Resolve(resolve);
+    let other_op = Op::Open(other_open);
+
+    assert!(open_op.conflicts(&resolve_op));
+    assert!(open_op.access().conflicts(&resolve_op.access()));
+    assert!(!open_op.conflicts(&other_op));
+    assert!(!open_op.access().conflicts(&other_op.access()));
+}
+
+#[test]
 fn block_reports_deterministic_cost_and_fee() {
     let ops = List::all([
         Op::Open(open_op()),
@@ -412,6 +431,22 @@ fn block_reports_deterministic_cost_and_fee() {
 
     assert_eq!(block.cost(), Some(Cost::new(2, 6, 6, 1)));
     assert_eq!(block.fee(), Some(20));
+}
+
+#[test]
+fn block_reports_access_conflicts() {
+    let open = open_op();
+    let resolve = Resolve::new(
+        open.output(),
+        proof(),
+        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
+    );
+    let other_open = Open::new(funding(coin_id(20), coin_id(21)), PARTIES, terms());
+    let serial = Block::new(CONTEXT, List::all([Op::Open(open), Op::Resolve(resolve)]));
+    let disjoint = Block::new(CONTEXT, List::all([Op::Open(open), Op::Open(other_open)]));
+
+    assert!(serial.conflicts());
+    assert!(!disjoint.conflicts());
 }
 
 #[test]

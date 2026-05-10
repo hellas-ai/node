@@ -97,6 +97,13 @@ impl Op {
             Self::Resolve(op) => op.access(),
         }
     }
+
+    /// Returns true if this operation touches any state slot also touched by
+    /// `other`.
+    #[must_use]
+    pub fn conflicts(&self, other: &Self) -> bool {
+        self.access().conflicts(&other.access())
+    }
 }
 
 /// Deterministic state slots consumed and created by one operation.
@@ -131,6 +138,26 @@ impl Access {
     #[must_use]
     pub const fn new_edges(&self) -> &EdgeList {
         &self.new_edges
+    }
+
+    /// Returns true if two declared access sets touch any common state slot.
+    #[must_use]
+    pub fn conflicts(&self, other: &Self) -> bool {
+        self.coin_conflicts(other) || self.edge_conflicts(other)
+    }
+
+    fn coin_conflicts(&self, other: &Self) -> bool {
+        overlaps(self.coins(), other.coins())
+            || overlaps(self.coins(), other.new_coins())
+            || overlaps(self.new_coins(), other.coins())
+            || overlaps(self.new_coins(), other.new_coins())
+    }
+
+    fn edge_conflicts(&self, other: &Self) -> bool {
+        overlaps(self.edges(), other.edges())
+            || overlaps(self.edges(), other.new_edges())
+            || overlaps(self.new_edges(), other.edges())
+            || overlaps(self.new_edges(), other.new_edges())
     }
 }
 
@@ -770,6 +797,18 @@ impl Proof {
 
 fn units(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn overlaps<T: Eq, const A: usize, const B: usize>(left: &List<T, A>, right: &List<T, B>) -> bool {
+    for item in left.as_slice() {
+        for other in right.as_slice() {
+            if item == other {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 const fn empty_coins<const N: usize>() -> List<CoinId, N> {
