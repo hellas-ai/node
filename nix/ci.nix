@@ -41,7 +41,7 @@
         };
 
         clippy = {
-          inputs = [rustToolchain];
+          inputs = [rustToolchain pkgs.stdenv.cc];
           cmd = ''
             cargo clippy ${optionalString write "--fix --allow-dirty --allow-staged"} --workspace --all-targets -- -D warnings
           '';
@@ -102,7 +102,7 @@
 
   testPackage = mkCICheck {
     name = "check-test";
-    inputs = [rustToolchain pkgs.pkg-config pkgs.protobuf];
+    inputs = [rustToolchain pkgs.stdenv.cc pkgs.pkg-config pkgs.protobuf];
     cmd = ''
       cargo test --workspace
     '';
