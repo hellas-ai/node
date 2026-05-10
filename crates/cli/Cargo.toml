@@ -37,26 +37,22 @@ otel = [
     "tonic-iroh-transport/metrics",
 ]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-opentelemetry = { workspace = true, optional = true }
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
-iroh-metrics = { version = "0.38", default-features = false, features = ["metrics"], optional = true }
+
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+base64.workspace = true
 catgrad = { workspace = true, default-features = false }
 catgrad-llm.workspace = true
 chatgrad.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-
-anyhow = "1"
-base64.workspace = true
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 hellas-core.workspace = true
+hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "swarm", "client"] }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "node",
@@ -64,27 +60,31 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "compression",
     "discovery",
 ] }
-hellas-executor = { workspace = true, default-features = false, optional = true }
+iroh-metrics = { version = "0.38", default-features = false, features = ["metrics"], optional = true }
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+prometheus-client = "0.24"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.9"
+reqwest = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, features = [
     "client",
     "discovery-mdns",
     "discovery-dht",
 ] }
-tonic = { workspace = true }
-tokio-stream = { workspace = true }
-futures = "0.3"
-async-stream = "0.3"
-axum = "0.8"
 tower = { version = "0.5", default-features = false, features = ["util"] }
-prometheus-client = "0.24"
-minijinja = "2"
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-qrcode = { version = "0.14", default-features = false }
-rand = "0.9"
-tempfile = "3"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
 
 # dev-dependencies: enable `hellas-pb/compile` when regenerating checked-in protos.
 [dev-dependencies]

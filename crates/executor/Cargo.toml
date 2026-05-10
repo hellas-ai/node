@@ -14,30 +14,30 @@ candle-cuda = ["candle", "catgrad/cuda"]
 candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
+async-stream = "0.3"
+blake3 = "1"
+catgrad = { workspace = true, default-features = false, features = ["serde"] }
+catgrad-llm = { workspace = true, default-features = false }
+catnix.workspace = true
+chatgrad = { workspace = true, default-features = false }
+half = { workspace = true }
 hellas-core.workspace = true
 hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "server"] }
 hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
-tokio-util = "0.7"
-thiserror = { workspace = true }
-tonic = { workspace = true }
-tracing = { workspace = true }
-catgrad = { workspace = true, default-features = false, features = ["serde"] }
-catgrad-llm = { workspace = true, default-features = false }
-chatgrad = { workspace = true, default-features = false }
-catnix.workspace = true
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
-blake3 = "1"
 iroh-blobs = { workspace = true, features = ["fs-store"] }
-uuid = { version = "1", features = ["v4"] }
-async-stream = "0.3"
-half = { workspace = true }
+prometheus-client = "0.24"
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true }
-prometheus-client = "0.24"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = "0.7"
+tonic = { workspace = true }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

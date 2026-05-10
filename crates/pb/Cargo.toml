@@ -21,9 +21,9 @@ all = ["hellas", "symbolic", "opaque", "swarm", "courtesy", "client", "server"]
 compile = ["dep:glob", "dep:tonic-prost-build", "all"]
 
 [dependencies]
+prost = "0.14"
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
-prost = "0.14"
 
 [build-dependencies]
 glob = { version = "0.3", optional = true }
