@@ -102,7 +102,10 @@ fn resolve_rejects_basic_witness_without_fake_crypto() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::BasicNotAccepted,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -166,7 +169,10 @@ fn resolve_rejects_unpaid_fee_without_mutation() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
-        Err(ApplyError::InvalidResolve { input: edge() }),
+        Err(ApplyError::InvalidResolve {
+            input: edge(),
+            reason: InvalidResolveReason::ReserveTooSmall,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -207,6 +213,7 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
         state.apply(expensive, &FAKE_VERIFIER, &Op::Resolve(resolve)),
         Err(ApplyError::InvalidResolve {
             input: open.output(),
+            reason: InvalidResolveReason::ReserveTooSmall,
         }),
     );
     assert_eq!(*state.store(), store);
@@ -264,7 +271,10 @@ fn resolve_rejects_bad_agreement_signature_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(edge(), proof, outputs))
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::BadSignature,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -307,7 +317,10 @@ fn resolve_rejects_timeout_before_deadline_without_mutation() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::TimeoutNotReached,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -327,7 +340,10 @@ fn resolve_rejects_timeout_with_nondefault_payouts_without_mutation() {
                 payouts(Payout::new(MAKER, 8), Payout::new(TAKER, 7)),
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::PayoutMismatch,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -347,7 +363,10 @@ fn resolve_rejects_wrong_timeout_terms_without_mutation() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::TermsMismatch,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -416,7 +435,10 @@ fn placeholder_witnesses_do_not_verify_under_reject_verifier() {
                 outputs,
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::BadSignature,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -437,7 +459,10 @@ fn resolve_rejects_bad_dispute_seal_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(edge(), proof, outputs))
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::BadSeal,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -458,7 +483,10 @@ fn resolve_rejects_wrong_dispute_terms_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(edge(), proof, outputs))
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::TermsMismatch,
+        }),
     );
     assert_eq!(*state.store(), store);
 }
@@ -549,6 +577,7 @@ fn resolve_rejects_non_conserving_payouts_without_mutation() {
         ),
         Err(ApplyError::InvalidResolve {
             input: open.output(),
+            reason: InvalidResolveReason::ValueMismatch,
         }),
     );
     assert_eq!(*state.store(), store);
@@ -559,6 +588,9 @@ fn resolve_rejects_wrong_proof_without_mutation() {
     let mut state = open_state();
     let store = *state.store();
 
+    // other_proof() is a Timeout proof under different terms; the terms hash
+    // differs from the edge's commitment, so the kernel rejects with
+    // TermsMismatch regardless of feature config.
     assert_eq!(
         state.apply(
             CONTEXT,
@@ -569,7 +601,10 @@ fn resolve_rejects_wrong_proof_without_mutation() {
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8),),
             )),
         ),
-        Err(ApplyError::InvalidProof { input: edge() }),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::TermsMismatch,
+        }),
     );
     assert_eq!(*state.store(), store);
 }

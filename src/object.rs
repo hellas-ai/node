@@ -1,7 +1,7 @@
 //! On-chain object payloads: coins, edges, and initial coin seeds.
 
 use crate::{
-    error::{InsertError, KernelResult},
+    error::{InsertError, InvalidOpenReason, InvalidResolveReason, KernelResult},
     list::List,
     primitive::{CoinId, Key, TermsHash},
     store::Tx,
@@ -91,19 +91,28 @@ impl Edge {
         terms: TermsHash,
         open_fee: u64,
         reserve: u64,
-    ) -> Option<Self> {
-        let value = Self::total(coins)?
-            .checked_sub(open_fee)?
-            .checked_sub(reserve)?;
-        Some(Self::new(value, reserve, parties, terms))
+    ) -> Result<Self, InvalidOpenReason> {
+        let total = Self::total(coins).ok_or(InvalidOpenReason::FundingOverflow)?;
+        let value = total
+            .checked_sub(open_fee)
+            .and_then(|after_fee| after_fee.checked_sub(reserve))
+            .ok_or(InvalidOpenReason::FundingInsufficient)?;
+        Ok(Self::new(value, reserve, parties, terms))
     }
 
     pub(super) fn resolves<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,
         fee: u64,
-    ) -> bool {
-        fee <= self.reserve && Self::total(coins) == Some(self.value)
+    ) -> Result<(), InvalidResolveReason> {
+        if fee > self.reserve {
+            return Err(InvalidResolveReason::ReserveTooSmall);
+        }
+        match Self::total(coins) {
+            None => Err(InvalidResolveReason::PayoutOverflow),
+            Some(total) if total != self.value => Err(InvalidResolveReason::ValueMismatch),
+            Some(_) => Ok(()),
+        }
     }
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {

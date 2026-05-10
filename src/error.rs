@@ -95,18 +95,24 @@ pub enum ApplyError {
     InvalidOpen {
         /// Edge requested for open.
         output: EdgeId,
+        /// Specific reason the open was rejected.
+        reason: InvalidOpenReason,
     },
 
     /// An edge cannot resolve into the requested payouts.
     InvalidResolve {
         /// Edge requested for resolve.
         input: EdgeId,
+        /// Specific reason the resolve was rejected.
+        reason: InvalidResolveReason,
     },
 
     /// A resolve proof is unsupported or does not match the edge being resolved.
     InvalidProof {
         /// Edge requested for resolve.
         input: EdgeId,
+        /// Specific reason the proof was rejected.
+        reason: InvalidProofReason,
     },
 
     /// The backing store rejected a coin insertion.
@@ -124,4 +130,54 @@ pub enum ApplyError {
         /// Reason the store rejected the insertion.
         reason: InsertError,
     },
+}
+
+/// Specific reason an [`ApplyError::InvalidOpen`] was raised.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum InvalidOpenReason {
+    /// `context.fee(open.cost())` overflowed.
+    FeeOverflow,
+    /// `context.fee(open.reserve_cost())` overflowed.
+    ReserveOverflow,
+    /// Sum of funding coin values overflowed `u64`.
+    FundingOverflow,
+    /// Sum of funding coin values is less than open fee + locked reserve.
+    FundingInsufficient,
+    /// Constructing the bounded funding list exceeded its capacity. Defensive
+    /// path; reachable only from a misbehaving caller.
+    BoundsExceeded,
+}
+
+/// Specific reason an [`ApplyError::InvalidResolve`] was raised.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum InvalidResolveReason {
+    /// `context.fee(resolve.cost())` overflowed.
+    FeeOverflow,
+    /// Sum of payout values overflowed `u64`.
+    PayoutOverflow,
+    /// Locked reserve does not cover the current priced resolve cost. Under v1
+    /// fee semantics this is the deliberate stale-edge collection signal.
+    ReserveTooSmall,
+    /// Sum of payout values does not equal the edge's principal.
+    ValueMismatch,
+    /// Constructing the bounded payout list exceeded its capacity. Defensive
+    /// path; reachable only from a misbehaving caller.
+    BoundsExceeded,
+}
+
+/// Specific reason an [`ApplyError::InvalidProof`] was raised.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum InvalidProofReason {
+    /// `Proof::Basic` was supplied in a build that does not accept it.
+    BasicNotAccepted,
+    /// The proof's terms commitment does not match the edge's `TermsHash`.
+    TermsMismatch,
+    /// An agreement signature was rejected by the verifier.
+    BadSignature,
+    /// A dispute seal was rejected by the verifier.
+    BadSeal,
+    /// `Proof::Timeout` was submitted before the committed timeout height.
+    TimeoutNotReached,
+    /// `Proof::Timeout` payouts do not equal `Terms::timeout_outputs`.
+    PayoutMismatch,
 }

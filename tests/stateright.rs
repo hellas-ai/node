@@ -11,9 +11,11 @@ use support::{
     l1::{self, EdgeKey, OpenKey, ProofKey},
 };
 
+#[cfg(feature = "fake-crypto")]
+use hellas_kernel::InvalidResolveReason;
 use hellas_kernel::{
-    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, List, MAX_EDGE_INPUTS,
-    MAX_EDGE_OUTPUTS, Op, Open, Parties, Resolve, State, View,
+    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, InvalidProofReason, List,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Op, Open, Parties, Resolve, State, View,
 };
 use stateright::{Checker, Model, Property};
 
@@ -215,16 +217,29 @@ impl Action {
     }
 
     fn error(self) -> Option<ApplyError> {
+        // Action::InvalidProof submits a Basic proof under different terms.
+        // Under fake-crypto Basic verifies after a terms check (so the
+        // mismatch is what trips); without fake-crypto Basic is rejected
+        // outright before any terms check.
+        #[cfg(feature = "fake-crypto")]
+        let basic_wrong_terms_reason = InvalidProofReason::TermsMismatch;
+        #[cfg(not(feature = "fake-crypto"))]
+        let basic_wrong_terms_reason = InvalidProofReason::BasicNotAccepted;
+
         match self {
             #[cfg(feature = "fake-crypto")]
             Self::InvalidResolve => Some(ApplyError::InvalidResolve {
                 input: l1::edge_id(EdgeKey::First),
+                reason: InvalidResolveReason::ValueMismatch,
             }),
-            Self::InvalidProof | Self::Resolve(ProofKey::EarlyTimeout) => {
-                Some(ApplyError::InvalidProof {
-                    input: l1::edge_id(EdgeKey::First),
-                })
-            }
+            Self::InvalidProof => Some(ApplyError::InvalidProof {
+                input: l1::edge_id(EdgeKey::First),
+                reason: basic_wrong_terms_reason,
+            }),
+            Self::Resolve(ProofKey::EarlyTimeout) => Some(ApplyError::InvalidProof {
+                input: l1::edge_id(EdgeKey::First),
+                reason: InvalidProofReason::TimeoutNotReached,
+            }),
             Self::Open(_) | Self::Resolve(_) | Self::AdversarialTimeout => None,
         }
     }
