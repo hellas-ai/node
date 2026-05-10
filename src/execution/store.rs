@@ -1,68 +1,96 @@
-use commonware_cryptography::Sha256;
-use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
+use commonware_cryptography::{Sha256, sha256::Digest};
+use commonware_glue::stateful::db::ManagedDb;
+use commonware_parallel::Sequential;
+use commonware_runtime::{BufferPooler, Clock, Metrics, Storage, buffer::paged::CacheRef};
 use commonware_storage::{
-    journal::contiguous::fixed::Config as FConfig,
-    merkle::mmr::journaled::Config as MmrConfig,
-    qmdb::current::{FixedConfig, unordered::fixed::Db as CurrentFixedDb},
+    journal::contiguous::fixed::Config as FixedLogConfig,
+    mmr::{self, full::Config as MmrConfig},
+    qmdb::{
+        any::{FixedConfig, unordered::fixed::Db as AnyFixedDb},
+        sync::Target,
+    },
     translator::EightCap,
 };
+use commonware_utils::sync::AsyncRwLock;
 use hellas_types::{Coin, ObjectId};
-use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::{
+    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
 
-/// Bitmap chunk size for the QMDB Merkle tree.
-///
-/// Must be a power of 2 and a multiple of the digest size (32).
-pub const CHUNK_SIZE: usize = 32;
+pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Coin, Sha256, EightCap, Sequential>;
+pub type UtxoDatabase<E> = Arc<AsyncRwLock<UtxoDb<E>>>;
+pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
+pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
-/// Type alias for the UTXO state database.
-///
-/// - Keys are `ObjectId` (`sha256::Digest`, 32 bytes)
-/// - Values are `Coin` (40 bytes fixed: `PublicKey` 32 + `u64` 8)
-/// - `EightCap` compresses 32-byte keys to 8 bytes for index bucketing
-pub type UtxoDb<E> = CurrentFixedDb<E, ObjectId, Coin, Sha256, EightCap, CHUNK_SIZE>;
+pub async fn root<E>(database: &UtxoDatabase<E>) -> Digest
+where
+    E: Storage + Clock + Metrics + 'static,
+{
+    database.read().await.root()
+}
 
-/// Items per blob for journals.
+pub async fn get<E>(database: &UtxoDatabase<E>, object: &ObjectId) -> Option<Coin>
+where
+    E: Storage + Clock + Metrics + 'static,
+{
+    database.read().await.get(object).await.ok().flatten()
+}
+
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
-
-/// Write buffer size for journals.
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
 
-/// Buffer pool page size.
 pub const DEFAULT_PAGE_CACHE_SIZE: NonZeroU16 = NonZeroU16::new(4096).unwrap();
-
-/// Buffer pool page count.
 pub const DEFAULT_PAGE_CACHE_COUNT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
-/// Build a [FixedConfig] for the UTXO database.
-///
-/// The `partition_prefix` must be unique per validator instance to avoid
-/// storage collisions in tests or multi-process setups.
 pub fn utxo_db_config(
     pooler: &impl BufferPooler,
     partition_prefix: &str,
     page_cache_size: u16,
     page_cache_count: usize,
-) -> FixedConfig<EightCap> {
+) -> UtxoDbConfig {
     let page_cache_size = NonZeroU16::new(page_cache_size).unwrap_or(DEFAULT_PAGE_CACHE_SIZE);
     let page_cache_count = NonZeroUsize::new(page_cache_count).unwrap_or(DEFAULT_PAGE_CACHE_COUNT);
     let page_cache = CacheRef::from_pooler(pooler, page_cache_size, page_cache_count);
 
     FixedConfig {
-        mmr: MmrConfig {
+        merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}_utxo_mmr_journal"),
             metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
-            thread_pool: None,
+            strategy: Sequential,
             page_cache: page_cache.clone(),
         },
-        log: FConfig {
+        journal_config: FixedLogConfig {
             partition: format!("{partition_prefix}_utxo_log_journal"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache,
             write_buffer: WRITE_BUFFER,
         },
-        grafted_mmr_metadata_partition: format!("{partition_prefix}_utxo_grafted_mmr_metadata"),
         translator: EightCap,
     }
+}
+
+pub async fn empty_state<E>(
+    context: E,
+    partition_prefix: &str,
+    page_cache_size: u16,
+    page_cache_count: usize,
+) -> (Digest, UtxoSyncTarget)
+where
+    E: Storage + Clock + Metrics + BufferPooler,
+{
+    let config = utxo_db_config(
+        &context,
+        &format!("{partition_prefix}_genesis_probe"),
+        page_cache_size,
+        page_cache_count,
+    );
+    let db = UtxoDb::init(context, config)
+        .await
+        .expect("genesis probe database must initialize");
+    let state_root = db.root();
+    let sync_target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&db).await;
+    (state_root, sync_target)
 }

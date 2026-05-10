@@ -10,7 +10,6 @@ path = "src/bin/validator.rs"
 
 [features]
 default = []
-loom-tests = ["dep:loom"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -21,7 +20,7 @@ commonware-broadcast = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true, features = ["std"] }
-commonware-macros = { workspace = true }
+commonware-glue = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-parallel = { workspace = true }
 commonware-runtime = { workspace = true }
@@ -34,7 +33,6 @@ hellas-types = { workspace = true, features = ["consensus"] }
 hex = { workspace = true }
 http = "1"
 indexmap = { workspace = true }
-loom = { version = "0.7", optional = true }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }

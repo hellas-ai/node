@@ -1,27 +1,57 @@
 use base64ct::{Base64UrlUnpadded, Encoding};
 use clap::{Parser, Subcommand};
+use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
-use commonware_cryptography::certificate::Scheme as _;
+use commonware_consensus::{
+    marshal::{
+        self,
+        core::Actor as MarshalActor,
+        resolver::p2p as marshal_resolver,
+        standard::{Deferred, Standard},
+    },
+    simplex::{self, config::ForwardingPolicy, elector::RoundRobin},
+    types::{Epoch, FixedEpocher, ViewDelta},
+};
+use commonware_cryptography::bls12381::dkg::deal;
+use commonware_cryptography::certificate::{ConstantProvider, Scheme as _};
 use commonware_cryptography::{Signer, ed25519};
+use commonware_glue::stateful::{
+    Config as StatefulConfig, StartupMode, Stateful as StatefulActor,
+    db::{SyncEngineConfig, p2p as qmdb_resolver},
+};
 use commonware_p2p::{AddressableManager, authenticated::lookup};
-use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, tokio};
+use commonware_parallel::Sequential;
+use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
+use commonware_storage::{archive::immutable, mmr};
+use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
-use hellas_chain::TraceReporter;
-use hellas_chain::config::{Config, ConfigError, NodeConfig, PeerEntry, encode_private_key};
-use hellas_chain::engine::Engine;
-use hellas_types::Scheme;
+use hellas_chain::config::{
+    Config, ConfigError, NodeConfig, PeerEntry, encode_private_key, encode_threshold_polynomial,
+    encode_threshold_share,
+};
+use hellas_chain::{
+    ActivityReporter, Application, ApplicationConfig, Mempool, UtxoDb, utxo_db_config,
+};
+use hellas_types::{PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use p256::ecdsa::SigningKey as UserSigningKey;
 use p256::ecdsa::signature::Signer as _;
 use prometheus_client::metrics::gauge::Gauge;
-use rand::RngCore;
+use rand::{
+    RngCore, SeedableRng,
+    rngs::{OsRng, StdRng},
+};
 use sha2::{Digest as _, Sha256 as Sha2};
 use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+};
 use thiserror::Error;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use tracing::{info, warn};
 
 const NAMESPACE: &[u8] = b"hellas";
@@ -37,14 +67,40 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
     let mut raw = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut raw);
+    OsRng.fill_bytes(&mut raw);
     ed25519::PrivateKey::decode(raw.as_slice())
         .expect("decoding 32 random bytes as an ed25519 private key should always succeed")
 }
 
+fn deal_threshold_shares(
+    seed: Option<u64>,
+    participants: Set<PublicKey>,
+) -> Result<
+    (
+        ThresholdPolynomial,
+        commonware_utils::ordered::Map<PublicKey, ThresholdShare>,
+    ),
+    ValidatorError,
+> {
+    let dealt = match seed {
+        Some(seed) => {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x4845_4c4c_4153_424c);
+            deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants)
+        }
+        None => {
+            let mut rng = OsRng;
+            deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants)
+        }
+    }
+    .map_err(|e| ValidatorError::InvalidSetup(format!("failed to deal threshold shares: {e}")))?;
+
+    let (output, shares) = dealt;
+    Ok((output.public().clone(), shares))
+}
+
 fn random_user_private_key() -> UserSigningKey {
     let mut raw = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut raw);
+    OsRng.fill_bytes(&mut raw);
     UserSigningKey::from_slice(&raw)
         .expect("decoding 32 random bytes as a secp256r1 private key should succeed")
 }
@@ -66,7 +122,7 @@ fn mock_webauthn_sign(
     challenge: &commonware_cryptography::sha256::Digest,
     origin: &str,
 ) -> Result<hellas_types::WebAuthnSignature, ValidatorError> {
-    let challenge_b64 = Base64UrlUnpadded::encode_string(&challenge.to_vec());
+    let challenge_b64 = Base64UrlUnpadded::encode_string(challenge.as_ref());
     let client_data_json = format!(
         r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
         hellas_types::WEBAUTHN_TYPE_GET,
@@ -356,13 +412,13 @@ fn setup(
             "node index must be less than validators".to_string(),
         ));
     }
-    if let Some(ref addrs) = addresses {
-        if addrs.len() != validators as usize {
-            return Err(ValidatorError::InvalidSetup(format!(
-                "--addresses must have exactly {validators} entries (one per validator), got {}",
-                addrs.len(),
-            )));
-        }
+    if let Some(ref addrs) = addresses
+        && addrs.len() != validators as usize
+    {
+        return Err(ValidatorError::InvalidSetup(format!(
+            "--addresses must have exactly {validators} entries (one per validator), got {}",
+            addrs.len(),
+        )));
     }
 
     if seed.is_none() {
@@ -376,8 +432,22 @@ fn setup(
             None => random_private_key(),
         })
         .collect();
+    let threshold_participants = Set::try_from(
+        keys.iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<PublicKey>>(),
+    )
+    .map_err(|_| {
+        ValidatorError::InvalidSetup("generated duplicate validator identity keys".to_string())
+    })?;
+    let (threshold_polynomial, threshold_shares) =
+        deal_threshold_shares(seed, threshold_participants)?;
 
     let my_key = &keys[node as usize];
+    let my_public_key = my_key.public_key();
+    let my_threshold_share = threshold_shares.get_value(&my_public_key).ok_or_else(|| {
+        ValidatorError::InvalidSetup("missing threshold share for generated validator".to_string())
+    })?;
     let peers: Vec<PeerEntry> = keys
         .iter()
         .enumerate()
@@ -396,6 +466,8 @@ fn setup(
 
     let config = NodeConfig {
         private_key: encode_private_key(my_key),
+        threshold_share: encode_threshold_share(my_threshold_share),
+        threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
         listen_port: start_port + node as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
         ws_bind: None,
@@ -518,9 +590,12 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
             } => {
                 let private_key = parse_hex_private_key(&key)?;
                 let input_digest = parse_hex_digest(&input, "input")?;
-                let recipient_addr: hellas_types::Address = recipient.parse()
-                    .map_err(|e: hellas_types::AddressError| ValidatorError::InvalidSetup(format!("bad recipient: {e}")))?;
-                let challenge = hellas_types::transfer_challenge(&input_digest, &recipient_addr, amount);
+                let recipient_addr: hellas_types::Address =
+                    recipient.parse().map_err(|e: hellas_types::AddressError| {
+                        ValidatorError::InvalidSetup(format!("bad recipient: {e}"))
+                    })?;
+                let challenge =
+                    hellas_types::transfer_challenge(&input_digest, &recipient_addr, amount);
                 let signature = mock_webauthn_sign(&private_key, &challenge, &origin)?;
                 let tx = hellas_types::Transaction::Transfer {
                     input: input_digest,
@@ -534,7 +609,11 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                     .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
                 println!("transaction submitted");
             }
-            QueryCommand::MergeCoin { key, inputs, origin } => {
+            QueryCommand::MergeCoin {
+                key,
+                inputs,
+                origin,
+            } => {
                 let private_key = parse_hex_private_key(&key)?;
                 let mut input_digests: Vec<commonware_cryptography::sha256::Digest> = inputs
                     .iter()
@@ -583,10 +662,10 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                                 p.epoch, p.view, e.signer
                             );
                         }
-                        Event::MNotarization(e) => {
+                        Event::Notarization(e) => {
                             let p = e.proposal.unwrap_or_default();
                             println!(
-                                "m-notarization: epoch={} view={} signers={:?}",
+                                "notarization: epoch={} view={} signers={:?}",
                                 p.epoch, p.view, e.signers
                             );
                         }
@@ -607,14 +686,6 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                             println!(
                                 "finalization: epoch={} view={} signers={:?}",
                                 p.epoch, p.view, e.signers
-                            );
-                        }
-                        Event::ConflictingNotarize(e) => {
-                            let f = e.first.and_then(|n| n.proposal).unwrap_or_default();
-                            let s = e.second.and_then(|n| n.proposal).unwrap_or_default();
-                            println!(
-                                "conflicting-notarize: first=(epoch={} view={}) second=(epoch={} view={})",
-                                f.epoch, f.view, s.epoch, s.view
                             );
                         }
                     }
@@ -760,37 +831,38 @@ where
 }
 
 fn spawn_metrics_server(context: tokio::Context, addr: SocketAddr) {
-    use axum::{Extension, Router, routing::get};
+    use axum::{Router, routing::get};
 
-    context
-        .with_label("metrics")
-        .spawn(move |context| async move {
-            let listener = ::tokio::net::TcpListener::bind(addr)
-                .await
-                .expect("failed to bind metrics server");
+    context.child("metrics").spawn(move |context| async move {
+        let listener = ::tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("failed to bind metrics server");
+        let metrics_context = std::sync::Arc::new(context);
 
-            let app = Router::new()
-                .route(
-                    "/metrics",
-                    get(
-                        |Extension(ctx): Extension<tokio::Context>| async move {
-                            axum::http::Response::builder()
-                                .status(axum::http::StatusCode::OK)
-                                .header(
-                                    axum::http::header::CONTENT_TYPE,
-                                    "text/plain; version=0.0.4",
-                                )
-                                .body(axum::body::Body::from(ctx.encode()))
-                                .expect("failed to create response")
-                        },
-                    ),
-                )
-                .layer(Extension(context));
+        let app = Router::new().route(
+            "/metrics",
+            get({
+                let metrics_context = metrics_context.clone();
+                move || {
+                    let metrics_context = metrics_context.clone();
+                    async move {
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )
+                            .body(axum::body::Body::from(metrics_context.encode()))
+                            .expect("failed to create response")
+                    }
+                }
+            }),
+        );
 
-            axum::serve(listener, app.into_make_service())
-                .await
-                .expect("could not serve metrics");
-        });
+        axum::serve(listener, app.into_make_service())
+            .await
+            .expect("could not serve metrics");
+    });
 }
 
 async fn wait_for_shutdown_signal() -> &'static str {
@@ -888,6 +960,94 @@ async fn serve_relay(
     Ok(())
 }
 
+type Finalization = commonware_consensus::simplex::types::Finalization<
+    Scheme,
+    commonware_cryptography::sha256::Digest,
+>;
+type FinalizationStore =
+    immutable::Archive<tokio::Context, commonware_cryptography::sha256::Digest, Finalization>;
+type BlockStore = immutable::Archive<
+    tokio::Context,
+    commonware_cryptography::sha256::Digest,
+    hellas_chain::HellasBlock,
+>;
+
+async fn init_finalization_store(
+    context: tokio::Context,
+    partition_prefix: &str,
+    config: &Config,
+) -> FinalizationStore {
+    let page_cache = config.page_cache(&context);
+    immutable::Archive::init(
+        context,
+        immutable::Config {
+            metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
+            freezer_table_partition: format!(
+                "{partition_prefix}-finalizations-by-height-freezer-table"
+            ),
+            freezer_table_initial_size: 64,
+            freezer_table_resize_frequency: 10,
+            freezer_table_resize_chunk_size: 10,
+            freezer_key_partition: format!(
+                "{partition_prefix}-finalizations-by-height-freezer-key"
+            ),
+            freezer_key_page_cache: page_cache,
+            freezer_value_partition: format!(
+                "{partition_prefix}-finalizations-by-height-freezer-value"
+            ),
+            freezer_value_target_size: 65536,
+            freezer_value_compression: None,
+            ordinal_partition: format!("{partition_prefix}-finalizations-by-height-ordinal"),
+            items_per_section: NZU64!(256),
+            codec_config: Scheme::certificate_codec_config_unbounded(),
+            replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
+            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+        },
+    )
+    .await
+    .expect("failed to initialize finalizations archive")
+}
+
+async fn init_block_store(
+    context: tokio::Context,
+    partition_prefix: &str,
+    config: &Config,
+) -> BlockStore {
+    let page_cache = config.page_cache(&context);
+    immutable::Archive::init(
+        context,
+        immutable::Config {
+            metadata_partition: format!("{partition_prefix}-finalized-blocks-metadata"),
+            freezer_table_partition: format!("{partition_prefix}-finalized-blocks-freezer-table"),
+            freezer_table_initial_size: 64,
+            freezer_table_resize_frequency: 10,
+            freezer_table_resize_chunk_size: 10,
+            freezer_key_partition: format!("{partition_prefix}-finalized-blocks-freezer-key"),
+            freezer_key_page_cache: page_cache,
+            freezer_value_partition: format!("{partition_prefix}-finalized-blocks-freezer-value"),
+            freezer_value_target_size: 65536,
+            freezer_value_compression: None,
+            ordinal_partition: format!("{partition_prefix}-finalized-blocks-ordinal"),
+            items_per_section: NZU64!(256),
+            codec_config: (),
+            replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
+            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+        },
+    )
+    .await
+    .expect("failed to initialize finalized blocks archive")
+}
+
 fn run(
     config_path: PathBuf,
     log_json: Option<PathBuf>,
@@ -905,6 +1065,8 @@ fn run(
 
     let private_key = node_config.decode_private_key()?;
     let me = private_key.public_key();
+    let threshold_share = node_config.decode_threshold_share()?;
+    let threshold_polynomial = node_config.decode_threshold_polynomial()?;
     let genesis_allocations = node_config.genesis_allocations()?;
     if let Some(path) = log_json.as_ref() {
         eprintln!(
@@ -922,11 +1084,16 @@ fn run(
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", node_config.listen_port).parse()?;
 
     // Build consensus scheme
-    let scheme = match Scheme::signer(NAMESPACE, participants, private_key.clone()) {
+    let scheme = match Scheme::signer(
+        NAMESPACE,
+        participants,
+        threshold_polynomial,
+        threshold_share,
+    ) {
         Some(scheme) => scheme,
         None => {
             return Err(ValidatorError::Scheme(
-                "own key not found in participants".to_string(),
+                "threshold share does not match configured participants".to_string(),
             ));
         }
     };
@@ -949,7 +1116,7 @@ fn run(
         let tracer_provider = init_telemetry(telemetry_json);
 
         if let Some(addr) = metrics_addr {
-            spawn_metrics_server(context.with_label("telemetry"), addr);
+            spawn_metrics_server(context.child("telemetry"), addr);
         }
 
         info!(
@@ -963,8 +1130,7 @@ fn run(
 
         // Create lookup-based p2p network
         let p2p_cfg = lookup::Config::local(private_key, NAMESPACE, listen_addr, MAX_MESSAGE_SIZE);
-        let (mut network, mut oracle) =
-            lookup::Network::new(context.with_label("network"), p2p_cfg);
+        let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p_cfg);
 
         // Register all validators with the oracle, then allow address refreshes
         // without introducing a new peer-set epoch.
@@ -976,12 +1142,13 @@ fn run(
         let vote = network.register(0, quota, CHANNEL_BACKLOG);
         let certificate = network.register(1, quota, CHANNEL_BACKLOG);
         let consensus_resolver = network.register(2, quota, CHANNEL_BACKLOG);
-        let marshal_resolver = network.register(3, quota, CHANNEL_BACKLOG);
+        let marshal_resolver_network = network.register(3, quota, CHANNEL_BACKLOG);
         let broadcast_blocks = network.register(4, quota, CHANNEL_BACKLOG);
+        let qmdb_resolver_network = network.register(5, quota, CHANNEL_BACKLOG);
 
         // Publish process uptime as a prometheus gauge, updated every second.
         let uptime_gauge: Gauge<i64, AtomicI64> = Gauge::default();
-        context.with_label("process").register(
+        let _uptime_registration = context.child("process").register(
             "uptime_seconds",
             "seconds since the validator process started",
             uptime_gauge.clone(),
@@ -1003,20 +1170,189 @@ fn run(
             .collect();
 
         let chain_config = Config::mainnet();
-        let (engine, application, activity_tx) = Engine::new(
-            context.clone(),
-            chain_config,
-            scheme,
-            oracle.clone(),
-            oracle,
-            &me,
-            genesis_allocations.clone(),
-            TraceReporter,
+        let partition_prefix = format!("hellas_{me}");
+        let page_cache = chain_config.page_cache(&context);
+        let finalizations_by_height = init_finalization_store(
+            context.child("finalizations_by_height"),
+            &partition_prefix,
+            &chain_config,
         )
         .await;
-        let startup_root = application.get_state_root().await;
+        let finalized_blocks = init_block_store(
+            context.child("finalized_blocks"),
+            &partition_prefix,
+            &chain_config,
+        )
+        .await;
+
+        let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
+        let marshal_config = marshal::Config {
+            provider: ConstantProvider::new(scheme.clone()),
+            epocher: epocher.clone(),
+            partition_prefix: partition_prefix.clone(),
+            mailbox_size: chain_config.mailbox_size,
+            view_retention_timeout: ViewDelta::new(chain_config.activity_timeout),
+            prunable_items_per_section: NZU64!(256),
+            page_cache: page_cache.clone(),
+            replay_buffer: NonZeroUsize::new(chain_config.replay_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            key_write_buffer: NonZeroUsize::new(chain_config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            value_write_buffer: NonZeroUsize::new(chain_config.write_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            block_codec_config: (),
+            max_repair: NonZeroUsize::new(chain_config.max_repair).unwrap_or(NonZeroUsize::MIN),
+            max_pending_acks: NZUsize!(1),
+            strategy: Sequential,
+        };
+        let (marshal_actor, marshal_mailbox, _last_height) =
+            MarshalActor::<_, Standard<hellas_chain::HellasBlock>, _, _, _, _, _>::init(
+                context.child("marshal"),
+                finalizations_by_height,
+                finalized_blocks,
+                marshal_config,
+            )
+            .await;
+
+        let broadcast_config = buffered::Config {
+            public_key: me.clone(),
+            mailbox_size: chain_config.mailbox_size,
+            deque_size: chain_config.broadcast_cache_per_peer,
+            priority: false,
+            codec_config: (),
+            peer_provider: oracle.clone(),
+        };
+        let (broadcast_engine, buffer) =
+            buffered::Engine::new(context.child("broadcast"), broadcast_config);
+        let broadcast_handle = broadcast_engine.start(broadcast_blocks);
+
+        let resolver_cfg = marshal_resolver::Config {
+            public_key: me.clone(),
+            peer_provider: oracle.clone(),
+            blocker: oracle.clone(),
+            mailbox_size: chain_config.mailbox_size,
+            initial: Duration::from_secs(1),
+            timeout: chain_config.fetch_timeout,
+            fetch_retry_timeout: Duration::from_millis(100),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let resolver = marshal_resolver::init(
+            context.child("marshal_resolver"),
+            resolver_cfg,
+            marshal_resolver_network,
+        );
+
+        let (qmdb_resolver_actor, qmdb_sync_resolver) =
+            qmdb_resolver::Actor::<_, hellas_types::PublicKey, _, _, mmr::Family, UtxoDb<_>>::new(
+                context.child("qmdb_resolver"),
+                qmdb_resolver::Config {
+                    peer_provider: oracle.clone(),
+                    blocker: oracle.clone(),
+                    database: None,
+                    mailbox_size: chain_config.mailbox_size,
+                    me: Some(me.clone()),
+                    initial: Duration::from_secs(1),
+                    timeout: chain_config.fetch_timeout,
+                    fetch_retry_timeout: Duration::from_millis(100),
+                    max_serve_ops: NZU64!(64),
+                    priority_requests: false,
+                    priority_responses: false,
+                },
+            );
+        let qmdb_resolver_handle = qmdb_resolver_actor.start(qmdb_resolver_network);
+
+        let mempool = Mempool::default();
+        let genesis_leader = scheme
+            .participants()
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| me.clone());
+        let application = Application::new(
+            context.child("app"),
+            genesis_leader,
+            genesis_allocations.clone(),
+            &partition_prefix,
+            ApplicationConfig {
+                page_cache_size: chain_config.page_cache_size,
+                page_cache_count: chain_config.page_cache_count,
+            },
+        )
+        .await;
+        let db_config = utxo_db_config(
+            &context,
+            &partition_prefix,
+            chain_config.page_cache_size,
+            chain_config.page_cache_count,
+        );
+        let (stateful_actor, stateful_mailbox) = StatefulActor::init(
+            context.child("stateful"),
+            StatefulConfig {
+                app: application,
+                db_config,
+                input_provider: mempool.clone(),
+                marshal: marshal_mailbox.clone(),
+                mailbox_size: chain_config.mailbox_size,
+                partition_prefix: partition_prefix.clone(),
+                startup: StartupMode::MarshalSync,
+                resolvers: qmdb_sync_resolver.clone(),
+                sync_config: SyncEngineConfig {
+                    fetch_batch_size: NZU64!(64),
+                    apply_batch_size: 1024,
+                    max_outstanding_requests: 8,
+                    update_channel_size: NZUsize!(256),
+                    max_retained_roots: 8,
+                },
+            },
+        );
+
+        let deferred = Deferred::new(
+            context.child("deferred"),
+            stateful_mailbox.clone(),
+            marshal_mailbox.clone(),
+            epocher,
+        );
+        let (activity_tx, _) = ::tokio::sync::broadcast::channel(1024);
+        let simplex_config = simplex::Config {
+            scheme,
+            elector: RoundRobin::<commonware_cryptography::Sha256>::default(),
+            blocker: oracle.clone(),
+            automaton: deferred.clone(),
+            relay: deferred,
+            reporter: ActivityReporter::new(marshal_mailbox.clone(), activity_tx.clone()),
+            strategy: Sequential,
+            partition: format!("{partition_prefix}-simplex"),
+            mailbox_size: chain_config.mailbox_size,
+            epoch: Epoch::zero(),
+            replay_buffer: NonZeroUsize::new(chain_config.replay_buffer)
+                .unwrap_or(NonZeroUsize::MIN),
+            write_buffer: NonZeroUsize::new(chain_config.write_buffer).unwrap_or(NonZeroUsize::MIN),
+            page_cache,
+            leader_timeout: chain_config.leader_timeout,
+            certification_timeout: chain_config.certification_timeout,
+            timeout_retry: chain_config.nullify_retry,
+            activity_timeout: ViewDelta::new(chain_config.activity_timeout),
+            skip_timeout: ViewDelta::new(chain_config.skip_timeout),
+            fetch_timeout: chain_config.fetch_timeout,
+            fetch_concurrent: chain_config.fetch_concurrent,
+            forwarding: ForwardingPolicy::Disabled,
+        };
+        let simplex_engine = simplex::Engine::new(context.child("simplex"), simplex_config);
+
+        let marshal_handle = marshal_actor.start(stateful_mailbox.clone(), buffer, resolver);
+        let stateful_handle = stateful_actor.start();
+        let engine_handle = simplex_engine.start(vote, certificate, consensus_resolver);
+
+        let databases = stateful_mailbox.subscribe_databases().await;
+        let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
-        let light_client = hellas_chain::rpc::LocalLightClient::new(application, validators);
+        let light_client = hellas_chain::rpc::LocalLightClient::new(
+            databases,
+            mempool,
+            marshal_mailbox,
+            validators,
+        );
 
         // Start light-client gRPC server over WebSocket (if configured)
         if let Some(ws_bind) = &node_config.ws_bind {
@@ -1030,7 +1366,7 @@ fn run(
                 .await
                 .expect("failed to bind WebSocket listener");
             let incoming = hellas_rpc::ws::ws_incoming(listener);
-            context.clone().spawn(|_| async move {
+            context.child("ws_server").spawn(|_| async move {
                 tonic::transport::Server::builder()
                     .add_service(svc)
                     .serve_with_incoming(incoming)
@@ -1050,7 +1386,7 @@ fn run(
                 hellas_chain::rpc::LightClientGrpcServer::new(light_client, activity_tx)
                     .into_service(),
             );
-            context.clone().spawn(|ctx| async move {
+            context.child("relay").spawn(|ctx| async move {
                 loop {
                     match serve_relay(&relay_url, relay_svc.clone()).await {
                         Ok(()) => info!("relay connection closed normally"),
@@ -1063,13 +1399,6 @@ fn run(
             info!(%explorer_url, "relay connection started");
         }
 
-        let engine_handle = engine.start(
-            vote,
-            certificate,
-            consensus_resolver,
-            marshal_resolver,
-            broadcast_blocks,
-        );
         // Start networking only after the app + consensus engine are initialized.
         let network_handle = network.start();
 
@@ -1080,9 +1409,29 @@ fn run(
             .map(|_| ShutdownTrigger::NetworkExited)
             .boxed();
         let engine_waiter = engine_handle.map(|_| ShutdownTrigger::EngineExited).boxed();
+        let marshal_waiter = marshal_handle
+            .map(|_| ShutdownTrigger::EngineExited)
+            .boxed();
+        let broadcast_waiter = broadcast_handle
+            .map(|_| ShutdownTrigger::EngineExited)
+            .boxed();
+        let stateful_waiter = stateful_handle
+            .map(|_| ShutdownTrigger::EngineExited)
+            .boxed();
+        let qmdb_resolver_waiter = qmdb_resolver_handle
+            .map(|_| ShutdownTrigger::EngineExited)
+            .boxed();
 
-        let (trigger, _, _) =
-            futures::future::select_all(vec![signal_waiter, network_waiter, engine_waiter]).await;
+        let (trigger, _, _) = futures::future::select_all(vec![
+            signal_waiter,
+            network_waiter,
+            engine_waiter,
+            marshal_waiter,
+            broadcast_waiter,
+            stateful_waiter,
+            qmdb_resolver_waiter,
+        ])
+        .await;
 
         let monitor_second_signal = matches!(trigger, ShutdownTrigger::Signal(_));
         match trigger {
@@ -1099,10 +1448,10 @@ fn run(
 
         graceful_stop(context, monitor_second_signal).await;
 
-        if let Some(provider) = tracer_provider {
-            if let Err(err) = provider.shutdown() {
-                warn!(?err, "failed to flush OTLP traces on shutdown");
-            }
+        if let Some(provider) = tracer_provider
+            && let Err(err) = provider.shutdown()
+        {
+            warn!(?err, "failed to flush OTLP traces on shutdown");
         }
     });
     Ok(())

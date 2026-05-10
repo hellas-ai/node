@@ -1,13 +1,14 @@
-use commonware_codec::{DecodeExt, Encode};
+use commonware_codec::{Decode, DecodeExt, Encode};
+use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-use hellas_types::{Address as UserAddress, PublicKey};
+use hellas_types::{Address as UserAddress, PublicKey, ThresholdPolynomial, ThresholdShare};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    num::{NonZeroU16, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     path::PathBuf,
     time::Duration,
 };
@@ -17,7 +18,7 @@ use thiserror::Error;
 pub enum ConfigError {
     #[error("invalid hex key data")]
     InvalidHex(#[from] hex::FromHexError),
-    #[error("invalid ed25519 key bytes")]
+    #[error("invalid key bytes")]
     InvalidKey(#[from] commonware_codec::Error),
     #[error("unable to determine local data directory")]
     MissingDataDirectory,
@@ -41,7 +42,7 @@ pub struct Config {
     pub page_cache_size: u16,
     pub page_cache_count: usize,
     pub leader_timeout: Duration,
-    pub notarization_timeout: Duration,
+    pub certification_timeout: Duration,
     pub nullify_retry: Duration,
     pub activity_timeout: u64,
     pub skip_timeout: u64,
@@ -60,7 +61,7 @@ impl Config {
             page_cache_size: 4096,
             page_cache_count: 4096,
             leader_timeout: Duration::from_secs(1),
-            notarization_timeout: Duration::from_secs(2),
+            certification_timeout: Duration::from_secs(2),
             nullify_retry: Duration::from_millis(500),
             activity_timeout: 10,
             skip_timeout: 5,
@@ -68,25 +69,6 @@ impl Config {
             fetch_concurrent: 3,
             broadcast_cache_per_peer: 128,
             max_repair: 16,
-        }
-    }
-
-    pub const fn test() -> Self {
-        Self {
-            mailbox_size: 1024,
-            replay_buffer: 1024 * 1024,
-            write_buffer: 64 * 1024,
-            page_cache_size: 4096,
-            page_cache_count: 4096,
-            leader_timeout: Duration::from_millis(100),
-            notarization_timeout: Duration::from_millis(200),
-            nullify_retry: Duration::from_millis(50),
-            activity_timeout: 10,
-            skip_timeout: 5,
-            fetch_timeout: Duration::from_millis(500),
-            fetch_concurrent: 3,
-            broadcast_cache_per_peer: 64,
-            max_repair: 8,
         }
     }
 
@@ -101,6 +83,8 @@ impl Config {
 #[derive(Serialize, Deserialize)]
 pub struct NodeConfig {
     pub private_key: String,
+    pub threshold_share: String,
+    pub threshold_polynomial: String,
     pub listen_port: u16,
     #[serde(default)]
     pub metrics_port: Option<u16>,
@@ -129,6 +113,21 @@ impl NodeConfig {
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
         let bytes = hex::decode(&self.private_key)?;
         Ok(ed25519::PrivateKey::decode(bytes.as_slice())?)
+    }
+
+    pub fn decode_threshold_share(&self) -> Result<ThresholdShare, ConfigError> {
+        let bytes = hex::decode(&self.threshold_share)?;
+        Ok(ThresholdShare::decode(bytes.as_slice())?)
+    }
+
+    pub fn decode_threshold_polynomial(&self) -> Result<ThresholdPolynomial, ConfigError> {
+        let bytes = hex::decode(&self.threshold_polynomial)?;
+        let total = u32::try_from(self.peers.len() + 1).unwrap_or(u32::MAX);
+        let max_participants = NonZeroU32::new(total).unwrap_or(NonZeroU32::MIN);
+        Ok(ThresholdPolynomial::decode_cfg(
+            bytes.as_slice(),
+            &(max_participants, ModeVersion::v0()),
+        )?)
     }
 
     pub fn storage_directory(&self) -> Result<PathBuf, ConfigError> {
@@ -199,4 +198,12 @@ impl NodeConfig {
 
 pub fn encode_private_key(key: &ed25519::PrivateKey) -> String {
     hex::encode(key.encode())
+}
+
+pub fn encode_threshold_share(share: &ThresholdShare) -> String {
+    hex::encode(share.encode())
+}
+
+pub fn encode_threshold_polynomial(polynomial: &ThresholdPolynomial) -> String {
+    hex::encode(polynomial.encode())
 }

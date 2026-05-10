@@ -1,20 +1,18 @@
 //! Local implementation of the light-client query interface.
 //!
-//! [`LocalLightClient`] wraps the local application handle and implements the
-//! [`LightClient`] trait from `hellas_types::rpc`. Proof responses are encoded
-//! to opaque bytes before returning.
+//! [`LocalLightClient`] wraps the local database/mempool handles and implements the
+//! [`LightClient`] trait from `hellas_types::rpc`.
 
-use crate::app::{Application, ProofResponse};
-use bytes::BytesMut;
-use commonware_codec::{Read as _, ReadExt as _, Write as _};
-use commonware_cryptography::sha256::Digest;
-use commonware_storage::mmr::{Location, Proof};
-use commonware_storage::qmdb::current::proof::{OperationProof, RangeProof};
+use crate::{
+    app::{MarshalMailbox, Mempool},
+    execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
+};
+use commonware_consensus::{Heightable, marshal::Identifier as MarshalIdentifier};
+use commonware_cryptography::{Digestible, sha256::Digest};
 use hellas_rpc::pb::hellas::light_client_server::{self, LightClientServer};
 use hellas_rpc::pb::hellas::*;
 use hellas_types::rpc::{
-    ConsensusActivity, LatestBlock, LightClient, NotarizeInfo, ProposalInfo as TypesProposalInfo,
-    QueryError,
+    ConsensusActivity, LatestBlock, LightClient, ProposalInfo as TypesProposalInfo, QueryError,
 };
 use hellas_types::{
     Coin, DecodeExt, Encode, MAX_AUTHENTICATOR_DATA_LEN, MAX_CLIENT_DATA_JSON_LEN,
@@ -26,51 +24,26 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// Encode an [`OperationProof`] to opaque bytes by writing each public field
-/// using its existing commonware-codec `Write` impl.
-pub fn encode_proof(proof: &ProofResponse) -> Vec<u8> {
-    let mut buf = BytesMut::new();
-    proof.loc.write(&mut buf);
-    proof.chunk.write(&mut buf);
-    proof.range_proof.proof.write(&mut buf);
-    proof.range_proof.partial_chunk_digest.write(&mut buf);
-    proof.range_proof.ops_root.write(&mut buf);
-    buf.to_vec()
-}
-
-/// Decode opaque bytes back into an [`OperationProof`].
-pub fn decode_proof(data: &[u8]) -> Result<ProofResponse, commonware_codec::Error> {
-    let mut buf = &data[..];
-    let loc = Location::read(&mut buf)?;
-    let chunk = <[u8; 32]>::read(&mut buf)?;
-    // max_items=1: a single key-value proof; allows up to
-    // MAX_PROOF_DIGESTS_PER_ELEMENT (122) digests.
-    let proof = Proof::<Digest>::read_cfg(&mut buf, &1)?;
-    let partial_chunk_digest = Option::<Digest>::read(&mut buf)?;
-    let ops_root = Digest::read(&mut buf)?;
-    Ok(OperationProof {
-        loc,
-        chunk,
-        range_proof: RangeProof {
-            proof,
-            partial_chunk_digest,
-            ops_root,
-        },
-    })
-}
-
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]
 pub struct LocalLightClient {
-    application: Application,
+    databases: UtxoDatabase<commonware_runtime::tokio::Context>,
+    mempool: Mempool,
+    marshal: MarshalMailbox,
     validators: Vec<String>,
 }
 
 impl LocalLightClient {
-    /// Wraps an existing [`Application`] as a light-client query handle.
-    pub fn new(application: Application, validators: Vec<String>) -> Self {
+    pub fn new(
+        databases: UtxoDatabase<commonware_runtime::tokio::Context>,
+        mempool: Mempool,
+        marshal: MarshalMailbox,
+        validators: Vec<String>,
+    ) -> Self {
         Self {
-            application,
+            databases,
+            mempool,
+            marshal,
             validators,
         }
     }
@@ -78,12 +51,14 @@ impl LocalLightClient {
 
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
-        Ok(self.application.get_state_root().await)
+        Ok(Some(utxo_root(&self.databases).await))
     }
 
     async fn get_proof(&self, object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
-        let proof = self.application.get_proof(object_id).await;
-        Ok(proof.map(|p| encode_proof(&p)))
+        let _ = object_id;
+        Err(QueryError::StateUnavailable(
+            "key proofs are disabled in the glue cutover".to_string(),
+        ))
     }
 
     async fn get_coin(
@@ -91,19 +66,40 @@ impl LightClient for LocalLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> Result<Option<Coin>, QueryError> {
-        self.application.get_coin(payload, object_id).await
+        let latest = self.get_latest_block().await?;
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        if latest.payload != payload {
+            return Err(QueryError::StateUnavailable(
+                "coin queries only support the latest payload".to_string(),
+            ));
+        }
+        Ok(utxo_get(&self.databases, &object_id).await)
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
-        Ok(self.application.get_finalization(payload).await)
+        let Some((height, _)) = self.marshal.get_info(&payload).await else {
+            return Ok(None);
+        };
+        Ok(self
+            .marshal
+            .get_finalization(height)
+            .await
+            .map(|finalization| finalization.encode().to_vec()))
     }
 
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
-        Ok(self.application.get_latest_block().await)
+        let block = self.marshal.get_block(MarshalIdentifier::Latest).await;
+        Ok(block.map(|block| LatestBlock {
+            height: block.height().get(),
+            payload: block.digest(),
+            state_root: block.state_root(),
+        }))
     }
 
     async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
-        self.application.submit_tx(tx).await;
+        self.mempool.submit(tx).await;
         Ok(())
     }
 
@@ -115,7 +111,10 @@ impl LightClient for LocalLightClient {
         &self,
         owner: hellas_types::Address,
     ) -> Result<Vec<(ObjectId, u64)>, QueryError> {
-        Ok(self.application.get_coins_by_owner(owner).await)
+        let _ = owner;
+        Err(QueryError::StateUnavailable(
+            "owner scans are disabled in the glue cutover".to_string(),
+        ))
     }
 }
 
@@ -291,14 +290,6 @@ fn proposal_info_to_proto(p: TypesProposalInfo) -> ProposalInfo {
     }
 }
 
-fn notarize_info_to_proto(n: NotarizeInfo) -> NotarizeEvent {
-    NotarizeEvent {
-        proposal: Some(proposal_info_to_proto(n.proposal)),
-        signer: n.signer,
-        signature: n.signature,
-    }
-}
-
 pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
     let validator_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -313,11 +304,11 @@ pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent
             signer,
             signature,
         }),
-        ConsensusActivity::MNotarization {
+        ConsensusActivity::Notarization {
             proposal,
             signers,
             certificate,
-        } => activity_event::Event::MNotarization(MNotarizationEvent {
+        } => activity_event::Event::Notarization(NotarizationEvent {
             proposal: Some(proposal_info_to_proto(proposal)),
             signers,
             certificate,
@@ -353,12 +344,6 @@ pub fn consensus_activity_to_proto(activity: ConsensusActivity) -> ActivityEvent
             signers,
             certificate,
         }),
-        ConsensusActivity::ConflictingNotarize { first, second } => {
-            activity_event::Event::ConflictingNotarize(ConflictingNotarizeEvent {
-                first: Some(notarize_info_to_proto(first)),
-                second: Some(notarize_info_to_proto(second)),
-            })
-        }
     };
     ActivityEvent {
         event: Some(event),
