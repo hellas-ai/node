@@ -3,7 +3,14 @@
 
   # CA derivations let the HF cache packages (and any other system-independent
   # outputs) substitute across Linux/Darwin from a shared binary cache.
-  nixConfig.extra-experimental-features = ["ca-derivations"];
+  # extra-substituters / extra-trusted-public-keys are an opt-in for downstream
+  # users — nix will prompt to accept on first use (or auto-accept with
+  # `--accept-flake-config`).
+  nixConfig = {
+    extra-experimental-features = ["ca-derivations"];
+    extra-substituters = ["https://cache.hellas.ai"];
+    extra-trusted-public-keys = ["cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g="];
+  };
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
