@@ -798,10 +798,14 @@ and verdicts under perfect delivery.
 The first synchronous L1 model lives in `models/l1.qnt`. It mirrors the Rust
 operation vocabulary at an abstract level: `OpenEdge`, `ResolveEdge`, bounded
 resolve proof kinds, explicit block height for timeout, live coins, live edges,
-and a finite state universe suitable for simulation and trace export.
-When the Rust operation vocabulary grows, update this model in the same change:
-add the abstract transition, extend the named `*Test` traces, regenerate the ITF
-fixtures with `npm run quint:fixtures`, and keep the Rust replay tests aligned.
+and a finite state universe suitable for simulation and trace export. The
+separate `models/fees.qnt` model pins the payment-accounting invariant:
+principal plus live reserve plus value already paid to the protocol equals
+genesis funding.
+When the Rust operation vocabulary grows, update these models in the same
+change: add the abstract transition, extend the named `*Test` traces,
+regenerate the ITF fixtures with `npm run quint:fixtures`, and keep the Rust
+replay tests aligned.
 
 ### Choreo Or P
 
