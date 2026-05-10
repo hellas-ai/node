@@ -99,7 +99,16 @@
           '';
         };
       };
+
+  testPackage = mkCICheck {
+    name = "check-test";
+    inputs = [rustToolchain pkgs.pkg-config pkgs.protobuf];
+    cmd = ''
+      cargo test --workspace
+    '';
+  };
 in {
   checkPackages = mkCIChecks false;
   fixPackages = mkCIChecks true;
+  inherit testPackage;
 }

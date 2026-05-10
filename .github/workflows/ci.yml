@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - grw/feat/aiter
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  matrix:
+    runs-on: [self-hosted, shared]
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        name: Enumerate check-* apps
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#apps.x86_64-linux' --apply '
+              apps:
+              let
+                prefix = "check-";
+                pfxLen = builtins.stringLength prefix;
+                startsWith = name: builtins.substring 0 pfxLen name == prefix;
+                names = builtins.filter startsWith (builtins.attrNames apps);
+              in {
+                include = map (name: { inherit name; }) names;
+              }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  check:
+    runs-on: [self-hosted, shared]
+    name: ${{ matrix.name }}
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: nix run .#${{ matrix.name }}
+        run: nix run --accept-flake-config '.#${{ matrix.name }}'
+
+  ci-passed:
+    runs-on: [self-hosted, shared]
+    if: always()
+    name: CI passed
+    needs:
+      - matrix
+      - check
+    steps:
+      - name: Require matrix + all checks succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.matrix.result }}' = 'success'
+          test '${{ needs.check.result }}' = 'success'
