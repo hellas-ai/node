@@ -1,7 +1,12 @@
+#![allow(clippy::alloc_instead_of_core)]
+#![allow(clippy::disallowed_types)]
 #![allow(clippy::redundant_pub_crate)]
+#![allow(clippy::std_instead_of_alloc)]
+#![allow(clippy::std_instead_of_core)]
 #![allow(dead_code)]
 
 pub(crate) mod l1;
+pub(crate) mod map_store;
 
 use hellas_kernel::{
     Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, ProtocolCode,
