@@ -169,11 +169,27 @@ module l1 {
     resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout),
     resolveEdge(Edge2, ClaimantWins, MakerPayout, TakerPayout),
     resolveEdge(Edge2, ChallengerWins, MakerPayout, TakerPayout),
-    // Adversarial Basic splits. Reachable iff FakeCrypto is true.
+    // Adversarial Basic splits. Reachable iff FakeCrypto is true; under
+    // `l1_adversary.qnt` Apalache uses these to derive the
+    // payoutsHonorBindings counterexample.
     resolveEdge(Edge1, Basic, EdgeValue, 0),
     resolveEdge(Edge1, Basic, 0, EdgeValue),
     resolveEdge(Edge2, Basic, EdgeValue, 0),
     resolveEdge(Edge2, Basic, 0, EdgeValue),
+    // Adversarial bound-proof splits. Each is rejected by `canResolve`
+    // via `payoutsBound` regardless of `FakeCrypto`, because bound
+    // proofs commit to the canonical (MakerPayout, TakerPayout) split.
+    // Apalache symbolically confirms these remain unreachable in every
+    // explored state; listing them here makes the rejection surface
+    // explicit in the spec rather than implicit in `payoutsBound`.
+    resolveEdge(Edge1, Agreement, EdgeValue, 0),
+    resolveEdge(Edge1, Timeout, EdgeValue, 0),
+    resolveEdge(Edge1, ClaimantWins, EdgeValue, 0),
+    resolveEdge(Edge1, ChallengerWins, EdgeValue, 0),
+    resolveEdge(Edge2, Agreement, EdgeValue, 0),
+    resolveEdge(Edge2, Timeout, EdgeValue, 0),
+    resolveEdge(Edge2, ClaimantWins, EdgeValue, 0),
+    resolveEdge(Edge2, ChallengerWins, EdgeValue, 0),
     tick,
     idle,
   }
