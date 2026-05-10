@@ -9,11 +9,11 @@
     "quint:test:l1": "quint typecheck models/l1.qnt && quint test models/l1.qnt --verbosity=2",
     "quint:test:fees": "quint typecheck models/fees.qnt && quint test models/fees.qnt --verbosity=2",
     "quint:verify": "npm run quint:verify:production && npm run quint:verify:adversary && npm run quint:verify:fees",
-    "quint:verify:production": "quint verify models/l1.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown payoutsHonorBindings --verbosity=1",
+    "quint:verify:production": "quint verify --apalache-version=0.57.0 models/l1.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown payoutsHonorBindings --verbosity=1",
     "quint:verify:adversary": "npm run quint:verify:adversary:safety && npm run quint:verify:adversary:attack",
-    "quint:verify:adversary:safety": "quint verify models/l1_adversary.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown --verbosity=1",
-    "quint:verify:adversary:attack": "! quint verify models/l1_adversary.qnt --invariant=payoutsHonorBindings --max-steps=3 --verbosity=0",
-    "quint:verify:fees": "quint verify models/fees.qnt --invariants valueAccounted reserveAtLeastBaseFee paidWithinBounds atMostOneLiveEdge liveCoinsAreKnown noNegativeValue --verbosity=1"
+    "quint:verify:adversary:safety": "quint verify --apalache-version=0.57.0 models/l1_adversary.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown --verbosity=1",
+    "quint:verify:adversary:attack": "! quint verify --apalache-version=0.57.0 models/l1_adversary.qnt --invariant=payoutsHonorBindings --max-steps=3 --verbosity=0",
+    "quint:verify:fees": "quint verify --apalache-version=0.57.0 models/fees.qnt --invariants valueAccounted reserveAtLeastBaseFee paidWithinBounds atMostOneLiveEdge liveCoinsAreKnown noNegativeValue --verbosity=1"
   },
   "devDependencies": {
     "@informalsystems/quint": "0.32.0"
