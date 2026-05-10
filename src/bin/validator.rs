@@ -223,6 +223,11 @@ enum Command {
         #[arg(long)]
         ws_push: Option<String>,
     },
+    /// Validate a TOML config without running the node
+    CheckConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Query a running validator via RPC
     Query {
         /// RPC endpoint (e.g. http://127.0.0.1:9000)
@@ -331,6 +336,7 @@ fn main() {
             ws_bind,
             ws_push,
         } => run(config, ws_bind, ws_push),
+        Command::CheckConfig { config } => check_config(config),
         Command::Query { rpc, query } => do_query(rpc, query),
         Command::Wallet { wallet } => do_wallet(wallet),
     };
@@ -1038,6 +1044,21 @@ async fn init_block_store(
     .expect("failed to initialize finalized blocks archive")
 }
 
+/// Run all `NodeConfig` validations the runtime would perform at startup.
+/// Used by `validator check-config` and by `nix build` via runCommand.
+fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let node_config: NodeConfig = toml::from_str(&config_str)?;
+    node_config.decode_private_key()?;
+    node_config.decode_threshold_share()?;
+    node_config.decode_threshold_polynomial()?;
+    node_config.participants()?;
+    node_config.peer_address_map()?;
+    node_config.genesis_allocations()?;
+    println!("ok");
+    Ok(())
+}
+
 fn run(
     config_path: PathBuf,
     ws_bind: Option<String>,
@@ -1050,6 +1071,16 @@ fn run(
     }
     if ws_push.is_some() {
         node_config.explorer_url = ws_push;
+    }
+
+    // Prefer systemd-supplied credentials; otherwise keys come from the TOML — fine for dev/test,
+    // never for production. eprintln! because tracing isn't initialized yet at this point.
+    if !node_config.load_credentials()? {
+        eprintln!(
+            "WARNING: CREDENTIALS_DIRECTORY not set; using key material from {}. \
+             Production must supply keys via systemd LoadCredential.",
+            config_path.display(),
+        );
     }
 
     let private_key = node_config.decode_private_key()?;

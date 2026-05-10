@@ -32,7 +32,18 @@ pub enum ConfigError {
     InvalidGenesisAddress(#[from] hellas_types::AddressError),
     #[error("duplicate addresses in genesis allocations")]
     DuplicateGenesisAddresses,
+    #[error("failed to read credential {path}: {source}")]
+    CredentialRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
+
+/// Filenames systemd `LoadCredential=` is expected to provide under `$CREDENTIALS_DIRECTORY`.
+pub const CREDENTIAL_PRIVATE_KEY: &str = "private-key";
+pub const CREDENTIAL_THRESHOLD_SHARE: &str = "threshold-share";
+pub const CREDENTIAL_THRESHOLD_POLYNOMIAL: &str = "threshold-polynomial";
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -177,6 +188,27 @@ impl NodeConfig {
             Ok(map) => Ok(map),
             Err(_) => Err(ConfigError::DuplicatePeerAddressKeys),
         }
+    }
+
+    /// Overlay `private_key`, `threshold_share`, and `threshold_polynomial` from
+    /// `$CREDENTIALS_DIRECTORY/{private-key,threshold-share,threshold-polynomial}`. When the
+    /// env var is set, all three files are required — a partial set is a deployment misconfig.
+    /// Returns `Ok(true)` when credentials were loaded, `Ok(false)` when the env var is unset.
+    pub fn load_credentials(&mut self) -> Result<bool, ConfigError> {
+        let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) else {
+            return Ok(false);
+        };
+        for (name, field) in [
+            (CREDENTIAL_PRIVATE_KEY, &mut self.private_key),
+            (CREDENTIAL_THRESHOLD_SHARE, &mut self.threshold_share),
+            (CREDENTIAL_THRESHOLD_POLYNOMIAL, &mut self.threshold_polynomial),
+        ] {
+            let path = dir.join(name);
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::CredentialRead { path, source })?;
+            *field = raw.trim().to_string();
+        }
+        Ok(true)
     }
 
     pub fn genesis_allocations(&self) -> Result<Vec<(UserAddress, u64)>, ConfigError> {
