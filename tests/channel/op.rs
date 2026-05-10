@@ -9,23 +9,23 @@ fn operations_report_deterministic_cost() {
         payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
     );
 
-    assert_eq!(open.cost(), Cost::new(1, 3, 3, 0));
+    assert_eq!(open.cost(), Cost::new(1, 3, 0));
     assert_eq!(Op::Open(open).cost(), open.cost());
-    assert_eq!(resolve.cost(), Cost::new(1, 3, 3, 1));
+    assert_eq!(resolve.cost(), Cost::new(1, 3, 1));
     assert_eq!(Op::Resolve(resolve).cost(), resolve.cost());
-    assert_eq!(open.reserve_cost(), Cost::new(1, 5, 5, 2));
+    assert_eq!(open.reserve_cost(), Cost::new(1, 5, 2));
     assert!(resolve.cost().fits(open.reserve_cost()));
     assert_eq!(
         agreement_proof(edge(), resolve.outputs()).cost(),
-        Cost::new(0, 0, 0, 2)
+        Cost::new(0, 0, 2)
     );
     assert_eq!(proof().kind(), ResolveKind::Timeout);
     assert_eq!(proof().terms(), terms());
     assert_eq!(Proof::timeout(BASIC_TERMS).terms(), terms());
-    assert_eq!(Proof::timeout(BASIC_TERMS).cost(), Cost::new(0, 0, 0, 1));
+    assert_eq!(Proof::timeout(BASIC_TERMS).cost(), Cost::new(0, 0, 1));
     assert_eq!(
         claimant_proof(edge(), resolve.outputs()).cost(),
-        Cost::new(0, 0, 0, 2),
+        Cost::new(0, 0, 2),
     );
     assert_eq!(
         challenger_proof(edge(), resolve.outputs()).kind(),
@@ -120,15 +120,15 @@ fn block_reports_deterministic_cost_and_fee() {
     ]);
     let block = Block::new(RESOURCE_CONTEXT, ops);
 
-    assert_eq!(block.cost(), Some(Cost::new(2, 6, 6, 1)));
+    assert_eq!(block.cost(), Some(Cost::new(2, 6, 1)));
+    // 1*2 + 3*6 + 0*1 = 20 under RESOURCE_CONTEXT.
     assert_eq!(block.fee(), Some(20));
-    assert!(Cost::new(2, 6, 6, 1).fits(Cost::new(2, 6, 6, 1)));
-    assert!(block.fits(Cost::new(2, 6, 6, 1)));
-    assert!(block.fits(Cost::new(3, 6, 6, 1)));
-    assert!(!block.fits(Cost::new(1, 6, 6, 1)));
-    assert!(!block.fits(Cost::new(2, 5, 6, 1)));
-    assert!(!block.fits(Cost::new(2, 6, 5, 1)));
-    assert!(!block.fits(Cost::new(2, 6, 6, 0)));
+    assert!(Cost::new(2, 6, 1).fits(Cost::new(2, 6, 1)));
+    assert!(block.fits(Cost::new(2, 6, 1)));
+    assert!(block.fits(Cost::new(3, 6, 1)));
+    assert!(!block.fits(Cost::new(1, 6, 1)));
+    assert!(!block.fits(Cost::new(2, 5, 1)));
+    assert!(!block.fits(Cost::new(2, 6, 0)));
 }
 
 #[test]

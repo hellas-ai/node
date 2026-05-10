@@ -52,24 +52,23 @@ fn terms_hash_commits_to_basic_fields() {
 
 #[test]
 fn context_prices_resource_costs() {
-    let fees = Fees::new(3, 2, 5, 7);
+    let fees = Fees::new(3, 5, 7);
     let context = Context::with_fees(
         BlockHeight::new(7),
         BlockHash::from_bytes([1; BlockHash::LENGTH]),
         fees,
     );
-    let cost = Cost::new(1, 4, 2, 3);
+    let cost = Cost::new(1, 4, 3);
 
     assert_eq!(cost.base(), 1);
-    assert_eq!(cost.reads(), 4);
-    assert_eq!(cost.writes(), 2);
+    assert_eq!(cost.slots(), 4);
     assert_eq!(cost.proofs(), 3);
     assert_eq!(fees.base(), 3);
-    assert_eq!(fees.read(), 2);
-    assert_eq!(fees.write(), 5);
+    assert_eq!(fees.slot(), 5);
     assert_eq!(fees.proof(), 7);
     assert_eq!(context.fees(), fees);
-    assert_eq!(context.fee(cost), Some(42));
+    // 3*1 + 5*4 + 7*3 = 44
+    assert_eq!(context.fee(cost), Some(44));
 }
 
 fn payouts(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {

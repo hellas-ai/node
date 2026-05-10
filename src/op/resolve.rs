@@ -75,14 +75,10 @@ impl Resolve {
         Self::cost_for_kind(outputs, (*proof).kind())
     }
 
+    /// One slot per payout output plus one for the consumed edge.
     pub(super) fn cost_for_kind(outputs: usize, kind: ResolveKind) -> Cost {
         let outputs = units(outputs);
-        Cost::new(
-            1,
-            outputs.saturating_add(1),
-            outputs.saturating_add(1),
-            kind.proofs(),
-        )
+        Cost::new(1, outputs.saturating_add(1), kind.proofs())
     }
 
     pub(super) fn apply<T: Tx, V: Verifier + ?Sized>(

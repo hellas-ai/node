@@ -120,10 +120,12 @@ impl Open {
     }
 
     /// Returns the deterministic resource cost of this open.
+    ///
+    /// One slot per funding input plus one for the produced edge.
     #[must_use]
     pub fn cost(&self) -> Cost {
         let inputs = units(self.funding.len());
-        Cost::new(1, inputs.saturating_add(1), inputs.saturating_add(1), 0)
+        Cost::new(1, inputs.saturating_add(1), 0)
     }
 
     pub(super) fn apply<T: Tx>(&self, context: Context, tx: &T) -> KernelResult<Change> {

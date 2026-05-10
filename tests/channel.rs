@@ -28,12 +28,12 @@ const CONTEXT: Context = Context::new(
 const FEE_CONTEXT: Context = Context::with_fees(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
-    Fees::new(3, 0, 0, 0),
+    Fees::new(3, 0, 0),
 );
 const RESOURCE_CONTEXT: Context = Context::with_fees(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
-    Fees::new(1, 2, 1, 0),
+    Fees::new(1, 3, 0),
 );
 const TIMEOUT: BlockHeight = BlockHeight::new(1);
 const EARLY_CONTEXT: Context = Context::new(
