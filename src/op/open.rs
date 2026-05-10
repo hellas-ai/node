@@ -63,28 +63,20 @@ impl Funding {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Open {
     funding: Funding,
-    parties: Parties,
+    terms: Terms,
     output: EdgeId,
-    terms: TermsHash,
 }
 
 impl Open {
-    /// Creates an open operation with its canonical output id.
-    #[must_use]
-    pub fn new(funding: Funding, parties: Parties, terms: TermsHash) -> Self {
-        let output = Self::id(&funding, parties, terms);
-        Self {
-            funding,
-            parties,
-            output,
-            terms,
-        }
-    }
-
     /// Creates an open operation from concrete terms.
     #[must_use]
     pub fn from_terms(funding: Funding, terms: Terms) -> Self {
-        Self::new(funding, terms.parties(), terms.hash())
+        let output = Self::id(&funding, &terms);
+        Self {
+            funding,
+            terms,
+            output,
+        }
     }
 
     /// Returns the funding consumed by the open.
@@ -96,7 +88,7 @@ impl Open {
     /// Returns the parties committed by the produced edge.
     #[must_use]
     pub const fn parties(self) -> Parties {
-        self.parties
+        self.terms.parties()
     }
 
     /// Returns the edge produced by the open.
@@ -108,10 +100,7 @@ impl Open {
     /// Returns funding coin ids in canonical operation order.
     #[must_use]
     pub fn inputs(&self) -> List<CoinId, MAX_EDGE_INPUTS> {
-        let fill = self
-            .funding
-            .first()
-            .unwrap_or(CoinId::from_bytes([0; CoinId::LENGTH]));
+        let fill = self.funding.first().unwrap_or(CoinId::ZERO);
         let mut ids = [fill; MAX_EDGE_INPUTS];
 
         for (index, id) in self.funding.iter().enumerate() {
@@ -126,8 +115,8 @@ impl Open {
 
     /// Returns the open terms commitment for the produced edge.
     #[must_use]
-    pub const fn terms(self) -> TermsHash {
-        self.terms
+    pub fn terms(self) -> TermsHash {
+        self.terms.hash()
     }
 
     /// Returns the deterministic resource cost of this open.
@@ -154,12 +143,11 @@ impl Open {
             .ok_or(ApplyError::InvalidOpen {
                 output: self.output,
             })?;
-        let edge = Edge::open(&coins, self.parties, self.terms, open_fee, reserve).ok_or(
+        let edge = Edge::open(&coins, self.parties(), self.terms(), open_fee, reserve).ok_or(
             ApplyError::InvalidOpen {
                 output: self.output,
             },
         )?;
-
         Ok(Change::open(&coins, (self.output, edge)))
     }
 
@@ -181,10 +169,11 @@ impl Open {
         }
     }
 
-    fn id(funding: &Funding, parties: Parties, terms: TermsHash) -> EdgeId {
-        let mut digest = Digest::new(b"hellas.edge.edge.v1");
+    fn id(funding: &Funding, terms: &Terms) -> EdgeId {
+        let mut digest = Digest::new(crate::domain::EDGE_OPEN);
+        let parties = (*terms).parties();
 
-        digest.bytes(terms.as_bytes());
+        digest.bytes((*terms).hash().as_bytes());
         digest.bytes(parties.maker().as_bytes());
         digest.bytes(parties.taker().as_bytes());
         Self::ids(&mut digest, Party::Maker, &funding.maker);
@@ -208,10 +197,7 @@ impl Open {
 
     fn coins<T: Tx>(&self, tx: &T) -> KernelResult<OpenCoins> {
         let Some(first) = self.funding.first() else {
-            let fill = (CoinId::from_bytes([0; CoinId::LENGTH]), Coin::zero());
-            return List::new([fill; MAX_EDGE_INPUTS], 0).ok_or(ApplyError::InvalidOpen {
-                output: self.output,
-            });
+            return Ok(List::empty((CoinId::ZERO, Coin::ZERO)));
         };
         let first_coin = tx
             .coin(first)

@@ -133,7 +133,7 @@ fn replays_basic_trace() {
     Trace::new([
         Frame::accept(Step::Open(EdgeKey::First), Shape::Edge(EdgeKey::First)),
         Frame::accept(
-            Step::Resolve(EdgeKey::First, ProofKey::Basic),
+            Step::Resolve(EdgeKey::First, ProofKey::Timeout),
             Shape::Payout(EdgeKey::First),
         ),
     ])

@@ -109,7 +109,7 @@ impl Seal {
     /// shape only when built with the `fake-crypto` feature.
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
-        let mut digest = Digest::new(b"hellas.seal.placeholder.v1");
+        let mut digest = Digest::new(crate::domain::SEAL_PLACEHOLDER);
 
         digest.u8(protocol.get());
         digest.u8(kind.tag());
@@ -234,13 +234,26 @@ impl Proof {
 
     pub(super) fn accepts(self, context: Context, resolve: &Resolve, edge: Edge) -> bool {
         match self {
-            Self::Basic { terms } => terms == edge.terms(),
+            Self::Basic { terms } => {
+                #[cfg(feature = "fake-crypto")]
+                {
+                    terms == edge.terms()
+                }
+
+                #[cfg(not(feature = "fake-crypto"))]
+                {
+                    let _ = terms;
+                    false
+                }
+            }
             Self::Agreement { terms, agreement } => {
                 terms == edge.terms()
                     && agreement.accepts(edge.parties(), resolve.hash(ResolveKind::Agreement))
             }
             Self::Timeout { terms } => {
-                terms.hash() == edge.terms() && context.block_height() >= terms.timeout()
+                terms.hash() == edge.terms()
+                    && context.block_height() >= terms.timeout()
+                    && *resolve.outputs() == terms.timeout_outputs()
             }
             Self::ClaimantWins { terms, seal } => {
                 let kind = ResolveKind::ClaimantWins;

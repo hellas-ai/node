@@ -104,7 +104,7 @@ fn replays_basic_itf() {
         include_str!("../models/traces/l1_basicTraceTest.itf.json"),
         [
             Step::Open(EdgeKey::First),
-            Step::Resolve(EdgeKey::First, ProofKey::Basic),
+            Step::Resolve(EdgeKey::First, ProofKey::Timeout),
         ],
     )
     .replay();

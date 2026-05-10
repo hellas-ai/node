@@ -124,24 +124,13 @@ fn overlaps<T: Eq, const A: usize, const B: usize>(left: &List<T, A>, right: &Li
 }
 
 const fn empty_coins<const N: usize>() -> List<CoinId, N> {
-    let fill = CoinId::from_bytes([0; CoinId::LENGTH]);
-    let Some(ids) = List::new([fill; N], 0) else {
-        return List::all([fill; N]);
-    };
-    ids
+    List::empty(CoinId::ZERO)
 }
 
 const fn empty_edges() -> EdgeList {
-    let fill = EdgeId::from_bytes([0; EdgeId::LENGTH]);
-    let Some(ids) = List::new([fill], 0) else {
-        return List::all([fill]);
-    };
-    ids
+    List::empty(EdgeId::ZERO)
 }
 
 const fn one_edge(id: EdgeId) -> EdgeList {
-    let Some(ids) = List::new([id], 1) else {
-        return List::all([id]);
-    };
-    ids
+    List::all([id])
 }

@@ -172,9 +172,9 @@ interchangeable; the compiler stops cross-purpose assignment.
 
 `Edge` carries principal value, prepaid resolution reserve,
 `Parties { maker, taker }`, and a `TermsHash`, not a stored terms object id.
-`Terms::Basic` is the current concrete terms shape: protocol code, parties, and
-the earliest timeout block height. It has a deterministic no-allocation BLAKE3
-commitment path:
+`Terms::Basic` is the current concrete terms shape: protocol code, parties, the
+earliest timeout block height, and the deterministic payout list accepted by a
+timeout resolve. It has a deterministic no-allocation BLAKE3 commitment path:
 `Terms::hash() -> TermsHash`.
 
 Terms are still not on-chain state. The hot live object stores only
@@ -184,40 +184,45 @@ commitment and later verify resolve proofs against it.
 ### Edge Funding Shape
 
 `Open` consumes bounded bilateral `Funding { maker, taker }`, where each party
-is a bounded list of `CoinId` values, and carries `Parties { maker, taker }`,
-the two settlement keys committed by the produced edge. The produced `EdgeId`
-is canonical; it is not supplied by the caller. Either funding list may be
-empty; a one-sided or zero-funded open is valid when total funding covers the
-context-priced open cost plus the prepaid reserve for the worst-case bounded
-resolve path. Funding is invalid exactly when the sum of funding coin values is
-less than `context.fee(open.cost()) + context.fee(open.reserve_cost())`. The
-produced edge principal is that remaining value; the reserve is stored
-separately and is not payable principal. Maker and taker are positional party
-identities: the maker is the party whose open intent or offer is filled, and the
-taker is the party that fills it. They are not buyer/seller, requester/provider,
-payer/worker, or any other economic meaning.
+is a bounded list of `CoinId` values, and carries concrete `Terms`. The produced
+edge stores only `TermsHash` and `Parties { maker, taker }` derived from those
+terms. The produced `EdgeId` is canonical; it is not supplied by the caller.
+Either funding list may be empty; a one-sided or zero-funded open is valid when
+total funding covers the context-priced open cost plus the prepaid reserve for
+the worst-case bounded resolve path. Funding is invalid exactly when the sum of
+funding coin values is less than
+`context.fee(open.cost()) + context.fee(open.reserve_cost())`. The produced edge
+principal is that remaining value; the reserve is stored separately and is not
+payable principal. Maker and taker are positional party identities: the maker is
+the party whose open intent or offer is filled, and the taker is the party that
+fills it. They are not buyer/seller, requester/provider, payer/worker, or any
+other economic meaning. The kernel does not require the maker and taker keys to
+be distinct; self-edges are valid and can represent sends, merges, or no-work
+channels under higher-level protocol convention.
 
 `Resolve` consumes one `Edge`, carries a bounded resolve proof, and creates a
 bounded list of `Payout { owner, value }` values. Payout coin ids are canonical;
 they are not supplied by the caller. `Proof` carries a `ResolveKind`:
 `Basic`, `Agreement`, `Timeout`, `ClaimantWins`, or `ChallengerWins`. `Basic` is
 the degenerate modelling witness that only binds the resolve to the edge's
-`TermsHash`. `Agreement` is the first real non-basic witness: it requires both
-maker and taker signature-shaped witnesses over the same `ResolveHash`, which
-commits to the input edge, witness kind, terms, and ordered payouts. The current
+`TermsHash`; the kernel accepts it only under the `fake-crypto` feature.
+`Agreement` is the first real non-basic witness: it requires both maker and
+taker signature-shaped witnesses over the same `ResolveHash`, which commits to
+the input edge, witness kind, terms, and ordered payouts. The current
 `Sig::placeholder` path is deterministic and non-cryptographic; it stands in
 for the preverified settlement-signature cache until real signature verification
 is wired in outside the hot reducer. It verifies only under the `fake-crypto`
 feature, which is for models and tests and is blocked for optimized builds.
 `Timeout` reveals the concrete basic terms, checks that their commitment equals
-the edge's `TermsHash`, and accepts only when `Context::block_height() >=
-Terms::timeout()`. `ClaimantWins` and `ChallengerWins` reveal the same concrete
-terms and carry a fixed-size `Seal`. The seal is the compact mode-specific
-verifier result; the hot reducer only checks that it binds to the protocol code,
-outcome kind, terms commitment, input edge, and ordered payouts. The current
-`Seal::placeholder` path is deterministic and non-cryptographic, matching the
-placeholder signature path until a real verifier or preverification cache is
-wired in. It also verifies only under `fake-crypto`.
+the edge's `TermsHash`, accepts only when `Context::block_height() >=
+Terms::timeout()`, and requires the resolve payout list to equal the terms'
+committed timeout payout list. `ClaimantWins` and `ChallengerWins` reveal the
+same concrete terms and carry a fixed-size `Seal`. The seal is the compact
+mode-specific verifier result; the hot reducer only checks that it binds to the
+protocol code, outcome kind, terms commitment, input edge, and ordered payouts.
+The current `Seal::placeholder` path is deterministic and non-cryptographic,
+matching the placeholder signature path until a real verifier or preverification
+cache is wired in. It also verifies only under `fake-crypto`.
 Empty resolve output is valid exactly for a zero-value edge. A resolve is valid
 only when the edge reserve covers `context.fee(resolve.cost())`; the reserve is
 consumed by the resolve and does not appear in payout coins.

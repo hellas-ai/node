@@ -4,7 +4,7 @@ use crate::{
     block::Block,
     context::Context,
     error::{BatchError, InsertError, KernelResult},
-    event::{Diff, Event},
+    event::{Change, Diff, Event},
     list::List,
     object::Genesis,
     op::Op,
@@ -75,10 +75,9 @@ impl<S: Store> State<S> {
     /// current store contents or if the backing store rejects an insertion.
     pub fn apply(&mut self, context: Context, operation: &Op) -> KernelResult<Event> {
         let mut tx = self.store.begin();
-        let change = operation.apply(context, &tx)?;
-        change.fold(&mut tx)?;
+        let event = Self::fold_one(&mut tx, context, operation)?;
         tx.commit();
-        Ok(change.event())
+        Ok(event)
     }
 
     /// Applies an ordered operation batch atomically and returns its diff.
@@ -99,13 +98,9 @@ impl<S: Store> State<S> {
         let mut diff = Diff::empty();
 
         for (index, operation) in operations.iter().enumerate() {
-            let change = operation
-                .apply(context, &tx)
+            let event = Self::fold_one(&mut tx, context, &operation)
                 .map_err(|source| BatchError::new(index, source))?;
-            change
-                .fold(&mut tx)
-                .map_err(|source| BatchError::new(index, source))?;
-            diff.push(&change.event());
+            diff.push(&event);
         }
 
         tx.commit();
@@ -122,5 +117,15 @@ impl<S: Store> State<S> {
         block: &Block<N>,
     ) -> KernelResult<Diff<N>, BatchError> {
         self.apply_all(block.context(), block.ops())
+    }
+
+    fn fold_one<T: Tx>(tx: &mut T, context: Context, operation: &Op) -> KernelResult<Event> {
+        let change = operation.apply(context, tx)?;
+        Self::fold_change(tx, &change)
+    }
+
+    fn fold_change<T: Tx>(tx: &mut T, change: &Change) -> KernelResult<Event> {
+        change.fold(tx)?;
+        Ok(change.event())
     }
 }

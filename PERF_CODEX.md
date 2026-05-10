@@ -756,7 +756,7 @@ Use a closed resolve witness enum:
 
 ```rust
 enum ResolveKind {
-    Basic,
+    Basic, // modelling-only; accepted only behind fake-crypto
     Agreement,
     Timeout,
     ClaimantWins,
@@ -1444,7 +1444,8 @@ Do not optimize to a single TPS number. Track:
 
 ### Timeout Logic
 
-- Timeout witnesses reveal concrete terms and check the committed timeout height.
+- Timeout witnesses reveal concrete terms, check the committed timeout height,
+  and can only pay the timeout payout list committed by those terms.
 - Maker silent in every frontier state.
 - Taker silent in every frontier state.
 - One-step advance accepted only from the mode-defined active party.

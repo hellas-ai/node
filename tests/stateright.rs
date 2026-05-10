@@ -45,12 +45,14 @@ impl Model for ChannelModel {
         }
 
         if view.edge(l1::open_case_id(OpenKey::Full)).is_some() {
+            #[cfg(feature = "fake-crypto")]
             actions.push(Action::Resolve(ProofKey::Basic));
             actions.push(Action::Resolve(ProofKey::Agreement));
             actions.push(Action::Resolve(ProofKey::Timeout));
             actions.push(Action::Resolve(ProofKey::Claimant));
             actions.push(Action::Resolve(ProofKey::Challenger));
             actions.push(Action::Resolve(ProofKey::EarlyTimeout));
+            #[cfg(feature = "fake-crypto")]
             actions.push(Action::InvalidResolve);
             actions.push(Action::InvalidProof);
         }
@@ -165,6 +167,7 @@ impl ChannelModel {
 enum Action {
     Open(OpenKey),
     Resolve(ProofKey),
+    #[cfg(feature = "fake-crypto")]
     InvalidResolve,
     InvalidProof,
 }
@@ -181,6 +184,7 @@ impl Action {
         match self {
             Self::Open(key) => l1::open_case_op(key),
             Self::Resolve(proof) => Op::Resolve(l1::resolve(EdgeKey::First, proof)),
+            #[cfg(feature = "fake-crypto")]
             Self::InvalidResolve => Op::Resolve(l1::resolve_with(
                 EdgeKey::First,
                 ProofKey::Basic,
@@ -192,6 +196,7 @@ impl Action {
 
     fn error(self) -> Option<ApplyError> {
         match self {
+            #[cfg(feature = "fake-crypto")]
             Self::InvalidResolve => Some(ApplyError::InvalidResolve {
                 input: l1::edge_id(EdgeKey::First),
             }),

@@ -1,7 +1,8 @@
 //! Primitive wrapper tests.
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, Context, Cost, Fees, Key, Parties, Party, ProtocolCode, Terms,
+    BlockHash, BlockHeight, Context, Cost, Fees, Key, List, MAX_EDGE_OUTPUTS, Parties, Party,
+    Payout, ProtocolCode, Terms,
 };
 
 #[test]
@@ -26,19 +27,26 @@ fn terms_hash_commits_to_basic_fields() {
     let taker = Key::from_bytes([2; Key::LENGTH]);
     let parties = Parties::new(maker, taker);
     let timeout = BlockHeight::new(11);
-    let terms = Terms::basic(ProtocolCode::new(7), parties, timeout);
+    let outputs = payouts(Payout::new(maker, 6), Payout::new(taker, 4));
+    let other_outputs = payouts(Payout::new(maker, 5), Payout::new(taker, 5));
+    let terms = Terms::basic(ProtocolCode::new(7), parties, timeout, outputs);
 
     assert_eq!(terms.protocol(), ProtocolCode::new(7));
     assert_eq!(terms.parties(), parties);
     assert_eq!(terms.timeout(), timeout);
+    assert_eq!(terms.timeout_outputs(), outputs);
     assert_eq!(terms.hash(), terms.hash());
     assert_ne!(
         terms.hash(),
-        Terms::basic(ProtocolCode::new(8), parties, timeout).hash(),
+        Terms::basic(ProtocolCode::new(8), parties, timeout, outputs).hash(),
     );
     assert_ne!(
         terms.hash(),
-        Terms::basic(ProtocolCode::new(7), parties, BlockHeight::new(12)).hash(),
+        Terms::basic(ProtocolCode::new(7), parties, BlockHeight::new(12), outputs).hash(),
+    );
+    assert_ne!(
+        terms.hash(),
+        Terms::basic(ProtocolCode::new(7), parties, timeout, other_outputs).hash(),
     );
 }
 
@@ -62,4 +70,11 @@ fn context_prices_resource_costs() {
     assert_eq!(fees.proof(), 7);
     assert_eq!(context.fees(), fees);
     assert_eq!(context.fee(cost), Some(42));
+}
+
+fn payouts(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let Some(outputs) = List::new([first, second, first, first], 2) else {
+        panic!("invalid primitive payout list");
+    };
+    outputs
 }
