@@ -196,6 +196,23 @@ in {
         program = "${ci.fixPackages.all}/bin/hellas-fix-all";
         meta.description = "Apply all CI auto-fixes where supported";
       };
+      # Individual `check-*` apps are what CI's matrix enumerates.
+      check-fmt = {
+        type = "app";
+        program = "${ci.checkPackages.fmt}/bin/hellas-check-fmt";
+      };
+      check-clippy = {
+        type = "app";
+        program = "${ci.checkPackages.clippy}/bin/hellas-check-clippy";
+      };
+      check-sort = {
+        type = "app";
+        program = "${ci.checkPackages.sort}/bin/hellas-check-sort";
+      };
+      check-test = {
+        type = "app";
+        program = "${ci.testPackage}/bin/hellas-check-test";
+      };
     }
     // (linuxOutputs.apps or {});
 
