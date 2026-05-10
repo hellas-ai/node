@@ -17,7 +17,10 @@
 
 module l1 {
   import types.* from "./types"
-  import verifier.* from "./verifier"
+  // Production semantics: Basic proofs are rejected by policy. The
+  // adversary configuration with `FakeCrypto = true` lives in
+  // `l1_adversary.qnt` — keep the two modules' bodies in sync.
+  import verifier(FakeCrypto = false).* from "./verifier"
   import invariants as inv from "./rules/invariants"
 
   // ---------------------------------------------------------------------

@@ -20,7 +20,13 @@ module verifier {
   // true to model the modelling/test build (Basic accepted; Sig/Seal
   // placeholders verifiable). Set false to model production semantics
   // (Basic rejected by policy regardless of payouts).
-  pure val FakeCrypto = false
+  //
+  // Left as a free constant so different consumers can fix it
+  // independently — `models/configs/production.qnt` sets `false` and
+  // verifies all invariants hold; `models/configs/adversary.qnt` sets
+  // `true` and demonstrates that `payoutsHonorBindings` is reachably
+  // violated (Apalache prints a concrete adversary trace).
+  const FakeCrypto: bool
 
   // Whether a proof witness is *admissible at all* under the current
   // height and feature config. Production verifiers reject Basic; Timeout
