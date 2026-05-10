@@ -1,6 +1,8 @@
 #![allow(clippy::redundant_pub_crate)]
 #![allow(dead_code)]
 
+pub(crate) mod l1;
+
 use hellas_kernel::{
     Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, Snapshot, State,
     Store, TermsHash, Tx, View,
