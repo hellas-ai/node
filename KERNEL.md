@@ -265,6 +265,8 @@ It tracks:
 
 - coins
 - live edge records
+- explicit live-object sets in the abstract models, because zero value and
+  absence are distinct
 - bounded resolve operations
 - block height
 - finalized transaction order

@@ -17,7 +17,7 @@ use support::{
     },
 };
 
-const VARS: [&str; 4] = ["coins", "edges", "height", "liveEdges"];
+const VARS: [&str; 5] = ["coins", "edges", "height", "liveCoins", "liveEdges"];
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct Fixture<const N: usize> {
@@ -60,7 +60,7 @@ impl<const N: usize> Fixture<N> {
         let view: TraceView = state.view();
 
         assert_eq!(expected.height.as_u64(), height, "{}", self.name);
-        assert_eq!(view.coin_len(), expected.live_coins(), "{}", self.name);
+        assert_eq!(view.coin_len(), expected.live_coin_count(), "{}", self.name);
         assert_eq!(view.edge_len(), expected.live_edges(), "{}", self.name);
         check_coin(expected, &view, "MakerCoin", MAKER_ID, MAKER);
         check_coin(expected, &view, "TakerCoin", TAKER_ID, TAKER);
@@ -161,20 +161,20 @@ fn check_coin(
     owner: hellas_kernel::Key,
 ) {
     let value = expected.coins.get(tag);
-    let live = view.coin(id).map(coin_view);
+    let coin = view.coin(id).map(coin_view);
 
-    if value == 0 {
-        assert_eq!(live, None, "{tag}");
-    } else {
-        assert_eq!(live, Some((owner, value)), "{tag}");
+    if expected.live_coins.contains(tag) {
+        assert_eq!(coin, Some((owner, value)), "{tag}");
+        return;
     }
+
+    assert_eq!(coin, None, "{tag}");
 }
 
 fn check_edge(expected: &ItfState, view: &TraceView, tag: &str, id: hellas_kernel::EdgeId) {
     let value = expected.edges.get(tag);
     let live = expected.live_edges.contains(tag);
 
-    assert_eq!(live, value != 0, "{tag}");
     if live {
         assert_eq!(view.edge(id).map(edge_value), Some(value), "{tag}");
     } else {
@@ -211,13 +211,15 @@ struct ItfState {
     coins: ItfMap,
     edges: ItfMap,
     height: ItfInt,
+    #[serde(rename = "liveCoins")]
+    live_coins: ItfSet,
     #[serde(rename = "liveEdges")]
     live_edges: ItfSet,
 }
 
 impl ItfState {
-    fn live_coins(&self) -> usize {
-        self.coins.non_zero()
+    const fn live_coin_count(&self) -> usize {
+        self.live_coins.items.len()
     }
 
     const fn live_edges(&self) -> usize {
@@ -240,13 +242,6 @@ impl ItfMap {
         }
 
         panic!("missing ITF map item: {tag}");
-    }
-
-    fn non_zero(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|(_, value)| value.as_u64() != 0)
-            .count()
     }
 }
 
