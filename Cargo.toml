@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
+fake-crypto = []
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
