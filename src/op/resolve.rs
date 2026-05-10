@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     context::{Context, Cost},
-    error::{ApplyError, KernelResult},
+    error::{ApplyError, InvalidResolveReason, KernelResult},
     event::Change,
     list::List,
     object::Coin,
@@ -100,17 +100,26 @@ impl Resolve {
         let edge = tx
             .edge(self.input)
             .ok_or(ApplyError::MissingEdge { id: self.input })?;
-        if !self.proof.accepts(context, verifier, self, edge) {
-            return Err(ApplyError::InvalidProof { input: self.input });
-        }
+        self.proof
+            .accepts(context, verifier, self, edge)
+            .map_err(|reason| ApplyError::InvalidProof {
+                input: self.input,
+                reason,
+            })?;
         let fee = context
             .fee(self.cost())
-            .ok_or(ApplyError::InvalidResolve { input: self.input })?;
-        if !edge.resolves(&coins, fee) {
-            return Err(ApplyError::InvalidResolve { input: self.input });
-        }
+            .ok_or_else(|| self.invalid(InvalidResolveReason::FeeOverflow))?;
+        edge.resolves(&coins, fee)
+            .map_err(|reason| self.invalid(reason))?;
 
         Ok(Change::resolve((self.input, edge), &coins))
+    }
+
+    const fn invalid(&self, reason: InvalidResolveReason) -> ApplyError {
+        ApplyError::InvalidResolve {
+            input: self.input,
+            reason,
+        }
     }
 
     pub(super) fn access(&self) -> Access {
@@ -175,7 +184,8 @@ impl Resolve {
             coins[index] = output.coin(self.input, index);
         }
 
-        List::new(coins, outputs.len()).ok_or(ApplyError::InvalidResolve { input: self.input })
+        List::new(coins, outputs.len())
+            .ok_or_else(|| self.invalid(InvalidResolveReason::BoundsExceeded))
     }
 
     fn output_id(&self, index: usize, payout: Payout) -> CoinId {

@@ -250,6 +250,7 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
         state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
             output: open.output(),
+            reason: InvalidOpenReason::FundingInsufficient,
         }),
     );
     assert_eq!(*state.store(), store);
@@ -265,6 +266,7 @@ fn open_rejects_funding_below_fee_without_mutation() {
         state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
             output: open.output(),
+            reason: InvalidOpenReason::FundingInsufficient,
         }),
     );
     assert_eq!(*state.store(), store);
@@ -331,7 +333,10 @@ fn open_rejects_overflow_without_mutation() {
                 BASIC_TERMS,
             )),
         ),
-        Err(ApplyError::InvalidOpen { output: edge() }),
+        Err(ApplyError::InvalidOpen {
+            output: edge(),
+            reason: InvalidOpenReason::FundingOverflow,
+        }),
     );
     assert_eq!(*state.store(), store);
 }

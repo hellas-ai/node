@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     context::{Context, Cost},
-    error::{ApplyError, KernelResult},
+    error::{ApplyError, InvalidOpenReason, KernelResult},
     event::Change,
     list::List,
     object::{Coin, Edge, Parties},
@@ -135,20 +135,22 @@ impl Open {
         }
 
         let coins = self.coins(tx)?;
-        let open_fee = context.fee(self.cost()).ok_or(ApplyError::InvalidOpen {
-            output: self.output,
-        })?;
+        let open_fee = context
+            .fee(self.cost())
+            .ok_or_else(|| self.invalid(InvalidOpenReason::FeeOverflow))?;
         let reserve = context
             .fee(self.reserve_cost())
-            .ok_or(ApplyError::InvalidOpen {
-                output: self.output,
-            })?;
-        let edge = Edge::open(&coins, self.parties(), self.terms(), open_fee, reserve).ok_or(
-            ApplyError::InvalidOpen {
-                output: self.output,
-            },
-        )?;
+            .ok_or_else(|| self.invalid(InvalidOpenReason::ReserveOverflow))?;
+        let edge = Edge::open(&coins, self.parties(), self.terms(), open_fee, reserve)
+            .map_err(|reason| self.invalid(reason))?;
         Ok(Change::open(&coins, (self.output, edge)))
+    }
+
+    const fn invalid(&self, reason: InvalidOpenReason) -> ApplyError {
+        ApplyError::InvalidOpen {
+            output: self.output,
+            reason,
+        }
     }
 
     /// Returns the pessimistic resource cost prepaid for a future resolve.
@@ -205,8 +207,7 @@ impl Open {
             coins[index] = (id, coin);
         }
 
-        List::new(coins, self.funding.len()).ok_or(ApplyError::InvalidOpen {
-            output: self.output,
-        })
+        List::new(coins, self.funding.len())
+            .ok_or_else(|| self.invalid(InvalidOpenReason::BoundsExceeded))
     }
 }

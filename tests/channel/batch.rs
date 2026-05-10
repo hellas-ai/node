@@ -82,6 +82,7 @@ fn apply_all_rolls_back_on_error() {
         error.source(),
         ApplyError::InvalidResolve {
             input: open.output(),
+            reason: InvalidResolveReason::ValueMismatch,
         },
     );
     assert_eq!(*state.store(), store);

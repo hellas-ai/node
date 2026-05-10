@@ -1,6 +1,7 @@
 use super::{Resolve, SEAL_LENGTH};
 use crate::{
     context::{Context, Cost},
+    error::InvalidProofReason,
     object::{Edge, Parties},
     primitive::{Digest, ProtocolCode, ResolveHash, Sig, TermsHash},
     terms::Terms,
@@ -78,9 +79,14 @@ impl Agreement {
         verifier: &V,
         parties: Parties,
         hash: ResolveHash,
-    ) -> bool {
-        verifier.verify_sig(self.maker, parties.maker(), hash)
+    ) -> Result<(), InvalidProofReason> {
+        if verifier.verify_sig(self.maker, parties.maker(), hash)
             && verifier.verify_sig(self.taker, parties.taker(), hash)
+        {
+            Ok(())
+        } else {
+            Err(InvalidProofReason::BadSignature)
+        }
     }
 }
 
@@ -233,43 +239,80 @@ impl Proof {
         verifier: &V,
         resolve: &Resolve,
         edge: Edge,
-    ) -> bool {
+    ) -> Result<(), InvalidProofReason> {
         match self {
             Self::Basic { terms } => {
                 #[cfg(feature = "fake-crypto")]
                 {
-                    terms == edge.terms()
+                    if terms == edge.terms() {
+                        Ok(())
+                    } else {
+                        Err(InvalidProofReason::TermsMismatch)
+                    }
                 }
 
                 #[cfg(not(feature = "fake-crypto"))]
                 {
                     let _ = terms;
-                    false
+                    Err(InvalidProofReason::BasicNotAccepted)
                 }
             }
             Self::Agreement { terms, agreement } => {
-                terms == edge.terms()
-                    && agreement.accepts(
-                        verifier,
-                        edge.parties(),
-                        resolve.hash(ResolveKind::Agreement),
-                    )
+                if terms != edge.terms() {
+                    return Err(InvalidProofReason::TermsMismatch);
+                }
+                agreement.accepts(
+                    verifier,
+                    edge.parties(),
+                    resolve.hash(ResolveKind::Agreement),
+                )
             }
             Self::Timeout { terms } => {
-                terms.hash() == edge.terms()
-                    && context.block_height() >= terms.timeout()
-                    && *resolve.outputs() == terms.timeout_outputs()
+                if terms.hash() != edge.terms() {
+                    return Err(InvalidProofReason::TermsMismatch);
+                }
+                if context.block_height() < terms.timeout() {
+                    return Err(InvalidProofReason::TimeoutNotReached);
+                }
+                if *resolve.outputs() != terms.timeout_outputs() {
+                    return Err(InvalidProofReason::PayoutMismatch);
+                }
+                Ok(())
             }
-            Self::ClaimantWins { terms, seal } => {
-                let kind = ResolveKind::ClaimantWins;
-                terms.hash() == edge.terms()
-                    && verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind))
-            }
-            Self::ChallengerWins { terms, seal } => {
-                let kind = ResolveKind::ChallengerWins;
-                terms.hash() == edge.terms()
-                    && verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind))
-            }
+            Self::ClaimantWins { terms, seal } => Self::accepts_seal(
+                verifier,
+                resolve,
+                edge,
+                &terms,
+                seal,
+                ResolveKind::ClaimantWins,
+            ),
+            Self::ChallengerWins { terms, seal } => Self::accepts_seal(
+                verifier,
+                resolve,
+                edge,
+                &terms,
+                seal,
+                ResolveKind::ChallengerWins,
+            ),
+        }
+    }
+
+    fn accepts_seal<V: Verifier + ?Sized>(
+        verifier: &V,
+        resolve: &Resolve,
+        edge: Edge,
+        terms: &Terms,
+        seal: Seal,
+        kind: ResolveKind,
+    ) -> Result<(), InvalidProofReason> {
+        if terms.hash() != edge.terms() {
+            return Err(InvalidProofReason::TermsMismatch);
+        }
+        if verifier.verify_seal(seal, terms.protocol(), kind, resolve.hash(kind)) {
+            Ok(())
+        } else {
+            Err(InvalidProofReason::BadSeal)
         }
     }
 }

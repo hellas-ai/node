@@ -11,7 +11,7 @@ use support::{
     },
 };
 
-use hellas_kernel::ApplyError;
+use hellas_kernel::{ApplyError, InvalidProofReason};
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct Trace<const N: usize> {
@@ -187,6 +187,7 @@ fn replays_rejected_trace_step_without_mutation() {
             Step::Resolve(EdgeKey::First, ProofKey::EarlyTimeout),
             ApplyError::InvalidProof {
                 input: edge_id(EdgeKey::First),
+                reason: InvalidProofReason::TimeoutNotReached,
             },
             Shape::Edge(EdgeKey::First),
         ),
