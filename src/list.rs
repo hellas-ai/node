@@ -1,12 +1,22 @@
 //! Bounded no-allocation lists.
 
+use core::fmt;
 use core::hash::{Hash, Hasher};
 
 /// Bounded no-allocation list backed by a fixed array.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` prints only the live entries; the inactive tail is implementation
+/// detail and would otherwise flood error messages and example output.
+#[derive(Clone, Copy)]
 pub struct List<T, const N: usize> {
     items: [T; N],
     len: usize,
+}
+
+impl<T: fmt::Debug, const N: usize> fmt::Debug for List<T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
 }
 
 impl<T, const N: usize> List<T, N> {

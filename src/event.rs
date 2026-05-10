@@ -13,10 +13,16 @@ type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 
 /// Deterministic event diff produced by an ordered operation batch.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Diff<const N: usize> {
     events: [Option<Event>; N],
     len: usize,
+}
+
+impl<const N: usize> core::fmt::Debug for Diff<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 impl<const N: usize> Diff<N> {
