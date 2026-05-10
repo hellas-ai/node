@@ -20,6 +20,7 @@ module l1 {
 
   var coins: Coin -> int
   var edges: Edge -> int
+  var liveCoins: Set[Coin]
   var liveEdges: Set[Edge]
   var height: int
 
@@ -66,7 +67,7 @@ module l1 {
     }
 
   def totalCoins: int =
-    AllCoins.fold(0, (sum, id) => sum + coins.get(id))
+    liveCoins.fold(0, (sum, id) => sum + coins.get(id))
 
   def totalEdges: int =
     liveEdges.fold(0, (sum, id) => sum + edges.get(id))
@@ -85,18 +86,20 @@ module l1 {
       }
     ),
     edges' = AllEdges.mapBy(_ => 0),
+    liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     height' = 1,
   }
 
   action openEdge(e) = all {
     not(liveEdges.contains(e)),
-    coins.get(makerInput(e)) > 0,
-    coins.get(takerInput(e)) > 0,
+    liveCoins.contains(makerInput(e)),
+    liveCoins.contains(takerInput(e)),
     coins' = coins
       .set(makerInput(e), 0)
       .set(takerInput(e), 0),
     edges' = edges.set(e, coins.get(makerInput(e)) + coins.get(takerInput(e))),
+    liveCoins' = liveCoins.exclude(Set(makerInput(e), takerInput(e))),
     liveEdges' = liveEdges.union(Set(e)),
     height' = height,
   }
@@ -114,8 +117,8 @@ module l1 {
     liveEdges.contains(e)
       and edges.get(e) == EdgeValue
       and proofOk(p)
-      and coins.get(makerOutput(e)) == 0
-      and coins.get(takerOutput(e)) == 0
+      and not(liveCoins.contains(makerOutput(e)))
+      and not(liveCoins.contains(takerOutput(e)))
 
   action resolveEdge(e, p) = all {
     canResolve(e, p),
@@ -123,6 +126,7 @@ module l1 {
       .set(makerOutput(e), MakerPayout)
       .set(takerOutput(e), TakerPayout),
     edges' = edges.set(e, 0),
+    liveCoins' = liveCoins.union(Set(makerOutput(e), takerOutput(e))),
     liveEdges' = liveEdges.exclude(Set(e)),
     height' = height,
   }
@@ -130,6 +134,7 @@ module l1 {
   action tick = all {
     coins' = coins,
     edges' = edges,
+    liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height + 1,
   }
@@ -137,6 +142,7 @@ module l1 {
   action idle = all {
     coins' = coins,
     edges' = edges,
+    liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height,
   }
@@ -164,6 +170,7 @@ module l1 {
     AllCoins.forall(id => coins.get(id) >= 0)
       and AllEdges.forall(id => edges.get(id) >= 0)
   val liveEdgesAreKnown = liveEdges.subseteq(AllEdges)
+  val liveCoinsAreKnown = liveCoins.subseteq(AllCoins)
 
   run basicTraceTest =
     init

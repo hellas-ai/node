@@ -15,6 +15,7 @@ module fees {
   var coins: Coin -> int
   var edges: Edge -> int
   var reserves: Edge -> int
+  var liveCoins: Set[Coin]
   var liveEdges: Set[Edge]
   var paid: int
   var height: int
@@ -33,7 +34,7 @@ module fees {
   pure val Principal = MakerPayout + TakerPayout
 
   def coinTotal: int =
-    AllCoins.fold(0, (sum, id) => sum + coins.get(id))
+    liveCoins.fold(0, (sum, id) => sum + coins.get(id))
 
   def edgeTotal: int =
     liveEdges.fold(0, (sum, id) => sum + edges.get(id))
@@ -49,8 +50,10 @@ module fees {
 
   def canOpen: bool =
     not(liveEdges.contains(Channel))
-      and coins.get(MakerOut) == 0
-      and coins.get(TakerOut) == 0
+      and liveCoins.contains(MakerCoin)
+      and liveCoins.contains(TakerCoin)
+      and not(liveCoins.contains(MakerOut))
+      and not(liveCoins.contains(TakerOut))
       and funding >= OpenFee + ResolveReserve
 
   def proofOk(p: Proof): bool =
@@ -64,8 +67,8 @@ module fees {
       and proofOk(p)
       and reserves.get(Channel) >= ResolveFee
       and edges.get(Channel) == Principal
-      and coins.get(MakerOut) == 0
-      and coins.get(TakerOut) == 0
+      and not(liveCoins.contains(MakerOut))
+      and not(liveCoins.contains(TakerOut))
 
   action init = all {
     coins' = AllCoins.mapBy(id =>
@@ -79,6 +82,7 @@ module fees {
     ),
     edges' = AllEdges.mapBy(_ => 0),
     reserves' = AllEdges.mapBy(_ => 0),
+    liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     paid' = 0,
     height' = 1,
@@ -96,6 +100,7 @@ module fees {
     ),
     edges' = AllEdges.mapBy(_ => 0),
     reserves' = AllEdges.mapBy(_ => 0),
+    liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     paid' = 0,
     height' = 1,
@@ -108,6 +113,7 @@ module fees {
       .set(TakerCoin, 0),
     edges' = edges.set(Channel, funding - OpenFee - ResolveReserve),
     reserves' = reserves.set(Channel, ResolveReserve),
+    liveCoins' = liveCoins.exclude(Set(MakerCoin, TakerCoin)),
     liveEdges' = liveEdges.union(Set(Channel)),
     paid' = paid + OpenFee,
     height' = height,
@@ -120,6 +126,7 @@ module fees {
       .set(TakerOut, TakerPayout),
     edges' = edges.set(Channel, 0),
     reserves' = reserves.set(Channel, 0),
+    liveCoins' = liveCoins.union(Set(MakerOut, TakerOut)),
     liveEdges' = liveEdges.exclude(Set(Channel)),
     paid' = paid + reserves.get(Channel),
     height' = height,
@@ -129,6 +136,7 @@ module fees {
     coins' = coins,
     edges' = edges,
     reserves' = reserves,
+    liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     paid' = paid,
     height' = height + 1,
@@ -138,6 +146,7 @@ module fees {
     coins' = coins,
     edges' = edges,
     reserves' = reserves,
+    liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     paid' = paid,
     height' = height,
@@ -162,6 +171,9 @@ module fees {
 
   val atMostOneLiveEdge =
     liveEdgeCount <= 1
+
+  val liveCoinsAreKnown =
+    liveCoins.subseteq(AllCoins)
 
   val noNegativeValue =
     AllCoins.forall(id => coins.get(id) >= 0)
