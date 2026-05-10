@@ -8,7 +8,7 @@ const KEY_LENGTH: usize = 33;
 const SIG_LENGTH: usize = 64;
 
 /// Settlement public key controlling owner-only objects.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Key([u8; Self::LENGTH]);
 
 impl Key {
@@ -38,7 +38,7 @@ impl Key {
 ///
 /// Coin ids are derived as `H(coin_tag ‖ ...)`. Their byte representation
 /// cannot collide with that of an [`EdgeId`] under this domain separation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CoinId([u8; Self::LENGTH]);
 
 impl CoinId {
@@ -86,7 +86,7 @@ impl CoinId {
 ///
 /// Edge ids are derived as `H(edge_tag ‖ ...)`. Their byte representation
 /// cannot collide with that of a [`CoinId`] under this domain separation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EdgeId([u8; Self::LENGTH]);
 
 impl EdgeId {
@@ -120,7 +120,7 @@ impl EdgeId {
 }
 
 /// Commitment to the open terms of an edge.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TermsHash([u8; Self::LENGTH]);
 
 impl TermsHash {
@@ -147,7 +147,7 @@ impl TermsHash {
 }
 
 /// Commitment to one concrete resolve payload.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResolveHash([u8; Self::LENGTH]);
 
 impl ResolveHash {
@@ -179,7 +179,7 @@ impl ResolveHash {
 }
 
 /// Compact settlement signature bytes.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Sig([u8; Self::LENGTH]);
 
 impl Sig {
@@ -237,7 +237,7 @@ impl Sig {
 /// This is deliberately one byte in v1: protocol tags are scarce, governed hot
 /// path identifiers. Widening it changes terms commitments and requires a chain
 /// version boundary.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolCode(u8);
 
 impl ProtocolCode {
@@ -255,7 +255,7 @@ impl ProtocolCode {
 }
 
 /// Positional party in a v1 bilateral edge.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Party {
     /// Party whose open intent or offer is being filled.
     Maker,
