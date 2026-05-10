@@ -107,8 +107,14 @@ impl<const C: usize, const E: usize> View<C, E> {
 }
 
 /// Store extension for producing bounded abstract state views.
-pub trait Snapshot<const C: usize, const E: usize> {
+///
+/// Each store picks its canonical `View` shape via the associated type so
+/// callers can write `state.view()` without turbofish.
+pub trait Snapshot {
+    /// Bounded view shape produced by this store.
+    type View;
+
     /// Returns the live-state view for this store.
     #[must_use]
-    fn view(&self) -> View<C, E>;
+    fn view(&self) -> Self::View;
 }

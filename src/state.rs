@@ -9,7 +9,7 @@ use crate::{
     object::Genesis,
     op::Op,
     store::{Store, Tx},
-    view::{Snapshot, View},
+    view::Snapshot,
 };
 
 /// Kernel state over a concrete object store.
@@ -38,9 +38,9 @@ impl<S> State<S> {
 
     /// Returns an abstract view of the backing store.
     #[must_use]
-    pub fn view<const C: usize, const E: usize>(&self) -> View<C, E>
+    pub fn view(&self) -> S::View
     where
-        S: Snapshot<C, E>,
+        S: Snapshot,
     {
         self.store.view()
     }
