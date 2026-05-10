@@ -35,11 +35,32 @@ module l1 {
     | ClaimantWins
     | ChallengerWins
 
+  // The action that produced the current state. NoInput marks the initial
+  // state. Each non-init action records its input here; the Rust ITF runner
+  // reads `lastInput` from the trace, drives the kernel with it, and asserts
+  // the kernel's emitted event against `lastEvent`.
+  type Input =
+    | NoInput
+    | OpenInput(Edge)
+    | ResolveInput({ edge: Edge, proof: Proof, makerPay: int, takerPay: int })
+    | TickInput
+    | IdleInput
+
+  // Public-event abstraction emitted by the action that produced the current
+  // state. NoEvent marks init/tick/idle steps that change no live objects.
+  // Open/Resolve produce EdgeOpenedEvent/EdgeResolvedEvent.
+  type Event =
+    | NoEvent
+    | EdgeOpenedEvent(Edge)
+    | EdgeResolvedEvent(Edge)
+
   var coins: Coin -> int
   var edges: Edge -> int
   var liveCoins: Set[Coin]
   var liveEdges: Set[Edge]
   var height: int
+  var lastInput: Input
+  var lastEvent: Event
 
   // Closed universes used by the invariants below. If an operation introduces a
   // new id family, it should appear here and in the known-id invariants.
@@ -112,6 +133,8 @@ module l1 {
     liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     height' = 1,
+    lastInput' = NoInput,
+    lastEvent' = NoEvent,
   }
 
   // Open consumes the two canonical input coins for an edge and creates that
@@ -128,6 +151,8 @@ module l1 {
     liveCoins' = liveCoins.exclude(Set(makerInput(e), takerInput(e))),
     liveEdges' = liveEdges.union(Set(e)),
     height' = height,
+    lastInput' = OpenInput(e),
+    lastEvent' = EdgeOpenedEvent(e),
   }
 
   // FakeCrypto toggles the modelling/fake-crypto witness path. Set true to
@@ -184,6 +209,8 @@ module l1 {
     liveCoins' = liveCoins.union(Set(makerOutput(e), takerOutput(e))),
     liveEdges' = liveEdges.exclude(Set(e)),
     height' = height,
+    lastInput' = ResolveInput({ edge: e, proof: p, makerPay: makerPay, takerPay: takerPay }),
+    lastEvent' = EdgeResolvedEvent(e),
   }
 
   // Advance block height without changing live objects. This is how timeout
@@ -194,6 +221,8 @@ module l1 {
     liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height + 1,
+    lastInput' = TickInput,
+    lastEvent' = NoEvent,
   }
 
   // Stutter step for temporal exploration. It should preserve every invariant.
@@ -203,6 +232,8 @@ module l1 {
     liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height,
+    lastInput' = IdleInput,
+    lastEvent' = NoEvent,
   }
 
   // The nondeterministic transition relation checked by `quint run`. Each
