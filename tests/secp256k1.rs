@@ -57,19 +57,20 @@ fn agreement_with_real_ecdsa_signatures_resolves_under_production_verifier() {
     let outputs = payouts(maker_pk, taker_pk);
     let timeout_outputs = payouts(maker_pk, taker_pk);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, timeout_outputs);
+    let terms_hash = terms.hash();
     let maker_coin = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let open = Open::from_terms(funding, terms);
     let edge = open.output();
-    let resolve_hash = Resolve::payload_hash(edge, ResolveKind::Agreement, terms.hash(), &outputs);
+    let resolve_hash = Resolve::payload_hash(edge, ResolveKind::Agreement, terms_hash, &outputs);
     let proof = Proof::agreement(
-        terms.hash(),
+        terms_hash,
         Agreement::new(sign(&maker_sk, resolve_hash), sign(&taker_sk, resolve_hash)),
     );
-    let resolve = Resolve::new(edge, proof, outputs);
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
+    let resolve = Resolve::new(edge, proof, outputs);
     let store = FixedStore::empty([maker_coin, taker_coin, maker_out, taker_out], [edge]);
     let mut state = State::genesis(
         store,
@@ -97,21 +98,22 @@ fn forged_signature_is_rejected_by_real_verifier() {
     let (_taker_sk, taker_pk) = keypair(2);
     let parties = Parties::new(maker_pk, taker_pk);
     let outputs = payouts(maker_pk, taker_pk);
-    let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs);
+    let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
+    let terms_hash = terms.hash();
     let maker_coin = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let open = Open::from_terms(funding, terms);
     let edge = open.output();
-    let resolve_hash = Resolve::payload_hash(edge, ResolveKind::Agreement, terms.hash(), &outputs);
+    let resolve_hash = Resolve::payload_hash(edge, ResolveKind::Agreement, terms_hash, &outputs);
     // Sign with maker's key in *both* slots — taker's signature is forged.
     let proof = Proof::agreement(
-        terms.hash(),
+        terms_hash,
         Agreement::new(sign(&maker_sk, resolve_hash), sign(&maker_sk, resolve_hash)),
     );
-    let resolve = Resolve::new(edge, proof, outputs);
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
+    let resolve = Resolve::new(edge, proof, outputs);
     let store = FixedStore::empty([maker_coin, taker_coin, maker_out, taker_out], [edge]);
     let mut state = State::genesis(
         store,

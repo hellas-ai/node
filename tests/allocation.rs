@@ -5,7 +5,7 @@ mod support;
 use support::{FAKE_VERIFIER, FixedStore};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CoinId, Context, EventKind, Funding, Genesis, Key, List,
+    BlockHash, BlockHeight, CoinId, Context, Event, EventKind, Funding, Genesis, Key, List,
     MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof,
     ProtocolCode, Resolve, State, Terms,
 };
@@ -22,14 +22,28 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let parties = Parties::new(maker_key, taker_key);
     let maker = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker = CoinId::from_bytes([2; CoinId::LENGTH]);
-    let outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
-    let terms = Terms::basic(ProtocolCode::new(1), parties, BlockHeight::new(1), outputs);
-    let proof = Proof::timeout(terms);
-    let expected_open = Open::from_terms(funding(maker, taker), terms);
+    let expected_open = Open::from_terms(
+        funding(maker, taker),
+        Terms::basic(
+            ProtocolCode::new(1),
+            parties,
+            BlockHeight::new(1),
+            payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
+        ),
+    );
     let edge = expected_open.output();
-    let expected_resolve = Resolve::new(edge, proof, outputs);
-    let maker_out = nth(expected_resolve.output_ids(), 0);
-    let taker_out = nth(expected_resolve.output_ids(), 1);
+    let expected_resolve = Resolve::new(
+        edge,
+        Proof::timeout(Terms::basic(
+            ProtocolCode::new(1),
+            parties,
+            BlockHeight::new(1),
+            payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
+        )),
+        payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
+    );
+    let maker_out = nth(&expected_resolve.output_ids(), 0);
+    let taker_out = nth(&expected_resolve.output_ids(), 1);
     let maker_seed = Genesis::coin(maker, maker_key, 10);
     let taker_seed = Genesis::coin(taker, taker_key, 5);
     let store = FixedStore::empty([maker, taker, maker_out, taker_out], [edge]);
@@ -37,33 +51,36 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let info = allocation_counter::measure(|| {
         let store = core::hint::black_box(store);
 
+        let outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
+        let terms = Terms::basic(ProtocolCode::new(1), parties, BlockHeight::new(1), outputs.clone());
+        let proof = Proof::timeout(terms.clone());
         let open = Op::Open(Open::from_terms(funding(maker, taker), terms));
-        assert_eq!(open, Op::Open(expected_open));
+        assert_eq!(open, Op::Open(expected_open.clone()));
         let is_open = matches!(open, Op::Open(_));
         let resolve = Op::Resolve(Resolve::new(edge, proof, outputs));
-        assert_eq!(resolve, Op::Resolve(expected_resolve));
+        assert_eq!(resolve, Op::Resolve(expected_resolve.clone()));
         let is_resolve = matches!(resolve, Op::Resolve(_));
         let Ok(mut chain) = State::genesis(store, &[maker_seed, taker_seed]) else {
             panic!("genesis rejected test seed");
         };
         let ops = List::all([open, resolve]);
-        let diff = chain.apply_all(CONTEXT, &FAKE_VERIFIER, &ops);
+        let Ok(diff) = chain.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
+            panic!("apply_all rejected");
+        };
 
         assert_eq!(
-            diff.map(|diff| (
-                diff.event(0).map(|event| event.kind()),
-                diff.event(1).map(|event| event.kind()),
-            )),
-            Ok((
-                Some(EventKind::EdgeOpened {
-                    inputs: input_ids(maker, taker),
-                    output: edge,
-                }),
-                Some(EventKind::EdgeResolved {
-                    input: edge,
-                    outputs: output_ids(maker_out, taker_out),
-                }),
-            ))
+            diff.event(0).map(Event::kind),
+            Some(&EventKind::EdgeOpened {
+                inputs: input_ids(maker, taker),
+                output: edge,
+            }),
+        );
+        assert_eq!(
+            diff.event(1).map(Event::kind),
+            Some(&EventKind::EdgeResolved {
+                input: edge,
+                outputs: output_ids(maker_out, taker_out),
+            }),
         );
 
         core::hint::black_box((is_open, is_resolve));
@@ -109,6 +126,6 @@ fn output_ids(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_OUTPUTS> {
     ids
 }
 
-fn nth<const N: usize>(ids: List<CoinId, N>, index: usize) -> CoinId {
+fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
 }

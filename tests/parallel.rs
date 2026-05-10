@@ -97,11 +97,11 @@ enum EdgeKey {
 
 #[test]
 fn disjoint_waves_match_ordered_block_transition() {
-    let ops = ops();
-    let plan = Plan::build(&ops);
+    let block = Block::new(CONTEXT, ops());
+    let ops = block.ops();
+    let plan = Plan::build(ops);
     let mut ordered = initial_state();
     let mut waved = initial_state();
-    let block = Block::new(CONTEXT, ops);
 
     assert_eq!(plan.len, 2);
     assert_eq!(plan.wave(0), Some(0));
@@ -115,7 +115,7 @@ fn disjoint_waves_match_ordered_block_transition() {
     let Ok(diff) = ordered.apply_block(&FAKE_VERIFIER, &block) else {
         panic!("ordered block rejected");
     };
-    apply_reversed_waves(&mut waved, &ops, plan);
+    apply_reversed_waves(&mut waved, ops, plan);
 
     let ordered_view: TestView = ordered.view();
     let waved_view: TestView = waved.view();

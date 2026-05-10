@@ -87,7 +87,7 @@ impl ItfRunner for L1Runner {
                 let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected input {:?}: {err:?}", expected.last_input)
                 })?;
-                Ok(Some(event.kind()))
+                Ok(Some(event.kind().clone()))
             }
         }
     }

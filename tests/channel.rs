@@ -14,7 +14,7 @@ mod resolve;
 use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 
 use hellas_kernel::{
-    Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, EventKind,
+    Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, Event, EventKind,
     Fees, Funding, Genesis, InsertError, InvalidOpenReason, InvalidProofReason,
     InvalidResolveReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open,
     Parties, Payout, Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State,
@@ -144,15 +144,15 @@ fn edge() -> EdgeId {
 }
 
 fn maker_out() -> CoinId {
-    nth(output_ids(), 0)
+    nth(&output_ids(), 0)
 }
 
 fn taker_out() -> CoinId {
-    nth(output_ids(), 1)
+    nth(&output_ids(), 1)
 }
 
 fn extra_out() -> CoinId {
-    nth(output_ids3_values(), 2)
+    nth(&output_ids3_values(), 2)
 }
 
 fn funded_state() -> State<FixedStore<6, 1>> {
@@ -297,7 +297,7 @@ fn output_ids3_values() -> List<CoinId, MAX_EDGE_OUTPUTS> {
     .output_ids()
 }
 
-fn nth<const N: usize>(ids: List<CoinId, N>, index: usize) -> CoinId {
+fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
 }
 

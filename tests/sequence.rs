@@ -81,7 +81,7 @@ proptest! {
                 prop_assert_eq!(state, before);
             }
             if let Ok(event) = result {
-                assert_event_matches(step, &event.kind())?;
+                assert_event_matches(step, event.kind())?;
             }
             assert_invariants(&state)?;
         }
@@ -117,11 +117,11 @@ fn assert_event_matches(
             if proof_accepts(proof) =>
         {
             prop_assert_eq!(*input, l1::edge_id(edge));
-            prop_assert_eq!(*outputs, l1::output_ids(edge));
+            prop_assert_eq!(outputs, &l1::output_ids(edge));
         }
         (Step::BadPayout(edge), EventKind::EdgeResolved { input, outputs }) => {
             prop_assert_eq!(*input, l1::edge_id(edge));
-            prop_assert_eq!(*outputs, l1::output_ids(edge));
+            prop_assert_eq!(outputs, &l1::output_ids(edge));
         }
         _ => prop_assert!(false),
     }

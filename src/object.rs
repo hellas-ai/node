@@ -130,7 +130,7 @@ impl Edge {
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {
         let mut total = 0_u64;
-        for (_, coin) in coins.iter() {
+        for (_, coin) in coins {
             total = total.checked_add(coin.value())?;
         }
 

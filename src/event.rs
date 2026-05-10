@@ -19,7 +19,7 @@ type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 
 /// Deterministic event diff produced by an ordered operation batch.
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Diff<const N: usize> {
     events: [Option<Event>; N],
     len: usize,
@@ -34,14 +34,14 @@ impl<const N: usize> core::fmt::Debug for Diff<N> {
 impl<const N: usize> Diff<N> {
     pub(crate) const fn empty() -> Self {
         Self {
-            events: [None; N],
+            events: [const { None }; N],
             len: 0,
         }
     }
 
     pub(crate) fn push(&mut self, event: &Event) {
         debug_assert!(self.len < N);
-        self.events[self.len] = Some(*event);
+        self.events[self.len] = Some(event.clone());
         self.len += 1;
     }
 
@@ -59,22 +59,22 @@ impl<const N: usize> Diff<N> {
 
     /// Returns the event at `index`, if any.
     #[must_use]
-    pub const fn event(&self, index: usize) -> Option<Event> {
+    pub const fn event(&self, index: usize) -> Option<&Event> {
         if index >= self.len {
             return None;
         }
 
-        self.events[index]
+        self.events[index].as_ref()
     }
 
     /// Iterates over committed events.
-    pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
-        self.events[..self.len].iter().filter_map(|event| *event)
+    pub fn iter(&self) -> impl Iterator<Item = &Event> + '_ {
+        self.events[..self.len].iter().flatten()
     }
 }
 
 /// An externally visible kernel mutation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Event {
     kind: EventKind,
 }
@@ -82,13 +82,13 @@ pub struct Event {
 impl Event {
     /// Returns the public event payload.
     #[must_use]
-    pub const fn kind(&self) -> EventKind {
-        self.kind
+    pub const fn kind(&self) -> &EventKind {
+        &self.kind
     }
 }
 
 /// Public event payload.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum EventKind {
     /// Bounded funding was locked into one shared edge.
     EdgeOpened {
@@ -109,7 +109,7 @@ pub enum EventKind {
 
 /// Internal reducer output: public event plus private effect.
 #[allow(clippy::redundant_pub_crate)]
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(super) struct Change {
     event: Event,
     effect: Effect,
@@ -117,7 +117,6 @@ pub(super) struct Change {
 
 impl Change {
     pub(super) fn open(inputs: &OpenCoins, output: (EdgeId, Edge)) -> Self {
-        let inputs = *inputs;
         let event = Event {
             kind: EventKind::EdgeOpened {
                 inputs: Self::ids(inputs),
@@ -127,40 +126,43 @@ impl Change {
 
         Self {
             event,
-            effect: Effect::open(&inputs, output),
+            effect: Effect::open(inputs.clone(), output),
         }
     }
 
     pub(super) fn resolve(input: (EdgeId, Edge), outputs: &ResolveCoins) -> Self {
-        let outputs = *outputs;
         let event = Event {
             kind: EventKind::EdgeResolved {
                 input: input.0,
                 outputs: Self::ids(outputs),
             },
         };
-        let effect = Effect::resolve(input, &outputs);
+        let effect = Effect::resolve(input, outputs.clone());
 
         Self { event, effect }
     }
 
-    pub(super) const fn event(&self) -> Event {
-        self.event
+    pub(super) const fn event(&self) -> &Event {
+        &self.event
     }
 
     pub(super) fn fold<T: Tx>(&self, tx: &mut T) -> KernelResult<()> {
         self.effect.fold(tx)
     }
 
-    fn ids<const N: usize>(coins: List<(CoinId, Coin), N>) -> List<CoinId, N> {
+    fn ids<const N: usize>(coins: &List<(CoinId, Coin), N>) -> List<CoinId, N> {
         let fill = coins.as_slice().first().map_or(CoinId::ZERO, |&(id, _)| id);
-        coins.map(fill, |(id, _)| id)
+        let mut items = [fill; N];
+        for (index, (id, _)) in coins.as_slice().iter().enumerate() {
+            items[index] = *id;
+        }
+        List::take(items, coins.len())
     }
 }
 
 /// Private store mutation carried by a [`Change`].
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 enum Effect {
     Open {
         coins: OpenCoins,
@@ -173,28 +175,22 @@ enum Effect {
 }
 
 impl Effect {
-    const fn open(coins: &OpenCoins, edge: (EdgeId, Edge)) -> Self {
-        Self::Open {
-            edge,
-            coins: *coins,
-        }
+    const fn open(coins: OpenCoins, edge: (EdgeId, Edge)) -> Self {
+        Self::Open { edge, coins }
     }
 
-    const fn resolve(edge: (EdgeId, Edge), coins: &ResolveCoins) -> Self {
-        Self::Resolve {
-            edge,
-            coins: *coins,
-        }
+    const fn resolve(edge: (EdgeId, Edge), coins: ResolveCoins) -> Self {
+        Self::Resolve { edge, coins }
     }
 
     fn fold<T: Tx>(&self, tx: &mut T) -> KernelResult<()> {
-        match *self {
+        match self {
             Self::Open { coins, edge } => {
                 Self::remove_coins(tx, coins)?;
-                Self::insert_edge(tx, edge)
+                Self::insert_edge(tx, *edge)
             }
             Self::Resolve { edge, coins } => {
-                Self::remove_edge(tx, edge)?;
+                Self::remove_edge(tx, *edge)?;
                 Self::insert_coins(tx, coins)
             }
         }
@@ -202,20 +198,20 @@ impl Effect {
 
     fn insert_coins<T: Tx, const N: usize>(
         tx: &mut T,
-        coins: List<(CoinId, Coin), N>,
+        coins: &List<(CoinId, Coin), N>,
     ) -> KernelResult<()> {
-        for coin in coins.iter() {
-            Self::insert_coin(tx, coin)?;
+        for coin in coins.as_slice() {
+            Self::insert_coin(tx, *coin)?;
         }
         Ok(())
     }
 
     fn remove_coins<T: Tx, const N: usize>(
         tx: &mut T,
-        coins: List<(CoinId, Coin), N>,
+        coins: &List<(CoinId, Coin), N>,
     ) -> KernelResult<()> {
-        for coin in coins.iter() {
-            Self::remove_coin(tx, coin)?;
+        for coin in coins.as_slice() {
+            Self::remove_coin(tx, *coin)?;
         }
         Ok(())
     }

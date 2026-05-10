@@ -29,16 +29,16 @@ fn terms_hash_commits_to_basic_fields() {
     let timeout = BlockHeight::new(11);
     let outputs = payouts(Payout::new(maker, 6), Payout::new(taker, 4));
     let other_outputs = payouts(Payout::new(maker, 5), Payout::new(taker, 5));
-    let terms = Terms::basic(ProtocolCode::new(7), parties, timeout, outputs);
+    let terms = Terms::basic(ProtocolCode::new(7), parties, timeout, outputs.clone());
 
     assert_eq!(terms.protocol(), ProtocolCode::new(7));
     assert_eq!(terms.parties(), parties);
     assert_eq!(terms.timeout(), timeout);
-    assert_eq!(terms.timeout_outputs(), outputs);
+    assert_eq!(terms.timeout_outputs(), &outputs);
     assert_eq!(terms.hash(), terms.hash());
     assert_ne!(
         terms.hash(),
-        Terms::basic(ProtocolCode::new(8), parties, timeout, outputs).hash(),
+        Terms::basic(ProtocolCode::new(8), parties, timeout, outputs.clone()).hash(),
     );
     assert_ne!(
         terms.hash(),

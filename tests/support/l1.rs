@@ -183,11 +183,11 @@ pub(crate) fn edge_id(edge: EdgeKey) -> EdgeId {
 }
 
 pub(crate) fn maker_out(edge: EdgeKey) -> CoinId {
-    nth(output_ids(edge), 0)
+    nth(&output_ids(edge), 0)
 }
 
 pub(crate) fn taker_out(edge: EdgeKey) -> CoinId {
-    nth(output_ids(edge), 1)
+    nth(&output_ids(edge), 1)
 }
 
 pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
@@ -290,7 +290,7 @@ pub(crate) fn empty_party() -> List<CoinId, MAX_PARTY_INPUTS> {
     inputs
 }
 
-pub(crate) fn nth<const N: usize>(ids: List<CoinId, N>, index: usize) -> CoinId {
+pub(crate) fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
 }
 
