@@ -71,3 +71,57 @@ jobs:
           test '${{ needs.devshell.result }}' = 'success'
           test '${{ needs.matrix.result }}' = 'success'
           test '${{ needs.check.result }}' = 'success'
+
+  # ─── extended (post-gate) builds ──────────────────────────────────────
+  # Slow targets (static cross-builds, docker images). Push-only so PR
+  # turnaround stays on the quick CI gate alone.
+
+  extended-matrix:
+    if: github.event_name == 'push'
+    needs: ci-passed
+    runs-on: [self-hosted, shared]
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        name: Enumerate extended builds
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --json '.#ci.x86_64-linux.builds' --apply '
+              builds: {
+                include = builtins.attrValues (
+                  builtins.mapAttrs (name: attr: { inherit name attr; }) builds
+                );
+              }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  extended-build:
+    if: github.event_name == 'push'
+    needs: extended-matrix
+    runs-on: [self-hosted, shared]
+    name: build:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.extended-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: nix build .#${{ matrix.attr }}
+        run: nix build --print-build-logs --no-link '.#packages.x86_64-linux.${{ matrix.attr }}'
+
+  extended-builds-passed:
+    if: always() && github.event_name == 'push'
+    runs-on: [self-hosted, shared]
+    name: Extended builds passed
+    needs:
+      - extended-matrix
+      - extended-build
+    steps:
+      - name: Require extended-matrix + all builds succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.extended-matrix.result }}' = 'success'
+          test '${{ needs.extended-build.result }}' = 'success'
