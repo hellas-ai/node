@@ -28,6 +28,7 @@
           rustToolchain
           rust-analyzer
           llvmPackages.lld
+          nodejs_24
           pkg-config
 
           cargo-audit
