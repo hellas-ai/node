@@ -1332,6 +1332,7 @@ bytes or leader outbound bandwidth become bottlenecks.
    full proof systems in the hot path.
 6. Keep generated operation-sequence tests around conservation and rollback.
 7. Keep replay tests that compare model-shaped traces against Rust `View`.
+8. Keep `models/l1.qnt` aligned with the Rust L1 operation vocabulary.
 
 ### Phase 2: Admission and Block Building
 

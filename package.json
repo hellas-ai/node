@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "quint:run": "quint run models/l1.qnt --max-samples=500 --max-steps=8 --invariants=valueConserved --invariants=atMostOneLiveEdge --invariants=noNegativeValue --invariants=liveEdgesAreKnown --verbosity=1",
+    "quint:test": "quint typecheck models/l1.qnt && quint test models/l1.qnt --verbosity=2"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.32.0"
+  }
+}

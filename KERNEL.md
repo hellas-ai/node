@@ -785,6 +785,11 @@ Use for abstract protocol models:
 Start without Choreo. First prove the math of claims, deadlines, challenges,
 and verdicts under perfect delivery.
 
+The first synchronous L1 model lives in `models/l1.qnt`. It mirrors the Rust
+operation vocabulary at an abstract level: `OpenEdge`, `ResolveEdge`, bounded
+resolve proof kinds, explicit block height for timeout, live coins, live edges,
+and a finite state universe suitable for simulation and trace export.
+
 ### Choreo Or P
 
 Use when the distributed behavior matters:
@@ -898,9 +903,8 @@ because the system has genuinely different kinds of correctness obligations.
 
 The next kernel-shaped implementation steps are:
 
-1. Write the first synchronous Quint model using the same operation vocabulary.
-2. Add serialized external trace fixtures once the first Quint model exists.
-3. Replace placeholder `Sig` / `Seal` checks with real verifier or preverified
+1. Add serialized external trace fixtures from `models/l1.qnt`.
+2. Replace placeholder `Sig` / `Seal` checks with real verifier or preverified
    cache interfaces.
 
 Only after this should the async channel model move to Choreo or P.
