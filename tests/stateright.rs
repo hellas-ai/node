@@ -89,12 +89,12 @@ impl Model for ChannelModel {
             Property::always(
                 "channel value is conserved",
                 |_, state: &State<ChannelStore>| {
-                    l1::live_value(&state.view::<4, 4>()) == l1::EDGE_VALUE
+                    l1::live_value(&state.view()) == l1::EDGE_VALUE
                 },
             ),
             Property::always(
                 "channel objects have one live shape",
-                |_, state: &State<ChannelStore>| channel_shape(&state.view::<4, 4>()),
+                |_, state: &State<ChannelStore>| channel_shape(&state.view()),
             ),
         ]
     }
