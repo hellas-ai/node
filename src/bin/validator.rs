@@ -216,11 +216,6 @@ enum Command {
         /// Path to the TOML config file
         #[arg(long)]
         config: PathBuf,
-        /// Enable structured JSON logs on stderr.
-        ///
-        /// A value is accepted for backward CLI compatibility but not used.
-        #[arg(long)]
-        log_json: Option<PathBuf>,
         /// WebSocket gRPC bind address (e.g. [::]:31130)
         #[arg(long)]
         ws_bind: Option<String>,
@@ -333,10 +328,9 @@ fn main() {
         ),
         Command::Run {
             config,
-            log_json,
             ws_bind,
             ws_push,
-        } => run(config, log_json, ws_bind, ws_push),
+        } => run(config, ws_bind, ws_push),
         Command::Query { rpc, query } => do_query(rpc, query),
         Command::Wallet { wallet } => do_wallet(wallet),
     };
@@ -735,7 +729,7 @@ fn otlp_sample_rate() -> f64 {
 ///   OTEL_SERVICE_NAME                    — service name (default: hellas-validator)
 ///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
-fn init_telemetry(json: bool) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     use tracing_subscriber::prelude::*;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -746,13 +740,8 @@ fn init_telemetry(json: bool) -> Option<opentelemetry_sdk::trace::SdkTracerProvi
         .with_thread_ids(true)
         .with_file(true)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_writer(std::io::stderr);
-
-    let fmt_layer = if json {
-        fmt_layer.json().boxed()
-    } else {
-        fmt_layer.compact().boxed()
-    };
+        .with_writer(std::io::stderr)
+        .compact();
 
     let (otel_layer, provider) = init_otlp_layer();
 
@@ -1050,7 +1039,6 @@ async fn init_block_store(
 
 fn run(
     config_path: PathBuf,
-    log_json: Option<PathBuf>,
     ws_bind: Option<String>,
     ws_push: Option<String>,
 ) -> Result<(), ValidatorError> {
@@ -1068,13 +1056,6 @@ fn run(
     let threshold_share = node_config.decode_threshold_share()?;
     let threshold_polynomial = node_config.decode_threshold_polynomial()?;
     let genesis_allocations = node_config.genesis_allocations()?;
-    if let Some(path) = log_json.as_ref() {
-        eprintln!(
-            "note: --log-json file path ({}) is ignored; JSON logs go to stderr",
-            path.display(),
-        );
-    }
-    let telemetry_json = log_json.is_some();
 
     let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
 
@@ -1113,7 +1094,7 @@ fn run(
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(move |context| async move {
-        let tracer_provider = init_telemetry(telemetry_json);
+        let tracer_provider = init_telemetry();
 
         if let Some(addr) = metrics_addr {
             spawn_metrics_server(context.child("telemetry"), addr);
