@@ -1,0 +1,57 @@
+[package]
+name = "hellas-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+
+[dev-dependencies]
+allocation-counter = "0.8"
+criterion = "0.8.2"
+proptest = "1"
+stateright = "0.31"
+
+[[bench]]
+name = "apply"
+harness = false
+
+[lints.rust]
+elided-lifetimes-in-paths = "deny"
+missing-copy-implementations = "deny"
+missing-debug-implementations = "deny"
+missing-docs = "deny"
+rust-2018-idioms = "deny"
+unsafe-code = "forbid"
+unreachable-pub = "deny"
+unused-extern-crates = "deny"
+unused-must-use = "deny"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+alloc-instead-of-core = "deny"
+dbg-macro = "deny"
+disallowed-methods = "deny"
+disallowed-types = "deny"
+expect-used = "deny"
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+print-stderr = "deny"
+print-stdout = "deny"
+std-instead-of-alloc = "deny"
+std-instead-of-core = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap-used = "deny"
+
+[lints.rustdoc]
+bare-urls = "deny"
+broken-intra-doc-links = "deny"
