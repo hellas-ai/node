@@ -4,8 +4,8 @@ use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
     Agreement, BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, EventKind, Funding, Genesis,
-    Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof, ProtocolCode,
-    Resolve, ResolveHash, ResolveKind, Seal, Sig, State, Terms, View,
+    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout,
+    Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State, Terms, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -18,7 +18,10 @@ pub(crate) const TIMEOUT_CONTEXT: Context =
 pub(crate) const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 pub(crate) const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 pub(crate) const PARTIES: Parties = Parties::new(MAKER, TAKER);
-pub(crate) const TERMS: Terms = Terms::basic(ProtocolCode::new(1), PARTIES, TIMEOUT);
+pub(crate) const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
+pub(crate) const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
+pub(crate) const TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT);
+pub(crate) const OTHER_TERMS: Terms = Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT);
 pub(crate) const MAKER_ID: CoinId = coin_id(1);
 pub(crate) const TAKER_ID: CoinId = coin_id(2);
 pub(crate) const MAKER_VALUE: u64 = 10;
@@ -26,6 +29,7 @@ pub(crate) const TAKER_VALUE: u64 = 5;
 pub(crate) const EDGE_VALUE: u64 = MAKER_VALUE + TAKER_VALUE;
 pub(crate) const MAKER_PAYOUT: u64 = 7;
 pub(crate) const TAKER_PAYOUT: u64 = 8;
+pub(crate) const BAD_PAYOUT: u64 = TAKER_PAYOUT + 1;
 
 pub(crate) type TraceState = State<FixedStore<6, 2>>;
 pub(crate) type TraceView = View<6, 2>;
@@ -74,6 +78,14 @@ pub(crate) enum EdgeKey {
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) enum OpenKey {
+    Full,
+    MakerOnly,
+    TakerOnly,
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum ProofKey {
     Basic,
     Agreement,
@@ -81,6 +93,8 @@ pub(crate) enum ProofKey {
     Claimant,
     Challenger,
     EarlyTimeout,
+    WrongTerms,
+    BadSeal,
 }
 
 pub(crate) fn initial_state() -> TraceState {
@@ -103,9 +117,21 @@ pub(crate) fn initial_state() -> TraceState {
     )
 }
 
+pub(crate) fn genesis<const C: usize, const E: usize>(
+    store: FixedStore<C, E>,
+) -> State<FixedStore<C, E>> {
+    state(
+        store,
+        [
+            Genesis::coin(MAKER_ID, MAKER, MAKER_VALUE),
+            Genesis::coin(TAKER_ID, TAKER, TAKER_VALUE),
+        ],
+    )
+}
+
 pub(crate) fn open(edge: EdgeKey) -> Open {
     match edge {
-        EdgeKey::First => Open::from_terms(Funding::new(party1(MAKER_ID), party1(TAKER_ID)), TERMS),
+        EdgeKey::First => open_case(OpenKey::Full),
         EdgeKey::Second => Open::from_terms(
             Funding::new(
                 party1(maker_out(EdgeKey::First)),
@@ -116,8 +142,37 @@ pub(crate) fn open(edge: EdgeKey) -> Open {
     }
 }
 
+pub(crate) fn open_case(key: OpenKey) -> Open {
+    Open::from_terms(open_funding(key), TERMS)
+}
+
+pub(crate) fn open_case_op(key: OpenKey) -> Op {
+    Op::Open(open_case(key))
+}
+
+pub(crate) fn open_case_id(key: OpenKey) -> EdgeId {
+    open_case(key).output()
+}
+
+pub(crate) fn open_case_inputs(key: OpenKey) -> List<CoinId, MAX_EDGE_INPUTS> {
+    match key {
+        OpenKey::Full => input_ids2(MAKER_ID, TAKER_ID),
+        OpenKey::MakerOnly => input_ids1(MAKER_ID),
+        OpenKey::TakerOnly => input_ids1(TAKER_ID),
+        OpenKey::Empty => input_ids0(),
+    }
+}
+
 pub(crate) fn resolve(edge: EdgeKey, proof: ProofKey) -> Resolve {
-    Resolve::new(edge_id(edge), proof_for(edge, proof), payouts())
+    resolve_with(edge, proof, payouts())
+}
+
+pub(crate) fn resolve_with(
+    edge: EdgeKey,
+    proof: ProofKey,
+    outputs: List<Payout, MAX_EDGE_OUTPUTS>,
+) -> Resolve {
+    Resolve::new(edge_id(edge), proof_for(edge, proof, &outputs), outputs)
 }
 
 pub(crate) fn edge_id(edge: EdgeKey) -> EdgeId {
@@ -140,39 +195,32 @@ pub(crate) const fn edge_value(edge: Edge) -> u64 {
     edge.value()
 }
 
-fn proof_for(edge: EdgeKey, proof: ProofKey) -> Proof {
-    match proof {
-        ProofKey::Basic => Proof::basic(TERMS.hash()),
-        ProofKey::Agreement => Proof::agreement(
-            TERMS.hash(),
-            Agreement::new(
-                Sig::placeholder(MAKER, hash(edge, ResolveKind::Agreement)),
-                Sig::placeholder(TAKER, hash(edge, ResolveKind::Agreement)),
-            ),
-        ),
-        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(TERMS),
-        ProofKey::Claimant => Proof::claimant_wins(TERMS, seal(edge, ResolveKind::ClaimantWins)),
-        ProofKey::Challenger => {
-            Proof::challenger_wins(TERMS, seal(edge, ResolveKind::ChallengerWins))
-        }
+pub(crate) fn live_value<const C: usize, const E: usize>(view: &View<C, E>) -> u64 {
+    let mut total = 0_u64;
+    for (_, coin) in view.coins() {
+        total = total.saturating_add(coin.value());
     }
+    for (_, edge) in view.edges() {
+        total = total.saturating_add(edge.value());
+    }
+    total
 }
 
-fn seal(edge: EdgeKey, kind: ResolveKind) -> Seal {
-    Seal::placeholder(TERMS.protocol(), kind, hash(edge, kind))
+pub(crate) fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    payouts_with(MAKER_PAYOUT, TAKER_PAYOUT)
 }
 
-fn hash(edge: EdgeKey, kind: ResolveKind) -> ResolveHash {
-    Resolve::payload_hash(edge_id(edge), kind, TERMS.hash(), &payouts())
+pub(crate) fn bad_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    payouts_with(MAKER_PAYOUT, BAD_PAYOUT)
 }
 
-fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
+pub(crate) fn payouts_with(maker: u64, taker: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
     let Some(outputs) = List::new(
         [
-            Payout::new(MAKER, MAKER_PAYOUT),
-            Payout::new(TAKER, TAKER_PAYOUT),
-            Payout::new(MAKER, MAKER_PAYOUT),
-            Payout::new(MAKER, MAKER_PAYOUT),
+            Payout::new(MAKER, maker),
+            Payout::new(TAKER, taker),
+            Payout::new(MAKER, maker),
+            Payout::new(MAKER, maker),
         ],
         2,
     ) else {
@@ -181,13 +229,83 @@ fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
     outputs
 }
 
-fn party1(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
+pub(crate) fn input_ids2(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
+    let Some(inputs) = List::new([first, second, first, first, first, first, first, first], 2)
+    else {
+        panic!("invalid trace input id list");
+    };
+    inputs
+}
+
+pub(crate) fn input_ids1(id: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
+    let Some(inputs) = List::new([id; MAX_EDGE_INPUTS], 1) else {
+        panic!("invalid trace input id list");
+    };
+    inputs
+}
+
+pub(crate) fn input_ids0() -> List<CoinId, MAX_EDGE_INPUTS> {
+    let Some(inputs) = List::new([MAKER_ID; MAX_EDGE_INPUTS], 0) else {
+        panic!("invalid trace input id list");
+    };
+    inputs
+}
+
+pub(crate) fn party1(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
     let Some(inputs) = List::new([id; MAX_PARTY_INPUTS], 1) else {
         panic!("invalid trace party list");
     };
     inputs
 }
 
-fn nth<const N: usize>(ids: List<CoinId, N>, index: usize) -> CoinId {
+pub(crate) fn empty_party() -> List<CoinId, MAX_PARTY_INPUTS> {
+    let Some(inputs) = List::new([MAKER_ID; MAX_PARTY_INPUTS], 0) else {
+        panic!("invalid trace party list");
+    };
+    inputs
+}
+
+pub(crate) fn nth<const N: usize>(ids: List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
+}
+
+fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
+    match proof {
+        ProofKey::Basic => Proof::basic(TERMS.hash()),
+        ProofKey::Agreement => Proof::agreement(
+            TERMS.hash(),
+            Agreement::new(
+                Sig::placeholder(MAKER, hash(edge, ResolveKind::Agreement, outputs)),
+                Sig::placeholder(TAKER, hash(edge, ResolveKind::Agreement, outputs)),
+            ),
+        ),
+        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(TERMS),
+        ProofKey::Claimant => {
+            Proof::claimant_wins(TERMS, seal(edge, ResolveKind::ClaimantWins, outputs))
+        }
+        ProofKey::Challenger => {
+            Proof::challenger_wins(TERMS, seal(edge, ResolveKind::ChallengerWins, outputs))
+        }
+        ProofKey::WrongTerms => Proof::basic(OTHER_TERMS.hash()),
+        ProofKey::BadSeal => {
+            Proof::claimant_wins(TERMS, seal(edge, ResolveKind::ChallengerWins, outputs))
+        }
+    }
+}
+
+fn open_funding(key: OpenKey) -> Funding {
+    match key {
+        OpenKey::Full => Funding::new(party1(MAKER_ID), party1(TAKER_ID)),
+        OpenKey::MakerOnly => Funding::new(party1(MAKER_ID), empty_party()),
+        OpenKey::TakerOnly => Funding::new(empty_party(), party1(TAKER_ID)),
+        OpenKey::Empty => Funding::new(empty_party(), empty_party()),
+    }
+}
+
+fn seal(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    Seal::placeholder(TERMS.protocol(), kind, hash(edge, kind, outputs))
+}
+
+fn hash(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
+    Resolve::payload_hash(edge_id(edge), kind, TERMS.hash(), outputs)
 }
