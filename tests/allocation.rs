@@ -1,4 +1,14 @@
 //! Allocation hygiene tests for kernel hot-path primitives.
+//!
+//! These tests assert zero heap allocations across `apply_all` and
+//! `Op::access`/`Op::cost`. The invariant rests on every op-payload type
+//! (`Op`, `Open`, `Resolve`, `Funding`, `Terms`, `Proof`, `List<...>`)
+//! being stack-only: clones we make in setup or assertions are pure
+//! `memcpy`s, never `Box`/`Vec`/`String` allocations. Adding a heap
+//! field to any of those types — or changing `List<T, N>` to back its
+//! storage on the heap — would silently regress this without a clippy
+//! or rustc warning. Re-run `cargo test --test allocation` after any
+//! field-shape change to those types.
 
 mod support;
 

@@ -64,10 +64,10 @@ fn apply_all_allows_empty_batch() {
 #[test]
 fn apply_all_rolls_back_on_error() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
-    let mut state = state(store_for_resolve(&open, outputs.clone()), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_resolve(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
     let ops = List::all([
         Op::Open(open),

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn resolve_zero_edge_without_outputs() {
-    let terms = terms_with(no_payouts());
+    let terms = terms_with(&no_payouts());
     let open = Open::from_terms(Funding::new(empty_party(), empty_party()), terms.clone());
     let edge = open.output();
     let mut state = funded_state_for(&open);
@@ -110,7 +110,7 @@ fn resolve_rejects_basic_witness_without_fake_crypto() {
 #[test]
 fn resolve_uses_prepaid_reserve() {
     let outputs = payouts(Payout::new(MAKER, 12), Payout::new(TAKER, 12));
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
     let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
@@ -118,7 +118,7 @@ fn resolve_uses_prepaid_reserve() {
     let maker_out = nth(&output_ids, 0);
     let taker_out = nth(&output_ids, 1);
     let mut state = state(
-        store_for_resolve(&open, outputs),
+        store_for_resolve(&open, &outputs),
         [
             Genesis::coin(MAKER_COIN, MAKER, 30),
             Genesis::coin(TAKER_COIN, TAKER, 20),
@@ -188,13 +188,13 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
         Fees::new(0, 0, 3),
     );
     let outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let terms_hash = terms.hash();
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
     let reserve_cost = open.reserve_cost();
     let mut state = state(
-        store_for_resolve(&open, outputs.clone()),
+        store_for_resolve(&open, &outputs),
         [
             Genesis::coin(MAKER_COIN, MAKER, 20),
             Genesis::coin(TAKER_COIN, TAKER, 10),
@@ -500,7 +500,7 @@ fn resolve_spends_edge_into_three_payout_coins() {
         Payout::new(TAKER, 5),
         Payout::new(MAKER, 4),
     );
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
     let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
@@ -508,7 +508,7 @@ fn resolve_spends_edge_into_three_payout_coins() {
     let maker_out = nth(&output_ids, 0);
     let taker_out = nth(&output_ids, 1);
     let extra_out = nth(&output_ids, 2);
-    let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_resolve(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let event = apply(&mut state, &Op::Open(open));
     assert_eq!(
         event.kind(),
@@ -536,14 +536,14 @@ fn resolve_spends_edge_into_three_payout_coins() {
 #[test]
 fn resolve_allows_zero_value_payout_coin() {
     let outputs = payouts(Payout::new(MAKER, 0), Payout::new(TAKER, 15));
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
     let resolve = Resolve::new(edge, Proof::timeout(terms), outputs.clone());
     let output_ids = resolve.output_ids();
     let maker_out = nth(&output_ids, 0);
     let taker_out = nth(&output_ids, 1);
-    let mut state = state(store_for_resolve(&open, outputs), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_resolve(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &Op::Open(open));
     let event = apply(&mut state, &Op::Resolve(resolve));
 
@@ -567,11 +567,11 @@ fn resolve_allows_zero_value_payout_coin() {
 #[test]
 fn resolve_rejects_non_conserving_payouts_without_mutation() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms = terms_with(outputs.clone());
+    let terms = terms_with(&outputs);
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms.clone());
     let edge = open.output();
     let mut state = state(
-        store_for_resolve(&open, outputs.clone()),
+        store_for_resolve(&open, &outputs),
         [MAKER_SEED, TAKER_SEED],
     );
     let _event = apply(&mut state, &Op::Open(open));
