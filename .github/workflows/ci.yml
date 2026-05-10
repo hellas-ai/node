@@ -14,6 +14,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  devshell:
+    runs-on: [self-hosted, shared]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dev shell
+        run: nix develop --command true
+
   matrix:
     runs-on: [self-hosted, shared]
     outputs:
@@ -21,19 +28,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: set-matrix
-        name: Enumerate check-* apps
+        name: Enumerate CI checks
         run: |
           set -Eeu
           matrix="$(
-            nix eval --accept-flake-config --json '.#apps.x86_64-linux' --apply '
-              apps:
-              let
-                prefix = "check-";
-                pfxLen = builtins.stringLength prefix;
-                startsWith = name: builtins.substring 0 pfxLen name == prefix;
-                names = builtins.filter startsWith (builtins.attrNames apps);
-              in {
-                include = map (name: { inherit name; }) names;
+            nix eval --json '.#ci.x86_64-linux.commands' --apply '
+              cmds: {
+                include = builtins.attrValues (
+                  builtins.mapAttrs (name: cmd: { inherit name cmd; }) cmds
+                );
               }
             '
           )"
@@ -42,25 +45,29 @@ jobs:
   check:
     runs-on: [self-hosted, shared]
     name: ${{ matrix.name }}
-    needs: matrix
+    needs:
+      - devshell
+      - matrix
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: nix run .#${{ matrix.name }}
-        run: nix run --accept-flake-config '.#${{ matrix.name }}'
+      - name: ${{ matrix.cmd }}
+        run: nix develop --command bash -c '${{ matrix.cmd }}'
 
   ci-passed:
     runs-on: [self-hosted, shared]
     if: always()
     name: CI passed
     needs:
+      - devshell
       - matrix
       - check
     steps:
-      - name: Require matrix + all checks succeeded
+      - name: Require devshell + matrix + all checks succeeded
         run: |
           set -Eeu
+          test '${{ needs.devshell.result }}' = 'success'
           test '${{ needs.matrix.result }}' = 'success'
           test '${{ needs.check.result }}' = 'success'

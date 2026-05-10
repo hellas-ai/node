@@ -188,30 +188,13 @@ in {
     {
       check = {
         type = "app";
-        program = "${ci.checkPackages.all}/bin/hellas-check-all";
-        meta.description = "Run all CI checks (sort, fmt, clippy, outdated)";
+        program = "${ci.checkAll}/bin/hellas-check-all";
+        meta.description = "Run all CI checks (sort, fmt, clippy, test, outdated)";
       };
       fix = {
         type = "app";
-        program = "${ci.fixPackages.all}/bin/hellas-fix-all";
-        meta.description = "Apply all CI auto-fixes where supported";
-      };
-      # Individual `check-*` apps are what CI's matrix enumerates.
-      check-fmt = {
-        type = "app";
-        program = "${ci.checkPackages.fmt}/bin/hellas-check-fmt";
-      };
-      check-clippy = {
-        type = "app";
-        program = "${ci.checkPackages.clippy}/bin/hellas-check-clippy";
-      };
-      check-sort = {
-        type = "app";
-        program = "${ci.checkPackages.sort}/bin/hellas-check-sort";
-      };
-      check-test = {
-        type = "app";
-        program = "${ci.testPackage}/bin/hellas-check-test";
+        program = "${ci.fixAll}/bin/hellas-fix-all";
+        meta.description = "Apply auto-fixes (fmt, sort, clippy)";
       };
     }
     // (linuxOutputs.apps or {});
@@ -224,6 +207,10 @@ in {
       };
     }
     // (linuxOutputs.devShells or {});
+
+  # Data exposed for the GitHub Actions matrix. `nix eval .#ci.<system>.commands`
+  # returns { name → command } drawn from nix/ci.nix.
+  ci = {inherit (ci) commands;};
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
   checks = linuxOutputs.nixosTests or {};

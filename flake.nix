@@ -51,6 +51,7 @@
     devShells = forAllSystems (system: perSystem.${system}.devShells);
     checks = forAllSystems (system: perSystem.${system}.checks);
     nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
+    ci = forAllSystems (system: perSystem.${system}.ci);
 
     overlays.default = final: _prev: {
       hellas = self.packages.${final.system};
