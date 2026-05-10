@@ -131,8 +131,10 @@ impl<const C: usize, const E: usize> Tx for FixedTx<'_, C, E> {
     }
 }
 
-impl<const C: usize, const E: usize> Snapshot<C, E> for FixedStore<C, E> {
-    fn view(&self) -> View<C, E> {
+impl<const C: usize, const E: usize> Snapshot for FixedStore<C, E> {
+    type View = View<C, E>;
+
+    fn view(&self) -> Self::View {
         View::new(
             self.coins.map(|slot| slot.coin.map(|coin| (slot.id, coin))),
             self.edges.map(|slot| slot.edge.map(|edge| (slot.id, edge))),
