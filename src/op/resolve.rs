@@ -1,0 +1,217 @@
+use super::{
+    Access, MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, duplicate, empty_coins,
+    empty_edges, one_edge, units,
+};
+use crate::{
+    context::{Context, Cost},
+    error::{ApplyError, KernelResult},
+    event::Change,
+    list::List,
+    object::Coin,
+    primitive::{CoinId, Digest, EdgeId, Key, ResolveHash, TermsHash},
+    store::Tx,
+};
+
+/// Resolve one edge into bounded owner-only coin payouts.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct Resolve {
+    input: EdgeId,
+    proof: Proof,
+    outputs: Payouts,
+}
+
+impl Resolve {
+    /// Creates a resolve operation.
+    #[must_use]
+    pub const fn new(input: EdgeId, proof: Proof, outputs: List<Payout, MAX_EDGE_OUTPUTS>) -> Self {
+        Self {
+            input,
+            proof,
+            outputs,
+        }
+    }
+
+    /// Returns the edge consumed by the resolve.
+    #[must_use]
+    pub const fn input(self) -> EdgeId {
+        self.input
+    }
+
+    /// Returns the resolve proof.
+    #[must_use]
+    pub const fn proof(&self) -> Proof {
+        self.proof
+    }
+
+    /// Returns the coin payouts produced by the resolve.
+    #[must_use]
+    pub const fn outputs(&self) -> &List<Payout, MAX_EDGE_OUTPUTS> {
+        &self.outputs
+    }
+
+    /// Returns the canonical ids of the payout coins this resolve creates.
+    #[must_use]
+    pub fn output_ids(&self) -> List<CoinId, MAX_EDGE_OUTPUTS> {
+        let mut ids = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_OUTPUTS];
+
+        for (index, payout) in self.outputs.iter().enumerate() {
+            ids[index] = self.output_id(index, payout);
+        }
+
+        let Some(ids) = List::new(ids, self.outputs.len()) else {
+            return List::all(ids);
+        };
+        ids
+    }
+
+    /// Returns the deterministic resource cost of this resolve.
+    #[must_use]
+    pub fn cost(&self) -> Cost {
+        Self::cost_for(self.outputs.len(), self.proof)
+    }
+
+    fn cost_for(outputs: usize, proof: Proof) -> Cost {
+        Self::cost_for_kind(outputs, proof.kind())
+    }
+
+    pub(super) fn cost_for_kind(outputs: usize, kind: ResolveKind) -> Cost {
+        let outputs = units(outputs);
+        Cost::new(
+            1,
+            outputs.saturating_add(1),
+            outputs.saturating_add(1),
+            kind.proofs(),
+        )
+    }
+
+    pub(super) fn apply<T: Tx>(&self, context: Context, tx: &T) -> KernelResult<Change> {
+        if let Some(id) = self.duplicate_output() {
+            return Err(ApplyError::DuplicateOutput { id });
+        }
+        self.check_outputs(tx)?;
+
+        let coins = self.coins()?;
+        let edge = tx
+            .edge(self.input)
+            .ok_or(ApplyError::MissingEdge { id: self.input })?;
+        if !self.proof.accepts(context, self, edge) {
+            return Err(ApplyError::InvalidProof { input: self.input });
+        }
+        let fee = context
+            .fee(self.cost())
+            .ok_or(ApplyError::InvalidResolve { input: self.input })?;
+        if !edge.resolves(&coins, fee) {
+            return Err(ApplyError::InvalidResolve { input: self.input });
+        }
+
+        Change::resolve((self.input, edge), &coins)
+    }
+
+    pub(super) fn access(&self) -> Access {
+        Access {
+            coins: empty_coins(),
+            edges: one_edge(self.input),
+            new_coins: self.output_ids(),
+            new_edges: empty_edges(),
+        }
+    }
+
+    /// Returns the commitment signed or proven by a resolve witness.
+    #[must_use]
+    pub fn hash(&self, kind: ResolveKind) -> ResolveHash {
+        Self::payload_hash(self.input, kind, self.proof.terms(), &self.outputs)
+    }
+
+    /// Returns the commitment for a concrete resolve payload.
+    #[must_use]
+    pub fn payload_hash(
+        input: EdgeId,
+        kind: ResolveKind,
+        terms: TermsHash,
+        outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
+    ) -> ResolveHash {
+        let mut digest = Digest::new(b"hellas.edge.resolve.v1");
+
+        digest.bytes(input.as_bytes());
+        digest.u8(kind.tag());
+        digest.bytes(terms.as_bytes());
+        digest.usize(outputs.len());
+        for output in outputs.iter() {
+            digest.bytes(output.owner().as_bytes());
+            digest.u64(output.value());
+        }
+
+        ResolveHash::from_digest(digest)
+    }
+
+    fn duplicate_output(&self) -> Option<CoinId> {
+        duplicate(self.output_ids().as_slice())
+    }
+
+    fn check_outputs<T: Tx>(&self, tx: &T) -> KernelResult<()> {
+        for (index, output) in self.outputs.iter().enumerate() {
+            let id = self.output_id(index, output);
+            if tx.coin(id).is_some() {
+                return Err(ApplyError::OutputExists { id });
+            }
+        }
+        Ok(())
+    }
+
+    fn coins(&self) -> KernelResult<ResolveCoins> {
+        let outputs = self.outputs.as_slice();
+        let Some(first) = outputs.first().copied() else {
+            let fill = (CoinId::from_bytes([0; CoinId::LENGTH]), Coin::zero());
+            return List::new([fill; MAX_EDGE_OUTPUTS], 0)
+                .ok_or(ApplyError::InvalidResolve { input: self.input });
+        };
+        let mut coins = [first.coin(self.input, 0); MAX_EDGE_OUTPUTS];
+
+        for (index, output) in outputs.iter().copied().enumerate() {
+            coins[index] = output.coin(self.input, index);
+        }
+
+        List::new(coins, outputs.len()).ok_or(ApplyError::InvalidResolve { input: self.input })
+    }
+
+    fn output_id(&self, index: usize, payout: Payout) -> CoinId {
+        payout.id(self.input, index)
+    }
+}
+
+/// Coin payout requested by an edge resolve.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct Payout {
+    owner: Key,
+    value: u64,
+}
+
+impl Payout {
+    /// Creates a resolve payout.
+    #[must_use]
+    pub const fn new(owner: Key, value: u64) -> Self {
+        Self { owner, value }
+    }
+
+    /// Returns the output coin owner.
+    #[must_use]
+    pub const fn owner(self) -> Key {
+        self.owner
+    }
+
+    /// Returns the output coin value.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    /// Derives the canonical output coin id for this payout position.
+    #[must_use]
+    pub fn id(self, edge: EdgeId, index: usize) -> CoinId {
+        CoinId::payout(edge, index, self.owner)
+    }
+
+    fn coin(self, edge: EdgeId, index: usize) -> (CoinId, Coin) {
+        (self.id(edge, index), Coin::issue(self.owner, self.value))
+    }
+}
