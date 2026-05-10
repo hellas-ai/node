@@ -13,9 +13,9 @@ use hellas_kernel::{Funding, Op, Open, Payout, Proof, Resolve};
 
 #[test]
 fn op_size_within_envelope() {
-    // ~600 bytes per Op variant is the current envelope. Larger means
-    // List<Op, N> stack frames blow up; tighter is better. Cap is a sanity
-    // guard, not a target.
+    // Current sizes (Linux x86_64): Op=624, Open=616, Resolve=584, Proof=352,
+    // Funding=272, Payout=48. The 768-byte cap on Op is a sanity guard, not a
+    // target. Stack frames for `List<Op, N>` scale linearly here.
     assert!(
         size_of::<Op>() <= 768,
         "Op size {} exceeds 768-byte cap",
