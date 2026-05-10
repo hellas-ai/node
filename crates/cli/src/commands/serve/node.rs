@@ -32,9 +32,7 @@ use tonic_iroh_transport::{IrohContext, PoolOptions, TransportBuilder};
 // the `otel` feature is on; with the feature off it returns the service
 // unchanged so the trace layer compiles to nothing.
 #[cfg(feature = "otel")]
-fn traced_service<S>(
-    svc: S,
-) -> tonic_iroh_transport::otel::TraceContextService<S> {
+fn traced_service<S>(svc: S) -> tonic_iroh_transport::otel::TraceContextService<S> {
     tower::Layer::layer(&tonic_iroh_transport::otel::TraceContextLayer, svc)
 }
 #[cfg(not(feature = "otel"))]

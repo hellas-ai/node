@@ -119,8 +119,8 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
             let mut error_value = json!({
                 "error": { "message": format!("Inference error: {err}") }
             });
-            if commitment_pending {
-                if let (Some(prov), Some(map)) = (
+            if commitment_pending
+                && let (Some(prov), Some(map)) = (
                     stream_provenance.as_ref(),
                     error_value.as_object_mut(),
                 ) {
@@ -129,7 +129,6 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                         serde_json::to_value(HellasExt::commitment(prov)).unwrap(),
                     );
                 }
-            }
             yield Ok(sse_data(&error_value));
         } else if let Some((reason, receipt)) = completed {
             let final_chunk = plain::CompletionChunk::builder()
