@@ -1432,7 +1432,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         ])
         .await;
 
-        let monitor_second_signal = matches!(trigger, ShutdownTrigger::Signal(_));
+        let signal_triggered = matches!(trigger, ShutdownTrigger::Signal(_));
         match trigger {
             ShutdownTrigger::Signal(signal) => {
                 info!(signal, "received shutdown signal");
@@ -1445,12 +1445,18 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
         }
 
-        graceful_stop(context, monitor_second_signal).await;
+        graceful_stop(context, signal_triggered).await;
 
         if let Some(provider) = tracer_provider
             && let Err(err) = provider.shutdown()
         {
             warn!(?err, "failed to flush OTLP traces on shutdown");
+        }
+
+        // Any non-signal trigger means a sibling actor died unexpectedly. Exit non-zero so
+        // systemd's `Restart=on-failure` kicks in instead of treating us as a clean shutdown.
+        if !signal_triggered {
+            std::process::exit(1);
         }
     });
     Ok(())
