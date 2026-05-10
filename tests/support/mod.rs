@@ -237,10 +237,43 @@ pub(crate) const fn edge_id(byte: u8) -> EdgeId {
     EdgeId::from_bytes([byte; EdgeId::LENGTH])
 }
 
+pub(crate) const fn key(byte: u8) -> Key {
+    Key::from_bytes([byte; Key::LENGTH])
+}
+
 pub(crate) const fn coin_view(coin: Coin) -> (Key, u64) {
     (coin.owner(), coin.value())
 }
 
 pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, Parties, TermsHash) {
     (edge.value(), edge.reserve(), edge.parties(), edge.terms())
+}
+
+/// One-coin party funding: a `MAX_PARTY_INPUTS`-sized list with `id` in
+/// position 0 and a single live entry. The fill value is `id` itself, which
+/// is harmless because `as_slice()` only exposes the first `len` entries.
+pub(crate) const fn party_one(
+    id: CoinId,
+) -> hellas_kernel::List<CoinId, { hellas_kernel::MAX_PARTY_INPUTS }> {
+    let Some(list) = hellas_kernel::List::new([id; hellas_kernel::MAX_PARTY_INPUTS], 1) else {
+        panic!("one-coin party fits");
+    };
+    list
+}
+
+/// Bilateral payouts with explicit values: `(maker_key, maker_value)` at
+/// position 0, `(taker_key, taker_value)` at position 1, len = 2.
+pub(crate) const fn payouts_two(
+    maker: Key,
+    maker_value: u64,
+    taker: Key,
+    taker_value: u64,
+) -> hellas_kernel::List<hellas_kernel::Payout, { hellas_kernel::MAX_EDGE_OUTPUTS }> {
+    let payout = hellas_kernel::Payout::new(maker, maker_value);
+    let mut buf = [payout; hellas_kernel::MAX_EDGE_OUTPUTS];
+    buf[1] = hellas_kernel::Payout::new(taker, taker_value);
+    let Some(list) = hellas_kernel::List::new(buf, 2) else {
+        panic!("two payouts fit");
+    };
+    list
 }

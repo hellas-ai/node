@@ -30,12 +30,12 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof, ProtocolCode, Resolve, State, Terms,
+    Op, Open, Parties, Payout, Proof, ProtocolCode, Resolve, State, Terms,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
-use support::{FAKE_VERIFIER, FixedStore};
+use support::{FAKE_VERIFIER, FixedStore, party_one, payouts_two};
 
 const COIN_SLOTS: usize = 6;
 const EDGE_SLOTS: usize = 2;
@@ -129,26 +129,14 @@ const fn terms() -> Terms {
 }
 
 const fn canonical_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let payout = Payout::new(MAKER, MAKER_PAYOUT);
-    let mut buf = [payout; MAX_EDGE_OUTPUTS];
-    buf[1] = Payout::new(TAKER, TAKER_PAYOUT);
-    let Some(list) = List::new(buf, 2) else {
-        panic!("canonical payouts fit");
-    };
-    list
+    payouts_two(MAKER, MAKER_PAYOUT, TAKER, TAKER_PAYOUT)
 }
 
 fn full_open() -> Open {
-    let maker = party_one(MAKER_COIN);
-    let taker = party_one(TAKER_COIN);
-    Open::from_terms(Funding::new(maker, taker), terms())
-}
-
-const fn party_one(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(list) = List::new([id; MAX_PARTY_INPUTS], 1) else {
-        panic!("one-coin party fits");
-    };
-    list
+    Open::from_terms(
+        Funding::new(party_one(MAKER_COIN), party_one(TAKER_COIN)),
+        terms(),
+    )
 }
 
 fn full_edge_id() -> EdgeId {
