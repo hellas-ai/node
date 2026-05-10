@@ -41,27 +41,46 @@ pub enum InsertError {
 }
 
 /// Error returned when a [`crate::Op`] cannot be applied.
+///
+/// Most variants describe ordinary user-input rejections — bad funding,
+/// unknown ids, mismatched payouts. The [`Self::CoinChanged`],
+/// [`Self::EdgeChanged`], and fold-phase [`Self::MissingCoin`] /
+/// [`Self::MissingEdge`] paths instead signal a [`crate::Tx`] contract
+/// violation: the kernel reads a slot during validation, then the same
+/// slot returns different bytes (or nothing) during fold without any
+/// intervening kernel write. The kernel surfaces these as recoverable
+/// errors rather than panicking so a misbehaving store can be rolled
+/// back, but seeing them in production means the store implementation
+/// is broken, not the operation payload.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum ApplyError {
-    /// A required coin does not exist.
+    /// A required coin does not exist. During validation this is an
+    /// ordinary rejection (the user named a coin id that is not live);
+    /// during fold it is a [`crate::Tx`] contract violation (the slot
+    /// disappeared between validation and fold without a kernel write).
     MissingCoin {
         /// Missing coin id.
         id: CoinId,
     },
 
-    /// A coin changed between validation and fold.
+    /// A coin changed between validation and fold. Indicates a
+    /// [`crate::Tx`] contract violation — the kernel does not write to
+    /// a slot between reading it and folding the corresponding effect,
+    /// so any divergence is the store's fault.
     CoinChanged {
         /// Changed coin id.
         id: CoinId,
     },
 
-    /// A required edge does not exist.
+    /// A required edge does not exist. Same dual interpretation as
+    /// [`Self::MissingCoin`]: validation = user error, fold = store bug.
     MissingEdge {
         /// Missing edge id.
         id: EdgeId,
     },
 
-    /// An edge changed between validation and fold.
+    /// An edge changed between validation and fold. Same interpretation
+    /// as [`Self::CoinChanged`]: a [`crate::Tx`] contract violation.
     EdgeChanged {
         /// Changed edge id.
         id: EdgeId,
@@ -82,12 +101,6 @@ pub enum ApplyError {
     /// An operation attempts to consume the same input twice.
     DuplicateInput {
         /// Duplicated input coin id.
-        id: CoinId,
-    },
-
-    /// An operation attempts to create the same output twice.
-    DuplicateOutput {
-        /// Duplicated output coin id.
         id: CoinId,
     },
 
@@ -143,9 +156,6 @@ pub enum InvalidOpenReason {
     FundingOverflow,
     /// Sum of funding coin values is less than open fee + locked reserve.
     FundingInsufficient,
-    /// Constructing the bounded funding list exceeded its capacity. Defensive
-    /// path; reachable only from a misbehaving caller.
-    BoundsExceeded,
 }
 
 /// Specific reason an [`ApplyError::InvalidResolve`] was raised.
@@ -160,9 +170,6 @@ pub enum InvalidResolveReason {
     ReserveTooSmall,
     /// Sum of payout values does not equal the edge's principal.
     ValueMismatch,
-    /// Constructing the bounded payout list exceeded its capacity. Defensive
-    /// path; reachable only from a misbehaving caller.
-    BoundsExceeded,
 }
 
 /// Specific reason an [`ApplyError::InvalidProof`] was raised.

@@ -7,8 +7,8 @@
 //! gating an action on `canResolve(...)` before primed-variable updates.
 
 use super::{
-    Access, MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, duplicate, empty_coins,
-    empty_edges, one_edge, units,
+    Access, MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, empty_coins, empty_edges,
+    one_edge, units,
 };
 use crate::{
     context::{Context, Cost},
@@ -67,10 +67,7 @@ impl Resolve {
             ids[index] = self.output_id(index, payout);
         }
 
-        let Some(ids) = List::new(ids, self.outputs.len()) else {
-            return List::all(ids);
-        };
-        ids
+        List::take(ids, self.outputs.len())
     }
 
     /// Returns the deterministic resource cost of this resolve.
@@ -95,12 +92,9 @@ impl Resolve {
         verifier: &V,
         tx: &T,
     ) -> KernelResult<Change> {
-        if let Some(id) = self.duplicate_output() {
-            return Err(ApplyError::DuplicateOutput { id });
-        }
         self.check_outputs(tx)?;
 
-        let coins = self.coins()?;
+        let coins = self.coins();
         let edge = tx
             .edge(self.input)
             .ok_or(ApplyError::MissingEdge { id: self.input })?;
@@ -163,10 +157,6 @@ impl Resolve {
         ResolveHash::from_digest(digest)
     }
 
-    fn duplicate_output(&self) -> Option<CoinId> {
-        duplicate(self.output_ids().as_slice())
-    }
-
     fn check_outputs<T: Tx>(&self, tx: &T) -> KernelResult<()> {
         for (index, output) in self.outputs.iter().enumerate() {
             let id = self.output_id(index, output);
@@ -177,19 +167,12 @@ impl Resolve {
         Ok(())
     }
 
-    fn coins(&self) -> KernelResult<ResolveCoins> {
-        let outputs = self.outputs.as_slice();
-        let Some(first) = outputs.first().copied() else {
-            return Ok(List::empty((CoinId::ZERO, Coin::ZERO)));
-        };
-        let mut coins = [first.coin(self.input, 0); MAX_EDGE_OUTPUTS];
-
-        for (index, output) in outputs.iter().copied().enumerate() {
+    fn coins(&self) -> ResolveCoins {
+        let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
+        for (index, output) in self.outputs.iter().enumerate() {
             coins[index] = output.coin(self.input, index);
         }
-
-        List::new(coins, outputs.len())
-            .ok_or_else(|| self.invalid(InvalidResolveReason::BoundsExceeded))
+        List::take(coins, self.outputs.len())
     }
 
     fn output_id(&self, index: usize, payout: Payout) -> CoinId {
