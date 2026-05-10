@@ -1,4 +1,10 @@
 //! Concrete edge terms and their deterministic commitment.
+//!
+//! No direct abstract counterpart — the L1 model treats terms as opaque
+//! constants (`TimeoutHeight`, `MakerPayout`, `TakerPayout` in
+//! `models/types.qnt`). The Rust kernel commits to a structured [`Terms`]
+//! enum and binds it via [`TermsHash`] so resolves can carry only the
+//! commitment, not the full payload.
 
 use crate::{
     context::BlockHeight,

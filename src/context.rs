@@ -1,4 +1,9 @@
 //! Block context and deterministic resource pricing.
+//!
+//! Abstract counterpart: the `height` state var in `models/l1.qnt` (read
+//! by the `proofOk` Timeout guard in `models/verifier.qnt`). The
+//! `heightMonotonic` assumption in `models/deps/assumptions.qnt` is what
+//! lets the kernel trust [`BlockHeight`] without re-checking every apply.
 
 const HASH_LENGTH: usize = 32;
 

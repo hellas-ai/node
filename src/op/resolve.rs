@@ -1,3 +1,11 @@
+//! Resolve: consume one edge and materialize bounded payout coins.
+//!
+//! Abstract counterpart: `models/l1.qnt::resolveEdge` action plus the
+//! `canResolve` predicate. The action's preconditions (live edge, valid
+//! proof, payout sum equals edge value, payouts honor binding) are
+//! enforced here before any state mutation, mirroring the Quint pattern of
+//! gating an action on `canResolve(...)` before primed-variable updates.
+
 use super::{
     Access, MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, duplicate, empty_coins,
     empty_edges, one_edge, units,

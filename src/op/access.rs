@@ -1,3 +1,11 @@
+//! Slot access summary used by parallel scheduling.
+//!
+//! No abstract counterpart — the model evaluates one action at a time and
+//! has no notion of parallel scheduling. [`Access`] exists so callers
+//! ordering operations into waves can detect read/write conflicts without
+//! taking the full apply path; `tests/parallel.rs` checks that disjoint
+//! waves produce the same final state as a sequential block.
+
 use super::{EdgeList, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, overlaps};
 use crate::{list::List, primitive::CoinId};
 

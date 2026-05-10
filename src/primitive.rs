@@ -1,4 +1,10 @@
 //! Byte-level primitives: settlement keys, object identifiers, protocol tags.
+//!
+//! No direct abstract counterpart — the model addresses objects by tagged
+//! identifiers (`MakerCoin`, `Edge1`, …) declared in `models/types.qnt`.
+//! These byte newtypes are the kernel's concrete realization of those
+//! abstract tags; structural invariants come from how they are used in
+//! [`crate::object`] and [`crate::op`].
 
 use core::fmt;
 
