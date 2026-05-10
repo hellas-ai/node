@@ -234,7 +234,8 @@ Cost { base, reads, writes, proofs }
 funding before creating the edge, and locks a separate resolution reserve priced
 from the maximum basic resolve shape. Resolve checks that the edge reserve can
 pay the current priced resolve cost, then consumes the reserve and pays out only
-edge principal.
+edge principal. `Block::fits` checks the summed block cost against a
+multi-dimensional resource budget before admission.
 
 ### Access Sets
 

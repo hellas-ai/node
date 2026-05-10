@@ -50,6 +50,12 @@ impl<const N: usize> Block<N> {
         self.context.fee(self.cost()?)
     }
 
+    /// Returns true if the block cost fits within `budget`.
+    #[must_use]
+    pub fn fits(&self, budget: Cost) -> bool {
+        self.cost().is_some_and(|cost| cost.fits(budget))
+    }
+
     /// Returns true if any two operations in the block touch the same state
     /// slot.
     #[must_use]
