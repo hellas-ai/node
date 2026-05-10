@@ -95,6 +95,7 @@ fn resolve_rejects_basic_witness_without_fake_crypto() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 Proof::basic(terms()),
@@ -158,6 +159,7 @@ fn resolve_rejects_unpaid_fee_without_mutation() {
     assert_eq!(
         state.apply(
             RESOURCE_CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 proof(),
@@ -202,7 +204,7 @@ fn resolve_rejects_when_current_fee_exceeds_reserve_without_mutation() {
     );
     assert_eq!(expensive.fee(resolve.cost()), Some(3));
     assert_eq!(
-        state.apply(expensive, &Op::Resolve(resolve)),
+        state.apply(expensive, &FAKE_VERIFIER, &Op::Resolve(resolve)),
         Err(ApplyError::InvalidResolve {
             input: open.output(),
         }),
@@ -257,7 +259,11 @@ fn resolve_rejects_bad_agreement_signature_without_mutation() {
     );
 
     assert_eq!(
-        state.apply(CONTEXT, &Op::Resolve(Resolve::new(edge(), proof, outputs))),
+        state.apply(
+            CONTEXT,
+            &FAKE_VERIFIER,
+            &Op::Resolve(Resolve::new(edge(), proof, outputs))
+        ),
         Err(ApplyError::InvalidProof { input: edge() }),
     );
     assert_eq!(*state.store(), store);
@@ -294,6 +300,7 @@ fn resolve_rejects_timeout_before_deadline_without_mutation() {
     assert_eq!(
         state.apply(
             EARLY_CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 Proof::timeout(BASIC_TERMS),
@@ -313,6 +320,7 @@ fn resolve_rejects_timeout_with_nondefault_payouts_without_mutation() {
     assert_eq!(
         state.apply(
             TIMEOUT_CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 Proof::timeout(BASIC_TERMS),
@@ -332,6 +340,7 @@ fn resolve_rejects_wrong_timeout_terms_without_mutation() {
     assert_eq!(
         state.apply(
             TIMEOUT_CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 Proof::timeout(OTHER_TERMS_VALUE),
@@ -392,8 +401,7 @@ fn resolve_accepts_challenger_wins_witness() {
 }
 
 #[test]
-#[cfg(not(feature = "fake-crypto"))]
-fn placeholder_witnesses_do_not_verify_without_fake_crypto() {
+fn placeholder_witnesses_do_not_verify_under_reject_verifier() {
     let mut state = open_state();
     let store = *state.store();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
@@ -401,6 +409,7 @@ fn placeholder_witnesses_do_not_verify_without_fake_crypto() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &REJECT_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 agreement_proof(edge(), &outputs),
@@ -423,7 +432,11 @@ fn resolve_rejects_bad_dispute_seal_without_mutation() {
     );
 
     assert_eq!(
-        state.apply(CONTEXT, &Op::Resolve(Resolve::new(edge(), proof, outputs))),
+        state.apply(
+            CONTEXT,
+            &FAKE_VERIFIER,
+            &Op::Resolve(Resolve::new(edge(), proof, outputs))
+        ),
         Err(ApplyError::InvalidProof { input: edge() }),
     );
     assert_eq!(*state.store(), store);
@@ -440,7 +453,11 @@ fn resolve_rejects_wrong_dispute_terms_without_mutation() {
     );
 
     assert_eq!(
-        state.apply(CONTEXT, &Op::Resolve(Resolve::new(edge(), proof, outputs))),
+        state.apply(
+            CONTEXT,
+            &FAKE_VERIFIER,
+            &Op::Resolve(Resolve::new(edge(), proof, outputs))
+        ),
         Err(ApplyError::InvalidProof { input: edge() }),
     );
     assert_eq!(*state.store(), store);
@@ -527,6 +544,7 @@ fn resolve_rejects_non_conserving_payouts_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(open.output(), Proof::timeout(terms), outputs,)),
         ),
         Err(ApplyError::InvalidResolve {
@@ -544,6 +562,7 @@ fn resolve_rejects_wrong_proof_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
                 other_proof(),

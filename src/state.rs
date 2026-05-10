@@ -9,6 +9,7 @@ use crate::{
     object::Genesis,
     op::Op,
     store::{Store, Tx},
+    verifier::Verifier,
     view::Snapshot,
 };
 
@@ -73,9 +74,14 @@ impl<S: Store> State<S> {
     ///
     /// Returns [`crate::ApplyError`] if the operation is not valid for the
     /// current store contents or if the backing store rejects an insertion.
-    pub fn apply(&mut self, context: Context, operation: &Op) -> KernelResult<Event> {
+    pub fn apply<V: Verifier + ?Sized>(
+        &mut self,
+        context: Context,
+        verifier: &V,
+        operation: &Op,
+    ) -> KernelResult<Event> {
         let mut tx = self.store.begin();
-        let event = Self::fold_one(&mut tx, context, operation)?;
+        let event = Self::fold_one(&mut tx, context, verifier, operation)?;
         tx.commit();
         Ok(event)
     }
@@ -89,16 +95,17 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_all<const N: usize>(
+    pub fn apply_all<V: Verifier + ?Sized, const N: usize>(
         &mut self,
         context: Context,
+        verifier: &V,
         operations: &List<Op, N>,
     ) -> KernelResult<Diff<N>, BatchError> {
         let mut tx = self.store.begin();
         let mut diff = Diff::empty();
 
         for (index, operation) in operations.iter().enumerate() {
-            let event = Self::fold_one(&mut tx, context, &operation)
+            let event = Self::fold_one(&mut tx, context, verifier, &operation)
                 .map_err(|source| BatchError::new(index, source))?;
             diff.push(&event);
         }
@@ -112,15 +119,21 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_block<const N: usize>(
+    pub fn apply_block<V: Verifier + ?Sized, const N: usize>(
         &mut self,
+        verifier: &V,
         block: &Block<N>,
     ) -> KernelResult<Diff<N>, BatchError> {
-        self.apply_all(block.context(), block.ops())
+        self.apply_all(block.context(), verifier, block.ops())
     }
 
-    fn fold_one<T: Tx>(tx: &mut T, context: Context, operation: &Op) -> KernelResult<Event> {
-        let change = operation.apply(context, tx)?;
+    fn fold_one<T: Tx, V: Verifier + ?Sized>(
+        tx: &mut T,
+        context: Context,
+        verifier: &V,
+        operation: &Op,
+    ) -> KernelResult<Event> {
+        let change = operation.apply(context, verifier, tx)?;
         Self::fold_change(tx, &change)
     }
 

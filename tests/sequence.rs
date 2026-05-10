@@ -6,7 +6,10 @@
 
 mod support;
 
-use support::l1::{self, EdgeKey, ProofKey};
+use support::{
+    FAKE_VERIFIER,
+    l1::{self, EdgeKey, ProofKey},
+};
 
 use hellas_kernel::{EventKind, Op};
 use proptest::{
@@ -72,7 +75,7 @@ proptest! {
         for step in steps {
             let before = state;
             let op = step.op();
-            let result = state.apply(step.context(), &op);
+            let result = state.apply(step.context(), &FAKE_VERIFIER, &op);
 
             if result.is_err() {
                 prop_assert_eq!(state, before);
@@ -128,10 +131,11 @@ fn assert_event_matches(
 
 const fn proof_accepts(proof: ProofKey) -> bool {
     match proof {
-        ProofKey::Timeout => true,
-        ProofKey::Basic | ProofKey::Agreement | ProofKey::Claimant | ProofKey::Challenger => {
-            cfg!(feature = "fake-crypto")
-        }
+        // FAKE_VERIFIER accepts every placeholder-shaped sig/seal, so
+        // Agreement/Claimant/Challenger pass under both feature configs.
+        // Basic is still gated by cfg(feature = "fake-crypto") in the kernel.
+        ProofKey::Timeout | ProofKey::Agreement | ProofKey::Claimant | ProofKey::Challenger => true,
+        ProofKey::Basic => cfg!(feature = "fake-crypto"),
         ProofKey::EarlyTimeout | ProofKey::WrongTerms | ProofKey::BadSeal => false,
     }
 }

@@ -154,6 +154,7 @@ fn open_pays_fee_from_funding() {
     let mut state = funded_state();
     let Ok(event) = state.apply(
         FEE_CONTEXT,
+        &FAKE_VERIFIER,
         &Op::Open(Open::from_terms(
             funding(MAKER_COIN, TAKER_COIN),
             BASIC_TERMS,
@@ -185,7 +186,7 @@ fn open_fee_uses_resource_cost() {
         ],
     );
     let open = open_op();
-    let Ok(event) = state.apply(RESOURCE_CONTEXT, &Op::Open(open)) else {
+    let Ok(event) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)) else {
         panic!("operation rejected");
     };
 
@@ -246,7 +247,7 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
     assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
     assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
     assert_eq!(
-        state.apply(RESOURCE_CONTEXT, &Op::Open(open)),
+        state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
             output: open.output(),
         }),
@@ -261,7 +262,7 @@ fn open_rejects_funding_below_fee_without_mutation() {
     let store = *state.store();
 
     assert_eq!(
-        state.apply(FEE_CONTEXT, &Op::Open(open)),
+        state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
             output: open.output(),
         }),
@@ -277,6 +278,7 @@ fn open_rejects_duplicate_funding_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 Funding::new(party1(MAKER_COIN), party1(MAKER_COIN)),
                 BASIC_TERMS
@@ -295,6 +297,7 @@ fn open_rejects_unavailable_edge_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 funding(MAKER_COIN, TAKER_COIN),
                 BASIC_TERMS,
@@ -322,6 +325,7 @@ fn open_rejects_overflow_without_mutation() {
     assert_eq!(
         state.apply(
             CONTEXT,
+            &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 funding(MAKER_COIN, TAKER_COIN),
                 BASIC_TERMS,

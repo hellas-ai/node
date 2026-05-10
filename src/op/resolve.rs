@@ -10,6 +10,7 @@ use crate::{
     object::Coin,
     primitive::{CoinId, Digest, EdgeId, Key, ResolveHash, TermsHash},
     store::Tx,
+    verifier::Verifier,
 };
 
 /// Resolve one edge into bounded owner-only coin payouts.
@@ -84,7 +85,12 @@ impl Resolve {
         )
     }
 
-    pub(super) fn apply<T: Tx>(&self, context: Context, tx: &T) -> KernelResult<Change> {
+    pub(super) fn apply<T: Tx, V: Verifier + ?Sized>(
+        &self,
+        context: Context,
+        verifier: &V,
+        tx: &T,
+    ) -> KernelResult<Change> {
         if let Some(id) = self.duplicate_output() {
             return Err(ApplyError::DuplicateOutput { id });
         }
@@ -94,7 +100,7 @@ impl Resolve {
         let edge = tx
             .edge(self.input)
             .ok_or(ApplyError::MissingEdge { id: self.input })?;
-        if !self.proof.accepts(context, self, edge) {
+        if !self.proof.accepts(context, verifier, self, edge) {
             return Err(ApplyError::InvalidProof { input: self.input });
         }
         let fee = context

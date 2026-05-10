@@ -206,8 +206,9 @@ impl Sig {
 
     /// Creates a deterministic signature placeholder for modelling.
     ///
-    /// This is forgeable and not a cryptographic signature. The kernel accepts
-    /// this shape only when built with the `fake-crypto` feature.
+    /// This is forgeable and not a cryptographic signature. Whether the kernel
+    /// accepts this shape is decided by the [`crate::Verifier`] passed at
+    /// apply time.
     #[must_use]
     pub fn placeholder(key: Key, hash: ResolveHash) -> Self {
         let mut out = [0_u8; Self::LENGTH];
@@ -218,19 +219,6 @@ impl Sig {
         out[ResolveHash::LENGTH..].copy_from_slice(&second);
 
         Self(out)
-    }
-
-    pub(crate) fn verifies(self, key: Key, hash: ResolveHash) -> bool {
-        #[cfg(feature = "fake-crypto")]
-        {
-            self == Self::placeholder(key, hash)
-        }
-
-        #[cfg(not(feature = "fake-crypto"))]
-        {
-            let _ = (self, key, hash);
-            false
-        }
     }
 
     fn half(key: Key, hash: ResolveHash, index: u8) -> [u8; ResolveHash::LENGTH] {

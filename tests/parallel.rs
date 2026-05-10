@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{FixedStore, coin_id, state};
+use support::{FAKE_VERIFIER, FixedStore, coin_id, state};
 
 use hellas_kernel::{
     Block, BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List,
@@ -112,7 +112,7 @@ fn disjoint_waves_match_ordered_block_transition() {
     assert!(!ops.as_slice()[2].conflicts(&ops.as_slice()[3]));
     assert!(ops.as_slice()[0].conflicts(&ops.as_slice()[2]));
 
-    let Ok(diff) = ordered.apply_block(&block) else {
+    let Ok(diff) = ordered.apply_block(&FAKE_VERIFIER, &block) else {
         panic!("ordered block rejected");
     };
     apply_reversed_waves(&mut waved, &ops, plan);
@@ -132,7 +132,8 @@ fn apply_reversed_waves(state: &mut TestState, ops: &Ops, plan: Plan<4>) {
         while index > 0 {
             index -= 1;
             if plan.wave(index) == Some(wave) {
-                let Ok(_event) = state.apply(CONTEXT, &ops.as_slice()[index]) else {
+                let Ok(_event) = state.apply(CONTEXT, &FAKE_VERIFIER, &ops.as_slice()[index])
+                else {
                     panic!("wave operation rejected");
                 };
             }

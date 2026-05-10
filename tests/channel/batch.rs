@@ -16,7 +16,7 @@ fn apply_all_opens_and_resolves_one_batch() {
     ]);
 
     let block = Block::new(CONTEXT, ops);
-    let Ok(diff) = state.apply_block(&block) else {
+    let Ok(diff) = state.apply_block(&FAKE_VERIFIER, &block) else {
         panic!("valid batch rejected");
     };
 
@@ -52,7 +52,7 @@ fn apply_all_allows_empty_batch() {
     let mut state = funded_state();
     let store = *state.store();
     let ops: List<Op, 0> = List::all([]);
-    let Ok(diff) = state.apply_all(CONTEXT, &ops) else {
+    let Ok(diff) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
         panic!("empty batch rejected");
     };
 
@@ -73,7 +73,7 @@ fn apply_all_rolls_back_on_error() {
         Op::Resolve(Resolve::new(open.output(), Proof::timeout(terms), outputs)),
     ]);
 
-    let Err(error) = state.apply_all(CONTEXT, &ops) else {
+    let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
         panic!("invalid batch accepted");
     };
 
