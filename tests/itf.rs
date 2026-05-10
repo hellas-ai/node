@@ -111,6 +111,7 @@ fn replays_basic_itf() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn replays_agreement_timeout_itf() {
     Fixture::new(
         "agreementTimeoutTraceTest",
@@ -127,6 +128,7 @@ fn replays_agreement_timeout_itf() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn replays_dispute_itf() {
     Fixture::new(
         "disputeTraceTest",

@@ -141,6 +141,7 @@ fn replays_basic_trace() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn replays_agreement_then_timeout_trace() {
     Trace::new([
         Frame::accept(Step::Open(EdgeKey::First), Shape::Edge(EdgeKey::First)),
@@ -158,6 +159,7 @@ fn replays_agreement_then_timeout_trace() {
 }
 
 #[test]
+#[cfg(feature = "fake-crypto")]
 fn replays_dispute_outcome_trace() {
     Trace::new([
         Frame::accept(Step::Open(EdgeKey::First), Shape::Edge(EdgeKey::First)),

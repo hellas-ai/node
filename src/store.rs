@@ -26,6 +26,9 @@ pub trait Store {
 /// Reads observe the working transaction state. Writes are staged against the
 /// transaction and become visible to the backing store only on [`Tx::commit`].
 /// A dropped (uncommitted) transaction rolls back.
+///
+/// The edge methods have coin-only defaults for narrow test stores. A real L1
+/// object store must implement coin and edge access together.
 pub trait Tx {
     /// Returns the coin stored under `id`, if any.
     fn coin(&self, id: CoinId) -> Option<Coin>;
