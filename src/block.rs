@@ -49,4 +49,25 @@ impl<const N: usize> Block<N> {
     pub fn fee(&self) -> Option<u64> {
         self.context.fee(self.cost()?)
     }
+
+    /// Returns true if any two operations in the block touch the same state
+    /// slot.
+    #[must_use]
+    pub fn conflicts(&self) -> bool {
+        let ops = self.ops.as_slice();
+        let mut left = 0;
+
+        while left < ops.len() {
+            let mut right = left + 1;
+            while right < ops.len() {
+                if ops[left].conflicts(&ops[right]) {
+                    return true;
+                }
+                right += 1;
+            }
+            left += 1;
+        }
+
+        false
+    }
 }
