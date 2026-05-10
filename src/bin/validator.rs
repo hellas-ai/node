@@ -741,6 +741,7 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
         .with_file(true)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .compact();
 
     let (otel_layer, provider) = init_otlp_layer();
