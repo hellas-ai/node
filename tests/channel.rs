@@ -15,9 +15,10 @@ use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, ed
 
 use hellas_kernel::{
     Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, EventKind,
-    Fees, Funding, Genesis, InsertError, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof, ProtocolCode, Resolve, ResolveHash,
-    ResolveKind, Seal, Sig, State, Terms, TermsHash, View,
+    Fees, Funding, Genesis, InsertError, InvalidOpenReason, InvalidProofReason,
+    InvalidResolveReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open,
+    Parties, Payout, Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State,
+    Terms, TermsHash, View,
 };
 
 const CONTEXT: Context = Context::new(

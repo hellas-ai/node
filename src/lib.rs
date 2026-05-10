@@ -66,7 +66,10 @@ mod view;
 
 pub use block::Block;
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
-pub use error::{ApplyError, BatchError, InsertError, KernelResult};
+pub use error::{
+    ApplyError, BatchError, InsertError, InvalidOpenReason, InvalidProofReason,
+    InvalidResolveReason, KernelResult,
+};
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
