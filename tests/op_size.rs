@@ -34,7 +34,11 @@ fn open_resolve_proof_sizes() {
         "Resolve size {}",
         size_of::<Resolve>(),
     );
-    assert!(size_of::<Proof>() <= 384, "Proof size {}", size_of::<Proof>());
+    assert!(
+        size_of::<Proof>() <= 384,
+        "Proof size {}",
+        size_of::<Proof>()
+    );
     assert!(
         size_of::<Funding>() <= 320,
         "Funding size {}",

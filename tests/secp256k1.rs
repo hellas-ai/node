@@ -19,11 +19,11 @@ mod support;
 
 use hellas_kernel::{
     Agreement, ApplyError, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis,
-    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout,
-    Proof, ProtocolCode, Resolve, ResolveKind, Secp256k1Verifier, Sig, State, Terms,
+    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Op, Open, Parties, Payout, Proof,
+    ProtocolCode, Resolve, ResolveKind, Secp256k1Verifier, Sig, State, Terms,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
-use support::FixedStore;
+use support::{FixedStore, party_one, payouts_two};
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const CONTEXT: Context = Context::new(
@@ -45,21 +45,8 @@ fn sign(secret: &SecretKey, hash: hellas_kernel::ResolveHash) -> Sig {
     Sig::from_bytes(signature.serialize_compact())
 }
 
-const fn party_one(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(list) = List::new([id; MAX_PARTY_INPUTS], 1) else {
-        panic!("one-coin party fits");
-    };
-    list
-}
-
 const fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let payout = Payout::new(maker, 7);
-    let mut buf = [payout; MAX_EDGE_OUTPUTS];
-    buf[1] = Payout::new(taker, 8);
-    let Some(list) = List::new(buf, 2) else {
-        panic!("two payouts fit");
-    };
-    list
+    payouts_two(maker, 7, taker, 8)
 }
 
 #[test]
