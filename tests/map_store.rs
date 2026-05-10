@@ -14,10 +14,10 @@
 mod support;
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof, ProtocolCode, Resolve, Terms,
+    BlockHash, BlockHeight, Context, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, Op, Open,
+    Parties, Payout, Proof, ProtocolCode, Resolve, Terms,
 };
-use support::{FAKE_VERIFIER, map_store::map_state};
+use support::{FAKE_VERIFIER, coin_id, key, map_store::map_state, party_one, payouts_two};
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const TIMEOUT_CONTEXT: Context =
@@ -27,34 +27,13 @@ const CONTEXT: Context = Context::new(
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 
-const fn key(seed: u8) -> Key {
-    Key::from_bytes([seed; Key::LENGTH])
-}
-
-const fn coin_id(seed: u8) -> CoinId {
-    CoinId::from_bytes([seed; CoinId::LENGTH])
-}
-
-const fn party_one(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(list) = List::new([id; MAX_PARTY_INPUTS], 1) else {
-        panic!("one-coin party fits");
-    };
-    list
-}
-
 const fn payouts(
     maker: Key,
     taker: Key,
     maker_value: u64,
     taker_value: u64,
 ) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let payout = Payout::new(maker, maker_value);
-    let mut buf = [payout; MAX_EDGE_OUTPUTS];
-    buf[1] = Payout::new(taker, taker_value);
-    let Some(list) = List::new(buf, 2) else {
-        panic!("two payouts fit");
-    };
-    list
+    payouts_two(maker, maker_value, taker, taker_value)
 }
 
 #[test]
