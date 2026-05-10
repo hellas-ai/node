@@ -4,11 +4,21 @@
 #![allow(clippy::std_instead_of_core)]
 
 //! ITF fixture replay against concrete Rust state.
+//!
+//! Quint emits each abstract trace as an `Informal Trace Format` JSON file
+//! (see `models/traces/`). Deserialization uses the upstream `itf` crate
+//! (Cosmos/Malachite ecosystem standard) so that variable shapes — Quint maps,
+//! sets, and bigints — translate into Rust types without hand-rolled parsing.
+//! Each test specifies the operation sequence that produced the trace; the
+//! runner replays it against the kernel and asserts that live coin/edge
+//! shape and height match the abstract state at every step.
 
 mod support;
 
-use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 
+use itf::de::{As, Integer, Same};
+use serde::Deserialize;
 use support::{
     FAKE_VERIFIER, coin_view,
     l1::{
@@ -17,9 +27,44 @@ use support::{
     },
 };
 
-const VARS: [&str; 5] = ["coins", "edges", "height", "liveCoins", "liveEdges"];
+/// Abstract state mirrored from `models/l1.qnt`. Variable order and names
+/// must match the Quint declarations exactly; the `itf` crate verifies the
+/// trace's variable list against the struct's fields at parse time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct State {
+    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
+    coins: BTreeMap<CoinTag, i64>,
+    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
+    edges: BTreeMap<EdgeTag, i64>,
+    #[serde(with = "As::<Integer>")]
+    height: i64,
+    live_coins: BTreeSet<CoinTag>,
+    live_edges: BTreeSet<EdgeTag>,
+}
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Tags mirror the Quint `Coin` enum's variant names. The `tag`/`content`
+/// adapter matches Quint's internally-tagged enum encoding
+/// (`{"tag": "MakerCoin", "value": {"#tup": []}}`).
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+enum CoinTag {
+    MakerCoin,
+    TakerCoin,
+    MakerOut1,
+    TakerOut1,
+    MakerOut2,
+    TakerOut2,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+enum EdgeTag {
+    Edge1,
+    Edge2,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Fixture<const N: usize> {
     name: &'static str,
     json: &'static str,
@@ -32,12 +77,22 @@ impl<const N: usize> Fixture<N> {
     }
 
     fn replay(&self) {
-        let trace = ItfTrace::parse(self.name, self.json);
-        assert_eq!(trace.states.len(), self.steps.len() + 1, "{}", self.name);
+        let trace = match itf::trace_from_str::<State>(self.json) {
+            Ok(trace) => trace,
+            Err(error) => panic!("invalid ITF fixture {}: {error}", self.name),
+        };
+        assert_eq!(
+            trace.states.len(),
+            self.steps.len() + 1,
+            "{}: states={}, steps={}",
+            self.name,
+            trace.states.len(),
+            self.steps.len(),
+        );
 
         let mut state = initial_state();
-        let mut height = 1;
-        self.check(&state, &trace.states[0], height);
+        let mut height = 1_i64;
+        self.check(&state, &trace.states[0].value, height);
 
         for (index, step) in self.steps.into_iter().enumerate() {
             if step == Step::Tick {
@@ -52,48 +107,48 @@ impl<const N: usize> Fixture<N> {
                 step.check(&event.kind());
             }
 
-            self.check(&state, &trace.states[index + 1], height);
+            self.check(&state, &trace.states[index + 1].value, height);
         }
     }
 
-    fn check(&self, state: &TraceState, expected: &ItfState, height: u64) {
+    fn check(&self, state: &TraceState, expected: &State, height: i64) {
         let view: TraceView = state.view();
 
-        assert_eq!(expected.height.as_u64(), height, "{}", self.name);
-        assert_eq!(view.coin_len(), expected.live_coin_count(), "{}", self.name);
-        assert_eq!(view.edge_len(), expected.live_edges(), "{}", self.name);
-        check_coin(expected, &view, "MakerCoin", MAKER_ID, MAKER);
-        check_coin(expected, &view, "TakerCoin", TAKER_ID, TAKER);
+        assert_eq!(expected.height, height, "{}", self.name);
+        assert_eq!(view.coin_len(), expected.live_coins.len(), "{}", self.name);
+        assert_eq!(view.edge_len(), expected.live_edges.len(), "{}", self.name);
+        check_coin(expected, &view, CoinTag::MakerCoin, MAKER_ID, MAKER);
+        check_coin(expected, &view, CoinTag::TakerCoin, TAKER_ID, TAKER);
         check_coin(
             expected,
             &view,
-            "MakerOut1",
+            CoinTag::MakerOut1,
             maker_out(EdgeKey::First),
             MAKER,
         );
         check_coin(
             expected,
             &view,
-            "TakerOut1",
+            CoinTag::TakerOut1,
             taker_out(EdgeKey::First),
             TAKER,
         );
         check_coin(
             expected,
             &view,
-            "MakerOut2",
+            CoinTag::MakerOut2,
             maker_out(EdgeKey::Second),
             MAKER,
         );
         check_coin(
             expected,
             &view,
-            "TakerOut2",
+            CoinTag::TakerOut2,
             taker_out(EdgeKey::Second),
             TAKER,
         );
-        check_edge(expected, &view, "Edge1", edge_id(EdgeKey::First));
-        check_edge(expected, &view, "Edge2", edge_id(EdgeKey::Second));
+        check_edge(expected, &view, EdgeTag::Edge1, edge_id(EdgeKey::First));
+        check_edge(expected, &view, EdgeTag::Edge2, edge_id(EdgeKey::Second));
     }
 }
 
@@ -154,125 +209,42 @@ fn replays_early_timeout_guard_itf() {
 }
 
 fn check_coin(
-    expected: &ItfState,
+    expected: &State,
     view: &TraceView,
-    tag: &str,
+    tag: CoinTag,
     id: hellas_kernel::CoinId,
     owner: hellas_kernel::Key,
 ) {
-    let value = expected.coins.get(tag);
     let coin = view.coin(id).map(coin_view);
 
-    if expected.live_coins.contains(tag) {
-        assert_eq!(coin, Some((owner, value)), "{tag}");
+    if expected.live_coins.contains(&tag) {
+        let value = expected
+            .coins
+            .get(&tag)
+            .copied()
+            .map(u64::try_from)
+            .and_then(Result::ok)
+            .unwrap_or_else(|| panic!("missing or negative coin value: {tag:?}"));
+        assert_eq!(coin, Some((owner, value)), "{tag:?}");
         return;
     }
 
-    assert_eq!(coin, None, "{tag}");
+    assert_eq!(coin, None, "{tag:?}");
 }
 
-fn check_edge(expected: &ItfState, view: &TraceView, tag: &str, id: hellas_kernel::EdgeId) {
-    let value = expected.edges.get(tag);
-    let live = expected.live_edges.contains(tag);
+fn check_edge(expected: &State, view: &TraceView, tag: EdgeTag, id: hellas_kernel::EdgeId) {
+    let live = expected.live_edges.contains(&tag);
 
     if live {
-        assert_eq!(view.edge(id).map(edge_value), Some(value), "{tag}");
+        let value = expected
+            .edges
+            .get(&tag)
+            .copied()
+            .map(u64::try_from)
+            .and_then(Result::ok)
+            .unwrap_or_else(|| panic!("missing or negative edge value: {tag:?}"));
+        assert_eq!(view.edge(id).map(edge_value), Some(value), "{tag:?}");
     } else {
-        assert_eq!(view.edge(id), None, "{tag}");
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfTrace {
-    vars: Vec<String>,
-    states: Vec<ItfState>,
-}
-
-impl ItfTrace {
-    fn parse(name: &str, json: &str) -> Self {
-        let Ok(trace) = serde_json::from_str::<Self>(json) else {
-            panic!("invalid ITF fixture: {name}");
-        };
-
-        trace.check_vars(name);
-        trace
-    }
-
-    fn check_vars(&self, name: &str) {
-        assert_eq!(self.vars.len(), VARS.len(), "{name}");
-        for (actual, expected) in self.vars.iter().zip(VARS) {
-            assert_eq!(actual, expected, "{name}");
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfState {
-    coins: ItfMap,
-    edges: ItfMap,
-    height: ItfInt,
-    #[serde(rename = "liveCoins")]
-    live_coins: ItfSet,
-    #[serde(rename = "liveEdges")]
-    live_edges: ItfSet,
-}
-
-impl ItfState {
-    const fn live_coin_count(&self) -> usize {
-        self.live_coins.items.len()
-    }
-
-    const fn live_edges(&self) -> usize {
-        self.live_edges.items.len()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfMap {
-    #[serde(rename = "#map")]
-    items: Vec<(ItfTag, ItfInt)>,
-}
-
-impl ItfMap {
-    fn get(&self, tag: &str) -> u64 {
-        for (item, value) in &self.items {
-            if item.tag == tag {
-                return value.as_u64();
-            }
-        }
-
-        panic!("missing ITF map item: {tag}");
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfSet {
-    #[serde(rename = "#set")]
-    items: Vec<ItfTag>,
-}
-
-impl ItfSet {
-    fn contains(&self, tag: &str) -> bool {
-        self.items.iter().any(|item| item.tag == tag)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfTag {
-    tag: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItfInt {
-    #[serde(rename = "#bigint")]
-    value: String,
-}
-
-impl ItfInt {
-    fn as_u64(&self) -> u64 {
-        let Ok(value) = self.value.parse() else {
-            panic!("invalid ITF integer: {}", self.value);
-        };
-        value
+        assert_eq!(view.edge(id), None, "{tag:?}");
     }
 }
