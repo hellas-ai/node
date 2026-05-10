@@ -87,9 +87,12 @@ pay for an extension that is not coming.
 State transitions follow a two-phase, event-sourced shape:
 
 ```text
-op_apply(ctx, &Tx, Op) -> KernelResult<Change>      // read-only
-change_fold(&mut Tx, &Change) -> KernelResult<()>   // private mutation
+op_apply(ctx, &Verifier, &Tx, Op) -> KernelResult<Change>   // read-only
+change_fold(&mut Tx, &Change)     -> KernelResult<()>       // private mutation
 ```
+
+`Verifier` is the crypto boundary; `Tx` is the storage boundary. Both are
+caller-supplied interfaces, both pure during validation.
 
 - `Event` is the public opaque fact emitted by an operation. Its constructors
   are private; external code cannot fabricate events.
@@ -163,12 +166,56 @@ There is no public `Object` type. In-memory store implementations may use a
 private `enum Slot { Coin(Coin), Edge(Edge) }`; database-backed implementations
 need not.
 
+`FixedStore` is the no-allocation hot-path backend the kernel ships with: it
+pre-allocates every coin/edge slot at construction time and lookup is a small
+linear scan. `MapStore` (in `tests/support/`) is the growing-set reference
+shape real production backends will follow — `BTreeMap`-backed, transactional
+via a working snapshot swapped in on `commit`. Tests run against both so any
+`FixedStore`-specific assumption baked into kernel logic surfaces immediately.
+
+### Verifier Boundary
+
+The kernel implements no cryptography. Signature and dispute-seal
+verification go through a `Verifier` trait that callers wire in at apply
+time:
+
+```rust
+trait Verifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool;
+    fn verify_seal(
+        &self,
+        seal: Seal,
+        protocol: ProtocolCode,
+        kind: ResolveKind,
+        hash: ResolveHash,
+    ) -> bool;
+}
+```
+
+`State::apply(context, &verifier, op)` plumbs the verifier through to
+`Proof::accepts`. The kernel never sees the verification mechanism.
+Production callers wire a real verifier — `Secp256k1Verifier` behind the
+`secp256k1` feature flag is the included reference, or a preverified-cache
+lookup populated off the apply critical path (PERF.md §4). Tests use
+`FakeVerifier`, which accepts the deterministic placeholder shape produced
+by `Sig::placeholder` / `Seal::placeholder`. A `RejectVerifier` covers
+"production has no key for this proof" cases.
+
+The kernel's `cfg(feature = "fake-crypto")` gate still applies to one place:
+`Proof::Basic`. Basic is a structural marker for the modelling/testing
+witness — there is no signature to verify, so the verifier is not consulted.
+Production builds reject Basic at the type level regardless of the verifier
+supplied.
+
 ### Per-Digest Types
 
 Every 32-byte digest the kernel handles has its own newtype: `BlockHash`,
 `TermsHash`, and one per future digest purpose (claim hashes, evidence hashes,
 transaction roots, ...). They share a private `[u8; 32]` shape but are not
-interchangeable; the compiler stops cross-purpose assignment.
+interchangeable; the compiler stops cross-purpose assignment. They derive
+`Ord` and `PartialOrd` over their byte representation so they compose with
+`BTreeMap` and other ordered collections — useful for production stores and
+test reference models alike.
 
 `Edge` carries principal value, prepaid resolution reserve,
 `Parties { maker, taker }`, and a `TermsHash`, not a stored terms object id.
@@ -208,24 +255,33 @@ the degenerate modelling witness that only binds the resolve to the edge's
 `TermsHash`; the kernel accepts it only under the `fake-crypto` feature.
 `Agreement` is the first real non-basic witness: it requires both maker and
 taker signature-shaped witnesses over the same `ResolveHash`, which commits to
-the input edge, witness kind, terms, and ordered payouts. The current
-`Sig::placeholder` path is deterministic and non-cryptographic; it stands in
-for the preverified settlement-signature cache until real signature verification
-is wired in outside the hot reducer. It verifies only under the `fake-crypto`
-feature, which is for models and tests and is blocked for optimized builds.
-`Timeout` reveals the concrete basic terms, checks that their commitment equals
-the edge's `TermsHash`, accepts only when `Context::block_height() >=
-Terms::timeout()`, and requires the resolve payout list to equal the terms'
-committed timeout payout list. `ClaimantWins` and `ChallengerWins` reveal the
-same concrete terms and carry a fixed-size `Seal`. The seal is the compact
-mode-specific verifier result; the hot reducer only checks that it binds to the
-protocol code, outcome kind, terms commitment, input edge, and ordered payouts.
-The current `Seal::placeholder` path is deterministic and non-cryptographic,
-matching the placeholder signature path until a real verifier or preverification
-cache is wired in. It also verifies only under `fake-crypto`.
+the input edge, witness kind, terms, and ordered payouts. Signature verification
+is delegated to the `Verifier` trait the caller supplies (see [Verifier
+Boundary](#verifier-boundary)); production builds wire `Secp256k1Verifier` or
+a preverified-cache verifier; tests wire `FakeVerifier` against the deterministic
+`Sig::placeholder` shape. `Timeout` reveals the concrete basic terms, checks
+that their commitment equals the edge's `TermsHash`, accepts only when
+`Context::block_height() >= Terms::timeout()`, and requires the resolve payout
+list to equal the terms' committed timeout payout list — the only resolve path
+where the kernel itself enforces a payout shape. `ClaimantWins` and
+`ChallengerWins` reveal the same concrete terms and carry a fixed-size `Seal`,
+the compact mode-specific verifier result; the kernel asks the verifier whether
+the seal binds to the protocol code, outcome kind, and resolve hash. As with
+signatures, `Seal::placeholder` is the test shape; production composes a
+seal-aware verifier (the included `Secp256k1Verifier` rejects every seal —
+seals are protocol-specific and there is no universal seal verifier).
 Empty resolve output is valid exactly for a zero-value edge. A resolve is valid
 only when the edge reserve covers `context.fee(resolve.cost())`; the reserve is
 consumed by the resolve and does not appear in payout coins.
+
+Every kernel rejection self-describes via a structured `ApplyError::Invalid*`
+reason: `InvalidOpenReason { FundingInsufficient, FundingOverflow, FeeOverflow,
+ReserveOverflow, BoundsExceeded }`, `InvalidResolveReason { ValueMismatch,
+ReserveTooSmall, FeeOverflow, PayoutOverflow, BoundsExceeded }`,
+`InvalidProofReason { TermsMismatch, BadSignature, BadSeal, TimeoutNotReached,
+PayoutMismatch, BasicNotAccepted }`. Callers do not parse free text to tell
+"fee schedule changed under me" (`ReserveTooSmall`) from "I miscomputed
+payouts" (`ValueMismatch`).
 
 ### Resource Costs
 
@@ -233,8 +289,14 @@ Every operation exposes a deterministic `Cost` derived only from bounded
 operation shape:
 
 ```text
-Cost { base, reads, writes, proofs }
+Cost { base, slots, proofs }
+Fees { base, slot,  proof  }
 ```
+
+`base` is fixed per-op overhead; `slots` counts every store slot the kernel
+touches (each is read for the existence check and written for the
+insert/remove that follows, so reads and writes are structurally equal and
+fold into one dimension); `proofs` counts signature/seal verifications.
 
 `Context` carries the active `Fees` schedule and prices costs with
 `context.fee(op.cost())`. The L1 open path burns the priced open cost from
@@ -658,13 +720,27 @@ function:
 view: State -> View
 ```
 
-`View` is the protocol-relevant part of concrete Rust state. It should be a
+`View` is the protocol-relevant part of concrete Rust state. It is a
 first-class Rust type, not an ad hoc test helper.
 
 In Rust, `Store` remains the hot apply boundary and does not require
-enumeration. Stores that participate in modelling or trace replay implement the
-separate `Snapshot` extension, and `State::view()` returns a bounded `View`
-snapshot of live coins and live edges.
+enumeration. Stores that participate in modelling or trace replay implement
+the separate `Snapshot` trait whose associated `View` type lets each store
+pick its own bounded snapshot shape:
+
+```rust
+trait Snapshot {
+    type View;
+    fn view(&self) -> Self::View;
+}
+```
+
+`State::view()` returns `<S as Snapshot>::View` — no turbofish at the call
+site, the view shape travels with the store. `FixedStore<C, E>` implements
+`Snapshot { type View = View<C, E> }`. `MapStore` (the growing reference)
+deliberately does not implement `Snapshot` because its capacity has no
+compile-time bound; tests iterate via `MapStore::coins()` / `edges()`
+instead.
 
 The refinement property is:
 
@@ -687,6 +763,30 @@ and those operations produce the same abstract outcomes
 
 This is the anti-drift contract between Rust and the spec.
 
+### ITF Replay
+
+Refinement is mechanically checked by replaying every Quint-generated trace
+against the Rust kernel. Each Quint state in `models/l1.qnt` carries
+`lastInput` (the action that produced the state) and `lastEvent` (the
+abstract event emitted), in addition to the live coin/edge state. The Rust
+runner in `tests/itf.rs` is one impl of `itf::Runner` (Cosmos/Malachite
+ecosystem standard) that:
+
+1. Deserializes each `.itf.json` fixture into a Rust `State` mirroring the
+   Quint variable shape.
+2. For each step, reads `lastInput` from the trace and synthesizes the
+   corresponding `Op`.
+3. Calls `state.apply(context, &FAKE_VERIFIER, &op)`, capturing the emitted
+   `EventKind`.
+4. Asserts the kernel event matches `lastEvent` (`result_invariant`) and the
+   kernel's live state matches the abstract trace (`state_invariant`) at
+   every step.
+
+A single glob-based test replays every committed fixture; adding a new Quint
+trace test means adding a fixture and zero Rust code. Fixtures whose actions
+require placeholder verification are skipped under `--no-default-features`
+(production semantics) and run under `--features fake-crypto`.
+
 ## Atomic Transitions
 
 Kernel transitions are atomic. A successful `apply` commits exactly one state
@@ -696,45 +796,48 @@ containing the ordered events; any failing operation leaves the whole batch
 uncommitted and returns no diff. `apply_block` is the node-facing wrapper around
 the same transition, taking a `Block<N>` that pairs `Context` with ordered ops.
 
-The implementation enforces this through the store's transaction boundary:
+The implementation enforces this through the store's transaction boundary,
+with the verifier injected as a separate parameter (kernel is verifier-
+agnostic; see [Verifier Boundary](#verifier-boundary)):
 
 ```rust
 impl<S: Store> State<S> {
-    pub fn apply(&mut self, ctx: Context, op: &Op) -> KernelResult<Event> {
+    pub fn apply<V: Verifier + ?Sized>(
+        &mut self,
+        ctx: Context,
+        verifier: &V,
+        op: &Op,
+    ) -> KernelResult<Event> {
         let mut tx = self.store.begin();
-        let change = op.apply(ctx, &tx)?;
+        let change = op.apply(ctx, verifier, &tx)?;
         change.fold(&mut tx)?;
         tx.commit();
         Ok(change.event())
     }
 
-    pub fn apply_all<const N: usize>(
+    pub fn apply_all<V: Verifier + ?Sized, const N: usize>(
         &mut self,
         ctx: Context,
+        verifier: &V,
         ops: &List<Op, N>,
     ) -> KernelResult<Diff<N>, BatchError> {
         let mut tx = self.store.begin();
         let mut diff = Diff::empty();
         for (index, op) in ops.iter().enumerate() {
-            let change = op.apply(ctx, &tx).map_err(|source| BatchError {
-                index,
-                source,
-            })?;
-            change.fold(&mut tx).map_err(|source| BatchError {
-                index,
-                source,
-            })?;
-            diff.push(&change.event());
+            let event = Self::fold_one(&mut tx, ctx, verifier, op)
+                .map_err(|source| BatchError::new(index, source))?;
+            diff.push(&event);
         }
         tx.commit();
         Ok(diff)
     }
 
-    pub fn apply_block<const N: usize>(
+    pub fn apply_block<V: Verifier + ?Sized, const N: usize>(
         &mut self,
+        verifier: &V,
         block: &Block<N>,
     ) -> KernelResult<Diff<N>, BatchError> {
-        self.apply_all(block.context(), block.ops())
+        self.apply_all(block.context(), verifier, block.ops())
     }
 }
 ```
@@ -760,7 +863,25 @@ Use for the concrete implementation:
 - failure atomicity
 - coin conservation
 
-This should be the first line of defense.
+This is the first line of defense. Layered as:
+
+- `tests/channel/` — focused unit tests per operation shape (open, resolve,
+  batch, op).
+- `tests/sequence.rs` — proptest over random `Op` sequences asserting
+  kernel-level invariants (coin/edge conservation).
+- `tests/state_machine.rs` — `proptest-state-machine` driving random
+  sequences against a `BTreeMap`-backed Rust reference model with
+  shrinking. Catches state-tracking divergence between kernel and a
+  hand-readable spec impl.
+- `tests/parallel.rs` — declared access sets compose into disjoint waves;
+  reverse-order execution within a wave produces the same state as ordered.
+- `tests/allocation.rs` — `allocation-counter` asserts zero heap allocation
+  on the hot apply path.
+- `tests/secp256k1.rs` (under `--features secp256k1`) — real ECDSA
+  signatures resolve through `Agreement` end-to-end; forged signatures
+  reject with `BadSignature`.
+- `tests/map_store.rs` — `MapStore` round-trips and 32-edge chains validate
+  the `Store` trait composes with non-bounded backends.
 
 ### Stateright
 
@@ -935,10 +1056,27 @@ because the system has genuinely different kinds of correctness obligations.
 
 ## Near-Term Work
 
-The next kernel-shaped implementation steps are:
+The kernel-shaped items previously listed here are done:
 
-1. Add serialized external trace fixtures from `models/l1.qnt`.
-2. Replace placeholder `Sig` / `Seal` checks with real verifier or preverified
-   cache interfaces.
+- Serialized ITF trace fixtures from `models/l1.qnt` are committed under
+  `models/traces/`. The Rust runner is `itf::Runner`-based; adding a Quint
+  trace test means regenerating fixtures, no Rust changes.
+- Placeholder `Sig` / `Seal` verification has been replaced by a `Verifier`
+  trait the caller wires in. The kernel implements no cryptography. A
+  reference `Secp256k1Verifier` lives under the `secp256k1` feature flag.
 
-Only after this should the async channel model move to Choreo or P.
+What's left, in roughly increasing depth:
+
+1. **Adapter layer.** `Call` / `CallResult` / `Claim` / `Evidence` shapes
+   that produce the resolve proofs the kernel's `Verifier` will accept. Out
+   of crate.
+2. **Channel layer.** Off-chain state, signed frontiers, claim/challenge
+   timing, watcher obligations. The async/distributed shape moves to Choreo
+   or P when the synchronous channel math is settled. Out of crate.
+3. **Consensus integration.** The kernel assumes ordered finalized blocks;
+   that's the contract. Wiring to a real consensus implementation is
+   downstream.
+4. **Persistent storage backend.** The `Store` trait composes with
+   non-bounded backends (validated by `MapStore`). A real persistent
+   backend (likely commonware-storage `qmdb` per PERF.md §5) implements
+   `Store` outside this crate.
