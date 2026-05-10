@@ -431,6 +431,13 @@ fn block_reports_deterministic_cost_and_fee() {
 
     assert_eq!(block.cost(), Some(Cost::new(2, 6, 6, 1)));
     assert_eq!(block.fee(), Some(20));
+    assert!(Cost::new(2, 6, 6, 1).fits(Cost::new(2, 6, 6, 1)));
+    assert!(block.fits(Cost::new(2, 6, 6, 1)));
+    assert!(block.fits(Cost::new(3, 6, 6, 1)));
+    assert!(!block.fits(Cost::new(1, 6, 6, 1)));
+    assert!(!block.fits(Cost::new(2, 5, 6, 1)));
+    assert!(!block.fits(Cost::new(2, 6, 5, 1)));
+    assert!(!block.fits(Cost::new(2, 6, 6, 0)));
 }
 
 #[test]
