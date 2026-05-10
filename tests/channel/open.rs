@@ -13,7 +13,7 @@ fn open_locks_two_coins_into_one_edge() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
             output: edge(),
         },
@@ -32,6 +32,7 @@ fn open_locks_three_coins_into_one_edge() {
         maker2_funding(MAKER_COIN, EXTRA_COIN, TAKER_COIN),
         BASIC_TERMS,
     );
+    let output = open.output();
     let mut state = state(
         store_for(&open),
         [MAKER_SEED, TAKER_SEED, Genesis::coin(EXTRA_COIN, MAKER, 3)],
@@ -40,14 +41,14 @@ fn open_locks_three_coins_into_one_edge() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids3(MAKER_COIN, EXTRA_COIN, TAKER_COIN),
-            output: open.output(),
+            output,
         },
     );
     assert_eq!(state.store().coin(EXTRA_COIN), None);
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
+        state.store().edge(output).map(edge_view),
         Some((18, 0, PARTIES, terms())),
     );
 }
@@ -55,14 +56,15 @@ fn open_locks_three_coins_into_one_edge() {
 #[test]
 fn open_allows_maker_only_funding() {
     let open = Open::from_terms(Funding::new(party1(MAKER_COIN), empty_party()), BASIC_TERMS);
+    let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids1(MAKER_COIN),
-            output: open.output(),
+            output,
         },
     );
     assert_eq!(state.store().coin(MAKER_COIN), None);
@@ -71,7 +73,7 @@ fn open_allows_maker_only_funding() {
         Some((TAKER, 5))
     );
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
+        state.store().edge(output).map(edge_view),
         Some((10, 0, PARTIES, terms())),
     );
 }
@@ -79,14 +81,15 @@ fn open_allows_maker_only_funding() {
 #[test]
 fn open_allows_taker_only_funding() {
     let open = Open::from_terms(Funding::new(empty_party(), party1(TAKER_COIN)), BASIC_TERMS);
+    let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids1(TAKER_COIN),
-            output: open.output(),
+            output,
         },
     );
     assert_eq!(
@@ -95,7 +98,7 @@ fn open_allows_taker_only_funding() {
     );
     assert_eq!(state.store().coin(TAKER_COIN), None);
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
+        state.store().edge(output).map(edge_view),
         Some((5, 0, PARTIES, terms())),
     );
 }
@@ -105,34 +108,37 @@ fn open_allows_same_maker_and_taker_party() {
     let parties = Parties::new(MAKER, MAKER);
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(MAKER, 8));
     let terms = Terms::basic(PROTOCOL, parties, TIMEOUT, outputs);
+    let terms_hash = terms.hash();
     let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
+    let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
-            output: open.output(),
+            output,
         },
     );
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
-        Some((15, 0, parties, terms.hash())),
+        state.store().edge(output).map(edge_view),
+        Some((15, 0, parties, terms_hash)),
     );
 }
 
 #[test]
 fn open_allows_empty_funding_when_fee_is_zero() {
     let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
+    let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids0(),
-            output: open.output(),
+            output,
         },
     );
     assert_eq!(
@@ -144,7 +150,7 @@ fn open_allows_empty_funding_when_fee_is_zero() {
         Some((TAKER, 5)),
     );
     assert_eq!(
-        state.store().edge(open.output()).map(edge_view),
+        state.store().edge(output).map(edge_view),
         Some((0, 0, PARTIES, terms())),
     );
 }
@@ -165,7 +171,7 @@ fn open_pays_fee_from_funding() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
             output: edge(),
         },
@@ -186,19 +192,21 @@ fn open_fee_uses_resource_cost() {
         ],
     );
     let open = open_op();
+    let cost = open.cost();
+    let reserve_cost = open.reserve_cost();
     let Ok(event) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)) else {
         panic!("operation rejected");
     };
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
             output: edge(),
         },
     );
-    assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
-    assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
+    assert_eq!(RESOURCE_CONTEXT.fee(cost), Some(10));
+    assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(
         state.store().edge(edge()).map(edge_view),
         Some((24, 16, PARTIES, terms())),
@@ -208,6 +216,8 @@ fn open_fee_uses_resource_cost() {
 #[test]
 fn open_allows_exact_fee_and_reserve_funding() {
     let open = open_op();
+    let cost = open.cost();
+    let reserve_cost = open.reserve_cost();
     let mut state = state(
         empty_store(),
         [
@@ -219,13 +229,13 @@ fn open_allows_exact_fee_and_reserve_funding() {
 
     assert_eq!(
         event.kind(),
-        EventKind::EdgeOpened {
+        &EventKind::EdgeOpened {
             inputs: input_ids2(MAKER_COIN, TAKER_COIN),
             output: edge(),
         },
     );
-    assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
-    assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
+    assert_eq!(RESOURCE_CONTEXT.fee(cost), Some(10));
+    assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(
         state.store().edge(edge()).map(edge_view),
         Some((0, 16, PARTIES, terms())),
@@ -235,6 +245,9 @@ fn open_allows_exact_fee_and_reserve_funding() {
 #[test]
 fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
     let open = open_op();
+    let output = open.output();
+    let cost = open.cost();
+    let reserve_cost = open.reserve_cost();
     let mut state = state(
         empty_store(),
         [
@@ -244,12 +257,12 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
     );
     let store = *state.store();
 
-    assert_eq!(RESOURCE_CONTEXT.fee(open.cost()), Some(10));
-    assert_eq!(RESOURCE_CONTEXT.fee(open.reserve_cost()), Some(16));
+    assert_eq!(RESOURCE_CONTEXT.fee(cost), Some(10));
+    assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(
         state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
-            output: open.output(),
+            output,
             reason: InvalidOpenReason::FundingInsufficient,
         }),
     );
@@ -259,13 +272,14 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
 #[test]
 fn open_rejects_funding_below_fee_without_mutation() {
     let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
+    let output = open.output();
     let mut state = funded_state();
     let store = *state.store();
 
     assert_eq!(
         state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
         Err(ApplyError::InvalidOpen {
-            output: open.output(),
+            output,
             reason: InvalidOpenReason::FundingInsufficient,
         }),
     );

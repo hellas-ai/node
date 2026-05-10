@@ -110,7 +110,7 @@ impl<S: Store> State<S> {
         let mut diff = Diff::empty();
 
         for (index, operation) in operations.iter().enumerate() {
-            let event = Self::fold_one(&mut tx, context, verifier, &operation)
+            let event = Self::fold_one(&mut tx, context, verifier, operation)
                 .map_err(|source| BatchError::new(index, source))?;
             diff.push(&event);
         }
@@ -144,6 +144,6 @@ impl<S: Store> State<S> {
 
     fn fold_change<T: Tx>(tx: &mut T, change: &Change) -> KernelResult<Event> {
         change.fold(tx)?;
-        Ok(change.event())
+        Ok(change.event().clone())
     }
 }

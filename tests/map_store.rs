@@ -44,10 +44,10 @@ fn map_store_round_trip() {
     let maker_coin = coin_id(1);
     let taker_coin = coin_id(2);
     let outputs = payouts(maker, taker, 7, 8);
-    let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs);
+    let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
     let open = Open::from_terms(
         Funding::new(party_one(maker_coin), party_one(taker_coin)),
-        terms,
+        terms.clone(),
     );
     let edge = open.output();
     let resolve = Resolve::new(edge, Proof::timeout(terms), outputs);
@@ -102,11 +102,14 @@ fn map_store_handles_long_chain() {
     for _ in 0..N {
         let open = Open::from_terms(
             Funding::new(party_one(maker_coin), party_one(taker_coin)),
-            terms,
+            terms.clone(),
         );
         let edge = open.output();
         let outputs = payouts(maker, taker, 7, 8);
-        let resolve = Resolve::new(edge, Proof::timeout(terms), outputs);
+        let resolve = Resolve::new(edge, Proof::timeout(terms.clone()), outputs);
+        // The two payout coins from this resolve become the next open's
+        // funding. Compute them before consuming `resolve`.
+        let resolved_outputs = resolve.output_ids();
 
         state
             .apply(CONTEXT, &FAKE_VERIFIER, &Op::Open(open))
@@ -115,9 +118,6 @@ fn map_store_handles_long_chain() {
             .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &Op::Resolve(resolve))
             .expect("resolve accepted in chain");
 
-        // The two payout coins from this resolve become the next open's
-        // funding.
-        let resolved_outputs = resolve.output_ids();
         maker_coin = resolved_outputs.as_slice()[0];
         taker_coin = resolved_outputs.as_slice()[1];
     }

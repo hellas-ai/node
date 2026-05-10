@@ -181,6 +181,7 @@ fn main() {
         timeout_height,
         timeout_payouts,
     );
+    let terms_hash = terms.hash();
 
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let open = Open::from_terms(funding, terms);
@@ -234,11 +235,11 @@ fn main() {
     let resolve_hash = Resolve::payload_hash(
         edge,
         ResolveKind::Agreement,
-        terms.hash(),
+        terms_hash,
         &agreement_payouts,
     );
     let proof = Proof::agreement(
-        terms.hash(),
+        terms_hash,
         Agreement::new(sign(&maker_sk, resolve_hash), sign(&taker_sk, resolve_hash)),
     );
     let resolve = Resolve::new(edge, proof, agreement_payouts);

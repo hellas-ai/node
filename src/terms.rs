@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Concrete open terms committed by an edge.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Terms {
     /// Degenerate bilateral terms used until protocol-specific terms land.
     Basic {
@@ -49,31 +49,31 @@ impl Terms {
 
     /// Returns the chain-version-local protocol code.
     #[must_use]
-    pub const fn protocol(self) -> ProtocolCode {
+    pub const fn protocol(&self) -> ProtocolCode {
         match self {
-            Self::Basic { protocol, .. } => protocol,
+            Self::Basic { protocol, .. } => *protocol,
         }
     }
 
     /// Returns the committed parties.
     #[must_use]
-    pub const fn parties(self) -> Parties {
+    pub const fn parties(&self) -> Parties {
         match self {
-            Self::Basic { parties, .. } => parties,
+            Self::Basic { parties, .. } => *parties,
         }
     }
 
     /// Returns the earliest valid timeout height.
     #[must_use]
-    pub const fn timeout(self) -> BlockHeight {
+    pub const fn timeout(&self) -> BlockHeight {
         match self {
-            Self::Basic { timeout, .. } => timeout,
+            Self::Basic { timeout, .. } => *timeout,
         }
     }
 
     /// Returns the deterministic timeout payout shape.
     #[must_use]
-    pub const fn timeout_outputs(self) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    pub const fn timeout_outputs(&self) -> &List<Payout, MAX_EDGE_OUTPUTS> {
         match self {
             Self::Basic {
                 timeout_outputs, ..
@@ -83,7 +83,7 @@ impl Terms {
 
     /// Returns the canonical BLAKE3 commitment for these terms.
     #[must_use]
-    pub fn hash(self) -> TermsHash {
+    pub fn hash(&self) -> TermsHash {
         let mut digest = Digest::new(crate::domain::TERMS_BASIC);
         let parties = self.parties();
         let maker = parties.maker().to_bytes();
@@ -95,7 +95,7 @@ impl Terms {
         digest.bytes(&taker);
         digest.u64(self.timeout().get());
         digest.usize(outputs.len());
-        for output in outputs.iter() {
+        for output in outputs.as_slice() {
             digest.bytes(output.owner().as_bytes());
             digest.u64(output.value());
         }
