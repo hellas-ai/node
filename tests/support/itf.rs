@@ -1,0 +1,195 @@
+#![allow(clippy::enum_variant_names)]
+#![allow(clippy::expect_used)]
+
+//! Shared ITF (Informal Trace Format) schema and op conversion.
+//!
+//! Quint emits each abstract trace under `models/traces/` as an ITF JSON
+//! file. The schema mirrors the state vars in `models/l1.qnt` exactly —
+//! the `itf` crate validates the trace's variable list against this
+//! struct's fields at parse time.
+//!
+//! The conversion functions (`op_for`, `context_for`, `resolve_op`) turn
+//! an abstract `Input` into the concrete `(Context, Op)` the kernel
+//! consumes. Both `tests/itf.rs` (validation replay) and
+//! `benches/apply.rs` (throughput) drive the kernel through the same
+//! conversion, so a fixture replayed in either place exercises the same
+//! kernel paths.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use itf::de::{As, Integer, Same};
+use serde::Deserialize;
+
+use hellas_kernel::{
+    Agreement, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Op, Payout, Proof, ProtocolCode, Resolve,
+    ResolveHash, ResolveKind, Seal, Sig,
+};
+
+use super::l1;
+
+// -- Abstract types mirrored from models/l1.qnt -----------------------------
+
+/// Abstract state mirrored from `models/l1.qnt`. Field order and names
+/// must match the Quint declarations exactly; the `itf` crate verifies
+/// the trace's variable list against the struct's fields at parse time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct State {
+    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
+    pub(crate) coins: BTreeMap<CoinTag, i64>,
+    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
+    pub(crate) edges: BTreeMap<EdgeTag, i64>,
+    #[serde(with = "As::<Integer>")]
+    pub(crate) height: i64,
+    pub(crate) last_event: Event,
+    pub(crate) last_input: Input,
+    pub(crate) live_coins: BTreeSet<CoinTag>,
+    pub(crate) live_edges: BTreeSet<EdgeTag>,
+}
+
+/// Quint `Coin` enum.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum CoinTag {
+    MakerCoin,
+    TakerCoin,
+    MakerOut1,
+    TakerOut1,
+    MakerOut2,
+    TakerOut2,
+}
+
+/// Quint `Edge` enum.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum EdgeTag {
+    Edge1,
+    Edge2,
+}
+
+/// Quint `Proof` enum.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum ProofTag {
+    Basic,
+    Agreement,
+    Timeout,
+    ClaimantWins,
+    ChallengerWins,
+}
+
+/// Quint `Input` ADT.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum Input {
+    NoInput,
+    OpenInput(EdgeTag),
+    ResolveInput(ResolveInputBody),
+    TickInput,
+    IdleInput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResolveInputBody {
+    pub(crate) edge: EdgeTag,
+    pub(crate) proof: ProofTag,
+    #[serde(with = "As::<Integer>")]
+    pub(crate) maker_pay: i64,
+    #[serde(with = "As::<Integer>")]
+    pub(crate) taker_pay: i64,
+}
+
+/// Quint `Event` ADT (abstract event emitted by the action that produced
+/// the state).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum Event {
+    NoEvent,
+    EdgeOpenedEvent(EdgeTag),
+    EdgeResolvedEvent(EdgeTag),
+}
+
+// -- Conversion -------------------------------------------------------------
+
+/// Maps `EdgeTag` to the corresponding model edge key.
+pub(crate) const fn edge_key(tag: EdgeTag) -> l1::EdgeKey {
+    match tag {
+        EdgeTag::Edge1 => l1::EdgeKey::First,
+        EdgeTag::Edge2 => l1::EdgeKey::Second,
+    }
+}
+
+/// True when the proof requires fake-crypto for the placeholder verifier
+/// to accept. Used to skip fixtures whose actions the production kernel
+/// cannot replay.
+pub(crate) const fn needs_fake_crypto(tag: ProofTag) -> bool {
+    matches!(
+        tag,
+        ProofTag::Basic | ProofTag::Agreement | ProofTag::ClaimantWins | ProofTag::ChallengerWins,
+    )
+}
+
+/// Synthesizes the kernel `Context` for an input. Timeout resolves need
+/// `Context::block_height >= terms.timeout`; everything else uses the
+/// genesis context.
+pub(crate) fn context_for(input: &Input) -> Context {
+    if matches!(
+        input,
+        Input::ResolveInput(body) if body.proof == ProofTag::Timeout,
+    ) {
+        l1::TIMEOUT_CONTEXT
+    } else {
+        l1::CONTEXT
+    }
+}
+
+/// Concrete `Op` (when the input maps to one). `NoInput`, `TickInput`,
+/// and `IdleInput` produce no kernel work.
+pub(crate) fn op_for(input: &Input) -> Option<Op> {
+    match input {
+        Input::OpenInput(tag) => Some(Op::Open(l1::open(edge_key(*tag)))),
+        Input::ResolveInput(body) => Some(Op::Resolve(resolve_op(body))),
+        Input::NoInput | Input::TickInput | Input::IdleInput => None,
+    }
+}
+
+/// Builds a `Resolve` op from a model `ResolveInput`. Payouts are taken
+/// from the model body, not the support helper, so adversarial-payout
+/// traces drive the kernel correctly.
+pub(crate) fn resolve_op(body: &ResolveInputBody) -> Resolve {
+    let edge = edge_key(body.edge);
+    let outputs = l1::payouts_with(
+        u64::try_from(body.maker_pay).expect("negative maker payout"),
+        u64::try_from(body.taker_pay).expect("negative taker payout"),
+    );
+    let input = l1::edge_id(edge);
+    let proof = match body.proof {
+        ProofTag::Basic => Proof::basic(l1::TERMS.hash()),
+        ProofTag::Agreement => Proof::agreement(
+            l1::TERMS.hash(),
+            Agreement::new(
+                Sig::placeholder(l1::MAKER, agreement_hash(input, &outputs)),
+                Sig::placeholder(l1::TAKER, agreement_hash(input, &outputs)),
+            ),
+        ),
+        ProofTag::Timeout => Proof::timeout(l1::TERMS),
+        ProofTag::ClaimantWins => {
+            Proof::claimant_wins(l1::TERMS, seal_for(input, ResolveKind::ClaimantWins, &outputs))
+        }
+        ProofTag::ChallengerWins => Proof::challenger_wins(
+            l1::TERMS,
+            seal_for(input, ResolveKind::ChallengerWins, &outputs),
+        ),
+    };
+    Resolve::new(input, proof, outputs)
+}
+
+fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
+    Resolve::payload_hash(input, ResolveKind::Agreement, l1::TERMS.hash(), outputs)
+}
+
+fn seal_for(input: EdgeId, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    let hash = Resolve::payload_hash(input, kind, l1::TERMS.hash(), outputs);
+    Seal::placeholder(ProtocolCode::new(1), kind, hash)
+}

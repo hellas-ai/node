@@ -5,6 +5,7 @@
 #![allow(clippy::std_instead_of_core)]
 #![allow(dead_code)]
 
+pub(crate) mod itf;
 pub(crate) mod l1;
 pub(crate) mod map_store;
 

@@ -13,8 +13,8 @@
 //! under `models/traces/`. Each state in the trace records the action that
 //! produced it (`lastInput`) and the abstract event it emitted (`lastEvent`).
 //! The runner here implements `itf::Runner`: it deserializes every fixture
-//! into the abstract `State`, reads `lastInput`, drives the kernel with the
-//! corresponding `Op`, and asserts that
+//! into the abstract `State` (defined in `support::itf`), reads `lastInput`,
+//! drives the kernel with the corresponding `Op`, and asserts that
 //!
 //!   - the kernel's emitted `Event` matches the abstract `lastEvent`
 //!     (`result_invariant`), and
@@ -26,127 +26,22 @@
 
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
 use itf::Runner as ItfRunner;
-use itf::de::{As, Integer, Same};
-use serde::Deserialize;
 use support::{
     FAKE_VERIFIER, coin_view,
+    itf::{CoinTag, EdgeTag, Event, Input, State, context_for, edge_key, op_for},
     l1::{
-        MAKER, MAKER_ID, TAKER, TAKER_ID, TIMEOUT_CONTEXT, TraceState, TraceView, edge_id,
-        edge_value, initial_state, maker_out, taker_out,
+        MAKER, MAKER_ID, TAKER, TAKER_ID, TraceState, TraceView, edge_id, edge_value,
+        initial_state, maker_out, taker_out,
     },
 };
 
-use hellas_kernel::{
-    Agreement, Context, EventKind, Op, Payout, Proof, ProtocolCode, Resolve, Seal,
-};
-
-// -- Abstract types mirrored from models/l1.qnt -----------------------------
-
-/// Abstract state mirrored from `models/l1.qnt`. Field order and names must
-/// match the Quint declarations exactly; the `itf` crate verifies the trace's
-/// variable list against the struct's fields at parse time.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct State {
-    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
-    coins: BTreeMap<CoinTag, i64>,
-    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
-    edges: BTreeMap<EdgeTag, i64>,
-    #[serde(with = "As::<Integer>")]
-    height: i64,
-    last_event: Event,
-    last_input: Input,
-    live_coins: BTreeSet<CoinTag>,
-    live_edges: BTreeSet<EdgeTag>,
-}
-
-/// Quint `Coin` enum.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-enum CoinTag {
-    MakerCoin,
-    TakerCoin,
-    MakerOut1,
-    TakerOut1,
-    MakerOut2,
-    TakerOut2,
-}
-
-/// Quint `Edge` enum.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-enum EdgeTag {
-    Edge1,
-    Edge2,
-}
-
-/// Quint `Proof` enum.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-enum ProofTag {
-    Basic,
-    Agreement,
-    Timeout,
-    ClaimantWins,
-    ChallengerWins,
-}
-
-/// Quint `Input` ADT.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-enum Input {
-    NoInput,
-    OpenInput(EdgeTag),
-    ResolveInput(ResolveInputBody),
-    TickInput,
-    IdleInput,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResolveInputBody {
-    edge: EdgeTag,
-    proof: ProofTag,
-    #[serde(with = "As::<Integer>")]
-    maker_pay: i64,
-    #[serde(with = "As::<Integer>")]
-    taker_pay: i64,
-}
-
-/// Quint `Event` ADT (abstract event emitted by the action that produced the
-/// state).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-enum Event {
-    NoEvent,
-    EdgeOpenedEvent(EdgeTag),
-    EdgeResolvedEvent(EdgeTag),
-}
+use hellas_kernel::EventKind;
 
 // -- Runner -----------------------------------------------------------------
-
-/// Maps `EdgeTag` to the corresponding model edge key.
-const fn edge_key(tag: EdgeTag) -> support::l1::EdgeKey {
-    match tag {
-        EdgeTag::Edge1 => support::l1::EdgeKey::First,
-        EdgeTag::Edge2 => support::l1::EdgeKey::Second,
-    }
-}
-
-/// True when the proof requires fake-crypto for the placeholder verifier to
-/// accept. Used to skip fixtures whose actions the production kernel cannot
-/// replay.
-const fn needs_fake_crypto(tag: ProofTag) -> bool {
-    matches!(
-        tag,
-        ProofTag::Basic | ProofTag::Agreement | ProofTag::ClaimantWins | ProofTag::ChallengerWins,
-    )
-}
 
 struct L1Runner {
     /// Block height under the runner's control. Quint's height advances on
@@ -159,82 +54,6 @@ impl L1Runner {
     const fn new() -> Self {
         Self { height: 1 }
     }
-
-    fn context_for(input: &Input) -> Context {
-        // Timeout resolves need `Context::block_height >= terms.timeout`.
-        // The model's height advances by `tick`, and the kernel uses the
-        // block height from the Context. For Timeout, use TIMEOUT_CONTEXT
-        // (height = 2); otherwise use the genesis CONTEXT (height = 1).
-        if matches!(
-            input,
-            Input::ResolveInput(body) if body.proof == ProofTag::Timeout,
-        ) {
-            TIMEOUT_CONTEXT
-        } else {
-            support::l1::CONTEXT
-        }
-    }
-
-    fn op_for(input: &Input) -> Option<Op> {
-        match input {
-            Input::OpenInput(tag) => Some(Op::Open(support::l1::open(edge_key(*tag)))),
-            Input::ResolveInput(body) => Some(Op::Resolve(resolve_op(body))),
-            Input::NoInput | Input::TickInput | Input::IdleInput => None,
-        }
-    }
-}
-
-/// Builds a `Resolve` op from a model `ResolveInput`. Payouts are taken from
-/// the model body, not the support helper, so adversarial-payout traces
-/// (whenever those land) drive the kernel correctly.
-fn resolve_op(body: &ResolveInputBody) -> Resolve {
-    let edge = edge_key(body.edge);
-    let outputs = support::l1::payouts_with(
-        u64::try_from(body.maker_pay).expect("negative maker payout"),
-        u64::try_from(body.taker_pay).expect("negative taker payout"),
-    );
-    let input = edge_id(edge);
-    let proof = match body.proof {
-        ProofTag::Basic => Proof::basic(support::l1::TERMS.hash()),
-        ProofTag::Agreement => Proof::agreement(
-            support::l1::TERMS.hash(),
-            Agreement::new(
-                hellas_kernel::Sig::placeholder(MAKER, agreement_hash(input, &outputs)),
-                hellas_kernel::Sig::placeholder(TAKER, agreement_hash(input, &outputs)),
-            ),
-        ),
-        ProofTag::Timeout => Proof::timeout(support::l1::TERMS),
-        ProofTag::ClaimantWins => Proof::claimant_wins(
-            support::l1::TERMS,
-            seal_for(input, hellas_kernel::ResolveKind::ClaimantWins, &outputs),
-        ),
-        ProofTag::ChallengerWins => Proof::challenger_wins(
-            support::l1::TERMS,
-            seal_for(input, hellas_kernel::ResolveKind::ChallengerWins, &outputs),
-        ),
-    };
-    Resolve::new(input, proof, outputs)
-}
-
-fn agreement_hash(
-    input: hellas_kernel::EdgeId,
-    outputs: &hellas_kernel::List<Payout, { hellas_kernel::MAX_EDGE_OUTPUTS }>,
-) -> hellas_kernel::ResolveHash {
-    Resolve::payload_hash(
-        input,
-        hellas_kernel::ResolveKind::Agreement,
-        support::l1::TERMS.hash(),
-        outputs,
-    )
-}
-
-fn seal_for(
-    input: hellas_kernel::EdgeId,
-    kind: hellas_kernel::ResolveKind,
-    outputs: &hellas_kernel::List<Payout, { hellas_kernel::MAX_EDGE_OUTPUTS }>,
-) -> Seal {
-    let hash = Resolve::payload_hash(input, kind, support::l1::TERMS.hash(), outputs);
-    Seal::placeholder(ProtocolCode::new(1), kind, hash)
 }
 
 impl ItfRunner for L1Runner {
@@ -262,9 +81,9 @@ impl ItfRunner for L1Runner {
                 Ok(None)
             }
             Input::OpenInput(_) | Input::ResolveInput(_) => {
-                let op = Self::op_for(&expected.last_input)
+                let op = op_for(&expected.last_input)
                     .expect("op_for returned None for input that should have produced one");
-                let context = Self::context_for(&expected.last_input);
+                let context = context_for(&expected.last_input);
                 let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected input {:?}: {err:?}", expected.last_input)
                 })?;
@@ -447,7 +266,7 @@ fn requires_fake_crypto(trace: &itf::Trace<State>) -> bool {
         .states
         .iter()
         .any(|state| match &state.value.last_input {
-            Input::ResolveInput(body) => needs_fake_crypto(body.proof),
+            Input::ResolveInput(body) => support::itf::needs_fake_crypto(body.proof),
             _ => false,
         })
 }
