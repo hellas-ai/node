@@ -77,6 +77,11 @@ pub(crate) const COIN_PAYOUT: &[u8] = b"hellas.edge.coin.v1";
 /// taker funding ids.
 pub(crate) const EDGE_OPEN: &[u8] = b"hellas.edge.edge.v1";
 
+/// Prefix for open payload hash. Inputs: edge id (which already binds
+/// funding ids and terms hash via [`Self::EDGE_OPEN`] domain separation).
+/// Maker and taker both sign this hash to authorize one open.
+pub(crate) const OPEN: &[u8] = b"hellas.edge.open.v1";
+
 /// Prefix for close payload hash. Inputs: edge id, close kind tag,
 /// terms hash, payouts.
 pub(crate) const CLOSE: &[u8] = b"hellas.edge.close.v1";

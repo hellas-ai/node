@@ -41,6 +41,10 @@ impl Funding {
         self.maker.len() + self.taker.len()
     }
 
+    pub(super) const fn maker_len(&self) -> usize {
+        self.maker.len()
+    }
+
     pub(super) fn first(&self) -> Option<CoinId> {
         self.iter().next()
     }

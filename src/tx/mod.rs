@@ -24,7 +24,7 @@ use crate::{
     event::Change,
     list::List,
     object::{Coin, Edge},
-    primitive::{CloseHash, CoinId, EdgeId, TermsHash},
+    primitive::{CloseHash, CoinId, EdgeId, Sig, TermsHash},
     store::Batch,
     terms::Terms,
     verifier::{SealPublicInputs, SealVerifier, SigVerifier},
@@ -38,12 +38,22 @@ type CloseCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 /// A protocol transaction submitted to the Hellas kernel.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Tx {
-    /// Open one edge by locking bounded bilateral funding.
+    /// Open one edge by locking bounded bilateral funding under both
+    /// parties' authorization.
     Open {
-        /// Bilateral funding consumed by the open.
+        /// Bilateral funding consumed by the open. Each list's coins
+        /// must be owned by the matching party's settlement key from
+        /// `terms.parties()`.
         funding: Funding,
         /// Concrete terms committing the produced edge.
         terms: Terms,
+        /// Maker's signature over [`Tx::open_hash`]. Required even when
+        /// the maker funding list is empty — opening an edge that names
+        /// the maker as a party requires the maker's consent.
+        maker_sig: Sig,
+        /// Taker's signature over [`Tx::open_hash`]. Same authorization
+        /// rule as `maker_sig`.
+        taker_sig: Sig,
     },
 
     /// Close one edge into bounded owner-only coin payouts.
@@ -60,8 +70,13 @@ pub enum Tx {
 impl Tx {
     /// Creates an open transaction from concrete terms.
     #[must_use]
-    pub const fn open(funding: Funding, terms: Terms) -> Self {
-        Self::Open { funding, terms }
+    pub const fn open(funding: Funding, terms: Terms, maker_sig: Sig, taker_sig: Sig) -> Self {
+        Self::Open {
+            funding,
+            terms,
+            maker_sig,
+            taker_sig,
+        }
     }
 
     /// Creates a close transaction.
@@ -82,6 +97,21 @@ impl Tx {
     #[must_use]
     pub fn edge_id_of(funding: &Funding, terms: &Terms) -> EdgeId {
         edge_id(funding, terms.hash())
+    }
+
+    /// Returns the canonical hash both parties must sign to authorize an
+    /// open of the edge that `funding` + `terms` would produce.
+    ///
+    /// Bound to the canonical [`EdgeId`] derived from the open inputs
+    /// under a distinct domain separator, so an open signature can never
+    /// be replayed as anything else (a close signature, a different
+    /// edge's open, etc.).
+    #[must_use]
+    pub fn open_hash(funding: &Funding, terms: &Terms) -> CloseHash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(crate::consts::OPEN);
+        Self::edge_id_of(funding, terms).encode_to(&mut hasher);
+        CloseHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
     /// Returns the canonical ids of the payout coins a close would produce.
@@ -136,7 +166,12 @@ impl Tx {
         V: SigVerifier + SealVerifier + ?Sized,
     {
         match self {
-            Self::Open { funding, terms } => apply_open(funding, terms, context, batch),
+            Self::Open {
+                funding,
+                terms,
+                maker_sig,
+                taker_sig,
+            } => apply_open(funding, terms, *maker_sig, *taker_sig, context, verifier, batch),
             Self::Close {
                 input,
                 proof,
@@ -163,12 +198,19 @@ fn close_cost(outputs: usize, kind: CloseKind) -> Cost {
     Cost::new(1, outputs.saturating_add(1), kind.proofs())
 }
 
-fn apply_open<B: Batch>(
+fn apply_open<B, V>(
     funding: &Funding,
     terms: &Terms,
+    maker_sig: Sig,
+    taker_sig: Sig,
     context: Context,
+    verifier: &V,
     batch: &B,
-) -> KernelResult<Change> {
+) -> KernelResult<Change>
+where
+    B: Batch,
+    V: SigVerifier + ?Sized,
+{
     let output = edge_id(funding, terms.hash());
 
     if let Some(id) = duplicate(open_inputs(funding).as_slice()) {
@@ -179,15 +221,59 @@ fn apply_open<B: Batch>(
     }
 
     let coins = open_coins(funding, batch)?;
+    let parties = terms.parties();
+    check_funding_ownership(output, &coins, funding.maker_len(), parties)?;
+    check_open_signatures(output, funding, terms, parties, maker_sig, taker_sig, verifier)?;
     let open_fee = context
         .fee(open_cost(funding))
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::FeeOverflow))?;
     let reserve = context
         .fee(open_reserve_cost())
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::ReserveOverflow))?;
-    let edge = Edge::open(&coins, terms.parties(), terms.hash(), open_fee, reserve)
+    let edge = Edge::open(&coins, parties, terms.hash(), open_fee, reserve)
         .map_err(|reason| invalid_open(output, reason))?;
     Ok(Change::open(&coins, (output, edge)))
+}
+
+/// Every coin in `funding.maker` must be owned by `parties.maker()`;
+/// same for the taker. The kernel reads each coin's `owner()` from the
+/// staged batch and compares against the matching party's key — the
+/// authentication check that complements the open signatures.
+fn check_funding_ownership(
+    output: EdgeId,
+    coins: &OpenCoins,
+    maker_len: usize,
+    parties: crate::object::Parties,
+) -> KernelResult<()> {
+    for (index, (_, coin)) in coins.as_slice().iter().enumerate() {
+        let expected = if index < maker_len {
+            parties.maker()
+        } else {
+            parties.taker()
+        };
+        if coin.owner() != expected {
+            return Err(invalid_open(output, InvalidOpenReason::FundingUnauthorized));
+        }
+    }
+    Ok(())
+}
+
+fn check_open_signatures<V: SigVerifier + ?Sized>(
+    output: EdgeId,
+    funding: &Funding,
+    terms: &Terms,
+    parties: crate::object::Parties,
+    maker_sig: Sig,
+    taker_sig: Sig,
+    verifier: &V,
+) -> KernelResult<()> {
+    let hash = Tx::open_hash(funding, terms);
+    if !verifier.verify_sig(maker_sig, parties.maker(), hash)
+        || !verifier.verify_sig(taker_sig, parties.taker(), hash)
+    {
+        return Err(invalid_open(output, InvalidOpenReason::BadSignature));
+    }
+    Ok(())
 }
 
 fn apply_close<B, V>(
