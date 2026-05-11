@@ -357,3 +357,75 @@ fn reserve_cost_for(_open: &Tx) -> Cost {
     )
     .cost()
 }
+
+// ---------------------------------------------------------------------
+// Authorization
+//
+// `Tx::Open` consumes coins. Each coin is owner-keyed; opening an edge
+// must require consent from each consumed coin's owner. Without that,
+// any party who knows live coin ids can lock them into terms of their
+// choosing and drain them via a structural Timeout close at the
+// committed height.
+//
+// The tests below construct unauthorized opens — opens where the coins
+// being consumed are owned by keys distinct from the claimed party
+// identities, with no signature binding consent — and assert the kernel
+// rejects them. They demonstrate the security property the open path
+// must enforce.
+// ---------------------------------------------------------------------
+
+const EVE: Key = Key::from_bytes([0xee; Key::LENGTH]);
+const EVE_PARTIES: Parties = Parties::new(EVE, EVE);
+
+fn eve_terms() -> Terms {
+    Terms::basic(
+        PROTOCOL,
+        EVE_PARTIES,
+        TIMEOUT,
+        payouts(Payout::new(EVE, 7), Payout::new(EVE, 8)),
+    )
+}
+
+#[test]
+fn open_rejects_funding_owned_by_other_keys() {
+    // Eve constructs an Open consuming Maker's + Taker's coins while
+    // naming herself as both parties. Without an authorization check,
+    // the kernel accepts this; a subsequent timeout close at the
+    // committed height pays everything to Eve.
+    let funding = funding(MAKER_COIN, TAKER_COIN);
+    let attack = Tx::open(funding, eve_terms());
+    let mut state = funded_state_for(&attack);
+
+    let result = state.apply(CONTEXT, &FAKE_VERIFIER, &attack);
+
+    assert!(
+        matches!(result, Err(ApplyError::InvalidOpen { .. })),
+        "kernel must reject opens that consume coins not owned by the \
+         claimed party; got {result:?}",
+    );
+}
+
+#[test]
+fn open_rejects_maker_coin_owned_by_someone_other_than_maker_party() {
+    // The taker is honest (TAKER owns TAKER_COIN), but the "maker"
+    // slot is filled with a coin Eve doesn't own. The kernel must
+    // reject; otherwise Eve can launder Maker's coin through a
+    // self-dealing edge whose timeout payouts target her.
+    let funding = funding(MAKER_COIN, TAKER_COIN);
+    let mixed_terms = Terms::basic(
+        PROTOCOL,
+        Parties::new(EVE, TAKER),
+        TIMEOUT,
+        payouts(Payout::new(EVE, 10), Payout::new(TAKER, 5)),
+    );
+    let attack = Tx::open(funding, mixed_terms);
+    let mut state = funded_state_for(&attack);
+
+    let result = state.apply(CONTEXT, &FAKE_VERIFIER, &attack);
+
+    assert!(
+        matches!(result, Err(ApplyError::InvalidOpen { .. })),
+        "kernel must reject opens where a party's funding coins are not \
+         owned by that party's key; got {result:?}",
+    );
+}
