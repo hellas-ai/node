@@ -132,6 +132,42 @@ impl<S: Store> State<S> {
         self.apply_all(block.context(), verifier, block.ops())
     }
 
+    /// Applies an ordered, dynamically-sized operation batch atomically.
+    ///
+    /// Equivalent to [`Self::apply_all`] but for callers whose batch size is
+    /// not known at the type level. Validation and folding share one staged
+    /// transaction; the closure receives each emitted [`Event`] as the batch
+    /// progresses, so callers who only need to observe events without
+    /// allocating an event vector can do so. If any operation fails the
+    /// transaction is dropped, the closure is not called for the failed or
+    /// any subsequent operations, and the backing store is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError`] with the failed operation index and source error.
+    pub fn apply_iter<V, F>(
+        &mut self,
+        context: Context,
+        verifier: &V,
+        operations: impl IntoIterator<Item = Op>,
+        mut on_event: F,
+    ) -> KernelResult<(), BatchError>
+    where
+        V: Verifier + ?Sized,
+        F: FnMut(usize, &Event),
+    {
+        let mut tx = self.store.begin();
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            let event = Self::fold_one(&mut tx, context, verifier, &operation)
+                .map_err(|source| BatchError::new(index, source))?;
+            on_event(index, &event);
+        }
+
+        tx.commit();
+        Ok(())
+    }
+
     fn fold_one<T: Tx, V: Verifier + ?Sized>(
         tx: &mut T,
         context: Context,

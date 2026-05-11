@@ -62,14 +62,4 @@ impl<const N: usize> Block<N> {
     pub fn fits(&self, budget: Cost) -> bool {
         self.cost().is_some_and(|cost| cost.fits(budget))
     }
-
-    /// Returns true if any two operations in the block touch the same state
-    /// slot.
-    #[must_use]
-    pub fn conflicts(&self) -> bool {
-        let ops = self.ops.as_slice();
-        ops.iter()
-            .enumerate()
-            .any(|(i, op)| ops[i + 1..].iter().any(|other| op.conflicts(other)))
-    }
 }

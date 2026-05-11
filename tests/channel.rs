@@ -315,17 +315,6 @@ fn output_ids3(first: CoinId, second: CoinId, third: CoinId) -> List<CoinId, MAX
     ids
 }
 
-fn edge_ids0() -> List<EdgeId, 1> {
-    let Some(ids) = List::new([edge()], 0) else {
-        panic!("invalid test edge id list");
-    };
-    ids
-}
-
-const fn edge_ids1(id: EdgeId) -> List<EdgeId, 1> {
-    List::all([id])
-}
-
 fn apply<const C: usize, const E: usize>(
     state: &mut State<FixedStore<C, E>>,
     op: &Op,

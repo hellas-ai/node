@@ -6,13 +6,11 @@
 //! `apply` here implements the same validate-then-fold discipline the model
 //! captures by primed-variable assignments inside an `action` block.
 
-mod access;
 mod open;
 mod proof;
 mod resolve;
 
 pub use self::{
-    access::Access,
     open::{Funding, Open},
     proof::{Agreement, Proof, ResolveKind, Seal},
     resolve::{Payout, Resolve},
@@ -24,7 +22,7 @@ use crate::{
     event::Change,
     list::List,
     object::Coin,
-    primitive::{CoinId, EdgeId},
+    primitive::CoinId,
     store::Tx,
     verifier::Verifier,
 };
@@ -52,7 +50,6 @@ type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 type Payouts = List<Payout, MAX_EDGE_OUTPUTS>;
 type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
-type EdgeList = List<EdgeId, 1>;
 
 /// A protocol operation submitted to the Hellas kernel.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -85,22 +82,6 @@ impl Op {
             Self::Resolve(op) => op.cost(),
         }
     }
-
-    /// Returns the deterministic state access set of this operation.
-    #[must_use]
-    pub fn access(&self) -> Access {
-        match self {
-            Self::Open(op) => op.access(),
-            Self::Resolve(op) => op.access(),
-        }
-    }
-
-    /// Returns true if this operation touches any state slot also touched by
-    /// `other`.
-    #[must_use]
-    pub fn conflicts(&self, other: &Self) -> bool {
-        self.access().conflicts(&other.access())
-    }
 }
 
 fn units(value: usize) -> u64 {
@@ -112,22 +93,4 @@ fn duplicate<T: Copy + Eq>(items: &[T]) -> Option<T> {
         .iter()
         .enumerate()
         .find_map(|(i, item)| items[i + 1..].contains(item).then_some(*item))
-}
-
-fn overlaps<T: Eq, const A: usize, const B: usize>(left: &List<T, A>, right: &List<T, B>) -> bool {
-    left.as_slice()
-        .iter()
-        .any(|item| right.as_slice().contains(item))
-}
-
-const fn empty_coins<const N: usize>() -> List<CoinId, N> {
-    List::empty(CoinId::ZERO)
-}
-
-const fn empty_edges() -> EdgeList {
-    List::empty(EdgeId::ZERO)
-}
-
-const fn one_edge(id: EdgeId) -> EdgeList {
-    List::all([id])
 }
