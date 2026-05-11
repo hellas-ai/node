@@ -14,7 +14,7 @@ use crate::{
     object::Genesis,
     tx::Tx,
     store::{Batch, Store},
-    verifier::Verifier,
+    verifier::{SealVerifier, SigVerifier},
     view::Snapshot,
 };
 
@@ -79,7 +79,7 @@ impl<S: Store> State<S> {
     ///
     /// Returns [`crate::ApplyError`] if the operation is not valid for the
     /// current store contents or if the backing store rejects an insertion.
-    pub fn apply<V: Verifier + ?Sized>(
+    pub fn apply<V: SigVerifier + SealVerifier + ?Sized>(
         &mut self,
         context: Context,
         verifier: &V,
@@ -100,7 +100,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_all<V: Verifier + ?Sized, const N: usize>(
+    pub fn apply_all<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
         &mut self,
         context: Context,
         verifier: &V,
@@ -124,7 +124,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_block<V: Verifier + ?Sized, const N: usize>(
+    pub fn apply_block<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
         &mut self,
         verifier: &V,
         block: &Block<N>,
@@ -153,7 +153,7 @@ impl<S: Store> State<S> {
         mut on_event: F,
     ) -> KernelResult<(), BatchError>
     where
-        V: Verifier + ?Sized,
+        V: SigVerifier + SealVerifier + ?Sized,
         F: FnMut(usize, &Event),
     {
         let mut tx = self.store.begin();
@@ -168,7 +168,7 @@ impl<S: Store> State<S> {
         Ok(())
     }
 
-    fn fold_one<B: Batch, V: Verifier + ?Sized>(
+    fn fold_one<B: Batch, V: SigVerifier + SealVerifier + ?Sized>(
         batch: &mut B,
         context: Context,
         verifier: &V,

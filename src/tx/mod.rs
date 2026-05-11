@@ -20,14 +20,14 @@ use crate::{
     canonical::Encode,
     consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS},
     context::{Context, Cost},
-    error::{ApplyError, InvalidCloseReason, InvalidOpenReason, KernelResult},
+    error::{ApplyError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason, KernelResult},
     event::Change,
     list::List,
     object::{Coin, Edge},
     primitive::{CloseHash, CoinId, EdgeId, TermsHash},
     store::Batch,
     terms::Terms,
-    verifier::Verifier,
+    verifier::{SealPublicInputs, SealVerifier, SigVerifier},
 };
 
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
@@ -125,12 +125,16 @@ impl Tx {
         }
     }
 
-    pub(crate) fn apply<B: Batch, V: Verifier + ?Sized>(
+    pub(crate) fn apply<B, V>(
         &self,
         context: Context,
         verifier: &V,
         batch: &B,
-    ) -> KernelResult<Change> {
+    ) -> KernelResult<Change>
+    where
+        B: Batch,
+        V: SigVerifier + SealVerifier + ?Sized,
+    {
         match self {
             Self::Open { funding, terms } => apply_open(funding, terms, context, batch),
             Self::Close {
@@ -186,22 +190,25 @@ fn apply_open<B: Batch>(
     Ok(Change::open(&coins, (output, edge)))
 }
 
-fn apply_close<B: Batch, V: Verifier + ?Sized>(
+fn apply_close<B, V>(
     input: EdgeId,
     proof: &Proof,
     outputs: &Payouts,
     context: Context,
     verifier: &V,
     batch: &B,
-) -> KernelResult<Change> {
+) -> KernelResult<Change>
+where
+    B: Batch,
+    V: SigVerifier + SealVerifier + ?Sized,
+{
     check_close_outputs(input, outputs, batch)?;
 
     let coins = close_coins(input, outputs);
     let edge = batch
         .edge(input)
         .ok_or(ApplyError::MissingEdge { id: input })?;
-    verifier
-        .verify_close(input, &edge, outputs, proof, &context)
+    check_proof(input, &edge, outputs, proof, context, verifier)
         .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
     let fee = context
         .fee(close_cost(outputs.len(), proof.kind()))
@@ -210,6 +217,64 @@ fn apply_close<B: Batch, V: Verifier + ?Sized>(
         .map_err(|reason| invalid_close(input, reason))?;
 
     Ok(Change::close((input, edge), &coins))
+}
+
+/// Dispatches close-proof admissibility per variant. Mutual routes to
+/// the signature verifier, Violation routes to the seal verifier, and
+/// Timeout is structural — the kernel checks terms-hash binding, height,
+/// and payout shape inline because none of those need cryptography.
+fn check_proof<V>(
+    input: EdgeId,
+    edge: &Edge,
+    outputs: &Payouts,
+    proof: &Proof,
+    context: Context,
+    verifier: &V,
+) -> Result<(), InvalidProofReason>
+where
+    V: SigVerifier + SealVerifier + ?Sized,
+{
+    match proof {
+        Proof::Mutual { maker, taker } => {
+            let hash = Tx::payload_hash(input, CloseKind::Mutual, edge.terms(), outputs);
+            let parties = edge.parties();
+            if verifier.verify_sig(*maker, parties.maker(), hash)
+                && verifier.verify_sig(*taker, parties.taker(), hash)
+            {
+                Ok(())
+            } else {
+                Err(InvalidProofReason::BadSignature)
+            }
+        }
+        Proof::Timeout { terms } => {
+            if terms.hash() != edge.terms() {
+                return Err(InvalidProofReason::TermsMismatch);
+            }
+            if context.block_height() < terms.timeout() {
+                return Err(InvalidProofReason::TimeoutNotReached);
+            }
+            if outputs != terms.timeout_outputs() {
+                return Err(InvalidProofReason::PayoutMismatch);
+            }
+            Ok(())
+        }
+        Proof::Violation { terms, seal } => {
+            if terms.hash() != edge.terms() {
+                return Err(InvalidProofReason::TermsMismatch);
+            }
+            let public = SealPublicInputs {
+                edge_id: input,
+                protocol: terms.protocol(),
+                terms_hash: terms.hash(),
+                payouts: outputs,
+            };
+            if verifier.verify_seal(*seal, &public) {
+                Ok(())
+            } else {
+                Err(InvalidProofReason::BadSeal)
+            }
+        }
+    }
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
