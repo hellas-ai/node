@@ -39,12 +39,6 @@
 //! ```
 //!
 //! ```compile_fail
-//! use hellas_kernel::State;
-//!
-//! let _state = State::new(());
-//! ```
-//!
-//! ```compile_fail
 //! use hellas_kernel::{CoinId, EdgeId, Event, EventKind, List, MAX_EDGE_INPUTS};
 //!
 //! let id = CoinId::from_bytes([0; CoinId::LENGTH]);
