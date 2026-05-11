@@ -15,7 +15,7 @@ provider gateway, or p2p content network.
 
 This document uses "kernel" for the small formal core of the protocol. The hot
 L1 kernel is the smaller live-state machine inside that core: coins, live
-edges, and resolve operations. State-channel frontiers, receipts, claims, and
+edges, and close operations. State-channel frontiers, receipts, claims, and
 dispute transcripts are kernel-relevant protocol objects, but they are not L1
 live state.
 
@@ -40,7 +40,7 @@ state channel
   exchanges signed frontiers, receipts, claims, and payments peer-to-peer
 
 L1 ledger
-  escrows coins, opens edges, resolves edges, and mints payout coins
+  escrows coins, opens edges, closes edges, and mints payout coins
 
 consensus
   finalizes an ordered log of L1 transactions
@@ -52,21 +52,21 @@ All models and implementations should meet at the same operation vocabulary.
 This keeps the Rust code and the formal models from drifting.
 
 ```rust
-enum Op {
+enum Tx {
     Open(Open),
-    Resolve(Resolve),
+    Close(Close),
 }
 
 enum EventKind {
     EdgeOpened { inputs: List<CoinId, MAX_EDGE_INPUTS>, output: EdgeId },
-    EdgeResolved { input: EdgeId, outputs: List<CoinId, MAX_EDGE_OUTPUTS> },
+    EdgeClosed { input: EdgeId, outputs: List<CoinId, MAX_EDGE_OUTPUTS> },
 }
 ```
 
 The L1 operation vocabulary is intentionally small. Claims, receipts,
 frontiers, challenges, and dispute transcripts are state-channel/protocol
-objects exchanged peer-to-peer. L1 only sees them if a resolve transaction
-carries some bounded resolve proof derived from them.
+objects exchanged peer-to-peer. L1 only sees them if a close transaction
+carries some bounded close proof derived from them.
 
 ## Kernel Implementation Invariants
 
@@ -87,11 +87,11 @@ pay for an extension that is not coming.
 State transitions follow a two-phase, event-sourced shape:
 
 ```text
-op_apply(ctx, &Verifier, &Tx, Op) -> KernelResult<Change>   // read-only
-change_fold(&mut Tx, &Change)     -> KernelResult<()>       // private mutation
+tx_apply(ctx, &Verifier, &Batch, Tx) -> KernelResult<Change>   // read-only
+change_fold(&mut Batch, &Change)     -> KernelResult<()>       // private mutation
 ```
 
-`Verifier` is the crypto boundary; `Tx` is the storage boundary. Both are
+`Verifier` is the crypto boundary; `Batch` is the storage boundary. Both are
 caller-supplied interfaces, both pure during validation.
 
 - `Event` is the public opaque fact emitted by an operation. Its constructors
@@ -100,15 +100,15 @@ caller-supplied interfaces, both pure during validation.
   private `Effect` needed to fold the mutation. External code can observe the
   event, but it cannot fabricate or replay effects.
 - The only paths to a `State` value are `Genesis::coin` seeds and
-  `State::apply(prev, op)?`.
-- Mutation lives in one private fold per op. No other code mutates the store.
-- Validation and fold must observe the same `Tx` working state. The
+  `State::apply(prev, tx)?`.
+- Mutation lives in one private fold per tx. No other code mutates the store.
+- Validation and fold must observe the same `Batch` working state. The
   `CoinChanged` and `EdgeChanged` errors exist only to catch a misbehaving
-  `Tx` implementation that returns one object during validation and removes a
-  different object during fold.
+  `Batch` implementation that returns one object during validation and removes
+  a different object during fold.
 
 By induction, every reachable kernel state equals either a set of genesis coins
-or `apply(prev, op)?` for some op. The model checker explores the transition
+or `apply(prev, tx)?` for some tx. The model checker explores the transition
 relation directly; reachability is not a separate proof obligation.
 
 The atomic-transition mechanics that realize this discipline are described in
@@ -130,7 +130,7 @@ unique to the object kind. As consequences:
 over "any id".
 
 Operation outputs are not caller-selected. `Open` derives its `EdgeId` from the
-edge domain tag, maker/taker funding ids, parties, and `TermsHash`. `Resolve`
+edge domain tag, maker/taker funding ids, parties, and `TermsHash`. `Close`
 derives each payout `CoinId` from the coin domain tag, consumed `EdgeId`, output
 position, and owner key. `from_bytes` constructors exist for decoding
 already-canonical live state references, genesis seeds, and store keys; they are
@@ -138,18 +138,18 @@ not part of output selection.
 
 ### Typed Store Boundary
 
-The store presents a typed `Tx` interface. The kernel asks for "the coin at
+The store presents a typed `Batch` interface. The kernel asks for "the coin at
 this `CoinId`" or "the edge at this `EdgeId`", never for "the object at id X".
 Storage representation is an implementation choice and does not cross the API
 boundary.
 
 ```rust
 trait Store {
-    type Tx<'a>: Tx where Self: 'a;
-    fn begin(&mut self) -> Self::Tx<'_>;
+    type Batch<'a>: Batch where Self: 'a;
+    fn begin(&mut self) -> Self::Batch<'_>;
 }
 
-trait Tx {
+trait Batch {
     fn coin(&self, id: CoinId) -> Option<Coin>;
     fn insert_coin(&mut self, id: CoinId, coin: Coin) -> KernelResult<(), InsertError>;
     fn remove_coin(&mut self, id: CoinId) -> Option<Coin>;
@@ -175,37 +175,45 @@ via a working snapshot swapped in on `commit`. Tests run against both so any
 
 ### Verifier Boundary
 
-The kernel implements no cryptography. Signature and dispute-seal
-verification go through a `Verifier` trait that callers wire in at apply
-time:
+The kernel implements no cryptography, and beyond bookkeeping it implements no
+close-admissibility policy either. Every decision about whether a `Proof`
+binds to its edge — terms-hash commitment, timeout-height check, timeout
+payout shape, mutual signature pair, dispute-seal verdict — goes through a
+single-method `Verifier` trait that callers wire in at apply time:
 
 ```rust
 trait Verifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool;
-    fn verify_seal(
+    fn verify_close(
         &self,
-        seal: Seal,
-        protocol: ProtocolCode,
-        kind: ResolveKind,
-        hash: ResolveHash,
-    ) -> bool;
+        edge_id: EdgeId,
+        edge: &Edge,
+        payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
+        proof: &Proof,
+        context: &Context,
+    ) -> Result<(), InvalidProofReason>;
 }
 ```
 
-`State::apply(context, &verifier, op)` plumbs the verifier through to
-`Proof::accepts`. The kernel never sees the verification mechanism.
-Production callers wire a real verifier — `Secp256k1Verifier` behind the
-`secp256k1` feature flag is the included reference, or a preverified-cache
-lookup populated off the apply critical path (PERF.md §4). Tests use
-`FakeVerifier`, which accepts the deterministic placeholder shape produced
-by `Sig::placeholder` / `Seal::placeholder`. A `RejectVerifier` covers
-"production has no key for this proof" cases.
+The kernel calls `verify_close` once per close transaction, after value
+conservation, slot-collision, and fee arithmetic have been checked, and
+before fold. The kernel itself does not unpack the proof or compare its
+revealed terms against `edge.terms()`; it forwards the whole `Proof` and lets
+the verifier return `Ok(())` or a structured `InvalidProofReason`.
 
-The kernel's `cfg(feature = "fake-crypto")` gate still applies to one place:
-`Proof::Basic`. Basic is a structural marker for the modelling/testing
-witness — there is no signature to verify, so the verifier is not consulted.
-Production builds reject Basic at the type level regardless of the verifier
-supplied.
+`State::apply(context, &verifier, tx)` plumbs the verifier through to the
+close path. Production callers wire a real verifier — `Secp256k1Verifier`
+behind the `secp256k1` feature flag is the included reference for `Mutual`
+signatures, or a preverified-cache lookup populated off the apply critical
+path (PERF.md §4). Dispute-seal admissibility is protocol-specific; the
+included `Secp256k1Verifier` rejects every `Violation` seal, and production
+deployments compose a seal-aware verifier per dispute protocol. Tests use
+`FakeVerifier`, which accepts the deterministic placeholder shape produced
+by `Sig::placeholder` / `Seal::placeholder` and otherwise enforces the same
+terms-hash, timeout, and payout checks a real verifier would. A
+`RejectVerifier` covers "production has no key for this proof" cases.
+
+There is no kernel-side cfg flag for proof admission. Production and test
+builds differ only in which `Verifier` they wire in.
 
 ### Per-Digest Types
 
@@ -217,16 +225,16 @@ interchangeable; the compiler stops cross-purpose assignment. They derive
 `BTreeMap` and other ordered collections — useful for production stores and
 test reference models alike.
 
-`Edge` carries principal value, prepaid resolution reserve,
+`Edge` carries principal value, prepaid close reserve,
 `Parties { maker, taker }`, and a `TermsHash`, not a stored terms object id.
 `Terms::Basic` is the current concrete terms shape: protocol code, parties, the
 earliest timeout block height, and the deterministic payout list accepted by a
-timeout resolve. It has a deterministic no-allocation BLAKE3 commitment path:
+timeout close. It has a deterministic no-allocation BLAKE3 commitment path:
 `Terms::hash() -> TermsHash`.
 
 Terms are still not on-chain state. The hot live object stores only
 `TermsHash`; concrete terms are an input-side vocabulary used to derive that
-commitment and later verify resolve proofs against it.
+commitment and later verify close proofs against it.
 
 ### Edge Funding Shape
 
@@ -236,7 +244,7 @@ edge stores only `TermsHash` and `Parties { maker, taker }` derived from those
 terms. The produced `EdgeId` is canonical; it is not supplied by the caller.
 Either funding list may be empty; a one-sided or zero-funded open is valid when
 total funding covers the context-priced open cost plus the prepaid reserve for
-the worst-case bounded resolve path. Funding is invalid exactly when the sum of
+the worst-case bounded close path. Funding is invalid exactly when the sum of
 funding coin values is less than
 `context.fee(open.cost()) + context.fee(open.reserve_cost())`. The produced edge
 principal is that remaining value; the reserve is stored separately and is not
@@ -247,41 +255,45 @@ other economic meaning. The kernel does not require the maker and taker keys to
 be distinct; self-edges are valid and can represent sends, merges, or no-work
 channels under higher-level protocol convention.
 
-`Resolve` consumes one `Edge`, carries a bounded resolve proof, and creates a
+`Close` consumes one `Edge`, carries a bounded close proof, and creates a
 bounded list of `Payout { owner, value }` values. Payout coin ids are canonical;
-they are not supplied by the caller. `Proof` carries a `ResolveKind`:
-`Basic`, `Agreement`, `Timeout`, `ClaimantWins`, or `ChallengerWins`. `Basic` is
-the degenerate modelling witness that only binds the resolve to the edge's
-`TermsHash`; the kernel accepts it only under the `fake-crypto` feature.
-`Agreement` is the first real non-basic witness: it requires both maker and
-taker signature-shaped witnesses over the same `ResolveHash`, which commits to
-the input edge, witness kind, terms, and ordered payouts. Signature verification
-is delegated to the `Verifier` trait the caller supplies (see [Verifier
-Boundary](#verifier-boundary)); production builds wire `Secp256k1Verifier` or
-a preverified-cache verifier; tests wire `FakeVerifier` against the deterministic
-`Sig::placeholder` shape. `Timeout` reveals the concrete basic terms, checks
-that their commitment equals the edge's `TermsHash`, accepts only when
-`Context::block_height() >= Terms::timeout()`, and requires the resolve payout
-list to equal the terms' committed timeout payout list — the only resolve path
-where the kernel itself enforces a payout shape. `ClaimantWins` and
-`ChallengerWins` reveal the same concrete terms and carry a fixed-size `Seal`,
-the compact mode-specific verifier result; the kernel asks the verifier whether
-the seal binds to the protocol code, outcome kind, and resolve hash. As with
-signatures, `Seal::placeholder` is the test shape; production composes a
-seal-aware verifier (the included `Secp256k1Verifier` rejects every seal —
-seals are protocol-specific and there is no universal seal verifier).
-Empty resolve output is valid exactly for a zero-value edge. A resolve is valid
-only when the edge reserve covers `context.fee(resolve.cost())`; the reserve is
-consumed by the resolve and does not appear in payout coins.
+they are not supplied by the caller. `Proof` is one of three variants, and the
+kernel forwards all admissibility decisions about it to the `Verifier` (see
+[Verifier Boundary](#verifier-boundary)):
+
+- `Proof::Mutual { maker: Sig, taker: Sig }` is the cooperative path. Both
+  signatures are taken over the canonical
+  `Tx::payload_hash(edge_id, CloseKind::Mutual, edge.terms(), payouts)`. No
+  terms are revealed on chain; the verifier reads `edge.terms()` directly off
+  the live edge. Production wires `Secp256k1Verifier` (or a preverified-cache
+  verifier); tests wire `FakeVerifier` against the deterministic
+  `Sig::placeholder` shape.
+- `Proof::Timeout { terms: Terms }` reveals the concrete basic terms. The
+  verifier is responsible for checking `terms.hash() == edge.terms()`,
+  `context.block_height() >= terms.timeout()`, and that `payouts` equals the
+  terms' committed timeout payout list. The kernel itself does not enforce
+  any of these — it only conserves value and consumes the reserve.
+- `Proof::Violation { terms: Terms, seal: Seal }` is the dispute path. It
+  reveals the concrete terms and carries a fixed-size protocol-specific
+  `Seal`. The seal is opaque to the kernel: protocol-specific dispute games
+  encode the winner inside its bytes, and a seal-aware verifier inside the
+  wired `Verifier` decides admissibility. This single variant subsumes the
+  earlier separate claimant/challenger paths; the winner is read out of the
+  seal at the verifier layer, not encoded in a kernel-level discriminant.
+
+Empty close output is valid exactly for a zero-value edge. A close is valid
+only when the edge reserve covers `context.fee(close.cost())`; the reserve is
+consumed by the close and does not appear in payout coins.
 
 Every kernel rejection self-describes via a structured `ApplyError::Invalid*`
 reason: `InvalidOpenReason { FundingInsufficient, FundingOverflow, FeeOverflow,
-ReserveOverflow, BoundsExceeded }`, `InvalidResolveReason { ValueMismatch,
+ReserveOverflow, BoundsExceeded }`, `InvalidCloseReason { ValueMismatch,
 ReserveTooSmall, FeeOverflow, PayoutOverflow, BoundsExceeded }`,
 `InvalidProofReason { TermsMismatch, BadSignature, BadSeal, TimeoutNotReached,
-PayoutMismatch, BasicNotAccepted }`. Callers do not parse free text to tell
-"fee schedule changed under me" (`ReserveTooSmall`) from "I miscomputed
-payouts" (`ValueMismatch`).
+PayoutMismatch }`. Callers do not parse free text to tell "fee schedule
+changed under me" (`ReserveTooSmall`) from "I miscomputed payouts"
+(`ValueMismatch`). The `InvalidProofReason` variants are returned by the
+`Verifier`, not by kernel bookkeeping.
 
 ### Resource Costs
 
@@ -293,31 +305,33 @@ Cost { base, slots, proofs }
 Fees { base, slot,  proof  }
 ```
 
-`base` is fixed per-op overhead; `slots` counts every store slot the kernel
+`base` is fixed per-tx overhead; `slots` counts every store slot the kernel
 touches (each is read for the existence check and written for the
 insert/remove that follows, so reads and writes are structurally equal and
 fold into one dimension); `proofs` counts signature/seal verifications.
 
 `Context` carries the active `Fees` schedule and prices costs with
-`context.fee(op.cost())`. The L1 open path burns the priced open cost from
-funding before creating the edge, and locks a separate resolution reserve priced
-from the pessimistic worst-case bounded resolve shape: `MAX_EDGE_OUTPUTS` plus
-`ResolveKind::ClaimantWins`. This is deliberate. V1 does not refund unused
-reserve and does not price resolves optimistically; the protocol should always
-be paid. Resolve checks that the edge reserve can pay the current priced resolve
-cost, then consumes the reserve and pays out only edge principal. `Block::fits`
-checks the summed block cost against a multi-dimensional resource budget before
-admission.
+`context.fee(tx.cost())`. The L1 open path burns the priced open cost from
+funding before creating the edge, and locks a separate close reserve priced
+from the pessimistic worst-case bounded close shape: `MAX_EDGE_OUTPUTS` plus
+the worst-case `CloseKind`. With the collapsed three-variant proof model,
+`CloseKind::Mutual` carries two signature-shaped witnesses and is the
+highest-cost variant at two proof units; the reserve is sized to that.
+This is deliberate. V1 does not refund unused reserve and does not price
+closes optimistically; the protocol should always be paid. Close checks that
+the edge reserve can pay the current priced close cost, then consumes the
+reserve and pays out only edge principal. `Block::fits` checks the summed
+block cost against a multi-dimensional resource budget before admission.
 
-Resolve fees are charged under the *current* block's fee schedule, not the
+Close fees are charged under the *current* block's fee schedule, not the
 schedule active when the edge opened. If a fee increase pushes the priced
-resolve cost above the locked reserve, the edge becomes unresolvable through
-the normal path. Principal stays conserved inside the live edge — it is not
+close cost above the locked reserve, the edge becomes unclosable through the
+normal path. Principal stays conserved inside the live edge — it is not
 redistributed and not lost from the global accounting — but it cannot be paid
 out under that schedule. This asymmetry is intentional: it gives the protocol a
 stale-edge collection knob. Lifting fees is the eviction mechanism for edges
-nobody bothered to resolve under the original prices. Pinning fees at open
-time would close that knob and is explicitly not v1 semantics.
+nobody bothered to close under the original prices. Pinning fees at open time
+would close that knob and is explicitly not v1 semantics.
 
 ## L1 Model
 
@@ -329,16 +343,16 @@ It tracks:
 - live edge records
 - explicit live-object sets in the abstract models, because zero value and
   absence are distinct
-- bounded resolve operations
+- bounded close operations
 - block height
 - finalized transaction order
 
 It does not know how a model was executed, how a TEE attestation works, or how a
-ZK proof was generated. It only knows how to open an edge, resolve an edge, and
-verify the bounded resolve proof required by the edge terms.
+ZK proof was generated. It only knows how to open an edge, close an edge, and
+forward the bounded close proof to the `Verifier` configured by the edge terms.
 
 An edge is live-only. Existence means open. Open consumes funding coins and
-creates the live edge. Resolve consumes the edge, deletes it from live L1 state,
+creates the live edge. Close consumes the edge, deletes it from live L1 state,
 and mints payout coins. There is no closed-edge status in live state;
 historical closure belongs in events and block history.
 
@@ -349,23 +363,23 @@ The basic invariants are:
 - every coin is in exactly one location
 - no live coin is spendable twice
 - every live edge represents principal consumed from coins at open, minus the
-  context-priced open cost and prepaid resolution reserve
+  context-priced open cost and prepaid close reserve
 - opening an edge consumes funding coins, pays the derived fee, locks the
   derived reserve, and creates the edge atomically
-- resolving an edge deletes the edge, consumes the reserve, and creates payout
+- closing an edge deletes the edge, consumes the reserve, and creates payout
   coins atomically
 - protocol costs are paid before a mutation commits; an operation that cannot
   pay its context-priced cost is invalid
-- resolve output coins exist after the resolve event
-- resolve output coins may later be spent or escrowed into a new edge
+- close output coins exist after the close event
+- close output coins may later be spent or escrowed into a new edge
 - block height is monotonic
 - finalized operations are applied in order
 - principal value (sum of all live coin values plus all live edge principal) is
   conserved by every non-genesis operation except for context-priced open costs
-  and prepaid resolution reserves
+  and prepaid close reserves
 
-The subtle point is resolved outputs. The live L1 state should not retain a
-closed-edge record to police those coins. Once minted, resolve outputs are
+The subtle point is close outputs. The live L1 state should not retain a
+closed-edge record to police those coins. Once minted, close outputs are
 normal UTXOs. They must not be required to stay free forever.
 
 ## Channel Model
@@ -388,8 +402,8 @@ The channel model never mutates L1 coins directly. It submits L1 transactions
 and observes L1 events.
 
 ```text
-channel --submits--> Open | Resolve
-channel <--observes-- EdgeOpened | EdgeResolved
+channel --submits--> Open | Close
+channel <--observes-- EdgeOpened | EdgeClosed
 ```
 
 This is the first major composition boundary. The channel does not get to reach
@@ -397,8 +411,8 @@ into `State`. It only talks to L1 through transactions and events.
 
 The frontier is not an L1 object. Frontier receipts, producer receipts,
 challenge messages, and fraud-game transcripts are passed peer-to-peer inside
-the channel. They matter to L1 only if they are summarized by a bounded resolve
-proof in a resolve transaction.
+the channel. They matter to L1 only if they are summarized by a bounded close
+proof in a close transaction.
 
 ### Watcher Liveness
 
@@ -415,9 +429,9 @@ Instead:
 ```text
 if a party has funds at risk,
 and a watcher for that party is live during the challenge window,
-and the watcher can deliver the required peer-to-peer challenge or resolve data
+and the watcher can deliver the required peer-to-peer challenge or close data
 before the channel deadline,
-then an invalid claim cannot become the channel's accepted resolve state by timeout
+then an invalid claim cannot become the channel's accepted close state by timeout
 ```
 
 Watcher liveness is a participant obligation. It is not a global fact about the
@@ -443,7 +457,7 @@ validity gadget
   says what makes the claim valid, invalid, proven, slashable, or final
 
 L1
-  verifies only the bounded resolve proof required to release escrowed coins
+  verifies only the bounded close proof required to release escrowed coins
 ```
 
 The common shape is:
@@ -730,10 +744,10 @@ instead.
 The refinement property is:
 
 ```text
-view(rust_apply(s, op)) == model_apply(view(s), op)
+view(rust_apply(s, tx)) == model_apply(view(s), tx)
 ```
 
-for every valid state `s` and operation `op`, with matching accept/reject
+for every valid state `s` and transaction `tx`, with matching accept/reject
 behavior.
 
 The abstraction is allowed to lose information. It must lose information, or it
@@ -760,26 +774,27 @@ ecosystem standard) that:
 1. Deserializes each `.itf.json` fixture into a Rust `State` mirroring the
    Quint variable shape.
 2. For each step, reads `lastInput` from the trace and synthesizes the
-   corresponding `Op`.
-3. Calls `state.apply(context, &FAKE_VERIFIER, &op)`, capturing the emitted
+   corresponding `Tx`.
+3. Calls `state.apply(context, &FAKE_VERIFIER, &tx)`, capturing the emitted
    `EventKind`.
 4. Asserts the kernel event matches `lastEvent` (`result_invariant`) and the
    kernel's live state matches the abstract trace (`state_invariant`) at
    every step.
 
 A single glob-based test replays every committed fixture; adding a new Quint
-trace test means adding a fixture and zero Rust code. Fixtures whose actions
-require placeholder verification are skipped under `--no-default-features`
-(production semantics) and run under `--features fake-crypto`.
+trace test means adding a fixture and zero Rust code. Fixtures use
+`FakeVerifier`, which accepts the deterministic `Sig::placeholder` /
+`Seal::placeholder` shape; production wires a real `Verifier` implementation
+in its place.
 
 ## Atomic Transitions
 
 Kernel transitions are atomic. A successful `apply` commits exactly one state
 transition and returns its `Event`. A failing `apply` leaves state unchanged. A
 successful `apply_all` commits one ordered batch and returns a bounded `Diff<N>`
-containing the ordered events; any failing operation leaves the whole batch
+containing the ordered events; any failing transaction leaves the whole batch
 uncommitted and returns no diff. `apply_block` is the node-facing wrapper around
-the same transition, taking a `Block<N>` that pairs `Context` with ordered ops.
+the same transition, taking a `Block<N>` that pairs `Context` with ordered txs.
 
 The implementation enforces this through the store's transaction boundary,
 with the verifier injected as a separate parameter (kernel is verifier-
@@ -791,12 +806,12 @@ impl<S: Store> State<S> {
         &mut self,
         ctx: Context,
         verifier: &V,
-        op: &Op,
+        tx: &Tx,
     ) -> KernelResult<Event> {
-        let mut tx = self.store.begin();
-        let change = op.apply(ctx, verifier, &tx)?;
-        change.fold(&mut tx)?;
-        tx.commit();
+        let mut batch = self.store.begin();
+        let change = tx.apply(ctx, verifier, &batch)?;
+        change.fold(&mut batch)?;
+        batch.commit();
         Ok(change.event())
     }
 
@@ -804,16 +819,16 @@ impl<S: Store> State<S> {
         &mut self,
         ctx: Context,
         verifier: &V,
-        ops: &List<Op, N>,
+        txs: &List<Tx, N>,
     ) -> KernelResult<Diff<N>, BatchError> {
-        let mut tx = self.store.begin();
+        let mut batch = self.store.begin();
         let mut diff = Diff::empty();
-        for (index, op) in ops.iter().enumerate() {
-            let event = Self::fold_one(&mut tx, ctx, verifier, op)
+        for (index, tx) in txs.iter().enumerate() {
+            let event = Self::fold_one(&mut batch, ctx, verifier, tx)
                 .map_err(|source| BatchError::new(index, source))?;
             diff.push(&event);
         }
-        tx.commit();
+        batch.commit();
         Ok(diff)
     }
 
@@ -822,17 +837,17 @@ impl<S: Store> State<S> {
         verifier: &V,
         block: &Block<N>,
     ) -> KernelResult<Diff<N>, BatchError> {
-        self.apply_all(block.context(), verifier, block.ops())
+        self.apply_all(block.context(), verifier, block.txs())
     }
 }
 ```
 
-Validation runs read-only against `&Tx`. Mutation runs via `Change::fold`
-against `&mut Tx`. `Tx::commit` is called only after both phases succeed; a
-dropped (uncommitted) `Tx` rolls back.
+Validation runs read-only against `&Batch`. Mutation runs via `Change::fold`
+against `&mut Batch`. `Batch::commit` is called only after both phases
+succeed; a dropped (uncommitted) `Batch` rolls back.
 
 This gives property tests a clean handle: every test can reason about `pre`,
-`op`, and `post` without worrying about intermediate state.
+`tx`, and `post` without worrying about intermediate state.
 
 ## Verification Plan
 
@@ -850,9 +865,9 @@ Use for the concrete implementation:
 
 This is the first line of defense. Layered as:
 
-- `tests/channel/` — focused unit tests per operation shape (open, resolve,
-  batch, op).
-- `tests/sequence.rs` — proptest over random `Op` sequences asserting
+- `tests/channel/` — focused unit tests per transaction shape (open, close,
+  batch, tx).
+- `tests/sequence.rs` — proptest over random `Tx` sequences asserting
   kernel-level invariants (coin/edge conservation).
 - `tests/state_machine.rs` — `proptest-state-machine` driving random
   sequences against a `BTreeMap`-backed Rust reference model with
@@ -861,7 +876,7 @@ This is the first line of defense. Layered as:
 - `tests/allocation.rs` — `allocation-counter` asserts zero heap allocation
   on the hot apply path.
 - `tests/secp256k1.rs` (under `--features secp256k1`) — real ECDSA
-  signatures resolve through `Agreement` end-to-end; forged signatures
+  signatures close through `Proof::Mutual` end-to-end; forged signatures
   reject with `BadSignature`.
 - `tests/map_store.rs` — `MapStore` round-trips and 32-edge chains validate
   the `Store` trait composes with non-bounded backends.
@@ -870,12 +885,12 @@ This is the first line of defense. Layered as:
 
 Use for small exhaustive Rust-native state exploration:
 
-- all short `Op` sequences over small states
+- all short `Tx` sequences over small states
 - no double spend
 - open consumes input coins exactly once
-- resolve consumes input edges exactly once
+- close consumes input edges exactly once
 - payout coins can be reused
-- open/resolve sequences preserve L1 invariants
+- open/close sequences preserve L1 invariants
 - channel/protocol models cover claim/challenge sequences
 
 Stateright is the best immediate bridge between proptest and formal specs
@@ -896,7 +911,7 @@ Use after the kernel API stabilizes.
 Verus is for durable proofs such as:
 
 ```text
-valid(pre) and apply(pre, op) = post
+valid(pre) and apply(pre, tx) = post
 => valid(post)
 ```
 
@@ -917,8 +932,8 @@ Start without Choreo. First prove the math of claims, deadlines, challenges,
 and verdicts under perfect delivery.
 
 The first synchronous L1 model lives in `models/l1.qnt`. It mirrors the Rust
-operation vocabulary at an abstract level: `OpenEdge`, `ResolveEdge`, bounded
-resolve proof kinds, explicit block height for timeout, live coins, live edges,
+operation vocabulary at an abstract level: `OpenEdge`, `CloseEdge`, bounded
+close proof kinds, explicit block height for timeout, live coins, live edges,
 and a finite state universe suitable for simulation and trace export. The
 separate `models/fees.qnt` model pins the payment-accounting invariant:
 principal plus live reserve plus value already paid to the protocol equals
@@ -948,10 +963,10 @@ ergonomics.
 
 Use for temporal/liveness properties:
 
-- no early resolve
-- valid challenge blocks timeout resolve
-- unchallenged claim eventually becomes resolvable under fairness assumptions
-- challenged claim eventually resolves under fairness assumptions
+- no early close
+- valid challenge blocks timeout close
+- unchallenged claim eventually becomes closable under fairness assumptions
+- challenged claim eventually closes under fairness assumptions
 
 The important part is fairness. Liveness properties are false unless the model
 states assumptions about block production, transaction inclusion, and live
@@ -990,7 +1005,7 @@ Verify in layers:
 1. L1 alone
    - UTXO safety
    - edge lifecycle
-   - resolve proof acceptance/rejection
+   - close proof acceptance/rejection
    - coin conservation
 
 2. Validity gadget alone
@@ -1045,13 +1060,15 @@ The kernel-shaped items previously listed here are done:
   `models/traces/`. The Rust runner is `itf::Runner`-based; adding a Quint
   trace test means regenerating fixtures, no Rust changes.
 - Placeholder `Sig` / `Seal` verification has been replaced by a `Verifier`
-  trait the caller wires in. The kernel implements no cryptography. A
-  reference `Secp256k1Verifier` lives under the `secp256k1` feature flag.
+  trait the caller wires in. The kernel implements no cryptography and no
+  proof-admissibility policy; the single `verify_close` method owns all
+  close-validity decisions. A reference `Secp256k1Verifier` lives under the
+  `secp256k1` feature flag.
 
 What's left, in roughly increasing depth:
 
 1. **Adapter layer.** `Call` / `CallResult` / `Claim` / `Evidence` shapes
-   that produce the resolve proofs the kernel's `Verifier` will accept. Out
+   that produce the close proofs the kernel's `Verifier` will accept. Out
    of crate.
 2. **Channel layer.** Off-chain state, signed frontiers, claim/challenge
    timing, watcher obligations. The async/distributed shape moves to Choreo

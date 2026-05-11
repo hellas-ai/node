@@ -1,108 +1,62 @@
-//! Resolve witnesses and the verifier-driven payout-binding policy.
+//! Close witnesses.
+//!
+//! A [`Proof`] is the kernel-visible *shape* of why an edge should
+//! close. All validity checks — terms-hash binding, timeout height,
+//! payout binding, signature, seal — live in the [`crate::Verifier`].
+//! The kernel only routes the proof to the verifier and bookkeeps the
+//! resulting state mutation; it makes no policy decision itself.
 //!
 //! Abstract counterpart: `models/types.qnt::Proof` (witness ADT) and
 //! `models/verifier.qnt` (`proofOk`, `payoutsBound`). The Quint module
 //! treats these as pure predicates over an opaque verifier; the kernel
-//! defers the same check by calling [`crate::Verifier::verify_sig`] /
-//! [`crate::Verifier::verify_seal`] and enforcing per-kind payout binding
-//! inline.
+//! defers the same check by calling [`crate::Verifier::verify_close`].
 
-use super::{Payout, Tx};
 use crate::{
     canonical::Encode,
-    consts::{MAX_EDGE_OUTPUTS, SEAL_LENGTH},
-    context::{Context, Cost},
-    error::InvalidProofReason,
-    list::List,
-    object::{Edge, Parties},
-    primitive::{EdgeId, ProtocolCode, ResolveHash, Sig, TermsHash},
+    consts::SEAL_LENGTH,
+    context::Cost,
+    primitive::{CloseHash, ProtocolCode, Sig},
     terms::Terms,
-    verifier::Verifier,
 };
 
-/// Universal resolve witness kind.
+/// Universal close witness kind.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum ResolveKind {
-    /// Degenerate modelling witness.
-    Basic,
+pub enum CloseKind {
+    /// Cooperative close agreed by both parties.
+    Mutual,
 
-    /// Cooperative resolve agreed by both parties.
-    Agreement,
-
-    /// Timeout resolve under the committed terms.
+    /// Timeout close under the committed terms.
     Timeout,
 
-    /// Correctness dispute resolved for the claimant.
-    ClaimantWins,
-
-    /// Correctness dispute resolved for the challenger.
-    ChallengerWins,
+    /// Correctness violation resolved by a protocol-specific seal.
+    Violation,
 }
 
-impl ResolveKind {
-    /// Returns the canonical one-byte resolve witness tag.
+impl CloseKind {
+    /// Returns the canonical one-byte close witness tag.
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
-            Self::Basic => 0,
-            Self::Agreement => 1,
-            Self::Timeout => 2,
-            Self::ClaimantWins => 3,
-            Self::ChallengerWins => 4,
+            Self::Mutual => 0,
+            Self::Timeout => 1,
+            Self::Violation => 2,
         }
     }
 
     pub(crate) const fn proofs(self) -> u64 {
         match self {
-            Self::Basic | Self::Timeout => 1,
-            Self::Agreement | Self::ClaimantWins | Self::ChallengerWins => 2,
+            Self::Timeout | Self::Violation => 1,
+            Self::Mutual => 2,
         }
     }
 }
 
-/// Cooperative resolve witness signed by both edge parties.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub struct Agreement {
-    maker: Sig,
-    taker: Sig,
-}
-
-impl Agreement {
-    /// Creates a cooperative agreement witness.
-    #[must_use]
-    pub const fn new(maker: Sig, taker: Sig) -> Self {
-        Self { maker, taker }
-    }
-
-    /// Returns the maker signature.
-    #[must_use]
-    pub const fn maker(self) -> Sig {
-        self.maker
-    }
-
-    /// Returns the taker signature.
-    #[must_use]
-    pub const fn taker(self) -> Sig {
-        self.taker
-    }
-
-    fn accepts<V: Verifier + ?Sized>(
-        self,
-        verifier: &V,
-        parties: Parties,
-        hash: ResolveHash,
-    ) -> Result<(), InvalidProofReason> {
-        if verifier.verify_sig(self.maker, parties.maker(), hash)
-            && verifier.verify_sig(self.taker, parties.taker(), hash)
-        {
-            Ok(())
-        } else {
-            Err(InvalidProofReason::BadSignature)
-        }
-    }
-}
-
-/// Compact mode-specific proof result for a dispute outcome.
+/// Compact mode-specific proof result for a violation outcome.
+///
+/// Opaque to the kernel. The seal's bytes encode whatever artifact the
+/// protocol-specific dispute game produces — a TEE attestation, a ZK
+/// proof commitment, a fraud-game commitment — and the [`crate::Verifier`]
+/// alone decides whether it is admissible.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Seal([u8; Self::LENGTH]);
 
@@ -134,7 +88,7 @@ impl Seal {
     /// accepts this shape is decided by the [`crate::Verifier`] passed at
     /// apply time.
     #[must_use]
-    pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
+    pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: CloseHash) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::SEAL_PLACEHOLDER);
         protocol.encode_to(&mut hasher);
@@ -144,44 +98,31 @@ impl Seal {
     }
 }
 
-/// Bounded proof carried by an edge resolve.
+/// Bounded close witness.
 ///
-/// Variants that reveal concrete [`Terms`] read the hash via
-/// `terms.hash()` — a field load now that `Terms` self-computes its
-/// commitment. The kernel never holds a `TermsHash` outside of `Terms`
-/// itself; the two cannot drift.
+/// The kernel routes the proof straight to the [`crate::Verifier`] —
+/// it makes no admissibility decision itself.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Proof {
-    /// Degenerate modelling witness.
-    Basic {
-        /// Terms commitment this proof opens under.
-        terms: TermsHash,
+    /// Cooperative close signed by both edge parties. The signed
+    /// payload is `Tx::payload_hash(edge_id, Mutual, edge.terms(),
+    /// payouts)`; the terms commitment is read from the edge itself, so
+    /// no terms reveal is needed here.
+    Mutual {
+        /// Maker signature.
+        maker: Sig,
+        /// Taker signature.
+        taker: Sig,
     },
 
-    /// Cooperative agreement witness signed by both parties.
-    Agreement {
-        /// Terms commitment this proof opens under.
-        terms: TermsHash,
-        /// Agreement signatures.
-        agreement: Agreement,
-    },
-
-    /// Timeout witness under committed terms.
+    /// Timeout close under committed terms.
     Timeout {
         /// Concrete terms revealed to check the timeout.
         terms: Terms,
     },
 
-    /// Correctness witness resolving for the claimant.
-    ClaimantWins {
-        /// Concrete terms revealed to select the mode verifier.
-        terms: Terms,
-        /// Compact mode-specific verifier result.
-        seal: Seal,
-    },
-
-    /// Correctness witness resolving for the challenger.
-    ChallengerWins {
+    /// Correctness violation witness resolved by a mode-specific seal.
+    Violation {
         /// Concrete terms revealed to select the mode verifier.
         terms: Terms,
         /// Compact mode-specific verifier result.
@@ -190,56 +131,31 @@ pub enum Proof {
 }
 
 impl Proof {
-    /// Creates a basic resolve proof.
+    /// Creates a cooperative close witness.
     #[must_use]
-    pub const fn basic(terms: TermsHash) -> Self {
-        Self::Basic { terms }
+    pub const fn mutual(maker: Sig, taker: Sig) -> Self {
+        Self::Mutual { maker, taker }
     }
 
-    /// Creates a cooperative agreement resolve witness.
-    #[must_use]
-    pub const fn agreement(terms: TermsHash, agreement: Agreement) -> Self {
-        Self::Agreement { terms, agreement }
-    }
-
-    /// Creates a timeout resolve witness.
+    /// Creates a timeout close witness.
     #[must_use]
     pub const fn timeout(terms: Terms) -> Self {
         Self::Timeout { terms }
     }
 
-    /// Creates a claimant-wins resolve witness.
+    /// Creates a correctness-violation close witness.
     #[must_use]
-    pub const fn claimant_wins(terms: Terms, seal: Seal) -> Self {
-        Self::ClaimantWins { terms, seal }
+    pub const fn violation(terms: Terms, seal: Seal) -> Self {
+        Self::Violation { terms, seal }
     }
 
-    /// Creates a challenger-wins resolve witness.
+    /// Returns the close witness kind.
     #[must_use]
-    pub const fn challenger_wins(terms: Terms, seal: Seal) -> Self {
-        Self::ChallengerWins { terms, seal }
-    }
-
-    /// Returns the resolve witness kind.
-    #[must_use]
-    pub const fn kind(&self) -> ResolveKind {
+    pub const fn kind(&self) -> CloseKind {
         match self {
-            Self::Basic { .. } => ResolveKind::Basic,
-            Self::Agreement { .. } => ResolveKind::Agreement,
-            Self::Timeout { .. } => ResolveKind::Timeout,
-            Self::ClaimantWins { .. } => ResolveKind::ClaimantWins,
-            Self::ChallengerWins { .. } => ResolveKind::ChallengerWins,
-        }
-    }
-
-    /// Returns the terms commitment this proof opens under.
-    #[must_use]
-    pub const fn terms(&self) -> TermsHash {
-        match self {
-            Self::Basic { terms } | Self::Agreement { terms, .. } => *terms,
-            Self::Timeout { terms }
-            | Self::ClaimantWins { terms, .. }
-            | Self::ChallengerWins { terms, .. } => terms.hash(),
+            Self::Mutual { .. } => CloseKind::Mutual,
+            Self::Timeout { .. } => CloseKind::Timeout,
+            Self::Violation { .. } => CloseKind::Violation,
         }
     }
 
@@ -247,97 +163,5 @@ impl Proof {
     #[must_use]
     pub const fn cost(&self) -> Cost {
         Cost::new(0, 0, self.kind().proofs())
-    }
-
-    pub(super) fn accepts<V: Verifier + ?Sized>(
-        &self,
-        context: Context,
-        verifier: &V,
-        input: EdgeId,
-        outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-        edge: Edge,
-    ) -> Result<(), InvalidProofReason> {
-        match self {
-            Self::Basic { terms } => {
-                #[cfg(feature = "fake-crypto")]
-                {
-                    if *terms == edge.terms() {
-                        Ok(())
-                    } else {
-                        Err(InvalidProofReason::TermsMismatch)
-                    }
-                }
-
-                #[cfg(not(feature = "fake-crypto"))]
-                {
-                    let _ = terms;
-                    Err(InvalidProofReason::BasicNotAccepted)
-                }
-            }
-            Self::Agreement { terms, agreement } => {
-                if *terms != edge.terms() {
-                    return Err(InvalidProofReason::TermsMismatch);
-                }
-                agreement.accepts(
-                    verifier,
-                    edge.parties(),
-                    Tx::payload_hash(input, ResolveKind::Agreement, *terms, outputs),
-                )
-            }
-            Self::Timeout { terms } => {
-                if terms.hash() != edge.terms() {
-                    return Err(InvalidProofReason::TermsMismatch);
-                }
-                if context.block_height() < terms.timeout() {
-                    return Err(InvalidProofReason::TimeoutNotReached);
-                }
-                if outputs != terms.timeout_outputs() {
-                    return Err(InvalidProofReason::PayoutMismatch);
-                }
-                Ok(())
-            }
-            Self::ClaimantWins { terms, seal } => Self::accepts_seal(
-                verifier,
-                input,
-                outputs,
-                edge,
-                terms.protocol(),
-                terms.hash(),
-                *seal,
-                ResolveKind::ClaimantWins,
-            ),
-            Self::ChallengerWins { terms, seal } => Self::accepts_seal(
-                verifier,
-                input,
-                outputs,
-                edge,
-                terms.protocol(),
-                terms.hash(),
-                *seal,
-                ResolveKind::ChallengerWins,
-            ),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn accepts_seal<V: Verifier + ?Sized>(
-        verifier: &V,
-        input: EdgeId,
-        outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-        edge: Edge,
-        protocol: ProtocolCode,
-        terms_hash: TermsHash,
-        seal: Seal,
-        kind: ResolveKind,
-    ) -> Result<(), InvalidProofReason> {
-        if terms_hash != edge.terms() {
-            return Err(InvalidProofReason::TermsMismatch);
-        }
-        let hash = Tx::payload_hash(input, kind, terms_hash, outputs);
-        if verifier.verify_seal(seal, protocol, kind, hash) {
-            Ok(())
-        } else {
-            Err(InvalidProofReason::BadSeal)
-        }
     }
 }

@@ -15,12 +15,12 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 
 | Concern                | Alto today                                              | Hellas-kernel                                  |
 |------------------------|----------------------------------------------------------|------------------------------------------------|
-| Op enum                | `Transaction { Transfer, MergeCoin }`                    | `Op { Open, Resolve }`                         |
+| Tx enum                | `Transaction { Transfer, MergeCoin }`                    | `Tx { Open, Close }`                           |
 | Object                 | `Coin { owner: Address, value: u64 }`                    | `Coin` (same shape) + `Edge`                   |
 | Object id              | `ObjectId = Sha256 Digest`                               | `CoinId`, `EdgeId`                             |
 | Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` (ECDSA)                       |
 | STF                    | `execute_all` / `execute_proposal` (inline, async)       | `State::apply*` (sync, trait-bounded)          |
-| Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Tx` traits (sync)                     |
+| Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Batch` traits (sync)                  |
 | Crypto                 | Inline `Transaction::verify_signature`                   | `Verifier` trait                               |
 | Context                | `Context<Digest, PublicKey>` + height + timestamp        | `Context { height, hash, fees }`               |
 | Genesis                | `Vec<(Address, u64)>` looped at height 0                 | `State::genesis(store, &[Genesis::coin(...)])` |
@@ -33,7 +33,7 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
   `execute_all`, `execute_proposal`, `apply_transaction`,
   `maybe_seed_genesis` functions all go.
 - `types/src/lib.rs::Transaction` enum and impl block — replaced by
-  `hellas_kernel::Op`.
+  `hellas_kernel::Tx`.
 - `types/src/lib.rs::Coin` — replaced by `hellas_kernel::Coin`. (Same
   shape, but coming from the kernel crate so tests and protocol all
   point to one source of truth.)
@@ -61,15 +61,18 @@ Where `UserVerifier` is a unit struct (or carries any policy state
 alto needs — e.g. a precomputed-sig cache).
 
 ```rust
-// chain/src/execution/verifier.rs (new file, ~40 lines)
+// chain/src/execution/verifier.rs (new file, ~60 lines)
 
-use hellas_kernel::{Key, ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, Verifier};
+use hellas_kernel::{
+    CloseKind, Context, Edge, EdgeId, InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Payout,
+    Proof, Sig, Tx, Verifier,
+};
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 
 pub struct UserVerifier;
 
-impl Verifier for UserVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool {
+impl UserVerifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::CloseHash) -> bool {
         let Ok(vk) = VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
             return false;
         };
@@ -78,10 +81,44 @@ impl Verifier for UserVerifier {
         };
         vk.verify(hash.as_bytes(), &sig).is_ok()
     }
+}
 
-    fn verify_seal(&self, _seal: Seal, _proto: ProtocolCode, _kind: ResolveKind, _hash: ResolveHash) -> bool {
-        // No dispute seals in v1. Re-enable per protocol mode later.
-        false
+impl Verifier for UserVerifier {
+    fn verify_close(
+        &self,
+        edge_id: EdgeId,
+        edge: &Edge,
+        payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
+        proof: &Proof,
+        context: &Context,
+    ) -> Result<(), InvalidProofReason> {
+        match proof {
+            Proof::Mutual { maker, taker } => {
+                let hash = Tx::payload_hash(edge_id, CloseKind::Mutual, edge.terms(), payouts);
+                let parties = edge.parties();
+                if self.verify_sig(*maker, parties.maker(), hash)
+                    && self.verify_sig(*taker, parties.taker(), hash)
+                {
+                    Ok(())
+                } else {
+                    Err(InvalidProofReason::BadSignature)
+                }
+            }
+            Proof::Timeout { terms } => {
+                if terms.hash() != edge.terms() {
+                    return Err(InvalidProofReason::TermsMismatch);
+                }
+                if context.block_height() < terms.timeout() {
+                    return Err(InvalidProofReason::TimeoutNotReached);
+                }
+                if payouts != terms.timeout_outputs() {
+                    return Err(InvalidProofReason::PayoutMismatch);
+                }
+                Ok(())
+            }
+            // No dispute seals in v1. Re-enable per protocol mode later.
+            Proof::Violation { .. } => Err(InvalidProofReason::BadSeal),
+        }
     }
 }
 ```
@@ -89,12 +126,12 @@ impl Verifier for UserVerifier {
 **Important boundary decision: WebAuthn lives in admission, not in the
 kernel.** Alto's mempool / proposer is responsible for unwrapping
 `WebAuthnSignature` (with `authenticator_data` + `client_data_json`)
-into a bare 64-byte ECDSA `Sig` before the op reaches the kernel:
+into a bare 64-byte ECDSA `Sig` before the tx reaches the kernel:
 
 - Admission verifies the WebAuthn envelope binds to the expected
-  resolve hash (`client_data_json.challenge == base64(resolve_hash)`).
+  close hash (`client_data_json.challenge == base64(close_hash)`).
 - Admission extracts the 64-byte ECDSA bytes and constructs the
-  kernel `Op` with `Sig::from_bytes(ecdsa)`.
+  kernel `Tx` with `Sig::from_bytes(ecdsa)`.
 - Kernel re-verifies the inner ECDSA at apply time via the `Verifier`
   trait. Defense-in-depth over the cryptographically meaningful piece.
 
@@ -102,10 +139,10 @@ If you decide later to drop WebAuthn entirely (raw secp256r1 sigs
 direct from clients), the admission step shrinks but the kernel stays
 the same.
 
-### 2. `impl hellas_kernel::Store for UtxoDb<E>` (and a `Tx` adapter)
+### 2. `impl hellas_kernel::Store for UtxoDb<E>` (and a `Batch` adapter)
 
 The friction: alto's `UtxoDb` is **async** (`batches.get(id).await`),
-and the kernel's `Store::Tx` is **sync**. Bridging requires alto to
+and the kernel's `Store::Batch` is **sync**. Bridging requires alto to
 pre-load the working set for the block into a sync in-memory map
 before invoking the kernel.
 
@@ -113,7 +150,7 @@ before invoking the kernel.
 // chain/src/execution/store.rs (additions, ~120 lines)
 
 use std::collections::HashMap;
-use hellas_kernel::{Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, Store, Tx};
+use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, Store};
 
 /// Synchronous working set for one block's apply pass. Loaded async
 /// from `UtxoDb` before kernel invocation; the diff (writes + deletes)
@@ -125,14 +162,14 @@ pub struct BlockWorkingSet {
 }
 
 impl Store for BlockWorkingSet { /* ... */ }
-impl<'a> Tx for &'a mut BlockWorkingSet { /* ... */ }
+impl<'a> Batch for &'a mut BlockWorkingSet { /* ... */ }
 ```
 
 `BlockWorkingSet`:
 - Pre-loaded with every `CoinId` / `EdgeId` referenced by the block's
-  ops (alto walks the ops to extract the access surface before apply).
-- `Tx::coin(id)` and `Tx::edge(id)` return from the map; `tx.insert_*`
-  and `tx.remove_*` mutate the map.
+  txs (alto walks the txs to extract the access surface before apply).
+- `Batch::coin(id)` and `Batch::edge(id)` return from the map;
+  `batch.insert_*` and `batch.remove_*` mutate the map.
 - After kernel commit, alto replays the map's writes into the
   `Unmerkleized` batch (`batch = batch.write(id, value)`), which
   produces the next merkleized state and a new root.
@@ -158,11 +195,11 @@ to:
 async fn execute_block<E>(
     db: &UtxoDatabase<E>,
     context: Context,  // hellas_kernel::Context
-    ops: Vec<hellas_kernel::Op>,
+    txs: Vec<hellas_kernel::Tx>,
 ) -> Result<(Diff, Digest, UtxoSyncTarget), BatchError>
 {
-    // 1. Walk ops to collect referenced object ids
-    let touched: BTreeSet<ObjectId> = ops.iter().flat_map(touched_ids).collect();
+    // 1. Walk txs to collect referenced object ids
+    let touched: BTreeSet<ObjectId> = txs.iter().flat_map(touched_ids).collect();
 
     // 2. Pre-load working set from async store
     let mut ws = BlockWorkingSet::load(db, &touched).await;
@@ -172,7 +209,7 @@ async fn execute_block<E>(
 
     // 4. Invoke kernel
     let mut events = Vec::new();
-    state.apply_iter(context, &UserVerifier, ops, |_, ev| events.push(ev.clone()))?;
+    state.apply_iter(context, &UserVerifier, txs, |_, ev| events.push(ev.clone()))?;
 
     // 5. Materialize merkleized state from the working set's writes
     let batch = state.into_store().into_batch(db).await;
@@ -183,7 +220,7 @@ async fn execute_block<E>(
 ```
 
 Notes:
-- `touched_ids(op)` is the closest thing alto needs to the deleted
+- `touched_ids(tx)` is the closest thing alto needs to the deleted
   `Access` set, but it's local-to-alto, doesn't need to be
   kernel-public, and only collects ids (not direction).
 - `State::new` doesn't exist on the public kernel API today — only
@@ -223,9 +260,9 @@ so when alto wires real fees the kernel side is unchanged.
 Alto's mempool stays at the alto layer (kernel doesn't see mempools).
 The mempool's job changes:
 
-- Accepts `Op` instead of `Transaction`.
+- Accepts `Tx` instead of `Transaction`.
 - Pre-admission: WebAuthn envelope validation (extract ECDSA sig,
-  verify challenge binding, extract the kernel `Op` shape).
+  verify challenge binding, extract the kernel `Tx` shape).
 - Drops the `is_transient_for_mempool` classification — kernel's
   `ApplyError::MissingCoin` is the moral equivalent; the mempool
   can pattern-match on `ApplyError` variants to decide retain-vs-drop.
@@ -236,7 +273,7 @@ The mempool's job changes:
    just exposes the existing constructor.
 2. **Alto: bring `hellas-kernel` in as a path dep.** Update `Cargo.toml`
    under `chain/`.
-3. **Alto: write `BlockWorkingSet` + trait impls** (`Store` + `Tx`)
+3. **Alto: write `BlockWorkingSet` + trait impls** (`Store` + `Batch`)
    in `chain/src/execution/store.rs`. Write a small test that loads,
    mutates, replays.
 4. **Alto: write `UserVerifier`** in `chain/src/execution/verifier.rs`.
@@ -252,7 +289,7 @@ The mempool's job changes:
    from `types/src/lib.rs`. WebAuthn envelope type itself stays (used
    by the RPC submission path) but its `verify` impl moves outside.
 8. **Alto: update RPC submission path** to unwrap WebAuthn into a
-   kernel `Op` before mempool insertion.
+   kernel `Tx` before mempool insertion.
 
 ## Open questions to resolve during Phase 1
 
@@ -265,8 +302,8 @@ The mempool's job changes:
    shared `ObjectId` (both `CoinId` and `EdgeId` are 32-byte
    domain-separated BLAKE3 digests; their id spaces don't collide),
    with a thin `enum Object { Coin(Coin), Edge(Edge) }` as the MMR's
-   value type. Alto's `BlockWorkingSet` exposes `Tx::coin` and
-   `Tx::edge` by pattern-matching on the variant. One root, one
+   value type. Alto's `BlockWorkingSet` exposes `Batch::coin` and
+   `Batch::edge` by pattern-matching on the variant. One root, one
    commit, atomic by construction.
 
 2. **Validator-set rotation vs `Context`.** Alto's existing
@@ -281,12 +318,12 @@ The mempool's job changes:
    ids at the API layer. They reconcile cleanly: both kernel ids are
    32-byte domain-separated BLAKE3 digests with disjoint id spaces, so
    they slot into a single `ObjectId`-keyed MMR. The kernel's typing is
-   preserved at the API surface (`Tx::coin(CoinId)` vs `Tx::edge(EdgeId)`),
+   preserved at the API surface (`Batch::coin(CoinId)` vs `Batch::edge(EdgeId)`),
    with the conversion happening inside `BlockWorkingSet`.
 
 4. **Block envelope.** Alto's `HellasBlock` carries
    `(height, timestamp, parent, state_root, sync_target, [Transaction])`.
-   Replace `[Transaction]` with `Vec<Op>` (or a length-prefixed encoded
+   Replace `[Transaction]` with `Vec<Tx>` (or a length-prefixed encoded
    blob). Block hashing input changes — coordinate with whatever
    downstream consumers (RPC, indexer) decode `HellasBlock`.
 
@@ -309,7 +346,9 @@ replaced by trait impls and kernel calls.
 ## Out of scope for Phase 1
 
 - Real fee model (Fees::ZERO suffices).
-- Dispute seals / `verify_seal` returning anything other than `false`.
+- Dispute seals: admitting `Proof::Violation` requires a
+  protocol-specific seal verifier; v1 leaves `UserVerifier` returning
+  `Err(InvalidProofReason::BadSeal)` for that arm.
 - Adding `BlockTime` / timestamp to `Context`.
 - Validator-set-bound proofs.
 - Edge fanout > current `MAX_EDGE_INPUTS=8` / `MAX_EDGE_OUTPUTS=4`
@@ -323,6 +362,6 @@ Once alto runs through the kernel:
 - CLI subcommand `node validator` spawns alto's consensus driver.
 - CLI subcommand `node worker` keeps the existing `Execute` RPC.
 - Validator-exposed external interface = kernel public types
-  (`Op`, `Diff`, `Event`) over gRPC. Proto definitions for `Op`/`Block`
+  (`Tx`, `Diff`, `Event`) over gRPC. Proto definitions for `Tx`/`Block`
   /`Event` likely live in this crate as a `tonic`-feature-gated module
   to avoid two sources of truth.

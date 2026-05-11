@@ -1,7 +1,7 @@
 //! Public events and private store effects.
 //!
 //! Abstract counterpart: `models/types.qnt::Event` (the public events
-//! `EdgeOpenedEvent` / `EdgeResolvedEvent`) and the `lastEvent` recording
+//! `EdgeOpenedEvent` / `EdgeClosedEvent`) and the `lastEvent` recording
 //! var in `models/l1.qnt`. ITF replay (`tests/itf.rs`) drives the kernel
 //! and asserts each emitted [`EventKind`] against the abstract event the
 //! producing action recorded.
@@ -16,7 +16,7 @@ use crate::{
 };
 
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
-type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
+type CloseCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 
 /// Deterministic event diff produced by an ordered operation batch.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -98,11 +98,11 @@ pub enum EventKind {
         output: EdgeId,
     },
 
-    /// One edge was resolved into bounded owner-only coins.
-    EdgeResolved {
-        /// Edge consumed by the resolve.
+    /// One edge was closed into bounded owner-only coins.
+    EdgeClosed {
+        /// Edge consumed by the close.
         input: EdgeId,
-        /// Coins produced by the resolve.
+        /// Coins produced by the close.
         outputs: List<CoinId, MAX_EDGE_OUTPUTS>,
     },
 }
@@ -130,14 +130,14 @@ impl Change {
         }
     }
 
-    pub(super) fn resolve(input: (EdgeId, Edge), outputs: &ResolveCoins) -> Self {
+    pub(super) fn close(input: (EdgeId, Edge), outputs: &CloseCoins) -> Self {
         let event = Event {
-            kind: EventKind::EdgeResolved {
+            kind: EventKind::EdgeClosed {
                 input: input.0,
                 outputs: Self::ids(outputs),
             },
         };
-        let effect = Effect::resolve(input, outputs.clone());
+        let effect = Effect::close(input, outputs.clone());
 
         Self { event, effect }
     }
@@ -168,9 +168,9 @@ enum Effect {
         coins: OpenCoins,
         edge: (EdgeId, Edge),
     },
-    Resolve {
+    Close {
         edge: (EdgeId, Edge),
-        coins: ResolveCoins,
+        coins: CloseCoins,
     },
 }
 
@@ -179,8 +179,8 @@ impl Effect {
         Self::Open { edge, coins }
     }
 
-    const fn resolve(edge: (EdgeId, Edge), coins: ResolveCoins) -> Self {
-        Self::Resolve { edge, coins }
+    const fn close(edge: (EdgeId, Edge), coins: CloseCoins) -> Self {
+        Self::Close { edge, coins }
     }
 
     fn fold<B: Batch>(&self, batch: &mut B) -> KernelResult<()> {
@@ -189,7 +189,7 @@ impl Effect {
                 Self::remove_coins(batch, coins)?;
                 Self::insert_edge(batch, *edge)
             }
-            Self::Resolve { edge, coins } => {
+            Self::Close { edge, coins } => {
                 Self::remove_edge(batch, *edge)?;
                 Self::insert_coins(batch, coins)
             }

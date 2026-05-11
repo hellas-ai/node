@@ -17,7 +17,7 @@
 //!   integrity story is at the *derivation site*: the kernel's
 //!   `CoinId::genesis`/`CoinId::payout`/`Tx::edge_id_of` helpers are the
 //!   canonical ways to produce *fresh* ids.
-//! - **Cryptographic commitments** ([`TermsHash`], [`ResolveHash`]).
+//! - **Cryptographic commitments** ([`TermsHash`], [`CloseHash`]).
 //!   These are pure derived outputs of `Terms::hash()` /
 //!   `Tx::payload_hash`. They implement [`Encode`] only — you can
 //!   serialize a commitment you hold, you cannot deserialize one in
@@ -129,7 +129,7 @@ impl CoinId {
         Self(crate::canonical::hash(crate::consts::COIN_GENESIS, &index))
     }
 
-    /// Derives the canonical id for one resolve payout coin.
+    /// Derives the canonical id for one close payout coin.
     pub(crate) fn payout(edge: EdgeId, index: usize, owner: Key) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::COIN_PAYOUT);
@@ -241,15 +241,15 @@ impl Encode for TermsHash {
 
 // TermsHash deliberately does *not* implement `Decode`.
 
-/// Commitment to one concrete resolve payload.
+/// Commitment to one concrete close payload.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ResolveHash([u8; Self::LENGTH]);
+pub struct CloseHash([u8; Self::LENGTH]);
 
-impl ResolveHash {
-    /// Encoded length of a resolve commitment.
+impl CloseHash {
+    /// Encoded length of a close commitment.
     pub const LENGTH: usize = HASH_LENGTH;
 
-    /// Reconstructs a resolve commitment from canonical bytes.
+    /// Reconstructs a close commitment from canonical bytes.
     ///
     /// `pub(crate)` by design: see [`CoinId::from_bytes`].
     pub(crate) const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
@@ -269,7 +269,7 @@ impl ResolveHash {
     }
 }
 
-impl Encode for ResolveHash {
+impl Encode for CloseHash {
     const MAX_ENCODED_SIZE: usize = Self::LENGTH;
     fn encoded_size(&self) -> usize {
         Self::LENGTH
@@ -279,7 +279,7 @@ impl Encode for ResolveHash {
     }
 }
 
-// ResolveHash deliberately does *not* implement `Decode`.
+// CloseHash deliberately does *not* implement `Decode`.
 
 /// Compact settlement signature bytes.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -319,18 +319,18 @@ impl Sig {
     /// accepts this shape is decided by the [`crate::Verifier`] passed at
     /// apply time.
     #[must_use]
-    pub fn placeholder(key: Key, hash: ResolveHash) -> Self {
+    pub fn placeholder(key: Key, hash: CloseHash) -> Self {
         let mut out = [0_u8; Self::LENGTH];
         let first = Self::half(key, hash, 0);
         let second = Self::half(key, hash, 1);
 
-        out[..ResolveHash::LENGTH].copy_from_slice(&first);
-        out[ResolveHash::LENGTH..].copy_from_slice(&second);
+        out[..CloseHash::LENGTH].copy_from_slice(&first);
+        out[CloseHash::LENGTH..].copy_from_slice(&second);
 
         Self(out)
     }
 
-    fn half(key: Key, hash: ResolveHash, index: u8) -> [u8; ResolveHash::LENGTH] {
+    fn half(key: Key, hash: CloseHash, index: u8) -> [u8; CloseHash::LENGTH] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::SIG_PLACEHOLDER);
         index.encode_to(&mut hasher);

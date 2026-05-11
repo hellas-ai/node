@@ -7,8 +7,8 @@
 //
 //   Coin   ↔ src/object.rs::Coin       (live coin id, abstracted to a tag)
 //   Edge   ↔ src/object.rs::Edge       (live edge id, abstracted to a tag)
-//   Proof  ↔ src/op/proof.rs::Proof    (resolve witness kind)
-//   Input  ↔ src/op/mod.rs::Op + Tick/Idle scaffolding
+//   Proof  ↔ src/tx/proof.rs::Proof    (close witness kind)
+//   Input  ↔ src/tx/mod.rs::Tx + Tick/Idle scaffolding
 //   Event  ↔ src/event.rs::EventKind
 //
 // The module is type-only — no state vars, no actions, no predicates that
@@ -18,8 +18,8 @@
 module types {
   // The fixed-finite universe of coin ids the small L1 model explores. Two
   // genesis coins (MakerCoin, TakerCoin) plus four payout outputs let us
-  // exercise open → resolve → open → resolve sequences without an unbounded
-  // id generator. The outputs of Edge1's resolve are exactly Edge2's
+  // exercise open → close → open → close sequences without an unbounded
+  // id generator. The outputs of Edge1's close are exactly Edge2's
   // funding inputs.
   type Coin =
     | MakerCoin
@@ -30,21 +30,18 @@ module types {
     | TakerOut2
 
   // The fixed-finite universe of edge ids. Edge2 is funded from Edge1's
-  // resolve outputs, so at most one is ever live in a well-formed trace.
+  // close outputs, so at most one is ever live in a well-formed trace.
   type Edge =
     | Edge1
     | Edge2
 
-  // Resolve witness kind. `Basic` is the modelling/fake-crypto witness;
-  // production Rust accepts it only under the `fake-crypto` feature.
-  // `Timeout` is the proof-free production path. Agreement / ClaimantWins /
-  // ChallengerWins stand in for preverified evidence.
+  // Close witness kind. The kernel admits exactly these three shapes; all
+  // close-validity policy (terms binding, height, payout shape, signature,
+  // seal) lives in the verifier.
   type Proof =
-    | Basic
-    | Agreement
+    | Mutual
     | Timeout
-    | ClaimantWins
-    | ChallengerWins
+    | Violation
 
   // The action that produced the current state. `NoInput` marks the initial
   // state; every other action records its input here. The Rust ITF runner
@@ -53,17 +50,17 @@ module types {
   type Input =
     | NoInput
     | OpenInput(Edge)
-    | ResolveInput({ edge: Edge, proof: Proof, makerPay: int, takerPay: int })
+    | CloseInput({ edge: Edge, proof: Proof, makerPay: int, takerPay: int })
     | TickInput
     | IdleInput
 
   // Public-event abstraction emitted by the action that produced the
   // current state. `NoEvent` marks init/tick/idle steps that change no live
-  // objects. Open / Resolve produce `EdgeOpenedEvent` / `EdgeResolvedEvent`.
+  // objects. Open / Close produce `EdgeOpenedEvent` / `EdgeClosedEvent`.
   type Event =
     | NoEvent
     | EdgeOpenedEvent(Edge)
-    | EdgeResolvedEvent(Edge)
+    | EdgeClosedEvent(Edge)
 
   // Closed-universe constants. New id families must be added here before
   // they can appear in invariants without breaking `liveCoinsAreKnown` /
@@ -77,7 +74,7 @@ module types {
     TakerOut2,
   )
   pure val AllEdges = Set(Edge1, Edge2)
-  pure val AllProofs = Set(Basic, Agreement, Timeout, ClaimantWins, ChallengerWins)
+  pure val AllProofs = Set(Mutual, Timeout, Violation)
 
   // Concrete model parameters. Picked small for finite exploration.
   pure val TimeoutHeight = 2
@@ -92,9 +89,9 @@ module types {
   // equals this constant in every reachable state.
   pure val Total = EdgeValue
 
-  // Canonical input/output wiring. Each edge's funding sources and resolve
+  // Canonical input/output wiring. Each edge's funding sources and close
   // outputs are positionally fixed; the kernel does the same via id
-  // derivation in `Open::id` and `CoinId::payout`.
+  // derivation in `Tx::edge_id_of` and `CoinId::payout`.
   pure def makerInput(e: Edge): Coin =
     match e {
       | Edge1 => MakerCoin

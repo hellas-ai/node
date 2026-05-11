@@ -7,7 +7,7 @@
 //! `models/deps/assumptions.qnt`.
 
 use crate::{
-    error::{InsertError, InvalidOpenReason, InvalidResolveReason, KernelResult},
+    error::{InsertError, InvalidCloseReason, InvalidOpenReason, KernelResult},
     list::List,
     primitive::{CoinId, Key, TermsHash},
     store::Batch,
@@ -106,24 +106,24 @@ impl Edge {
         Ok(Self::new(value, reserve, parties, terms))
     }
 
-    /// Validates a resolve against the edge's locked principal and reserve.
+    /// Validates a close against the edge's locked principal and reserve.
     ///
     /// Payouts must sum to exactly `self.value` (the principal locked at
-    /// open). The reserve covers the resolve fee; any unspent reserve
+    /// open). The reserve covers the close fee; any unspent reserve
     /// (`self.reserve - fee`) is *burned*, not refunded — this is the
     /// protocol's deflationary tip, modelled by the `paid` accumulator
     /// in `models/fees.qnt`.
-    pub(super) fn resolves<const N: usize>(
+    pub(super) fn closes<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,
         fee: u64,
-    ) -> Result<(), InvalidResolveReason> {
+    ) -> Result<(), InvalidCloseReason> {
         if fee > self.reserve {
-            return Err(InvalidResolveReason::ReserveTooSmall);
+            return Err(InvalidCloseReason::ReserveTooSmall);
         }
         match Self::total(coins) {
-            None => Err(InvalidResolveReason::PayoutOverflow),
-            Some(total) if total != self.value => Err(InvalidResolveReason::ValueMismatch),
+            None => Err(InvalidCloseReason::PayoutOverflow),
+            Some(total) if total != self.value => Err(InvalidCloseReason::ValueMismatch),
             Some(_) => Ok(()),
         }
     }
@@ -143,7 +143,7 @@ impl Edge {
         self.value
     }
 
-    /// Returns the prepaid reserve consumed when this edge resolves.
+    /// Returns the prepaid reserve consumed when this edge closes.
     #[must_use]
     pub const fn reserve(self) -> u64 {
         self.reserve

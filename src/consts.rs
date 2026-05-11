@@ -5,7 +5,7 @@
 //! Changing any value here is a **protocol-incompatible change**. Every
 //! deployment must agree on these, and every BLAKE3 commitment computed
 //! by the kernel depends on them — coin ids, edge ids, terms commitments,
-//! and resolve hashes would all shift under a different choice of sizes
+//! and close hashes would all shift under a different choice of sizes
 //! or domain separators.
 //!
 //! Group by area; document each constant's role; never inline a "magic
@@ -14,7 +14,7 @@
 // ── Identifier and hash sizes (bytes) ─────────────────────────────────
 
 /// Length of every kernel hash output. BLAKE3-256 produces a 32-byte
-/// digest; every commitment ([`crate::TermsHash`], [`crate::ResolveHash`])
+/// digest; every commitment ([`crate::TermsHash`], [`crate::CloseHash`])
 /// and every derived identifier ([`crate::CoinId`], [`crate::EdgeId`],
 /// [`crate::BlockHash`]) is this size.
 pub(crate) const HASH_LENGTH: usize = 32;
@@ -52,10 +52,10 @@ pub const MAX_PARTY_INPUTS: usize = 4;
 /// `2 * MAX_PARTY_INPUTS`.
 pub const MAX_EDGE_INPUTS: usize = MAX_PARTY_INPUTS * 2;
 
-/// Maximum coins that can be produced by one v1 edge resolve.
+/// Maximum coins that can be produced by one v1 edge close.
 ///
 /// Four outputs leaves room for maker, taker, and small protocol-defined
-/// splits without making every resolve pay for an unbounded payout
+/// splits without making every close pay for an unbounded payout
 /// fanout. Raising this is also a chain-version change.
 pub const MAX_EDGE_OUTPUTS: usize = 4;
 
@@ -77,18 +77,18 @@ pub(crate) const COIN_PAYOUT: &[u8] = b"hellas.edge.coin.v1";
 /// taker funding ids.
 pub(crate) const EDGE_OPEN: &[u8] = b"hellas.edge.edge.v1";
 
-/// Prefix for resolve payload hash. Inputs: edge id, resolve kind tag,
+/// Prefix for close payload hash. Inputs: edge id, close kind tag,
 /// terms hash, payouts.
-pub(crate) const RESOLVE: &[u8] = b"hellas.edge.resolve.v1";
+pub(crate) const CLOSE: &[u8] = b"hellas.edge.close.v1";
 
 /// Prefix for the basic-terms commitment. Inputs: protocol code,
 /// parties, timeout height, timeout payouts.
 pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v1";
 
 /// Prefix for the deterministic seal placeholder used by tests and
-/// modelling. Inputs: protocol code, resolve kind tag, resolve hash.
+/// modelling. Inputs: protocol code, close kind tag, close hash.
 pub(crate) const SEAL_PLACEHOLDER: &[u8] = b"hellas.seal.placeholder.v1";
 
 /// Prefix for the deterministic signature placeholder used by tests and
-/// modelling. Inputs: half index (0 or 1), key, resolve hash.
+/// modelling. Inputs: half index (0 or 1), key, close hash.
 pub(crate) const SIG_PLACEHOLDER: &[u8] = b"hellas.sig.placeholder.v1";

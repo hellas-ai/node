@@ -3,7 +3,7 @@
 //! No direct abstract counterpart — the L1 model treats terms as opaque
 //! constants (`TimeoutHeight`, `MakerPayout`, `TakerPayout` in
 //! `models/types.qnt`). The Rust kernel commits to a structured [`Terms`]
-//! body and binds it via [`TermsHash`] so resolves can carry only the
+//! body and binds it via [`TermsHash`] so closes can carry only the
 //! commitment, not the full payload.
 //!
 //! [`Terms`] computes its [`TermsHash`] at construction and stores it
