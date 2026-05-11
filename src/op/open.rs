@@ -10,12 +10,13 @@ use super::{
     ResolveKind, duplicate, units,
 };
 use crate::{
+    canonical::Encode,
     context::{Context, Cost},
     error::{ApplyError, InvalidOpenReason, KernelResult},
     event::Change,
     list::List,
     object::{Coin, Edge, Parties},
-    primitive::{CoinId, Digest, EdgeId, TermsHash},
+    primitive::{CoinId, EdgeId, TermsHash},
     store::Tx,
     terms::Terms,
 };
@@ -168,21 +169,12 @@ impl Open {
     }
 
     fn id(funding: &Funding, terms_hash: TermsHash) -> EdgeId {
-        let mut digest = Digest::new(crate::domain::EDGE_OPEN);
-
-        digest.bytes(terms_hash.as_bytes());
-        Self::ids(&mut digest, &funding.maker);
-        Self::ids(&mut digest, &funding.taker);
-
-        EdgeId::from_digest(digest)
-    }
-
-    fn ids(digest: &mut Digest, ids: &PartyCoins) {
-        digest.usize(ids.len());
-
-        for id in ids {
-            digest.bytes(id.as_bytes());
-        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(crate::domain::EDGE_OPEN);
+        terms_hash.encode_to(&mut hasher);
+        funding.maker.encode_to(&mut hasher);
+        funding.taker.encode_to(&mut hasher);
+        EdgeId::from_bytes(*hasher.finalize().as_bytes())
     }
 
     fn duplicate_input(&self) -> Option<CoinId> {
