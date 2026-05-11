@@ -7,13 +7,14 @@
 //! [`crate::Verifier::verify_seal`] and enforcing per-kind payout binding
 //! inline.
 
-use super::{Resolve, SEAL_LENGTH};
+use super::{MAX_EDGE_OUTPUTS, Payout, SEAL_LENGTH, Tx};
 use crate::{
     canonical::Encode,
     context::{Context, Cost},
     error::InvalidProofReason,
+    list::List,
     object::{Edge, Parties},
-    primitive::{ProtocolCode, ResolveHash, Sig, TermsHash},
+    primitive::{EdgeId, ProtocolCode, ResolveHash, Sig, TermsHash},
     terms::Terms,
     verifier::Verifier,
 };
@@ -50,7 +51,7 @@ impl ResolveKind {
         }
     }
 
-    pub(super) const fn proofs(self) -> u64 {
+    pub(crate) const fn proofs(self) -> u64 {
         match self {
             Self::Basic | Self::Timeout => 1,
             Self::Agreement | Self::ClaimantWins | Self::ChallengerWins => 2,
@@ -251,7 +252,8 @@ impl Proof {
         &self,
         context: Context,
         verifier: &V,
-        resolve: &Resolve,
+        input: EdgeId,
+        outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
         edge: Edge,
     ) -> Result<(), InvalidProofReason> {
         match self {
@@ -278,7 +280,7 @@ impl Proof {
                 agreement.accepts(
                     verifier,
                     edge.parties(),
-                    resolve.hash(ResolveKind::Agreement),
+                    Tx::payload_hash(input, ResolveKind::Agreement, *terms, outputs),
                 )
             }
             Self::Timeout { terms } => {
@@ -288,14 +290,15 @@ impl Proof {
                 if context.block_height() < terms.timeout() {
                     return Err(InvalidProofReason::TimeoutNotReached);
                 }
-                if resolve.outputs() != terms.timeout_outputs() {
+                if outputs != terms.timeout_outputs() {
                     return Err(InvalidProofReason::PayoutMismatch);
                 }
                 Ok(())
             }
             Self::ClaimantWins { terms, seal } => Self::accepts_seal(
                 verifier,
-                resolve,
+                input,
+                outputs,
                 edge,
                 terms.protocol(),
                 terms.hash(),
@@ -304,7 +307,8 @@ impl Proof {
             ),
             Self::ChallengerWins { terms, seal } => Self::accepts_seal(
                 verifier,
-                resolve,
+                input,
+                outputs,
                 edge,
                 terms.protocol(),
                 terms.hash(),
@@ -314,9 +318,11 @@ impl Proof {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accepts_seal<V: Verifier + ?Sized>(
         verifier: &V,
-        resolve: &Resolve,
+        input: EdgeId,
+        outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
         edge: Edge,
         protocol: ProtocolCode,
         terms_hash: TermsHash,
@@ -326,7 +332,8 @@ impl Proof {
         if terms_hash != edge.terms() {
             return Err(InvalidProofReason::TermsMismatch);
         }
-        if verifier.verify_seal(seal, protocol, kind, resolve.hash(kind)) {
+        let hash = Tx::payload_hash(input, kind, terms_hash, outputs);
+        if verifier.verify_seal(seal, protocol, kind, hash) {
             Ok(())
         } else {
             Err(InvalidProofReason::BadSeal)

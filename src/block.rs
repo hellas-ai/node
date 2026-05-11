@@ -10,20 +10,20 @@
 use crate::{
     context::{Context, Cost},
     list::List,
-    op::Op,
+    tx::Tx,
 };
 
 /// Ordered kernel operation batch with explicit block context.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Block<const N: usize> {
     context: Context,
-    ops: List<Op, N>,
+    ops: List<Tx, N>,
 }
 
 impl<const N: usize> Block<N> {
     /// Creates an ordered block transition input.
     #[must_use]
-    pub const fn new(context: Context, ops: List<Op, N>) -> Self {
+    pub const fn new(context: Context, ops: List<Tx, N>) -> Self {
         Self { context, ops }
     }
 
@@ -35,7 +35,7 @@ impl<const N: usize> Block<N> {
 
     /// Returns the ordered operations.
     #[must_use]
-    pub const fn ops(&self) -> &List<Op, N> {
+    pub const fn ops(&self) -> &List<Tx, N> {
         &self.ops
     }
 

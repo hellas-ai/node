@@ -1,8 +1,8 @@
 //! Allocation hygiene tests for kernel hot-path primitives.
 //!
 //! These tests assert zero heap allocations across `apply_all` and
-//! `Op::access`/`Op::cost`. The invariant rests on every op-payload type
-//! (`Op`, `Open`, `Resolve`, `Funding`, `Terms`, `Proof`, `List<...>`)
+//! `Tx::cost`. The invariant rests on every tx-payload type
+//! (`Tx`, `Funding`, `Terms`, `Proof`, `List<...>`)
 //! being stack-only: clones we make in setup or assertions are pure
 //! `memcpy`s, never `Box`/`Vec`/`String` allocations. Adding a heap
 //! field to any of those types — or changing `List<T, N>` to back its
@@ -16,8 +16,8 @@ use support::{FAKE_VERIFIER, FixedStore};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Event, EventKind, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout, Proof,
-    ProtocolCode, Resolve, State, Terms,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode,
+    State, Terms, Tx,
 };
 
 const CONTEXT: Context = Context::new(
@@ -32,28 +32,24 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let parties = Parties::new(maker_key, taker_key);
     let maker = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker = CoinId::from_bytes([2; CoinId::LENGTH]);
-    let expected_open = Open::from_terms(
-        funding(maker, taker),
-        Terms::basic(
-            ProtocolCode::new(1),
-            parties,
-            BlockHeight::new(1),
-            payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
-        ),
-    );
-    let edge = expected_open.output();
-    let expected_resolve = Resolve::new(
-        edge,
-        Proof::timeout(Terms::basic(
-            ProtocolCode::new(1),
-            parties,
-            BlockHeight::new(1),
-            payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
-        )),
+    let funding_value = funding(maker, taker);
+    let terms_value = Terms::basic(
+        ProtocolCode::new(1),
+        parties,
+        BlockHeight::new(1),
         payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
     );
-    let maker_out = nth(&expected_resolve.output_ids(), 0);
-    let taker_out = nth(&expected_resolve.output_ids(), 1);
+    let edge = Tx::edge_id_of(&funding_value, &terms_value);
+    let expected_open = Tx::open(funding_value, terms_value.clone());
+    let resolve_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
+    let expected_resolve = Tx::resolve(
+        edge,
+        Proof::timeout(terms_value),
+        resolve_outputs.clone(),
+    );
+    let output_id_list = Tx::resolve_output_ids(edge, &resolve_outputs);
+    let maker_out = nth(&output_id_list, 0);
+    let taker_out = nth(&output_id_list, 1);
     let maker_seed = Genesis::coin(maker, maker_key, 10);
     let taker_seed = Genesis::coin(taker, taker_key, 5);
     let store = FixedStore::empty([maker, taker, maker_out, taker_out], [edge]);
@@ -62,14 +58,19 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         let store = core::hint::black_box(store);
 
         let outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
-        let terms = Terms::basic(ProtocolCode::new(1), parties, BlockHeight::new(1), outputs.clone());
+        let terms = Terms::basic(
+            ProtocolCode::new(1),
+            parties,
+            BlockHeight::new(1),
+            outputs.clone(),
+        );
         let proof = Proof::timeout(terms.clone());
-        let open = Op::Open(Open::from_terms(funding(maker, taker), terms));
-        assert_eq!(open, Op::Open(expected_open.clone()));
-        let is_open = matches!(open, Op::Open(_));
-        let resolve = Op::Resolve(Resolve::new(edge, proof, outputs));
-        assert_eq!(resolve, Op::Resolve(expected_resolve.clone()));
-        let is_resolve = matches!(resolve, Op::Resolve(_));
+        let open = Tx::open(funding(maker, taker), terms);
+        assert_eq!(open, expected_open.clone());
+        let is_open = matches!(open, Tx::Open { .. });
+        let resolve = Tx::resolve(edge, proof, outputs);
+        assert_eq!(resolve, expected_resolve.clone());
+        let is_resolve = matches!(resolve, Tx::Resolve { .. });
         let Ok(mut chain) = State::genesis(store, &[maker_seed, taker_seed]) else {
             panic!("genesis rejected test seed");
         };

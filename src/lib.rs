@@ -11,7 +11,7 @@
 //! | Concern              | Rust                       | Quint                                |
 //! |----------------------|----------------------------|--------------------------------------|
 //! | Apply driver         | [`State`]                  | `models/l1.qnt`                      |
-//! | Op vocabulary + step | [`Op`]                     | `models/l1.qnt` (`step` action)      |
+//! | Tx vocabulary + step | [`Tx`]                     | `models/l1.qnt` (`step` action)      |
 //! | Proof witnesses      | [`Proof`]                  | `models/verifier.qnt`                |
 //! | Verification policy  | [`Verifier`]               | `models/verifier.qnt`                |
 //! | Live objects         | [`Coin`] / [`Edge`] / ids  | `models/types.qnt`                   |
@@ -74,13 +74,13 @@ mod error;
 mod event;
 mod list;
 mod object;
-mod op;
 mod primitive;
 #[cfg(feature = "secp256k1")]
 mod secp256k1;
 mod state;
 mod store;
 mod terms;
+mod tx;
 mod verifier;
 mod view;
 
@@ -94,9 +94,9 @@ pub use error::{
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
-pub use op::{
-    Agreement, Funding, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Payout,
-    Proof, Resolve, ResolveKind, Seal,
+pub use tx::{
+    Agreement, Funding, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Payout, Proof,
+    ResolveKind, Seal, Tx,
 };
 pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]

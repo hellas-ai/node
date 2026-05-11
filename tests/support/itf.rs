@@ -21,8 +21,8 @@ use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
 use hellas_kernel::{
-    Agreement, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Op, Payout, Proof, ProtocolCode, Resolve,
-    ResolveHash, ResolveKind, Seal, Sig,
+    Agreement, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof, ProtocolCode, ResolveHash,
+    ResolveKind, Seal, Sig, Tx,
 };
 
 use super::l1;
@@ -144,20 +144,20 @@ pub(crate) fn context_for(input: &Input) -> Context {
     }
 }
 
-/// Concrete `Op` (when the input maps to one). `NoInput`, `TickInput`,
+/// Concrete `Tx` (when the input maps to one). `NoInput`, `TickInput`,
 /// and `IdleInput` produce no kernel work.
-pub(crate) fn op_for(input: &Input) -> Option<Op> {
+pub(crate) fn op_for(input: &Input) -> Option<Tx> {
     match input {
-        Input::OpenInput(tag) => Some(Op::Open(l1::open(edge_key(*tag)))),
-        Input::ResolveInput(body) => Some(Op::Resolve(resolve_op(body))),
+        Input::OpenInput(tag) => Some(l1::open(edge_key(*tag))),
+        Input::ResolveInput(body) => Some(resolve_op(body)),
         Input::NoInput | Input::TickInput | Input::IdleInput => None,
     }
 }
 
-/// Builds a `Resolve` op from a model `ResolveInput`. Payouts are taken
+/// Builds a resolve `Tx` from a model `ResolveInput`. Payouts are taken
 /// from the model body, not the support helper, so adversarial-payout
 /// traces drive the kernel correctly.
-pub(crate) fn resolve_op(body: &ResolveInputBody) -> Resolve {
+pub(crate) fn resolve_op(body: &ResolveInputBody) -> Tx {
     let edge = edge_key(body.edge);
     let outputs = l1::payouts_with(
         u64::try_from(body.maker_pay).expect("negative maker payout"),
@@ -183,14 +183,14 @@ pub(crate) fn resolve_op(body: &ResolveInputBody) -> Resolve {
             seal_for(input, ResolveKind::ChallengerWins, &outputs),
         ),
     };
-    Resolve::new(input, proof, outputs)
+    Tx::resolve(input, proof, outputs)
 }
 
 fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    Resolve::payload_hash(input, ResolveKind::Agreement, l1::terms().hash(), outputs)
+    Tx::payload_hash(input, ResolveKind::Agreement, l1::terms().hash(), outputs)
 }
 
 fn seal_for(input: EdgeId, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Resolve::payload_hash(input, kind, l1::terms().hash(), outputs);
+    let hash = Tx::payload_hash(input, kind, l1::terms().hash(), outputs);
     Seal::placeholder(ProtocolCode::new(1), kind, hash)
 }

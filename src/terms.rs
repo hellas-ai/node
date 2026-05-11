@@ -16,7 +16,7 @@ use crate::{
     context::BlockHeight,
     list::List,
     object::Parties,
-    op::{MAX_EDGE_OUTPUTS, Payout},
+    tx::{MAX_EDGE_OUTPUTS, Payout},
     primitive::{ProtocolCode, TermsHash},
 };
 

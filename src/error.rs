@@ -40,7 +40,7 @@ pub enum InsertError {
     Unavailable,
 }
 
-/// Error returned when a [`crate::Op`] cannot be applied.
+/// Error returned when a [`crate::Tx`] cannot be applied.
 ///
 /// Most variants describe ordinary user-input rejections — bad funding,
 /// unknown ids, mismatched payouts. The [`Self::CoinChanged`],
