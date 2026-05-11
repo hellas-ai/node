@@ -30,9 +30,14 @@ pub(crate) const TAKER_PAYOUT: u64 = 8;
 pub(crate) const BAD_PAYOUT: u64 = TAKER_PAYOUT + 1;
 pub(crate) const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> =
     payouts_const(MAKER_PAYOUT, TAKER_PAYOUT);
-pub(crate) const TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
-pub(crate) const OTHER_TERMS: Terms =
-    Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
+
+pub(crate) fn terms() -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
+}
+
+pub(crate) fn other_terms() -> Terms {
+    Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
+}
 
 pub(crate) type TraceState = State<FixedStore<6, 2>>;
 pub(crate) type TraceView = View<6, 2>;
@@ -140,13 +145,13 @@ pub(crate) fn open(edge: EdgeKey) -> Open {
                 party1(maker_out(EdgeKey::First)),
                 party1(taker_out(EdgeKey::First)),
             ),
-            TERMS,
+            terms(),
         ),
     }
 }
 
 pub(crate) fn open_case(key: OpenKey) -> Open {
-    Open::from_terms(open_funding(key), TERMS)
+    Open::from_terms(open_funding(key), terms())
 }
 
 pub(crate) fn open_case_op(key: OpenKey) -> Op {
@@ -191,7 +196,7 @@ pub(crate) fn taker_out(edge: EdgeKey) -> CoinId {
 }
 
 pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Resolve::new(edge_id(edge), Proof::basic(TERMS.hash()), payouts()).output_ids()
+    Resolve::new(edge_id(edge), Proof::basic(terms().hash()), payouts()).output_ids()
 }
 
 pub(crate) const fn edge_value(edge: Edge) -> u64 {
@@ -295,25 +300,26 @@ pub(crate) fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId
 }
 
 fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
+    let terms = terms();
     match proof {
-        ProofKey::Basic => Proof::basic(TERMS.hash()),
+        ProofKey::Basic => Proof::basic(terms.hash()),
         ProofKey::Agreement => Proof::agreement(
-            TERMS.hash(),
+            terms.hash(),
             Agreement::new(
                 Sig::placeholder(MAKER, hash(edge, ResolveKind::Agreement, outputs)),
                 Sig::placeholder(TAKER, hash(edge, ResolveKind::Agreement, outputs)),
             ),
         ),
-        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(TERMS),
+        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
         ProofKey::Claimant => {
-            Proof::claimant_wins(TERMS, seal(edge, ResolveKind::ClaimantWins, outputs))
+            Proof::claimant_wins(terms, seal(edge, ResolveKind::ClaimantWins, outputs))
         }
         ProofKey::Challenger => {
-            Proof::challenger_wins(TERMS, seal(edge, ResolveKind::ChallengerWins, outputs))
+            Proof::challenger_wins(terms, seal(edge, ResolveKind::ChallengerWins, outputs))
         }
-        ProofKey::WrongTerms => Proof::basic(OTHER_TERMS.hash()),
+        ProofKey::WrongTerms => Proof::basic(other_terms().hash()),
         ProofKey::BadSeal => {
-            Proof::claimant_wins(TERMS, seal(edge, ResolveKind::ChallengerWins, outputs))
+            Proof::claimant_wins(terms, seal(edge, ResolveKind::ChallengerWins, outputs))
         }
     }
 }
@@ -328,9 +334,9 @@ fn open_funding(key: OpenKey) -> Funding {
 }
 
 fn seal(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    Seal::placeholder(TERMS.protocol(), kind, hash(edge, kind, outputs))
+    Seal::placeholder(terms().protocol(), kind, hash(edge, kind, outputs))
 }
 
 fn hash(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    Resolve::payload_hash(edge_id(edge), kind, TERMS.hash(), outputs)
+    Resolve::payload_hash(edge_id(edge), kind, terms().hash(), outputs)
 }

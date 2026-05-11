@@ -124,7 +124,7 @@ enum Transition {
     Tick,
 }
 
-const fn terms() -> Terms {
+fn terms() -> Terms {
     Terms::basic(PROTOCOL, PARTIES, TIMEOUT, canonical_payouts())
 }
 

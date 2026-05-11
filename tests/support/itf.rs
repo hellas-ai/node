@@ -164,21 +164,22 @@ pub(crate) fn resolve_op(body: &ResolveInputBody) -> Resolve {
         u64::try_from(body.taker_pay).expect("negative taker payout"),
     );
     let input = l1::edge_id(edge);
+    let terms = l1::terms();
     let proof = match body.proof {
-        ProofTag::Basic => Proof::basic(l1::TERMS.hash()),
+        ProofTag::Basic => Proof::basic(terms.hash()),
         ProofTag::Agreement => Proof::agreement(
-            l1::TERMS.hash(),
+            terms.hash(),
             Agreement::new(
                 Sig::placeholder(l1::MAKER, agreement_hash(input, &outputs)),
                 Sig::placeholder(l1::TAKER, agreement_hash(input, &outputs)),
             ),
         ),
-        ProofTag::Timeout => Proof::timeout(l1::TERMS),
+        ProofTag::Timeout => Proof::timeout(terms),
         ProofTag::ClaimantWins => {
-            Proof::claimant_wins(l1::TERMS, seal_for(input, ResolveKind::ClaimantWins, &outputs))
+            Proof::claimant_wins(terms, seal_for(input, ResolveKind::ClaimantWins, &outputs))
         }
         ProofTag::ChallengerWins => Proof::challenger_wins(
-            l1::TERMS,
+            terms,
             seal_for(input, ResolveKind::ChallengerWins, &outputs),
         ),
     };
@@ -186,10 +187,10 @@ pub(crate) fn resolve_op(body: &ResolveInputBody) -> Resolve {
 }
 
 fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    Resolve::payload_hash(input, ResolveKind::Agreement, l1::TERMS.hash(), outputs)
+    Resolve::payload_hash(input, ResolveKind::Agreement, l1::terms().hash(), outputs)
 }
 
 fn seal_for(input: EdgeId, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Resolve::payload_hash(input, kind, l1::TERMS.hash(), outputs);
+    let hash = Resolve::payload_hash(input, kind, l1::terms().hash(), outputs);
     Seal::placeholder(ProtocolCode::new(1), kind, hash)
 }

@@ -289,7 +289,7 @@ fn resolve_accepts_timeout_witness_at_deadline() {
         TIMEOUT_CONTEXT,
         &Op::Resolve(Resolve::new(
             edge(),
-            Proof::timeout(BASIC_TERMS),
+            Proof::timeout(basic_terms()),
             payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
         )),
     );
@@ -315,7 +315,7 @@ fn resolve_rejects_timeout_before_deadline_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
-                Proof::timeout(BASIC_TERMS),
+                Proof::timeout(basic_terms()),
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
@@ -338,7 +338,7 @@ fn resolve_rejects_timeout_with_nondefault_payouts_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
-                Proof::timeout(BASIC_TERMS),
+                Proof::timeout(basic_terms()),
                 payouts(Payout::new(MAKER, 8), Payout::new(TAKER, 7)),
             )),
         ),
@@ -361,7 +361,7 @@ fn resolve_rejects_wrong_timeout_terms_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Resolve(Resolve::new(
                 edge(),
-                Proof::timeout(OTHER_TERMS_VALUE),
+                Proof::timeout(other_terms_value()),
                 payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
             )),
         ),
@@ -451,7 +451,7 @@ fn resolve_rejects_bad_dispute_seal_without_mutation() {
     let store = *state.store();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     let proof = Proof::claimant_wins(
-        BASIC_TERMS,
+        basic_terms(),
         seal(ResolveKind::ChallengerWins, edge(), &outputs),
     );
 
@@ -475,7 +475,7 @@ fn resolve_rejects_wrong_dispute_terms_without_mutation() {
     let store = *state.store();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     let proof = Proof::claimant_wins(
-        OTHER_TERMS_VALUE,
+        other_terms_value(),
         other_seal(ResolveKind::ClaimantWins, edge(), &outputs),
     );
 

@@ -3,8 +3,13 @@
 //! No direct abstract counterpart — the L1 model treats terms as opaque
 //! constants (`TimeoutHeight`, `MakerPayout`, `TakerPayout` in
 //! `models/types.qnt`). The Rust kernel commits to a structured [`Terms`]
-//! enum and binds it via [`TermsHash`] so resolves can carry only the
+//! body and binds it via [`TermsHash`] so resolves can carry only the
 //! commitment, not the full payload.
+//!
+//! [`Terms`] computes its [`TermsHash`] at construction and stores it
+//! alongside the body. Callers that need the hash get a field load; no
+//! type that contains a `Terms` ever needs to cache `terms_hash`
+//! separately.
 
 use crate::{
     context::BlockHeight,
@@ -15,17 +20,26 @@ use crate::{
 };
 
 /// Concrete open terms committed by an edge.
+///
+/// `Terms` is the *body* + a precomputed [`TermsHash`] that binds it.
+/// The two cannot drift because the only constructor computes the hash
+/// once and stores it, and the body is immutable thereafter.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub enum Terms {
+pub struct Terms {
+    body: TermsBody,
+    hash: TermsHash,
+}
+
+/// Body of a [`Terms`] commitment. Variants enumerate the supported
+/// protocol-mode shapes; the wrapping [`Terms`] adds the canonical
+/// commitment over the body.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+enum TermsBody {
     /// Degenerate bilateral terms used until protocol-specific terms land.
     Basic {
-        /// Chain-version-local protocol code.
         protocol: ProtocolCode,
-        /// Positional settlement parties.
         parties: Parties,
-        /// Earliest block height at which a timeout resolve is valid.
         timeout: BlockHeight,
-        /// Deterministic payout shape accepted by timeout resolve.
         timeout_outputs: List<Payout, MAX_EDGE_OUTPUTS>,
     },
 }
@@ -33,73 +47,89 @@ pub enum Terms {
 impl Terms {
     /// Creates basic terms.
     #[must_use]
-    pub const fn basic(
+    pub fn basic(
         protocol: ProtocolCode,
         parties: Parties,
         timeout: BlockHeight,
         timeout_outputs: List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> Self {
-        Self::Basic {
+        let body = TermsBody::Basic {
             protocol,
             parties,
             timeout,
             timeout_outputs,
-        }
+        };
+        let hash = body.compute_hash();
+        Self { body, hash }
+    }
+
+    /// Returns the canonical BLAKE3 commitment for these terms.
+    ///
+    /// Computed once at construction; this is a field load.
+    #[must_use]
+    pub const fn hash(&self) -> TermsHash {
+        self.hash
     }
 
     /// Returns the chain-version-local protocol code.
     #[must_use]
     pub const fn protocol(&self) -> ProtocolCode {
-        match self {
-            Self::Basic { protocol, .. } => *protocol,
+        match &self.body {
+            TermsBody::Basic { protocol, .. } => *protocol,
         }
     }
 
     /// Returns the committed parties.
     #[must_use]
     pub const fn parties(&self) -> Parties {
-        match self {
-            Self::Basic { parties, .. } => *parties,
+        match &self.body {
+            TermsBody::Basic { parties, .. } => *parties,
         }
     }
 
     /// Returns the earliest valid timeout height.
     #[must_use]
     pub const fn timeout(&self) -> BlockHeight {
-        match self {
-            Self::Basic { timeout, .. } => *timeout,
+        match &self.body {
+            TermsBody::Basic { timeout, .. } => *timeout,
         }
     }
 
     /// Returns the deterministic timeout payout shape.
     #[must_use]
     pub const fn timeout_outputs(&self) -> &List<Payout, MAX_EDGE_OUTPUTS> {
-        match self {
-            Self::Basic {
+        match &self.body {
+            TermsBody::Basic {
                 timeout_outputs, ..
             } => timeout_outputs,
         }
     }
+}
 
-    /// Returns the canonical BLAKE3 commitment for these terms.
-    #[must_use]
-    pub fn hash(&self) -> TermsHash {
+impl TermsBody {
+    fn compute_hash(&self) -> TermsHash {
         let mut digest = Digest::new(crate::domain::TERMS_BASIC);
-        let parties = self.parties();
-        let maker = parties.maker().to_bytes();
-        let taker = parties.taker().to_bytes();
-        let outputs = self.timeout_outputs();
+        match self {
+            Self::Basic {
+                protocol,
+                parties,
+                timeout,
+                timeout_outputs,
+            } => {
+                let maker = parties.maker().to_bytes();
+                let taker = parties.taker().to_bytes();
 
-        digest.u8(self.protocol().get());
-        digest.bytes(&maker);
-        digest.bytes(&taker);
-        digest.u64(self.timeout().get());
-        digest.usize(outputs.len());
-        for output in outputs.as_slice() {
-            digest.bytes(output.owner().as_bytes());
-            digest.u64(output.value());
+                digest.u8(protocol.get());
+                digest.bytes(&maker);
+                digest.bytes(&taker);
+                digest.u64(timeout.get());
+                digest.usize(timeout_outputs.len());
+                for output in timeout_outputs.as_slice() {
+                    digest.bytes(output.owner().as_bytes());
+                    digest.u64(output.value());
+                }
+            }
         }
-
         TermsHash::from_bytes(digest.finish())
     }
 }
