@@ -1,0 +1,322 @@
+# Alto integration plan
+
+How `hellas-kernel` slots into `~/src/hellas-alto`. This is a destructive
+migration: alto's current STF, transaction type, and inline crypto get
+deleted and replaced by direct dependencies on `hellas-kernel`. No
+parallel structures, no adapter wrappers — the kernel becomes alto's
+state machine, and alto becomes a thin consensus + persistence shell
+around it.
+
+Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
+`State::apply_iter` added, deliberate omissions documented in
+`Context`. This document is the Phase 1 work plan.
+
+## Surface comparison
+
+| Concern                | Alto today                                              | Hellas-kernel                                  |
+|------------------------|----------------------------------------------------------|------------------------------------------------|
+| Op enum                | `Transaction { Transfer, MergeCoin }`                    | `Op { Open, Resolve }`                         |
+| Object                 | `Coin { owner: Address, value: u64 }`                    | `Coin` (same shape) + `Edge`                   |
+| Object id              | `ObjectId = Sha256 Digest`                               | `CoinId`, `EdgeId`                             |
+| Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` (ECDSA)                       |
+| STF                    | `execute_all` / `execute_proposal` (inline, async)       | `State::apply*` (sync, trait-bounded)          |
+| Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Tx` traits (sync)                     |
+| Crypto                 | Inline `Transaction::verify_signature`                   | `Verifier` trait                               |
+| Context                | `Context<Digest, PublicKey>` + height + timestamp        | `Context { height, hash, fees }`               |
+| Genesis                | `Vec<(Address, u64)>` looped at height 0                 | `State::genesis(store, &[Genesis::coin(...)])` |
+| Fees                   | None                                                     | `Fees`, `Cost` per op                          |
+| Block size             | `MAX_TXS_PER_BLOCK` constant, `Vec<Transaction>`         | Variable, via `apply_iter`                     |
+
+## What gets deleted from alto
+
+- `chain/src/execution/kernel.rs` — entire file (~306 lines). The
+  `execute_all`, `execute_proposal`, `apply_transaction`,
+  `maybe_seed_genesis` functions all go.
+- `types/src/lib.rs::Transaction` enum and impl block — replaced by
+  `hellas_kernel::Op`.
+- `types/src/lib.rs::Coin` — replaced by `hellas_kernel::Coin`. (Same
+  shape, but coming from the kernel crate so tests and protocol all
+  point to one source of truth.)
+- `types/src/lib.rs::Transaction::verify_signature` — moves into the
+  `Verifier` impl.
+- `types/src/lib.rs::transfer_challenge`, `merge_challenge` — the
+  WebAuthn challenge construction. Stays in alto but lives below the
+  kernel; the kernel never sees these.
+- `chain/src/execution/kernel.rs::ExecutionError` — replaced by
+  `hellas_kernel::ApplyError` / `BatchError`. Drop the
+  `is_transient_for_mempool` / `is_fatal_storage` classifier and re-add
+  if alto's mempool genuinely needs it (the variants will be different
+  shape).
+- All inline check logic (zero-amount, duplicate inputs, owner match,
+  overflow, output collision) — kernel handles equivalents.
+
+## What alto adds
+
+Three direct trait impls on alto's existing types. No new wrapper
+structs.
+
+### 1. `impl hellas_kernel::Verifier for UserVerifier`
+
+Where `UserVerifier` is a unit struct (or carries any policy state
+alto needs — e.g. a precomputed-sig cache).
+
+```rust
+// chain/src/execution/verifier.rs (new file, ~40 lines)
+
+use hellas_kernel::{Key, ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, Verifier};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
+
+pub struct UserVerifier;
+
+impl Verifier for UserVerifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool {
+        let Ok(vk) = VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(sig.as_bytes()) else {
+            return false;
+        };
+        vk.verify(hash.as_bytes(), &sig).is_ok()
+    }
+
+    fn verify_seal(&self, _seal: Seal, _proto: ProtocolCode, _kind: ResolveKind, _hash: ResolveHash) -> bool {
+        // No dispute seals in v1. Re-enable per protocol mode later.
+        false
+    }
+}
+```
+
+**Important boundary decision: WebAuthn lives in admission, not in the
+kernel.** Alto's mempool / proposer is responsible for unwrapping
+`WebAuthnSignature` (with `authenticator_data` + `client_data_json`)
+into a bare 64-byte ECDSA `Sig` before the op reaches the kernel:
+
+- Admission verifies the WebAuthn envelope binds to the expected
+  resolve hash (`client_data_json.challenge == base64(resolve_hash)`).
+- Admission extracts the 64-byte ECDSA bytes and constructs the
+  kernel `Op` with `Sig::from_bytes(ecdsa)`.
+- Kernel re-verifies the inner ECDSA at apply time via the `Verifier`
+  trait. Defense-in-depth over the cryptographically meaningful piece.
+
+If you decide later to drop WebAuthn entirely (raw secp256r1 sigs
+direct from clients), the admission step shrinks but the kernel stays
+the same.
+
+### 2. `impl hellas_kernel::Store for UtxoDb<E>` (and a `Tx` adapter)
+
+The friction: alto's `UtxoDb` is **async** (`batches.get(id).await`),
+and the kernel's `Store::Tx` is **sync**. Bridging requires alto to
+pre-load the working set for the block into a sync in-memory map
+before invoking the kernel.
+
+```rust
+// chain/src/execution/store.rs (additions, ~120 lines)
+
+use std::collections::HashMap;
+use hellas_kernel::{Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, Store, Tx};
+
+/// Synchronous working set for one block's apply pass. Loaded async
+/// from `UtxoDb` before kernel invocation; the diff (writes + deletes)
+/// is replayed back into the async `DatabaseSet::Unmerkleized` after
+/// commit so the merkleized state root advances normally.
+pub struct BlockWorkingSet {
+    coins: HashMap<CoinId, Option<Coin>>,
+    edges: HashMap<EdgeId, Option<Edge>>,
+}
+
+impl Store for BlockWorkingSet { /* ... */ }
+impl<'a> Tx for &'a mut BlockWorkingSet { /* ... */ }
+```
+
+`BlockWorkingSet`:
+- Pre-loaded with every `CoinId` / `EdgeId` referenced by the block's
+  ops (alto walks the ops to extract the access surface before apply).
+- `Tx::coin(id)` and `Tx::edge(id)` return from the map; `tx.insert_*`
+  and `tx.remove_*` mutate the map.
+- After kernel commit, alto replays the map's writes into the
+  `Unmerkleized` batch (`batch = batch.write(id, value)`), which
+  produces the next merkleized state and a new root.
+
+**This is the central piece of the integration.** Pre-loading instead
+of an async kernel keeps the kernel's purity guarantee intact and
+avoids dragging `async-trait` or futures into the no_std kernel.
+
+Alternatives considered and rejected:
+- **Async kernel** — pollutes a deterministic embeddable library with
+  runtime concerns. No.
+- **Block-on inside `Tx`** — requires a tokio runtime handle inside
+  kernel; couples kernel to async ecosystem. No.
+- **Streaming async/sync bridge per op** — complex, no real benefit
+  over batch pre-load.
+
+### 3. Block production wiring in `chain/src/app.rs`
+
+The `Application::propose` / `Application::execute` paths get rewritten
+to:
+
+```rust
+async fn execute_block<E>(
+    db: &UtxoDatabase<E>,
+    context: Context,  // hellas_kernel::Context
+    ops: Vec<hellas_kernel::Op>,
+) -> Result<(Diff, Digest, UtxoSyncTarget), BatchError>
+{
+    // 1. Walk ops to collect referenced object ids
+    let touched: BTreeSet<ObjectId> = ops.iter().flat_map(touched_ids).collect();
+
+    // 2. Pre-load working set from async store
+    let mut ws = BlockWorkingSet::load(db, &touched).await;
+
+    // 3. Wrap in kernel State
+    let mut state = State::new(ws);  // (new helper — see below)
+
+    // 4. Invoke kernel
+    let mut events = Vec::new();
+    state.apply_iter(context, &UserVerifier, ops, |_, ev| events.push(ev.clone()))?;
+
+    // 5. Materialize merkleized state from the working set's writes
+    let batch = state.into_store().into_batch(db).await;
+    let merkleized = batch.merkleize().await;
+
+    Ok((Diff::from(events), merkleized.root(), merkleized.sync_target()))
+}
+```
+
+Notes:
+- `touched_ids(op)` is the closest thing alto needs to the deleted
+  `Access` set, but it's local-to-alto, doesn't need to be
+  kernel-public, and only collects ids (not direction).
+- `State::new` doesn't exist on the public kernel API today — only
+  `State::genesis` does. **Phase 1 needs a kernel-side `pub fn
+  new(store: S) -> Self`** for the case where the store is already
+  populated. Trivial addition.
+- The replayed batch is what alto already does today (post-execute,
+  it merkleizes the batch). The shape of the post-kernel hand-off
+  stays unchanged.
+
+### Genesis
+
+Alto's `Vec<(Address, u64)>` allocation list becomes:
+
+```rust
+let seeds: Vec<Genesis> = genesis_allocations.iter().enumerate().map(|(i, (addr, value))| {
+    let coin_id = hellas_kernel::CoinId::from_bytes(genesis_object_id(i as u16).into());
+    let key = hellas_kernel::Key::from_bytes(addr.public_key().to_bytes());
+    Genesis::coin(coin_id, key, *value)
+}).collect();
+State::genesis(store, &seeds)?;
+```
+
+The `genesis_object_id(idx)` deterministic id derivation stays in alto
+(or moves into a `genesis.rs` helper) — the kernel doesn't care how
+coin ids are derived for genesis, only that they're distinct.
+
+### Fees
+
+`Fees::ZERO` plumbed into every `Context` constructor for now. Alto's
+fee model design is deferred — the kernel already supports
+`Fees { base, slot, proof }` and `Cost { base, slots, proofs }` per op,
+so when alto wires real fees the kernel side is unchanged.
+
+### Mempool integration
+
+Alto's mempool stays at the alto layer (kernel doesn't see mempools).
+The mempool's job changes:
+
+- Accepts `Op` instead of `Transaction`.
+- Pre-admission: WebAuthn envelope validation (extract ECDSA sig,
+  verify challenge binding, extract the kernel `Op` shape).
+- Drops the `is_transient_for_mempool` classification — kernel's
+  `ApplyError::MissingCoin` is the moral equivalent; the mempool
+  can pattern-match on `ApplyError` variants to decide retain-vs-drop.
+
+## Migration order (within Phase 1)
+
+1. **Kernel-side: add `State::new`.** ~5 lines. No semantic change;
+   just exposes the existing constructor.
+2. **Alto: bring `hellas-kernel` in as a path dep.** Update `Cargo.toml`
+   under `chain/`.
+3. **Alto: write `BlockWorkingSet` + trait impls** (`Store` + `Tx`)
+   in `chain/src/execution/store.rs`. Write a small test that loads,
+   mutates, replays.
+4. **Alto: write `UserVerifier`** in `chain/src/execution/verifier.rs`.
+   Standalone test against known secp256r1 vectors.
+5. **Alto: rewrite `Application::execute` / `Application::propose`** in
+   `chain/src/app.rs` to use the kernel. Existing alto integration tests
+   should pass without modification of expected post-state.
+6. **Alto: delete `execute_all`, `execute_proposal`,
+   `apply_transaction`, `maybe_seed_genesis`** from
+   `chain/src/execution/kernel.rs`. File becomes a re-export shim or
+   gets deleted entirely.
+7. **Alto: delete `Transaction`, `Coin`, `WebAuthnSignature::verify`**
+   from `types/src/lib.rs`. WebAuthn envelope type itself stays (used
+   by the RPC submission path) but its `verify` impl moves outside.
+8. **Alto: update RPC submission path** to unwrap WebAuthn into a
+   kernel `Op` before mempool insertion.
+
+## Open questions to resolve during Phase 1
+
+1. **Should `Edge` go through alto's MMR alongside `Coin`?** Currently
+   alto's MMR is typed `ObjectId -> Coin`. Adding `Edge` either
+   means:
+   - A second typed MMR (`EdgeId -> Edge`), or
+   - A union object type `ObjectId -> Object { Coin | Edge }`.
+   The second is closer to kernel's view but requires a wider commonware
+   type. Suggest: two MMRs, alto's `BlockWorkingSet` queries both.
+
+2. **Validator-set rotation vs `Context`.** Alto's existing
+   `HellasBlock` carries leader pubkey; kernel's `Context` does not.
+   This is fine for v1 (kernel's Verifier doesn't bind to validators)
+   but if a future protocol mode needs it, the validator set comes from
+   alto's consensus and gets handed to `UserVerifier` (not into
+   `Context`).
+
+3. **`ObjectId` vs split `CoinId`/`EdgeId`.** Alto uses one
+   `ObjectId = Digest` type; kernel uses two typed ids. The MMR change
+   above settles this — alto's two-MMR shape mirrors the kernel's
+   typed ids. If alto sticks with one MMR (option A above), it needs
+   a `kind: u8` discriminator byte prepended, which complicates the
+   storage layer.
+
+4. **Block envelope.** Alto's `HellasBlock` carries
+   `(height, timestamp, parent, state_root, sync_target, [Transaction])`.
+   Replace `[Transaction]` with `Vec<Op>` (or a length-prefixed encoded
+   blob). Block hashing input changes — coordinate with whatever
+   downstream consumers (RPC, indexer) decode `HellasBlock`.
+
+## Estimated diff
+
+| Area                      | Delete  | Add   | Net    |
+|---------------------------|---------|-------|--------|
+| `chain/src/execution/`    | ~310    | ~180  | −130   |
+| `types/src/lib.rs`        | ~250    | ~10   | −240   |
+| `chain/src/app.rs`        | ~80     | ~120  | +40    |
+| `chain/src/rpc.rs`        | ~30     | ~30   | 0      |
+| `chain/Cargo.toml`        | +1 dep  |       |        |
+| Tests                     | ~300    | ~200  | −100   |
+| **Total**                 | ~970    | ~540  | **−430** |
+
+Roughly the same shape of cleanup we got from removing the `Access`
+subsystem — about a third of alto's chain logic deletes outright,
+replaced by trait impls and kernel calls.
+
+## Out of scope for Phase 1
+
+- Real fee model (Fees::ZERO suffices).
+- Dispute seals / `verify_seal` returning anything other than `false`.
+- Adding `BlockTime` / timestamp to `Context`.
+- Validator-set-bound proofs.
+- Edge fanout > current `MAX_EDGE_INPUTS=8` / `MAX_EDGE_OUTPUTS=4`
+  bounds. If alto needs more, that's a chain-version change and a
+  separate kernel migration.
+
+## Phase 2 preview (node integration)
+
+Once alto runs through the kernel:
+- `node` adds `hellas-alto` and `hellas-kernel` as path deps.
+- CLI subcommand `node validator` spawns alto's consensus driver.
+- CLI subcommand `node worker` keeps the existing `Execute` RPC.
+- Validator-exposed external interface = kernel public types
+  (`Op`, `Diff`, `Event`) over gRPC. Proto definitions for `Op`/`Block`
+  /`Event` likely live in this crate as a `tonic`-feature-gated module
+  to avoid two sources of truth.
