@@ -11,7 +11,7 @@ pub(crate) mod map_store;
 
 use hellas_kernel::{
     Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, ProtocolCode,
-    ResolveHash, ResolveKind, Seal, Sig, Snapshot, State, Store, TermsHash, Tx, Verifier, View,
+    Batch, ResolveHash, ResolveKind, Seal, Sig, Snapshot, State, Store, TermsHash, Verifier, View,
 };
 
 /// Forgeable verifier used by every test in this crate. Accepts any signature
@@ -123,12 +123,12 @@ impl<const C: usize, const E: usize> FixedStore<C, E> {
 }
 
 impl<const C: usize, const E: usize> Store for FixedStore<C, E> {
-    type Tx<'a>
+    type Batch<'a>
         = FixedTx<'a, C, E>
     where
         Self: 'a;
 
-    fn begin(&mut self) -> Self::Tx<'_> {
+    fn begin(&mut self) -> Self::Batch<'_> {
         FixedTx {
             working: *self,
             parent: self,
@@ -141,7 +141,7 @@ pub(crate) struct FixedTx<'a, const C: usize, const E: usize> {
     parent: &'a mut FixedStore<C, E>,
 }
 
-impl<const C: usize, const E: usize> Tx for FixedTx<'_, C, E> {
+impl<const C: usize, const E: usize> Batch for FixedTx<'_, C, E> {
     fn coin(&self, id: CoinId) -> Option<Coin> {
         self.working.coin(id)
     }

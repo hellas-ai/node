@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use hellas_kernel::{Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Store, Tx};
+use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Store};
 
 /// Two-phase staged transaction: writes go to a side `working` map; on
 /// `commit`, the working map is swapped into the parent. A dropped
@@ -51,12 +51,12 @@ impl MapStore {
 }
 
 impl Store for MapStore {
-    type Tx<'a>
+    type Batch<'a>
         = MapTx<'a>
     where
         Self: 'a;
 
-    fn begin(&mut self) -> Self::Tx<'_> {
+    fn begin(&mut self) -> Self::Batch<'_> {
         let working = Working {
             coins: self.coins.clone(),
             edges: self.edges.clone(),
@@ -81,7 +81,7 @@ pub(crate) struct MapTx<'a> {
     parent: &'a mut MapStore,
 }
 
-impl Tx for MapTx<'_> {
+impl Batch for MapTx<'_> {
     fn coin(&self, id: CoinId) -> Option<Coin> {
         self.working.coins.get(&id).copied()
     }

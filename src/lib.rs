@@ -102,7 +102,7 @@ pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, 
 #[cfg(feature = "secp256k1")]
 pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
-pub use store::{Store, Tx};
+pub use store::{Batch, Store};
 pub use terms::Terms;
 pub use verifier::Verifier;
 pub use view::{Snapshot, View};
