@@ -4,6 +4,21 @@
 //! by the `proofOk` Timeout guard in `models/verifier.qnt`). The
 //! `heightMonotonic` assumption in `models/deps/assumptions.qnt` is what
 //! lets the kernel trust [`BlockHeight`] without re-checking every apply.
+//!
+//! # Deliberately absent
+//!
+//! - **Wall-clock timestamp.** A BFT-safe block timestamp is its own
+//!   subtle problem (median-of-validators? leader-asserts-then-bounded?
+//!   tolerated drift?), and adding one to [`Context`] commits the kernel
+//!   to one set of safety arguments before consensus integration has
+//!   pinned them down. [`BlockHeight`] is sufficient for every current
+//!   proof shape; revisit only when a settlement semantic genuinely
+//!   needs wall-clock time, not block-relative time.
+//! - **Validator set.** The kernel never checks "is this signer in the
+//!   active set?" — that knowledge lives in whichever
+//!   [`crate::Verifier`] implementation the chain wires in. A future
+//!   dispute mode that wants validator-quorum-signed seals expresses
+//!   that policy inside the `Verifier`; [`Context`] stays oblivious.
 
 const HASH_LENGTH: usize = 32;
 

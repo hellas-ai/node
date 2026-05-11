@@ -93,8 +93,8 @@ pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
 pub use op::{
-    Access, Agreement, Funding, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open,
-    Payout, Proof, Resolve, ResolveKind, Seal,
+    Agreement, Funding, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Payout,
+    Proof, Resolve, ResolveKind, Seal,
 };
 pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]

@@ -6,10 +6,7 @@
 //! enforced here before any state mutation, mirroring the Quint pattern of
 //! gating an action on `canResolve(...)` before primed-variable updates.
 
-use super::{
-    Access, MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, empty_coins, empty_edges,
-    one_edge, units,
-};
+use super::{MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, units};
 use crate::{
     context::{Context, Cost},
     error::{ApplyError, InvalidResolveReason, KernelResult},
@@ -117,15 +114,6 @@ impl Resolve {
         ApplyError::InvalidResolve {
             input: self.input,
             reason,
-        }
-    }
-
-    pub(super) fn access(&self) -> Access {
-        Access {
-            coins: empty_coins(),
-            edges: one_edge(self.input),
-            new_coins: self.output_ids(),
-            new_edges: empty_edges(),
         }
     }
 

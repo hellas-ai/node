@@ -6,8 +6,8 @@
 //! `liveEdges'` updates in the model.
 
 use super::{
-    Access, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, OpenCoins, PartyCoins, Resolve,
-    ResolveKind, duplicate, empty_coins, empty_edges, one_edge, units,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, OpenCoins, PartyCoins, Resolve,
+    ResolveKind, duplicate, units,
 };
 use crate::{
     context::{Context, Cost},
@@ -170,15 +170,6 @@ impl Open {
     #[must_use]
     pub fn reserve_cost(&self) -> Cost {
         Resolve::cost_for_kind(MAX_EDGE_OUTPUTS, ResolveKind::ClaimantWins)
-    }
-
-    pub(super) fn access(&self) -> Access {
-        Access {
-            coins: self.inputs(),
-            edges: empty_edges(),
-            new_coins: empty_coins(),
-            new_edges: one_edge(self.output),
-        }
     }
 
     fn id(funding: &Funding, terms_hash: TermsHash) -> EdgeId {
