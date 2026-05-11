@@ -1,15 +1,22 @@
 {
   self,
-  hellas ? import ./hellas.nix {inherit self;},
-}: {
+  hellas ? import ./hellas.nix { inherit self; },
+}:
+{
   config,
   lib,
   pkgs,
   ...
-}: let
-  inherit (lib) mkEnableOption mkIf mkMerge optionals;
+}:
+let
+  inherit (lib)
+    mkEnableOption
+    mkIf
+    mkMerge
+    optionals
+    ;
   cfg = config.programs.hellas;
-  isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+  inherit (pkgs.stdenv.hostPlatform) isDarwin;
 
   baseEnv =
     hellas.mkOtelEnv {
@@ -17,7 +24,8 @@
       inherit (cfg) otel;
     }
     // cfg.environment;
-in {
+in
+{
   options.programs.hellas =
     hellas.commonOptions {
       inherit lib;
@@ -33,16 +41,15 @@ in {
     // {
       # User-space serve daemon. Currently darwin-only (uses HM's launchd
       # integration). Linux users should use the NixOS module instead.
-      serve =
-        {
-          enable = mkEnableOption "Hellas serve daemon as a launchd user agent (darwin only)";
-        }
-        // hellas.serveOptions {inherit lib;};
+      serve = {
+        enable = mkEnableOption "Hellas serve daemon as a launchd user agent (darwin only)";
+      }
+      // hellas.serveOptions { inherit lib pkgs; };
     };
 
   config = mkMerge [
     (mkIf cfg.enable {
-      home.packages = [cfg.package];
+      home.packages = [ cfg.package ];
       home.sessionVariables = hellas.renderEnvironment baseEnv;
     })
 
@@ -64,17 +71,16 @@ in {
       launchd.agents.hellas = {
         enable = true;
         config = {
-          ProgramArguments =
-            ["${cfg.package}/bin/hellas-cli"]
-            ++ hellas.mkServeArgs {
-              inherit lib;
-              serve = cfg.serve;
-            };
+          ProgramArguments = [
+            "${cfg.package}/bin/hellas-cli"
+          ]
+          ++ hellas.mkServeArgs {
+            inherit lib;
+            inherit (cfg) serve;
+          };
           RunAtLoad = true;
           KeepAlive = true;
-          EnvironmentVariables = hellas.renderEnvironment (
-            baseEnv // {HOME = config.home.homeDirectory;}
-          );
+          EnvironmentVariables = hellas.renderEnvironment (baseEnv // { HOME = config.home.homeDirectory; });
           StandardOutPath = "${config.home.homeDirectory}/Library/Logs/hellas/stdout.log";
           StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/hellas/stderr.log";
         };

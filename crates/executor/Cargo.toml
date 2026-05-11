@@ -22,8 +22,19 @@ catnix.workspace = true
 chatgrad = { workspace = true, default-features = false }
 half = { workspace = true }
 hellas-core.workspace = true
-hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "server"] }
-hellas-rpc = { workspace = true, features = ["server", "client", "compression", "node"] }
+hellas-pb = { workspace = true, features = [
+  "hellas",
+  "symbolic",
+  "opaque",
+  "courtesy",
+  "server",
+] }
+hellas-rpc = { workspace = true, features = [
+  "server",
+  "client",
+  "compression",
+  "node",
+] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh-blobs = { workspace = true, features = ["fs-store"] }
 prometheus-client = "0.24"
