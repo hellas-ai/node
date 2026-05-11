@@ -17,7 +17,7 @@ use crate::{
     list::List,
     object::{Coin, Edge, Parties},
     primitive::{CoinId, EdgeId, TermsHash},
-    store::Tx,
+    store::Batch,
     terms::Terms,
 };
 
@@ -132,15 +132,15 @@ impl Open {
         Cost::new(1, inputs.saturating_add(1), 0)
     }
 
-    pub(super) fn apply<T: Tx>(&self, context: Context, tx: &T) -> KernelResult<Change> {
+    pub(super) fn apply<B: Batch>(&self, context: Context, batch: &B) -> KernelResult<Change> {
         if let Some(id) = self.duplicate_input() {
             return Err(ApplyError::DuplicateInput { id });
         }
-        if tx.edge(self.output).is_some() {
+        if batch.edge(self.output).is_some() {
             return Err(ApplyError::EdgeExists { id: self.output });
         }
 
-        let coins = self.coins(tx)?;
+        let coins = self.coins(batch)?;
         let open_fee = context
             .fee(self.cost())
             .ok_or_else(|| self.invalid(InvalidOpenReason::FeeOverflow))?;
@@ -181,10 +181,10 @@ impl Open {
         duplicate(self.inputs().as_slice())
     }
 
-    fn coins<T: Tx>(&self, tx: &T) -> KernelResult<OpenCoins> {
+    fn coins<B: Batch>(&self, batch: &B) -> KernelResult<OpenCoins> {
         let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
         for (index, id) in self.funding.iter().enumerate() {
-            let coin = tx.coin(id).ok_or(ApplyError::MissingCoin { id })?;
+            let coin = batch.coin(id).ok_or(ApplyError::MissingCoin { id })?;
             coins[index] = (id, coin);
         }
         Ok(List::take(coins, self.funding.len()))

@@ -13,7 +13,7 @@ use crate::{
     list::List,
     object::Genesis,
     op::Op,
-    store::{Store, Tx},
+    store::{Batch, Store},
     verifier::Verifier,
     view::Snapshot,
 };
@@ -168,18 +168,18 @@ impl<S: Store> State<S> {
         Ok(())
     }
 
-    fn fold_one<T: Tx, V: Verifier + ?Sized>(
-        tx: &mut T,
+    fn fold_one<B: Batch, V: Verifier + ?Sized>(
+        batch: &mut B,
         context: Context,
         verifier: &V,
         operation: &Op,
     ) -> KernelResult<Event> {
-        let change = operation.apply(context, verifier, tx)?;
-        Self::fold_change(tx, &change)
+        let change = operation.apply(context, verifier, batch)?;
+        Self::fold_change(batch, &change)
     }
 
-    fn fold_change<T: Tx>(tx: &mut T, change: &Change) -> KernelResult<Event> {
-        change.fold(tx)?;
+    fn fold_change<B: Batch>(batch: &mut B, change: &Change) -> KernelResult<Event> {
+        change.fold(batch)?;
         Ok(change.event().clone())
     }
 }

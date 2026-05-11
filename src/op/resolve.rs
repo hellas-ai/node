@@ -15,7 +15,7 @@ use crate::{
     list::List,
     object::Coin,
     primitive::{CoinId, EdgeId, Key, ResolveHash, TermsHash},
-    store::Tx,
+    store::Batch,
     verifier::Verifier,
 };
 
@@ -84,16 +84,16 @@ impl Resolve {
         Cost::new(1, outputs.saturating_add(1), kind.proofs())
     }
 
-    pub(super) fn apply<T: Tx, V: Verifier + ?Sized>(
+    pub(super) fn apply<B: Batch, V: Verifier + ?Sized>(
         &self,
         context: Context,
         verifier: &V,
-        tx: &T,
+        batch: &B,
     ) -> KernelResult<Change> {
-        self.check_outputs(tx)?;
+        self.check_outputs(batch)?;
 
         let coins = self.coins();
-        let edge = tx
+        let edge = batch
             .edge(self.input)
             .ok_or(ApplyError::MissingEdge { id: self.input })?;
         self.proof
@@ -141,10 +141,10 @@ impl Resolve {
         ResolveHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
-    fn check_outputs<T: Tx>(&self, tx: &T) -> KernelResult<()> {
+    fn check_outputs<B: Batch>(&self, batch: &B) -> KernelResult<()> {
         for (index, output) in self.outputs.iter().enumerate() {
             let id = self.output_id(index, *output);
-            if tx.coin(id).is_some() {
+            if batch.coin(id).is_some() {
                 return Err(ApplyError::OutputExists { id });
             }
         }
