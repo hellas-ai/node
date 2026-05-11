@@ -1,9 +1,9 @@
-//! Coin payout requested by an edge resolve.
+//! Coin payout requested by an edge close.
 //!
 //! Abstract counterpart: the per-position payout entries in
-//! `models/l1.qnt::resolveEdge`. The kernel materializes one owner-only
+//! `models/l1.qnt::closeEdge`. The kernel materializes one owner-only
 //! coin per `Payout`, with a canonical id derived from the consumed edge
-//! and the position of the payout in the resolve.
+//! and the position of the payout in the close.
 
 use crate::{
     canonical::{Decode, DecodeError, Encode, Writer},
@@ -11,7 +11,7 @@ use crate::{
     primitive::{CoinId, EdgeId, Key},
 };
 
-/// Coin payout requested by an edge resolve.
+/// Coin payout requested by an edge close.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, PartialEq)]
 pub struct Payout {
     owner: Key,
@@ -38,7 +38,7 @@ impl Decode for Payout {
 }
 
 impl Payout {
-    /// Creates a resolve payout.
+    /// Creates a close payout.
     #[must_use]
     pub const fn new(owner: Key, value: u64) -> Self {
         Self { owner, value }

@@ -17,10 +17,7 @@
 
 module l1 {
   import types.* from "./types"
-  // Production semantics: Basic proofs are rejected by policy. The
-  // adversary configuration with `FakeCrypto = true` lives in
-  // `l1_adversary.qnt` — keep the two modules' bodies in sync.
-  import verifier(FakeCrypto = false).* from "./verifier"
+  import verifier.* from "./verifier"
   import invariants as inv from "./rules/invariants"
 
   // ---------------------------------------------------------------------
@@ -53,10 +50,10 @@ module l1 {
     liveEdges.size()
 
   // ---------------------------------------------------------------------
-  // Resolve precondition (combines verifier policy + state shape)
+  // Close precondition (combines verifier policy + state shape)
   // ---------------------------------------------------------------------
 
-  def canResolve(e: Edge, p: Proof, makerPay: int, takerPay: int): bool =
+  def canClose(e: Edge, p: Proof, makerPay: int, takerPay: int): bool =
     liveEdges.contains(e)
       and edges.get(e) == EdgeValue
       and proofOk(p, height)
@@ -108,11 +105,11 @@ module l1 {
     lastEvent' = EdgeOpenedEvent(e),
   }
 
-  // Resolve consumes one live edge and materializes payout coins. Payouts
-  // are explicit so the model can explore adversarial Basic choices and
-  // confirm bound proofs reject anything but the canonical split.
-  action resolveEdge(e, p, makerPay, takerPay) = all {
-    canResolve(e, p, makerPay, takerPay),
+  // Close consumes one live edge and materializes payout coins. Payouts
+  // are explicit so the model can explore non-canonical splits and
+  // confirm the verifier rejects everything but the canonical split.
+  action closeEdge(e, p, makerPay, takerPay) = all {
+    canClose(e, p, makerPay, takerPay),
     coins' = coins
       .set(makerOutput(e), makerPay)
       .set(takerOutput(e), takerPay),
@@ -120,8 +117,8 @@ module l1 {
     liveCoins' = liveCoins.union(Set(makerOutput(e), takerOutput(e))),
     liveEdges' = liveEdges.exclude(Set(e)),
     height' = height,
-    lastInput' = ResolveInput({ edge: e, proof: p, makerPay: makerPay, takerPay: takerPay }),
-    lastEvent' = EdgeResolvedEvent(e),
+    lastInput' = CloseInput({ edge: e, proof: p, makerPay: makerPay, takerPay: takerPay }),
+    lastEvent' = EdgeClosedEvent(e),
   }
 
   // Advance height. Required for Timeout proofs to become admissible.
@@ -151,45 +148,29 @@ module l1 {
   // ---------------------------------------------------------------------
 
   // Each proof kind appears with the canonical (MakerPayout, TakerPayout)
-  // split, and Basic also appears with adversarial splits. Adversarial
-  // splits under bound proofs are not listed because canResolve rejects
-  // them through payoutsBound — Quint's exploration covers this by never
-  // enabling those actions, regardless of whether they appear here.
+  // split. Non-canonical splits under bound proofs are also listed so the
+  // spec makes the rejection surface explicit; `canClose` rejects them
+  // through `payoutsBound`, and Apalache confirms they remain unreachable.
   action step = any {
     openEdge(Edge1),
     openEdge(Edge2),
-    // Canonical-split resolves under each proof kind.
-    resolveEdge(Edge1, Basic, MakerPayout, TakerPayout),
-    resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout),
-    resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout),
-    resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout),
-    resolveEdge(Edge1, ChallengerWins, MakerPayout, TakerPayout),
-    resolveEdge(Edge2, Basic, MakerPayout, TakerPayout),
-    resolveEdge(Edge2, Agreement, MakerPayout, TakerPayout),
-    resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout),
-    resolveEdge(Edge2, ClaimantWins, MakerPayout, TakerPayout),
-    resolveEdge(Edge2, ChallengerWins, MakerPayout, TakerPayout),
-    // Adversarial Basic splits. Reachable iff FakeCrypto is true; under
-    // `l1_adversary.qnt` Apalache uses these to derive the
-    // payoutsHonorBindings counterexample.
-    resolveEdge(Edge1, Basic, EdgeValue, 0),
-    resolveEdge(Edge1, Basic, 0, EdgeValue),
-    resolveEdge(Edge2, Basic, EdgeValue, 0),
-    resolveEdge(Edge2, Basic, 0, EdgeValue),
-    // Adversarial bound-proof splits. Each is rejected by `canResolve`
-    // via `payoutsBound` regardless of `FakeCrypto`, because bound
-    // proofs commit to the canonical (MakerPayout, TakerPayout) split.
-    // Apalache symbolically confirms these remain unreachable in every
-    // explored state; listing them here makes the rejection surface
-    // explicit in the spec rather than implicit in `payoutsBound`.
-    resolveEdge(Edge1, Agreement, EdgeValue, 0),
-    resolveEdge(Edge1, Timeout, EdgeValue, 0),
-    resolveEdge(Edge1, ClaimantWins, EdgeValue, 0),
-    resolveEdge(Edge1, ChallengerWins, EdgeValue, 0),
-    resolveEdge(Edge2, Agreement, EdgeValue, 0),
-    resolveEdge(Edge2, Timeout, EdgeValue, 0),
-    resolveEdge(Edge2, ClaimantWins, EdgeValue, 0),
-    resolveEdge(Edge2, ChallengerWins, EdgeValue, 0),
+    // Canonical-split closes under each proof kind.
+    closeEdge(Edge1, Mutual, MakerPayout, TakerPayout),
+    closeEdge(Edge1, Timeout, MakerPayout, TakerPayout),
+    closeEdge(Edge1, Violation, MakerPayout, TakerPayout),
+    closeEdge(Edge2, Mutual, MakerPayout, TakerPayout),
+    closeEdge(Edge2, Timeout, MakerPayout, TakerPayout),
+    closeEdge(Edge2, Violation, MakerPayout, TakerPayout),
+    // Non-canonical splits. Each is rejected by `canClose` via
+    // `payoutsBound`; Apalache symbolically confirms these remain
+    // unreachable, making the rejection surface explicit in the spec
+    // rather than implicit in `payoutsBound`.
+    closeEdge(Edge1, Mutual, EdgeValue, 0),
+    closeEdge(Edge1, Timeout, EdgeValue, 0),
+    closeEdge(Edge1, Violation, EdgeValue, 0),
+    closeEdge(Edge2, Mutual, EdgeValue, 0),
+    closeEdge(Edge2, Timeout, EdgeValue, 0),
+    closeEdge(Edge2, Violation, EdgeValue, 0),
     tick,
     idle,
   }
@@ -209,62 +190,60 @@ module l1 {
   // Trace tests — exported as ITF fixtures via `npm run quint:fixtures`
   // ---------------------------------------------------------------------
 
-  // Smoke: open the canonical edge, cooperatively resolve. Uses Agreement
-  // so the trace runs under both feature configs (Basic would need
-  // FakeCrypto = true).
+  // Smoke: open the canonical edge, cooperatively close.
   run basicTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  // Multi-edge: agreement on Edge1, then handoff to Edge2 funded by
-  // Edge1's payout coins, then timeout-resolve Edge2.
-  run agreementTimeoutTraceTest =
+  // Multi-edge: mutual close on Edge1, then handoff to Edge2 funded by
+  // Edge1's payout coins, then timeout-close Edge2.
+  run mutualTimeoutTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, Agreement, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
       .then(tick)
-      .then(resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  // Dispute: claimant wins Edge1; challenger wins Edge2.
-  run disputeTraceTest =
+  // Violation closes on both edges.
+  run violationTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
-      .then(resolveEdge(Edge2, ChallengerWins, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge2, Violation, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   // Negative trace: an open without a tick cannot Timeout.
   run earlyTimeoutRejectedTest =
     init
       .then(openEdge(Edge1))
-      .expect(not(canResolve(Edge1, Timeout, MakerPayout, TakerPayout)))
+      .expect(not(canClose(Edge1, Timeout, MakerPayout, TakerPayout)))
 
-  // Both edges resolved by Timeout. Demonstrates the timeout-only path
+  // Both edges closed by Timeout. Demonstrates the timeout-only path
   // without any cooperative or dispute witness — production Rust uses
   // exactly this path when no one signed and no one disputed.
   run bothEdgesTimeoutTraceTest =
     init
       .then(openEdge(Edge1))
       .then(tick)
-      .then(resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
-      .then(resolveEdge(Edge2, Timeout, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
-  // Mixed proof kinds across edges: cooperative agreement on the first,
-  // dispute outcome on the second. Catches kernel paths that assume the
+  // Mixed proof kinds across edges: violation close on the first,
+  // mutual on the second. Catches kernel paths that assume the
   // same proof kind across an entire trace.
   run mixedProofsTraceTest =
     init
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, ClaimantWins, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
       .then(openEdge(Edge2))
-      .then(resolveEdge(Edge2, Agreement, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge2, Mutual, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   // Height accumulates across multiple ticks; idle stutter does not
@@ -276,6 +255,6 @@ module l1 {
       .then(idle)
       .then(tick)
       .then(openEdge(Edge1))
-      .then(resolveEdge(Edge1, Timeout, MakerPayout, TakerPayout))
+      .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and noNegativeValue and height == 3)
 }

@@ -2,6 +2,7 @@
 
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
+#![allow(clippy::match_same_arms)]
 #![allow(clippy::std_instead_of_core)]
 
 mod support;
@@ -22,7 +23,7 @@ const MAX_STEPS: usize = 16;
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 enum Step {
     Open(EdgeKey),
-    Resolve(EdgeKey, ProofKey),
+    Close(EdgeKey, ProofKey),
     BadPayout(EdgeKey),
 }
 
@@ -31,26 +32,26 @@ impl Step {
         match index {
             0 => Self::Open(EdgeKey::First),
             1 => Self::Open(EdgeKey::Second),
-            2 => Self::Resolve(EdgeKey::First, ProofKey::Basic),
-            3 => Self::Resolve(EdgeKey::Second, ProofKey::Basic),
-            4 => Self::Resolve(EdgeKey::First, ProofKey::Agreement),
-            5 => Self::Resolve(EdgeKey::Second, ProofKey::Agreement),
-            6 => Self::Resolve(EdgeKey::First, ProofKey::Timeout),
-            7 => Self::Resolve(EdgeKey::Second, ProofKey::Timeout),
-            8 => Self::Resolve(EdgeKey::First, ProofKey::EarlyTimeout),
-            9 => Self::Resolve(EdgeKey::Second, ProofKey::EarlyTimeout),
-            10 => Self::Resolve(EdgeKey::First, ProofKey::Claimant),
-            11 => Self::Resolve(EdgeKey::Second, ProofKey::Challenger),
-            12 => Self::Resolve(EdgeKey::First, ProofKey::WrongTerms),
-            13 => Self::Resolve(EdgeKey::Second, ProofKey::BadSeal),
-            14 => Self::BadPayout(EdgeKey::First),
-            _ => Self::BadPayout(EdgeKey::Second),
+            2 => Self::Close(EdgeKey::First, ProofKey::Mutual),
+            3 => Self::Close(EdgeKey::Second, ProofKey::Mutual),
+            4 => Self::Close(EdgeKey::First, ProofKey::Timeout),
+            5 => Self::Close(EdgeKey::Second, ProofKey::Timeout),
+            6 => Self::Close(EdgeKey::First, ProofKey::EarlyTimeout),
+            7 => Self::Close(EdgeKey::Second, ProofKey::EarlyTimeout),
+            8 => Self::Close(EdgeKey::First, ProofKey::Violation),
+            9 => Self::Close(EdgeKey::Second, ProofKey::Violation),
+            10 => Self::Close(EdgeKey::First, ProofKey::WrongTerms),
+            11 => Self::Close(EdgeKey::Second, ProofKey::BadSeal),
+            12 => Self::BadPayout(EdgeKey::First),
+            13 => Self::BadPayout(EdgeKey::Second),
+            14 => Self::Open(EdgeKey::First),
+            _ => Self::Open(EdgeKey::Second),
         }
     }
 
     const fn context(self) -> hellas_kernel::Context {
         match self {
-            Self::Resolve(_, ProofKey::Timeout) => l1::TIMEOUT_CONTEXT,
+            Self::Close(_, ProofKey::Timeout) => l1::TIMEOUT_CONTEXT,
             _ => l1::CONTEXT,
         }
     }
@@ -58,8 +59,12 @@ impl Step {
     fn op(self) -> Tx {
         match self {
             Self::Open(edge) => l1::open(edge),
-            Self::Resolve(edge, proof) => l1::resolve(edge, proof),
-            Self::BadPayout(edge) => l1::resolve_with(edge, ProofKey::Basic, l1::bad_payouts()),
+            Self::Close(edge, proof) => l1::close(edge, proof),
+            // Mutual is the only proof shape that does not bind payouts to
+            // terms; sending non-canonical payouts under mutual still goes
+            // through close-validation. Pick mutual so this exercises the
+            // value-mismatch path in the kernel.
+            Self::BadPayout(edge) => l1::close_with(edge, ProofKey::Mutual, l1::bad_payouts()),
         }
     }
 }
@@ -111,15 +116,18 @@ fn assert_event_matches(
         (Step::Open(edge), EventKind::EdgeOpened { output, .. }) => {
             prop_assert_eq!(*output, l1::edge_id(edge));
         }
-        (Step::Resolve(edge, proof), EventKind::EdgeResolved { input, outputs })
+        (Step::Close(edge, proof), EventKind::EdgeClosed { input, outputs })
             if proof_accepts(proof) =>
         {
             prop_assert_eq!(*input, l1::edge_id(edge));
             prop_assert_eq!(outputs, &l1::output_ids(edge));
         }
-        (Step::BadPayout(edge), EventKind::EdgeResolved { input, outputs }) => {
+        (Step::BadPayout(edge), EventKind::EdgeClosed { input, outputs }) => {
             prop_assert_eq!(*input, l1::edge_id(edge));
-            prop_assert_eq!(outputs, &l1::output_ids(edge));
+            // BadPayout produces non-canonical outputs; the kernel either
+            // rejects (handled by the err branch above) or, in pathological
+            // configurations, emits the close event with the supplied outputs.
+            prop_assert_eq!(outputs, &Tx::close_output_ids(l1::edge_id(edge), &l1::bad_payouts()));
         }
         _ => prop_assert!(false),
     }
@@ -130,10 +138,8 @@ fn assert_event_matches(
 const fn proof_accepts(proof: ProofKey) -> bool {
     match proof {
         // FAKE_VERIFIER accepts every placeholder-shaped sig/seal, so
-        // Agreement/Claimant/Challenger pass under both feature configs.
-        // Basic is still gated by cfg(feature = "fake-crypto") in the kernel.
-        ProofKey::Timeout | ProofKey::Agreement | ProofKey::Claimant | ProofKey::Challenger => true,
-        ProofKey::Basic => cfg!(feature = "fake-crypto"),
+        // Mutual/Violation pass under both feature configs.
+        ProofKey::Mutual | ProofKey::Timeout | ProofKey::Violation => true,
         ProofKey::EarlyTimeout | ProofKey::WrongTerms | ProofKey::BadSeal => false,
     }
 }

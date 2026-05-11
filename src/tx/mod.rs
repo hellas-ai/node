@@ -1,7 +1,7 @@
 //! Transaction vocabulary, events, and the validate-then-fold transition machinery.
 //!
 //! Abstract counterpart: the actions in `models/l1.qnt` (`openEdge`,
-//! `resolveEdge`, `tick`, `idle`) and the `step` relation that dispatches
+//! `closeEdge`, `tick`, `idle`) and the `step` relation that dispatches
 //! over them. Each concrete [`Tx`] variant lines up with one Quint action;
 //! `apply` here implements the same validate-then-fold discipline the model
 //! captures by primed-variable assignments inside an `action` block.
@@ -13,18 +13,18 @@ mod proof;
 pub use self::{
     funding::Funding,
     payout::Payout,
-    proof::{Agreement, Proof, ResolveKind, Seal},
+    proof::{CloseKind, Proof, Seal},
 };
 
 use crate::{
     canonical::Encode,
     consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS},
     context::{Context, Cost},
-    error::{ApplyError, InvalidOpenReason, InvalidResolveReason, KernelResult},
+    error::{ApplyError, InvalidCloseReason, InvalidOpenReason, KernelResult},
     event::Change,
     list::List,
     object::{Coin, Edge},
-    primitive::{CoinId, EdgeId, ResolveHash, TermsHash},
+    primitive::{CloseHash, CoinId, EdgeId, TermsHash},
     store::Batch,
     terms::Terms,
     verifier::Verifier,
@@ -33,7 +33,7 @@ use crate::{
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
 type Payouts = List<Payout, MAX_EDGE_OUTPUTS>;
-type ResolveCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
+type CloseCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 
 /// A protocol transaction submitted to the Hellas kernel.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -46,13 +46,13 @@ pub enum Tx {
         terms: Terms,
     },
 
-    /// Resolve one edge into bounded owner-only coin payouts.
-    Resolve {
-        /// Edge consumed by the resolve.
+    /// Close one edge into bounded owner-only coin payouts.
+    Close {
+        /// Edge consumed by the close.
         input: EdgeId,
-        /// Resolve proof witness.
+        /// Close proof witness.
         proof: Proof,
-        /// Coin payouts produced by the resolve.
+        /// Coin payouts produced by the close.
         outputs: Payouts,
     },
 }
@@ -64,10 +64,10 @@ impl Tx {
         Self::Open { funding, terms }
     }
 
-    /// Creates a resolve transaction.
+    /// Creates a close transaction.
     #[must_use]
-    pub const fn resolve(input: EdgeId, proof: Proof, outputs: Payouts) -> Self {
-        Self::Resolve {
+    pub const fn close(input: EdgeId, proof: Proof, outputs: Payouts) -> Self {
+        Self::Close {
             input,
             proof,
             outputs,
@@ -84,9 +84,9 @@ impl Tx {
         edge_id(funding, terms.hash())
     }
 
-    /// Returns the canonical ids of the payout coins a resolve would produce.
+    /// Returns the canonical ids of the payout coins a close would produce.
     #[must_use]
-    pub fn resolve_output_ids(
+    pub fn close_output_ids(
         edge: EdgeId,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> List<CoinId, MAX_EDGE_OUTPUTS> {
@@ -99,21 +99,21 @@ impl Tx {
         List::take(ids, outputs.len())
     }
 
-    /// Returns the commitment signed or proven by a resolve witness.
+    /// Returns the commitment signed or proven by a close witness.
     #[must_use]
     pub fn payload_hash(
         input: EdgeId,
-        kind: ResolveKind,
+        kind: CloseKind,
         terms: TermsHash,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-    ) -> ResolveHash {
+    ) -> CloseHash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(crate::consts::RESOLVE);
+        hasher.update(crate::consts::CLOSE);
         input.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         terms.encode_to(&mut hasher);
         outputs.encode_to(&mut hasher);
-        ResolveHash::from_bytes(*hasher.finalize().as_bytes())
+        CloseHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
     /// Returns the deterministic resource cost of this transaction.
@@ -121,7 +121,7 @@ impl Tx {
     pub fn cost(&self) -> Cost {
         match self {
             Self::Open { funding, .. } => open_cost(funding),
-            Self::Resolve { proof, outputs, .. } => resolve_cost(outputs.len(), proof.kind()),
+            Self::Close { proof, outputs, .. } => close_cost(outputs.len(), proof.kind()),
         }
     }
 
@@ -133,11 +133,11 @@ impl Tx {
     ) -> KernelResult<Change> {
         match self {
             Self::Open { funding, terms } => apply_open(funding, terms, context, batch),
-            Self::Resolve {
+            Self::Close {
                 input,
                 proof,
                 outputs,
-            } => apply_resolve(*input, proof, outputs, context, verifier, batch),
+            } => apply_close(*input, proof, outputs, context, verifier, batch),
         }
     }
 }
@@ -148,11 +148,13 @@ fn open_cost(funding: &Funding) -> Cost {
 }
 
 fn open_reserve_cost() -> Cost {
-    resolve_cost(MAX_EDGE_OUTPUTS, ResolveKind::ClaimantWins)
+    // Reserve covers the worst-case close: the close kind with the most
+    // proof units, applied at the maximum payout fanout.
+    close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual)
 }
 
 /// One slot per payout output plus one for the consumed edge.
-fn resolve_cost(outputs: usize, kind: ResolveKind) -> Cost {
+fn close_cost(outputs: usize, kind: CloseKind) -> Cost {
     let outputs = units(outputs);
     Cost::new(1, outputs.saturating_add(1), kind.proofs())
 }
@@ -184,7 +186,7 @@ fn apply_open<B: Batch>(
     Ok(Change::open(&coins, (output, edge)))
 }
 
-fn apply_resolve<B: Batch, V: Verifier + ?Sized>(
+fn apply_close<B: Batch, V: Verifier + ?Sized>(
     input: EdgeId,
     proof: &Proof,
     outputs: &Payouts,
@@ -192,22 +194,22 @@ fn apply_resolve<B: Batch, V: Verifier + ?Sized>(
     verifier: &V,
     batch: &B,
 ) -> KernelResult<Change> {
-    check_resolve_outputs(input, outputs, batch)?;
+    check_close_outputs(input, outputs, batch)?;
 
-    let coins = resolve_coins(input, outputs);
+    let coins = close_coins(input, outputs);
     let edge = batch
         .edge(input)
         .ok_or(ApplyError::MissingEdge { id: input })?;
-    proof
-        .accepts(context, verifier, input, outputs, edge)
+    verifier
+        .verify_close(input, &edge, outputs, proof, &context)
         .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
     let fee = context
-        .fee(resolve_cost(outputs.len(), proof.kind()))
-        .ok_or_else(|| invalid_resolve(input, InvalidResolveReason::FeeOverflow))?;
-    edge.resolves(&coins, fee)
-        .map_err(|reason| invalid_resolve(input, reason))?;
+        .fee(close_cost(outputs.len(), proof.kind()))
+        .ok_or_else(|| invalid_close(input, InvalidCloseReason::FeeOverflow))?;
+    edge.closes(&coins, fee)
+        .map_err(|reason| invalid_close(input, reason))?;
 
-    Ok(Change::resolve((input, edge), &coins))
+    Ok(Change::close((input, edge), &coins))
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
@@ -230,7 +232,7 @@ fn open_coins<B: Batch>(funding: &Funding, batch: &B) -> KernelResult<OpenCoins>
     Ok(List::take(coins, funding.len()))
 }
 
-fn check_resolve_outputs<B: Batch>(
+fn check_close_outputs<B: Batch>(
     input: EdgeId,
     outputs: &Payouts,
     batch: &B,
@@ -244,7 +246,7 @@ fn check_resolve_outputs<B: Batch>(
     Ok(())
 }
 
-fn resolve_coins(input: EdgeId, outputs: &Payouts) -> ResolveCoins {
+fn close_coins(input: EdgeId, outputs: &Payouts) -> CloseCoins {
     let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
     for (index, output) in outputs.iter().enumerate() {
         coins[index] = output.coin(input, index);
@@ -265,8 +267,8 @@ const fn invalid_open(output: EdgeId, reason: InvalidOpenReason) -> ApplyError {
     ApplyError::InvalidOpen { output, reason }
 }
 
-const fn invalid_resolve(input: EdgeId, reason: InvalidResolveReason) -> ApplyError {
-    ApplyError::InvalidResolve { input, reason }
+const fn invalid_close(input: EdgeId, reason: InvalidCloseReason) -> ApplyError {
+    ApplyError::InvalidClose { input, reason }
 }
 
 fn units(value: usize) -> u64 {

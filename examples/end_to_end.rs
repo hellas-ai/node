@@ -11,7 +11,7 @@
 //!     feature. Real ECDSA, no placeholder semantics.
 //!   - `Context` — block height, previous hash, fee schedule. The example
 //!     drives the kernel as if a tiny consensus had handed it two finalized
-//!     blocks: one with an `Open`, one with a `Resolve`.
+//!     blocks: one with an `Open`, one with a `Close`.
 //!
 //! Build and run with:
 //!
@@ -33,9 +33,9 @@
 use std::collections::BTreeMap;
 
 use hellas_kernel::{
-    Agreement, Batch, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId,
+    Batch, Block, BlockHash, BlockHeight, CloseKind, Coin, CoinId, Context, Edge, EdgeId,
     EventKind, Fees, Funding, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, ResolveKind, Secp256k1Verifier, Sig,
+    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Secp256k1Verifier, Sig,
     State, Store, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
@@ -127,7 +127,7 @@ fn keypair(seed: u8) -> (SecretKey, Key) {
     (secret, Key::from_bytes(public.serialize()))
 }
 
-fn sign(secret: &SecretKey, hash: hellas_kernel::ResolveHash) -> Sig {
+fn sign(secret: &SecretKey, hash: hellas_kernel::CloseHash) -> Sig {
     let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);
@@ -173,7 +173,7 @@ fn main() {
     let taker_coin = CoinId::from_bytes([0xbb; CoinId::LENGTH]);
 
     let timeout_payouts = payouts(maker_pk, taker_pk, 6, 4);
-    let agreement_payouts = payouts(maker_pk, taker_pk, 7, 8);
+    let mutual_payouts = payouts(maker_pk, taker_pk, 7, 8);
     let timeout_height = BlockHeight::new(2);
     let terms = Terms::basic(
         ProtocolCode::new(1),
@@ -218,7 +218,7 @@ fn main() {
     let event = diff_open.event(0).expect("one event in the open block");
     println!();
     println!("block 1 (height 1): submit Tx::Open");
-    println!("  emitted event: {}", summarize(&event.kind()));
+    println!("  emitted event: {}", summarize(event.kind()));
     println!(
         "  store now: {} coins, {} edges; edge value = {}",
         state.store().coins.len(),
@@ -231,33 +231,30 @@ fn main() {
             .value(),
     );
 
-    // -- Block 2: cooperative resolve via real ECDSA --------------------
-    let resolve_hash = Tx::payload_hash(
+    // -- Block 2: cooperative close via real ECDSA ----------------------
+    let close_hash = Tx::payload_hash(
         edge,
-        ResolveKind::Agreement,
+        CloseKind::Mutual,
         terms_hash,
-        &agreement_payouts,
+        &mutual_payouts,
     );
-    let proof = Proof::agreement(
-        terms_hash,
-        Agreement::new(sign(&maker_sk, resolve_hash), sign(&taker_sk, resolve_hash)),
-    );
-    let resolve = Tx::resolve(edge, proof, agreement_payouts);
-    let context_resolve = Context::with_fees(
+    let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&taker_sk, close_hash));
+    let close = Tx::close(edge, proof, mutual_payouts);
+    let context_close = Context::with_fees(
         BlockHeight::new(3),
         BlockHash::from_bytes([1; BlockHash::LENGTH]),
         Fees::ZERO,
     );
-    let block_resolve = Block::new(context_resolve, List::all([resolve]));
-    let diff_resolve = state
-        .apply_block(&verifier, &block_resolve)
-        .expect("agreement resolve accepted under real ECDSA");
-    let event = diff_resolve
+    let block_close = Block::new(context_close, List::all([close]));
+    let diff_close = state
+        .apply_block(&verifier, &block_close)
+        .expect("mutual close accepted under real ECDSA");
+    let event = diff_close
         .event(0)
-        .expect("one event in the resolve block");
+        .expect("one event in the close block");
     println!();
-    println!("block 2 (height 3): submit Tx::Resolve(Agreement)");
-    println!("  emitted event: {}", summarize(&event.kind()));
+    println!("block 2 (height 3): submit Tx::Close(Mutual)");
+    println!("  emitted event: {}", summarize(event.kind()));
     println!(
         "  store now: {} coins, {} edges",
         state.store().coins.len(),
@@ -307,14 +304,14 @@ fn summarize(event: &EventKind) -> String {
                 short(output.as_bytes()),
             )
         }
-        EventKind::EdgeResolved { input, outputs } => {
+        EventKind::EdgeClosed { input, outputs } => {
             let outputs: Vec<String> = outputs
                 .as_slice()
                 .iter()
                 .map(|id| short(id.as_bytes()))
                 .collect();
             format!(
-                "EdgeResolved(input={}, outputs=[{}])",
+                "EdgeClosed(input={}, outputs=[{}])",
                 short(input.as_bytes()),
                 outputs.join(", "),
             )

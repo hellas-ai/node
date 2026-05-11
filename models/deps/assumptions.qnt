@@ -11,7 +11,7 @@
 // Layer correspondence:
 //   consensus → src/state.rs::apply_block (kernel applies whatever it gets)
 //   verifier  → src/verifier.rs::Verifier
-//   store     → src/store.rs::Store, src/store.rs::Tx
+//   store     → src/store.rs::Store, src/store.rs::Batch
 //   genesis   → src/object.rs::Genesis::insert
 //
 // Each assumption is a `pure def` predicate over abstract state and a
@@ -40,9 +40,11 @@ module assumptions {
   // ---------------------------------------------------------------------
 
   // The verifier never accepts a witness it should not. If `proofOk(p, h)
-  // = true`, the kernel treats the proof as valid; if the verifier admits
-  // an invalid signature or seal, an unauthorized resolve can drain an
-  // edge. Modelled by the `proofOk` predicate in `verifier.qnt`.
+  // = true` and `payoutsBound(p, mPay, tPay) = true`, the kernel treats
+  // the proof as valid; if the verifier admits an invalid signature, seal,
+  // or non-canonical payout split, an unauthorized close can drain an
+  // edge. Modelled by the `proofOk` / `payoutsBound` predicates in
+  // `verifier.qnt`.
 
   // Verification is deterministic — same proof, same answer every call.
   // The kernel relies on this to avoid double-checking; the abstract

@@ -112,17 +112,17 @@ pub enum ApplyError {
         reason: InvalidOpenReason,
     },
 
-    /// An edge cannot resolve into the requested payouts.
-    InvalidResolve {
-        /// Edge requested for resolve.
+    /// An edge cannot close into the requested payouts.
+    InvalidClose {
+        /// Edge requested for close.
         input: EdgeId,
-        /// Specific reason the resolve was rejected.
-        reason: InvalidResolveReason,
+        /// Specific reason the close was rejected.
+        reason: InvalidCloseReason,
     },
 
-    /// A resolve proof is unsupported or does not match the edge being resolved.
+    /// A close proof is unsupported or does not match the edge being closed.
     InvalidProof {
-        /// Edge requested for resolve.
+        /// Edge requested for close.
         input: EdgeId,
         /// Specific reason the proof was rejected.
         reason: InvalidProofReason,
@@ -158,14 +158,14 @@ pub enum InvalidOpenReason {
     FundingInsufficient,
 }
 
-/// Specific reason an [`ApplyError::InvalidResolve`] was raised.
+/// Specific reason an [`ApplyError::InvalidClose`] was raised.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum InvalidResolveReason {
-    /// `context.fee(resolve.cost())` overflowed.
+pub enum InvalidCloseReason {
+    /// `context.fee(close.cost())` overflowed.
     FeeOverflow,
     /// Sum of payout values overflowed `u64`.
     PayoutOverflow,
-    /// Locked reserve does not cover the current priced resolve cost. Under v1
+    /// Locked reserve does not cover the current priced close cost. Under v1
     /// fee semantics this is the deliberate stale-edge collection signal.
     ReserveTooSmall,
     /// Sum of payout values does not equal the edge's principal.
@@ -173,18 +173,20 @@ pub enum InvalidResolveReason {
 }
 
 /// Specific reason an [`ApplyError::InvalidProof`] was raised.
+///
+/// The kernel surfaces these as a fixed vocabulary; deciding which (if
+/// any) applies to a given close is the [`crate::Verifier`]'s job.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidProofReason {
-    /// `Proof::Basic` was supplied in a build that does not accept it.
-    BasicNotAccepted,
     /// The proof's terms commitment does not match the edge's `TermsHash`.
     TermsMismatch,
-    /// An agreement signature was rejected by the verifier.
+    /// A signature on the close payload was rejected.
     BadSignature,
-    /// A dispute seal was rejected by the verifier.
+    /// A dispute seal was rejected.
     BadSeal,
-    /// `Proof::Timeout` was submitted before the committed timeout height.
+    /// A `Proof::Timeout` was submitted before the committed timeout height.
     TimeoutNotReached,
-    /// `Proof::Timeout` payouts do not equal `Terms::timeout_outputs`.
+    /// A `Proof::Timeout` carries payouts that do not equal
+    /// `Terms::timeout_outputs`.
     PayoutMismatch,
 }

@@ -1,11 +1,11 @@
 use super::*;
 
 #[test]
-fn apply_all_opens_and_resolves_one_batch() {
+fn apply_all_opens_and_closes_one_batch() {
     let mut state = funded_state();
     let ops = List::all([
         Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
-        Tx::resolve(
+        Tx::close(
             edge(),
             proof(),
             payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
@@ -27,7 +27,7 @@ fn apply_all_opens_and_resolves_one_batch() {
     );
     assert_eq!(
         diff.event(1).map(Event::kind),
-        Some(&EventKind::EdgeResolved {
+        Some(&EventKind::EdgeClosed {
             input: edge(),
             outputs: output_ids2(maker_out(), taker_out()),
         }),
@@ -65,11 +65,11 @@ fn apply_all_rolls_back_on_error() {
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
     let open = Tx::open(funding_value, terms_value.clone());
-    let mut state = state(store_for_resolve(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
     let ops = List::all([
         open,
-        Tx::resolve(edge, Proof::timeout(terms_value), outputs),
+        Tx::close(edge, Proof::timeout(terms_value), outputs),
     ]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
@@ -79,9 +79,9 @@ fn apply_all_rolls_back_on_error() {
     assert_eq!(error.index(), 1);
     assert_eq!(
         error.source(),
-        ApplyError::InvalidResolve {
+        ApplyError::InvalidClose {
             input: edge,
-            reason: InvalidResolveReason::ValueMismatch,
+            reason: InvalidCloseReason::ValueMismatch,
         },
     );
     assert_eq!(*state.store(), store);
@@ -95,7 +95,7 @@ fn apply_iter_emits_events_per_op() {
     let open = Tx::open(funding_value, basic_terms());
     let ops = [
         open,
-        Tx::resolve(
+        Tx::close(
             edge_id,
             proof(),
             payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
@@ -118,7 +118,7 @@ fn apply_iter_emits_events_per_op() {
     assert_eq!(observed[1].0, 1);
     assert!(matches!(
         observed[1].1,
-        EventKind::EdgeResolved { input, .. } if input == edge_id,
+        EventKind::EdgeClosed { input, .. } if input == edge_id,
     ));
     assert_eq!(state.store().edge(edge_id), None);
     assert_eq!(
@@ -134,11 +134,11 @@ fn apply_iter_rolls_back_on_mid_batch_failure() {
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge_id = Tx::edge_id_of(&funding_value, &terms_value);
     let open = Tx::open(funding_value, terms_value.clone());
-    let mut state = state(store_for_resolve(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store_before = *state.store();
     let ops = [
         open,
-        Tx::resolve(edge_id, Proof::timeout(terms_value), outputs),
+        Tx::close(edge_id, Proof::timeout(terms_value), outputs),
     ];
 
     let mut observed = Vec::new();
@@ -151,9 +151,9 @@ fn apply_iter_rolls_back_on_mid_batch_failure() {
     assert_eq!(error.index(), 1);
     assert_eq!(
         error.source(),
-        ApplyError::InvalidResolve {
+        ApplyError::InvalidClose {
             input: edge_id,
-            reason: InvalidResolveReason::ValueMismatch,
+            reason: InvalidCloseReason::ValueMismatch,
         },
     );
     // op-0's event was observed before op-1 failed, but the transaction

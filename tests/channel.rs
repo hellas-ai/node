@@ -1,4 +1,4 @@
-//! Channel open/resolve tests.
+//! Channel open/close tests.
 
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
@@ -13,17 +13,16 @@ mod batch;
 mod op;
 #[path = "channel/open.rs"]
 mod open;
-#[path = "channel/resolve.rs"]
-mod resolve;
+#[path = "channel/close.rs"]
+mod close;
 
 use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 
 use hellas_kernel::{
-    Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, Event,
-    EventKind, Fees, Funding, Genesis, InsertError, InvalidOpenReason, InvalidProofReason,
-    InvalidResolveReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    Payout, Proof, ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, State, Terms, TermsHash, Tx,
-    View,
+    ApplyError, Block, BlockHash, BlockHeight, CloseHash, CloseKind, CoinId, Context, Cost, EdgeId,
+    Event, EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
+    InvalidProofReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+    Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, TermsHash, Tx, View,
 };
 
 const CONTEXT: Context = Context::new(
@@ -91,61 +90,47 @@ fn other_proof() -> Proof {
     Proof::timeout(other_terms_value())
 }
 
-fn agreement_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::agreement(
-        terms(),
-        Agreement::new(maker_sig(input, outputs), taker_sig(input, outputs)),
-    )
+fn mutual_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
+    Proof::mutual(maker_sig(input, outputs), taker_sig(input, outputs))
 }
 
 fn maker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
-    Sig::placeholder(MAKER, agreement_hash(input, outputs))
+    Sig::placeholder(MAKER, mutual_hash(input, outputs))
 }
 
 fn taker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
-    Sig::placeholder(TAKER, agreement_hash(input, outputs))
+    Sig::placeholder(TAKER, mutual_hash(input, outputs))
 }
 
-fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    resolve_hash(ResolveKind::Agreement, input, outputs)
+fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> CloseHash {
+    close_hash(CloseKind::Mutual, input, outputs)
 }
 
-fn claimant_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::claimant_wins(basic_terms(), seal(ResolveKind::ClaimantWins, input, outputs))
+fn violation_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
+    Proof::violation(basic_terms(), seal(CloseKind::Violation, input, outputs))
 }
 
-fn challenger_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::challenger_wins(
-        basic_terms(),
-        seal(ResolveKind::ChallengerWins, input, outputs),
-    )
+fn seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    Seal::placeholder(PROTOCOL, kind, close_hash(kind, input, outputs))
 }
 
-fn seal(kind: ResolveKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    Seal::placeholder(PROTOCOL, kind, resolve_hash(kind, input, outputs))
+fn other_seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    Seal::placeholder(OTHER_PROTOCOL, kind, other_close_hash(kind, input, outputs))
 }
 
-fn other_seal(kind: ResolveKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    Seal::placeholder(
-        OTHER_PROTOCOL,
-        kind,
-        other_resolve_hash(kind, input, outputs),
-    )
-}
-
-fn resolve_hash(
-    kind: ResolveKind,
+fn close_hash(
+    kind: CloseKind,
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> ResolveHash {
+) -> CloseHash {
     Tx::payload_hash(input, kind, terms(), outputs)
 }
 
-fn other_resolve_hash(
-    kind: ResolveKind,
+fn other_close_hash(
+    kind: CloseKind,
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> ResolveHash {
+) -> CloseHash {
     Tx::payload_hash(input, kind, other_terms(), outputs)
 }
 
@@ -186,7 +171,7 @@ fn open_op() -> Tx {
 fn open_edge_id(open: &Tx) -> EdgeId {
     match open {
         Tx::Open { funding, terms } => Tx::edge_id_of(funding, terms),
-        Tx::Resolve { .. } => panic!("expected Tx::Open"),
+        Tx::Close { .. } => panic!("expected Tx::Open"),
     }
 }
 
@@ -293,14 +278,14 @@ fn output_ids0() -> List<CoinId, MAX_EDGE_OUTPUTS> {
 }
 
 fn output_ids() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Tx::resolve_output_ids(
+    Tx::close_output_ids(
         edge(),
         &payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
     )
 }
 
 fn output_ids3_values() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Tx::resolve_output_ids(
+    Tx::close_output_ids(
         edge(),
         &payouts3(
             Payout::new(MAKER, 6),
@@ -364,9 +349,9 @@ fn store_for(open: &Tx) -> FixedStore<6, 1> {
     )
 }
 
-fn store_for_resolve(open: &Tx, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
+fn store_for_close(open: &Tx, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
     let edge_id = open_edge_id(open);
-    let ids = Tx::resolve_output_ids(edge_id, outputs);
+    let ids = Tx::close_output_ids(edge_id, outputs);
     let first = ids.as_slice().first().copied().unwrap_or_else(maker_out);
     let second = ids.as_slice().get(1).copied().unwrap_or_else(taker_out);
     let third = ids.as_slice().get(2).copied().unwrap_or_else(extra_out);

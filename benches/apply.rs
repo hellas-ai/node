@@ -37,12 +37,12 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("../models/traces/l1_basicTraceTest.itf.json"),
     ),
     (
-        "agreement_timeout",
-        include_str!("../models/traces/l1_agreementTimeoutTraceTest.itf.json"),
+        "mutual_timeout",
+        include_str!("../models/traces/l1_mutualTimeoutTraceTest.itf.json"),
     ),
     (
-        "dispute",
-        include_str!("../models/traces/l1_disputeTraceTest.itf.json"),
+        "violation",
+        include_str!("../models/traces/l1_violationTraceTest.itf.json"),
     ),
     (
         "both_edges_timeout",

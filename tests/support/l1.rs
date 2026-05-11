@@ -3,9 +3,9 @@
 use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
-    Agreement, BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, EventKind, Funding, Genesis,
-    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
-    ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, State, Terms, Tx, View,
+    BlockHash, BlockHeight, CloseHash, CloseKind, CoinId, Context, Edge, EdgeId, EventKind,
+    Funding, Genesis, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+    Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, Tx, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -45,14 +45,14 @@ pub(crate) type TraceView = View<6, 2>;
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum Step {
     Open(EdgeKey),
-    Resolve(EdgeKey, ProofKey),
+    Close(EdgeKey, ProofKey),
     Tick,
 }
 
 impl Step {
     pub(crate) const fn context(self) -> Context {
         match self {
-            Self::Resolve(_, ProofKey::Timeout) => TIMEOUT_CONTEXT,
+            Self::Close(_, ProofKey::Timeout) => TIMEOUT_CONTEXT,
             _ => CONTEXT,
         }
     }
@@ -60,7 +60,7 @@ impl Step {
     pub(crate) fn op(self) -> Option<Tx> {
         match self {
             Self::Open(edge) => Some(open(edge)),
-            Self::Resolve(edge, proof) => Some(resolve(edge, proof)),
+            Self::Close(edge, proof) => Some(close(edge, proof)),
             Self::Tick => None,
         }
     }
@@ -70,7 +70,7 @@ impl Step {
             (Self::Open(edge), EventKind::EdgeOpened { output, .. }) => {
                 assert_eq!(*output, edge_id(edge));
             }
-            (Self::Resolve(edge, _), EventKind::EdgeResolved { input, outputs }) => {
+            (Self::Close(edge, _), EventKind::EdgeClosed { input, outputs }) => {
                 assert_eq!(*input, edge_id(edge));
                 assert_eq!(*outputs, output_ids(edge));
             }
@@ -95,11 +95,9 @@ pub(crate) enum OpenKey {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum ProofKey {
-    Basic,
-    Agreement,
+    Mutual,
     Timeout,
-    Claimant,
-    Challenger,
+    Violation,
     EarlyTimeout,
     WrongTerms,
     BadSeal,
@@ -171,16 +169,16 @@ pub(crate) fn open_case_inputs(key: OpenKey) -> List<CoinId, MAX_EDGE_INPUTS> {
     }
 }
 
-pub(crate) fn resolve(edge: EdgeKey, proof: ProofKey) -> Tx {
-    resolve_with(edge, proof, payouts())
+pub(crate) fn close(edge: EdgeKey, proof: ProofKey) -> Tx {
+    close_with(edge, proof, payouts())
 }
 
-pub(crate) fn resolve_with(
+pub(crate) fn close_with(
     edge: EdgeKey,
     proof: ProofKey,
     outputs: List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> Tx {
-    Tx::resolve(edge_id(edge), proof_for(edge, proof, &outputs), outputs)
+    Tx::close(edge_id(edge), proof_for(edge, proof, &outputs), outputs)
 }
 
 pub(crate) fn edge_id(edge: EdgeKey) -> EdgeId {
@@ -205,7 +203,7 @@ pub(crate) fn taker_out(edge: EdgeKey) -> CoinId {
 }
 
 pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Tx::resolve_output_ids(edge_id(edge), &payouts())
+    Tx::close_output_ids(edge_id(edge), &payouts())
 }
 
 pub(crate) const fn edge_value(edge: Edge) -> u64 {
@@ -311,25 +309,21 @@ pub(crate) fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId
 fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
     let terms = terms();
     match proof {
-        ProofKey::Basic => Proof::basic(terms.hash()),
-        ProofKey::Agreement => Proof::agreement(
-            terms.hash(),
-            Agreement::new(
-                Sig::placeholder(MAKER, hash(edge, ResolveKind::Agreement, outputs)),
-                Sig::placeholder(TAKER, hash(edge, ResolveKind::Agreement, outputs)),
-            ),
+        ProofKey::Mutual => Proof::mutual(
+            Sig::placeholder(MAKER, hash(edge, CloseKind::Mutual, outputs)),
+            Sig::placeholder(TAKER, hash(edge, CloseKind::Mutual, outputs)),
         ),
         ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
-        ProofKey::Claimant => {
-            Proof::claimant_wins(terms, seal(edge, ResolveKind::ClaimantWins, outputs))
+        ProofKey::Violation => {
+            Proof::violation(terms, seal(edge, CloseKind::Violation, outputs))
         }
-        ProofKey::Challenger => {
-            Proof::challenger_wins(terms, seal(edge, ResolveKind::ChallengerWins, outputs))
-        }
-        ProofKey::WrongTerms => Proof::basic(other_terms().hash()),
-        ProofKey::BadSeal => {
-            Proof::claimant_wins(terms, seal(edge, ResolveKind::ChallengerWins, outputs))
-        }
+        // Submitting a Timeout proof whose terms don't match the edge's terms
+        // commitment triggers `TermsMismatch` in the verifier (replaces the
+        // old "Proof::basic with other terms" admission test).
+        ProofKey::WrongTerms => Proof::timeout(other_terms()),
+        // Bind the seal to a payload that does not match the canonical close
+        // payload, so the verifier rejects it with `BadSeal`.
+        ProofKey::BadSeal => Proof::violation(terms, bad_seal(edge, outputs)),
     }
 }
 
@@ -342,10 +336,19 @@ fn open_funding(key: OpenKey) -> Funding {
     }
 }
 
-fn seal(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+fn seal(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
     Seal::placeholder(terms().protocol(), kind, hash(edge, kind, outputs))
 }
 
-fn hash(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
+/// Seal bound to a non-canonical close payload (uses `other_terms()` for the
+/// terms-hash binding), so the verifier rejects with `BadSeal` rather than
+/// `TermsMismatch`.
+fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    let bad_hash =
+        Tx::payload_hash(edge_id(edge), CloseKind::Violation, other_terms().hash(), outputs);
+    Seal::placeholder(terms().protocol(), CloseKind::Violation, bad_hash)
+}
+
+fn hash(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> CloseHash {
     Tx::payload_hash(edge_id(edge), kind, terms().hash(), outputs)
 }

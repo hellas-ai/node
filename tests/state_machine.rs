@@ -145,7 +145,7 @@ fn full_edge_id() -> EdgeId {
 }
 
 fn timeout_resolve() -> Tx {
-    Tx::resolve(full_edge_id(), Proof::timeout(terms()), canonical_payouts())
+    Tx::close(full_edge_id(), Proof::timeout(terms()), canonical_payouts())
 }
 
 struct L1Reference;

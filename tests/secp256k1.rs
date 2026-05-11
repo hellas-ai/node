@@ -1,10 +1,9 @@
 //! Real-crypto smoke test for the [`Secp256k1Verifier`].
 //!
-//! Constructs a real keypair, signs the kernel's canonical resolve hash with
-//! ECDSA, and asserts that the kernel accepts the resulting Agreement
-//! resolve through the production `Verifier` impl. Mutating any of (sig,
-//! key, hash) or swapping the kernel for a `RejectVerifier` causes
-//! rejection.
+//! Constructs a real keypair, signs the kernel's canonical close hash with
+//! ECDSA, and asserts that the kernel accepts the resulting Mutual close
+//! through the production `Verifier` impl. Mutating any of (sig, key, hash)
+//! or swapping the kernel for a `RejectVerifier` causes rejection.
 
 #![cfg(feature = "secp256k1")]
 #![allow(clippy::alloc_instead_of_core)]
@@ -18,9 +17,9 @@
 mod support;
 
 use hellas_kernel::{
-    Agreement, ApplyError, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis,
+    ApplyError, BlockHash, BlockHeight, CloseKind, CoinId, Context, Funding, Genesis,
     InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode,
-    ResolveKind, Secp256k1Verifier, Sig, State, Terms, Tx,
+    Secp256k1Verifier, Sig, State, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 use support::{FixedStore, party_one, payouts_two};
@@ -38,7 +37,7 @@ fn keypair(seed: u8) -> (SecretKey, Key) {
     (secret, Key::from_bytes(public.serialize()))
 }
 
-fn sign(secret: &SecretKey, hash: hellas_kernel::ResolveHash) -> Sig {
+fn sign(secret: &SecretKey, hash: hellas_kernel::CloseHash) -> Sig {
     let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);
@@ -50,7 +49,7 @@ const fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {
 }
 
 #[test]
-fn agreement_with_real_ecdsa_signatures_resolves_under_production_verifier() {
+fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
     let (maker_sk, maker_pk) = keypair(1);
     let (taker_sk, taker_pk) = keypair(2);
     let parties = Parties::new(maker_pk, taker_pk);
@@ -63,14 +62,11 @@ fn agreement_with_real_ecdsa_signatures_resolves_under_production_verifier() {
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(funding, terms);
-    let resolve_hash = Tx::payload_hash(edge, ResolveKind::Agreement, terms_hash, &outputs);
-    let proof = Proof::agreement(
-        terms_hash,
-        Agreement::new(sign(&maker_sk, resolve_hash), sign(&taker_sk, resolve_hash)),
-    );
+    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
+    let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&taker_sk, close_hash));
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
-    let resolve = Tx::resolve(edge, proof, outputs);
+    let close = Tx::close(edge, proof, outputs);
     let store = FixedStore::empty([maker_coin, taker_coin, maker_out, taker_out], [edge]);
     let mut state = State::genesis(
         store,
@@ -86,8 +82,8 @@ fn agreement_with_real_ecdsa_signatures_resolves_under_production_verifier() {
         .apply(CONTEXT, &verifier, &open)
         .expect("open accepted");
     let event = state
-        .apply(CONTEXT, &verifier, &resolve)
-        .expect("agreement with valid ECDSA accepted");
+        .apply(CONTEXT, &verifier, &close)
+        .expect("mutual with valid ECDSA accepted");
     assert_eq!(state.store().edge(edge), None);
     let _ = event;
 }
@@ -105,15 +101,12 @@ fn forged_signature_is_rejected_by_real_verifier() {
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(funding, terms);
-    let resolve_hash = Tx::payload_hash(edge, ResolveKind::Agreement, terms_hash, &outputs);
+    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
     // Sign with maker's key in *both* slots — taker's signature is forged.
-    let proof = Proof::agreement(
-        terms_hash,
-        Agreement::new(sign(&maker_sk, resolve_hash), sign(&maker_sk, resolve_hash)),
-    );
+    let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&maker_sk, close_hash));
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
-    let resolve = Tx::resolve(edge, proof, outputs);
+    let close = Tx::close(edge, proof, outputs);
     let store = FixedStore::empty([maker_coin, taker_coin, maker_out, taker_out], [edge]);
     let mut state = State::genesis(
         store,
@@ -129,7 +122,7 @@ fn forged_signature_is_rejected_by_real_verifier() {
         .apply(CONTEXT, &verifier, &open)
         .expect("open accepted");
     assert_eq!(
-        state.apply(CONTEXT, &verifier, &resolve),
+        state.apply(CONTEXT, &verifier, &close),
         Err(ApplyError::InvalidProof {
             input: edge,
             reason: InvalidProofReason::BadSignature,

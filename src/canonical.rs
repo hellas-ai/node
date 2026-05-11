@@ -4,7 +4,7 @@
 //! gets stored at the chain boundary implements [`Encode`]. Values that
 //! can also be reconstructed from canonical bytes additionally implement
 //! [`Decode`]. The split is deliberate: hash newtypes ([`crate::CoinId`],
-//! [`crate::EdgeId`], [`crate::TermsHash`], [`crate::ResolveHash`]) impl
+//! [`crate::EdgeId`], [`crate::TermsHash`], [`crate::CloseHash`]) impl
 //! `Encode` only — you can serialize a hash you already hold, you cannot
 //! deserialize one in isolation. The hash discipline is enforced at the
 //! type system level.

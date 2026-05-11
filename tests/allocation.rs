@@ -41,13 +41,13 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     );
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
     let expected_open = Tx::open(funding_value, terms_value.clone());
-    let resolve_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
-    let expected_resolve = Tx::resolve(
+    let close_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
+    let expected_close = Tx::close(
         edge,
         Proof::timeout(terms_value),
-        resolve_outputs.clone(),
+        close_outputs.clone(),
     );
-    let output_id_list = Tx::resolve_output_ids(edge, &resolve_outputs);
+    let output_id_list = Tx::close_output_ids(edge, &close_outputs);
     let maker_out = nth(&output_id_list, 0);
     let taker_out = nth(&output_id_list, 1);
     let maker_seed = Genesis::coin(maker, maker_key, 10);
@@ -68,13 +68,13 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         let open = Tx::open(funding(maker, taker), terms);
         assert_eq!(open, expected_open.clone());
         let is_open = matches!(open, Tx::Open { .. });
-        let resolve = Tx::resolve(edge, proof, outputs);
-        assert_eq!(resolve, expected_resolve.clone());
-        let is_resolve = matches!(resolve, Tx::Resolve { .. });
+        let close = Tx::close(edge, proof, outputs);
+        assert_eq!(close, expected_close.clone());
+        let is_close = matches!(close, Tx::Close { .. });
         let Ok(mut chain) = State::genesis(store, &[maker_seed, taker_seed]) else {
             panic!("genesis rejected test seed");
         };
-        let ops = List::all([open, resolve]);
+        let ops = List::all([open, close]);
         let Ok(diff) = chain.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
             panic!("apply_all rejected");
         };
@@ -88,13 +88,13 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         );
         assert_eq!(
             diff.event(1).map(Event::kind),
-            Some(&EventKind::EdgeResolved {
+            Some(&EventKind::EdgeClosed {
                 input: edge,
                 outputs: output_ids(maker_out, taker_out),
             }),
         );
 
-        core::hint::black_box((is_open, is_resolve));
+        core::hint::black_box((is_open, is_close));
     });
 
     assert_eq!(info.count_total, 0);

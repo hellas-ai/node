@@ -66,11 +66,10 @@ module invariants {
   // ---------------------------------------------------------------------
 
   // Every live payout coin carries the canonical (MakerPayout,
-  // TakerPayout) split. Holds when `FakeCrypto = false` because the only
-  // enabled resolves are bound proofs. Becomes a reachable violation when
-  // `FakeCrypto = true` and a Basic adversary path resolves with a
-  // non-canonical split — that is the surface the fake-crypto feature
-  // gates and the Rust kernel matches.
+  // TakerPayout) split. Holds in every reachable state: every close
+  // witness binds payouts (Mutual via signature, Timeout via
+  // `terms.timeout_outputs`, Violation via dispute seal), and `canClose`
+  // enforces the binding through `payoutsBound`.
   pure def payoutsHonorBindings(
     coins: Coin -> int,
     liveCoins: Set[Coin],

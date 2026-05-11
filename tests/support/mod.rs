@@ -10,38 +10,76 @@ pub(crate) mod l1;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
-    Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties, ProtocolCode,
-    Batch, ResolveHash, ResolveKind, Seal, Sig, Snapshot, State, Store, TermsHash, Verifier, View,
+    Batch, CloseKind, Coin, CoinId, Context, Edge, EdgeId, Genesis, InsertError, InvalidProofReason,
+    KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, Sig, Snapshot, State, Store,
+    TermsHash, Tx, Verifier, View,
 };
 
-/// Forgeable verifier used by every test in this crate. Accepts any signature
-/// or seal whose bytes match the deterministic placeholder shape, mirroring
-/// the behaviour the kernel previously hardwired behind
-/// `cfg(feature = "fake-crypto")`. Production callers must wire a verifier
-/// backed by real cryptography or a preverified-cache lookup.
+/// Forgeable verifier used by every test in this crate. Mirrors the full
+/// close-validity rules a production verifier owns — terms-hash binding,
+/// timeout height, timeout payout shape, mutual signatures, dispute
+/// seals — but accepts placeholder shapes produced by
+/// [`Sig::placeholder`] / [`Seal::placeholder`] in place of real
+/// cryptography. Production callers must wire a verifier backed by real
+/// crypto or a preverified-cache lookup.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct FakeVerifier;
 
 pub(crate) const FAKE_VERIFIER: FakeVerifier = FakeVerifier;
 
 impl Verifier for FakeVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: ResolveHash) -> bool {
-        sig == Sig::placeholder(key, hash)
-    }
-
-    fn verify_seal(
+    fn verify_close(
         &self,
-        seal: Seal,
-        protocol: ProtocolCode,
-        kind: ResolveKind,
-        hash: ResolveHash,
-    ) -> bool {
-        seal == Seal::placeholder(protocol, kind, hash)
+        edge_id: EdgeId,
+        edge: &Edge,
+        payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
+        proof: &Proof,
+        context: &Context,
+    ) -> Result<(), InvalidProofReason> {
+        match proof {
+            Proof::Mutual { maker, taker } => {
+                let hash = Tx::payload_hash(edge_id, CloseKind::Mutual, edge.terms(), payouts);
+                let parties = edge.parties();
+                if *maker == Sig::placeholder(parties.maker(), hash)
+                    && *taker == Sig::placeholder(parties.taker(), hash)
+                {
+                    Ok(())
+                } else {
+                    Err(InvalidProofReason::BadSignature)
+                }
+            }
+            Proof::Timeout { terms } => {
+                if terms.hash() != edge.terms() {
+                    return Err(InvalidProofReason::TermsMismatch);
+                }
+                if context.block_height() < terms.timeout() {
+                    return Err(InvalidProofReason::TimeoutNotReached);
+                }
+                if payouts != terms.timeout_outputs() {
+                    return Err(InvalidProofReason::PayoutMismatch);
+                }
+                Ok(())
+            }
+            Proof::Violation { terms, seal } => {
+                if terms.hash() != edge.terms() {
+                    return Err(InvalidProofReason::TermsMismatch);
+                }
+                let hash =
+                    Tx::payload_hash(edge_id, CloseKind::Violation, terms.hash(), payouts);
+                if *seal
+                    == hellas_kernel::Seal::placeholder(terms.protocol(), CloseKind::Violation, hash)
+                {
+                    Ok(())
+                } else {
+                    Err(InvalidProofReason::BadSeal)
+                }
+            }
+        }
     }
 }
 
-/// Production-shaped verifier stub: rejects every signature and seal. Tests
-/// that exercise "what happens without an accepting verifier" use this to
+/// Production-shaped verifier stub: rejects every proof. Tests that
+/// exercise "what happens without an accepting verifier" use this to
 /// stand in for the unconfigured production case.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct RejectVerifier;
@@ -49,18 +87,19 @@ pub(crate) struct RejectVerifier;
 pub(crate) const REJECT_VERIFIER: RejectVerifier = RejectVerifier;
 
 impl Verifier for RejectVerifier {
-    fn verify_sig(&self, _sig: Sig, _key: Key, _hash: ResolveHash) -> bool {
-        false
-    }
-
-    fn verify_seal(
+    fn verify_close(
         &self,
-        _seal: Seal,
-        _protocol: ProtocolCode,
-        _kind: ResolveKind,
-        _hash: ResolveHash,
-    ) -> bool {
-        false
+        _edge_id: EdgeId,
+        _edge: &Edge,
+        _payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
+        proof: &Proof,
+        _context: &Context,
+    ) -> Result<(), InvalidProofReason> {
+        match proof {
+            Proof::Mutual { .. } => Err(InvalidProofReason::BadSignature),
+            Proof::Timeout { .. } => Err(InvalidProofReason::TimeoutNotReached),
+            Proof::Violation { .. } => Err(InvalidProofReason::BadSeal),
+        }
     }
 }
 

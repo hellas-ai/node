@@ -48,7 +48,7 @@ fn map_store_round_trip() {
     let funding_value = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding_value, &terms);
     let open = Tx::open(funding_value, terms.clone());
-    let resolve = Tx::resolve(edge, Proof::timeout(terms), outputs);
+    let resolve = Tx::close(edge, Proof::timeout(terms), outputs);
 
     let mut state = map_state([
         Genesis::coin(maker_coin, maker, 10),
@@ -102,10 +102,10 @@ fn map_store_handles_long_chain() {
         let edge = Tx::edge_id_of(&funding_value, &terms);
         let open = Tx::open(funding_value, terms.clone());
         let outputs = payouts(maker, taker, 7, 8);
-        let resolve = Tx::resolve(edge, Proof::timeout(terms.clone()), outputs.clone());
+        let resolve = Tx::close(edge, Proof::timeout(terms.clone()), outputs.clone());
         // The two payout coins from this resolve become the next open's
         // funding. Compute them before consuming `resolve`.
-        let resolved_outputs = Tx::resolve_output_ids(edge, &outputs);
+        let resolved_outputs = Tx::close_output_ids(edge, &outputs);
 
         state
             .apply(CONTEXT, &FAKE_VERIFIER, &open)
