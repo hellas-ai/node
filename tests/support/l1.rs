@@ -330,9 +330,7 @@ fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUT
             Sig::placeholder(TAKER, hash(edge, CloseKind::Mutual, outputs)),
         ),
         ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
-        ProofKey::Violation => {
-            Proof::violation(terms, seal(edge, CloseKind::Violation, outputs))
-        }
+        ProofKey::Violation => Proof::violation(terms, seal(edge, CloseKind::Violation, outputs)),
         // Submitting a Timeout proof whose terms don't match the edge's terms
         // commitment triggers `TermsMismatch` in the verifier (replaces the
         // old "Proof::basic with other terms" admission test).
@@ -360,8 +358,12 @@ fn seal(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>
 /// terms-hash binding), so the verifier rejects with `BadSeal` rather than
 /// `TermsMismatch`.
 fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let bad_hash =
-        Tx::payload_hash(edge_id(edge), CloseKind::Violation, other_terms().hash(), outputs);
+    let bad_hash = Tx::payload_hash(
+        edge_id(edge),
+        CloseKind::Violation,
+        other_terms().hash(),
+        outputs,
+    );
     Seal::placeholder(terms().protocol(), CloseKind::Violation, bad_hash)
 }
 

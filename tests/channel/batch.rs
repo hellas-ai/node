@@ -67,10 +67,7 @@ fn apply_all_rolls_back_on_error() {
     let open = open_tx(funding_value, terms_value.clone());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
-    let ops = List::all([
-        open,
-        Tx::close(edge, Proof::timeout(terms_value), outputs),
-    ]);
+    let ops = List::all([open, Tx::close(edge, Proof::timeout(terms_value), outputs)]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
         panic!("invalid batch accepted");

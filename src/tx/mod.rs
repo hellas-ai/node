@@ -171,7 +171,9 @@ impl Tx {
                 terms,
                 maker_sig,
                 taker_sig,
-            } => apply_open(funding, terms, *maker_sig, *taker_sig, context, verifier, batch),
+            } => apply_open(
+                funding, terms, *maker_sig, *taker_sig, context, verifier, batch,
+            ),
             Self::Close {
                 input,
                 proof,
@@ -222,8 +224,13 @@ where
 
     let coins = open_coins(funding, batch)?;
     let parties = terms.parties();
+    // Run every cheap structural / arithmetic check before the
+    // signature verifier. The verifier is the most expensive piece of
+    // the open path (BLAKE3 + two SigVerifier calls, potentially real
+    // ECDSA); under DoS pressure we don't want a tx that fails
+    // cheaply on owner-match or insufficient funding to also pay for
+    // crypto.
     check_funding_ownership(output, &coins, funding.maker_len(), parties)?;
-    check_open_signatures(output, funding, terms, parties, maker_sig, taker_sig, verifier)?;
     let open_fee = context
         .fee(open_cost(funding))
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::FeeOverflow))?;
@@ -232,6 +239,9 @@ where
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::ReserveOverflow))?;
     let edge = Edge::open(&coins, parties, terms.hash(), open_fee, reserve)
         .map_err(|reason| invalid_open(output, reason))?;
+    check_open_signatures(
+        output, funding, terms, parties, maker_sig, taker_sig, verifier,
+    )?;
     Ok(Change::open(&coins, (output, edge)))
 }
 
@@ -294,13 +304,17 @@ where
     let edge = batch
         .edge(input)
         .ok_or(ApplyError::MissingEdge { id: input })?;
-    check_proof(input, &edge, outputs, proof, context, verifier)
-        .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
+    // Cheap structural checks first: fee, reserve coverage, value
+    // conservation. Verifier comes last because real `SealVerifier`
+    // impls may resolve and check expensive ZK artifacts, and we don't
+    // want to pay for that on closes that fail trivial checks.
     let fee = context
         .fee(close_cost(outputs.len(), proof.kind()))
         .ok_or_else(|| invalid_close(input, InvalidCloseReason::FeeOverflow))?;
     edge.closes(&coins, fee)
         .map_err(|reason| invalid_close(input, reason))?;
+    check_proof(input, &edge, outputs, proof, context, verifier)
+        .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
 
     Ok(Change::close((input, edge), &coins))
 }
@@ -382,11 +396,7 @@ fn open_coins<B: Batch>(funding: &Funding, batch: &B) -> KernelResult<OpenCoins>
     Ok(List::take(coins, funding.len()))
 }
 
-fn check_close_outputs<B: Batch>(
-    input: EdgeId,
-    outputs: &Payouts,
-    batch: &B,
-) -> KernelResult<()> {
+fn check_close_outputs<B: Batch>(input: EdgeId, outputs: &Payouts, batch: &B) -> KernelResult<()> {
     for (index, output) in outputs.iter().enumerate() {
         let id = output.id(input, index);
         if batch.coin(id).is_some() {

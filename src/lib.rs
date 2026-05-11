@@ -77,6 +77,7 @@ mod view;
 
 pub use block::Block;
 pub use canonical::{BufferWriter, Decode, DecodeError, Encode, Writer};
+pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS};
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
 pub use error::{
     ApplyError, BatchError, InsertError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason,
@@ -85,13 +86,12 @@ pub use error::{
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
-pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS};
-pub use tx::{CloseKind, Funding, Payout, Proof, Seal, Tx};
 pub use primitive::{CloseHash, CoinId, EdgeId, Key, Party, ProtocolCode, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]
 pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::Terms;
+pub use tx::{CloseKind, Funding, Payout, Proof, Seal, Tx};
 pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};

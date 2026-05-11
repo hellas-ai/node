@@ -107,10 +107,7 @@ impl ItfRunner for L1Runner {
                     Err(format!("expected EdgeOpened {want:?}, got {output:?}"))
                 }
             }
-            (
-                Some(EventKind::EdgeClosed { input, .. }),
-                Event::EdgeClosedEvent(expected_edge),
-            ) => {
+            (Some(EventKind::EdgeClosed { input, .. }), Event::EdgeClosedEvent(expected_edge)) => {
                 let want = edge_id(edge_key(*expected_edge));
                 if *input == want {
                     Ok(true)

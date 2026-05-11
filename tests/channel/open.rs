@@ -356,12 +356,7 @@ fn open_rejects_overflow_without_mutation() {
 /// `reserve_cost`: `MAX_EDGE_OUTPUTS` payouts under `Mutual` (the proof
 /// kind charging the most proof units).
 fn reserve_cost_for(_open: &Tx) -> Cost {
-    Tx::close(
-        edge(),
-        mutual_proof(edge(), &payouts4()),
-        payouts4(),
-    )
-    .cost()
+    Tx::close(edge(), mutual_proof(edge(), &payouts4()), payouts4()).cost()
 }
 
 // ---------------------------------------------------------------------

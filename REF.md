@@ -51,11 +51,11 @@ By doing this, whenever a new channel resolution path or state edge case is need
 
 ## 2. Stateful Fuzzing with `proptest-state-machine`
 
-For local, synchronous data structures and core kernel logic (like allocations, open/resolve ops), manual scenarios are too rigid.
+For local, synchronous data structures and core kernel logic (like allocations, open/close ops), manual scenarios are too rigid.
 
 ### The Strategy:
 Use `proptest-state-machine`. You define:
-1. **Transitions:** An enum of possible operations (`Op::Open`, `Op::Resolve`).
+1. **Transitions:** An enum of possible operations (`Tx::Open`, `Tx::Close`).
 2. **Reference Model:** A dead-simple Rust struct that represents expected state (e.g., simple integers for balance, avoiding complex crypto).
 
 `proptest` will generate thousands of random operation interleavings. If it finds a sequence that causes your real `Tx` kernel to panic or deviate from the simple model, it shrinks it down to the exact minimal failing sequence.
