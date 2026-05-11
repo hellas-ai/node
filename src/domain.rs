@@ -2,6 +2,7 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
+pub(crate) const COIN_GENESIS: &[u8] = b"hellas.edge.genesis.v1";
 pub(crate) const COIN_PAYOUT: &[u8] = b"hellas.edge.coin.v1";
 pub(crate) const EDGE_OPEN: &[u8] = b"hellas.edge.edge.v1";
 pub(crate) const RESOLVE: &[u8] = b"hellas.edge.resolve.v1";

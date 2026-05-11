@@ -9,10 +9,11 @@
 
 use super::{Resolve, SEAL_LENGTH};
 use crate::{
+    canonical::Encode,
     context::{Context, Cost},
     error::InvalidProofReason,
     object::{Edge, Parties},
-    primitive::{Digest, ProtocolCode, ResolveHash, Sig, TermsHash},
+    primitive::{ProtocolCode, ResolveHash, Sig, TermsHash},
     terms::Terms,
     verifier::Verifier,
 };
@@ -132,13 +133,12 @@ impl Seal {
     /// apply time.
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
-        let mut digest = Digest::new(crate::domain::SEAL_PLACEHOLDER);
-
-        digest.u8(protocol.get());
-        digest.u8(kind.tag());
-        digest.bytes(hash.as_bytes());
-
-        Self(digest.finish())
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(crate::domain::SEAL_PLACEHOLDER);
+        protocol.encode_to(&mut hasher);
+        kind.tag().encode_to(&mut hasher);
+        hash.encode_to(&mut hasher);
+        Self(*hasher.finalize().as_bytes())
     }
 }
 

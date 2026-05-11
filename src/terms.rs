@@ -12,11 +12,12 @@
 //! separately.
 
 use crate::{
+    canonical::{Encode, Writer},
     context::BlockHeight,
     list::List,
     object::Parties,
     op::{MAX_EDGE_OUTPUTS, Payout},
-    primitive::{Digest, ProtocolCode, TermsHash},
+    primitive::{ProtocolCode, TermsHash},
 };
 
 /// Concrete open terms committed by an edge.
@@ -108,7 +109,16 @@ impl Terms {
 
 impl TermsBody {
     fn compute_hash(&self) -> TermsHash {
-        let mut digest = Digest::new(crate::domain::TERMS_BASIC);
+        TermsHash::from_bytes(crate::canonical::hash(crate::domain::TERMS_BASIC, self))
+    }
+}
+
+impl Encode for TermsBody {
+    // Max size: 1 (protocol) + 33 + 33 (parties) + 8 (timeout) + List<Payout, MAX>
+    const MAX_ENCODED_SIZE: usize =
+        1 + 33 + 33 + 8 + <List<Payout, MAX_EDGE_OUTPUTS> as Encode>::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
         match self {
             Self::Basic {
                 protocol,
@@ -116,20 +126,29 @@ impl TermsBody {
                 timeout,
                 timeout_outputs,
             } => {
-                let maker = parties.maker().to_bytes();
-                let taker = parties.taker().to_bytes();
-
-                digest.u8(protocol.get());
-                digest.bytes(&maker);
-                digest.bytes(&taker);
-                digest.u64(timeout.get());
-                digest.usize(timeout_outputs.len());
-                for output in timeout_outputs.as_slice() {
-                    digest.bytes(output.owner().as_bytes());
-                    digest.u64(output.value());
-                }
+                protocol.encoded_size()
+                    + parties.maker().encoded_size()
+                    + parties.taker().encoded_size()
+                    + timeout.get().encoded_size()
+                    + timeout_outputs.encoded_size()
             }
         }
-        TermsHash::from_bytes(digest.finish())
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        match self {
+            Self::Basic {
+                protocol,
+                parties,
+                timeout,
+                timeout_outputs,
+            } => {
+                protocol.encode_to(writer);
+                parties.maker().encode_to(writer);
+                parties.taker().encode_to(writer);
+                timeout.get().encode_to(writer);
+                timeout_outputs.encode_to(writer);
+            }
+        }
     }
 }
