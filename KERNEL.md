@@ -281,6 +281,23 @@ kernel forwards all admissibility decisions about it to the `Verifier` (see
   earlier separate claimant/challenger paths; the winner is read out of the
   seal at the verifier layer, not encoded in a kernel-level discriminant.
 
+  The intended v1+ shape (currently unimplemented — every bundled verifier
+  rejects `Violation` with `BadSeal`): the seal is a 32-byte commitment
+  produced by a ZK system, with public inputs `(edge_id, terms.hash(),
+  payouts)`. The protocol-specific verifier circuit attests "there exists a
+  valid trace of the dispute game named by `terms.protocol()` whose terminal
+  outcome maps to these payouts." Verification-key lookup happens via a
+  chain-level `ProtocolCode → vk` registry maintained outside the kernel —
+  `Terms` carries only the code. If the chosen ZK system produces succinct
+  ≤32B proofs, the seal *is* the proof; otherwise the seal is a commitment
+  (hash, Pedersen, KZG) and the verifier resolves the underlying proof blob
+  out of band. Either way the kernel sees only 32 bytes and routes them to
+  the verifier unchanged. This "proof normaliser" framing decouples the
+  kernel from every protocol-specific dispute mechanism: Truebit-style
+  interactive games, optimistic-rollup-style fraud proofs, MACI-style voting,
+  or any future shape can all plug in by producing seals with the same
+  public-input contract.
+
 Empty close output is valid exactly for a zero-value edge. A close is valid
 only when the edge reserve covers `context.fee(close.cost())`; the reserve is
 consumed by the close and does not appear in payout coins.
