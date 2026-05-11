@@ -30,7 +30,7 @@ impl BatchError {
     }
 }
 
-/// Reason an insert into a [`crate::Tx`] failed.
+/// Reason an insert into a [`crate::Batch`] failed.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InsertError {
     /// The target slot is already occupied.
@@ -45,7 +45,7 @@ pub enum InsertError {
 /// Most variants describe ordinary user-input rejections — bad funding,
 /// unknown ids, mismatched payouts. The [`Self::CoinChanged`],
 /// [`Self::EdgeChanged`], and fold-phase [`Self::MissingCoin`] /
-/// [`Self::MissingEdge`] paths instead signal a [`crate::Tx`] contract
+/// [`Self::MissingEdge`] paths instead signal a [`crate::Batch`] contract
 /// violation: the kernel reads a slot during validation, then the same
 /// slot returns different bytes (or nothing) during fold without any
 /// intervening kernel write. The kernel surfaces these as recoverable
@@ -56,7 +56,7 @@ pub enum InsertError {
 pub enum ApplyError {
     /// A required coin does not exist. During validation this is an
     /// ordinary rejection (the user named a coin id that is not live);
-    /// during fold it is a [`crate::Tx`] contract violation (the slot
+    /// during fold it is a [`crate::Batch`] contract violation (the slot
     /// disappeared between validation and fold without a kernel write).
     MissingCoin {
         /// Missing coin id.
@@ -64,7 +64,7 @@ pub enum ApplyError {
     },
 
     /// A coin changed between validation and fold. Indicates a
-    /// [`crate::Tx`] contract violation — the kernel does not write to
+    /// [`crate::Batch`] contract violation — the kernel does not write to
     /// a slot between reading it and folding the corresponding effect,
     /// so any divergence is the store's fault.
     CoinChanged {
@@ -80,7 +80,7 @@ pub enum ApplyError {
     },
 
     /// An edge changed between validation and fold. Same interpretation
-    /// as [`Self::CoinChanged`]: a [`crate::Tx`] contract violation.
+    /// as [`Self::CoinChanged`]: a [`crate::Batch`] contract violation.
     EdgeChanged {
         /// Changed edge id.
         id: EdgeId,

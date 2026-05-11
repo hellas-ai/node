@@ -12,7 +12,7 @@ use crate::{
     object::{Coin, Edge},
     op::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS},
     primitive::{CoinId, EdgeId},
-    store::Tx,
+    store::Batch,
 };
 
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
@@ -146,8 +146,8 @@ impl Change {
         &self.event
     }
 
-    pub(super) fn fold<T: Tx>(&self, tx: &mut T) -> KernelResult<()> {
-        self.effect.fold(tx)
+    pub(super) fn fold<B: Batch>(&self, batch: &mut B) -> KernelResult<()> {
+        self.effect.fold(batch)
     }
 
     fn ids<const N: usize>(coins: &List<(CoinId, Coin), N>) -> List<CoinId, N> {
@@ -183,59 +183,61 @@ impl Effect {
         Self::Resolve { edge, coins }
     }
 
-    fn fold<T: Tx>(&self, tx: &mut T) -> KernelResult<()> {
+    fn fold<B: Batch>(&self, batch: &mut B) -> KernelResult<()> {
         match self {
             Self::Open { coins, edge } => {
-                Self::remove_coins(tx, coins)?;
-                Self::insert_edge(tx, *edge)
+                Self::remove_coins(batch, coins)?;
+                Self::insert_edge(batch, *edge)
             }
             Self::Resolve { edge, coins } => {
-                Self::remove_edge(tx, *edge)?;
-                Self::insert_coins(tx, coins)
+                Self::remove_edge(batch, *edge)?;
+                Self::insert_coins(batch, coins)
             }
         }
     }
 
-    fn insert_coins<T: Tx, const N: usize>(
-        tx: &mut T,
+    fn insert_coins<B: Batch, const N: usize>(
+        batch: &mut B,
         coins: &List<(CoinId, Coin), N>,
     ) -> KernelResult<()> {
         for coin in coins.as_slice() {
-            Self::insert_coin(tx, *coin)?;
+            Self::insert_coin(batch, *coin)?;
         }
         Ok(())
     }
 
-    fn remove_coins<T: Tx, const N: usize>(
-        tx: &mut T,
+    fn remove_coins<B: Batch, const N: usize>(
+        batch: &mut B,
         coins: &List<(CoinId, Coin), N>,
     ) -> KernelResult<()> {
         for coin in coins.as_slice() {
-            Self::remove_coin(tx, *coin)?;
+            Self::remove_coin(batch, *coin)?;
         }
         Ok(())
     }
 
-    fn insert_coin<T: Tx>(tx: &mut T, coin: (CoinId, Coin)) -> KernelResult<()> {
-        tx.insert_coin(coin.0, coin.1)
+    fn insert_coin<B: Batch>(batch: &mut B, coin: (CoinId, Coin)) -> KernelResult<()> {
+        batch
+            .insert_coin(coin.0, coin.1)
             .map_err(|reason| ApplyError::CoinInsertRejected { id: coin.0, reason })
     }
 
-    fn remove_coin<T: Tx>(tx: &mut T, coin: (CoinId, Coin)) -> KernelResult<()> {
-        match tx.remove_coin(coin.0) {
+    fn remove_coin<B: Batch>(batch: &mut B, coin: (CoinId, Coin)) -> KernelResult<()> {
+        match batch.remove_coin(coin.0) {
             Some(removed) if removed == coin.1 => Ok(()),
             Some(_) => Err(ApplyError::CoinChanged { id: coin.0 }),
             None => Err(ApplyError::MissingCoin { id: coin.0 }),
         }
     }
 
-    fn insert_edge<T: Tx>(tx: &mut T, edge: (EdgeId, Edge)) -> KernelResult<()> {
-        tx.insert_edge(edge.0, edge.1)
+    fn insert_edge<B: Batch>(batch: &mut B, edge: (EdgeId, Edge)) -> KernelResult<()> {
+        batch
+            .insert_edge(edge.0, edge.1)
             .map_err(|reason| ApplyError::EdgeInsertRejected { id: edge.0, reason })
     }
 
-    fn remove_edge<T: Tx>(tx: &mut T, edge: (EdgeId, Edge)) -> KernelResult<()> {
-        match tx.remove_edge(edge.0) {
+    fn remove_edge<B: Batch>(batch: &mut B, edge: (EdgeId, Edge)) -> KernelResult<()> {
+        match batch.remove_edge(edge.0) {
             Some(removed) if removed == edge.1 => Ok(()),
             Some(_) => Err(ApplyError::EdgeChanged { id: edge.0 }),
             None => Err(ApplyError::MissingEdge { id: edge.0 }),

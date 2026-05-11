@@ -18,21 +18,21 @@ use crate::{
 /// Storage boundary for on-chain objects.
 pub trait Store {
     /// Transaction type used to stage object mutations.
-    type Tx<'a>: Tx
+    type Batch<'a>: Batch
     where
         Self: 'a;
 
     /// Starts a transaction over this object store.
-    fn begin(&mut self) -> Self::Tx<'_>;
+    fn begin(&mut self) -> Self::Batch<'_>;
 }
 
 /// Staged object-store transaction.
 ///
 /// Reads observe the working transaction state. Writes are staged against the
-/// transaction and become visible to the backing store only on [`Tx::commit`].
+/// transaction and become visible to the backing store only on [`Batch::commit`].
 /// A dropped (uncommitted) transaction rolls back.
 ///
-pub trait Tx {
+pub trait Batch {
     /// Returns the coin stored under `id`, if any.
     fn coin(&self, id: CoinId) -> Option<Coin>;
 

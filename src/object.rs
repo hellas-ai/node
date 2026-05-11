@@ -10,7 +10,7 @@ use crate::{
     error::{InsertError, InvalidOpenReason, InvalidResolveReason, KernelResult},
     list::List,
     primitive::{CoinId, Key, TermsHash},
-    store::Tx,
+    store::Batch,
 };
 
 /// Owner-only UTXO object.
@@ -183,7 +183,7 @@ impl Genesis {
         }
     }
 
-    pub(super) fn insert<T: Tx>(&self, tx: &mut T) -> KernelResult<(), InsertError> {
-        tx.insert_coin(self.id, self.coin)
+    pub(super) fn insert<B: Batch>(&self, batch: &mut B) -> KernelResult<(), InsertError> {
+        batch.insert_coin(self.id, self.coin)
     }
 }

@@ -23,7 +23,7 @@ use crate::{
     list::List,
     object::Coin,
     primitive::CoinId,
-    store::Tx,
+    store::Batch,
     verifier::Verifier,
 };
 
@@ -62,15 +62,15 @@ pub enum Op {
 }
 
 impl Op {
-    pub(crate) fn apply<T: Tx, V: Verifier + ?Sized>(
+    pub(crate) fn apply<B: Batch, V: Verifier + ?Sized>(
         &self,
         context: Context,
         verifier: &V,
-        tx: &T,
+        batch: &B,
     ) -> KernelResult<Change> {
         match self {
-            Self::Open(op) => op.apply(context, tx),
-            Self::Resolve(op) => op.apply(context, verifier, tx),
+            Self::Open(op) => op.apply(context, batch),
+            Self::Resolve(op) => op.apply(context, verifier, batch),
         }
     }
 

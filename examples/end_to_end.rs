@@ -36,7 +36,7 @@ use hellas_kernel::{
     Agreement, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId, EventKind, Fees,
     Funding, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op,
     Open, Parties, Payout, Proof, ProtocolCode, Resolve, ResolveKind, Secp256k1Verifier, Sig,
-    State, Store, Terms, Tx,
+    Batch, State, Store, Terms,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
@@ -56,12 +56,12 @@ struct MemStore {
 }
 
 impl Store for MemStore {
-    type Tx<'a>
+    type Batch<'a>
         = MemTx<'a>
     where
         Self: 'a;
 
-    fn begin(&mut self) -> Self::Tx<'_> {
+    fn begin(&mut self) -> Self::Batch<'_> {
         let working = (self.coins.clone(), self.edges.clone());
         MemTx {
             coins: working.0,
@@ -77,7 +77,7 @@ struct MemTx<'a> {
     parent: &'a mut MemStore,
 }
 
-impl Tx for MemTx<'_> {
+impl Batch for MemTx<'_> {
     fn coin(&self, id: CoinId) -> Option<Coin> {
         self.coins.get(&id).copied()
     }
