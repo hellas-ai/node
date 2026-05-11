@@ -11,52 +11,62 @@ documentation.workspace = true
 default = []
 compression = ["tonic/gzip", "tonic/zstd"]
 client = [
-    "tonic/channel",
-    "hellas-pb/client",
-    "hellas-pb/hellas",
-    "hellas-pb/symbolic",
-    "hellas-pb/opaque",
-    "hellas-pb/courtesy",
+  "tonic/channel",
+  "hellas-pb/client",
+  "hellas-pb/hellas",
+  "hellas-pb/symbolic",
+  "hellas-pb/opaque",
+  "hellas-pb/courtesy",
 ]
 discovery = [
-    "client",
-    "dep:futures",
-    "dep:mainline",
-    "dep:tonic-iroh-transport",
-    "tonic-iroh-transport/discovery-mdns",
-    "tonic-iroh-transport/discovery-dht",
+  "client",
+  "dep:futures",
+  "dep:mainline",
+  "dep:tonic-iroh-transport",
+  "tonic-iroh-transport/discovery-mdns",
+  "tonic-iroh-transport/discovery-dht",
 ]
 server = ["tonic/server", "hellas-pb/server"]
 node = [
-    "dep:catgrad",
-    "dep:catgrad-llm",
-    "dep:chatgrad",
-    "hellas-pb/hellas",
-    "hellas-pb/symbolic",
-    "hellas-pb/opaque",
-    "hellas-pb/courtesy",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:tokenizers",
-    "dep:hf-hub",
+  "dep:catgrad",
+  "dep:catgrad-llm",
+  "dep:chatgrad",
+  "hellas-pb/hellas",
+  "hellas-pb/symbolic",
+  "hellas-pb/opaque",
+  "hellas-pb/courtesy",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:tokenizers",
+  "dep:hf-hub",
 ]
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
-tokenizers = { version = "0.21", features = ["onig", "esaxx_fast"], optional = true }
+tokenizers = { version = "0.21", features = [
+  "onig",
+  "esaxx_fast",
+], optional = true }
 
 [dependencies]
-catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
+catgrad = { workspace = true, default-features = false, features = [
+  "serde",
+], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 hellas-pb.workspace = true
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
+hf-hub = { version = "0.5", default-features = false, features = [
+  "ureq",
+], optional = true }
 mainline = { version = "6", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = [
+  "progressbar",
+  "fancy-regex",
+], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 
