@@ -131,6 +131,7 @@ where
         self.genesis.clone()
     }
 
+    #[tracing::instrument(skip_all, fields(view = %context.1.round.view()))]
     async fn propose<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -173,6 +174,7 @@ where
         Some(Proposed { block, merkleized })
     }
 
+    #[tracing::instrument(skip_all, fields(view = %context.1.round.view()))]
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -221,6 +223,7 @@ where
         Some(merkleized)
     }
 
+    #[tracing::instrument(skip_all, fields(height = %block.height(), digest = ?block.digest()))]
     async fn apply(
         &mut self,
         _context: (E, Self::Context),
@@ -245,6 +248,7 @@ where
         merkleized
     }
 
+    #[tracing::instrument(skip_all, fields(height = %block.height(), view = %block.context().round.view()))]
     async fn finalized(
         &mut self,
         _context: (E, Self::Context),
