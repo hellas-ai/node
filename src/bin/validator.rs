@@ -641,7 +641,7 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
             QueryCommand::Activity => {
                 use hellas_rpc::pb::hellas::{ActivityEvent, activity_event::Event};
                 let mut stream = client
-                    .subscribe_activity()
+                    .subscribe_activity(Vec::new())
                     .await
                     .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
                 while let Some(event) = stream
