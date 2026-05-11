@@ -80,7 +80,7 @@ impl ItfRunner for L1Runner {
                 self.height += 1;
                 Ok(None)
             }
-            Input::OpenInput(_) | Input::ResolveInput(_) => {
+            Input::OpenInput(_) | Input::CloseInput(_) => {
                 let op = op_for(&expected.last_input)
                     .expect("op_for returned None for input that should have produced one");
                 let context = context_for(&expected.last_input);
@@ -108,14 +108,14 @@ impl ItfRunner for L1Runner {
                 }
             }
             (
-                Some(EventKind::EdgeResolved { input, .. }),
-                Event::EdgeResolvedEvent(expected_edge),
+                Some(EventKind::EdgeClosed { input, .. }),
+                Event::EdgeClosedEvent(expected_edge),
             ) => {
                 let want = edge_id(edge_key(*expected_edge));
                 if *input == want {
                     Ok(true)
                 } else {
-                    Err(format!("expected EdgeResolved {want:?}, got {input:?}"))
+                    Err(format!("expected EdgeClosed {want:?}, got {input:?}"))
                 }
             }
             (actual, expected_event) => Err(format!(
@@ -258,19 +258,6 @@ fn check_edge(
 
 // -- Test entry: discover and replay every committed fixture ----------------
 
-/// Returns true when the trace exercises a proof shape that the production
-/// kernel cannot accept (placeholder sigs/seals or `Proof::Basic`). Used to
-/// skip fixtures under `--no-default-features`.
-fn requires_fake_crypto(trace: &itf::Trace<State>) -> bool {
-    trace
-        .states
-        .iter()
-        .any(|state| match &state.value.last_input {
-            Input::ResolveInput(body) => support::itf::needs_fake_crypto(body.proof),
-            _ => false,
-        })
-}
-
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("models")
@@ -303,13 +290,6 @@ fn replays_all_itf_fixtures() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let trace: itf::Trace<State> = itf::trace_from_str(&json)
             .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));
-
-        if !cfg!(feature = "fake-crypto") && requires_fake_crypto(&trace) {
-            // Fixture exercises a proof shape that the production verifier
-            // does not accept. Skip rather than fail; the fake-crypto build
-            // covers it.
-            continue;
-        }
 
         let runner = L1Runner::new();
         trace

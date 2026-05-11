@@ -11,11 +11,10 @@ use support::{
     l1::{self, EdgeKey, OpenKey, ProofKey},
 };
 
-#[cfg(feature = "fake-crypto")]
-use hellas_kernel::InvalidResolveReason;
 use hellas_kernel::{
-    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, Funding, InvalidProofReason, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, State, Tx, View,
+    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, Funding, InvalidCloseReason,
+    InvalidProofReason, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, State, Tx,
+    View,
 };
 use stateright::{Checker, Model, Property};
 
@@ -47,15 +46,11 @@ impl Model for ChannelModel {
         }
 
         if view.edge(l1::open_case_id(OpenKey::Full)).is_some() {
-            #[cfg(feature = "fake-crypto")]
-            actions.push(Action::Resolve(ProofKey::Basic));
-            actions.push(Action::Resolve(ProofKey::Agreement));
-            actions.push(Action::Resolve(ProofKey::Timeout));
-            actions.push(Action::Resolve(ProofKey::Claimant));
-            actions.push(Action::Resolve(ProofKey::Challenger));
-            actions.push(Action::Resolve(ProofKey::EarlyTimeout));
-            #[cfg(feature = "fake-crypto")]
-            actions.push(Action::InvalidResolve);
+            actions.push(Action::Close(ProofKey::Mutual));
+            actions.push(Action::Close(ProofKey::Timeout));
+            actions.push(Action::Close(ProofKey::Violation));
+            actions.push(Action::Close(ProofKey::EarlyTimeout));
+            actions.push(Action::InvalidClose);
             actions.push(Action::InvalidProof);
             actions.push(Action::AdversarialTimeout);
         }
@@ -134,17 +129,17 @@ impl ChannelModel {
                 },
             ) => Self::valid_open(state, key, op, funding, terms, event_inputs, *output),
             (
-                Action::Resolve(proof),
-                Tx::Resolve {
+                Action::Close(proof),
+                Tx::Close {
                     input,
                     proof: tx_proof,
                     outputs,
                 },
-                EventKind::EdgeResolved {
+                EventKind::EdgeClosed {
                     input: event_input,
                     outputs: event_outputs,
                 },
-            ) => Self::valid_resolve(
+            ) => Self::valid_close(
                 state,
                 proof,
                 context,
@@ -177,7 +172,7 @@ impl ChannelModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn valid_resolve(
+    fn valid_close(
         state: &State<ChannelStore>,
         proof: ProofKey,
         context: Context,
@@ -190,7 +185,7 @@ impl ChannelModel {
     ) -> Option<State<ChannelStore>> {
         let ok = event_input == l1::edge_id(EdgeKey::First)
             && *event_outputs == l1::output_ids(EdgeKey::First)
-            && *op == l1::resolve(EdgeKey::First, proof)
+            && *op == l1::close(EdgeKey::First, proof)
             && (proof != ProofKey::Timeout || context == l1::TIMEOUT_CONTEXT);
 
         ok.then_some(*state)
@@ -200,11 +195,13 @@ impl ChannelModel {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Action {
     Open(OpenKey),
-    Resolve(ProofKey),
-    #[cfg(feature = "fake-crypto")]
-    InvalidResolve,
+    Close(ProofKey),
+    /// Submit a Mutual proof with non-canonical (value-mismatched) payouts;
+    /// the kernel rejects on `InvalidClose::ValueMismatch`.
+    InvalidClose,
+    /// Submit a proof whose terms commitment does not match the edge's.
     InvalidProof,
-    /// Submit a Timeout resolve with a value-conserving but non-canonical
+    /// Submit a Timeout close with a value-conserving but non-canonical
     /// payout split. The kernel must reject because the edge's terms commit a
     /// specific `timeout_outputs` shape; any divergence is `InvalidProof`.
     AdversarialTimeout,
@@ -213,7 +210,7 @@ enum Action {
 impl Action {
     const fn context(self) -> Context {
         match self {
-            Self::Resolve(ProofKey::Timeout) | Self::AdversarialTimeout => l1::TIMEOUT_CONTEXT,
+            Self::Close(ProofKey::Timeout) | Self::AdversarialTimeout => l1::TIMEOUT_CONTEXT,
             _ => l1::CONTEXT,
         }
     }
@@ -221,49 +218,38 @@ impl Action {
     fn op(self) -> Tx {
         match self {
             Self::Open(key) => l1::open_case_op(key),
-            Self::Resolve(proof) => l1::resolve(EdgeKey::First, proof),
-            #[cfg(feature = "fake-crypto")]
-            Self::InvalidResolve => {
-                l1::resolve_with(EdgeKey::First, ProofKey::Basic, l1::bad_payouts())
+            Self::Close(proof) => l1::close(EdgeKey::First, proof),
+            Self::InvalidClose => {
+                l1::close_with(EdgeKey::First, ProofKey::Mutual, l1::bad_payouts())
             }
-            Self::InvalidProof => l1::resolve(EdgeKey::First, ProofKey::WrongTerms),
+            Self::InvalidProof => l1::close(EdgeKey::First, ProofKey::WrongTerms),
             Self::AdversarialTimeout => {
-                l1::resolve_with(EdgeKey::First, ProofKey::Timeout, l1::maker_grab_payouts())
+                l1::close_with(EdgeKey::First, ProofKey::Timeout, l1::maker_grab_payouts())
             }
         }
     }
 
     fn error(self) -> Option<ApplyError> {
-        // Action::InvalidProof submits a Basic proof under different terms.
-        // Under fake-crypto Basic verifies after a terms check (so the
-        // mismatch is what trips); without fake-crypto Basic is rejected
-        // outright before any terms check.
-        #[cfg(feature = "fake-crypto")]
-        let basic_wrong_terms_reason = InvalidProofReason::TermsMismatch;
-        #[cfg(not(feature = "fake-crypto"))]
-        let basic_wrong_terms_reason = InvalidProofReason::BasicNotAccepted;
-
         match self {
-            #[cfg(feature = "fake-crypto")]
-            Self::InvalidResolve => Some(ApplyError::InvalidResolve {
+            Self::InvalidClose => Some(ApplyError::InvalidClose {
                 input: l1::edge_id(EdgeKey::First),
-                reason: InvalidResolveReason::ValueMismatch,
+                reason: InvalidCloseReason::ValueMismatch,
             }),
             Self::InvalidProof => Some(ApplyError::InvalidProof {
                 input: l1::edge_id(EdgeKey::First),
-                reason: basic_wrong_terms_reason,
+                reason: InvalidProofReason::TermsMismatch,
             }),
-            Self::Resolve(ProofKey::EarlyTimeout) => Some(ApplyError::InvalidProof {
+            Self::Close(ProofKey::EarlyTimeout) => Some(ApplyError::InvalidProof {
                 input: l1::edge_id(EdgeKey::First),
                 reason: InvalidProofReason::TimeoutNotReached,
             }),
-            Self::Open(_) | Self::Resolve(_) | Self::AdversarialTimeout => None,
+            Self::Open(_) | Self::Close(_) | Self::AdversarialTimeout => None,
         }
     }
 }
 
 #[test]
-fn open_resolve_model_checks() {
+fn open_close_model_checks() {
     let checker = ChannelModel.checker().spawn_dfs().join();
 
     assert!(checker.discoveries().is_empty());

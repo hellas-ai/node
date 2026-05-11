@@ -1,14 +1,14 @@
 // -*- mode: Bluespec; -*-
 //
-// Verification policy for resolve witnesses.
+// Verification policy for close witnesses.
 //
-// Mirrors src/verifier.rs and the policy embedded in src/op/proof.rs:
-// the kernel itself implements no cryptography; verification is policy
-// supplied by the caller. This module defines the *abstract* policy the
-// caller is assumed to enforce — `proofOk` for "this witness shape is
-// admissible at this height under the active feature config", and
-// `payoutsBound` for "this proof kind constrains the (m, t) split to the
-// canonical canonical-pair-or-better".
+// Mirrors src/verifier.rs and src/tx/proof.rs. The Rust kernel itself
+// implements no cryptography and no close-validity policy beyond
+// bookkeeping; every admissibility decision is delegated to the caller's
+// [`Verifier`]. This module defines the *abstract* policy any conforming
+// verifier is assumed to enforce — `proofOk` for "this witness shape is
+// admissible at this height" and `payoutsBound` for "this proof kind
+// constrains the (m, t) split to the canonical canonical-pair split".
 //
 // Pure: no state vars, no actions. Importing it gives any module access to
 // the verification rules without touching the model's live state.
@@ -16,42 +16,26 @@
 module verifier {
   import types.* from "./types"
 
-  // FakeCrypto mirrors the Rust `cfg(feature = "fake-crypto")` gate. Set
-  // true to model the modelling/test build (Basic accepted; Sig/Seal
-  // placeholders verifiable). Set false to model production semantics
-  // (Basic rejected by policy regardless of payouts).
-  //
-  // Left as a free constant so different consumers can fix it
-  // independently — `models/configs/production.qnt` sets `false` and
-  // verifies all invariants hold; `models/configs/adversary.qnt` sets
-  // `true` and demonstrates that `payoutsHonorBindings` is reachably
-  // violated (Apalache prints a concrete adversary trace).
-  const FakeCrypto: bool
-
-  // Whether a proof witness is *admissible at all* under the current
-  // height and feature config. Production verifiers reject Basic; Timeout
-  // is gated by the height guard; the rest are unconditionally admissible
-  // here because the abstract model trusts the verifier to have already
-  // validated their cryptographic content.
+  // Whether a proof witness is admissible at the current height. Mutual
+  // and Violation are unconditionally admissible — the abstract model
+  // trusts the verifier to have already validated their cryptographic
+  // content. Timeout is gated by the height guard.
   pure def proofOk(p: Proof, height: int): bool =
     match p {
-      | Basic => FakeCrypto
-      | Agreement => true
+      | Mutual => true
       | Timeout => height >= TimeoutHeight
-      | ClaimantWins => true
-      | ChallengerWins => true
+      | Violation => true
     }
 
-  // Per-proof payout binding. Agreement is bound by signature; Timeout is
-  // bound by `terms.timeout_outputs`; ClaimantWins/ChallengerWins are
-  // bound by the dispute seal. Basic carries no binding — it is the
-  // adversary surface gated by FakeCrypto via `proofOk`.
+  // Per-proof payout binding. Every close witness binds the canonical
+  // (MakerPayout, TakerPayout) split: Mutual via the signed payload,
+  // Timeout via `terms.timeout_outputs`, Violation via the dispute seal.
+  // There is no proof kind that admits an unbound split — that is the
+  // whole point of collapsing Basic out of the protocol.
   pure def payoutsBound(p: Proof, makerPay: int, takerPay: int): bool =
     match p {
-      | Basic => true
-      | Agreement => makerPay == MakerPayout and takerPay == TakerPayout
+      | Mutual => makerPay == MakerPayout and takerPay == TakerPayout
       | Timeout => makerPay == MakerPayout and takerPay == TakerPayout
-      | ClaimantWins => makerPay == MakerPayout and takerPay == TakerPayout
-      | ChallengerWins => makerPay == MakerPayout and takerPay == TakerPayout
+      | Violation => makerPay == MakerPayout and takerPay == TakerPayout
     }
 }

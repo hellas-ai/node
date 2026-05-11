@@ -346,12 +346,13 @@ fn open_rejects_overflow_without_mutation() {
     assert_eq!(*state.store(), store);
 }
 
-/// Worst-case resolve cost reserved at open-time. Mirrors `apply_open`'s
-/// `reserve_cost`: `MAX_EDGE_OUTPUTS` payouts under `ClaimantWins`.
+/// Worst-case close cost reserved at open-time. Mirrors `apply_open`'s
+/// `reserve_cost`: `MAX_EDGE_OUTPUTS` payouts under `Mutual` (the proof
+/// kind charging the most proof units).
 fn reserve_cost_for(_open: &Tx) -> Cost {
-    Tx::resolve(
+    Tx::close(
         edge(),
-        claimant_proof(edge(), &payouts4()),
+        mutual_proof(edge(), &payouts4()),
         payouts4(),
     )
     .cost()

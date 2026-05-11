@@ -3,50 +3,51 @@ use super::*;
 #[test]
 fn operations_report_deterministic_cost() {
     let open = open_op();
-    let resolve_outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-    let resolve = Tx::resolve(edge(), proof(), resolve_outputs.clone());
+    let close_outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+    let close = Tx::close(edge(), proof(), close_outputs.clone());
     let open_cost = open.cost();
-    let resolve_cost = resolve.cost();
+    let close_cost = close.cost();
     // Worst-case reserve mirrors `apply_open` reserve_cost: MAX_EDGE_OUTPUTS
-    // payouts under `ClaimantWins`.
-    let worst_case = Tx::resolve(
+    // payouts under `Mutual` (the proof kind charging the most proof units).
+    let worst_case = Tx::close(
         edge(),
-        claimant_proof(edge(), &payouts4()),
+        mutual_proof(edge(), &payouts4()),
         payouts4(),
     )
     .cost();
 
     assert_eq!(open_cost, Cost::new(1, 3, 0));
-    assert_eq!(resolve_cost, Cost::new(1, 3, 1));
+    assert_eq!(close_cost, Cost::new(1, 3, 1));
     assert_eq!(worst_case, Cost::new(1, 5, 2));
-    assert!(resolve_cost.fits(worst_case));
+    assert!(close_cost.fits(worst_case));
     assert_eq!(
-        agreement_proof(edge(), &resolve_outputs).cost(),
+        mutual_proof(edge(), &close_outputs).cost(),
         Cost::new(0, 0, 2)
     );
-    assert_eq!(proof().kind(), ResolveKind::Timeout);
-    assert_eq!(proof().terms(), terms());
-    assert_eq!(Proof::timeout(basic_terms()).terms(), terms());
+    assert_eq!(proof().kind(), CloseKind::Timeout);
     assert_eq!(Proof::timeout(basic_terms()).cost(), Cost::new(0, 0, 1));
     assert_eq!(
-        claimant_proof(edge(), &resolve_outputs).cost(),
-        Cost::new(0, 0, 2),
+        violation_proof(edge(), &close_outputs).cost(),
+        Cost::new(0, 0, 1),
     );
     assert_eq!(
-        challenger_proof(edge(), &resolve_outputs).kind(),
-        ResolveKind::ChallengerWins,
+        violation_proof(edge(), &close_outputs).kind(),
+        CloseKind::Violation,
     );
 }
 
 #[test]
-fn open_reserves_worst_case_resolve_cost() {
+fn open_reserves_worst_case_close_cost() {
     let outputs = payouts4();
-    let claimant = Tx::resolve(edge(), claimant_proof(edge(), &outputs), outputs.clone());
-    let challenger = Tx::resolve(edge(), challenger_proof(edge(), &outputs), outputs);
-    let expected = Cost::new(1, 5, 2);
+    // `Mutual` charges 2 proof units (two signatures); `Violation`/`Timeout`
+    // charge 1. The reserved worst case is Mutual at MAX_EDGE_OUTPUTS payouts.
+    let mutual = Tx::close(edge(), mutual_proof(edge(), &outputs), outputs.clone());
+    let violation = Tx::close(edge(), violation_proof(edge(), &outputs), outputs);
+    let expected_mutual = Cost::new(1, 5, 2);
+    let expected_violation = Cost::new(1, 5, 1);
 
-    assert_eq!(claimant.cost(), expected);
-    assert_eq!(challenger.cost(), expected);
+    assert_eq!(mutual.cost(), expected_mutual);
+    assert_eq!(violation.cost(), expected_violation);
 }
 
 #[test]
@@ -54,8 +55,8 @@ fn operations_derive_output_ids() {
     let open = open_op();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     let edge_id = open_edge_id(&open);
-    let resolve = Tx::resolve(edge_id, proof(), outputs.clone());
-    let ids = Tx::resolve_output_ids(edge_id, &outputs);
+    let close = Tx::close(edge_id, proof(), outputs.clone());
+    let ids = Tx::close_output_ids(edge_id, &outputs);
 
     assert_eq!(
         edge_id,
@@ -64,13 +65,13 @@ fn operations_derive_output_ids() {
     assert_eq!(ids.as_slice()[0], Payout::new(MAKER, 7).id(edge(), 0));
     assert_eq!(ids.as_slice()[1], Payout::new(TAKER, 8).id(edge(), 1));
     assert_ne!(ids.as_slice()[0], ids.as_slice()[1]);
-    // Sanity: the resolve still reports the configured outputs through pattern match.
-    let Tx::Resolve {
+    // Sanity: the close still reports the configured outputs through pattern match.
+    let Tx::Close {
         outputs: tx_outputs,
         ..
-    } = &resolve
+    } = &close
     else {
-        panic!("expected resolve");
+        panic!("expected close");
     };
     assert_eq!(tx_outputs, &outputs);
 }
@@ -79,7 +80,7 @@ fn operations_derive_output_ids() {
 fn block_reports_deterministic_cost_and_fee() {
     let ops = List::all([
         open_op(),
-        Tx::resolve(
+        Tx::close(
             edge(),
             proof(),
             payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
@@ -117,7 +118,7 @@ fn view_tracks_live_objects() {
     let mut resolved = open_state();
     let _event = apply(
         &mut resolved,
-        &Tx::resolve(
+        &Tx::close(
             edge(),
             proof(),
             payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),

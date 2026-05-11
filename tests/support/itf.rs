@@ -8,7 +8,7 @@
 //! the `itf` crate validates the trace's variable list against this
 //! struct's fields at parse time.
 //!
-//! The conversion functions (`op_for`, `context_for`, `resolve_op`) turn
+//! The conversion functions (`op_for`, `context_for`, `close_op`) turn
 //! an abstract `Input` into the concrete `(Context, Op)` the kernel
 //! consumes. Both `tests/itf.rs` (validation replay) and
 //! `benches/apply.rs` (throughput) drive the kernel through the same
@@ -21,8 +21,7 @@ use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
 use hellas_kernel::{
-    Agreement, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof, ProtocolCode, ResolveHash,
-    ResolveKind, Seal, Sig, Tx,
+    CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof, ProtocolCode, Seal, Sig, Tx,
 };
 
 use super::l1;
@@ -67,15 +66,13 @@ pub(crate) enum EdgeTag {
     Edge2,
 }
 
-/// Quint `Proof` enum.
+/// Quint `Proof` enum, mirrored from the collapsed kernel proof surface.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub(crate) enum ProofTag {
-    Basic,
-    Agreement,
+    Mutual,
     Timeout,
-    ClaimantWins,
-    ChallengerWins,
+    Violation,
 }
 
 /// Quint `Input` ADT.
@@ -84,14 +81,14 @@ pub(crate) enum ProofTag {
 pub(crate) enum Input {
     NoInput,
     OpenInput(EdgeTag),
-    ResolveInput(ResolveInputBody),
+    CloseInput(CloseInputBody),
     TickInput,
     IdleInput,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ResolveInputBody {
+pub(crate) struct CloseInputBody {
     pub(crate) edge: EdgeTag,
     pub(crate) proof: ProofTag,
     #[serde(with = "As::<Integer>")]
@@ -107,7 +104,7 @@ pub(crate) struct ResolveInputBody {
 pub(crate) enum Event {
     NoEvent,
     EdgeOpenedEvent(EdgeTag),
-    EdgeResolvedEvent(EdgeTag),
+    EdgeClosedEvent(EdgeTag),
 }
 
 // -- Conversion -------------------------------------------------------------
@@ -120,23 +117,13 @@ pub(crate) const fn edge_key(tag: EdgeTag) -> l1::EdgeKey {
     }
 }
 
-/// True when the proof requires fake-crypto for the placeholder verifier
-/// to accept. Used to skip fixtures whose actions the production kernel
-/// cannot replay.
-pub(crate) const fn needs_fake_crypto(tag: ProofTag) -> bool {
-    matches!(
-        tag,
-        ProofTag::Basic | ProofTag::Agreement | ProofTag::ClaimantWins | ProofTag::ChallengerWins,
-    )
-}
-
-/// Synthesizes the kernel `Context` for an input. Timeout resolves need
+/// Synthesizes the kernel `Context` for an input. Timeout closes need
 /// `Context::block_height >= terms.timeout`; everything else uses the
 /// genesis context.
 pub(crate) fn context_for(input: &Input) -> Context {
     if matches!(
         input,
-        Input::ResolveInput(body) if body.proof == ProofTag::Timeout,
+        Input::CloseInput(body) if body.proof == ProofTag::Timeout,
     ) {
         l1::TIMEOUT_CONTEXT
     } else {
@@ -149,15 +136,15 @@ pub(crate) fn context_for(input: &Input) -> Context {
 pub(crate) fn op_for(input: &Input) -> Option<Tx> {
     match input {
         Input::OpenInput(tag) => Some(l1::open(edge_key(*tag))),
-        Input::ResolveInput(body) => Some(resolve_op(body)),
+        Input::CloseInput(body) => Some(close_op(body)),
         Input::NoInput | Input::TickInput | Input::IdleInput => None,
     }
 }
 
-/// Builds a resolve `Tx` from a model `ResolveInput`. Payouts are taken
+/// Builds a close `Tx` from a model `CloseInput`. Payouts are taken
 /// from the model body, not the support helper, so adversarial-payout
 /// traces drive the kernel correctly.
-pub(crate) fn resolve_op(body: &ResolveInputBody) -> Tx {
+pub(crate) fn close_op(body: &CloseInputBody) -> Tx {
     let edge = edge_key(body.edge);
     let outputs = l1::payouts_with(
         u64::try_from(body.maker_pay).expect("negative maker payout"),
@@ -166,31 +153,20 @@ pub(crate) fn resolve_op(body: &ResolveInputBody) -> Tx {
     let input = l1::edge_id(edge);
     let terms = l1::terms();
     let proof = match body.proof {
-        ProofTag::Basic => Proof::basic(terms.hash()),
-        ProofTag::Agreement => Proof::agreement(
-            terms.hash(),
-            Agreement::new(
-                Sig::placeholder(l1::MAKER, agreement_hash(input, &outputs)),
-                Sig::placeholder(l1::TAKER, agreement_hash(input, &outputs)),
-            ),
-        ),
-        ProofTag::Timeout => Proof::timeout(terms),
-        ProofTag::ClaimantWins => {
-            Proof::claimant_wins(terms, seal_for(input, ResolveKind::ClaimantWins, &outputs))
+        ProofTag::Mutual => {
+            let hash = Tx::payload_hash(input, CloseKind::Mutual, terms.hash(), &outputs);
+            Proof::mutual(
+                Sig::placeholder(l1::MAKER, hash),
+                Sig::placeholder(l1::TAKER, hash),
+            )
         }
-        ProofTag::ChallengerWins => Proof::challenger_wins(
-            terms,
-            seal_for(input, ResolveKind::ChallengerWins, &outputs),
-        ),
+        ProofTag::Timeout => Proof::timeout(terms),
+        ProofTag::Violation => Proof::violation(terms, seal_for(input, &outputs)),
     };
-    Tx::resolve(input, proof, outputs)
+    Tx::close(input, proof, outputs)
 }
 
-fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    Tx::payload_hash(input, ResolveKind::Agreement, l1::terms().hash(), outputs)
-}
-
-fn seal_for(input: EdgeId, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Tx::payload_hash(input, kind, l1::terms().hash(), outputs);
-    Seal::placeholder(ProtocolCode::new(1), kind, hash)
+fn seal_for(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
+    let hash = Tx::payload_hash(input, CloseKind::Violation, l1::terms().hash(), outputs);
+    Seal::placeholder(ProtocolCode::new(1), CloseKind::Violation, hash)
 }

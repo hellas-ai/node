@@ -4,13 +4,13 @@ module fees {
   // The l1.qnt model focuses on live coin/edge shape. This model adds the
   // protocol payment bucket (`paid`) and an explicit edge reserve so we can
   // check the v1 rule that the protocol is paid pessimistically: open burns the
-  // open fee and locks the worst-case resolve reserve; resolve consumes the
+  // open fee and locks the worst-case close reserve; close consumes the
   // whole reserve rather than refunding unused reserve into payout coins.
   //
   // The model also exercises the deliberate fee-schedule asymmetry: an edge's
   // reserve is locked at open under the schedule active at that block, but a
-  // resolve is priced under the schedule active at *its* block. A protocol
-  // fee raise can therefore push the resolve cost above the locked reserve,
+  // close is priced under the schedule active at *its* block. A protocol
+  // fee raise can therefore push the close cost above the locked reserve,
   // which stalls the edge. Principal stays conserved; it just cannot be paid
   // out under the new schedule. This is the v1 stale-edge collection knob.
 
@@ -25,10 +25,10 @@ module fees {
   type Edge =
     | Channel
 
-  // Basic is the modelling/fake-crypto witness. Timeout is the proof-free
-  // production path in this reduced fee model.
+  // Mutual is the unconditionally-admitted cooperative close. Timeout is
+  // the height-gated production path in this reduced fee model.
   type Proof =
-    | Basic
+    | Mutual
     | Timeout
 
   var coins: Coin -> int
@@ -38,10 +38,10 @@ module fees {
   var liveEdges: Set[Edge]
   var paid: int
   var height: int
-  // Currently active resolve fee. Initialised to BaseResolveFee at genesis;
-  // a raiseFee step lifts it to RaisedResolveFee, modelling the protocol
+  // Currently active close fee. Initialised to BaseCloseFee at genesis;
+  // a raiseFee step lifts it to RaisedCloseFee, modelling the protocol
   // bumping fees mid-lifecycle.
-  var resolveFee: int
+  var closeFee: int
 
   // Concrete values chosen to mirror the Rust resource-fee tests:
   // 30 + 20 funding, 10 open fee, 16 prepaid reserve, 24 principal.
@@ -52,13 +52,13 @@ module fees {
   pure val TakerValue = 20
   pure val Total = MakerValue + TakerValue
   pure val OpenFee = 10
-  pure val ResolveReserve = 16
-  // Resolve fee under the schedule active at open. Locked reserve is sized
+  pure val CloseReserve = 16
+  // Close fee under the schedule active at open. Locked reserve is sized
   // to cover this exactly.
-  pure val BaseResolveFee = 10
-  // Resolve fee after a protocol fee raise. Chosen to exceed ResolveReserve so
-  // the model can witness an edge becoming unresolvable.
-  pure val RaisedResolveFee = ResolveReserve + 2
+  pure val BaseCloseFee = 10
+  // Close fee after a protocol fee raise. Chosen to exceed CloseReserve so
+  // the model can witness an edge becoming unclosable.
+  pure val RaisedCloseFee = CloseReserve + 2
   pure val MakerPayout = 12
   pure val TakerPayout = 12
   pure val Principal = MakerPayout + TakerPayout
@@ -87,27 +87,27 @@ module fees {
       and liveCoins.contains(TakerCoin)
       and not(liveCoins.contains(MakerOut))
       and not(liveCoins.contains(TakerOut))
-      and funding >= OpenFee + ResolveReserve
+      and funding >= OpenFee + CloseReserve
 
   def proofOk(p: Proof): bool =
     match p {
-      | Basic => true
+      | Mutual => true
       | Timeout => height >= TimeoutHeight
     }
 
-  // Resolve is admitted only when the edge's locked reserve covers the
-  // *current* resolve fee — not the fee active at open. Under a fee raise,
+  // Close is admitted only when the edge's locked reserve covers the
+  // *current* close fee — not the fee active at open. Under a fee raise,
   // an existing edge's reserve may no longer cover the new fee, leaving the
-  // edge unresolvable.
-  def canResolve(p: Proof): bool =
+  // edge unclosable.
+  def canClose(p: Proof): bool =
     liveEdges.contains(Channel)
       and proofOk(p)
-      and reserves.get(Channel) >= resolveFee
+      and reserves.get(Channel) >= closeFee
       and edges.get(Channel) == Principal
       and not(liveCoins.contains(MakerOut))
       and not(liveCoins.contains(TakerOut))
 
-  // Normal genesis: enough funding to pay open fee and reserve. Resolve fee
+  // Normal genesis: enough funding to pay open fee and reserve. Close fee
   // starts at the base schedule.
   action init = all {
     coins' = AllCoins.mapBy(id =>
@@ -125,7 +125,7 @@ module fees {
     liveEdges' = Set(),
     paid' = 0,
     height' = 1,
-    resolveFee' = BaseResolveFee,
+    closeFee' = BaseCloseFee,
   }
 
   // Underfunded genesis proves that an open with insufficient protocol payment
@@ -146,7 +146,7 @@ module fees {
     liveEdges' = Set(),
     paid' = 0,
     height' = 1,
-    resolveFee' = BaseResolveFee,
+    closeFee' = BaseCloseFee,
   }
 
   // Open consumes both funding coins, pays the open fee immediately, locks the
@@ -157,19 +157,19 @@ module fees {
     coins' = coins
       .set(MakerCoin, 0)
       .set(TakerCoin, 0),
-    edges' = edges.set(Channel, funding - OpenFee - ResolveReserve),
-    reserves' = reserves.set(Channel, ResolveReserve),
+    edges' = edges.set(Channel, funding - OpenFee - CloseReserve),
+    reserves' = reserves.set(Channel, CloseReserve),
     liveCoins' = liveCoins.exclude(Set(MakerCoin, TakerCoin)),
     liveEdges' = liveEdges.union(Set(Channel)),
     paid' = paid + OpenFee,
     height' = height,
-    resolveFee' = resolveFee,
+    closeFee' = closeFee,
   }
 
-  // Resolve materializes principal payouts and pays the entire locked reserve to
+  // Close materializes principal payouts and pays the entire locked reserve to
   // the protocol bucket. Deliberately no reserve surplus is refunded.
-  action resolveEdge(p) = all {
-    canResolve(p),
+  action closeEdge(p) = all {
+    canClose(p),
     coins' = coins
       .set(MakerOut, MakerPayout)
       .set(TakerOut, TakerPayout),
@@ -179,15 +179,15 @@ module fees {
     liveEdges' = liveEdges.exclude(Set(Channel)),
     paid' = paid + reserves.get(Channel),
     height' = height,
-    resolveFee' = resolveFee,
+    closeFee' = closeFee,
   }
 
-  // Protocol bumps the active resolve fee. Edges already opened keep their
+  // Protocol bumps the active close fee. Edges already opened keep their
   // locked reserve; if the raised fee exceeds that reserve, those edges
-  // become unresolvable. This is the deliberate stale-edge collection knob
+  // become unclosable. This is the deliberate stale-edge collection knob
   // and the production semantics this model exists to pin.
   action raiseFee = all {
-    resolveFee == BaseResolveFee,
+    closeFee == BaseCloseFee,
     coins' = coins,
     edges' = edges,
     reserves' = reserves,
@@ -195,7 +195,7 @@ module fees {
     liveEdges' = liveEdges,
     paid' = paid,
     height' = height,
-    resolveFee' = RaisedResolveFee,
+    closeFee' = RaisedCloseFee,
   }
 
   // Height advance enables timeout without changing money accounting.
@@ -207,7 +207,7 @@ module fees {
     liveEdges' = liveEdges,
     paid' = paid,
     height' = height + 1,
-    resolveFee' = resolveFee,
+    closeFee' = closeFee,
   }
 
   // Stutter step for invariant exploration.
@@ -219,14 +219,14 @@ module fees {
     liveEdges' = liveEdges,
     paid' = paid,
     height' = height,
-    resolveFee' = resolveFee,
+    closeFee' = closeFee,
   }
 
   // Nondeterministic transition relation for random exploration.
   action step = any {
     openEdge,
-    resolveEdge(Basic),
-    resolveEdge(Timeout),
+    closeEdge(Mutual),
+    closeEdge(Timeout),
     raiseFee,
     tick,
     idle,
@@ -240,14 +240,14 @@ module fees {
     coinTotal + edgeTotal + reserveTotal + paid == Total
 
   // Reserves are sized to the schedule active at open. Any live edge therefore
-  // covers BaseResolveFee even after a subsequent raise; what changes is
-  // whether the *current* fee fits, captured in canResolve.
+  // covers BaseCloseFee even after a subsequent raise; what changes is
+  // whether the *current* fee fits, captured in canClose.
   val reserveAtLeastBaseFee =
-    liveEdges.forall(id => reserves.get(id) >= BaseResolveFee)
+    liveEdges.forall(id => reserves.get(id) >= BaseCloseFee)
 
   // Paid can only be zero, open fee, or open fee plus consumed reserve.
   val paidWithinBounds =
-    paid >= 0 and paid <= OpenFee + ResolveReserve
+    paid >= 0 and paid <= OpenFee + CloseReserve
 
   val atMostOneLiveEdge =
     liveEdgeCount <= 1
@@ -265,29 +265,29 @@ module fees {
   run feeTraceTest =
     init
       .then(openEdge)
-      .then(resolveEdge(Basic))
-      .expect(valueAccounted and paid == OpenFee + ResolveReserve)
+      .then(closeEdge(Mutual))
+      .expect(valueAccounted and paid == OpenFee + CloseReserve)
 
   run timeoutFeeTraceTest =
     init
       .then(openEdge)
       .then(tick)
-      .then(resolveEdge(Timeout))
-      .expect(valueAccounted and paid == OpenFee + ResolveReserve)
+      .then(closeEdge(Timeout))
+      .expect(valueAccounted and paid == OpenFee + CloseReserve)
 
   run underfundedOpenRejectedTest =
     initUnderfunded
       .expect(not(canOpen))
 
   // Stale-edge collection: an edge opened under the base schedule cannot
-  // resolve once the protocol raises the fee above the locked reserve.
+  // close once the protocol raises the fee above the locked reserve.
   // Principal stays inside the live edge (valueAccounted continues to hold),
   // it just cannot be paid out under the new schedule.
   run staleEdgeAfterFeeRaiseTest =
     init
       .then(openEdge)
       .then(raiseFee)
-      .expect(valueAccounted and liveEdges.contains(Channel) and not(canResolve(Basic)) and not(canResolve(Timeout)) and reserves.get(Channel) == ResolveReserve and edges.get(Channel) == Principal)
+      .expect(valueAccounted and liveEdges.contains(Channel) and not(canClose(Mutual)) and not(canClose(Timeout)) and reserves.get(Channel) == CloseReserve and edges.get(Channel) == Principal)
 
   // Even after height advances past the timeout, a raised fee keeps the
   // edge stuck. Timeout is no escape hatch from a deliberate fee raise.
@@ -296,5 +296,5 @@ module fees {
       .then(openEdge)
       .then(raiseFee)
       .then(tick)
-      .expect(height >= TimeoutHeight and not(canResolve(Timeout)))
+      .expect(height >= TimeoutHeight and not(canClose(Timeout)))
 }

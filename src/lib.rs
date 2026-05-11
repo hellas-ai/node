@@ -19,19 +19,17 @@
 //! | Established rules    | [`Diff`], [`View`]         | `models/rules/invariants.qnt`        |
 //! | Assumed dependencies | [`Store`], [`Verifier`]    | `models/deps/assumptions.qnt`        |
 //!
-//! # Verifier Boundary
+//! # Verifier boundary
 //!
-//! The kernel implements no cryptography. Signature and dispute-seal
-//! verification go through a [`Verifier`] passed by the caller, typically a
-//! preverified-cache lookup populated off the apply critical path. Tests wire
-//! their own forgeable verifier; production wires real cryptography. The
-//! kernel does not see the difference.
-//!
-//! # Warning: Fake Crypto
-//!
-//! The `fake-crypto` feature enables the degenerate [`Proof::basic`] witness
-//! for modelling and tests. It must not be used in production. Without that
-//! feature, basic proofs do not verify regardless of the verifier supplied.
+//! The kernel implements no cryptography and no close-validity policy
+//! beyond bookkeeping (value conservation, slot collisions, fee
+//! arithmetic). Every admissibility decision about a [`Proof`] —
+//! terms-hash binding, timeout height, payout shape, signature, seal —
+//! is delegated to a [`Verifier`] passed by the caller, typically a
+//! preverified-cache lookup populated off the apply critical path.
+//! Test verifiers accept the deterministic placeholders documented on
+//! [`Sig::placeholder`] and [`Seal::placeholder`]; production verifiers
+//! wire real cryptography. The kernel does not see the difference.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!
@@ -61,11 +59,6 @@
 //! };
 //! ```
 
-#[cfg(all(feature = "fake-crypto", not(debug_assertions), not(doc)))]
-compile_error!(
-    "hellas-kernel fake-crypto is for modelling only; do not build optimized artifacts with forgeable placeholder verification"
-);
-
 mod block;
 mod canonical;
 pub(crate) mod consts;
@@ -88,15 +81,15 @@ pub use block::Block;
 pub use canonical::{BufferWriter, Decode, DecodeError, Encode, Writer};
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
 pub use error::{
-    ApplyError, BatchError, InsertError, InvalidOpenReason, InvalidProofReason,
-    InvalidResolveReason, KernelResult,
+    ApplyError, BatchError, InsertError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason,
+    KernelResult,
 };
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
 pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS};
-pub use tx::{Agreement, Funding, Payout, Proof, ResolveKind, Seal, Tx};
-pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, TermsHash};
+pub use tx::{CloseKind, Funding, Payout, Proof, Seal, Tx};
+pub use primitive::{CloseHash, CoinId, EdgeId, Key, Party, ProtocolCode, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]
 pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
