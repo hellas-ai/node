@@ -22,8 +22,17 @@ module fees {
     | MakerOut
     | TakerOut
 
+  // `UnusedEdge` is a workaround for an Apalache/Quint-IR bug: when a
+  // sum type has a single variant, the FUN_APP type inference produces
+  // a row-polymorphic argument type that Apalache rejects ("FUN_APP
+  // cannot be applied to arguments of types ((Channel({tag:Str}) -> Int),
+  // Channel({tag:Str}) | c)"). Adding a second variant collapses the row
+  // to a closed sum and unblocks verification. `UnusedEdge` is never
+  // a member of `AllEdges`, never live, and never appears in any
+  // reachable state; the trace and invariant semantics are unchanged.
   type Edge =
     | Channel
+    | UnusedEdge
 
   // Mutual is the unconditionally-admitted cooperative close. Timeout is
   // the height-gated production path in this reduced fee model.
