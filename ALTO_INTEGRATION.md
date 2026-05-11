@@ -256,13 +256,18 @@ The mempool's job changes:
 
 ## Open questions to resolve during Phase 1
 
-1. **Should `Edge` go through alto's MMR alongside `Coin`?** Currently
-   alto's MMR is typed `ObjectId -> Coin`. Adding `Edge` either
-   means:
-   - A second typed MMR (`EdgeId -> Edge`), or
-   - A union object type `ObjectId -> Object { Coin | Edge }`.
-   The second is closer to kernel's view but requires a wider commonware
-   type. Suggest: two MMRs, alto's `BlockWorkingSet` queries both.
+1. **One MMR with union object type, not two parallel MMRs.**
+   `commonware_glue::stateful::db::DatabaseSet::merkleize` is per-MMR
+   — two MMRs means two separate atomicity domains, and a kernel op
+   that consumes a coin and creates an edge in one logical step would
+   require atomic commits across both. Commonware doesn't expose a
+   cross-MMR transactional primitive. The fix: one MMR keyed by a
+   shared `ObjectId` (both `CoinId` and `EdgeId` are 32-byte
+   domain-separated BLAKE3 digests; their id spaces don't collide),
+   with a thin `enum Object { Coin(Coin), Edge(Edge) }` as the MMR's
+   value type. Alto's `BlockWorkingSet` exposes `Tx::coin` and
+   `Tx::edge` by pattern-matching on the variant. One root, one
+   commit, atomic by construction.
 
 2. **Validator-set rotation vs `Context`.** Alto's existing
    `HellasBlock` carries leader pubkey; kernel's `Context` does not.
@@ -272,11 +277,12 @@ The mempool's job changes:
    `Context`).
 
 3. **`ObjectId` vs split `CoinId`/`EdgeId`.** Alto uses one
-   `ObjectId = Digest` type; kernel uses two typed ids. The MMR change
-   above settles this — alto's two-MMR shape mirrors the kernel's
-   typed ids. If alto sticks with one MMR (option A above), it needs
-   a `kind: u8` discriminator byte prepended, which complicates the
-   storage layer.
+   `ObjectId = Digest` type at the storage layer; kernel uses two typed
+   ids at the API layer. They reconcile cleanly: both kernel ids are
+   32-byte domain-separated BLAKE3 digests with disjoint id spaces, so
+   they slot into a single `ObjectId`-keyed MMR. The kernel's typing is
+   preserved at the API surface (`Tx::coin(CoinId)` vs `Tx::edge(EdgeId)`),
+   with the conversion happening inside `BlockWorkingSet`.
 
 4. **Block envelope.** Alto's `HellasBlock` carries
    `(height, timestamp, parent, state_root, sync_target, [Transaction])`.
