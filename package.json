@@ -2,14 +2,14 @@
   "private": true,
   "scripts": {
     "quint:run": "npm run quint:run:l1 && npm run quint:run:fees",
-    "quint:run:l1": "quint run models/l1.qnt --max-samples=500 --max-steps=8 --invariants=valueConserved --invariants=atMostOneLiveEdge --invariants=noNegativeValue --invariants=liveEdgesAreKnown --invariants=liveCoinsAreKnown --invariants=payoutsHonorBindings --verbosity=1",
+    "quint:run:l1": "quint run models/l1.qnt --max-samples=500 --max-steps=8 --invariants=valueConserved --invariants=atMostOneLiveEdge --invariants=noNegativeValue --invariants=liveEdgesAreKnown --invariants=liveCoinsAreKnown --invariants=payoutsHonorBindings --invariants=fundingAuthorized --verbosity=1",
     "quint:run:fees": "quint run models/fees.qnt --max-samples=500 --max-steps=8 --invariants=valueAccounted --invariants=reserveAtLeastBaseFee --invariants=paidWithinBounds --invariants=atMostOneLiveEdge --invariants=liveCoinsAreKnown --invariants=noNegativeValue --verbosity=1",
     "quint:fixtures": "rm -f models/traces/*.itf.json && mkdir -p models/traces && quint test models/l1.qnt --out-itf 'models/traces/l1_{test}.itf.json' --verbosity=0",
     "quint:test": "npm run quint:test:l1 && npm run quint:test:fees",
     "quint:test:l1": "quint typecheck models/l1.qnt && quint test models/l1.qnt --verbosity=2",
     "quint:test:fees": "quint typecheck models/fees.qnt && quint test models/fees.qnt --verbosity=2",
     "quint:verify": "npm run quint:verify:l1 && npm run quint:verify:fees",
-    "quint:verify:l1": "quint verify --apalache-version=0.57.0 models/l1.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown payoutsHonorBindings --verbosity=1",
+    "quint:verify:l1": "quint verify --apalache-version=0.57.0 models/l1.qnt --invariants valueConserved noNegativeValue atMostOneLiveEdge liveCoinsAreKnown liveEdgesAreKnown payoutsHonorBindings fundingAuthorized --verbosity=1",
     "quint:verify:fees": "quint verify --apalache-version=0.57.0 models/fees.qnt --invariants valueAccounted reserveAtLeastBaseFee paidWithinBounds atMostOneLiveEdge liveCoinsAreKnown noNegativeValue --verbosity=1"
   },
   "devDependencies": {
