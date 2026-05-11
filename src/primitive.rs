@@ -99,8 +99,8 @@ impl CoinId {
     /// kernel from observed bytes (genesis allocation, MMR reads, RPC
     /// payloads). Public `from_bytes` is therefore legitimate; the
     /// integrity discipline that applies here is the kernel's
-    /// canonical derivation helpers ([`Self::genesis`],
-    /// [`Self::payout`]) for producing fresh ids.
+    /// canonical derivation helpers ([`Self::genesis`], `Self::payout`)
+    /// for producing fresh ids.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
@@ -316,7 +316,7 @@ impl Sig {
     /// Creates a deterministic signature placeholder for modelling.
     ///
     /// This is forgeable and not a cryptographic signature. Whether the kernel
-    /// accepts this shape is decided by the [`crate::Verifier`] passed at
+    /// accepts this shape is decided by the [`crate::SigVerifier`] passed at
     /// apply time.
     #[must_use]
     pub fn placeholder(key: Key, hash: CloseHash) -> Self {
