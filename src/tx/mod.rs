@@ -219,10 +219,8 @@ where
     Ok(Change::close((input, edge), &coins))
 }
 
-/// Dispatches close-proof admissibility per variant. Mutual routes to
-/// the signature verifier, Violation routes to the seal verifier, and
-/// Timeout is structural — the kernel checks terms-hash binding, height,
-/// and payout shape inline because none of those need cryptography.
+// Timeout is checked structurally because none of its rules — terms-hash
+// binding, height guard, payout shape — need cryptography.
 fn check_proof<V>(
     input: EdgeId,
     edge: &Edge,
@@ -259,13 +257,14 @@ where
             Ok(())
         }
         Proof::Violation { terms, seal } => {
-            if terms.hash() != edge.terms() {
+            let terms_hash = terms.hash();
+            if terms_hash != edge.terms() {
                 return Err(InvalidProofReason::TermsMismatch);
             }
             let public = SealPublicInputs {
                 edge_id: input,
                 protocol: terms.protocol(),
-                terms_hash: terms.hash(),
+                terms_hash,
                 payouts: outputs,
             };
             if verifier.verify_seal(*seal, &public) {

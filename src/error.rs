@@ -174,8 +174,10 @@ pub enum InvalidCloseReason {
 
 /// Specific reason an [`ApplyError::InvalidProof`] was raised.
 ///
-/// The kernel surfaces these as a fixed vocabulary; deciding which (if
-/// any) applies to a given close is the [`crate::Verifier`]'s job.
+/// `BadSignature` and `BadSeal` come from the wired
+/// [`crate::SigVerifier`] / [`crate::SealVerifier`]; `TermsMismatch`,
+/// `TimeoutNotReached`, and `PayoutMismatch` come from the kernel's
+/// inline Timeout/Violation structural checks.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidProofReason {
     /// The proof's terms commitment does not match the edge's `TermsHash`.

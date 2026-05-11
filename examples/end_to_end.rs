@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 use hellas_kernel::{
     Batch, Block, BlockHash, BlockHeight, CloseHash, CloseKind, Coin, CoinId, Context, Edge,
     EdgeId, EventKind, Fees, Funding, Genesis, InsertError, KernelResult, Key, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Seal,
-    SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig, SigVerifier, State, Store, Terms, Tx,
+    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Secp256k1Verifier,
+    Sig, State, Store, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
@@ -120,26 +120,6 @@ impl Batch for MemTx<'_> {
 // 2. A real keypair pair via `secp256k1`. The kernel never sees the secrets.
 // ---------------------------------------------------------------------------
 
-/// Composes the bundled secp256k1 sig verifier with a hard-reject seal
-/// verifier. The kernel requires `SigVerifier + SealVerifier`; this is
-/// the minimal production-shaped composition for a deployment that only
-/// supports cooperative (Mutual) and Timeout closes.
-struct ProductionVerifier {
-    sig: Secp256k1Verifier,
-}
-
-impl SigVerifier for ProductionVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool {
-        self.sig.verify_sig(sig, key, hash)
-    }
-}
-
-impl SealVerifier for ProductionVerifier {
-    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
-        false
-    }
-}
-
 fn keypair(seed: u8) -> (SecretKey, Key) {
     let secp = Secp256k1::new();
     let secret = SecretKey::from_byte_array([seed; 32]).expect("non-zero seed");
@@ -207,12 +187,11 @@ fn main() {
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(funding, terms);
 
-    // Production verifier — real ECDSA for sigs, hard-reject for seals
-    // (this example only exercises the Mutual path; a deployment that
-    // accepts Violation closes would compose a real seal verifier here).
-    let verifier = ProductionVerifier {
-        sig: Secp256k1Verifier::new(),
-    };
+    // Real ECDSA for cooperative-close signatures; the bundled verifier
+    // also impls SealVerifier as a hard-reject, so this example covers
+    // Mutual only. Deployments that admit violation closes wire a real
+    // SealVerifier in place of Secp256k1Verifier (or alongside).
+    let verifier = Secp256k1Verifier::new();
 
     // Genesis the store with two coins owned by the real public keys.
     let mut state = State::genesis(

@@ -2,12 +2,8 @@
 //!
 //! Constructs a real keypair, signs the kernel's canonical close hash with
 //! ECDSA, and asserts that the kernel accepts the resulting Mutual close
-//! through the production [`SigVerifier`] impl. Mutating any of (sig, key,
-//! hash) or swapping the kernel for a `RejectVerifier` causes rejection.
-//!
-//! `Secp256k1Verifier` is sig-only; the kernel apply path expects a value
-//! that impls both [`SigVerifier`] and [`SealVerifier`], so we compose
-//! locally with a no-seal stub.
+//! through the production verifier. Mutating any of (sig, key, hash) or
+//! swapping the kernel for a `RejectVerifier` causes rejection.
 
 #![cfg(feature = "secp256k1")]
 #![allow(clippy::alloc_instead_of_core)]
@@ -21,32 +17,12 @@
 mod support;
 
 use hellas_kernel::{
-    ApplyError, BlockHash, BlockHeight, CloseHash, CloseKind, CoinId, Context, Funding, Genesis,
-    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Seal,
-    SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig, SigVerifier, State, Terms, Tx,
+    ApplyError, BlockHash, BlockHeight, CloseKind, CoinId, Context, Funding, Genesis,
+    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode,
+    Secp256k1Verifier, Sig, State, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 use support::{FixedStore, party_one, payouts_two};
-
-/// Wires `Secp256k1Verifier` (real ECDSA for sigs) with a hard-rejecting
-/// seal verifier so the test value satisfies the kernel's
-/// `SigVerifier + SealVerifier` bound. Mirrors how a real deployment that
-/// doesn't yet support dispute seals would compose its verifiers.
-struct ProductionVerifier {
-    sig: Secp256k1Verifier,
-}
-
-impl SigVerifier for ProductionVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool {
-        self.sig.verify_sig(sig, key, hash)
-    }
-}
-
-impl SealVerifier for ProductionVerifier {
-    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
-        false
-    }
-}
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const CONTEXT: Context = Context::new(
@@ -100,9 +76,7 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
         ],
     )
     .expect("genesis seeds the store");
-    let verifier = ProductionVerifier {
-        sig: Secp256k1Verifier::new(),
-    };
+    let verifier = Secp256k1Verifier::new();
 
     state
         .apply(CONTEXT, &verifier, &open)
@@ -142,9 +116,7 @@ fn forged_signature_is_rejected_by_real_verifier() {
         ],
     )
     .expect("genesis seeds the store");
-    let verifier = ProductionVerifier {
-        sig: Secp256k1Verifier::new(),
-    };
+    let verifier = Secp256k1Verifier::new();
 
     state
         .apply(CONTEXT, &verifier, &open)
