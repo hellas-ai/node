@@ -12,7 +12,7 @@ use crate::{
     event::{Change, Diff, Event},
     list::List,
     object::Genesis,
-    op::Op,
+    tx::Tx,
     store::{Batch, Store},
     verifier::Verifier,
     view::Snapshot,
@@ -83,7 +83,7 @@ impl<S: Store> State<S> {
         &mut self,
         context: Context,
         verifier: &V,
-        operation: &Op,
+        operation: &Tx,
     ) -> KernelResult<Event> {
         let mut tx = self.store.begin();
         let event = Self::fold_one(&mut tx, context, verifier, operation)?;
@@ -104,7 +104,7 @@ impl<S: Store> State<S> {
         &mut self,
         context: Context,
         verifier: &V,
-        operations: &List<Op, N>,
+        operations: &List<Tx, N>,
     ) -> KernelResult<Diff<N>, BatchError> {
         let mut tx = self.store.begin();
         let mut diff = Diff::empty();
@@ -149,7 +149,7 @@ impl<S: Store> State<S> {
         &mut self,
         context: Context,
         verifier: &V,
-        operations: impl IntoIterator<Item = Op>,
+        operations: impl IntoIterator<Item = Tx>,
         mut on_event: F,
     ) -> KernelResult<(), BatchError>
     where
@@ -172,7 +172,7 @@ impl<S: Store> State<S> {
         batch: &mut B,
         context: Context,
         verifier: &V,
-        operation: &Op,
+        operation: &Tx,
     ) -> KernelResult<Event> {
         let change = operation.apply(context, verifier, batch)?;
         Self::fold_change(batch, &change)

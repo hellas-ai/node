@@ -20,7 +20,7 @@
 
 use secp256k1::{Message, PublicKey, Secp256k1, VerifyOnly, ecdsa::Signature};
 
-use crate::op::{ResolveKind, Seal};
+use crate::tx::{ResolveKind, Seal};
 use crate::primitive::{Key, ResolveHash, Sig};
 use crate::verifier::Verifier;
 

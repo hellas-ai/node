@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Op, Open, Parties, Payout, Proof, ProtocolCode, Resolve, State, Terms,
+    Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
@@ -132,19 +132,20 @@ const fn canonical_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
     payouts_two(MAKER, MAKER_PAYOUT, TAKER, TAKER_PAYOUT)
 }
 
-fn full_open() -> Open {
-    Open::from_terms(
-        Funding::new(party_one(MAKER_COIN), party_one(TAKER_COIN)),
-        terms(),
-    )
+const fn full_funding() -> Funding {
+    Funding::new(party_one(MAKER_COIN), party_one(TAKER_COIN))
+}
+
+fn full_open() -> Tx {
+    Tx::open(full_funding(), terms())
 }
 
 fn full_edge_id() -> EdgeId {
-    full_open().output()
+    Tx::edge_id_of(&full_funding(), &terms())
 }
 
-fn timeout_resolve() -> Resolve {
-    Resolve::new(full_edge_id(), Proof::timeout(terms()), canonical_payouts())
+fn timeout_resolve() -> Tx {
+    Tx::resolve(full_edge_id(), Proof::timeout(terms()), canonical_payouts())
 }
 
 struct L1Reference;
@@ -206,8 +207,7 @@ impl ReferenceStateMachine for L1Reference {
                     .edges
                     .remove(&edge)
                     .expect("ResolveTimeout precondition: edge open");
-                let resolve = timeout_resolve();
-                let outputs = resolve.outputs();
+                let outputs = canonical_payouts();
                 for (index, payout) in outputs.iter().enumerate() {
                     let id = payout.id(edge, index);
                     state.coins.insert(
@@ -285,16 +285,12 @@ impl StateMachineTest for L1Test {
         match transition {
             Transition::OpenFullEdge => {
                 sut.state
-                    .apply(CONTEXT, &FAKE_VERIFIER, &Op::Open(full_open()))
+                    .apply(CONTEXT, &FAKE_VERIFIER, &full_open())
                     .expect("kernel rejected OpenFullEdge that ref accepted");
             }
             Transition::ResolveTimeout => {
                 sut.state
-                    .apply(
-                        TIMEOUT_CONTEXT,
-                        &FAKE_VERIFIER,
-                        &Op::Resolve(timeout_resolve()),
-                    )
+                    .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &timeout_resolve())
                     .expect("kernel rejected ResolveTimeout that ref accepted");
             }
             Transition::Tick => {

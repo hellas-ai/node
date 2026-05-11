@@ -19,11 +19,11 @@ mod resolve;
 use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 
 use hellas_kernel::{
-    Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, Event, EventKind,
-    Fees, Funding, Genesis, InsertError, InvalidOpenReason, InvalidProofReason,
-    InvalidResolveReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open,
-    Parties, Payout, Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State,
-    Terms, TermsHash, View,
+    Agreement, ApplyError, Block, BlockHash, BlockHeight, CoinId, Context, Cost, EdgeId, Event,
+    EventKind, Fees, Funding, Genesis, InsertError, InvalidOpenReason, InvalidProofReason,
+    InvalidResolveReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+    Payout, Proof, ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, State, Terms, TermsHash, Tx,
+    View,
 };
 
 const CONTEXT: Context = Context::new(
@@ -138,7 +138,7 @@ fn resolve_hash(
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> ResolveHash {
-    Resolve::payload_hash(input, kind, terms(), outputs)
+    Tx::payload_hash(input, kind, terms(), outputs)
 }
 
 fn other_resolve_hash(
@@ -146,11 +146,11 @@ fn other_resolve_hash(
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> ResolveHash {
-    Resolve::payload_hash(input, kind, other_terms(), outputs)
+    Tx::payload_hash(input, kind, other_terms(), outputs)
 }
 
 fn edge() -> EdgeId {
-    open_op().output()
+    Tx::edge_id_of(&funding(MAKER_COIN, TAKER_COIN), &basic_terms())
 }
 
 fn maker_out() -> CoinId {
@@ -169,18 +169,25 @@ fn funded_state() -> State<FixedStore<6, 1>> {
     state(empty_store(), [MAKER_SEED, TAKER_SEED])
 }
 
-fn funded_state_for(open: &Open) -> State<FixedStore<6, 1>> {
+fn funded_state_for(open: &Tx) -> State<FixedStore<6, 1>> {
     state(store_for(open), [MAKER_SEED, TAKER_SEED])
 }
 
 fn open_state() -> State<FixedStore<6, 1>> {
     let mut state = funded_state();
-    let _event = apply(&mut state, &Op::Open(open_op()));
+    let _event = apply(&mut state, &open_op());
     state
 }
 
-fn open_op() -> Open {
-    Open::from_terms(funding(MAKER_COIN, TAKER_COIN), basic_terms())
+fn open_op() -> Tx {
+    Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms())
+}
+
+fn open_edge_id(open: &Tx) -> EdgeId {
+    match open {
+        Tx::Open { funding, terms } => Tx::edge_id_of(funding, terms),
+        Tx::Resolve { .. } => panic!("expected Tx::Open"),
+    }
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {
@@ -286,25 +293,21 @@ fn output_ids0() -> List<CoinId, MAX_EDGE_OUTPUTS> {
 }
 
 fn output_ids() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Resolve::new(
+    Tx::resolve_output_ids(
         edge(),
-        proof(),
-        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
+        &payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
     )
-    .output_ids()
 }
 
 fn output_ids3_values() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Resolve::new(
+    Tx::resolve_output_ids(
         edge(),
-        proof(),
-        payouts3(
+        &payouts3(
             Payout::new(MAKER, 6),
             Payout::new(TAKER, 5),
             Payout::new(MAKER, 4),
         ),
     )
-    .output_ids()
 }
 
 fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
@@ -327,7 +330,7 @@ fn output_ids3(first: CoinId, second: CoinId, third: CoinId) -> List<CoinId, MAX
 
 fn apply<const C: usize, const E: usize>(
     state: &mut State<FixedStore<C, E>>,
-    op: &Op,
+    op: &Tx,
 ) -> hellas_kernel::Event {
     apply_with(state, CONTEXT, op)
 }
@@ -335,7 +338,7 @@ fn apply<const C: usize, const E: usize>(
 fn apply_with<const C: usize, const E: usize>(
     state: &mut State<FixedStore<C, E>>,
     context: Context,
-    op: &Op,
+    op: &Tx,
 ) -> hellas_kernel::Event {
     let Ok(event) = state.apply(context, &FAKE_VERIFIER, op) else {
         panic!("operation rejected");
@@ -347,7 +350,7 @@ fn empty_store() -> FixedStore<6, 1> {
     store_for(&open_op())
 }
 
-fn store_for(open: &Open) -> FixedStore<6, 1> {
+fn store_for(open: &Tx) -> FixedStore<6, 1> {
     FixedStore::empty(
         [
             MAKER_COIN,
@@ -357,19 +360,20 @@ fn store_for(open: &Open) -> FixedStore<6, 1> {
             taker_out(),
             extra_out(),
         ],
-        [open.output()],
+        [open_edge_id(open)],
     )
 }
 
-fn store_for_resolve(open: &Open, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
-    let ids = Resolve::new(open.output(), proof(), outputs.clone()).output_ids();
+fn store_for_resolve(open: &Tx, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> FixedStore<6, 1> {
+    let edge_id = open_edge_id(open);
+    let ids = Tx::resolve_output_ids(edge_id, outputs);
     let first = ids.as_slice().first().copied().unwrap_or_else(maker_out);
     let second = ids.as_slice().get(1).copied().unwrap_or_else(taker_out);
     let third = ids.as_slice().get(2).copied().unwrap_or_else(extra_out);
 
     FixedStore::empty(
         [MAKER_COIN, TAKER_COIN, EXTRA_COIN, first, second, third],
-        [open.output()],
+        [edge_id],
     )
 }
 

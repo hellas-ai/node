@@ -4,8 +4,8 @@ use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
     Agreement, BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, EventKind, Funding, Genesis,
-    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op, Open, Parties, Payout,
-    Proof, ProtocolCode, Resolve, ResolveHash, ResolveKind, Seal, Sig, State, Terms, View,
+    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
+    ProtocolCode, ResolveHash, ResolveKind, Seal, Sig, State, Terms, Tx, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -57,10 +57,10 @@ impl Step {
         }
     }
 
-    pub(crate) fn op(self) -> Option<Op> {
+    pub(crate) fn op(self) -> Option<Tx> {
         match self {
-            Self::Open(edge) => Some(Op::Open(open(edge))),
-            Self::Resolve(edge, proof) => Some(Op::Resolve(resolve(edge, proof))),
+            Self::Open(edge) => Some(open(edge)),
+            Self::Resolve(edge, proof) => Some(resolve(edge, proof)),
             Self::Tick => None,
         }
     }
@@ -137,10 +137,10 @@ pub(crate) fn genesis<const C: usize, const E: usize>(
     )
 }
 
-pub(crate) fn open(edge: EdgeKey) -> Open {
+pub(crate) fn open(edge: EdgeKey) -> Tx {
     match edge {
         EdgeKey::First => open_case(OpenKey::Full),
-        EdgeKey::Second => Open::from_terms(
+        EdgeKey::Second => Tx::open(
             Funding::new(
                 party1(maker_out(EdgeKey::First)),
                 party1(taker_out(EdgeKey::First)),
@@ -150,16 +150,16 @@ pub(crate) fn open(edge: EdgeKey) -> Open {
     }
 }
 
-pub(crate) fn open_case(key: OpenKey) -> Open {
-    Open::from_terms(open_funding(key), terms())
+pub(crate) fn open_case(key: OpenKey) -> Tx {
+    Tx::open(open_funding(key), terms())
 }
 
-pub(crate) fn open_case_op(key: OpenKey) -> Op {
-    Op::Open(open_case(key))
+pub(crate) fn open_case_op(key: OpenKey) -> Tx {
+    open_case(key)
 }
 
 pub(crate) fn open_case_id(key: OpenKey) -> EdgeId {
-    open_case(key).output()
+    Tx::edge_id_of(&open_funding(key), &terms())
 }
 
 pub(crate) fn open_case_inputs(key: OpenKey) -> List<CoinId, MAX_EDGE_INPUTS> {
@@ -171,7 +171,7 @@ pub(crate) fn open_case_inputs(key: OpenKey) -> List<CoinId, MAX_EDGE_INPUTS> {
     }
 }
 
-pub(crate) fn resolve(edge: EdgeKey, proof: ProofKey) -> Resolve {
+pub(crate) fn resolve(edge: EdgeKey, proof: ProofKey) -> Tx {
     resolve_with(edge, proof, payouts())
 }
 
@@ -179,12 +179,21 @@ pub(crate) fn resolve_with(
     edge: EdgeKey,
     proof: ProofKey,
     outputs: List<Payout, MAX_EDGE_OUTPUTS>,
-) -> Resolve {
-    Resolve::new(edge_id(edge), proof_for(edge, proof, &outputs), outputs)
+) -> Tx {
+    Tx::resolve(edge_id(edge), proof_for(edge, proof, &outputs), outputs)
 }
 
 pub(crate) fn edge_id(edge: EdgeKey) -> EdgeId {
-    open(edge).output()
+    match edge {
+        EdgeKey::First => Tx::edge_id_of(&open_funding(OpenKey::Full), &terms()),
+        EdgeKey::Second => Tx::edge_id_of(
+            &Funding::new(
+                party1(maker_out(EdgeKey::First)),
+                party1(taker_out(EdgeKey::First)),
+            ),
+            &terms(),
+        ),
+    }
 }
 
 pub(crate) fn maker_out(edge: EdgeKey) -> CoinId {
@@ -196,7 +205,7 @@ pub(crate) fn taker_out(edge: EdgeKey) -> CoinId {
 }
 
 pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Resolve::new(edge_id(edge), Proof::basic(terms().hash()), payouts()).output_ids()
+    Tx::resolve_output_ids(edge_id(edge), &payouts())
 }
 
 pub(crate) const fn edge_value(edge: Edge) -> u64 {
@@ -338,5 +347,5 @@ fn seal(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUT
 }
 
 fn hash(edge: EdgeKey, kind: ResolveKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> ResolveHash {
-    Resolve::payload_hash(edge_id(edge), kind, terms().hash(), outputs)
+    Tx::payload_hash(edge_id(edge), kind, terms().hash(), outputs)
 }

@@ -14,8 +14,8 @@
 mod support;
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, Context, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, Op, Open,
-    Parties, Payout, Proof, ProtocolCode, Resolve, Terms,
+    BlockHash, BlockHeight, Context, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, Parties,
+    Payout, Proof, ProtocolCode, Terms, Tx,
 };
 use support::{FAKE_VERIFIER, coin_id, key, map_store::map_state, party_one, payouts_two};
 
@@ -45,12 +45,10 @@ fn map_store_round_trip() {
     let taker_coin = coin_id(2);
     let outputs = payouts(maker, taker, 7, 8);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
-    let open = Open::from_terms(
-        Funding::new(party_one(maker_coin), party_one(taker_coin)),
-        terms.clone(),
-    );
-    let edge = open.output();
-    let resolve = Resolve::new(edge, Proof::timeout(terms), outputs);
+    let funding_value = Funding::new(party_one(maker_coin), party_one(taker_coin));
+    let edge = Tx::edge_id_of(&funding_value, &terms);
+    let open = Tx::open(funding_value, terms.clone());
+    let resolve = Tx::resolve(edge, Proof::timeout(terms), outputs);
 
     let mut state = map_state([
         Genesis::coin(maker_coin, maker, 10),
@@ -60,14 +58,14 @@ fn map_store_round_trip() {
     assert_eq!(state.store().edge_count(), 0);
 
     state
-        .apply(CONTEXT, &FAKE_VERIFIER, &Op::Open(open))
+        .apply(CONTEXT, &FAKE_VERIFIER, &open)
         .expect("open accepted");
     assert_eq!(state.store().coin_count(), 0);
     assert_eq!(state.store().edge_count(), 1);
     assert!(state.store().edge(edge).is_some());
 
     state
-        .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &Op::Resolve(resolve))
+        .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &resolve)
         .expect("resolve accepted");
     assert_eq!(state.store().coin_count(), 2);
     assert_eq!(state.store().edge_count(), 0);
@@ -100,22 +98,20 @@ fn map_store_handles_long_chain() {
     ]);
 
     for _ in 0..N {
-        let open = Open::from_terms(
-            Funding::new(party_one(maker_coin), party_one(taker_coin)),
-            terms.clone(),
-        );
-        let edge = open.output();
+        let funding_value = Funding::new(party_one(maker_coin), party_one(taker_coin));
+        let edge = Tx::edge_id_of(&funding_value, &terms);
+        let open = Tx::open(funding_value, terms.clone());
         let outputs = payouts(maker, taker, 7, 8);
-        let resolve = Resolve::new(edge, Proof::timeout(terms.clone()), outputs);
+        let resolve = Tx::resolve(edge, Proof::timeout(terms.clone()), outputs.clone());
         // The two payout coins from this resolve become the next open's
         // funding. Compute them before consuming `resolve`.
-        let resolved_outputs = resolve.output_ids();
+        let resolved_outputs = Tx::resolve_output_ids(edge, &outputs);
 
         state
-            .apply(CONTEXT, &FAKE_VERIFIER, &Op::Open(open))
+            .apply(CONTEXT, &FAKE_VERIFIER, &open)
             .expect("open accepted in chain");
         state
-            .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &Op::Resolve(resolve))
+            .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &resolve)
             .expect("resolve accepted in chain");
 
         maker_coin = resolved_outputs.as_slice()[0];

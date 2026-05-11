@@ -10,7 +10,7 @@ use crate::{
     error::{ApplyError, KernelResult},
     list::List,
     object::{Coin, Edge},
-    op::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS},
+    tx::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS},
     primitive::{CoinId, EdgeId},
     store::Batch,
 };

@@ -166,7 +166,7 @@ impl Edge {
 ///
 /// `Genesis` values populate a [`crate::Store`] before it is wrapped in a
 /// [`crate::State`]. Every other [`Coin`] and every [`Edge`] originates from a
-/// [`crate::Op`] applied against existing state.
+/// [`crate::Tx`] applied against existing state.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Genesis {
     id: CoinId,
