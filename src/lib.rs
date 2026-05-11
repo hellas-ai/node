@@ -67,6 +67,7 @@ compile_error!(
 );
 
 mod block;
+mod canonical;
 mod context;
 pub(crate) mod domain;
 mod error;
@@ -84,6 +85,7 @@ mod verifier;
 mod view;
 
 pub use block::Block;
+pub use canonical::{BufferWriter, Decode, DecodeError, Encode, Writer};
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
 pub use error::{
     ApplyError, BatchError, InsertError, InvalidOpenReason, InvalidProofReason,

@@ -8,12 +8,13 @@
 
 use super::{MAX_EDGE_OUTPUTS, Payouts, Proof, ResolveCoins, ResolveKind, units};
 use crate::{
+    canonical::Encode,
     context::{Context, Cost},
     error::{ApplyError, InvalidResolveReason, KernelResult},
     event::Change,
     list::List,
     object::Coin,
-    primitive::{CoinId, Digest, EdgeId, Key, ResolveHash, TermsHash},
+    primitive::{CoinId, EdgeId, Key, ResolveHash, TermsHash},
     store::Tx,
     verifier::Verifier,
 };
@@ -131,18 +132,13 @@ impl Resolve {
         terms: TermsHash,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> ResolveHash {
-        let mut digest = Digest::new(crate::domain::RESOLVE);
-
-        digest.bytes(input.as_bytes());
-        digest.u8(kind.tag());
-        digest.bytes(terms.as_bytes());
-        digest.usize(outputs.len());
-        for output in outputs {
-            digest.bytes(output.owner().as_bytes());
-            digest.u64(output.value());
-        }
-
-        ResolveHash::from_digest(digest)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(crate::domain::RESOLVE);
+        input.encode_to(&mut hasher);
+        kind.tag().encode_to(&mut hasher);
+        terms.encode_to(&mut hasher);
+        outputs.encode_to(&mut hasher);
+        ResolveHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
     fn check_outputs<T: Tx>(&self, tx: &T) -> KernelResult<()> {
@@ -169,10 +165,29 @@ impl Resolve {
 }
 
 /// Coin payout requested by an edge resolve.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, Hash, PartialEq)]
 pub struct Payout {
     owner: Key,
     value: u64,
+}
+
+impl crate::canonical::Encode for Payout {
+    const MAX_ENCODED_SIZE: usize = Key::LENGTH + 8;
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+    fn encode_to<W: crate::canonical::Writer + ?Sized>(&self, writer: &mut W) {
+        self.owner.encode_to(writer);
+        self.value.encode_to(writer);
+    }
+}
+
+impl crate::canonical::Decode for Payout {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), crate::canonical::DecodeError> {
+        let (owner, n) = Key::decode(buf)?;
+        let (value, m) = u64::decode(&buf[n..])?;
+        Ok((Self { owner, value }, n + m))
+    }
 }
 
 impl Payout {
