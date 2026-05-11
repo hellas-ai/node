@@ -7,7 +7,7 @@ fn open_locks_two_coins_into_one_edge() {
         &mut state,
         &Op::Open(Open::from_terms(
             funding(MAKER_COIN, TAKER_COIN),
-            BASIC_TERMS,
+            basic_terms(),
         )),
     );
 
@@ -30,7 +30,7 @@ fn open_locks_two_coins_into_one_edge() {
 fn open_locks_three_coins_into_one_edge() {
     let open = Open::from_terms(
         maker2_funding(MAKER_COIN, EXTRA_COIN, TAKER_COIN),
-        BASIC_TERMS,
+        basic_terms(),
     );
     let output = open.output();
     let mut state = state(
@@ -55,7 +55,7 @@ fn open_locks_three_coins_into_one_edge() {
 
 #[test]
 fn open_allows_maker_only_funding() {
-    let open = Open::from_terms(Funding::new(party1(MAKER_COIN), empty_party()), BASIC_TERMS);
+    let open = Open::from_terms(Funding::new(party1(MAKER_COIN), empty_party()), basic_terms());
     let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
@@ -80,7 +80,7 @@ fn open_allows_maker_only_funding() {
 
 #[test]
 fn open_allows_taker_only_funding() {
-    let open = Open::from_terms(Funding::new(empty_party(), party1(TAKER_COIN)), BASIC_TERMS);
+    let open = Open::from_terms(Funding::new(empty_party(), party1(TAKER_COIN)), basic_terms());
     let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
@@ -129,7 +129,7 @@ fn open_allows_same_maker_and_taker_party() {
 
 #[test]
 fn open_allows_empty_funding_when_fee_is_zero() {
-    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
+    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), basic_terms());
     let output = open.output();
     let mut state = funded_state_for(&open);
     let event = apply(&mut state, &Op::Open(open));
@@ -163,7 +163,7 @@ fn open_pays_fee_from_funding() {
         &FAKE_VERIFIER,
         &Op::Open(Open::from_terms(
             funding(MAKER_COIN, TAKER_COIN),
-            BASIC_TERMS,
+            basic_terms(),
         )),
     ) else {
         panic!("operation rejected");
@@ -271,7 +271,7 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
 
 #[test]
 fn open_rejects_funding_below_fee_without_mutation() {
-    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), BASIC_TERMS);
+    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), basic_terms());
     let output = open.output();
     let mut state = funded_state();
     let store = *state.store();
@@ -297,7 +297,7 @@ fn open_rejects_duplicate_funding_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 Funding::new(party1(MAKER_COIN), party1(MAKER_COIN)),
-                BASIC_TERMS
+                basic_terms()
             )),
         ),
         Err(ApplyError::DuplicateInput { id: MAKER_COIN }),
@@ -316,7 +316,7 @@ fn open_rejects_unavailable_edge_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 funding(MAKER_COIN, TAKER_COIN),
-                BASIC_TERMS,
+                basic_terms(),
             )),
         ),
         Err(ApplyError::EdgeInsertRejected {
@@ -344,7 +344,7 @@ fn open_rejects_overflow_without_mutation() {
             &FAKE_VERIFIER,
             &Op::Open(Open::from_terms(
                 funding(MAKER_COIN, TAKER_COIN),
-                BASIC_TERMS,
+                basic_terms(),
             )),
         ),
         Err(ApplyError::InvalidOpen {

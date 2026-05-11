@@ -64,15 +64,12 @@ impl Funding {
 
 /// Open one edge by locking bounded bilateral funding.
 ///
-/// `terms_hash` is cached at construction. The kernel reaches for it on every
-/// apply, and recomputing the BLAKE3 each time is the dominant per-op cost in
-/// benchmarks; one extra 32 bytes per `Open` saves roughly half the apply
-/// time at the largest batch sizes.
+/// `output` is cached at construction. `terms.hash()` is a field load now
+/// that `Terms` self-computes its hash, so it isn't cached on `Open`.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Open {
     funding: Funding,
     terms: Terms,
-    terms_hash: TermsHash,
     output: EdgeId,
 }
 
@@ -80,12 +77,10 @@ impl Open {
     /// Creates an open operation from concrete terms.
     #[must_use]
     pub fn from_terms(funding: Funding, terms: Terms) -> Self {
-        let terms_hash = terms.hash();
-        let output = Self::id(&funding, terms_hash);
+        let output = Self::id(&funding, terms.hash());
         Self {
             funding,
             terms,
-            terms_hash,
             output,
         }
     }
@@ -124,7 +119,7 @@ impl Open {
     /// Returns the open terms commitment for the produced edge.
     #[must_use]
     pub const fn terms(&self) -> TermsHash {
-        self.terms_hash
+        self.terms.hash()
     }
 
     /// Returns the deterministic resource cost of this open.

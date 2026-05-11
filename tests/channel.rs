@@ -1,5 +1,10 @@
 //! Channel open/resolve tests.
 
+#![allow(clippy::alloc_instead_of_core)]
+#![allow(clippy::disallowed_types)]
+#![allow(clippy::std_instead_of_alloc)]
+#![allow(clippy::std_instead_of_core)]
+
 mod support;
 
 #[path = "channel/batch.rs"]
@@ -55,18 +60,23 @@ const EXTRA_COIN: CoinId = coin_id(7);
 
 const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> =
     payouts_const(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-const BASIC_TERMS: Terms = Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
-const OTHER_TERMS_VALUE: Terms = Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS);
+fn basic_terms() -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
+}
+
+fn other_terms_value() -> Terms {
+    Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
+}
 
 const MAKER_SEED: Genesis = Genesis::coin(MAKER_COIN, MAKER, 10);
 const TAKER_SEED: Genesis = Genesis::coin(TAKER_COIN, TAKER, 5);
 
 fn terms() -> TermsHash {
-    BASIC_TERMS.hash()
+    basic_terms().hash()
 }
 
 fn other_terms() -> TermsHash {
-    OTHER_TERMS_VALUE.hash()
+    other_terms_value().hash()
 }
 
 fn terms_with(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
@@ -74,11 +84,11 @@ fn terms_with(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
 }
 
 fn proof() -> Proof {
-    Proof::timeout(BASIC_TERMS)
+    Proof::timeout(basic_terms())
 }
 
 fn other_proof() -> Proof {
-    Proof::timeout(OTHER_TERMS_VALUE)
+    Proof::timeout(other_terms_value())
 }
 
 fn agreement_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
@@ -101,12 +111,12 @@ fn agreement_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Re
 }
 
 fn claimant_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::claimant_wins(BASIC_TERMS, seal(ResolveKind::ClaimantWins, input, outputs))
+    Proof::claimant_wins(basic_terms(), seal(ResolveKind::ClaimantWins, input, outputs))
 }
 
 fn challenger_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
     Proof::challenger_wins(
-        BASIC_TERMS,
+        basic_terms(),
         seal(ResolveKind::ChallengerWins, input, outputs),
     )
 }
@@ -170,7 +180,7 @@ fn open_state() -> State<FixedStore<6, 1>> {
 }
 
 fn open_op() -> Open {
-    Open::from_terms(funding(MAKER_COIN, TAKER_COIN), BASIC_TERMS)
+    Open::from_terms(funding(MAKER_COIN, TAKER_COIN), basic_terms())
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {

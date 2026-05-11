@@ -25,8 +25,8 @@ fn operations_report_deterministic_cost() {
     );
     assert_eq!(proof().kind(), ResolveKind::Timeout);
     assert_eq!(proof().terms(), terms());
-    assert_eq!(Proof::timeout(BASIC_TERMS).terms(), terms());
-    assert_eq!(Proof::timeout(BASIC_TERMS).cost(), Cost::new(0, 0, 1));
+    assert_eq!(Proof::timeout(basic_terms()).terms(), terms());
+    assert_eq!(Proof::timeout(basic_terms()).cost(), Cost::new(0, 0, 1));
     assert_eq!(
         claimant_proof(edge(), &resolve_outputs).cost(),
         Cost::new(0, 0, 2),
@@ -60,7 +60,7 @@ fn operations_derive_output_ids() {
 
     assert_eq!(
         open.output(),
-        Open::from_terms(funding(MAKER_COIN, TAKER_COIN), BASIC_TERMS).output(),
+        Open::from_terms(funding(MAKER_COIN, TAKER_COIN), basic_terms()).output(),
     );
     assert_eq!(ids.as_slice()[0], Payout::new(MAKER, 7).id(edge(), 0));
     assert_eq!(ids.as_slice()[1], Payout::new(TAKER, 8).id(edge(), 1));
