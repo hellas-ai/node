@@ -39,6 +39,14 @@ impl Writer for blake3::Hasher {
 }
 
 /// Streaming write of canonical bytes into a `&mut [u8]`.
+///
+/// The buffer must be at least `value.encoded_size()` bytes for every
+/// value the writer consumes; smaller buffers panic on the first
+/// [`Writer::write`] that exceeds capacity. This is a programming-error
+/// contract: every [`Encode`] type self-reports `encoded_size()`, so
+/// callers can size the buffer exactly. The kernel does not offer a
+/// fallible variant — undersized buffers indicate a caller bug, not a
+/// runtime condition.
 #[derive(Debug)]
 pub struct BufferWriter<'a> {
     buf: &'a mut [u8],
@@ -47,6 +55,10 @@ pub struct BufferWriter<'a> {
 
 impl<'a> BufferWriter<'a> {
     /// Wraps a byte slice for streaming writes starting at offset 0.
+    ///
+    /// The slice must be sized to hold the full encoding the caller
+    /// intends to write. See the type-level documentation on
+    /// [`BufferWriter`] for the precondition contract.
     #[must_use]
     pub const fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, pos: 0 }
@@ -60,6 +72,14 @@ impl<'a> BufferWriter<'a> {
 }
 
 impl Writer for BufferWriter<'_> {
+    /// Appends `bytes` at the current write position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes.len()` would exceed the remaining buffer
+    /// capacity (`self.buf.len() - self.pos`). This indicates the
+    /// caller sized the buffer below the value's `encoded_size()` —
+    /// a programming error.
     fn write(&mut self, bytes: &[u8]) {
         let end = self.pos + bytes.len();
         self.buf[self.pos..end].copy_from_slice(bytes);

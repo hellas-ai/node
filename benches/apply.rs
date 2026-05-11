@@ -70,8 +70,7 @@ fn workload(json: &str) -> Vec<(Context, Tx)> {
         .states
         .iter()
         .filter_map(|state| {
-            op_for(&state.value.last_input)
-                .map(|op| (context_for(&state.value.last_input), op))
+            op_for(&state.value.last_input).map(|op| (context_for(&state.value.last_input), op))
         })
         .collect()
 }

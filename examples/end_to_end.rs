@@ -241,12 +241,7 @@ fn main() {
     );
 
     // -- Block 2: cooperative close via real ECDSA ----------------------
-    let close_hash = Tx::payload_hash(
-        edge,
-        CloseKind::Mutual,
-        terms_hash,
-        &mutual_payouts,
-    );
+    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &mutual_payouts);
     let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&taker_sk, close_hash));
     let close = Tx::close(edge, proof, mutual_payouts);
     let context_close = Context::with_fees(
@@ -258,9 +253,7 @@ fn main() {
     let diff_close = state
         .apply_block(&verifier, &block_close)
         .expect("mutual close accepted under real ECDSA");
-    let event = diff_close
-        .event(0)
-        .expect("one event in the close block");
+    let event = diff_close.event(0).expect("one event in the close block");
     println!();
     println!("block 2 (height 3): submit Tx::Close(Mutual)");
     println!("  emitted event: {}", summarize(event.kind()));

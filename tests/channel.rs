@@ -9,12 +9,12 @@ mod support;
 
 #[path = "channel/batch.rs"]
 mod batch;
+#[path = "channel/close.rs"]
+mod close;
 #[path = "channel/op.rs"]
 mod op;
 #[path = "channel/open.rs"]
 mod open;
-#[path = "channel/close.rs"]
-mod close;
 
 use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 

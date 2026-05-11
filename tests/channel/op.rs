@@ -9,12 +9,7 @@ fn operations_report_deterministic_cost() {
     let close_cost = close.cost();
     // Worst-case reserve mirrors `apply_open` reserve_cost: MAX_EDGE_OUTPUTS
     // payouts under `Mutual` (the proof kind charging the most proof units).
-    let worst_case = Tx::close(
-        edge(),
-        mutual_proof(edge(), &payouts4()),
-        payouts4(),
-    )
-    .cost();
+    let worst_case = Tx::close(edge(), mutual_proof(edge(), &payouts4()), payouts4()).cost();
 
     assert_eq!(open_cost, Cost::new(1, 3, 0));
     assert_eq!(close_cost, Cost::new(1, 3, 1));
