@@ -99,8 +99,6 @@ impl EdgeId {
     /// Encoded length of an edge identifier.
     pub const LENGTH: usize = ID_LENGTH;
 
-    pub(crate) const ZERO: Self = Self([0; Self::LENGTH]);
-
     /// Creates an edge id from canonical bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {

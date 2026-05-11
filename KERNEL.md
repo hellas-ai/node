@@ -319,21 +319,6 @@ stale-edge collection knob. Lifting fees is the eviction mechanism for edges
 nobody bothered to resolve under the original prices. Pinning fees at open
 time would close that knob and is explicitly not v1 semantics.
 
-### Access Sets
-
-Every operation exposes a deterministic `Access` set before execution:
-
-```text
-Access { coins, edges, new_coins, new_edges }
-```
-
-`Open` declares its funding coins and produced edge. `Resolve` declares its
-input edge and produced payout coins. The kernel still validates against the
-transactional store, but schedulers and model checkers do not need to discover
-hot-path state dynamically. `Access::conflicts` is the static pairwise predicate
-used to build execution waves: two operations conflict if their consumed or
-created coin/edge IDs overlap.
-
 ## L1 Model
 
 The L1 machine owns the canonical UTXO state.
@@ -873,8 +858,6 @@ This is the first line of defense. Layered as:
   sequences against a `BTreeMap`-backed Rust reference model with
   shrinking. Catches state-tracking divergence between kernel and a
   hand-readable spec impl.
-- `tests/parallel.rs` — declared access sets compose into disjoint waves;
-  reverse-order execution within a wave produces the same state as ordered.
 - `tests/allocation.rs` — `allocation-counter` asserts zero heap allocation
   on the hot apply path.
 - `tests/secp256k1.rs` (under `--features secp256k1`) — real ECDSA

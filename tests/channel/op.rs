@@ -68,52 +68,6 @@ fn operations_derive_output_ids() {
 }
 
 #[test]
-fn operations_report_access_sets() {
-    let open = open_op();
-    let resolve = Resolve::new(
-        open.output(),
-        proof(),
-        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-    );
-    let open_inputs = open.inputs();
-    let open_access = Op::Open(open).access();
-    let resolve_access = Op::Resolve(resolve).access();
-
-    assert_eq!(open_inputs, input_ids2(MAKER_COIN, TAKER_COIN));
-    assert_eq!(*open_access.coins(), input_ids2(MAKER_COIN, TAKER_COIN));
-    assert_eq!(*open_access.edges(), edge_ids0());
-    assert_eq!(*open_access.new_coins(), output_ids0());
-    assert_eq!(*open_access.new_edges(), edge_ids1(edge()));
-
-    assert_eq!(*resolve_access.coins(), input_ids0());
-    assert_eq!(*resolve_access.edges(), edge_ids1(edge()));
-    assert_eq!(
-        *resolve_access.new_coins(),
-        output_ids2(maker_out(), taker_out())
-    );
-    assert_eq!(*resolve_access.new_edges(), edge_ids0());
-}
-
-#[test]
-fn operations_report_access_conflicts() {
-    let open = open_op();
-    let resolve = Resolve::new(
-        open.output(),
-        proof(),
-        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-    );
-    let other_open = Open::from_terms(funding(coin_id(20), coin_id(21)), BASIC_TERMS);
-    let open_op = Op::Open(open);
-    let resolve_op = Op::Resolve(resolve);
-    let other_op = Op::Open(other_open);
-
-    assert!(open_op.conflicts(&resolve_op));
-    assert!(open_op.access().conflicts(&resolve_op.access()));
-    assert!(!open_op.conflicts(&other_op));
-    assert!(!open_op.access().conflicts(&other_op.access()));
-}
-
-#[test]
 fn block_reports_deterministic_cost_and_fee() {
     let ops = List::all([
         Op::Open(open_op()),
@@ -134,25 +88,6 @@ fn block_reports_deterministic_cost_and_fee() {
     assert!(!block.fits(Cost::new(1, 6, 1)));
     assert!(!block.fits(Cost::new(2, 5, 1)));
     assert!(!block.fits(Cost::new(2, 6, 0)));
-}
-
-#[test]
-fn block_reports_access_conflicts() {
-    let open = open_op();
-    let resolve = Resolve::new(
-        open.output(),
-        proof(),
-        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-    );
-    let other_open = Open::from_terms(funding(coin_id(20), coin_id(21)), BASIC_TERMS);
-    let serial = Block::new(
-        CONTEXT,
-        List::all([Op::Open(open.clone()), Op::Resolve(resolve)]),
-    );
-    let disjoint = Block::new(CONTEXT, List::all([Op::Open(open), Op::Open(other_open)]));
-
-    assert!(serial.conflicts());
-    assert!(!disjoint.conflicts());
 }
 
 #[test]
