@@ -30,7 +30,6 @@ use core::fmt;
 use crate::canonical::{Decode, DecodeError, Encode, Writer};
 use crate::consts::{HASH_LENGTH, ID_LENGTH, KEY_LENGTH, SIG_LENGTH};
 
-
 /// Settlement public key controlling owner-only objects.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Key([u8; Self::LENGTH]);

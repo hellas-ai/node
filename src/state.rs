@@ -12,8 +12,8 @@ use crate::{
     event::{Change, Diff, Event},
     list::List,
     object::Genesis,
-    tx::Tx,
     store::{Batch, Store},
+    tx::Tx,
     verifier::{SealVerifier, SigVerifier},
     view::Snapshot,
 };
@@ -141,6 +141,17 @@ impl<S: Store> State<S> {
     /// allocating an event vector can do so. If any operation fails the
     /// transaction is dropped, the closure is not called for the failed or
     /// any subsequent operations, and the backing store is unchanged.
+    ///
+    /// # Pre-commit event emission
+    ///
+    /// `on_event` fires *before* the batch commits. If operation _k_ succeeds
+    /// the closure is called for it; if a later operation in the same batch
+    /// fails, the whole transaction is rolled back — but the closure has
+    /// already observed event _k_. Consumers that index events to external
+    /// systems (RPC subscribers, log indexers, side-channel notifiers) must
+    /// **buffer events and only emit downstream after this function returns
+    /// `Ok`**, otherwise they will publish events for operations that never
+    /// actually committed to the store.
     ///
     /// # Errors
     ///

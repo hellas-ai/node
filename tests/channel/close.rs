@@ -216,11 +216,7 @@ fn close_rejects_bad_mutual_signature_without_mutation() {
     );
 
     assert_eq!(
-        state.apply(
-            CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(edge(), proof, outputs),
-        ),
+        state.apply(CONTEXT, &FAKE_VERIFIER, &Tx::close(edge(), proof, outputs),),
         Err(ApplyError::InvalidProof {
             input: edge(),
             reason: InvalidProofReason::BadSignature,
@@ -373,11 +369,7 @@ fn close_rejects_bad_dispute_seal_without_mutation() {
     let proof = Proof::violation(basic_terms(), bad_seal);
 
     assert_eq!(
-        state.apply(
-            CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(edge(), proof, outputs),
-        ),
+        state.apply(CONTEXT, &FAKE_VERIFIER, &Tx::close(edge(), proof, outputs),),
         Err(ApplyError::InvalidProof {
             input: edge(),
             reason: InvalidProofReason::BadSeal,
@@ -397,11 +389,7 @@ fn close_rejects_wrong_dispute_terms_without_mutation() {
     );
 
     assert_eq!(
-        state.apply(
-            CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(edge(), proof, outputs),
-        ),
+        state.apply(CONTEXT, &FAKE_VERIFIER, &Tx::close(edge(), proof, outputs),),
         Err(ApplyError::InvalidProof {
             input: edge(),
             reason: InvalidProofReason::TermsMismatch,
@@ -537,10 +525,5 @@ fn close_rejects_wrong_proof_without_mutation() {
 /// Worst-case close cost reserved at open-time: `MAX_EDGE_OUTPUTS` payouts
 /// under `Mutual` (the proof kind charging the most proof units).
 fn worst_case_close_cost(edge: EdgeId) -> Cost {
-    Tx::close(
-        edge,
-        mutual_proof(edge, &payouts4()),
-        payouts4(),
-    )
-    .cost()
+    Tx::close(edge, mutual_proof(edge, &payouts4()), payouts4()).cost()
 }

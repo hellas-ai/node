@@ -127,7 +127,10 @@ fn assert_event_matches(
             // BadPayout produces non-canonical outputs; the kernel either
             // rejects (handled by the err branch above) or, in pathological
             // configurations, emits the close event with the supplied outputs.
-            prop_assert_eq!(outputs, &Tx::close_output_ids(l1::edge_id(edge), &l1::bad_payouts()));
+            prop_assert_eq!(
+                outputs,
+                &Tx::close_output_ids(l1::edge_id(edge), &l1::bad_payouts())
+            );
         }
         _ => prop_assert!(false),
     }
