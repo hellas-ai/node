@@ -95,5 +95,5 @@ pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::Terms;
-pub use verifier::Verifier;
+pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};
