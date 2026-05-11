@@ -15,11 +15,11 @@
 //!   reads, RPC payloads. Both implement [`Encode`] + [`Decode`] (where
 //!   applicable) and have a public `from_bytes` constructor. The
 //!   integrity story is at the *derivation site*: the kernel's
-//!   `CoinId::genesis`/`CoinId::payout`/`Open::id` helpers are the
+//!   `CoinId::genesis`/`CoinId::payout`/`Tx::edge_id_of` helpers are the
 //!   canonical ways to produce *fresh* ids.
 //! - **Cryptographic commitments** ([`TermsHash`], [`ResolveHash`]).
 //!   These are pure derived outputs of `Terms::hash()` /
-//!   `Resolve::payload_hash`. They implement [`Encode`] only — you can
+//!   `Tx::payload_hash`. They implement [`Encode`] only — you can
 //!   serialize a commitment you hold, you cannot deserialize one in
 //!   isolation. The `pub(crate) from_bytes` constructor is reserved for
 //!   the kernel's own round-trip decoders on object types containing
@@ -172,7 +172,7 @@ impl EdgeId {
     /// `EdgeId` is an *object identifier* — it routinely enters the
     /// kernel from observed bytes (MMR reads, RPC payloads). Public
     /// `from_bytes` is legitimate; the integrity discipline is at the
-    /// kernel's canonical derivation site (`Open::id`).
+    /// kernel's canonical derivation site (`Tx::edge_id_of`).
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)

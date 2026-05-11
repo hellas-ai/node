@@ -5,10 +5,7 @@ fn open_locks_two_coins_into_one_edge() {
     let mut state = funded_state();
     let event = apply(
         &mut state,
-        &Op::Open(Open::from_terms(
-            funding(MAKER_COIN, TAKER_COIN),
-            basic_terms(),
-        )),
+        &Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
     );
 
     assert_eq!(
@@ -28,16 +25,14 @@ fn open_locks_two_coins_into_one_edge() {
 
 #[test]
 fn open_locks_three_coins_into_one_edge() {
-    let open = Open::from_terms(
-        maker2_funding(MAKER_COIN, EXTRA_COIN, TAKER_COIN),
-        basic_terms(),
-    );
-    let output = open.output();
+    let funding_value = maker2_funding(MAKER_COIN, EXTRA_COIN, TAKER_COIN);
+    let output = Tx::edge_id_of(&funding_value, &basic_terms());
+    let open = Tx::open(funding_value, basic_terms());
     let mut state = state(
         store_for(&open),
         [MAKER_SEED, TAKER_SEED, Genesis::coin(EXTRA_COIN, MAKER, 3)],
     );
-    let event = apply(&mut state, &Op::Open(open));
+    let event = apply(&mut state, &open);
 
     assert_eq!(
         event.kind(),
@@ -55,10 +50,11 @@ fn open_locks_three_coins_into_one_edge() {
 
 #[test]
 fn open_allows_maker_only_funding() {
-    let open = Open::from_terms(Funding::new(party1(MAKER_COIN), empty_party()), basic_terms());
-    let output = open.output();
+    let funding_value = Funding::new(party1(MAKER_COIN), empty_party());
+    let output = Tx::edge_id_of(&funding_value, &basic_terms());
+    let open = Tx::open(funding_value, basic_terms());
     let mut state = funded_state_for(&open);
-    let event = apply(&mut state, &Op::Open(open));
+    let event = apply(&mut state, &open);
 
     assert_eq!(
         event.kind(),
@@ -80,10 +76,11 @@ fn open_allows_maker_only_funding() {
 
 #[test]
 fn open_allows_taker_only_funding() {
-    let open = Open::from_terms(Funding::new(empty_party(), party1(TAKER_COIN)), basic_terms());
-    let output = open.output();
+    let funding_value = Funding::new(empty_party(), party1(TAKER_COIN));
+    let output = Tx::edge_id_of(&funding_value, &basic_terms());
+    let open = Tx::open(funding_value, basic_terms());
     let mut state = funded_state_for(&open);
-    let event = apply(&mut state, &Op::Open(open));
+    let event = apply(&mut state, &open);
 
     assert_eq!(
         event.kind(),
@@ -107,12 +104,13 @@ fn open_allows_taker_only_funding() {
 fn open_allows_same_maker_and_taker_party() {
     let parties = Parties::new(MAKER, MAKER);
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(MAKER, 8));
-    let terms = Terms::basic(PROTOCOL, parties, TIMEOUT, outputs);
-    let terms_hash = terms.hash();
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), terms);
-    let output = open.output();
+    let terms_value = Terms::basic(PROTOCOL, parties, TIMEOUT, outputs);
+    let terms_hash = terms_value.hash();
+    let funding_value = funding(MAKER_COIN, TAKER_COIN);
+    let output = Tx::edge_id_of(&funding_value, &terms_value);
+    let open = Tx::open(funding_value, terms_value);
     let mut state = funded_state_for(&open);
-    let event = apply(&mut state, &Op::Open(open));
+    let event = apply(&mut state, &open);
 
     assert_eq!(
         event.kind(),
@@ -129,10 +127,11 @@ fn open_allows_same_maker_and_taker_party() {
 
 #[test]
 fn open_allows_empty_funding_when_fee_is_zero() {
-    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), basic_terms());
-    let output = open.output();
+    let funding_value = Funding::new(empty_party(), empty_party());
+    let output = Tx::edge_id_of(&funding_value, &basic_terms());
+    let open = Tx::open(funding_value, basic_terms());
     let mut state = funded_state_for(&open);
-    let event = apply(&mut state, &Op::Open(open));
+    let event = apply(&mut state, &open);
 
     assert_eq!(
         event.kind(),
@@ -161,10 +160,7 @@ fn open_pays_fee_from_funding() {
     let Ok(event) = state.apply(
         FEE_CONTEXT,
         &FAKE_VERIFIER,
-        &Op::Open(Open::from_terms(
-            funding(MAKER_COIN, TAKER_COIN),
-            basic_terms(),
-        )),
+        &Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
     ) else {
         panic!("operation rejected");
     };
@@ -193,8 +189,8 @@ fn open_fee_uses_resource_cost() {
     );
     let open = open_op();
     let cost = open.cost();
-    let reserve_cost = open.reserve_cost();
-    let Ok(event) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)) else {
+    let reserve_cost = reserve_cost_for(&open);
+    let Ok(event) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &open) else {
         panic!("operation rejected");
     };
 
@@ -217,7 +213,7 @@ fn open_fee_uses_resource_cost() {
 fn open_allows_exact_fee_and_reserve_funding() {
     let open = open_op();
     let cost = open.cost();
-    let reserve_cost = open.reserve_cost();
+    let reserve_cost = reserve_cost_for(&open);
     let mut state = state(
         empty_store(),
         [
@@ -225,7 +221,7 @@ fn open_allows_exact_fee_and_reserve_funding() {
             Genesis::coin(TAKER_COIN, TAKER, 6),
         ],
     );
-    let event = apply_with(&mut state, RESOURCE_CONTEXT, &Op::Open(open));
+    let event = apply_with(&mut state, RESOURCE_CONTEXT, &open);
 
     assert_eq!(
         event.kind(),
@@ -245,9 +241,9 @@ fn open_allows_exact_fee_and_reserve_funding() {
 #[test]
 fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
     let open = open_op();
-    let output = open.output();
+    let output = open_edge_id(&open);
     let cost = open.cost();
-    let reserve_cost = open.reserve_cost();
+    let reserve_cost = reserve_cost_for(&open);
     let mut state = state(
         empty_store(),
         [
@@ -260,7 +256,7 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
     assert_eq!(RESOURCE_CONTEXT.fee(cost), Some(10));
     assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(
-        state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
+        state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &open),
         Err(ApplyError::InvalidOpen {
             output,
             reason: InvalidOpenReason::FundingInsufficient,
@@ -271,13 +267,14 @@ fn open_rejects_funding_below_fee_and_reserve_without_mutation() {
 
 #[test]
 fn open_rejects_funding_below_fee_without_mutation() {
-    let open = Open::from_terms(Funding::new(empty_party(), empty_party()), basic_terms());
-    let output = open.output();
+    let funding_value = Funding::new(empty_party(), empty_party());
+    let output = Tx::edge_id_of(&funding_value, &basic_terms());
+    let open = Tx::open(funding_value, basic_terms());
     let mut state = funded_state();
     let store = *state.store();
 
     assert_eq!(
-        state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &Op::Open(open)),
+        state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &open),
         Err(ApplyError::InvalidOpen {
             output,
             reason: InvalidOpenReason::FundingInsufficient,
@@ -295,10 +292,10 @@ fn open_rejects_duplicate_funding_without_mutation() {
         state.apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &Op::Open(Open::from_terms(
+            &Tx::open(
                 Funding::new(party1(MAKER_COIN), party1(MAKER_COIN)),
                 basic_terms()
-            )),
+            ),
         ),
         Err(ApplyError::DuplicateInput { id: MAKER_COIN }),
     );
@@ -314,10 +311,7 @@ fn open_rejects_unavailable_edge_without_mutation() {
         state.apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &Op::Open(Open::from_terms(
-                funding(MAKER_COIN, TAKER_COIN),
-                basic_terms(),
-            )),
+            &Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
         ),
         Err(ApplyError::EdgeInsertRejected {
             id: edge(),
@@ -342,10 +336,7 @@ fn open_rejects_overflow_without_mutation() {
         state.apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &Op::Open(Open::from_terms(
-                funding(MAKER_COIN, TAKER_COIN),
-                basic_terms(),
-            )),
+            &Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
         ),
         Err(ApplyError::InvalidOpen {
             output: edge(),
@@ -353,4 +344,15 @@ fn open_rejects_overflow_without_mutation() {
         }),
     );
     assert_eq!(*state.store(), store);
+}
+
+/// Worst-case resolve cost reserved at open-time. Mirrors `apply_open`'s
+/// `reserve_cost`: `MAX_EDGE_OUTPUTS` payouts under `ClaimantWins`.
+fn reserve_cost_for(_open: &Tx) -> Cost {
+    Tx::resolve(
+        edge(),
+        claimant_proof(edge(), &payouts4()),
+        payouts4(),
+    )
+    .cost()
 }

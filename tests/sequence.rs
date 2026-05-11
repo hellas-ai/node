@@ -11,7 +11,7 @@ use support::{
     l1::{self, EdgeKey, ProofKey},
 };
 
-use hellas_kernel::{EventKind, Op};
+use hellas_kernel::{EventKind, Tx};
 use proptest::{
     collection::vec,
     prelude::{Strategy, prop_assert, prop_assert_eq, proptest},
@@ -55,13 +55,11 @@ impl Step {
         }
     }
 
-    fn op(self) -> Op {
+    fn op(self) -> Tx {
         match self {
-            Self::Open(edge) => Op::Open(l1::open(edge)),
-            Self::Resolve(edge, proof) => Op::Resolve(l1::resolve(edge, proof)),
-            Self::BadPayout(edge) => {
-                Op::Resolve(l1::resolve_with(edge, ProofKey::Basic, l1::bad_payouts()))
-            }
+            Self::Open(edge) => l1::open(edge),
+            Self::Resolve(edge, proof) => l1::resolve(edge, proof),
+            Self::BadPayout(edge) => l1::resolve_with(edge, ProofKey::Basic, l1::bad_payouts()),
         }
     }
 }

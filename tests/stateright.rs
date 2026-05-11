@@ -14,8 +14,8 @@ use support::{
 #[cfg(feature = "fake-crypto")]
 use hellas_kernel::InvalidResolveReason;
 use hellas_kernel::{
-    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, InvalidProofReason, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Op, Open, Parties, Resolve, State, View,
+    ApplyError, Coin, CoinId, Context, Edge, EdgeId, EventKind, Funding, InvalidProofReason, List,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, State, Tx, View,
 };
 use stateright::{Checker, Model, Property};
 
@@ -105,7 +105,7 @@ impl ChannelModel {
         state: &mut State<ChannelStore>,
         last_state: &State<ChannelStore>,
         context: Context,
-        op: &Op,
+        op: &Tx,
         error: ApplyError,
     ) -> Option<State<ChannelStore>> {
         let rejected = state.apply(context, &FAKE_VERIFIER, op).err()?;
@@ -121,55 +121,76 @@ impl ChannelModel {
         state: &State<ChannelStore>,
         action: Action,
         context: Context,
-        op: &Op,
+        op: &Tx,
         event: &EventKind,
     ) -> Option<State<ChannelStore>> {
         match (action, op, event) {
             (
                 Action::Open(key),
-                Op::Open(operation),
+                Tx::Open { funding, terms },
                 EventKind::EdgeOpened {
                     inputs: event_inputs,
                     output,
                 },
-            ) => Self::valid_open(state, key, operation, event_inputs, *output),
+            ) => Self::valid_open(state, key, op, funding, terms, event_inputs, *output),
             (
                 Action::Resolve(proof),
-                Op::Resolve(operation),
-                EventKind::EdgeResolved {
+                Tx::Resolve {
                     input,
+                    proof: tx_proof,
+                    outputs,
+                },
+                EventKind::EdgeResolved {
+                    input: event_input,
                     outputs: event_outputs,
                 },
-            ) => Self::valid_resolve(state, proof, context, operation, *input, event_outputs),
+            ) => Self::valid_resolve(
+                state,
+                proof,
+                context,
+                op,
+                *input,
+                tx_proof,
+                outputs,
+                *event_input,
+                event_outputs,
+            ),
             _ => None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn valid_open(
         state: &State<ChannelStore>,
         key: OpenKey,
-        operation: &Open,
+        op: &Tx,
+        _funding: &Funding,
+        _terms: &hellas_kernel::Terms,
         inputs: &List<CoinId, MAX_EDGE_INPUTS>,
         output: EdgeId,
     ) -> Option<State<ChannelStore>> {
-        let ok = *operation == l1::open_case(key)
+        let ok = *op == l1::open_case(key)
             && *inputs == l1::open_case_inputs(key)
             && output == l1::open_case_id(key);
 
         ok.then_some(*state)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn valid_resolve(
         state: &State<ChannelStore>,
         proof: ProofKey,
         context: Context,
-        operation: &Resolve,
-        input: EdgeId,
-        outputs: &List<CoinId, MAX_EDGE_OUTPUTS>,
+        op: &Tx,
+        _input: EdgeId,
+        _tx_proof: &Proof,
+        _outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
+        event_input: EdgeId,
+        event_outputs: &List<CoinId, MAX_EDGE_OUTPUTS>,
     ) -> Option<State<ChannelStore>> {
-        let ok = input == l1::edge_id(EdgeKey::First)
-            && *outputs == l1::output_ids(EdgeKey::First)
-            && *operation == l1::resolve(EdgeKey::First, proof)
+        let ok = event_input == l1::edge_id(EdgeKey::First)
+            && *event_outputs == l1::output_ids(EdgeKey::First)
+            && *op == l1::resolve(EdgeKey::First, proof)
             && (proof != ProofKey::Timeout || context == l1::TIMEOUT_CONTEXT);
 
         ok.then_some(*state)
@@ -197,22 +218,18 @@ impl Action {
         }
     }
 
-    fn op(self) -> Op {
+    fn op(self) -> Tx {
         match self {
             Self::Open(key) => l1::open_case_op(key),
-            Self::Resolve(proof) => Op::Resolve(l1::resolve(EdgeKey::First, proof)),
+            Self::Resolve(proof) => l1::resolve(EdgeKey::First, proof),
             #[cfg(feature = "fake-crypto")]
-            Self::InvalidResolve => Op::Resolve(l1::resolve_with(
-                EdgeKey::First,
-                ProofKey::Basic,
-                l1::bad_payouts(),
-            )),
-            Self::InvalidProof => Op::Resolve(l1::resolve(EdgeKey::First, ProofKey::WrongTerms)),
-            Self::AdversarialTimeout => Op::Resolve(l1::resolve_with(
-                EdgeKey::First,
-                ProofKey::Timeout,
-                l1::maker_grab_payouts(),
-            )),
+            Self::InvalidResolve => {
+                l1::resolve_with(EdgeKey::First, ProofKey::Basic, l1::bad_payouts())
+            }
+            Self::InvalidProof => l1::resolve(EdgeKey::First, ProofKey::WrongTerms),
+            Self::AdversarialTimeout => {
+                l1::resolve_with(EdgeKey::First, ProofKey::Timeout, l1::maker_grab_payouts())
+            }
         }
     }
 

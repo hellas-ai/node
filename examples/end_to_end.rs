@@ -33,10 +33,10 @@
 use std::collections::BTreeMap;
 
 use hellas_kernel::{
-    Agreement, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId, EventKind, Fees,
-    Funding, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Op,
-    Open, Parties, Payout, Proof, ProtocolCode, Resolve, ResolveKind, Secp256k1Verifier, Sig,
-    Batch, State, Store, Terms,
+    Agreement, Batch, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId,
+    EventKind, Fees, Funding, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS,
+    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, ResolveKind, Secp256k1Verifier, Sig,
+    State, Store, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
@@ -184,8 +184,8 @@ fn main() {
     let terms_hash = terms.hash();
 
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
-    let open = Open::from_terms(funding, terms);
-    let edge = open.output();
+    let edge = Tx::edge_id_of(&funding, &terms);
+    let open = Tx::open(funding, terms);
 
     // Production verifier — real ECDSA, no placeholder bytes.
     let verifier = Secp256k1Verifier::new();
@@ -211,13 +211,13 @@ fn main() {
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::ZERO,
     );
-    let block_open = Block::new(context_open, List::all([Op::Open(open)]));
+    let block_open = Block::new(context_open, List::all([open]));
     let diff_open = state
         .apply_block(&verifier, &block_open)
         .expect("open block accepted");
     let event = diff_open.event(0).expect("one event in the open block");
     println!();
-    println!("block 1 (height 1): submit Op::Open");
+    println!("block 1 (height 1): submit Tx::Open");
     println!("  emitted event: {}", summarize(&event.kind()));
     println!(
         "  store now: {} coins, {} edges; edge value = {}",
@@ -232,7 +232,7 @@ fn main() {
     );
 
     // -- Block 2: cooperative resolve via real ECDSA --------------------
-    let resolve_hash = Resolve::payload_hash(
+    let resolve_hash = Tx::payload_hash(
         edge,
         ResolveKind::Agreement,
         terms_hash,
@@ -242,13 +242,13 @@ fn main() {
         terms_hash,
         Agreement::new(sign(&maker_sk, resolve_hash), sign(&taker_sk, resolve_hash)),
     );
-    let resolve = Resolve::new(edge, proof, agreement_payouts);
+    let resolve = Tx::resolve(edge, proof, agreement_payouts);
     let context_resolve = Context::with_fees(
         BlockHeight::new(3),
         BlockHash::from_bytes([1; BlockHash::LENGTH]),
         Fees::ZERO,
     );
-    let block_resolve = Block::new(context_resolve, List::all([Op::Resolve(resolve)]));
+    let block_resolve = Block::new(context_resolve, List::all([resolve]));
     let diff_resolve = state
         .apply_block(&verifier, &block_resolve)
         .expect("agreement resolve accepted under real ECDSA");
@@ -256,7 +256,7 @@ fn main() {
         .event(0)
         .expect("one event in the resolve block");
     println!();
-    println!("block 2 (height 3): submit Op::Resolve(Agreement)");
+    println!("block 2 (height 3): submit Tx::Resolve(Agreement)");
     println!("  emitted event: {}", summarize(&event.kind()));
     println!(
         "  store now: {} coins, {} edges",

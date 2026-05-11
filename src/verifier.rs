@@ -16,7 +16,7 @@
 //! takes the verifier on faith. The corresponding determinism and
 //! soundness assumptions are documented in `models/deps/assumptions.qnt`.
 
-use crate::op::{ResolveKind, Seal};
+use crate::tx::{ResolveKind, Seal};
 use crate::primitive::{Key, ProtocolCode, ResolveHash, Sig};
 
 /// Decides whether a witness is accepted by the kernel for one resolve.

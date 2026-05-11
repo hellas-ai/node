@@ -22,7 +22,7 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hellas_kernel::{Context, Op};
+use hellas_kernel::{Context, Tx};
 use support::{
     FAKE_VERIFIER,
     itf::{State, context_for, op_for},
@@ -62,7 +62,7 @@ const FIXTURES: &[(&str, &str)] = &[
 /// entry per kernel-visible step. `tick`/`idle`/`init` produce no kernel
 /// work and are dropped, so the resulting length is exactly the number of
 /// `apply` calls the bench will measure.
-fn workload(json: &str) -> Vec<(Context, Op)> {
+fn workload(json: &str) -> Vec<(Context, Tx)> {
     let trace: itf::Trace<State> =
         itf::trace_from_str(json).expect("ITF fixture parses against the shared schema");
 
@@ -77,7 +77,7 @@ fn workload(json: &str) -> Vec<(Context, Op)> {
 }
 
 fn apply(c: &mut Criterion) {
-    let workloads: Vec<(&'static str, Vec<(Context, Op)>)> = FIXTURES
+    let workloads: Vec<(&'static str, Vec<(Context, Tx)>)> = FIXTURES
         .iter()
         .map(|(name, json)| (*name, workload(json)))
         .collect();
