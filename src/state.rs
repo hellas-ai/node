@@ -30,6 +30,21 @@ pub struct State<S> {
 }
 
 impl<S> State<S> {
+    /// Wraps an already-populated object store as kernel state.
+    ///
+    /// For genesis bootstrap use [`State::genesis`], which seeds an empty
+    /// store and then wraps it. `new` is for callers that manage their
+    /// own store population — e.g. restoring from durable storage, or a
+    /// host (like `hellas-alto`) that has pre-loaded the block's
+    /// referenced objects into a sync working set before invoking the
+    /// kernel. The kernel makes no claim about the store's contents; it
+    /// just begins applying ordered operations against whatever is
+    /// there.
+    #[must_use]
+    pub const fn new(store: S) -> Self {
+        Self { store }
+    }
+
     /// Returns the backing object store.
     #[must_use]
     pub const fn store(&self) -> &S {
