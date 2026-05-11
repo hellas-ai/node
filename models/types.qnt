@@ -35,6 +35,33 @@ module types {
     | Edge1
     | Edge2
 
+  // Party identities the model reasons about. `Maker` and `Taker` are the
+  // canonical owners of the maker/taker funding lineages; `Adversary` is
+  // any third party who knows live coin ids but holds no ownership over
+  // them. The abstraction is coarse — a single `Adversary` value stands
+  // for the whole class of unauthorized actors — and is enough to express
+  // the authorization invariant the kernel must enforce on open.
+  type Party =
+    | Maker
+    | Taker
+    | Adversary
+
+  // Canonical coin ownership. Every concrete coin in the closed universe
+  // belongs to exactly one party; the abstraction mirrors the kernel's
+  // `Coin::owner` field. `Adversary` never owns anything in any reachable
+  // state — the whole point of the authorization property is that the
+  // kernel must reject opens that try to consume coins not owned by the
+  // claimed parties.
+  pure def coinOwner(c: Coin): Party =
+    match c {
+      | MakerCoin => Maker
+      | MakerOut1 => Maker
+      | MakerOut2 => Maker
+      | TakerCoin => Taker
+      | TakerOut1 => Taker
+      | TakerOut2 => Taker
+    }
+
   // Close witness kind. The kernel admits exactly these three shapes; all
   // close-validity policy (terms binding, height, payout shape, signature,
   // seal) lives in the verifier.
@@ -75,6 +102,7 @@ module types {
   )
   pure val AllEdges = Set(Edge1, Edge2)
   pure val AllProofs = Set(Mutual, Timeout, Violation)
+  pure val AllParties = Set(Maker, Taker, Adversary)
 
   // Concrete model parameters. Picked small for finite exploration.
   pure val TimeoutHeight = 2

@@ -30,6 +30,15 @@ module l1 {
   var liveEdges: Set[Edge]
   var height: int
 
+  // Per-edge open authorization. For every edge that goes live, the
+  // open action records the (asMaker, asTaker) parties the submitter
+  // claimed when calling `openEdge`. The `fundingAuthorized` invariant
+  // checks these against `coinOwner(makerInput(e))` / `coinOwner(takerInput(e))`
+  // — i.e. that the claimed parties actually own the consumed coins.
+  // Dead-edge entries are meaningless; the invariant only ranges over
+  // `liveEdges`.
+  var openAuth: Edge -> { maker: Party, taker: Party }
+
   // Recording vars: the action that produced the current state and the
   // abstract event it emitted. The Rust ITF runner reads these to drive
   // the kernel and assert event/state correspondence at each step.
@@ -83,14 +92,22 @@ module l1 {
     liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     height' = 1,
+    openAuth' = AllEdges.mapBy(_ => { maker: Adversary, taker: Adversary }),
     lastInput' = NoInput,
     lastEvent' = NoEvent,
   }
 
   // Open consumes the canonical input coins for an edge and creates the
-  // edge with their summed value. Fees/reserves are abstracted away here
-  // and modelled separately in `fees.qnt`.
-  action openEdge(e) = all {
+  // edge with their summed value, recording the parties the submitter
+  // claimed (`asMaker`, `asTaker`). Fees/reserves are abstracted away
+  // here and modelled separately in `fees.qnt`.
+  //
+  // The action accepts ANY (asMaker, asTaker) pair: this models a
+  // kernel that takes the submitter's word at face value. The
+  // `fundingAuthorized` invariant captures the property a correct kernel
+  // must enforce; weak preconditions here are what let Apalache reach
+  // (and surface) the violating state.
+  action openEdge(e, asMaker, asTaker) = all {
     not(liveEdges.contains(e)),
     liveCoins.contains(makerInput(e)),
     liveCoins.contains(takerInput(e)),
@@ -101,6 +118,7 @@ module l1 {
     liveCoins' = liveCoins.exclude(Set(makerInput(e), takerInput(e))),
     liveEdges' = liveEdges.union(Set(e)),
     height' = height,
+    openAuth' = openAuth.set(e, { maker: asMaker, taker: asTaker }),
     lastInput' = OpenInput(e),
     lastEvent' = EdgeOpenedEvent(e),
   }
@@ -117,6 +135,7 @@ module l1 {
     liveCoins' = liveCoins.union(Set(makerOutput(e), takerOutput(e))),
     liveEdges' = liveEdges.exclude(Set(e)),
     height' = height,
+    openAuth' = openAuth,
     lastInput' = CloseInput({ edge: e, proof: p, makerPay: makerPay, takerPay: takerPay }),
     lastEvent' = EdgeClosedEvent(e),
   }
@@ -128,6 +147,7 @@ module l1 {
     liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height + 1,
+    openAuth' = openAuth,
     lastInput' = TickInput,
     lastEvent' = NoEvent,
   }
@@ -139,6 +159,7 @@ module l1 {
     liveCoins' = liveCoins,
     liveEdges' = liveEdges,
     height' = height,
+    openAuth' = openAuth,
     lastInput' = IdleInput,
     lastEvent' = NoEvent,
   }
@@ -152,8 +173,20 @@ module l1 {
   // spec makes the rejection surface explicit; `canClose` rejects them
   // through `payoutsBound`, and Apalache confirms they remain unreachable.
   action step = any {
-    openEdge(Edge1),
-    openEdge(Edge2),
+    // Canonical (authorized) opens.
+    openEdge(Edge1, Maker, Taker),
+    openEdge(Edge2, Maker, Taker),
+    // Adversarial (unauthorized) opens. Each consumes a party's coin
+    // while the submitter claims a different party identity. These are
+    // currently *enabled* by `openEdge` — the action takes any
+    // (asMaker, asTaker) — and exist in `step` so Apalache symbolically
+    // reaches the violating state that `fundingAuthorized` flags.
+    openEdge(Edge1, Adversary, Adversary),
+    openEdge(Edge1, Adversary, Taker),
+    openEdge(Edge1, Maker, Adversary),
+    openEdge(Edge2, Adversary, Adversary),
+    openEdge(Edge2, Adversary, Taker),
+    openEdge(Edge2, Maker, Adversary),
     // Canonical-split closes under each proof kind.
     closeEdge(Edge1, Mutual, MakerPayout, TakerPayout),
     closeEdge(Edge1, Timeout, MakerPayout, TakerPayout),
@@ -186,6 +219,18 @@ module l1 {
   val liveEdgesAreKnown = inv::liveEdgesAreKnown(liveEdges)
   val payoutsHonorBindings = inv::payoutsHonorBindings(coins, liveCoins)
 
+  // Every live edge's (asMaker, asTaker) authorization must match the
+  // canonical owners of the coins that funded it. A correct kernel
+  // enforces this on open; reaching a state where it fails means an
+  // unauthorized open went through. The current Rust kernel does NOT
+  // enforce this — Apalache should find a counterexample reachable in
+  // ≤2 steps (`init → openEdge(_, Adversary, _)`).
+  val fundingAuthorized =
+    AllEdges.forall(e =>
+      not(liveEdges.contains(e))
+        or (openAuth.get(e).maker == coinOwner(makerInput(e))
+              and openAuth.get(e).taker == coinOwner(takerInput(e))))
+
   // ---------------------------------------------------------------------
   // Trace tests — exported as ITF fixtures via `npm run quint:fixtures`
   // ---------------------------------------------------------------------
@@ -193,17 +238,30 @@ module l1 {
   // Smoke: open the canonical edge, cooperatively close.
   run basicTraceTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+      .expect(valueConserved
+        and atMostOneLiveEdge
+        and noNegativeValue
+        and fundingAuthorized)
+
+  // Adversary opens Edge1 by submitting an unauthorized claim
+  // (Adversary as both parties). The action is enabled — the abstract
+  // model takes the submitter's word — but `fundingAuthorized` flags
+  // the resulting live state. A correct kernel must prevent the open
+  // from landing in the first place.
+  run unauthorizedOpenViolatesAuthorizationTest =
+    init
+      .then(openEdge(Edge1, Adversary, Adversary))
+      .expect(not(fundingAuthorized))
 
   // Multi-edge: mutual close on Edge1, then handoff to Edge2 funded by
   // Edge1's payout coins, then timeout-close Edge2.
   run mutualTimeoutTraceTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2))
+      .then(openEdge(Edge2, Maker, Taker))
       .then(tick)
       .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
@@ -211,16 +269,16 @@ module l1 {
   // Violation closes on both edges.
   run violationTraceTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2))
+      .then(openEdge(Edge2, Maker, Taker))
       .then(closeEdge(Edge2, Violation, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
   // Negative trace: an open without a tick cannot Timeout.
   run earlyTimeoutRejectedTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .expect(not(canClose(Edge1, Timeout, MakerPayout, TakerPayout)))
 
   // Both edges closed by Timeout. Demonstrates the timeout-only path
@@ -228,10 +286,10 @@ module l1 {
   // exactly this path when no one signed and no one disputed.
   run bothEdgesTimeoutTraceTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
       .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2))
+      .then(openEdge(Edge2, Maker, Taker))
       .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
@@ -240,9 +298,9 @@ module l1 {
   // same proof kind across an entire trace.
   run mixedProofsTraceTest =
     init
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2))
+      .then(openEdge(Edge2, Maker, Taker))
       .then(closeEdge(Edge2, Mutual, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
 
@@ -254,7 +312,7 @@ module l1 {
       .then(tick)
       .then(idle)
       .then(tick)
-      .then(openEdge(Edge1))
+      .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and noNegativeValue and height == 3)
 }
