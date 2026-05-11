@@ -4,7 +4,7 @@ use super::*;
 fn apply_all_opens_and_closes_one_batch() {
     let mut state = funded_state();
     let ops = List::all([
-        Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
+        open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
         Tx::close(
             edge(),
             proof(),
@@ -64,7 +64,7 @@ fn apply_all_rolls_back_on_error() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
     let ops = List::all([
@@ -92,7 +92,7 @@ fn apply_iter_emits_events_per_op() {
     let mut state = funded_state();
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge_id = Tx::edge_id_of(&funding_value, &basic_terms());
-    let open = Tx::open(funding_value, basic_terms());
+    let open = open_tx(funding_value, basic_terms());
     let ops = [
         open,
         Tx::close(
@@ -133,7 +133,7 @@ fn apply_iter_rolls_back_on_mid_batch_failure() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge_id = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store_before = *state.store();
     let ops = [

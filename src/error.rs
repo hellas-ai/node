@@ -156,6 +156,15 @@ pub enum InvalidOpenReason {
     FundingOverflow,
     /// Sum of funding coin values is less than open fee + locked reserve.
     FundingInsufficient,
+    /// A funding coin's owner does not match its party's settlement key.
+    /// The maker funding list must contain coins owned by
+    /// `terms.parties().maker()`; the taker funding list, by
+    /// `terms.parties().taker()`.
+    FundingUnauthorized,
+    /// One of the open signatures was rejected by the configured
+    /// `SigVerifier`. Both maker and taker must sign the canonical open
+    /// hash for the produced edge.
+    BadSignature,
 }
 
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.

@@ -185,7 +185,13 @@ fn main() {
 
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open(funding, terms);
+    let open_hash = Tx::open_hash(&funding, &terms);
+    let open = Tx::open(
+        funding,
+        terms,
+        sign(&maker_sk, open_hash),
+        sign(&taker_sk, open_hash),
+    );
 
     // Real ECDSA for cooperative-close signatures; the bundled verifier
     // also impls SealVerifier as a hard-reject, so this example covers

@@ -138,18 +138,34 @@ pub(crate) fn genesis<const C: usize, const E: usize>(
 pub(crate) fn open(edge: EdgeKey) -> Tx {
     match edge {
         EdgeKey::First => open_case(OpenKey::Full),
-        EdgeKey::Second => Tx::open(
-            Funding::new(
+        EdgeKey::Second => {
+            let funding = Funding::new(
                 party1(maker_out(EdgeKey::First)),
                 party1(taker_out(EdgeKey::First)),
-            ),
-            terms(),
-        ),
+            );
+            let terms = terms();
+            let (maker_sig, taker_sig) = open_sigs(&funding, &terms, MAKER, TAKER);
+            Tx::open(funding, terms, maker_sig, taker_sig)
+        }
     }
 }
 
 pub(crate) fn open_case(key: OpenKey) -> Tx {
-    Tx::open(open_funding(key), terms())
+    let funding = open_funding(key);
+    let terms = terms();
+    let (maker_sig, taker_sig) = open_sigs(&funding, &terms, MAKER, TAKER);
+    Tx::open(funding, terms, maker_sig, taker_sig)
+}
+
+/// Builds canonical placeholder open signatures (one per party) bound to the
+/// open hash of `(funding, terms)`. Use this in tests driven by
+/// `FAKE_VERIFIER`, which accepts any placeholder sig keyed to the matching
+/// party. Each test that constructs a `Tx::Open` over canonical
+/// `(MAKER, TAKER)` parties can call this and forward the pair directly into
+/// [`Tx::open`].
+pub(crate) fn open_sigs(funding: &Funding, terms: &Terms, maker: Key, taker: Key) -> (Sig, Sig) {
+    let hash = Tx::open_hash(funding, terms);
+    (Sig::placeholder(maker, hash), Sig::placeholder(taker, hash))
 }
 
 pub(crate) fn open_case_op(key: OpenKey) -> Tx {

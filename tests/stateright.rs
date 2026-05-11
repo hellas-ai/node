@@ -122,7 +122,12 @@ impl ChannelModel {
         match (action, op, event) {
             (
                 Action::Open(key),
-                Tx::Open { funding, terms },
+                Tx::Open {
+                    funding,
+                    terms,
+                    maker_sig: _,
+                    taker_sig: _,
+                },
                 EventKind::EdgeOpened {
                     inputs: event_inputs,
                     output,
