@@ -15,7 +15,7 @@ mod support;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, Context, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, Parties,
-    Payout, Proof, ProtocolCode, Terms, Tx,
+    Payout, Proof, ProtocolCode, Sig, Terms, Tx,
 };
 use support::{FAKE_VERIFIER, coin_id, key, map_store::map_state, party_one, payouts_two};
 
@@ -47,7 +47,7 @@ fn map_store_round_trip() {
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
     let funding_value = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding_value, &terms);
-    let open = Tx::open(funding_value, terms.clone());
+    let open = open_tx(funding_value, terms.clone(), maker, taker);
     let resolve = Tx::close(edge, Proof::timeout(terms), outputs);
 
     let mut state = map_state([
@@ -100,7 +100,7 @@ fn map_store_handles_long_chain() {
     for _ in 0..N {
         let funding_value = Funding::new(party_one(maker_coin), party_one(taker_coin));
         let edge = Tx::edge_id_of(&funding_value, &terms);
-        let open = Tx::open(funding_value, terms.clone());
+        let open = open_tx(funding_value, terms.clone(), maker, taker);
         let outputs = payouts(maker, taker, 7, 8);
         let resolve = Tx::close(edge, Proof::timeout(terms.clone()), outputs.clone());
         // The two payout coins from this resolve become the next open's
@@ -122,4 +122,16 @@ fn map_store_handles_long_chain() {
     // Each iteration's payouts feed the next open's funding, so at the end
     // only the final iteration's two payout coins remain live.
     assert_eq!(state.store().coin_count(), 2);
+}
+
+/// Wraps `Tx::open` with `FAKE_VERIFIER`-acceptable placeholder signatures
+/// keyed to the canonical maker/taker.
+fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
+    let hash = Tx::open_hash(&funding, &terms);
+    Tx::open(
+        funding,
+        terms,
+        Sig::placeholder(maker, hash),
+        Sig::placeholder(taker, hash),
+    )
 }

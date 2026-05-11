@@ -165,14 +165,31 @@ fn open_state() -> State<FixedStore<6, 1>> {
 }
 
 fn open_op() -> Tx {
-    Tx::open(funding(MAKER_COIN, TAKER_COIN), basic_terms())
+    open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms())
 }
 
 fn open_edge_id(open: &Tx) -> EdgeId {
     match open {
-        Tx::Open { funding, terms } => Tx::edge_id_of(funding, terms),
+        Tx::Open { funding, terms, .. } => Tx::edge_id_of(funding, terms),
         Tx::Close { .. } => panic!("expected Tx::Open"),
     }
+}
+
+/// Builds a `Tx::Open` with canonical placeholder open signatures for
+/// `(MAKER, TAKER)`. Every channel test that constructs an open consumes
+/// coins owned by `MAKER`/`TAKER` (the parties named in `basic_terms`), and
+/// `FAKE_VERIFIER` accepts placeholder sigs for any key/hash — so this
+/// helper covers every honest-open test path. Adversarial tests
+/// (`open_rejects_*` etc.) construct signatures directly.
+fn open_tx(funding: Funding, terms: Terms) -> Tx {
+    open_tx_with(funding, terms, MAKER, TAKER)
+}
+
+fn open_tx_with(funding: Funding, terms: Terms, maker_key: Key, taker_key: Key) -> Tx {
+    let hash = Tx::open_hash(&funding, &terms);
+    let maker_sig = Sig::placeholder(maker_key, hash);
+    let taker_sig = Sig::placeholder(taker_key, hash);
+    Tx::open(funding, terms, maker_sig, taker_sig)
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {

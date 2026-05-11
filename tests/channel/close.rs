@@ -5,7 +5,7 @@ fn close_zero_edge_without_outputs() {
     let terms_value = terms_with(&no_payouts());
     let funding_value = Funding::new(empty_party(), empty_party());
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let mut state = funded_state_for(&open);
     let _event = apply(&mut state, &open);
     let event = apply(
@@ -67,7 +67,7 @@ fn close_uses_prepaid_reserve() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let close = Tx::close(edge, Proof::timeout(terms_value), outputs.clone());
     let output_ids = Tx::close_output_ids(edge, &outputs);
     let maker_out = nth(&output_ids, 0);
@@ -147,7 +147,7 @@ fn close_rejects_when_current_fee_exceeds_reserve_without_mutation() {
     let terms_hash = terms_value.hash();
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let reserve_cost = worst_case_close_cost(edge);
     let mut state = state(
         store_for_close(&open, &outputs),
@@ -420,7 +420,7 @@ fn close_spends_edge_into_three_payout_coins() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let close = Tx::close(edge, Proof::timeout(terms_value), outputs.clone());
     let output_ids = Tx::close_output_ids(edge, &outputs);
     let maker_out = nth(&output_ids, 0);
@@ -457,7 +457,7 @@ fn close_allows_zero_value_payout_coin() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let close = Tx::close(edge, Proof::timeout(terms_value), outputs.clone());
     let output_ids = Tx::close_output_ids(edge, &outputs);
     let maker_out = nth(&output_ids, 0);
@@ -489,7 +489,7 @@ fn close_rejects_non_conserving_payouts_without_mutation() {
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = Tx::open(funding_value, terms_value.clone());
+    let open = open_tx(funding_value, terms_value.clone());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &open);
     let store = *state.store();

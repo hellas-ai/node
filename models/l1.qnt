@@ -102,15 +102,19 @@ module l1 {
   // claimed (`asMaker`, `asTaker`). Fees/reserves are abstracted away
   // here and modelled separately in `fees.qnt`.
   //
-  // The action accepts ANY (asMaker, asTaker) pair: this models a
-  // kernel that takes the submitter's word at face value. The
-  // `fundingAuthorized` invariant captures the property a correct kernel
-  // must enforce; weak preconditions here are what let Apalache reach
-  // (and surface) the violating state.
+  // The action requires the claimed parties to actually own the coins
+  // being consumed: `asMaker == coinOwner(makerInput(e))` and likewise
+  // for the taker. This mirrors the kernel's owner-match + dual-
+  // signature check on `apply_open`. Adversarial calls (with
+  // `Adversary` as a claimed party) are then disabled rather than
+  // landing in live state, and `fundingAuthorized` holds in every
+  // reachable state.
   action openEdge(e, asMaker, asTaker) = all {
     not(liveEdges.contains(e)),
     liveCoins.contains(makerInput(e)),
     liveCoins.contains(takerInput(e)),
+    asMaker == coinOwner(makerInput(e)),
+    asTaker == coinOwner(takerInput(e)),
     coins' = coins
       .set(makerInput(e), 0)
       .set(takerInput(e), 0),
@@ -176,11 +180,12 @@ module l1 {
     // Canonical (authorized) opens.
     openEdge(Edge1, Maker, Taker),
     openEdge(Edge2, Maker, Taker),
-    // Adversarial (unauthorized) opens. Each consumes a party's coin
-    // while the submitter claims a different party identity. These are
-    // currently *enabled* by `openEdge` — the action takes any
-    // (asMaker, asTaker) — and exist in `step` so Apalache symbolically
-    // reaches the violating state that `fundingAuthorized` flags.
+    // Adversarial (unauthorized) opens. Each names a party identity
+    // that doesn't own the corresponding funding coin. `openEdge`'s
+    // owner-match precondition disables every one of them; Apalache
+    // confirms they remain unreachable. Listing them in `step`
+    // surfaces the rejection in the spec rather than hiding it inside
+    // the precondition.
     openEdge(Edge1, Adversary, Adversary),
     openEdge(Edge1, Adversary, Taker),
     openEdge(Edge1, Maker, Adversary),
@@ -245,15 +250,6 @@ module l1 {
         and noNegativeValue
         and fundingAuthorized)
 
-  // Adversary opens Edge1 by submitting an unauthorized claim
-  // (Adversary as both parties). The action is enabled — the abstract
-  // model takes the submitter's word — but `fundingAuthorized` flags
-  // the resulting live state. A correct kernel must prevent the open
-  // from landing in the first place.
-  run unauthorizedOpenViolatesAuthorizationTest =
-    init
-      .then(openEdge(Edge1, Adversary, Adversary))
-      .expect(not(fundingAuthorized))
 
   // Multi-edge: mutual close on Edge1, then handoff to Edge2 funded by
   // Edge1's payout coins, then timeout-close Edge2.

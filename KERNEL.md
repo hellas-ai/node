@@ -247,21 +247,42 @@ commitment and later verify close proofs against it.
 ### Edge Funding Shape
 
 `Open` consumes bounded bilateral `Funding { maker, taker }`, where each party
-is a bounded list of `CoinId` values, and carries concrete `Terms`. The produced
-edge stores only `TermsHash` and `Parties { maker, taker }` derived from those
-terms. The produced `EdgeId` is canonical; it is not supplied by the caller.
-Either funding list may be empty; a one-sided or zero-funded open is valid when
-total funding covers the context-priced open cost plus the prepaid reserve for
-the worst-case bounded close path. Funding is invalid exactly when the sum of
-funding coin values is less than
-`context.fee(open.cost()) + context.fee(open.reserve_cost())`. The produced edge
-principal is that remaining value; the reserve is stored separately and is not
-payable principal. Maker and taker are positional party identities: the maker is
-the party whose open intent or offer is filled, and the taker is the party that
-fills it. They are not buyer/seller, requester/provider, payer/worker, or any
-other economic meaning. The kernel does not require the maker and taker keys to
-be distinct; self-edges are valid and can represent sends, merges, or no-work
-channels under higher-level protocol convention.
+is a bounded list of `CoinId` values, and carries concrete `Terms` plus two
+authorizing signatures `(maker_sig, taker_sig)`. The produced edge stores only
+`TermsHash` and `Parties { maker, taker }` derived from those terms. The
+produced `EdgeId` is canonical; it is not supplied by the caller.
+
+The kernel enforces two authentication rules at apply time, before any
+fee/reserve math:
+
+1. **Owner match.** Every coin in `funding.maker` must have
+   `coin.owner() == terms.parties().maker()`; same for the taker list. A
+   mismatch returns `InvalidOpenReason::FundingUnauthorized`. This stops an
+   attacker who knows live coin ids from locking someone else's coin into
+   attacker-chosen terms.
+2. **Dual signatures.** Both `maker_sig` and `taker_sig` must verify against
+   `Tx::open_hash(funding, terms)` under the matching party's key, routed
+   through the configured `SigVerifier`. The signed payload binds the
+   canonical `EdgeId` (which already commits to funding ids and
+   `TermsHash`) under a distinct domain separator so an open signature can
+   never be replayed as a close signature or applied to a different edge.
+   Failure returns `InvalidOpenReason::BadSignature`.
+
+Either funding list may be empty; a one-sided or zero-funded open is valid
+when total funding covers the context-priced open cost plus the prepaid
+reserve for the worst-case bounded close path. **Both signatures are still
+required even with empty funding** — naming a party in `Terms::parties()`
+is itself the consent that needs witnessing. Funding is invalid exactly when
+the sum of funding coin values is less than
+`context.fee(open.cost()) + context.fee(open.reserve_cost())`. The produced
+edge principal is that remaining value; the reserve is stored separately and
+is not payable principal. Maker and taker are positional party identities:
+the maker is the party whose open intent or offer is filled, and the taker
+is the party that fills it. They are not buyer/seller, requester/provider,
+payer/worker, or any other economic meaning. The kernel does not require the
+maker and taker keys to be distinct; self-edges are valid (both signatures
+must still verify under the same key) and can represent sends, merges, or
+no-work channels under higher-level protocol convention.
 
 `Close` consumes one `Edge`, carries a bounded close proof, and creates a
 bounded list of `Payout { owner, value }` values. Payout coin ids are canonical;
@@ -315,10 +336,10 @@ consumed by the close and does not appear in payout coins.
 
 Every kernel rejection self-describes via a structured `ApplyError::Invalid*`
 reason: `InvalidOpenReason { FundingInsufficient, FundingOverflow, FeeOverflow,
-ReserveOverflow, BoundsExceeded }`, `InvalidCloseReason { ValueMismatch,
-ReserveTooSmall, FeeOverflow, PayoutOverflow, BoundsExceeded }`,
-`InvalidProofReason { TermsMismatch, BadSignature, BadSeal, TimeoutNotReached,
-PayoutMismatch }`. Callers do not parse free text to tell "fee schedule
+ReserveOverflow, BoundsExceeded, FundingUnauthorized, BadSignature }`,
+`InvalidCloseReason { ValueMismatch, ReserveTooSmall, FeeOverflow,
+PayoutOverflow, BoundsExceeded }`, `InvalidProofReason { TermsMismatch,
+BadSignature, BadSeal, TimeoutNotReached, PayoutMismatch }`. Callers do not parse free text to tell "fee schedule
 changed under me" (`ReserveTooSmall`) from "I miscomputed payouts"
 (`ValueMismatch`). `InvalidProofReason::BadSignature` and `BadSeal` come from
 the wired verifiers; `TermsMismatch`, `TimeoutNotReached`, and

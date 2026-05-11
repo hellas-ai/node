@@ -103,11 +103,19 @@ kernel.** Alto's mempool / proposer is responsible for unwrapping
 into a bare 64-byte ECDSA `Sig` before the tx reaches the kernel:
 
 - Admission verifies the WebAuthn envelope binds to the expected
-  close hash (`client_data_json.challenge == base64(close_hash)`).
+  payload hash (`client_data_json.challenge == base64(payload_hash)`,
+  where `payload_hash` is `Tx::open_hash(...)` for opens or
+  `Tx::payload_hash(...)` for closes).
 - Admission extracts the 64-byte ECDSA bytes and constructs the
-  kernel `Tx` with `Sig::from_bytes(ecdsa)`.
-- Kernel re-verifies the inner ECDSA at apply time via the `SigVerifier`
-  trait. Defense-in-depth over the cryptographically meaningful piece.
+  kernel `Tx` with `Sig::from_bytes(ecdsa)`. For opens this means
+  populating `Tx::Open { funding, terms, maker_sig, taker_sig }`
+  after collecting both signatures (typically: WebAuthn-signed maker
+  envelope + WebAuthn-signed taker envelope, both over the same
+  open hash).
+- Kernel re-verifies the inner ECDSA at apply time via the
+  `SigVerifier` trait, and also enforces the owner-match rule
+  (every funding coin must be owned by its party's key). Defense-
+  in-depth over the cryptographically meaningful piece.
 
 If you decide later to drop WebAuthn entirely (raw secp256r1 sigs
 direct from clients), the admission step shrinks but the kernel stays

@@ -61,7 +61,13 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open(funding, terms);
+    let open_hash = Tx::open_hash(&funding, &terms);
+    let open = Tx::open(
+        funding,
+        terms,
+        sign(&maker_sk, open_hash),
+        sign(&taker_sk, open_hash),
+    );
     let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
     let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&taker_sk, close_hash));
     let maker_out = outputs.as_slice()[0].id(edge, 0);
@@ -91,7 +97,7 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
 #[test]
 fn forged_signature_is_rejected_by_real_verifier() {
     let (maker_sk, maker_pk) = keypair(1);
-    let (_taker_sk, taker_pk) = keypair(2);
+    let (taker_sk, taker_pk) = keypair(2);
     let parties = Parties::new(maker_pk, taker_pk);
     let outputs = payouts(maker_pk, taker_pk);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
@@ -100,7 +106,15 @@ fn forged_signature_is_rejected_by_real_verifier() {
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open(funding, terms);
+    // Open is honestly authorized by both parties; the forgery happens on
+    // the close side below (the test's actual subject).
+    let open_hash = Tx::open_hash(&funding, &terms);
+    let open = Tx::open(
+        funding,
+        terms,
+        sign(&maker_sk, open_hash),
+        sign(&taker_sk, open_hash),
+    );
     let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
     // Sign with maker's key in *both* slots — taker's signature is forged.
     let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&maker_sk, close_hash));

@@ -16,7 +16,7 @@ use support::{FAKE_VERIFIER, FixedStore};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Event, EventKind, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Sig,
     State, Terms, Tx,
 };
 
@@ -40,7 +40,7 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
     );
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let expected_open = Tx::open(funding_value, terms_value.clone());
+    let expected_open = open_tx(funding_value, terms_value.clone(), maker_key, taker_key);
     let close_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
     let expected_close = Tx::close(
         edge,
@@ -65,7 +65,7 @@ fn open_resolve_and_operation_match_do_not_allocate() {
             outputs.clone(),
         );
         let proof = Proof::timeout(terms.clone());
-        let open = Tx::open(funding(maker, taker), terms);
+        let open = open_tx(funding(maker, taker), terms, maker_key, taker_key);
         assert_eq!(open, expected_open.clone());
         let is_open = matches!(open, Tx::Open { .. });
         let close = Tx::close(edge, proof, outputs);
@@ -139,4 +139,17 @@ fn output_ids(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_OUTPUTS> {
 
 fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
+}
+
+/// Builds a `Tx::Open` with placeholder signatures (`Sig::placeholder` is
+/// allocation-free) and is itself allocation-free, preserving the
+/// zero-alloc invariant the test asserts.
+fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
+    let hash = Tx::open_hash(&funding, &terms);
+    Tx::open(
+        funding,
+        terms,
+        Sig::placeholder(maker, hash),
+        Sig::placeholder(taker, hash),
+    )
 }

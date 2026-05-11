@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    Parties, Payout, Proof, ProtocolCode, Sig, State, Terms, Tx,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
@@ -137,7 +137,15 @@ const fn full_funding() -> Funding {
 }
 
 fn full_open() -> Tx {
-    Tx::open(full_funding(), terms())
+    let funding = full_funding();
+    let terms = terms();
+    let hash = Tx::open_hash(&funding, &terms);
+    Tx::open(
+        funding,
+        terms,
+        Sig::placeholder(MAKER, hash),
+        Sig::placeholder(TAKER, hash),
+    )
 }
 
 fn full_edge_id() -> EdgeId {
