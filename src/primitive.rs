@@ -28,11 +28,8 @@
 use core::fmt;
 
 use crate::canonical::{Decode, DecodeError, Encode, Writer};
+use crate::consts::{HASH_LENGTH, ID_LENGTH, KEY_LENGTH, SIG_LENGTH};
 
-const ID_LENGTH: usize = 32;
-const HASH_LENGTH: usize = 32;
-const KEY_LENGTH: usize = 33;
-const SIG_LENGTH: usize = 64;
 
 /// Settlement public key controlling owner-only objects.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -129,13 +126,13 @@ impl CoinId {
     /// returns the canonical ids.
     #[must_use]
     pub fn genesis(index: u32) -> Self {
-        Self(crate::canonical::hash(crate::domain::COIN_GENESIS, &index))
+        Self(crate::canonical::hash(crate::consts::COIN_GENESIS, &index))
     }
 
     /// Derives the canonical id for one resolve payout coin.
     pub(crate) fn payout(edge: EdgeId, index: usize, owner: Key) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(crate::domain::COIN_PAYOUT);
+        hasher.update(crate::consts::COIN_PAYOUT);
         edge.encode_to(&mut hasher);
         index.encode_to(&mut hasher);
         owner.encode_to(&mut hasher);
@@ -335,7 +332,7 @@ impl Sig {
 
     fn half(key: Key, hash: ResolveHash, index: u8) -> [u8; ResolveHash::LENGTH] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(crate::domain::SIG_PLACEHOLDER);
+        hasher.update(crate::consts::SIG_PLACEHOLDER);
         index.encode_to(&mut hasher);
         key.encode_to(&mut hasher);
         hash.encode_to(&mut hasher);

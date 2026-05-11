@@ -20,7 +20,7 @@
 //!   dispute mode that wants validator-quorum-signed seals expresses
 //!   that policy inside the `Verifier`; [`Context`] stays oblivious.
 
-const HASH_LENGTH: usize = 32;
+use crate::consts::HASH_LENGTH;
 
 /// Hash of the previous finalized block.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]

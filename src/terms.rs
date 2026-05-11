@@ -13,11 +13,12 @@
 
 use crate::{
     canonical::{Encode, Writer},
+    consts::MAX_EDGE_OUTPUTS,
     context::BlockHeight,
     list::List,
     object::Parties,
-    tx::{MAX_EDGE_OUTPUTS, Payout},
     primitive::{ProtocolCode, TermsHash},
+    tx::Payout,
 };
 
 /// Concrete open terms committed by an edge.
@@ -109,7 +110,7 @@ impl Terms {
 
 impl TermsBody {
     fn compute_hash(&self) -> TermsHash {
-        TermsHash::from_bytes(crate::canonical::hash(crate::domain::TERMS_BASIC, self))
+        TermsHash::from_bytes(crate::canonical::hash(crate::consts::TERMS_BASIC, self))
     }
 }
 

@@ -7,9 +7,10 @@
 //! [`crate::Verifier::verify_seal`] and enforcing per-kind payout binding
 //! inline.
 
-use super::{MAX_EDGE_OUTPUTS, Payout, SEAL_LENGTH, Tx};
+use super::{Payout, Tx};
 use crate::{
     canonical::Encode,
+    consts::{MAX_EDGE_OUTPUTS, SEAL_LENGTH},
     context::{Context, Cost},
     error::InvalidProofReason,
     list::List,
@@ -135,7 +136,7 @@ impl Seal {
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: ResolveKind, hash: ResolveHash) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(crate::domain::SEAL_PLACEHOLDER);
+        hasher.update(crate::consts::SEAL_PLACEHOLDER);
         protocol.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         hash.encode_to(&mut hasher);
