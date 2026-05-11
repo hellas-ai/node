@@ -87,12 +87,13 @@ pay for an extension that is not coming.
 State transitions follow a two-phase, event-sourced shape:
 
 ```text
-tx_apply(ctx, &Verifier, &Batch, Tx) -> KernelResult<Change>   // read-only
-change_fold(&mut Batch, &Change)     -> KernelResult<()>       // private mutation
+tx_apply(ctx, &(SigVerifier + SealVerifier), &Batch, Tx) -> KernelResult<Change>   // read-only
+change_fold(&mut Batch, &Change)                          -> KernelResult<()>      // private mutation
 ```
 
-`Verifier` is the crypto boundary; `Batch` is the storage boundary. Both are
-caller-supplied interfaces, both pure during validation.
+The `SigVerifier` / `SealVerifier` pair is the crypto boundary; `Batch` is
+the storage boundary. Both are caller-supplied interfaces, both pure during
+validation.
 
 - `Event` is the public opaque fact emitted by an operation. Its constructors
   are private; external code cannot fabricate events.
@@ -175,45 +176,52 @@ via a working snapshot swapped in on `commit`. Tests run against both so any
 
 ### Verifier Boundary
 
-The kernel implements no cryptography, and beyond bookkeeping it implements no
-close-admissibility policy either. Every decision about whether a `Proof`
-binds to its edge — terms-hash commitment, timeout-height check, timeout
-payout shape, mutual signature pair, dispute-seal verdict — goes through a
-single-method `Verifier` trait that callers wire in at apply time:
+The kernel implements no cryptography. Two narrow traits draw the
+kernel/crypto seam, each scoped to exactly one kind of verification:
 
 ```rust
-trait Verifier {
-    fn verify_close(
-        &self,
-        edge_id: EdgeId,
-        edge: &Edge,
-        payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
-        proof: &Proof,
-        context: &Context,
-    ) -> Result<(), InvalidProofReason>;
+trait SigVerifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool;
+}
+
+struct SealPublicInputs<'a> {
+    pub edge_id: EdgeId,
+    pub protocol: ProtocolCode,
+    pub terms_hash: TermsHash,
+    pub payouts: &'a List<Payout, MAX_EDGE_OUTPUTS>,
+}
+
+trait SealVerifier {
+    fn verify_seal(&self, seal: Seal, public: &SealPublicInputs<'_>) -> bool;
 }
 ```
 
-The kernel calls `verify_close` once per close transaction, after value
-conservation, slot-collision, and fee arithmetic have been checked, and
-before fold. The kernel itself does not unpack the proof or compare its
-revealed terms against `edge.terms()`; it forwards the whole `Proof` and lets
-the verifier return `Ok(())` or a structured `InvalidProofReason`.
+The three `Proof` variants map cleanly onto where validation belongs:
 
-`State::apply(context, &verifier, tx)` plumbs the verifier through to the
-close path. Production callers wire a real verifier — `Secp256k1Verifier`
-behind the `secp256k1` feature flag is the included reference for `Mutual`
-signatures, or a preverified-cache lookup populated off the apply critical
-path (PERF.md §4). Dispute-seal admissibility is protocol-specific; the
-included `Secp256k1Verifier` rejects every `Violation` seal, and production
-deployments compose a seal-aware verifier per dispute protocol. Tests use
-`FakeVerifier`, which accepts the deterministic placeholder shape produced
-by `Sig::placeholder` / `Seal::placeholder` and otherwise enforces the same
-terms-hash, timeout, and payout checks a real verifier would. A
-`RejectVerifier` covers "production has no key for this proof" cases.
+| Variant      | Validator      | Where             |
+|--------------|----------------|-------------------|
+| `Mutual`     | `SigVerifier`  | external          |
+| `Timeout`    | structural     | kernel inline     |
+| `Violation`  | `SealVerifier` | external          |
 
-There is no kernel-side cfg flag for proof admission. Production and test
-builds differ only in which `Verifier` they wire in.
+`Mutual` calls `verify_sig` twice (maker, taker) over the canonical close
+payload hash. `Timeout` needs no cryptography — the kernel checks
+`terms.hash() == edge.terms()`, `context.block_height() >= terms.timeout()`,
+and `payouts == terms.timeout_outputs()` inline. `Violation` builds the
+`SealPublicInputs` from the close transaction and live edge, hands them to
+`verify_seal`, and forwards a `BadSeal` rejection if the seal isn't
+admissible. The kernel itself never inspects seal bytes; the verifier is the
+sole authority on whether they admit the close.
+
+`State::apply(context, &verifier, tx)` takes a single `V` constrained by
+`SigVerifier + SealVerifier`. Test verifiers (`FakeVerifier`,
+`RejectVerifier`) implement both traits on one struct, so callers pass a
+single value. Production deployments compose: `Secp256k1Verifier` is the
+included reference `SigVerifier` for cooperative closes, and a
+protocol-specific `SealVerifier` (ZK proof verifier, TEE attestation
+checker, fraud-game seal checker) is wired alongside. There is no kernel-
+side cfg flag for proof admission; the only difference between production
+and test builds is which `Sig`/`Seal` verifiers they compose.
 
 ### Per-Digest Types
 
@@ -257,29 +265,32 @@ channels under higher-level protocol convention.
 
 `Close` consumes one `Edge`, carries a bounded close proof, and creates a
 bounded list of `Payout { owner, value }` values. Payout coin ids are canonical;
-they are not supplied by the caller. `Proof` is one of three variants, and the
-kernel forwards all admissibility decisions about it to the `Verifier` (see
-[Verifier Boundary](#verifier-boundary)):
+they are not supplied by the caller. `Proof` is one of three variants; each
+maps to exactly one validation kind (see [Verifier Boundary](#verifier-boundary)):
 
 - `Proof::Mutual { maker: Sig, taker: Sig }` is the cooperative path. Both
   signatures are taken over the canonical
   `Tx::payload_hash(edge_id, CloseKind::Mutual, edge.terms(), payouts)`. No
-  terms are revealed on chain; the verifier reads `edge.terms()` directly off
-  the live edge. Production wires `Secp256k1Verifier` (or a preverified-cache
-  verifier); tests wire `FakeVerifier` against the deterministic
-  `Sig::placeholder` shape.
+  terms are revealed on chain; the kernel computes the payload hash from
+  `edge.terms()` and routes both sigs through `SigVerifier::verify_sig`.
+  Production wires `Secp256k1Verifier` (or a preverified-cache verifier);
+  tests wire `FakeVerifier` against the deterministic `Sig::placeholder`
+  shape.
 - `Proof::Timeout { terms: Terms }` reveals the concrete basic terms. The
-  verifier is responsible for checking `terms.hash() == edge.terms()`,
+  kernel enforces `terms.hash() == edge.terms()`,
   `context.block_height() >= terms.timeout()`, and that `payouts` equals the
-  terms' committed timeout payout list. The kernel itself does not enforce
-  any of these — it only conserves value and consumes the reserve.
+  terms' committed timeout payout list inline — no verifier is involved
+  because none of these checks need cryptography.
 - `Proof::Violation { terms: Terms, seal: Seal }` is the dispute path. It
   reveals the concrete terms and carries a fixed-size protocol-specific
-  `Seal`. The seal is opaque to the kernel: protocol-specific dispute games
-  encode the winner inside its bytes, and a seal-aware verifier inside the
-  wired `Verifier` decides admissibility. This single variant subsumes the
-  earlier separate claimant/challenger paths; the winner is read out of the
-  seal at the verifier layer, not encoded in a kernel-level discriminant.
+  `Seal`. The kernel binds `terms.hash() == edge.terms()` then builds a
+  `SealPublicInputs { edge_id, protocol, terms_hash, payouts }` and routes
+  the seal through `SealVerifier::verify_seal`. The seal is opaque to the
+  kernel: protocol-specific dispute games encode the winner inside its
+  bytes, and the wired `SealVerifier` decides admissibility. This single
+  variant subsumes the earlier separate claimant/challenger paths; the
+  winner is read out of the seal at the verifier layer, not encoded in a
+  kernel-level discriminant.
 
   The intended v1+ shape (currently unimplemented — every bundled verifier
   rejects `Violation` with `BadSeal`): the seal is a 32-byte commitment
@@ -309,8 +320,10 @@ ReserveTooSmall, FeeOverflow, PayoutOverflow, BoundsExceeded }`,
 `InvalidProofReason { TermsMismatch, BadSignature, BadSeal, TimeoutNotReached,
 PayoutMismatch }`. Callers do not parse free text to tell "fee schedule
 changed under me" (`ReserveTooSmall`) from "I miscomputed payouts"
-(`ValueMismatch`). The `InvalidProofReason` variants are returned by the
-`Verifier`, not by kernel bookkeeping.
+(`ValueMismatch`). `InvalidProofReason::BadSignature` and `BadSeal` come from
+the wired verifiers; `TermsMismatch`, `TimeoutNotReached`, and
+`PayoutMismatch` come from the kernel's inline Timeout/Violation structural
+checks.
 
 ### Resource Costs
 
@@ -366,7 +379,8 @@ It tracks:
 
 It does not know how a model was executed, how a TEE attestation works, or how a
 ZK proof was generated. It only knows how to open an edge, close an edge, and
-forward the bounded close proof to the `Verifier` configured by the edge terms.
+route close proofs to the wired `SigVerifier` / `SealVerifier` configured by
+the edge terms.
 
 An edge is live-only. Existence means open. Open consumes funding coins and
 creates the live edge. Close consumes the edge, deletes it from live L1 state,
@@ -800,9 +814,9 @@ ecosystem standard) that:
 
 A single glob-based test replays every committed fixture; adding a new Quint
 trace test means adding a fixture and zero Rust code. Fixtures use
-`FakeVerifier`, which accepts the deterministic `Sig::placeholder` /
-`Seal::placeholder` shape; production wires a real `Verifier` implementation
-in its place.
+`FakeVerifier`, which impls both `SigVerifier` and `SealVerifier` and accepts
+the deterministic `Sig::placeholder` / `Seal::placeholder` shape; production
+wires real verifier impls in its place.
 
 ## Atomic Transitions
 
@@ -819,7 +833,7 @@ agnostic; see [Verifier Boundary](#verifier-boundary)):
 
 ```rust
 impl<S: Store> State<S> {
-    pub fn apply<V: Verifier + ?Sized>(
+    pub fn apply<V: SigVerifier + SealVerifier + ?Sized>(
         &mut self,
         ctx: Context,
         verifier: &V,
@@ -832,7 +846,7 @@ impl<S: Store> State<S> {
         Ok(change.event())
     }
 
-    pub fn apply_all<V: Verifier + ?Sized, const N: usize>(
+    pub fn apply_all<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
         &mut self,
         ctx: Context,
         verifier: &V,
@@ -849,7 +863,7 @@ impl<S: Store> State<S> {
         Ok(diff)
     }
 
-    pub fn apply_block<V: Verifier + ?Sized, const N: usize>(
+    pub fn apply_block<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
         &mut self,
         verifier: &V,
         block: &Block<N>,
@@ -1076,17 +1090,19 @@ The kernel-shaped items previously listed here are done:
 - Serialized ITF trace fixtures from `models/l1.qnt` are committed under
   `models/traces/`. The Rust runner is `itf::Runner`-based; adding a Quint
   trace test means regenerating fixtures, no Rust changes.
-- Placeholder `Sig` / `Seal` verification has been replaced by a `Verifier`
-  trait the caller wires in. The kernel implements no cryptography and no
-  proof-admissibility policy; the single `verify_close` method owns all
-  close-validity decisions. A reference `Secp256k1Verifier` lives under the
-  `secp256k1` feature flag.
+- Placeholder `Sig` / `Seal` verification has been replaced by two narrow
+  caller-wired traits: `SigVerifier` for cooperative-close signatures and
+  `SealVerifier` for dispute seals. Timeout admissibility is structural and
+  the kernel checks it inline. A reference `Secp256k1Verifier` lives under
+  the `secp256k1` feature flag and supplies a real ECDSA `SigVerifier`;
+  production deployments compose it with a protocol-specific `SealVerifier`
+  (or a hard-reject stub if violations aren't yet supported).
 
 What's left, in roughly increasing depth:
 
 1. **Adapter layer.** `Call` / `CallResult` / `Claim` / `Evidence` shapes
-   that produce the close proofs the kernel's `Verifier` will accept. Out
-   of crate.
+   that produce the close proofs the kernel's `SigVerifier` /
+   `SealVerifier` impls will accept. Out of crate.
 2. **Channel layer.** Off-chain state, signed frontiers, claim/challenge
    timing, watcher obligations. The async/distributed shape moves to Choreo
    or P when the synchronous channel math is settled. Out of crate.

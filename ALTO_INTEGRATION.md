@@ -21,7 +21,7 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 | Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` (ECDSA)                       |
 | STF                    | `execute_all` / `execute_proposal` (inline, async)       | `State::apply*` (sync, trait-bounded)          |
 | Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Batch` traits (sync)                  |
-| Crypto                 | Inline `Transaction::verify_signature`                   | `Verifier` trait                               |
+| Crypto                 | Inline `Transaction::verify_signature`                   | `SigVerifier` + `SealVerifier` traits          |
 | Context                | `Context<Digest, PublicKey>` + height + timestamp        | `Context { height, hash, fees }`               |
 | Genesis                | `Vec<(Address, u64)>` looped at height 0                 | `State::genesis(store, &[Genesis::coin(...)])` |
 | Fees                   | None                                                     | `Fees`, `Cost` per op                          |
@@ -38,7 +38,7 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
   shape, but coming from the kernel crate so tests and protocol all
   point to one source of truth.)
 - `types/src/lib.rs::Transaction::verify_signature` — moves into the
-  `Verifier` impl.
+  `SigVerifier` impl.
 - `types/src/lib.rs::transfer_challenge`, `merge_challenge` — the
   WebAuthn challenge construction. Stays in alto but lives below the
   kernel; the kernel never sees these.
@@ -55,24 +55,25 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 Three direct trait impls on alto's existing types. No new wrapper
 structs.
 
-### 1. `impl hellas_kernel::Verifier for UserVerifier`
+### 1. `impl SigVerifier + SealVerifier for UserVerifier`
 
 Where `UserVerifier` is a unit struct (or carries any policy state
-alto needs — e.g. a precomputed-sig cache).
+alto needs — e.g. a precomputed-sig cache). The kernel takes one value
+that impls *both* traits; we impl them on the same struct so callers
+pass `&UserVerifier`.
 
 ```rust
-// chain/src/execution/verifier.rs (new file, ~60 lines)
+// chain/src/execution/verifier.rs (new file, ~35 lines)
 
 use hellas_kernel::{
-    CloseKind, Context, Edge, EdgeId, InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Payout,
-    Proof, Sig, Tx, Verifier,
+    CloseHash, Key, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier,
 };
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 
 pub struct UserVerifier;
 
-impl UserVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::CloseHash) -> bool {
+impl SigVerifier for UserVerifier {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool {
         let Ok(vk) = VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
             return false;
         };
@@ -83,45 +84,18 @@ impl UserVerifier {
     }
 }
 
-impl Verifier for UserVerifier {
-    fn verify_close(
-        &self,
-        edge_id: EdgeId,
-        edge: &Edge,
-        payouts: &List<Payout, MAX_EDGE_OUTPUTS>,
-        proof: &Proof,
-        context: &Context,
-    ) -> Result<(), InvalidProofReason> {
-        match proof {
-            Proof::Mutual { maker, taker } => {
-                let hash = Tx::payload_hash(edge_id, CloseKind::Mutual, edge.terms(), payouts);
-                let parties = edge.parties();
-                if self.verify_sig(*maker, parties.maker(), hash)
-                    && self.verify_sig(*taker, parties.taker(), hash)
-                {
-                    Ok(())
-                } else {
-                    Err(InvalidProofReason::BadSignature)
-                }
-            }
-            Proof::Timeout { terms } => {
-                if terms.hash() != edge.terms() {
-                    return Err(InvalidProofReason::TermsMismatch);
-                }
-                if context.block_height() < terms.timeout() {
-                    return Err(InvalidProofReason::TimeoutNotReached);
-                }
-                if payouts != terms.timeout_outputs() {
-                    return Err(InvalidProofReason::PayoutMismatch);
-                }
-                Ok(())
-            }
-            // No dispute seals in v1. Re-enable per protocol mode later.
-            Proof::Violation { .. } => Err(InvalidProofReason::BadSeal),
-        }
+impl SealVerifier for UserVerifier {
+    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
+        // No dispute seals in v1. Wire a protocol-specific seal verifier
+        // here when violations are supported.
+        false
     }
 }
 ```
+
+Timeout structural checks (terms-hash binding, height guard, payout
+match) live inside the kernel and need no verifier — the `UserVerifier`
+above carries no Timeout logic.
 
 **Important boundary decision: WebAuthn lives in admission, not in the
 kernel.** Alto's mempool / proposer is responsible for unwrapping
@@ -132,7 +106,7 @@ into a bare 64-byte ECDSA `Sig` before the tx reaches the kernel:
   close hash (`client_data_json.challenge == base64(close_hash)`).
 - Admission extracts the 64-byte ECDSA bytes and constructs the
   kernel `Tx` with `Sig::from_bytes(ecdsa)`.
-- Kernel re-verifies the inner ECDSA at apply time via the `Verifier`
+- Kernel re-verifies the inner ECDSA at apply time via the `SigVerifier`
   trait. Defense-in-depth over the cryptographically meaningful piece.
 
 If you decide later to drop WebAuthn entirely (raw secp256r1 sigs
@@ -308,10 +282,10 @@ The mempool's job changes:
 
 2. **Validator-set rotation vs `Context`.** Alto's existing
    `HellasBlock` carries leader pubkey; kernel's `Context` does not.
-   This is fine for v1 (kernel's Verifier doesn't bind to validators)
-   but if a future protocol mode needs it, the validator set comes from
-   alto's consensus and gets handed to `UserVerifier` (not into
-   `Context`).
+   This is fine for v1 (the kernel's verifier traits don't bind to
+   validators) but if a future protocol mode needs it, the validator set
+   comes from alto's consensus and gets handed to `UserVerifier` (not
+   into `Context`).
 
 3. **`ObjectId` vs split `CoinId`/`EdgeId`.** Alto uses one
    `ObjectId = Digest` type at the storage layer; kernel uses two typed
@@ -347,8 +321,8 @@ replaced by trait impls and kernel calls.
 
 - Real fee model (Fees::ZERO suffices).
 - Dispute seals: admitting `Proof::Violation` requires a
-  protocol-specific seal verifier; v1 leaves `UserVerifier` returning
-  `Err(InvalidProofReason::BadSeal)` for that arm.
+  protocol-specific `SealVerifier` impl; v1 leaves `UserVerifier`'s
+  `verify_seal` returning `false`.
 - Adding `BlockTime` / timestamp to `Context`.
 - Validator-set-bound proofs.
 - Edge fanout > current `MAX_EDGE_INPUTS=8` / `MAX_EDGE_OUTPUTS=4`

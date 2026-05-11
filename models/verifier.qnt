@@ -2,24 +2,33 @@
 //
 // Verification policy for close witnesses.
 //
-// Mirrors src/verifier.rs and src/tx/proof.rs. The Rust kernel itself
-// implements no cryptography and no close-validity policy beyond
-// bookkeeping; every admissibility decision is delegated to the caller's
-// [`Verifier`]. This module defines the *abstract* policy any conforming
-// verifier is assumed to enforce — `proofOk` for "this witness shape is
-// admissible at this height" and `payoutsBound` for "this proof kind
-// constrains the (m, t) split to the canonical canonical-pair split".
+// Mirrors src/verifier.rs: the kernel implements no cryptography and
+// owns no protocol-level admissibility policy beyond Timeout structural
+// checks. Two narrow verifier interfaces draw the kernel/crypto seam:
 //
-// Pure: no state vars, no actions. Importing it gives any module access to
-// the verification rules without touching the model's live state.
+//   sigOk(...)  ↔ SigVerifier::verify_sig
+//   sealOk(...) ↔ SealVerifier::verify_seal
+//
+// Timeout closes need neither — their admissibility is purely
+// structural (terms-hash binding, height guard, payout shape) and lives
+// in the kernel's apply path, not behind a verifier. This module pins
+// the *abstract* policy any conforming verifier is assumed to enforce.
+//
+// Pure: no state vars, no actions. Importing it gives any module access
+// to the verification rules without touching the model's live state.
 
 module verifier {
   import types.* from "./types"
 
-  // Whether a proof witness is admissible at the current height. Mutual
-  // and Violation are unconditionally admissible — the abstract model
-  // trusts the verifier to have already validated their cryptographic
-  // content. Timeout is gated by the height guard.
+  // Whether a proof witness is admissible at the current height.
+  //
+  // The Mutual case folds the abstract `sigOk` predicate inline:
+  // every conforming signature verifier admits a witness *only when*
+  // both maker and taker signed the canonical payload — which at this
+  // abstraction layer is just "the protocol's bound (MakerPayout,
+  // TakerPayout) split was committed to". The Violation case folds
+  // `sealOk` similarly. Timeout has no verifier: the kernel itself
+  // enforces the height guard.
   pure def proofOk(p: Proof, height: int): bool =
     match p {
       | Mutual => true
@@ -28,10 +37,10 @@ module verifier {
     }
 
   // Per-proof payout binding. Every close witness binds the canonical
-  // (MakerPayout, TakerPayout) split: Mutual via the signed payload,
-  // Timeout via `terms.timeout_outputs`, Violation via the dispute seal.
-  // There is no proof kind that admits an unbound split — that is the
-  // whole point of collapsing Basic out of the protocol.
+  // (MakerPayout, TakerPayout) split: Mutual via signed payload,
+  // Timeout via `terms.timeout_outputs` (kernel-enforced), Violation
+  // via the dispute seal's public inputs. There is no proof kind that
+  // admits an unbound split.
   pure def payoutsBound(p: Proof, makerPay: int, takerPay: int): bool =
     match p {
       | Mutual => makerPay == MakerPayout and takerPay == TakerPayout
