@@ -1,15 +1,15 @@
 //! Close witnesses.
 //!
 //! A [`Proof`] is the kernel-visible *shape* of why an edge should
-//! close. All validity checks — terms-hash binding, timeout height,
-//! payout binding, signature, seal — live in the [`crate::Verifier`].
-//! The kernel only routes the proof to the verifier and bookkeeps the
-//! resulting state mutation; it makes no policy decision itself.
+//! close. Each variant maps to exactly one validation kind: `Mutual` →
+//! [`crate::SigVerifier`], `Timeout` → kernel inline structural check,
+//! `Violation` → [`crate::SealVerifier`].
 //!
 //! Abstract counterpart: `models/types.qnt::Proof` (witness ADT) and
 //! `models/verifier.qnt` (`proofOk`, `payoutsBound`). The Quint module
-//! treats these as pure predicates over an opaque verifier; the kernel
-//! defers the same check by calling [`crate::Verifier::verify_close`].
+//! treats these as pure predicates over opaque verifiers; the kernel
+//! defers the same checks by routing each variant to the matching
+//! verifier impl (or to its own inline check for Timeout).
 
 use crate::{
     canonical::Encode,
@@ -55,8 +55,8 @@ impl CloseKind {
 ///
 /// Opaque to the kernel. The seal's bytes encode whatever artifact the
 /// protocol-specific dispute game produces — a TEE attestation, a ZK
-/// proof commitment, a fraud-game commitment — and the [`crate::Verifier`]
-/// alone decides whether it is admissible.
+/// proof commitment, a fraud-game commitment — and the wired
+/// [`crate::SealVerifier`] alone decides whether it is admissible.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Seal([u8; Self::LENGTH]);
 
@@ -85,8 +85,8 @@ impl Seal {
     /// Creates a deterministic dispute seal placeholder for modelling.
     ///
     /// This is forgeable and not a cryptographic proof. Whether the kernel
-    /// accepts this shape is decided by the [`crate::Verifier`] passed at
-    /// apply time.
+    /// accepts this shape is decided by the [`crate::SealVerifier`] passed
+    /// at apply time.
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: CloseHash) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -100,8 +100,9 @@ impl Seal {
 
 /// Bounded close witness.
 ///
-/// The kernel routes the proof straight to the [`crate::Verifier`] —
-/// it makes no admissibility decision itself.
+/// Each variant maps to one validator: `Mutual` is checked by
+/// [`crate::SigVerifier`], `Timeout` is checked structurally inside the
+/// kernel, `Violation` is checked by [`crate::SealVerifier`].
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Proof {
     /// Cooperative close signed by both edge parties. The signed

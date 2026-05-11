@@ -12,18 +12,20 @@
 //!
 //! # Scope
 //!
-//! This verifier covers the [`SigVerifier`] half only:
-//! signature-shaped witnesses used by [`crate::Proof::Mutual`]. The seal
-//! half — [`crate::Proof::Violation`] — is protocol-specific (TEE
-//! attestation, ZK proof commitment, fraud-game seal) and has no
-//! universal admissibility policy, so production deployments compose
-//! `Secp256k1Verifier` with a separate [`crate::SealVerifier`]
-//! implementation that knows their protocol's seal shape.
+//! Real ECDSA covers [`SigVerifier`] cleanly: cooperative-close
+//! signatures used by [`crate::Proof::Mutual`]. The seal half —
+//! [`crate::Proof::Violation`] — is protocol-specific (TEE attestation,
+//! ZK proof commitment, fraud-game seal) with no universal admissibility
+//! policy, so [`Secp256k1Verifier`] also implements [`SealVerifier`] as
+//! a hard-reject: every seal is rejected, every violation close fails.
+//! Deployments that support violation closes wrap or replace the seal
+//! impl with one that knows their protocol's seal shape.
 
 use secp256k1::{Message, PublicKey, Secp256k1, VerifyOnly, ecdsa::Signature};
 
 use crate::primitive::{CloseHash, Key, Sig};
-use crate::verifier::SigVerifier;
+use crate::tx::Seal;
+use crate::verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 
 /// Verifier that accepts compact-form secp256k1 ECDSA signatures from
 /// compressed public keys, with the close hash interpreted as the
@@ -59,5 +61,15 @@ impl SigVerifier for Secp256k1Verifier {
         };
         let message = Message::from_digest(hash.to_bytes());
         self.secp.verify_ecdsa(message, &signature, &pk).is_ok()
+    }
+}
+
+impl SealVerifier for Secp256k1Verifier {
+    /// Rejects every seal. Dispute seals are protocol-specific (TEE
+    /// attestation, ZK proof commitment, fraud-game seal); this verifier
+    /// owns no such policy. Deployments that admit violation closes wrap
+    /// or replace this impl with one that knows their protocol's seal.
+    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
+        false
     }
 }

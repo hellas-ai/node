@@ -10,26 +10,24 @@
 //!
 //! | Concern              | Rust                       | Quint                                |
 //! |----------------------|----------------------------|--------------------------------------|
-//! | Apply driver         | [`State`]                  | `models/l1.qnt`                      |
-//! | Tx vocabulary + step | [`Tx`]                     | `models/l1.qnt` (`step` action)      |
-//! | Proof witnesses      | [`Proof`]                  | `models/verifier.qnt`                |
-//! | Verification policy  | [`Verifier`]               | `models/verifier.qnt`                |
-//! | Live objects         | [`Coin`] / [`Edge`] / ids  | `models/types.qnt`                   |
-//! | Block context        | [`Context`]                | `models/l1.qnt` (`height` var)       |
-//! | Established rules    | [`Diff`], [`View`]         | `models/rules/invariants.qnt`        |
-//! | Assumed dependencies | [`Store`], [`Verifier`]    | `models/deps/assumptions.qnt`        |
+//! | Apply driver         | [`State`]                       | `models/l1.qnt`                      |
+//! | Tx vocabulary + step | [`Tx`]                          | `models/l1.qnt` (`step` action)      |
+//! | Proof witnesses      | [`Proof`]                       | `models/verifier.qnt`                |
+//! | Verification policy  | [`SigVerifier`]/[`SealVerifier`]| `models/verifier.qnt`                |
+//! | Live objects         | [`Coin`] / [`Edge`] / ids       | `models/types.qnt`                   |
+//! | Block context        | [`Context`]                     | `models/l1.qnt` (`height` var)       |
+//! | Established rules    | [`Diff`], [`View`]              | `models/rules/invariants.qnt`        |
+//! | Assumed dependencies | [`Store`], verifier traits      | `models/deps/assumptions.qnt`        |
 //!
 //! # Verifier boundary
 //!
-//! The kernel implements no cryptography and no close-validity policy
-//! beyond bookkeeping (value conservation, slot collisions, fee
-//! arithmetic). Every admissibility decision about a [`Proof`] —
-//! terms-hash binding, timeout height, payout shape, signature, seal —
-//! is delegated to a [`Verifier`] passed by the caller, typically a
-//! preverified-cache lookup populated off the apply critical path.
-//! Test verifiers accept the deterministic placeholders documented on
-//! [`Sig::placeholder`] and [`Seal::placeholder`]; production verifiers
-//! wire real cryptography. The kernel does not see the difference.
+//! The kernel implements no cryptography. Two narrow caller-wired traits
+//! draw the kernel/crypto seam: [`SigVerifier`] decides cooperative-close
+//! signatures, [`SealVerifier`] decides dispute seals. [`Proof::Timeout`]
+//! needs neither — its admissibility is purely structural and the kernel
+//! checks it inline. Test verifiers accept the deterministic placeholders
+//! documented on [`Sig::placeholder`] and [`Seal::placeholder`]; production
+//! verifiers wire real cryptography. The kernel does not see the difference.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!

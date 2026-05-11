@@ -16,9 +16,10 @@
 //!   needs wall-clock time, not block-relative time.
 //! - **Validator set.** The kernel never checks "is this signer in the
 //!   active set?" — that knowledge lives in whichever
-//!   [`crate::Verifier`] implementation the chain wires in. A future
-//!   dispute mode that wants validator-quorum-signed seals expresses
-//!   that policy inside the `Verifier`; [`Context`] stays oblivious.
+//!   [`crate::SigVerifier`] / [`crate::SealVerifier`] implementations
+//!   the chain wires in. A future dispute mode that wants validator-
+//!   quorum-signed seals expresses that policy inside the verifier
+//!   impls; [`Context`] stays oblivious.
 
 use crate::consts::HASH_LENGTH;
 
