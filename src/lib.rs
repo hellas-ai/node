@@ -68,8 +68,8 @@ compile_error!(
 
 mod block;
 mod canonical;
+pub(crate) mod consts;
 mod context;
-pub(crate) mod domain;
 mod error;
 mod event;
 mod list;
@@ -94,10 +94,8 @@ pub use error::{
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
-pub use tx::{
-    Agreement, Funding, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Payout, Proof,
-    ResolveKind, Seal, Tx,
-};
+pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS};
+pub use tx::{Agreement, Funding, Payout, Proof, ResolveKind, Seal, Tx};
 pub use primitive::{CoinId, EdgeId, Key, Party, ProtocolCode, ResolveHash, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]
 pub use secp256k1::Secp256k1Verifier;

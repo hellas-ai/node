@@ -7,10 +7,10 @@
 //! producing action recorded.
 
 use crate::{
+    consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS},
     error::{ApplyError, KernelResult},
     list::List,
     object::{Coin, Edge},
-    tx::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS},
     primitive::{CoinId, EdgeId},
     store::Batch,
 };

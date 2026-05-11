@@ -18,6 +18,7 @@ pub use self::{
 
 use crate::{
     canonical::Encode,
+    consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS},
     context::{Context, Cost},
     error::{ApplyError, InvalidOpenReason, InvalidResolveReason, KernelResult},
     event::Change,
@@ -28,25 +29,6 @@ use crate::{
     terms::Terms,
     verifier::Verifier,
 };
-
-const SEAL_LENGTH: usize = 32;
-
-/// Maximum coins that can fund one party in a v1 edge open.
-///
-/// Four inputs per party covers the expected one-or-two-coin channel open while
-/// keeping validation fully bounded. Raising this changes operation shape,
-/// resource costs, and model bounds, so it is a chain-version change.
-pub const MAX_PARTY_INPUTS: usize = 4;
-
-/// Maximum coins that can fund one v1 edge open.
-pub const MAX_EDGE_INPUTS: usize = MAX_PARTY_INPUTS * 2;
-
-/// Maximum coins that can be produced by one v1 edge resolve.
-///
-/// Four outputs leaves room for maker, taker, and small protocol-defined splits
-/// without making every resolve pay for an unbounded payout fanout. Raising this
-/// is also a chain-version change.
-pub const MAX_EDGE_OUTPUTS: usize = 4;
 
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
@@ -126,7 +108,7 @@ impl Tx {
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> ResolveHash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(crate::domain::RESOLVE);
+        hasher.update(crate::consts::RESOLVE);
         input.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         terms.encode_to(&mut hasher);
@@ -272,7 +254,7 @@ fn resolve_coins(input: EdgeId, outputs: &Payouts) -> ResolveCoins {
 
 fn edge_id(funding: &Funding, terms_hash: TermsHash) -> EdgeId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(crate::domain::EDGE_OPEN);
+    hasher.update(crate::consts::EDGE_OPEN);
     terms_hash.encode_to(&mut hasher);
     funding.maker().encode_to(&mut hasher);
     funding.taker().encode_to(&mut hasher);
