@@ -7,9 +7,9 @@
   # users — nix will prompt to accept on first use (or auto-accept with
   # `--accept-flake-config`).
   nixConfig = {
-    extra-experimental-features = ["ca-derivations"];
-    extra-substituters = ["https://cache.hellas.ai"];
-    extra-trusted-public-keys = ["cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g="];
+    extra-experimental-features = [ "ca-derivations" ];
+    extra-substituters = [ "https://cache.hellas.ai" ];
+    extra-trusted-public-keys = [ "cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g=" ];
   };
 
   inputs = {
@@ -21,20 +21,22 @@
     };
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    rust-overlay,
-    catgrad,
-  }: let
-    systems = [
-      "x86_64-linux"
-      "aarch64-linux"
-      "aarch64-darwin"
-    ];
-    forAllSystems = nixpkgs.lib.genAttrs systems;
-    perSystem = forAllSystems (
-      system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      catgrad,
+    }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+      perSystem = forAllSystems (
+        system:
         import ./nix {
           inherit
             self
@@ -44,23 +46,25 @@
             catgrad
             ;
         }
-    );
-  in {
-    packages = forAllSystems (system: perSystem.${system}.packages);
-    apps = forAllSystems (system: perSystem.${system}.apps);
-    devShells = forAllSystems (system: perSystem.${system}.devShells);
-    checks = forAllSystems (system: perSystem.${system}.checks);
-    nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
-    ci = forAllSystems (system: perSystem.${system}.ci);
+      );
+    in
+    {
+      packages = forAllSystems (system: perSystem.${system}.packages);
+      apps = forAllSystems (system: perSystem.${system}.apps);
+      devShells = forAllSystems (system: perSystem.${system}.devShells);
+      checks = forAllSystems (system: perSystem.${system}.checks);
+      nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
+      ci = forAllSystems (system: perSystem.${system}.ci);
 
-    overlays.default = final: _prev: {
-      hellas = self.packages.${final.system};
+      overlays.default = final: _prev: {
+        hellas = self.packages.${final.system};
+        hellasLib = import ./nix/lib { pkgs = final; };
+      };
+
+      nixosModules.hellas = import ./nix/modules/nixos.nix { inherit self; };
+      nixosModules.default = self.nixosModules.hellas;
+
+      homeManagerModules.hellas = import ./nix/modules/home-manager.nix { inherit self; };
+      homeManagerModules.default = self.homeManagerModules.hellas;
     };
-
-    nixosModules.hellas = import ./nix/modules/nixos.nix {inherit self;};
-    nixosModules.default = self.nixosModules.hellas;
-
-    homeManagerModules.hellas = import ./nix/modules/home-manager.nix {inherit self;};
-    homeManagerModules.default = self.homeManagerModules.hellas;
-  };
 }

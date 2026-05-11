@@ -2,35 +2,66 @@
   pkgs,
   lib,
   rustToolchain,
-}: let
-  # Single source of truth for CI lint/test commands. Each entry has:
-  #   check — read-only verification command (run by CI, `nix run .#check`)
-  #   fix   — optional auto-apply variant (run by `nix run .#fix`)
-  # `nix eval .#ci.<system>.commands` returns { name → check } and is
-  # what the GitHub Actions matrix enumerates.
-  ciChecks = {
-    fmt = {
-      check = "cargo fmt --all -- --check";
-      fix = "cargo fmt --all";
+  workspaceNativeBuildInputs,
+}:
+let
+  mk =
+    name: cmd: inputs:
+    pkgs.writeShellApplication {
+      inherit name;
+      text = ''
+        export PATH="${lib.makeBinPath inputs}"
+        ${cmd}
+      '';
     };
-    clippy = {
-      check = "cargo clippy --workspace --all-targets -- -D warnings";
-      fix = "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged";
-    };
-    sort = {
-      check = "cargo-sort --workspace --check";
-      fix = "cargo-sort --workspace";
-    };
-    test = {
-      check = "cargo test --workspace";
-    };
+
+  cargoEnv =
+    toolchain:
+    [
+      toolchain
+      pkgs.stdenv.cc
+    ]
+    ++ workspaceNativeBuildInputs;
+
+  # CI-gating checks. These surface as `apps.<sys>.check-<name>` and run in
+  # the GitHub Actions matrix.
+  checks = {
+    fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
+    clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
+      cargoEnv rustToolchain
+    );
+    sort = mk "check-sort" "cargo-sort --workspace --check" [ pkgs.cargo-sort ];
+    taplo = mk "check-taplo" "taplo fmt --check '*.toml' 'crates/**/Cargo.toml'" [ pkgs.taplo ];
+    buf = mk "check-buf" "buf lint" [ pkgs.buf ];
+    deadnix = mk "check-deadnix" ''
+      shopt -s globstar
+      deadnix --fail flake.nix nix/**/*.nix
+    '' [ pkgs.deadnix ];
+    statix = mk "check-statix" "statix check ." [ pkgs.statix ];
+    nixfmt = mk "check-nixfmt" ''
+      shopt -s globstar
+      nixfmt --check flake.nix nix/**/*.nix
+    '' [ pkgs.nixfmt-rfc-style ];
+    flake-check = mk "check-flake-check" "nix flake check --no-build" [ pkgs.nix ];
+    wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
+      cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
+    );
   };
 
-  # Heuristic checks — included in `nix run .#check` for dev runs but
-  # kept out of CI (false positives when an upstream dep ships a major).
-  devOnlyChecks = {
-    outdated = {
-      check = ''
+  # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
+  fixes = {
+    fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
+    clippy =
+      mk "fix-clippy" "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
+        (cargoEnv rustToolchain);
+    sort = mk "fix-sort" "cargo-sort --workspace" [ pkgs.cargo-sort ];
+  };
+
+  # Heuristic — noisy enough to keep out of CI. Surfaced only via
+  # `nix run .#check` for occasional dev use.
+  outdatedCheck =
+    mk "check-outdated"
+      ''
         report="$(cargo outdated --workspace --root-deps-only --format json)"
         breaking_updates="$(
           echo "$report" | jq -r '
@@ -52,65 +83,41 @@
           exit 1
         fi
         echo "No semver-breaking root dependency updates detected."
-      '';
-    };
-  };
+      ''
+      (
+        with pkgs;
+        [
+          rustToolchain
+          cargo-outdated
+          jq
+        ]
+      );
 
-  allChecks = ciChecks // devOnlyChecks;
-
-  # All-runner used by `nix run .#check` / `nix run .#fix`. Carries its
-  # own toolchain so it works outside the dev shell.
-  mkRunner = mode:
+  # `nix run .#check` runs every gating check plus outdated.
+  # `nix run .#fix`   runs the auto-fix variants.
+  mkAggregate =
+    name: pkgList:
     pkgs.writeShellApplication {
-      name = "hellas-${mode}-all";
-      runtimeInputs = with pkgs; [
-        git
-        coreutils
-        rustToolchain
-        stdenv.cc
-        pkg-config
-        protobuf
-        cargo-sort
-        cargo-outdated
-        jq
-      ];
-      text =
-        ''
-          set -euo pipefail
-          cd "$(git rev-parse --show-toplevel)"
-        ''
-        + lib.concatMapStrings (
-          name: let
-            c = allChecks.${name};
-          in ''
-
-            echo "== ${mode}-${name}"
-            ${
-              if mode == "check"
-              then c.check
-              else c.fix
-            }
-          ''
-        ) (
-          if mode == "check"
-          then lib.attrNames allChecks
-          else lib.attrNames (lib.filterAttrs (_: c: c ? fix) allChecks)
-        );
+      inherit name;
+      text = lib.concatMapStringsSep "\n" lib.getExe pkgList;
     };
+
   # Extended (post-gate) builds run only on push. Each value is an attribute
   # path under `packages.<system>` consumed by the GitHub Actions matrix as
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
-    static-x86_64 = "cross.x86_64-linux-musl.cli";
-    static-aarch64 = "cross.aarch64-linux-musl.cli";
-    docker-cpu = "docker-cpu";
+    cli = "cli";
+    cli-candle = "cli-candle";
+    static-x86_64 = "cross-x86_64-linux-musl-cli";
+    static-aarch64 = "cross-aarch64-linux-musl-cli";
+    static-windows = "cross-x86_64-windows-cli";
     docker-cuda = "docker-cuda";
+    hellas-rpc-wasm = "hellas-rpc-wasm";
   };
-in {
-  # Flat { name → command } exposed to the CI matrix. Keep this stable;
-  # adding a key here adds a CI job (no workflow edit needed).
-  commands = lib.mapAttrs (_: c: c.check) ciChecks;
+in
+{
+  inherit checks fixes;
   builds = ciBuilds;
-  checkAll = mkRunner "check";
-  fixAll = mkRunner "fix";
+  checkAll = mkAggregate "check-all" ((lib.attrValues checks) ++ [ outdatedCheck ]);
+  fixAll = mkAggregate "fix-all" (lib.attrValues fixes);
 }

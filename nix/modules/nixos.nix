@@ -1,15 +1,18 @@
 {
   self,
-  hellas ? import ./hellas.nix {inherit self;},
-}: {
+  hellas ? import ./hellas.nix { inherit self; },
+}:
+{
   config,
   lib,
   pkgs,
   ...
-}: let
+}:
+let
   inherit (lib) mkIf mkOption types;
   cfg = config.services.hellas;
-in {
+in
+{
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
@@ -23,7 +26,7 @@ in {
         generation.
       '';
     }
-    // hellas.serveOptions {inherit lib;}
+    // hellas.serveOptions { inherit lib pkgs; }
     // {
       openFirewall = mkOption {
         type = types.bool;
@@ -42,20 +45,22 @@ in {
 
     systemd.services.hellas = {
       description = "Hellas node server";
-      wantedBy = ["multi-user.target"];
-      after = ["network-online.target"];
-      wants = ["network-online.target"];
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
           inherit (cfg) otel;
         }
         // cfg.environment
-        // {HOME = "/var/lib/hellas";}
+        // {
+          HOME = pkgs.hellasLib.defaultStateDir;
+        }
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
-          ["${cfg.package}/bin/hellas-cli"]
+          [ "${cfg.package}/bin/hellas-cli" ]
           ++ hellas.mkServeArgs {
             inherit lib;
             serve = cfg;
@@ -64,12 +69,12 @@ in {
         Restart = "on-failure";
         DynamicUser = true;
         StateDirectory = "hellas";
-        WorkingDirectory = "/var/lib/hellas";
+        WorkingDirectory = pkgs.hellasLib.defaultStateDir;
       };
     };
 
     networking.firewall = mkIf (cfg.openFirewall && cfg.port != null) {
-      allowedUDPPorts = [cfg.port];
+      allowedUDPPorts = [ cfg.port ];
     };
   };
 }

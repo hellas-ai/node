@@ -14,10 +14,10 @@ default = []
 # RPC/transport server bits. Source code gates on the implicit `hellas-executor`
 # feature that cargo creates from the optional dep (no `dep:` prefix used).
 candle = [
-    "hellas-executor/candle",
-    "hellas-pb/server",
-    "hellas-rpc/server",
-    "tonic-iroh-transport/server",
+  "hellas-executor/candle",
+  "hellas-pb/server",
+  "hellas-rpc/server",
+  "tonic-iroh-transport/server",
 ]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
@@ -27,14 +27,14 @@ candle-metal = ["candle", "hellas-executor/candle-metal"]
 # `execution.rs` / `serve/node.rs` collapse to identity, and iroh's metrics
 # module is not built.
 otel = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-    "dep:reqwest",
-    "dep:iroh-metrics",
-    "tonic-iroh-transport/otel",
-    "tonic-iroh-transport/metrics",
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+  "dep:reqwest",
+  "dep:iroh-metrics",
+  "tonic-iroh-transport/otel",
+  "tonic-iroh-transport/metrics",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -53,14 +53,23 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
-hellas-pb = { workspace = true, features = ["hellas", "symbolic", "opaque", "courtesy", "swarm", "client"] }
-hellas-rpc = { workspace = true, default-features = false, features = [
-    "node",
-    "client",
-    "compression",
-    "discovery",
+hellas-pb = { workspace = true, features = [
+  "hellas",
+  "symbolic",
+  "opaque",
+  "courtesy",
+  "swarm",
+  "client",
 ] }
-iroh-metrics = { version = "0.38", default-features = false, features = ["metrics"], optional = true }
+hellas-rpc = { workspace = true, default-features = false, features = [
+  "node",
+  "client",
+  "compression",
+  "discovery",
+] }
+iroh-metrics = { version = "0.38", default-features = false, features = [
+  "metrics",
+], optional = true }
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 opentelemetry = { workspace = true, optional = true }
@@ -77,9 +86,9 @@ tokio.workspace = true
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, features = [
-    "client",
-    "discovery-mdns",
-    "discovery-dht",
+  "client",
+  "discovery-mdns",
+  "discovery-dht",
 ] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
