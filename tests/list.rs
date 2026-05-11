@@ -2,6 +2,10 @@
 //! the constructors that didn't get exercised through the kernel's
 //! higher-level paths.
 
+#![allow(clippy::alloc_instead_of_core)]
+#![allow(clippy::disallowed_types)]
+#![allow(clippy::std_instead_of_alloc)]
+#![allow(clippy::std_instead_of_core)]
 #![allow(clippy::unwrap_used)]
 
 use hellas_kernel::List;

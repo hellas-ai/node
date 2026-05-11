@@ -99,7 +99,7 @@ fn assert_invariants(state: &l1::TraceState) -> Result<(), proptest::test_runner
     prop_assert!(view.edge_len() <= 1);
     for (_, edge) in view.edges() {
         prop_assert_eq!(edge.parties(), l1::PARTIES);
-        prop_assert_eq!(edge.terms(), l1::TERMS.hash());
+        prop_assert_eq!(edge.terms(), l1::terms().hash());
     }
 
     Ok(())

@@ -6,7 +6,7 @@ fn apply_all_opens_and_resolves_one_batch() {
     let ops = List::all([
         Op::Open(Open::from_terms(
             funding(MAKER_COIN, TAKER_COIN),
-            BASIC_TERMS,
+            basic_terms(),
         )),
         Op::Resolve(Resolve::new(
             edge(),
@@ -92,7 +92,7 @@ fn apply_all_rolls_back_on_error() {
 #[test]
 fn apply_iter_emits_events_per_op() {
     let mut state = funded_state();
-    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), BASIC_TERMS);
+    let open = Open::from_terms(funding(MAKER_COIN, TAKER_COIN), basic_terms());
     let edge_id = open.output();
     let ops = [
         Op::Open(open),
