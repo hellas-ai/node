@@ -13,6 +13,6 @@ pub use admission::{AcquireDenied, Outcome, Permit, RequestKind};
 pub use id::PeerId;
 pub use registry::{
     DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerRegistry, PeerRegistryConfig,
-    ServiceState, ServiceStatus,
+    ServiceObservation, ServiceState, ServiceStatus,
 };
 pub use security::{AuthLevel, TransportSecurity};
