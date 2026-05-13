@@ -2648,6 +2648,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-iroh-transport",
+ "tonic-prost",
  "tower-layer",
  "tower-service",
 ]
