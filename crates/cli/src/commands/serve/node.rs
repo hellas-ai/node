@@ -1,4 +1,3 @@
-use super::peer_tracker::{MAX_SERVICE_ALPN_LEN, PeerTracker, RequestKind};
 use anyhow::Context;
 use catgrad::prelude::Dtype;
 use futures::StreamExt;
@@ -14,11 +13,20 @@ use hellas_pb::swarm::{
 };
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
+use hellas_rpc::peers::{
+    DiscoverySource, InboundRequestPolicy, PeerDirectory, PeerId, RequestKind as PeerRequestKind,
+    ServiceKey, TransportSecurity,
+};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::service::{
+    CourtesyService as CourtesyRpcService, ExecuteService as ExecuteRpcService,
+    NodeService as NodeRpcService, OpaqueService as OpaqueRpcService,
+    SymbolicService as SymbolicRpcService,
+};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tonic::codec::CompressionEncoding;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
@@ -48,20 +56,25 @@ struct NodeService {
     node_id: String,
     build: String,
     graffiti: Vec<u8>,
-    peer_tracker: Arc<Mutex<PeerTracker>>,
+    peer_directory: PeerDirectory,
 }
 
 #[derive(Clone)]
 struct ExecutePeerInterceptor {
-    peer_tracker: Arc<Mutex<PeerTracker>>,
+    peer_directory: PeerDirectory,
 }
 
 impl tonic::service::Interceptor for ExecutePeerInterceptor {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request)
-            && let Ok(mut tracker) = self.peer_tracker.lock()
-        {
-            let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::ExecuteRpc);
+        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
+            let _ = self.peer_directory.observe_inbound_request(
+                peer_id_from_endpoint(peer_id),
+                observed_rtt.map(duration_ms),
+                InboundRequestPolicy::account_only(
+                    PeerRequestKind::for_service::<ExecuteRpcService>("ExecuteRpc"),
+                    1.0,
+                ),
+            );
         }
         Ok(request)
     }
@@ -73,10 +86,15 @@ impl Node for NodeService {
         &self,
         request: Request<GetNodeInfoRequest>,
     ) -> Result<Response<GetNodeInfoResponse>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request)
-            && let Ok(mut tracker) = self.peer_tracker.lock()
-        {
-            let _ = tracker.observe_request(peer_id, observed_rtt, RequestKind::GetNodeInfo);
+        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
+            let _ = self.peer_directory.observe_inbound_request(
+                peer_id_from_endpoint(peer_id),
+                observed_rtt.map(duration_ms),
+                InboundRequestPolicy::account_only(
+                    PeerRequestKind::for_service::<NodeRpcService>("GetNodeInfo"),
+                    0.5,
+                ),
+            );
         }
 
         Ok(Response::new(GetNodeInfoResponse {
@@ -98,22 +116,29 @@ impl Node for NodeService {
         };
 
         let req = request.into_inner();
-        if req.service_alpn.len() > MAX_SERVICE_ALPN_LEN {
-            if let Ok(mut tracker) = self.peer_tracker.lock() {
-                tracker.mark_invalid_request(requester_id);
-            }
+        let max_service_filter_len = self.peer_directory.max_service_filter_len();
+        if req.service_alpn.len() > max_service_filter_len {
+            let _ = self
+                .peer_directory
+                .observe_invalid_request(peer_id_from_endpoint(requester_id));
             return Err(Status::invalid_argument(format!(
-                "service_alpn too long (max {MAX_SERVICE_ALPN_LEN} bytes)"
+                "service_alpn too long (max {max_service_filter_len} bytes)"
             )));
         }
 
-        let mut tracker = self
-            .peer_tracker
-            .lock()
-            .map_err(|_| Status::internal("peer tracker is unavailable"))?;
-
-        let admission =
-            tracker.observe_request(requester_id, observed_rtt, RequestKind::GetKnownPeers);
+        let requester = peer_id_from_endpoint(requester_id);
+        let admission = self
+            .peer_directory
+            .observe_inbound_request(
+                requester,
+                observed_rtt.map(duration_ms),
+                InboundRequestPolicy::rate_limited(
+                    PeerRequestKind::for_service::<NodeRpcService>("GetKnownPeers"),
+                    4.0,
+                    1.0,
+                ),
+            )
+            .map_err(|_| Status::internal("peer directory is unavailable"))?;
         if !admission.allow {
             warn!(
                 peer = %requester_id,
@@ -124,11 +149,14 @@ impl Node for NodeService {
             ));
         }
 
-        let peers = tracker.ranked_known_peers(
-            requester_id,
-            req.service_alpn.as_str(),
-            admission.disclosure_limit,
-        );
+        let peers = self
+            .peer_directory
+            .ranked_known_peers(
+                requester,
+                req.service_alpn.as_str(),
+                admission.disclosure_limit,
+            )
+            .map_err(|_| Status::internal("peer directory is unavailable"))?;
         let peer_ids = peers
             .into_iter()
             .map(|peer_id| peer_id.as_bytes().to_vec())
@@ -141,6 +169,14 @@ impl Node for NodeService {
 fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::time::Duration>)> {
     let context = request.extensions().get::<IrohContext>()?;
     Some((context.node_id, context.connection.rtt(PathId::ZERO)))
+}
+
+fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
+    PeerId::from(*peer_id.as_bytes())
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 async fn bind_endpoint(
@@ -236,13 +272,13 @@ pub(super) async fn spawn_node(
         node_id: endpoint.id().to_string(),
         build,
         graffiti,
-        peer_tracker: Arc::new(Mutex::new(PeerTracker::new(endpoint.id()))),
+        peer_directory: PeerDirectory::new(peer_id_from_endpoint(endpoint.id())),
     };
 
-    let peer_tracker = node_service.peer_tracker.clone();
+    let peer_directory = node_service.peer_directory.clone();
 
     let execute_interceptor = ExecutePeerInterceptor {
-        peer_tracker: peer_tracker.clone(),
+        peer_directory: peer_directory.clone(),
     };
 
     info!(
@@ -308,42 +344,40 @@ pub(super) async fn spawn_node(
         .context("failed to start transport")?;
 
     // Background peer discovery: watch DHT + mDNS for other executors and
-    // feed them into the PeerTracker so GetKnownPeers returns useful results.
+    // feed them into the peer directory so GetKnownPeers returns useful results.
     {
-        let peer_tracker = peer_tracker.clone();
+        let peer_directory = peer_directory.clone();
         let disc_endpoint = endpoint.clone();
         let disc_dht = DhtBackend::with_dht(&disc_endpoint, Arc::clone(&shared_dht));
         tokio::spawn(async move {
-            use hellas_rpc::peers::ServiceKey;
-            use hellas_rpc::service::{
-                CourtesyService as CourtesySvc, ExecuteService as ExecSvc, NodeService as NodeSvc,
-                OpaqueService as OpaqueSvc, SymbolicService as SymbolicSvc,
-            };
             let Ok(bindings) = DiscoveryBindings::client(disc_endpoint.id()) else {
-                warn!("failed to create discovery bindings for peer tracker");
+                warn!("failed to create discovery bindings for peer directory");
                 return;
             };
             let mut registry = ServiceRegistry::new(&disc_endpoint);
             registry.with_pool_options(PoolOptions::default());
             registry.add(MdnsBackend::new(bindings.mdns));
             registry.add(disc_dht);
-            let mut node_peers = Box::pin(registry.discover::<NodeSvc>());
-            let mut exec_peers = Box::pin(registry.discover::<ExecSvc>());
-            let mut symbolic_peers = Box::pin(registry.discover::<SymbolicSvc>());
-            let mut opaque_peers = Box::pin(registry.discover::<OpaqueSvc>());
-            let mut courtesy_peers = Box::pin(registry.discover::<CourtesySvc>());
+            let mut node_peers = Box::pin(registry.discover::<NodeRpcService>());
+            let mut exec_peers = Box::pin(registry.discover::<ExecuteRpcService>());
+            let mut symbolic_peers = Box::pin(registry.discover::<SymbolicRpcService>());
+            let mut opaque_peers = Box::pin(registry.discover::<OpaqueRpcService>());
+            let mut courtesy_peers = Box::pin(registry.discover::<CourtesyRpcService>());
             loop {
                 let (peer_id, service) = tokio::select! {
-                    Some(Ok(peer)) = node_peers.next() => (peer.id(), <NodeSvc as ServiceKey>::NAME),
-                    Some(Ok(peer)) = exec_peers.next() => (peer.id(), <ExecSvc as ServiceKey>::NAME),
-                    Some(Ok(peer)) = symbolic_peers.next() => (peer.id(), <SymbolicSvc as ServiceKey>::NAME),
-                    Some(Ok(peer)) = opaque_peers.next() => (peer.id(), <OpaqueSvc as ServiceKey>::NAME),
-                    Some(Ok(peer)) = courtesy_peers.next() => (peer.id(), <CourtesySvc as ServiceKey>::NAME),
+                    Some(Ok(peer)) = node_peers.next() => (peer.id(), <NodeRpcService as ServiceKey>::NAME),
+                    Some(Ok(peer)) = exec_peers.next() => (peer.id(), <ExecuteRpcService as ServiceKey>::NAME),
+                    Some(Ok(peer)) = symbolic_peers.next() => (peer.id(), <SymbolicRpcService as ServiceKey>::NAME),
+                    Some(Ok(peer)) = opaque_peers.next() => (peer.id(), <OpaqueRpcService as ServiceKey>::NAME),
+                    Some(Ok(peer)) = courtesy_peers.next() => (peer.id(), <CourtesyRpcService as ServiceKey>::NAME),
                     else => break,
                 };
-                if let Ok(mut tracker) = peer_tracker.lock() {
-                    tracker.mark_service(peer_id, service);
-                }
+                let _ = peer_directory.observe_discovered_service(
+                    peer_id_from_endpoint(peer_id),
+                    DiscoverySource::Transport("discovery"),
+                    service,
+                    TransportSecurity::Untrusted,
+                );
             }
         });
     }
