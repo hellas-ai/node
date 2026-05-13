@@ -2,6 +2,49 @@
 
 #[allow(unused_imports)]
 use crate::peers::RpcService;
+/// A protocol-level service entry — its FQN and the iroh ALPN
+/// derived from it. Emitted for every `.proto` service the
+/// build script saw, regardless of whether the matching feature
+/// flag is enabled in this build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownService {
+    pub name: &'static str,
+    pub alpn: &'static str,
+}
+/// Catalogue of every service this crate knows about. The
+/// transport layer (peer-disclosure filters, ALPN registry,
+/// etc.) iterates this to avoid hardcoding service identities
+/// in multiple places.
+pub const KNOWN_SERVICES: &[KnownService] = &[
+    KnownService {
+        name: "hellas.v1.Execute",
+        alpn: "/hellas.v1.Execute/1.0",
+    },
+    KnownService {
+        name: "hellas.symbolic.v1.Symbolic",
+        alpn: "/hellas.symbolic.v1.Symbolic/1.0",
+    },
+    KnownService {
+        name: "hellas.courtesy.v1.Courtesy",
+        alpn: "/hellas.courtesy.v1.Courtesy/1.0",
+    },
+    KnownService {
+        name: "hellas.opaque.v1.Opaque",
+        alpn: "/hellas.opaque.v1.Opaque/1.0",
+    },
+    KnownService {
+        name: "hellas.swarm.v1.Node",
+        alpn: "/hellas.swarm.v1.Node/1.0",
+    },
+];
+/// gRPC paths of every method marked rate-limited at codegen
+/// time. The `RpcServiceSpec::inbound_policy` match arms use the
+/// same source-of-truth (the `is_rate_limited` table in
+/// build.rs); this list lets runtime callers inspect the policy
+/// without having to fabricate `InboundRequestPolicy` values.
+pub const KNOWN_RATE_LIMITED_METHODS: &[&'static str] = &[
+    "/hellas.swarm.v1.Node/GetKnownPeers",
+];
 #[cfg(feature = "execute")]
 pub struct ExecuteService;
 #[cfg(feature = "execute")]

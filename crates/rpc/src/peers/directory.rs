@@ -7,21 +7,11 @@ use super::{
     PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
 };
 
-pub const NODE_SERVICE_ALPN: &str = "/hellas.swarm.v1.Node/1.0";
-pub const EXECUTE_SERVICE_ALPN: &str = "/hellas.v1.Execute/1.0";
-pub const SYMBOLIC_SERVICE_ALPN: &str = "/hellas.symbolic.v1.Symbolic/1.0";
-pub const OPAQUE_SERVICE_ALPN: &str = "/hellas.opaque.v1.Opaque/1.0";
-pub const COURTESY_SERVICE_ALPN: &str = "/hellas.courtesy.v1.Courtesy/1.0";
-
-// Bare service FQNs. Hardcoded here so the directory module compiles without
-// any protocol feature: it's purely transport-side machinery that needs to
-// recognize service-by-name in peer-disclosure filters, regardless of whether
-// the local crate actually carries that service's typed marker.
-const NODE_SERVICE_NAME: &str = "hellas.swarm.v1.Node";
-const EXECUTE_SERVICE_NAME: &str = "hellas.v1.Execute";
-const SYMBOLIC_SERVICE_NAME: &str = "hellas.symbolic.v1.Symbolic";
-const OPAQUE_SERVICE_NAME: &str = "hellas.opaque.v1.Opaque";
-const COURTESY_SERVICE_NAME: &str = "hellas.courtesy.v1.Courtesy";
+// The hand-maintained `*_SERVICE_ALPN` / `*_SERVICE_NAME` constants used to
+// live here. They've been replaced by `crate::service::KNOWN_SERVICES`,
+// which the build script generates from the same `.proto` files that
+// produce the service markers — one source of truth for "what services
+// exist in this protocol".
 
 const DEFAULT_MAX_TRACKED_PEERS: usize = 2048;
 const DEFAULT_MAX_KNOWN_PEERS_RESPONSE: usize = 64;
@@ -45,18 +35,16 @@ impl ServiceAlias {
 }
 
 fn default_service_aliases() -> Vec<ServiceAlias> {
-    vec![
-        ServiceAlias::new(NODE_SERVICE_ALPN, NODE_SERVICE_NAME),
-        ServiceAlias::new(NODE_SERVICE_NAME, NODE_SERVICE_NAME),
-        ServiceAlias::new(EXECUTE_SERVICE_ALPN, EXECUTE_SERVICE_NAME),
-        ServiceAlias::new(EXECUTE_SERVICE_NAME, EXECUTE_SERVICE_NAME),
-        ServiceAlias::new(SYMBOLIC_SERVICE_ALPN, SYMBOLIC_SERVICE_NAME),
-        ServiceAlias::new(SYMBOLIC_SERVICE_NAME, SYMBOLIC_SERVICE_NAME),
-        ServiceAlias::new(OPAQUE_SERVICE_ALPN, OPAQUE_SERVICE_NAME),
-        ServiceAlias::new(OPAQUE_SERVICE_NAME, OPAQUE_SERVICE_NAME),
-        ServiceAlias::new(COURTESY_SERVICE_ALPN, COURTESY_SERVICE_NAME),
-        ServiceAlias::new(COURTESY_SERVICE_NAME, COURTESY_SERVICE_NAME),
-    ]
+    // Derive the alias table from the generated `KNOWN_SERVICES` list so the
+    // directory's view of "what services exist" stays in sync with codegen.
+    // Each service contributes two aliases: one keyed by ALPN and one keyed
+    // by FQN, both pointing at the FQN as the canonical service name.
+    let mut aliases = Vec::with_capacity(crate::service::KNOWN_SERVICES.len() * 2);
+    for entry in crate::service::KNOWN_SERVICES {
+        aliases.push(ServiceAlias::new(entry.alpn, entry.name));
+        aliases.push(ServiceAlias::new(entry.name, entry.name));
+    }
+    aliases
 }
 
 /// Policy and bounds for serving peer-disclosure APIs.
@@ -412,12 +400,19 @@ fn bounded_penalty(count: u64, weight: i64) -> i64 {
 #[cfg(all(test, feature = "swarm", feature = "execute"))]
 mod tests {
     use super::*;
+    use crate::peers::IrohServiceSpec;
     use crate::service::{ExecuteService, NodeService};
 
     const GET_NODE_INFO: RequestKind =
         RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
     const GET_KNOWN_PEERS: RequestKind =
         RequestKind::for_method::<crate::service::methods::GetKnownPeers>();
+
+    // Test-local aliases for the well-known ALPNs. Kept here so the tests
+    // don't depend on hand-written constants in this module — the actual
+    // service catalogue is the build-script-generated `KNOWN_SERVICES`.
+    const NODE_SERVICE_ALPN: &str = <NodeService as IrohServiceSpec>::ALPN;
+    const EXECUTE_SERVICE_ALPN: &str = <ExecuteService as IrohServiceSpec>::ALPN;
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
