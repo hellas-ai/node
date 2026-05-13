@@ -19,10 +19,10 @@ mod open;
 use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
 
 use hellas_kernel::{
-    ApplyError, Block, BlockHash, BlockHeight, CloseHash, CloseKind, CoinId, Context, Cost, EdgeId,
-    Event, EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
+    ApplyError, Block, BlockHash, BlockHeight, CloseKind, CoinId, Context, Cost, EdgeId, Event,
+    EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
     InvalidProofReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, TermsHash, Tx, View,
+    PayloadHash, Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, TermsHash, Tx, View,
 };
 
 const CONTEXT: Context = Context::new(
@@ -32,16 +32,21 @@ const CONTEXT: Context = Context::new(
 const FEE_CONTEXT: Context = Context::with_fees(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
-    Fees::new(3, 0, 0),
+    Fees::new(3, 0, 0, 0),
 );
 const RESOURCE_CONTEXT: Context = Context::with_fees(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
-    Fees::new(1, 3, 0),
+    Fees::new(1, 3, 0, 3),
 );
-const TIMEOUT: BlockHeight = BlockHeight::new(1);
+const TIMEOUT: BlockHeight = BlockHeight::new(2);
+const RESOURCE_TIMEOUT_CONTEXT: Context = Context::with_fees(
+    TIMEOUT,
+    BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    Fees::new(1, 3, 0, 3),
+);
 const EARLY_CONTEXT: Context = Context::new(
-    BlockHeight::new(0),
+    BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 const TIMEOUT_CONTEXT: Context =
@@ -79,7 +84,18 @@ fn other_terms() -> TermsHash {
 }
 
 fn terms_with(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
-    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, outputs.clone())
+    terms_with_timeout(TIMEOUT, outputs)
+}
+
+fn terms_with_timeout(timeout: BlockHeight, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, timeout, outputs.clone())
+}
+
+fn terms_paying(maker: u64, taker: u64) -> Terms {
+    terms_with(&payouts(
+        Payout::new(MAKER, maker),
+        Payout::new(TAKER, taker),
+    ))
 }
 
 fn proof() -> Proof {
@@ -102,7 +118,7 @@ fn taker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
     Sig::placeholder(TAKER, mutual_hash(input, outputs))
 }
 
-fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> CloseHash {
+fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> PayloadHash {
     close_hash(CloseKind::Mutual, input, outputs)
 }
 
@@ -122,7 +138,7 @@ fn close_hash(
     kind: CloseKind,
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> CloseHash {
+) -> PayloadHash {
     Tx::payload_hash(input, kind, terms(), outputs)
 }
 
@@ -130,7 +146,7 @@ fn other_close_hash(
     kind: CloseKind,
     input: EdgeId,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> CloseHash {
+) -> PayloadHash {
     Tx::payload_hash(input, kind, other_terms(), outputs)
 }
 
@@ -346,6 +362,11 @@ fn apply_with<const C: usize, const E: usize>(
         panic!("operation rejected");
     };
     event
+}
+
+fn lifetime_fee_for(context: Context, timeout: BlockHeight) -> Option<u64> {
+    let blocks = timeout.get().checked_sub(context.block_height().get())?;
+    context.fees().lifetime().checked_mul(blocks)
 }
 
 fn empty_store() -> FixedStore<6, 1> {

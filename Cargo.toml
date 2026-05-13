@@ -10,10 +10,13 @@ path = "src/lib.rs"
 [features]
 default = []
 secp256k1 = ["dep:secp256k1"]
+webauthn = ["dep:p256", "dep:sha2"]
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
 secp256k1 = { version = "0.31", default-features = false, optional = true, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false, optional = true }
 
 [dev-dependencies]
 allocation-counter = "0.8"

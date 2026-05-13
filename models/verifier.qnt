@@ -2,9 +2,12 @@
 //
 // Verification policy for close witnesses.
 //
-// Mirrors src/verifier.rs: the kernel implements no cryptography and
-// owns no protocol-level admissibility policy beyond Timeout structural
-// checks. Two narrow verifier interfaces draw the kernel/crypto seam:
+// Mirrors src/verifier.rs at the abstract close-proof level. The Rust
+// verifier trait also covers typed open authorization; the L1 model
+// represents that separately as `openAuth` in l1.qnt because the concrete
+// signature envelope (native vs WebAuthn) is irrelevant to the state
+// invariants once it establishes "this party authorized the open".
+// Two narrow verifier interfaces draw the kernel/crypto seam:
 //
 //   sigOk(...)  ↔ SigVerifier::verify_sig
 //   sealOk(...) ↔ SealVerifier::verify_seal
@@ -27,13 +30,13 @@ module verifier {
   // both maker and taker signed the canonical payload — which at this
   // abstraction layer is just "the protocol's bound (MakerPayout,
   // TakerPayout) split was committed to". The Violation case folds
-  // `sealOk` similarly. Timeout has no verifier: the kernel itself
-  // enforces the height guard.
+  // `sealOk` similarly. Mutual and Violation are pre-expiry paths; Timeout
+  // is the deterministic fallback once the paid lifetime has expired.
   pure def proofOk(p: Proof, height: int): bool =
     match p {
-      | Mutual => true
+      | Mutual => height < TimeoutHeight
       | Timeout => height >= TimeoutHeight
-      | Violation => true
+      | Violation => height < TimeoutHeight
     }
 
   // Per-proof payout binding. Every close witness binds the canonical
@@ -43,8 +46,8 @@ module verifier {
   // admits an unbound split.
   pure def payoutsBound(p: Proof, makerPay: int, takerPay: int): bool =
     match p {
-      | Mutual => makerPay == MakerPayout and takerPay == TakerPayout
-      | Timeout => makerPay == MakerPayout and takerPay == TakerPayout
-      | Violation => makerPay == MakerPayout and takerPay == TakerPayout
+      | Mutual => payoutSplitOk(makerPay, takerPay)
+      | Timeout => payoutSplitOk(makerPay, takerPay)
+      | Violation => payoutSplitOk(makerPay, takerPay)
     }
 }

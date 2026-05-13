@@ -33,10 +33,10 @@
 use std::collections::BTreeMap;
 
 use hellas_kernel::{
-    Batch, Block, BlockHash, BlockHeight, CloseHash, CloseKind, Coin, CoinId, Context, Edge,
-    EdgeId, EventKind, Fees, Funding, Genesis, InsertError, KernelResult, Key, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Secp256k1Verifier,
-    Sig, State, Store, Terms, Tx,
+    Batch, Block, BlockHash, BlockHeight, CloseKind, Coin, CoinId, Context, Edge, EdgeId,
+    EventKind, Fees, Funding, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS,
+    MAX_PARTY_INPUTS, Parties, PayloadHash, Payout, Proof, ProtocolCode, Secp256k1Verifier, Sig,
+    State, Store, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
@@ -127,7 +127,7 @@ fn keypair(seed: u8) -> (SecretKey, Key) {
     (secret, Key::from_bytes(public.serialize()))
 }
 
-fn sign(secret: &SecretKey, hash: CloseHash) -> Sig {
+fn sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
     let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);
@@ -172,9 +172,9 @@ fn main() {
     let maker_coin = CoinId::from_bytes([0xaa; CoinId::LENGTH]);
     let taker_coin = CoinId::from_bytes([0xbb; CoinId::LENGTH]);
 
-    let timeout_payouts = payouts(maker_pk, taker_pk, 6, 4);
+    let timeout_payouts = payouts(maker_pk, taker_pk, 7, 8);
     let mutual_payouts = payouts(maker_pk, taker_pk, 7, 8);
-    let timeout_height = BlockHeight::new(2);
+    let timeout_height = BlockHeight::new(4);
     let terms = Terms::basic(
         ProtocolCode::new(1),
         parties,

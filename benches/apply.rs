@@ -45,16 +45,12 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("../models/traces/l1_violationTraceTest.itf.json"),
     ),
     (
-        "both_edges_timeout",
-        include_str!("../models/traces/l1_bothEdgesTimeoutTraceTest.itf.json"),
+        "timeout_expiry",
+        include_str!("../models/traces/l1_timeoutExpiryTraceTest.itf.json"),
     ),
     (
         "mixed_proofs",
         include_str!("../models/traces/l1_mixedProofsTraceTest.itf.json"),
-    ),
-    (
-        "height_accumulation",
-        include_str!("../models/traces/l1_heightAccumulationTraceTest.itf.json"),
     ),
 ];
 

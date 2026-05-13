@@ -7,7 +7,7 @@
 //!
 //! Compact-form ECDSA signatures are 64 bytes (`r ‖ s`), matching the
 //! kernel's [`Sig`] shape. Compressed public keys are 33 bytes, matching
-//! [`Key`]. The 32-byte [`CloseHash`] is interpreted as the pre-hashed
+//! [`Key`]. The 32-byte [`PayloadHash`] is interpreted as the pre-hashed
 //! message — the verifier does not hash again.
 //!
 //! # Scope
@@ -23,8 +23,8 @@
 
 use secp256k1::{Message, PublicKey, Secp256k1, VerifyOnly, ecdsa::Signature};
 
-use crate::primitive::{CloseHash, Key, Sig};
-use crate::tx::Seal;
+use crate::primitive::{Key, PayloadHash, Sig};
+use crate::tx::{OpenAuth, Seal};
 use crate::verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 
 /// Verifier that accepts compact-form secp256k1 ECDSA signatures from
@@ -52,7 +52,7 @@ impl Default for Secp256k1Verifier {
 }
 
 impl SigVerifier for Secp256k1Verifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
         let Ok(pk) = PublicKey::from_slice(key.as_bytes()) else {
             return false;
         };
@@ -61,6 +61,18 @@ impl SigVerifier for Secp256k1Verifier {
         };
         let message = Message::from_digest(hash.to_bytes());
         self.secp.verify_ecdsa(message, &signature, &pk).is_ok()
+    }
+
+    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+        match auth {
+            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            #[cfg(feature = "webauthn")]
+            OpenAuth::WebAuthn(assertion) => {
+                crate::webauthn::verify_webauthn_assertion(assertion, key, hash).is_ok()
+            }
+            #[cfg(not(feature = "webauthn"))]
+            OpenAuth::WebAuthn(_) => false,
+        }
     }
 }
 

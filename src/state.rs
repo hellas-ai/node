@@ -5,6 +5,8 @@
 //! through a `step` relation; here `apply` / `apply_all` / `apply_block` play
 //! the same role over a concrete [`Store`].
 
+use core::borrow::Borrow;
+
 use crate::{
     block::Block,
     context::Context,
@@ -150,9 +152,10 @@ impl<S: Store> State<S> {
     /// Applies an ordered, dynamically-sized operation batch atomically.
     ///
     /// Equivalent to [`Self::apply_all`] but for callers whose batch size is
-    /// not known at the type level. Validation and folding share one staged
-    /// transaction; the closure receives each emitted [`Event`] as the batch
-    /// progresses, so callers who only need to observe events without
+    /// not known at the type level. The operation iterator may yield owned
+    /// transactions or borrowed transactions. Validation and folding share one
+    /// staged transaction; the closure receives each emitted [`Event`] as the
+    /// batch progresses, so callers who only need to observe events without
     /// allocating an event vector can do so. If any operation fails the
     /// transaction is dropped, the closure is not called for the failed or
     /// any subsequent operations, and the backing store is unchanged.
@@ -171,21 +174,23 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_iter<V, F>(
+    pub fn apply_iter<V, F, I, B>(
         &mut self,
         context: Context,
         verifier: &V,
-        operations: impl IntoIterator<Item = Tx>,
+        operations: I,
         mut on_event: F,
     ) -> KernelResult<(), BatchError>
     where
         V: SigVerifier + SealVerifier + ?Sized,
+        I: IntoIterator<Item = B>,
+        B: Borrow<Tx>,
         F: FnMut(usize, &Event),
     {
         let mut tx = self.store.begin();
 
         for (index, operation) in operations.into_iter().enumerate() {
-            let event = Self::fold_one(&mut tx, context, verifier, &operation)
+            let event = Self::fold_one(&mut tx, context, verifier, operation.borrow())
                 .map_err(|source| BatchError::new(index, source))?;
             on_event(index, &event);
         }

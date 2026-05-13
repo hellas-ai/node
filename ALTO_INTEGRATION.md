@@ -18,10 +18,10 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 | Tx enum                | `Transaction { Transfer, MergeCoin }`                    | `Tx { Open, Close }`                           |
 | Object                 | `Coin { owner: Address, value: u64 }`                    | `Coin` (same shape) + `Edge`                   |
 | Object id              | `ObjectId = Sha256 Digest`                               | `CoinId`, `EdgeId`                             |
-| Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` (ECDSA)                       |
+| Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` for native close/open auth; `OpenAuth::WebAuthn` for passkey opens |
 | STF                    | `execute_all` / `execute_proposal` (inline, async)       | `State::apply*` (sync, trait-bounded)          |
 | Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Batch` traits (sync)                  |
-| Crypto                 | Inline `Transaction::verify_signature`                   | `SigVerifier` + `SealVerifier` traits          |
+| Crypto                 | Inline `Transaction::verify_signature`                   | `SigVerifier` + `SealVerifier`; WebAuthn open helpers behind `webauthn` |
 | Context                | `Context<Digest, PublicKey>` + height + timestamp        | `Context { height, hash, fees }`               |
 | Genesis                | `Vec<(Address, u64)>` looped at height 0                 | `State::genesis(store, &[Genesis::coin(...)])` |
 | Fees                   | None                                                     | `Fees`, `Cost` per op                          |
@@ -39,9 +39,10 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
   point to one source of truth.)
 - `types/src/lib.rs::Transaction::verify_signature` — moves into the
   `SigVerifier` impl.
-- `types/src/lib.rs::transfer_challenge`, `merge_challenge` — the
-  WebAuthn challenge construction. Stays in alto but lives below the
-  kernel; the kernel never sees these.
+- `types/src/lib.rs::transfer_challenge`, `merge_challenge` — replaced
+  by the kernel's canonical open hash (`Tx::open_hash`) for channel
+  opens. Alto may still build browser request options, but the
+  submitted assertion is carried into the kernel as `OpenAuth::WebAuthn`.
 - `chain/src/execution/kernel.rs::ExecutionError` — replaced by
   `hellas_kernel::ApplyError` / `BatchError`. Drop the
   `is_transient_for_mempool` / `is_fatal_storage` classifier and re-add
@@ -66,14 +67,15 @@ pass `&UserVerifier`.
 // chain/src/execution/verifier.rs (new file, ~35 lines)
 
 use hellas_kernel::{
-    CloseHash, Key, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier,
+    verify_webauthn_assertion, PayloadHash, Key, OpenAuth, Seal,
+    SealPublicInputs, SealVerifier, Sig, SigVerifier,
 };
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 
 pub struct UserVerifier;
 
 impl SigVerifier for UserVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
         let Ok(vk) = VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
             return false;
         };
@@ -81,6 +83,15 @@ impl SigVerifier for UserVerifier {
             return false;
         };
         vk.verify(hash.as_bytes(), &sig).is_ok()
+    }
+
+    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+        match auth {
+            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::WebAuthn(assertion) => {
+                verify_webauthn_assertion(assertion, key, hash).is_ok()
+            }
+        }
     }
 }
 
@@ -97,29 +108,25 @@ Timeout structural checks (terms-hash binding, height guard, payout
 match) live inside the kernel and need no verifier — the `UserVerifier`
 above carries no Timeout logic.
 
-**Important boundary decision: WebAuthn lives in admission, not in the
-kernel.** Alto's mempool / proposer is responsible for unwrapping
-`WebAuthnSignature` (with `authenticator_data` + `client_data_json`)
-into a bare 64-byte ECDSA `Sig` before the tx reaches the kernel:
+**Important boundary decision: WebAuthn open authorization lives in the
+kernel.** Alto's mempool / proposer should not unwrap WebAuthn into a
+bare ECDSA `Sig`. For an open, it constructs:
 
-- Admission verifies the WebAuthn envelope binds to the expected
-  payload hash (`client_data_json.challenge == base64(payload_hash)`,
-  where `payload_hash` is `Tx::open_hash(...)` for opens or
-  `Tx::payload_hash(...)` for closes).
-- Admission extracts the 64-byte ECDSA bytes and constructs the
-  kernel `Tx` with `Sig::from_bytes(ecdsa)`. For opens this means
-  populating `Tx::Open { funding, terms, maker_sig, taker_sig }`
-  after collecting both signatures (typically: WebAuthn-signed maker
-  envelope + WebAuthn-signed taker envelope, both over the same
-  open hash).
-- Kernel re-verifies the inner ECDSA at apply time via the
-  `SigVerifier` trait, and also enforces the owner-match rule
-  (every funding coin must be owned by its party's key). Defense-
-  in-depth over the cryptographically meaningful piece.
+- `OpenAuth::Native(Sig)` for a native party signature, or
+- `OpenAuth::WebAuthn(WebAuthnAssertion)` for a passkey assertion.
 
-If you decide later to drop WebAuthn entirely (raw secp256r1 sigs
-direct from clients), the admission step shrinks but the kernel stays
-the same.
+The kernel verifier checks the WebAuthn assertion directly:
+
+- `clientDataJSON.type == "webauthn.get"`;
+- `clientDataJSON.challenge == base64url(Tx::open_hash(...))`;
+- UP or UV flag set; AT and ED rejected;
+- P-256 signature verifies over
+  `sha256(authenticatorData || sha256(clientDataJSON))`;
+- P-256 public key compresses to the party `Key`.
+
+Following Tempo's consensus shape, the kernel does not enforce
+`origin` or `rpIdHash`. Those bytes remain inside the signed WebAuthn
+message, but they are not policy inputs for kernel validity.
 
 ### 2. `impl hellas_kernel::Store for UtxoDb<E>` (and a `Batch` adapter)
 
@@ -234,8 +241,10 @@ coin ids are derived for genesis, only that they're distinct.
 
 `Fees::ZERO` plumbed into every `Context` constructor for now. Alto's
 fee model design is deferred — the kernel already supports
-`Fees { base, slot, proof }` and `Cost { base, slots, proofs }` per op,
-so when alto wires real fees the kernel side is unchanged.
+`Fees { base, slot, proof, lifetime }` and `Cost { base, slots, proofs }`
+per op, so when alto wires real fees the kernel side is unchanged. The
+`lifetime` price is charged on open for the prepaid live-edge span; it is
+separate from execution `slot` pricing.
 
 ### Mempool integration
 
@@ -243,8 +252,9 @@ Alto's mempool stays at the alto layer (kernel doesn't see mempools).
 The mempool's job changes:
 
 - Accepts `Tx` instead of `Transaction`.
-- Pre-admission: WebAuthn envelope validation (extract ECDSA sig,
-  verify challenge binding, extract the kernel `Tx` shape).
+- Build kernel `Tx::open_with_auth(...)` values. WebAuthn assertions
+  are not unwrapped; the kernel verifies their challenge binding and
+  P-256 signature during apply.
 - Drops the `is_transient_for_mempool` classification — kernel's
   `ApplyError::MissingCoin` is the moral equivalent; the mempool
   can pattern-match on `ApplyError` variants to decide retain-vs-drop.
@@ -268,10 +278,11 @@ The mempool's job changes:
    `chain/src/execution/kernel.rs`. File becomes a re-export shim or
    gets deleted entirely.
 7. **Alto: delete `Transaction`, `Coin`, `WebAuthnSignature::verify`**
-   from `types/src/lib.rs`. WebAuthn envelope type itself stays (used
-   by the RPC submission path) but its `verify` impl moves outside.
-8. **Alto: update RPC submission path** to unwrap WebAuthn into a
-   kernel `Tx` before mempool insertion.
+   from `types/src/lib.rs`. WebAuthn envelope type itself stays only if
+   it is still useful as an RPC DTO; kernel validation is via
+   `hellas_kernel::WebAuthnAssertion`.
+8. **Alto: update RPC submission path** to map WebAuthn RPC payloads
+   into `OpenAuth::WebAuthn` before mempool insertion.
 
 ## Open questions to resolve during Phase 1
 

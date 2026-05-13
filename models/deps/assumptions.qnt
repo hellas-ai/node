@@ -41,10 +41,12 @@ module assumptions {
 
   // The verifier never accepts a witness it should not. If `proofOk(p, h)
   // = true` and `payoutsBound(p, mPay, tPay) = true`, the kernel treats
-  // the proof as valid; if the verifier admits an invalid signature, seal,
-  // or non-canonical payout split, an unauthorized close can drain an
-  // edge. Modelled by the `proofOk` / `payoutsBound` predicates in
-  // `verifier.qnt`.
+  // the close proof as valid; if the verifier admits an invalid signature,
+  // seal, or non-canonical payout split, an unauthorized close can drain an
+  // edge. For opens, `openAuth` in `l1.qnt` abstracts both native and
+  // WebAuthn authorization as "the named party authorized this edge".
+  // Modelled by the `proofOk` / `payoutsBound` predicates in
+  // `verifier.qnt` and the `fundingAuthorized` invariant in `l1.qnt`.
 
   // Verification is deterministic — same proof, same answer every call.
   // The kernel relies on this to avoid double-checking; the abstract

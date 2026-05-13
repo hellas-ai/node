@@ -46,6 +46,12 @@ module types {
     | Taker
     | Adversary
 
+  // Open authorization reduced to the security property the kernel needs:
+  // the named maker/taker parties authorized the open. The concrete envelope
+  // may be native or WebAuthn; at this abstraction level only the resulting
+  // party identity matters.
+  type OpenAuth = { maker: Party, taker: Party }
+
   // Canonical coin ownership. Every concrete coin in the closed universe
   // belongs to exactly one party; the abstraction mirrors the kernel's
   // `Coin::owner` field. `Adversary` never owns anything in any reachable
@@ -117,6 +123,16 @@ module types {
   // equals this constant in every reachable state.
   pure val Total = EdgeValue
 
+  pure def canonicalCoinValue(c: Coin): int =
+    match c {
+      | MakerCoin => MakerValue
+      | TakerCoin => TakerValue
+      | MakerOut1 => MakerPayout
+      | MakerOut2 => MakerPayout
+      | TakerOut1 => TakerPayout
+      | TakerOut2 => TakerPayout
+    }
+
   // Canonical input/output wiring. Each edge's funding sources and close
   // outputs are positionally fixed; the kernel does the same via id
   // derivation in `Tx::edge_id_of` and `CoinId::payout`.
@@ -143,4 +159,20 @@ module types {
       | Edge1 => TakerOut1
       | Edge2 => TakerOut2
     }
+
+  // Sentinel value for edge slots that are not live. The value is not treated
+  // as an authorization; invariants only inspect open auth for live edges.
+  pure val NoOpenAuth = { maker: Adversary, taker: Adversary }
+
+  // The only authorization acceptable for an edge is the pair of owners of
+  // the funding coins that edge consumes.
+  pure def canonicalOpenAuth(e: Edge): OpenAuth =
+    { maker: coinOwner(makerInput(e)), taker: coinOwner(takerInput(e)) }
+
+  pure def openAuthOk(e: Edge, auth: OpenAuth): bool =
+    auth.maker == canonicalOpenAuth(e).maker
+      and auth.taker == canonicalOpenAuth(e).taker
+
+  pure def payoutSplitOk(makerPay: int, takerPay: int): bool =
+    makerPay == MakerPayout and takerPay == TakerPayout
 }
