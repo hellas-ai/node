@@ -6,6 +6,7 @@ use hellas_pb::courtesy::courtesy_client::CourtesyClient;
 use hellas_pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
+use hellas_rpc::iroh_client::{finish_unary, tracked_iroh_channel};
 use hellas_rpc::peers::{IrohRpcPool, MethodKey, PeerManager, RpcPermitGuard};
 use hellas_rpc::service::{CourtesyService, methods};
 use std::net::SocketAddr;
@@ -66,21 +67,16 @@ async fn put(
         .await
         .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
     let peer_registry = PeerManager::default();
-    let (mut client, mut permit) =
+    let (mut client, permit) =
         connect::<methods::PutArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
-    let response = match client
-        .put_artifact(PutArtifactRequest { canonical_artifact })
-        .await
-    {
-        Ok(response) => {
-            permit.finish_ok();
-            response.into_inner()
-        }
-        Err(err) => {
-            permit.finish_err(err.to_string());
-            return Err(err).context("put_artifact RPC failed");
-        }
-    };
+    let response = finish_unary::<methods::PutArtifact, _>(
+        permit,
+        client
+            .put_artifact(PutArtifactRequest { canonical_artifact })
+            .await,
+    )
+    .context("put_artifact RPC failed")?
+    .into_inner();
     let cid =
         Digest::from_slice(&response.cid).context("provider returned invalid artifact cid")?;
     println!("{cid}");
@@ -96,23 +92,18 @@ async fn get(
 ) -> CliResult<()> {
     let cid = parse_digest_hex(&cid)?;
     let peer_registry = PeerManager::default();
-    let (mut client, mut permit) =
+    let (mut client, permit) =
         connect::<methods::GetArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
-    let response = match client
-        .get_artifact(GetArtifactRequest {
-            cid: cid.as_bytes().to_vec(),
-        })
-        .await
-    {
-        Ok(response) => {
-            permit.finish_ok();
-            response.into_inner()
-        }
-        Err(err) => {
-            permit.finish_err(err.to_string());
-            return Err(err).context("get_artifact RPC failed");
-        }
-    };
+    let response = finish_unary::<methods::GetArtifact, _>(
+        permit,
+        client
+            .get_artifact(GetArtifactRequest {
+                cid: cid.as_bytes().to_vec(),
+            })
+            .await,
+    )
+    .context("get_artifact RPC failed")?
+    .into_inner();
     let actual = Digest::hash(&response.canonical_artifact);
     if actual != cid {
         bail!("provider returned bytes with cid {actual}, expected {cid}");
@@ -143,21 +134,14 @@ where
             .await
             .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))?
     } else {
-        let mut permit = peer_registry.acquire_iroh_method::<M>(node_id, 1.0)?;
-        let channel = match CourtesyService::connect(
-            &endpoint,
-            EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip)),
-        )
-        .await
-        .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))
-        {
-            Ok(channel) => channel,
-            Err(err) => {
-                permit.finish_connect_err(err.to_string());
-                return Err(err);
-            }
-        };
-        (channel, permit)
+        let endpoint_addr =
+            EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
+        tracked_iroh_channel::<M, _, _>(peer_registry, node_id, 1.0, async {
+            CourtesyService::connect(&endpoint, endpoint_addr)
+                .await
+                .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))
+        })
+        .await?
     };
     let client = CourtesyClient::new(channel)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
