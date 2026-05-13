@@ -7,12 +7,6 @@ use super::{
     PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
 };
 
-// The hand-maintained `*_SERVICE_ALPN` / `*_SERVICE_NAME` constants used to
-// live here. They've been replaced by `crate::service::KNOWN_SERVICES`,
-// which the build script generates from the same `.proto` files that
-// produce the service markers — one source of truth for "what services
-// exist in this protocol".
-
 const DEFAULT_MAX_TRACKED_PEERS: usize = 2048;
 const DEFAULT_MAX_KNOWN_PEERS_RESPONSE: usize = 64;
 const DEFAULT_STALE_PEER_AFTER_MS: u64 = 15 * 60 * 1000;

@@ -22,12 +22,24 @@ all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
 
 # === Transports ============================================================
 # Bare `iroh` brings the dep with no sub-features — useful when you only need
-# the `PeerId: From<EndpointId>` conversion. For a real client/server you also
-# enable `iroh-client`/`iroh-server`, which switch on the matching sub-feature
-# in `tonic-iroh-transport` (channel + pool / accepter + IrohContext).
+# the `PeerId: From<EndpointId>` conversion. For real outbound/inbound RPC
+# you also enable `iroh-client` / `iroh-server`, which switch on the matching
+# sub-feature in `tonic-iroh-transport` and (for `iroh-client`) bring in the
+# typed call types' prost codec plus `hellas-pb`'s tonic-client stubs.
 iroh        = ["dep:tonic-iroh-transport"]
+iroh-client = [
+  "iroh",
+  "hellas-pb/client",
+  "dep:tonic-prost",
+  "tonic-iroh-transport/client",
+]
 iroh-server = ["iroh", "tonic-iroh-transport/server"]
 # websocket, uart, etc. — added when the transport adapters land.
+
+# === Server role ===========================================================
+# Tonic's server runtime + hellas-pb's per-service server stubs. Orthogonal
+# to protocol selection — combine with any subset of the protocol features.
+server = ["tonic/server", "hellas-pb/server"]
 
 # === Other knobs ===========================================================
 compression = ["tonic/gzip", "tonic/zstd"]
@@ -44,34 +56,19 @@ compile = [
   "dep:syn",
 ]
 
-# TODO(step 8 cleanup): the four entries below are fat aliases that predate the
-# protocol × transport × role split. They keep working during the consumer
-# migration, but the role features (`client`, `server`) should stop pulling
-# protocol features, and `iroh-client` should be deleted once callers move to
-# explicit granular flags.
-client = [
-  "hellas-pb/client",
-  "hellas-pb/hellas",
-  "hellas-pb/symbolic",
-  "hellas-pb/opaque",
-  "hellas-pb/courtesy",
-]
-server = ["tonic/server", "hellas-pb/server"]
+# Discovery (mDNS + DHT) is iroh-only today; keeps `iroh` as its transport
+# floor without pulling any protocol features.
 discovery = [
-  "client",
+  "iroh",
   "dep:futures",
   "dep:mainline",
-  "iroh",
   "tonic-iroh-transport/discovery-mdns",
   "tonic-iroh-transport/discovery-dht",
 ]
-iroh-client = [
-  "iroh",
-  "client",
-  "all-protocols",
-  "dep:tonic-prost",
-  "tonic-iroh-transport/client",
-]
+
+# Binary-side bundle: server + every protocol + the executor / model deps a
+# `hellas-cli` / `hellas-executor` build needs. Not a "fat alias" — this is
+# the curated set of deps for the node binary itself.
 node = [
   "server",
   "all-protocols",
