@@ -12,6 +12,9 @@
 //!   before notifying application code;
 //! - generated or hand-written RPC clients acquire/release request permits here
 //!   around actual RPC calls;
+//! - RPC servers record inbound calls with `observe_inbound_request` for
+//!   accounting and admission, but do not infer service capabilities from those
+//!   calls;
 //! - application code queries the current registry view, usually through a
 //!   manager snapshot/view API, rather than hand-feeding events.
 //!
