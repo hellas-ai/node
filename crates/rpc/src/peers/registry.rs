@@ -61,7 +61,7 @@ impl PeerRegistryConfig {
         }
     }
 
-    fn normalized(mut self) -> Self {
+    pub(super) fn normalized(mut self) -> Self {
         if !self.bucket_capacity.is_finite() || self.bucket_capacity < 0.0 {
             self.bucket_capacity = 0.0;
         }
@@ -73,6 +73,39 @@ impl PeerRegistryConfig {
         }
         self.rtt_ema_alpha = self.rtt_ema_alpha.clamp(0.0, 1.0);
         self
+    }
+
+    /// Combinations that would make the registry behave nonsensically.
+    /// Distinct from [`Self::normalized`], which silently clamps NaN /
+    /// negative inputs into sane defaults — `validate` rejects internally
+    /// consistent but operationally broken combinations the caller must
+    /// fix at the config layer.
+    ///
+    /// Returns the list of reasons the config is invalid (empty when ok),
+    /// so [`PeerRegistry::with_config`] can surface every violation at
+    /// once instead of forcing the operator to fix and re-run.
+    pub fn validate(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.bucket_capacity > 0.0 && self.bucket_capacity < 1.0 {
+            reasons.push(format!(
+                "bucket_capacity {:.3} is in (0, 1): the bucket can never hold \
+                 a full token, so every rate-limited request would be rejected \
+                 with no path to recovery. Set bucket_capacity >= 1.0 (or 0.0 \
+                 to reject everything explicitly).",
+                self.bucket_capacity
+            ));
+        }
+        if self.max_in_flight_per_peer == 0 {
+            reasons.push(
+                "max_in_flight_per_peer is 0: no peer can ever be admitted.".into(),
+            );
+        }
+        if self.max_in_flight_total == 0 {
+            reasons.push(
+                "max_in_flight_total is 0: the registry can never admit a request.".into(),
+            );
+        }
+        reasons
     }
 }
 
@@ -409,6 +442,12 @@ impl PeerRegistry {
 
     pub fn with_config(config: PeerRegistryConfig) -> Self {
         let config = config.normalized();
+        let reasons = config.validate();
+        assert!(
+            reasons.is_empty(),
+            "PeerRegistryConfig is invalid:\n  - {}",
+            reasons.join("\n  - "),
+        );
         Self {
             config,
             peers: HashMap::with_capacity(config.max_peers.min(1024)),
@@ -1076,6 +1115,47 @@ mod tests {
         assert_eq!(registry.config().bucket_capacity, 0.0);
         assert_eq!(registry.config().bucket_refill_per_sec, 0.0);
         assert_eq!(registry.config().rtt_ema_alpha, 1.0);
+    }
+
+    #[test]
+    fn validate_flags_sub_unit_bucket_capacity() {
+        let reasons = PeerRegistryConfig {
+            bucket_capacity: 0.5,
+            bucket_refill_per_sec: 1.0,
+            ..config()
+        }
+        .validate();
+        assert_eq!(reasons.len(), 1, "exactly one violation expected: {reasons:?}");
+        assert!(
+            reasons[0].contains("bucket_capacity"),
+            "violation should mention the failing knob: {}",
+            reasons[0]
+        );
+    }
+
+    #[test]
+    fn validate_accepts_capacity_zero_as_explicit_reject_all() {
+        // capacity == 0.0 is the "reject everything" signal and is valid.
+        let reasons = PeerRegistryConfig {
+            bucket_capacity: 0.0,
+            bucket_refill_per_sec: 0.0,
+            ..config()
+        }
+        .validate();
+        assert!(reasons.is_empty(), "capacity 0.0 must validate: {reasons:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "PeerRegistryConfig is invalid")]
+    fn with_config_panics_on_unsatisfiable_bucket() {
+        // Sub-unit capacity with positive refill: bucket can never hold a
+        // full token. `with_config` should refuse to construct a registry
+        // that would silently reject every rate-limited request.
+        let _ = PeerRegistry::with_config(PeerRegistryConfig {
+            bucket_capacity: 0.5,
+            bucket_refill_per_sec: 1.0,
+            ..config()
+        });
     }
 
     #[test]
