@@ -125,6 +125,13 @@ needs them:
 ```rust
 manager
     .peer(peer)
+    .observe_discovered(
+        DiscoverySource::PeerExchange,
+        TransportSecurity::Untrusted,
+    )?;
+
+manager
+    .peer(peer)
     .service::<CourtesyService>()
     .observe_discovered(
         DiscoverySource::Transport("discovery"),

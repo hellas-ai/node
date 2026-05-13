@@ -7,7 +7,7 @@ use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, ServiceKey, TransportSecurity};
+use hellas_rpc::peers::{DiscoverySource, PeerId, ServiceKey, TransportSecurity};
 use hellas_rpc::service::{ExecuteService, NodeService, methods};
 use std::collections::HashSet;
 use std::future;
@@ -184,13 +184,12 @@ pub async fn run(
                         if !outcome.known_peers.is_empty() {
                             hinted_peers += outcome.known_peers.len();
                             for hinted in &outcome.known_peers {
-                                let _ = peer_registry.apply(
-                                    peer_id_from_endpoint(*hinted),
-                                    PeerEvent::Discovered {
-                                        source: DiscoverySource::PeerExchange,
-                                        transport_security: TransportSecurity::Untrusted,
-                                    },
-                                );
+                                let _ = peer_registry
+                                    .peer(peer_id_from_endpoint(*hinted))
+                                    .observe_discovered(
+                                        DiscoverySource::PeerExchange,
+                                        TransportSecurity::Untrusted,
+                                    );
                             }
                             for hinted in &outcome.known_peers {
                                 println!("event=peer-hint from={} peer={}", peer_id, hinted);
