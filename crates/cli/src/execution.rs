@@ -51,14 +51,15 @@ use hellas_pb::hellas::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, w
 use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{
-    ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
+    ExecuteDriver, ManagedRemoteDriver, QuotedPreparedTextResponse, QuotedResponse,
+    RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::peers::{IrohRpcPool, IrohTarget, IrohTransport, PeerManager};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService, methods};
+use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -82,7 +83,7 @@ type TracedChannel = tonic::service::interceptor::InterceptedService<
 #[cfg(not(feature = "otel"))]
 type TracedChannel = IrohChannel;
 
-type TracedDriver = RemoteExecuteDriver<TracedChannel>;
+type TracedDriver = ManagedRemoteDriver<TracedChannel>;
 
 #[cfg(feature = "otel")]
 fn traced(channel: IrohChannel) -> TracedChannel {
@@ -766,7 +767,7 @@ fn opaque_discovery_stream(
                 &tried,
                 peer_registry.clone(),
             ).await?;
-            let peer_id = remote.peer_id;
+            let peer_id = remote.driver.peer_id();
             let mut committed = false;
             let mut transport_err: Option<anyhow::Error> = None;
             let mut got_terminal = false;
@@ -841,7 +842,7 @@ fn discovery_stream(
                 &tried,
                 peer_registry.clone(),
             ).await?;
-            let peer_id = remote.peer_id;
+            let peer_id = remote.driver.peer_id();
             let mut committed = false;
             let mut transport_err: Option<anyhow::Error> = None;
             let mut got_terminal = false;
@@ -895,8 +896,6 @@ fn discovery_stream(
 
 struct RemoteExecution {
     endpoint: Arc<Endpoint>,
-    peer_id: EndpointId,
-    peer_registry: PeerManager,
     request_commitment: Vec<u8>,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
@@ -906,8 +905,6 @@ impl RemoteExecution {
     fn from_quoted(endpoint: Arc<Endpoint>, quoted: QuotedRemoteDriver) -> Self {
         Self {
             endpoint,
-            peer_id: quoted.peer_id,
-            peer_registry: quoted.peer_registry,
             request_commitment: quoted.quote.request_commitment,
             provenance: quoted.provenance,
             driver: quoted.driver,
@@ -917,25 +914,16 @@ impl RemoteExecution {
     fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         let Self {
             endpoint,
-            peer_id,
-            peer_registry,
             request_commitment,
             provenance: _,
             driver,
         } = self;
-        track_remote_execution_stream(
-            endpoint,
-            peer_registry,
-            peer_id,
-            execute_stream(driver, request_commitment),
-        )
+        track_remote_execution_stream(endpoint, execute_stream(driver, request_commitment))
     }
 }
 
 struct OpaqueRemoteExecution {
     endpoint: Arc<Endpoint>,
-    peer_id: EndpointId,
-    peer_registry: PeerManager,
     request: PbOpaqueRequest,
     request_commitment: Vec<u8>,
     driver: TracedDriver,
@@ -949,8 +937,6 @@ impl OpaqueRemoteExecution {
     ) -> Self {
         Self {
             endpoint,
-            peer_id: quoted.peer_id,
-            peer_registry: quoted.peer_registry,
             request,
             request_commitment: quoted.quote.request_commitment,
             driver: quoted.driver,
@@ -960,78 +946,36 @@ impl OpaqueRemoteExecution {
     fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
         let Self {
             endpoint,
-            peer_id,
-            peer_registry,
             request,
             request_commitment,
             driver,
         } = self;
         track_remote_execution_stream(
             endpoint,
-            peer_registry,
-            peer_id,
             execute_opaque_stream(driver, request_commitment, request),
         )
     }
 }
 
-/// Last-yielded variant of a remote-execution event stream. Both
-/// `ExecutionEvent` and `OpaqueExecutionEvent` carry a `Done(_)` terminal
-/// — the `track_remote_execution_stream` helper consults this to flush
-/// the permit before yielding the terminal event (so a consumer that
-/// drops on Done doesn't trigger a spurious `Cancelled`).
-trait IsTerminalExecutionEvent {
-    fn is_terminal(&self) -> bool;
-}
-
-impl IsTerminalExecutionEvent for ExecutionEvent {
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done(_))
-    }
-}
-
-impl IsTerminalExecutionEvent for OpaqueExecutionEvent {
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done(_))
-    }
-}
-
-/// Wrap a per-execution stream with the registry's `RunTicket` permit
-/// lifecycle: acquire on first poll, finish_ok before yielding the
-/// terminal event, finish_err on a transport error, and (via the
-/// `RpcPermitGuard` Drop) Cancelled if the consumer drops the stream
-/// before it terminates. Holds the endpoint alive for the duration so a
-/// concurrent endpoint drop doesn't tear down the underlying QUIC
-/// connection mid-execution.
+/// Hold the endpoint alive for the duration of the per-execution stream so
+/// a concurrent endpoint drop doesn't tear down the underlying QUIC
+/// connection mid-execution. The RunTicket permit lifecycle (acquire on
+/// the call, finish on terminal / error / drop) lives inside
+/// `ManagedRemoteDriver::execute_streaming`, so this helper is now a thin
+/// shape-converter.
 fn track_remote_execution_stream<E, S>(
     endpoint: Arc<Endpoint>,
-    peer_registry: PeerManager,
-    peer_id: EndpointId,
     inner: S,
 ) -> impl Stream<Item = anyhow::Result<E>> + Send
 where
-    E: IsTerminalExecutionEvent + Send + 'static,
+    E: Send + 'static,
     S: Stream<Item = anyhow::Result<E>> + Send + 'static,
 {
     try_stream! {
         let _endpoint = endpoint;
-        let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
         tokio::pin!(inner);
         while let Some(event) = inner.next().await {
-            match event {
-                Ok(event) => {
-                    if event.is_terminal() {
-                        permit.finish_ok();
-                        yield event;
-                        return;
-                    }
-                    yield event;
-                }
-                Err(err) => {
-                    permit.finish_err(err.to_string());
-                    Err(err)?;
-                }
-            }
+            yield event?;
         }
     }
 }
@@ -1228,10 +1172,10 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 // ---------------------------------------------------------------------------
 
 struct QuotedRemoteDriver {
-    peer_id: EndpointId,
-    peer_registry: PeerManager,
     quote: hellas_pb::hellas::Ticket,
     provenance: ExecutionProvenance,
+    /// Carries its own `PeerManager` + `peer_id`; the surrounding fields
+    /// don't need to repeat them.
     driver: TracedDriver,
 }
 
@@ -1335,10 +1279,10 @@ fn bind_remote_transport(endpoint: &Endpoint, peer_registry: PeerManager) -> Iro
 }
 
 /// Dial Execute + Courtesy at `target`, then issue `QuotePreparedText`
-/// across the courtesy channel. Each dial acquires its own service-level
-/// permit (billed to the representative method per service), so a failed
-/// dial on one service can't cross-bill the other. `target.addrs` selects
-/// direct vs discovered.
+/// across the courtesy channel through a `ManagedRemoteDriver`. The dials
+/// are service-level (`pool.dial`) so they don't take method permits;
+/// the `QuotePreparedText` permit is acquired inside the managed driver
+/// and resolved on the call's outcome.
 #[instrument(skip_all, fields(peer_id = %target.peer_id, model = %quote_req.huggingface_model_id))]
 async fn quote_remote_via_pools(
     quote_req: &QuotePreparedTextRequest,
@@ -1348,52 +1292,32 @@ async fn quote_remote_via_pools(
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let peer_id = target.peer_id;
-    let (execute_channel, mut execute_permit) = execute_pool
-        .channel::<methods::RunTicket>(target.clone())
+    let execute_channel = execute_pool
+        .dial(target.clone())
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let (courtesy_channel, mut courtesy_permit) = match courtesy_pool
-        .channel::<methods::QuotePreparedText>(target)
+    let courtesy_channel = courtesy_pool
+        .dial(target)
         .await
-    {
-        Ok(channels) => channels,
-        Err(err) => {
-            // The Execute dial already succeeded — release its permit so the
-            // RAII guard doesn't record Cancelled.
-            execute_permit.finish_ok();
-            return Err(QuoteCandidateError::Connect(
-                anyhow::Error::from(err).context(format!("failed to connect to node {peer_id}")),
-            ));
-        }
-    };
-    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let inner = RemoteExecuteDriver::with_execute_and_courtesy(
         traced(execute_channel),
         traced(courtesy_channel),
     );
-    let quoted = match quote_with_driver(quote_req, &mut driver, || {
+    let mut driver = ManagedRemoteDriver::new(inner, peer_registry.clone(), peer_id);
+    let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {peer_id} declined ticket")
     })
     .await
-    {
-        Ok(quoted) => quoted,
-        Err(err) => {
-            execute_permit.finish_ok();
-            courtesy_permit.finish_err(err.to_string());
-            return Err(QuoteCandidateError::Declined(err));
-        }
-    };
+    .map_err(QuoteCandidateError::Declined)?;
     let Some(ticket) = quoted.response.ticket else {
-        let err = anyhow!("quote_prepared_text response missing ticket");
-        execute_permit.finish_ok();
-        courtesy_permit.finish_err(err.to_string());
-        return Err(QuoteCandidateError::Declined(err));
+        return Err(QuoteCandidateError::Declined(anyhow!(
+            "quote_prepared_text response missing ticket"
+        )));
     };
-    execute_permit.finish_ok();
-    courtesy_permit.finish_ok();
     Ok(QuotedRemoteDriver {
-        peer_id,
-        peer_registry,
         quote: ticket,
         provenance: quoted.provenance,
         driver,
@@ -1410,46 +1334,27 @@ async fn quote_opaque_remote_via_pools(
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let peer_id = target.peer_id;
-    let (execute_channel, mut execute_permit) = execute_pool
-        .channel::<methods::RunTicket>(target.clone())
+    let execute_channel = execute_pool
+        .dial(target.clone())
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let (opaque_channel, mut opaque_permit) = match opaque_pool
-        .channel::<methods::OpaqueCreateTicket>(target)
+    let opaque_channel = opaque_pool
+        .dial(target)
         .await
-    {
-        Ok(channels) => channels,
-        Err(err) => {
-            execute_permit.finish_ok();
-            return Err(QuoteCandidateError::Connect(
-                anyhow::Error::from(err).context(format!("failed to connect to node {peer_id}")),
-            ));
-        }
-    };
-    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let inner = RemoteExecuteDriver::with_execute_and_opaque(
         traced(execute_channel),
         traced(opaque_channel),
     );
-    let quoted = match quote_opaque_with_driver(request, &mut driver, || {
+    let mut driver = ManagedRemoteDriver::new(inner, peer_registry.clone(), peer_id);
+    let quoted = quote_opaque_with_driver(request, &mut driver, || {
         format!("node {peer_id} declined opaque ticket")
     })
     .await
-    {
-        Ok(quoted) => {
-            execute_permit.finish_ok();
-            opaque_permit.finish_ok();
-            quoted
-        }
-        Err(err) => {
-            execute_permit.finish_ok();
-            opaque_permit.finish_err(err.to_string());
-            return Err(QuoteCandidateError::Declined(err));
-        }
-    };
+    .map_err(QuoteCandidateError::Declined)?;
     Ok(QuotedRemoteDriver {
-        peer_id,
-        peer_registry,
         quote: quoted.response,
         provenance: quoted.provenance,
         driver,

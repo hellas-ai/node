@@ -56,7 +56,7 @@ pub trait ExecuteDriver: Send {
 }
 
 #[cfg(feature = "iroh-client")]
-pub use remote::RemoteExecuteDriver;
+pub use remote::{ManagedRemoteDriver, RemoteExecuteDriver};
 
 /// Tonic-client-based [`ExecuteDriver`] for outbound iroh RPC. Lives in its
 /// own module because it imports `hellas_pb::*::client_stubs::*` (only
@@ -288,6 +288,238 @@ where
             stream: Box::pin(resp.into_inner()),
             provenance,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ManagedRemoteDriver — RemoteExecuteDriver with permit lifecycle attached
+// ---------------------------------------------------------------------------
+
+use std::task::{Context, Poll};
+use crate::peers::{PeerManager, PeerManagerError, RpcPermitGuard};
+use crate::service::methods;
+use hellas_pb::hellas::work_event;
+
+/// `RemoteExecuteDriver` wrapped with per-call permit management. Each
+/// quote/run method acquires the matching [`RpcPermitGuard`] from the
+/// shared [`PeerManager`], dispatches to the inner driver, and finishes
+/// the permit on the outcome — so callers never need to thread permits
+/// through the quote/run flow.
+///
+/// For `execute_streaming`, the permit travels with the returned stream
+/// via [`ManagedExecuteStream`] and resolves on the terminal `Finished`
+/// / `Failed` event (or on transport error / unexpected stream end);
+/// dropping the stream early resolves it as `Cancelled` through the
+/// `RpcPermitGuard` Drop impl.
+pub struct ManagedRemoteDriver<T> {
+    inner: RemoteExecuteDriver<T>,
+    manager: PeerManager,
+    peer_id: tonic_iroh_transport::iroh::EndpointId,
+}
+
+impl<T> ManagedRemoteDriver<T> {
+    pub fn new(
+        inner: RemoteExecuteDriver<T>,
+        manager: PeerManager,
+        peer_id: tonic_iroh_transport::iroh::EndpointId,
+    ) -> Self {
+        Self {
+            inner,
+            manager,
+            peer_id,
+        }
+    }
+
+    /// Peer this driver is bound to. Discovery loops use this to mark a
+    /// node as tried-and-failed without having to thread `peer_id` past
+    /// the driver alongside it.
+    pub const fn peer_id(&self) -> tonic_iroh_transport::iroh::EndpointId {
+        self.peer_id
+    }
+
+    /// Borrow the underlying driver. Useful for tests and for direct
+    /// `RemoteExecuteDriver::put_artifact` / `get_artifact` calls that
+    /// don't ride through `ExecuteDriver` — those should grow their own
+    /// managed wrappers when a non-test caller actually needs them.
+    pub fn inner_mut(&mut self) -> &mut RemoteExecuteDriver<T> {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> RemoteExecuteDriver<T> {
+        self.inner
+    }
+}
+
+/// Map a `PeerManagerError` (admission failure / poisoned mutex / etc.)
+/// to a `tonic::Status`. Resource-exhausted captures rate-limit denials,
+/// internal captures lock failures.
+fn permit_acquire_status(err: PeerManagerError) -> Status {
+    match err {
+        PeerManagerError::Admission(_) => Status::resource_exhausted(err.to_string()),
+        PeerManagerError::Unavailable => Status::internal(err.to_string()),
+    }
+}
+
+#[tonic::async_trait]
+impl<T> ExecuteDriver for ManagedRemoteDriver<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + 'static,
+    T::Error: Into<StdError>,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+    T::Future: Send,
+{
+    async fn create_symbolic_ticket(
+        &mut self,
+        request: SymbolicRequest,
+    ) -> Result<QuotedResponse, Status> {
+        let mut permit = self
+            .manager
+            .acquire_iroh_method::<methods::SymbolicCreateTicket>(self.peer_id)
+            .map_err(permit_acquire_status)?;
+        match self.inner.create_symbolic_ticket(request).await {
+            Ok(resp) => {
+                permit.finish_ok();
+                Ok(resp)
+            }
+            Err(status) => {
+                permit.finish_err(format!(
+                    "{}: {status}",
+                    <methods::SymbolicCreateTicket as crate::peers::RpcMethod>::NAME
+                ));
+                Err(status)
+            }
+        }
+    }
+
+    async fn create_opaque_ticket(
+        &mut self,
+        request: OpaqueRequest,
+    ) -> Result<QuotedResponse, Status> {
+        let mut permit = self
+            .manager
+            .acquire_iroh_method::<methods::OpaqueCreateTicket>(self.peer_id)
+            .map_err(permit_acquire_status)?;
+        match self.inner.create_opaque_ticket(request).await {
+            Ok(resp) => {
+                permit.finish_ok();
+                Ok(resp)
+            }
+            Err(status) => {
+                permit.finish_err(format!(
+                    "{}: {status}",
+                    <methods::OpaqueCreateTicket as crate::peers::RpcMethod>::NAME
+                ));
+                Err(status)
+            }
+        }
+    }
+
+    async fn quote_prepared_text(
+        &mut self,
+        request: QuotePreparedTextRequest,
+    ) -> Result<QuotedPreparedTextResponse, Status> {
+        let mut permit = self
+            .manager
+            .acquire_iroh_method::<methods::QuotePreparedText>(self.peer_id)
+            .map_err(permit_acquire_status)?;
+        match self.inner.quote_prepared_text(request).await {
+            Ok(resp) => {
+                permit.finish_ok();
+                Ok(resp)
+            }
+            Err(status) => {
+                permit.finish_err(format!(
+                    "{}: {status}",
+                    <methods::QuotePreparedText as crate::peers::RpcMethod>::NAME
+                ));
+                Err(status)
+            }
+        }
+    }
+
+    async fn execute_streaming(
+        &mut self,
+        request: RunTicketRequest,
+    ) -> Result<StreamedExecution, Status> {
+        let permit = self
+            .manager
+            .acquire_iroh_method::<methods::RunTicket>(self.peer_id)
+            .map_err(permit_acquire_status)?;
+        match self.inner.execute_streaming(request).await {
+            Ok(streamed) => {
+                let StreamedExecution { stream, provenance } = streamed;
+                Ok(StreamedExecution {
+                    stream: Box::pin(ManagedExecuteStream {
+                        inner: stream,
+                        permit: Some(permit),
+                    }),
+                    provenance,
+                })
+            }
+            Err(status) => {
+                let mut permit = permit;
+                permit.finish_err(format!(
+                    "{}: {status}",
+                    <methods::RunTicket as crate::peers::RpcMethod>::NAME
+                ));
+                Err(status)
+            }
+        }
+    }
+}
+
+/// Stream wrapper that owns the RunTicket permit for the lifetime of the
+/// execution stream. Finishes the permit on:
+/// * a terminal `Finished` / `Failed` wire event (yielded *before* the
+///   permit resolves, so a consumer that drops on terminal won't get a
+///   spurious `Cancelled`).
+/// * an `Err(Status)` from the underlying gRPC stream.
+/// * natural end-of-stream (`Ready(None)`).
+///
+/// If the consumer drops the stream early, `RpcPermitGuard`'s Drop fires
+/// and records `Cancelled`.
+struct ManagedExecuteStream {
+    inner: ExecuteEventStream,
+    permit: Option<RpcPermitGuard>,
+}
+
+impl Stream for ManagedExecuteStream {
+    type Item = Result<WorkEvent, Status>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(event))) => {
+                if matches!(
+                    event.kind,
+                    Some(work_event::Kind::Finished(_) | work_event::Kind::Failed(_))
+                ) {
+                    if let Some(mut permit) = self.permit.take() {
+                        permit.finish_ok();
+                    }
+                }
+                Poll::Ready(Some(Ok(event)))
+            }
+            Poll::Ready(Some(Err(status))) => {
+                if let Some(mut permit) = self.permit.take() {
+                    permit.finish_err(format!(
+                        "{}: {status}",
+                        <methods::RunTicket as crate::peers::RpcMethod>::NAME
+                    ));
+                }
+                Poll::Ready(Some(Err(status)))
+            }
+            Poll::Ready(None) => {
+                if let Some(mut permit) = self.permit.take() {
+                    permit.finish_ok();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 }

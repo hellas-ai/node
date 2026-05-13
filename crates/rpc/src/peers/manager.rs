@@ -432,6 +432,35 @@ impl<S: IrohServiceSpec> IrohRpcPool<S> {
             }
         }
     }
+
+    /// Service-level dial: open a channel to the peer without taking any
+    /// method permit. The caller manages permits per RPC themselves —
+    /// typically because the channel is held across many calls (e.g. by a
+    /// `ManagedRemoteDriver`), and pinning one method permit to the dial
+    /// would mis-attribute every later call to that method.
+    ///
+    /// Success records a service-level observation in the registry (so the
+    /// peer is known to offer `S`); failures bubble up the connect error.
+    pub async fn dial(
+        &self,
+        target: IrohTarget,
+    ) -> Result<tonic_iroh_transport::IrohChannel, IrohRpcPoolError> {
+        use tonic_iroh_transport::IrohConnect;
+        let result = match target.addrs {
+            Some(addr) => S::connect(&self.endpoint, addr).await,
+            None => self.pool.channel(target.peer_id).await,
+        };
+        match result {
+            Ok(channel) => {
+                let _ = self.manager.observe_iroh_service::<S>(target.peer_id);
+                Ok(channel)
+            }
+            Err(source) => Err(IrohRpcPoolError::Connect {
+                service: <S as RpcService>::NAME,
+                source,
+            }),
+        }
+    }
 }
 
 #[cfg(feature = "iroh-client")]
