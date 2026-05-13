@@ -431,7 +431,36 @@ fn render_service_markers(services: &[RpcService]) -> String {
         }
     }
 
-    output.push_str("}\n");
+    output.push_str("}\n\n");
+
+    // RpcServiceSpec impls — the only string-keyed dispatch in the system.
+    // Each service emits one match arm per method so the inbound admission
+    // layer can translate a gRPC path into a typed RequestKind without any
+    // call site ever spelling a method name as a string.
+    for service in services {
+        let service_ident = service_ident(&service.name);
+        let feature = feature_for_package(&service.package);
+        let mut arms = String::new();
+        for method in &service.methods {
+            let method_ident = method_ident(method, &method_counts);
+            arms.push_str(&format!(
+                "            <methods::{method_ident} as crate::peers::RpcMethod>::GRPC_PATH \
+                  => Some(crate::peers::InboundRequestPolicy::account_method::<methods::{method_ident}>()),\n",
+            ));
+        }
+        output.push_str(&format!(
+            "#[cfg(feature = \"{feature}\")]\n\
+             impl crate::peers::RpcServiceSpec for {service_ident} {{\n\
+                 fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {{\n\
+                     match path {{\n\
+{arms}\
+                         _ => None,\n\
+                     }}\n\
+                 }}\n\
+             }}\n\n",
+        ));
+    }
+
     output
 }
 
