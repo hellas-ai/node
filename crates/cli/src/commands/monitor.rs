@@ -6,7 +6,7 @@ use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResp
 use hellas_rpc::client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{
-    DiscoverySource, IrohTransport, PeerId, PeerManager, ServiceKey, TransportSecurity,
+    DiscoverySource, IrohTransport, PeerId, PeerManager, RpcService, TransportSecurity,
 };
 use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
@@ -248,7 +248,7 @@ pub async fn run(
     Ok(())
 }
 
-fn handle_discovery_event<S: ServiceKey>(
+fn handle_discovery_event<S: RpcService>(
     service: &str,
     peer: &Peer,
     context: DiscoveryEventContext<'_>,

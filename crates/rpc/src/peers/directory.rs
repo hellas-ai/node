@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::admission::TokenBucket;
 use super::{
-    AuthLevel, DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
-    PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
+    AuthLevel, DiscoverySource, PeerEntry, PeerId, PeerManager, PeerManagerError,
+    PeerRegistryConfig, RequestKind, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
 };
 
 pub const NODE_SERVICE_ALPN: &str = "/hellas.swarm.v1.Node/1.0";
@@ -136,11 +136,11 @@ impl InboundRequestPolicy {
         }
     }
 
-    pub const fn account_method<M: MethodKey>() -> Self {
+    pub const fn account_method<M: RpcMethod>() -> Self {
         Self::account_only(RequestKind::for_method::<M>())
     }
 
-    pub const fn rate_limited_method<M: MethodKey>() -> Self {
+    pub const fn rate_limited_method<M: RpcMethod>() -> Self {
         Self::rate_limited(RequestKind::for_method::<M>())
     }
 }
@@ -268,7 +268,7 @@ impl PeerDirectory {
             .observe_discovered_service_name(peer, source, service, transport_security)
     }
 
-    pub fn observe_discovered_service<S: ServiceKey>(
+    pub fn observe_discovered_service<S: RpcService>(
         &self,
         peer: PeerId,
         source: DiscoverySource,
