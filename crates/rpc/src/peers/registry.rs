@@ -1186,6 +1186,61 @@ mod tests {
     }
 
     #[test]
+    fn eviction_tie_break_uses_peer_id_so_choice_is_deterministic() {
+        // With max_peers=2, inserting a third peer must evict one of the
+        // existing two. When every other eviction key is identical (same
+        // discovery moment, same trust, same security, same services,
+        // same success count), the only differentiator is PeerId. The
+        // trailing PeerId in eviction_key turns randomized HashMap
+        // iteration into a stable, lowest-id-evicts-first rule — repeated
+        // runs against the same inputs must always evict the same peer.
+        let lower = peer(1);
+        let upper = peer(2);
+
+        // Run a small number of trials with fresh registries; without the
+        // PeerId tiebreaker, HashMap's iteration order would surface here
+        // as a random pick.
+        for _ in 0..16 {
+            let mut registry = PeerRegistry::with_config(PeerRegistryConfig {
+                max_peers: 2,
+                ..config()
+            });
+
+            registry.apply(
+                0,
+                lower,
+                PeerEvent::Discovered {
+                    source: DiscoverySource::Manual,
+                    transport_security: TransportSecurity::Untrusted,
+                },
+            );
+            registry.apply(
+                0,
+                upper,
+                PeerEvent::Discovered {
+                    source: DiscoverySource::Manual,
+                    transport_security: TransportSecurity::Untrusted,
+                },
+            );
+
+            let third = peer(3);
+            let change = registry.apply(
+                0,
+                third,
+                PeerEvent::Discovered {
+                    source: DiscoverySource::Manual,
+                    transport_security: TransportSecurity::Untrusted,
+                },
+            );
+            assert_eq!(
+                change.evicted,
+                Some(lower),
+                "lowest PeerId should win the eviction tie-break every run"
+            );
+        }
+    }
+
+    #[test]
     fn peer_id_display_alternate_emits_full_hex() {
         let id = peer(0xab);
         let short = format!("{id}");

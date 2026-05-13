@@ -933,4 +933,69 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn finish_ok_after_forget_preserves_tombstone_and_purges_entry() {
+        // Regression for the bug where finish_ok went through `apply` (not
+        // `apply_completion`), so the Discovered/ServiceObserved events
+        // emitted as part of completion would un-tombstone the peer. That
+        // left the final `release` looking at a live entry, so an in-flight
+        // RPC completing after `forget_peer` would re-enliven the peer.
+        let manager = PeerManager::with_config(config());
+        let id = peer(7);
+
+        let mut permit = manager
+            .acquire_rpc(
+                id,
+                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RpcObservation::authenticated_transport("iroh"),
+            )
+            .expect("request should be admitted");
+
+        // Forget while a permit is in flight. The peer is tombstoned —
+        // hidden from queries but still bookkept so release doesn't
+        // double-count.
+        let change = manager.forget_peer(id).expect("forget should succeed");
+        assert!(change.removed, "forget reports removed even when deferred");
+        assert!(
+            manager
+                .snapshot()
+                .expect("registry readable")
+                .get(id)
+                .is_none(),
+            "tombstoned peer hidden from snapshot"
+        );
+
+        // Completing the RPC must not revive the peer — the entry should
+        // be purged after the final release.
+        permit.finish_ok();
+
+        let registry = manager.snapshot().expect("registry readable");
+        assert!(
+            registry.get(id).is_none(),
+            "finish_ok must preserve tombstone so release purges the entry"
+        );
+        assert_eq!(registry.total_in_flight(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Permit for peer")]
+    fn dropping_armed_permit_panics_in_debug() {
+        // Belt-and-braces — the only way to leak the in-flight slot is to
+        // construct a Permit and drop it without going through
+        // `PeerRegistry::release`. Higher-level guards always disarm via
+        // release, so we exercise the raw Permit here.
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(8);
+
+        let permit = registry
+            .try_acquire(
+                0,
+                id,
+                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+            )
+            .expect("permit should be admitted");
+        // Dropping without release should fire the debug tripwire.
+        drop(permit);
+    }
 }
