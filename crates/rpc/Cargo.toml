@@ -91,6 +91,8 @@ hf-hub = { version = "0.5", default-features = false, features = [
   "ureq",
 ], optional = true }
 http = "1"
+http-body = "1"
+pin-project = "1"
 mainline = { version = "6", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -102,6 +104,8 @@ tokenizers = { version = "0.21", default-features = false, features = [
 ], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
+tower-layer = "0.3"
+tower-service = "0.3"
 
 [dev-dependencies]
 tokio.workspace = true

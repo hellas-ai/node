@@ -18,6 +18,8 @@ pub mod peers;
 #[cfg(feature = "node")]
 pub mod policy;
 pub mod provenance;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod service;
 pub mod spec;
 
