@@ -581,15 +581,31 @@ fn method_ident(method: &RpcMethod, method_counts: &HashMap<String, usize>) -> S
     }
 }
 
-fn pb_module_for_package(package: &str) -> &'static str {
-    match package {
-        "hellas.v1" => "hellas",
-        "hellas.courtesy.v1" => "courtesy",
-        "hellas.opaque.v1" => "opaque",
-        "hellas.swarm.v1" => "swarm",
-        "hellas.symbolic.v1" => "symbolic",
-        _ => panic!("unknown hellas protobuf package {package}"),
+/// Map a protobuf package name to the `hellas_pb` submodule that hosts its
+/// generated types. The convention is "last namespace component, skipping a
+/// trailing `vN` version segment":
+///
+///   hellas.v1               -> hellas
+///   hellas.swarm.v1         -> swarm
+///   hellas.courtesy.v1      -> courtesy
+///   hellas.opaque.v1        -> opaque
+///   hellas.symbolic.v1      -> symbolic
+///
+/// New packages that follow the same pattern slot in without a code change.
+fn pb_module_for_package(package: &str) -> String {
+    let mut parts: Vec<&str> = package.split('.').collect();
+    if let Some(last) = parts.last()
+        && last.starts_with('v')
+        && last[1..].bytes().all(|b| b.is_ascii_digit())
+        && parts.len() > 1
+    {
+        parts.pop();
     }
+    parts
+        .last()
+        .copied()
+        .unwrap_or(package)
+        .to_string()
 }
 
 fn rust_type(current_package: &str, raw: &str) -> String {
