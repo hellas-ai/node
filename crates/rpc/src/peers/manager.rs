@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
+use super::MethodKey;
 use super::{
     AcquireDenied, DiscoverySource, Outcome, PeerChange, PeerEvent, PeerId, PeerRegistry,
     PeerRegistryConfig, Permit, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
@@ -125,6 +126,15 @@ impl PeerManager {
             started: Instant::now(),
             observation,
         })
+    }
+
+    pub fn acquire_method<M: MethodKey>(
+        &self,
+        peer: PeerId,
+        cost: f32,
+        observation: RpcObservation,
+    ) -> Result<RpcPermitGuard, PeerManagerError> {
+        self.acquire_rpc(peer, RequestKind::for_method::<M>(), cost, observation)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PeerRegistry>, PeerManagerError> {
@@ -300,7 +310,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_service::<NodeService>("GetNodeInfo"),
+                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
                 1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
@@ -330,7 +340,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_service::<NodeService>("GetNodeInfo"),
+                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
                 1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
@@ -353,7 +363,7 @@ mod tests {
         let permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_service::<NodeService>("GetNodeInfo"),
+                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
                 1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )

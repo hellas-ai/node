@@ -61,3 +61,12 @@ pub use security::{AuthLevel, TransportSecurity};
 pub trait ServiceKey {
     const NAME: &'static str;
 }
+
+/// Type-level RPC method identity.
+///
+/// Generated clients should emit method marker types implementing this trait so
+/// application code does not pass method names as raw strings.
+pub trait MethodKey {
+    type Service: ServiceKey;
+    const NAME: &'static str;
+}
