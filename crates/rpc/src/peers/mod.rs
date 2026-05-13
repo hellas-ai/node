@@ -5,8 +5,8 @@
 //! and observations in, and the registry returns deterministic state changes and
 //! admission decisions.
 //!
-//! Most application code should not call [`PeerRegistry::apply`] directly. The
-//! intended layering is:
+//! Most application code should use [`PeerManager`] instead of calling
+//! [`PeerRegistry::apply`] directly. The intended layering is:
 //!
 //! - a transport/discovery driver owns discovery streams and records facts here
 //!   before notifying application code;
@@ -32,17 +32,19 @@
 //! }
 //! ```
 //!
-//! A higher-level async manager should normally expose snapshots or read guards
-//! instead of long-lived `Arc<PeerEntry>` handles, so callers do not accidentally
-//! hold locks or depend on stale mutable state.
+//! `PeerManager` exposes snapshots and closure-based reads instead of long-lived
+//! `Arc<PeerEntry>` handles, so callers do not accidentally hold locks or
+//! depend on stale mutable state.
 
 mod admission;
 mod id;
+mod manager;
 mod registry;
 mod security;
 
 pub use admission::{AcquireDenied, Outcome, Permit, RequestKind};
 pub use id::PeerId;
+pub use manager::{PeerManager, PeerManagerError, RpcObservation, RpcPermitGuard};
 pub use registry::{
     DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerRegistry, PeerRegistryConfig,
     ServiceObservation, ServiceState, ServiceStatus,
