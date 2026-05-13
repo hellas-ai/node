@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 
 use pin_project::pin_project;
 
-use crate::peers::{PeerDirectory, PeerExtractor, PeerManagerError, RpcServiceSpec};
+use crate::peers::{PeerDirectory, PeerExtractor, RpcServiceSpec};
 
 /// Pin-projected tower::Service wrapper around a tonic-generated server.
 ///
@@ -91,37 +91,33 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         let Some(policy) = S::inbound_policy(req.uri().path()) else {
             // Path doesn't belong to this service — pass through, the inner
             // tonic dispatcher will reply with UNIMPLEMENTED.
             return ManagedFuture::pass(self.inner.call(req));
         };
 
-        match self.extractor.extract(&req) {
-            None => {
-                // No peer context available — surface as unauthenticated.
-                // (Iroh inbound requests always carry IrohContext, so this
-                // is reserved for unauthenticated transports.)
-                return ManagedFuture::status(tonic::Status::unauthenticated(
-                    "missing peer context",
-                ));
+        let Some(observation) = self.extractor.extract(&req) else {
+            // No peer context available — surface as unauthenticated.
+            // (iroh inbound requests always carry IrohContext, so this only
+            // fires for transports that haven't installed an extractor.)
+            return ManagedFuture::status(tonic::Status::unauthenticated("missing peer context"));
+        };
+
+        match self
+            .directory
+            .observe_inbound_request(observation.peer, observation.rtt_ms, policy)
+        {
+            Ok(admission) if admission.allow => {
+                // Stash the typed admission decision so handlers that care
+                // about its `disclosure_limit` (e.g. GetKnownPeers) don't
+                // have to re-observe — that would double-bill the bucket.
+                req.extensions_mut().insert(admission);
+                ManagedFuture::pass(self.inner.call(req))
             }
-            Some(observation) => {
-                match self.directory.observe_inbound_request(
-                    observation.peer,
-                    observation.rtt_ms,
-                    policy,
-                ) {
-                    Ok(_) => ManagedFuture::pass(self.inner.call(req)),
-                    Err(PeerManagerError::Admission(_)) => ManagedFuture::status(
-                        tonic::Status::resource_exhausted("rate limited"),
-                    ),
-                    Err(PeerManagerError::Unavailable) => ManagedFuture::status(
-                        tonic::Status::internal("peer directory unavailable"),
-                    ),
-                }
-            }
+            Ok(_) => ManagedFuture::status(tonic::Status::resource_exhausted("rate limited")),
+            Err(_) => ManagedFuture::status(tonic::Status::internal("peer directory unavailable")),
         }
     }
 }
