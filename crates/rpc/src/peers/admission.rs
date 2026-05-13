@@ -201,13 +201,22 @@ impl TokenBucket {
     }
 
     /// Try to consume one token. Returns `Err(retry_after_ms)` when empty —
-    /// `None` retry-after means "never" (refill rate is zero).
+    /// `None` retry-after means "never" (either refill rate is zero, or the
+    /// bucket's capacity is below one token so it can never admit at all).
     pub(super) fn try_take(
         &mut self,
         now_ms: u64,
         capacity: f64,
         refill_per_sec: f64,
     ) -> Result<(), Option<u64>> {
+        // A bucket whose capacity is below one token can never hold enough to
+        // admit a request, no matter how long the caller waits. Refilling
+        // would just clamp back to the sub-token capacity. Return `Err(None)`
+        // so callers don't advertise a misleading retry-after.
+        if capacity < 1.0 {
+            return Err(None);
+        }
+
         self.refill(now_ms, capacity, refill_per_sec);
 
         if self.tokens >= 1.0 {
