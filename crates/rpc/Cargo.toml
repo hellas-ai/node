@@ -116,6 +116,10 @@ tonic-iroh-transport = { workspace = true, default-features = false, optional = 
 tonic-prost = { version = "0.14", default-features = false, optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
+# `web-time` shims `std::time::Instant` / `SystemTime` so the peer registry's
+# monotonic clock works under wasm (where stdlib's `Instant::now` panics with
+# "time not implemented on this platform"). Identical to std on native targets.
+web-time = "1"
 
 [build-dependencies]
 prettyplease = { version = "0.2", optional = true }
