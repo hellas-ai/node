@@ -2,23 +2,22 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
-use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
-use hellas_rpc::GRPC_MESSAGE_LIMIT;
+use hellas_rpc::client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{
-    DiscoverySource, IrohRpcPool, PeerId, PeerManager, ServiceKey, TransportSecurity,
+    DiscoverySource, IrohTransport, PeerId, PeerManager, ServiceKey, TransportSecurity,
 };
-use hellas_rpc::service::{ExecuteService, NodeService, methods};
+use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
 use std::future;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
+use tonic_iroh_transport::PoolOptions;
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };
-use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,7 +29,7 @@ struct PeerInterrogationOutcome {
 }
 
 struct DiscoveryEventContext<'a> {
-    node_pool: &'a ConnectionPool,
+    transport: &'a IrohTransport,
     peer_registry: &'a PeerManager,
     interrogate: bool,
     interrogated: &'a mut HashSet<EndpointId>,
@@ -56,12 +55,20 @@ pub async fn run(
     registry.add(MdnsBackend::new(mdns));
     registry.add(DhtBackend::with_dht(&endpoint, shared_dht));
     registry.add(peer_exchange.clone());
-    let node_pool = registry.pool::<NodeService>();
+
+    let peer_registry = PeerManager::default();
+    let transport = IrohTransport::with_options(
+        endpoint.clone(),
+        peer_registry.clone(),
+        PoolOptions {
+            connect_timeout: CONNECT_TIMEOUT,
+            ..PoolOptions::default()
+        },
+    );
 
     let mut node_discovery = Box::pin(registry.discover::<NodeService>());
     let mut execute_discovery = Box::pin(registry.discover::<ExecuteService>());
 
-    let peer_registry = PeerManager::default();
     let mut interrogations = JoinSet::new();
     let mut interrogated = HashSet::new();
 
@@ -107,7 +114,7 @@ pub async fn run(
                             "node",
                             &peer,
                             DiscoveryEventContext {
-                                node_pool: &node_pool,
+                                transport: &transport,
                                 peer_registry: &peer_registry,
                                 interrogate,
                                 interrogated: &mut interrogated,
@@ -131,7 +138,7 @@ pub async fn run(
                             "execute",
                             &peer,
                             DiscoveryEventContext {
-                                node_pool: &node_pool,
+                                transport: &transport,
                                 peer_registry: &peer_registry,
                                 interrogate,
                                 interrogated: &mut interrogated,
@@ -267,44 +274,29 @@ fn handle_discovery_event<S: ServiceKey>(
 
     if context.interrogate && context.interrogated.insert(peer_id) {
         println!("event=interrogate-start peer={}", peer_id);
-        let node_pool = context.node_pool.clone();
-        let peer_registry = context.peer_registry.clone();
+        let transport = context.transport.clone();
         context.interrogations.spawn(async move {
-            let result = interrogate_peer(node_pool, peer_registry, peer_id).await;
+            let result = interrogate_peer(transport, peer_id).await;
             (peer_id, result)
         });
     }
 }
 
 async fn interrogate_peer(
-    node_pool: ConnectionPool,
-    peer_registry: PeerManager,
+    transport: IrohTransport,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
-    let node_pool = IrohRpcPool::<NodeService>::from_pool(node_pool, peer_registry.clone());
-    let (channel, mut node_info_permit) = node_pool
-        .channel::<methods::GetNodeInfo>(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node service on {peer_id}"))?;
+    let peer = transport.peer(peer_id);
 
-    let mut client = NodeClient::new(channel)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-
-    let node_info = match timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {})).await {
-        Ok(Ok(resp)) => {
-            node_info_permit.finish_ok();
-            resp.into_inner()
-        }
-        Ok(Err(status)) => {
-            let error = format!("get_node_info RPC failed: {status}");
-            node_info_permit.finish_err(error.clone());
-            return Err(anyhow::anyhow!(error));
-        }
+    // Permits, admission, and finish-on-error are handled inside the typed
+    // call builders — the call site is just the request + timeout.
+    let node_info = match timeout(RPC_TIMEOUT, peer.get_node_info(GetNodeInfoRequest {})).await {
+        Ok(Ok(resp)) => resp.into_inner(),
+        Ok(Err(err)) => return Err(anyhow::anyhow!("get_node_info RPC failed: {err}")),
         Err(_) => {
-            let error = format!("get_node_info timed out after {RPC_TIMEOUT:?}");
-            node_info_permit.finish_err(error.clone());
-            return Err(anyhow::anyhow!(error));
+            return Err(anyhow::anyhow!(
+                "get_node_info timed out after {RPC_TIMEOUT:?}"
+            ));
         }
     };
 
@@ -312,45 +304,33 @@ async fn interrogate_peer(
     let mut invalid_known_peers = 0usize;
     let mut known_peers_error = None;
 
-    match peer_registry.acquire_iroh_method::<methods::GetKnownPeers>(peer_id) {
-        Ok(mut known_peers_permit) => {
-            match timeout(
-                RPC_TIMEOUT,
-                client.get_known_peers(GetKnownPeersRequest {
-                    service_alpn: String::new(),
-                }),
-            )
-            .await
-            {
-                Ok(Ok(resp)) => {
-                    known_peers_permit.finish_ok();
-                    let mut dedupe = HashSet::new();
-                    for raw_id in resp.into_inner().peer_ids {
-                        match decode_endpoint_id(&raw_id) {
-                            Ok(id) if id != peer_id => {
-                                if dedupe.insert(id) {
-                                    known_peers.push(id);
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(_) => invalid_known_peers += 1,
+    match timeout(
+        RPC_TIMEOUT,
+        peer.get_known_peers(GetKnownPeersRequest {
+            service_alpn: String::new(),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let mut dedupe = HashSet::new();
+            for raw_id in resp.into_inner().peer_ids {
+                match decode_endpoint_id(&raw_id) {
+                    Ok(id) if id != peer_id => {
+                        if dedupe.insert(id) {
+                            known_peers.push(id);
                         }
                     }
-                }
-                Ok(Err(status)) => {
-                    let error = format!("get_known_peers RPC failed: {status}");
-                    known_peers_permit.finish_err(error.clone());
-                    known_peers_error = Some(error);
-                }
-                Err(_) => {
-                    let error = format!("get_known_peers timed out after {RPC_TIMEOUT:?}");
-                    known_peers_permit.finish_err(error.clone());
-                    known_peers_error = Some(error);
+                    Ok(_) => {}
+                    Err(_) => invalid_known_peers += 1,
                 }
             }
         }
-        Err(err) => {
-            known_peers_error = Some(err.to_string());
+        Ok(Err(err)) => {
+            known_peers_error = Some(format!("get_known_peers RPC failed: {err}"));
+        }
+        Err(_) => {
+            known_peers_error = Some(format!("get_known_peers timed out after {RPC_TIMEOUT:?}"));
         }
     }
 
