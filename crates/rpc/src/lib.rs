@@ -35,7 +35,13 @@ pub mod policy;
 pub mod provenance;
 #[cfg(feature = "server")]
 pub mod server;
-pub mod service;
+/// Generated per-service / per-method type markers (e.g. `NodeService`,
+/// `methods::GetNodeInfo`). Implement `RpcService` / `RpcMethod` and
+/// `tonic::server::NamedService`; emitted by `crates/rpc/build.rs` with the
+/// `compile` feature and checked into `src/generated/`.
+pub mod service {
+    include!("generated/service_markers.rs");
+}
 pub mod spec;
 
 pub use spec::ModelSpec;
