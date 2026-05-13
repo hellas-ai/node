@@ -50,7 +50,6 @@ compile = [
 # protocol features, and `iroh-client` should be deleted once callers move to
 # explicit granular flags.
 client = [
-  "tonic/channel",
   "hellas-pb/client",
   "hellas-pb/hellas",
   "hellas-pb/symbolic",
