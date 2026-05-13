@@ -2637,7 +2637,9 @@ dependencies = [
  "hellas-pb",
  "hf-hub 0.5.0",
  "http",
+ "http-body",
  "mainline",
+ "pin-project",
  "prost",
  "serde",
  "serde_json",
@@ -2646,6 +2648,8 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-iroh-transport",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
