@@ -134,13 +134,18 @@ impl PeerManager {
     pub fn observe_inbound_request(
         &self,
         peer: PeerId,
-        kind: RequestKind,
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, PeerManagerError> {
         let now = self.now_ms();
-        Ok(self
-            .lock()?
-            .observe_inbound_request(now, peer, kind, rtt_ms)?)
+        Ok(self.lock()?.observe_inbound_request(now, peer, rtt_ms)?)
+    }
+
+    /// Spend a per-peer rate-limit token. Only the directory's
+    /// rate-limited policy path calls this; account-only methods leave the
+    /// bucket alone so they can't starve disclosure rate-limits.
+    pub fn try_admit_inbound(&self, peer: PeerId) -> Result<(), PeerManagerError> {
+        let now = self.now_ms();
+        Ok(self.lock()?.try_admit_inbound(now, peer)?)
     }
 
     pub fn observe_invalid_request(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {

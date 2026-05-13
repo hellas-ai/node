@@ -199,15 +199,9 @@ impl PeerDirectory {
         observed_rtt_ms: Option<f64>,
         policy: InboundRequestPolicy,
     ) -> Result<InboundAdmission, PeerManagerError> {
-        let per_peer_ok = match self.manager.observe_inbound_request(
-            peer,
-            policy.kind,
-            observed_rtt_ms,
-        ) {
-            Ok(_) => true,
-            Err(PeerManagerError::Admission(_)) => false,
-            Err(err) => return Err(err),
-        };
+        // Stats first — every inbound request bumps total_requests and the
+        // RTT EMA, regardless of whether the policy will reject.
+        self.manager.observe_inbound_request(peer, observed_rtt_ms)?;
 
         let now = self.manager.now_ms();
         let disclosure_limit = self.manager.with_registry(|registry| {
@@ -216,39 +210,47 @@ impl PeerDirectory {
                 .map_or(8, |entry| disclosure_limit(entry, now, self.config.as_ref()))
         })?;
 
-        // Only spend a global-bucket token if the per-peer check passed.
-        // Otherwise an abusive peer past its own limit could keep calling
-        // and drain the shared bucket, denying unrelated well-behaved peers
-        // by collateral damage.
-        let global_ok = if policy.reject_when_limited && per_peer_ok {
-            self.known_peers_global_bucket
-                .lock()
-                .map_err(|_| PeerManagerError::Unavailable)?
-                .try_take(
-                    now,
-                    self.config.global_known_peers_bucket_capacity,
-                    self.config.global_known_peers_bucket_refill_per_sec,
-                )
-                .is_ok()
-        } else {
-            // When the per-peer bucket already denied, the global decision
-            // doesn't matter — the request is already going to be rejected
-            // (if rate-limited) or accepted (if account-only).
-            per_peer_ok
-        };
+        if !policy.reject_when_limited {
+            // Account-only methods don't touch the per-peer bucket: that
+            // bucket exists to gate disclosure-style methods, and letting
+            // ordinary calls drain it would lock those out for free.
+            return Ok(InboundAdmission {
+                allow: true,
+                disclosure_limit,
+            });
+        }
 
-        if policy.reject_when_limited && !(per_peer_ok && global_ok) {
+        // Rate-limited path: spend a per-peer token first. If that fails,
+        // the global bucket is irrelevant — refuse.
+        let per_peer_ok = self.manager.try_admit_inbound(peer).is_ok();
+        if !per_peer_ok {
+            let _ = self.manager.observe_rate_limited(peer);
+            return Ok(InboundAdmission {
+                allow: false,
+                disclosure_limit,
+            });
+        }
+
+        // Per-peer admitted — now check the shared disclosure bucket. We
+        // only spend a global token if the per-peer check passed so an
+        // abusive peer past its own limit can't collateral-damage other
+        // peers by draining the shared bucket.
+        let global_ok = self
+            .known_peers_global_bucket
+            .lock()
+            .map_err(|_| PeerManagerError::Unavailable)?
+            .try_take(
+                now,
+                self.config.global_known_peers_bucket_capacity,
+                self.config.global_known_peers_bucket_refill_per_sec,
+            )
+            .is_ok();
+        if !global_ok {
             let _ = self.manager.observe_rate_limited(peer);
         }
 
-        let allow = if policy.reject_when_limited {
-            per_peer_ok && global_ok
-        } else {
-            true
-        };
-
         Ok(InboundAdmission {
-            allow,
+            allow: global_ok,
             disclosure_limit,
         })
     }
@@ -819,5 +821,67 @@ mod tests {
         let result = expected.expect("at least one trial ran");
         // PeerId ascending: peer(1) < peer(2) < peer(3) < peer(5) < peer(7).
         assert_eq!(result, vec![peer(1), peer(2), peer(3), peer(5), peer(7)]);
+    }
+
+    #[test]
+    fn account_only_methods_do_not_drain_rate_limit_bucket() {
+        // Regression for H1: previously every inbound request spent one
+        // token from the per-peer bucket, so a flood of `account_only`
+        // calls (e.g. GetNodeInfo) could drain admission for the actually
+        // rate-limited methods (e.g. GetKnownPeers). Now `account_only`
+        // bypasses the bucket entirely.
+        let directory = PeerDirectory::with_config(
+            peer(0),
+            PeerDirectoryConfig {
+                registry: PeerRegistryConfig {
+                    max_peers: 8,
+                    // Capacity 1 makes the regression unmistakable: a single
+                    // account_only call under the old behaviour would drain
+                    // the bucket and the next rate_limited call would be
+                    // rejected.
+                    bucket_capacity: 1.0,
+                    bucket_refill_per_sec: 0.0,
+                    ..PeerRegistryConfig::default()
+                },
+                ..PeerDirectoryConfig::default()
+            },
+        );
+
+        let caller = peer(1);
+
+        // Hammer with account_only requests — these should NOT touch the
+        // bucket.
+        for _ in 0..32 {
+            let admission = directory
+                .observe_inbound_request(
+                    caller,
+                    None,
+                    InboundRequestPolicy::account_only(GET_NODE_INFO),
+                )
+                .expect("account_only never errors");
+            assert!(admission.allow);
+        }
+
+        // The first rate_limited call must still be admitted — the bucket
+        // is intact because nothing has spent it yet.
+        let admission = directory
+            .observe_inbound_request(
+                caller,
+                None,
+                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
+            )
+            .expect("rate_limited returns Ok with allow=false on overflow");
+        assert!(admission.allow, "rate_limited call must succeed after only account_only traffic");
+
+        // A second rate_limited call should be rejected — the bucket only
+        // held one token and we just spent it.
+        let admission = directory
+            .observe_inbound_request(
+                caller,
+                None,
+                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
+            )
+            .expect("rate_limited returns Ok with allow=false on overflow");
+        assert!(!admission.allow, "drained bucket must reject the next rate_limited call");
     }
 }
