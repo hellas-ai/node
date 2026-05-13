@@ -186,5 +186,3 @@ where
         }
     }
 }
-
-include!(concat!(env!("OUT_DIR"), "/iroh_clients.rs"));
