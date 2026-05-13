@@ -1,4 +1,5 @@
 use crate::commands::CliResult;
+use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc};
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -6,14 +7,10 @@ use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::{
-    DiscoverySource, Outcome, PeerEvent, PeerId, PeerRegistry, Permit,
-    RequestKind as PeerRequestKind, TransportSecurity,
-};
+use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, TransportSecurity};
 use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
 use std::future;
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
@@ -37,7 +34,7 @@ struct PeerInterrogationOutcome {
 
 struct DiscoveryEventContext<'a> {
     node_pool: &'a ConnectionPool,
-    peer_registry: &'a Arc<Mutex<PeerRegistry>>,
+    peer_registry: &'a SharedPeerRegistry,
     interrogate: bool,
     interrogated: &'a mut HashSet<EndpointId>,
     interrogations: &'a mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
@@ -67,7 +64,7 @@ pub async fn run(
     let mut node_discovery = Box::pin(registry.discover::<NodeService>());
     let mut execute_discovery = Box::pin(registry.discover::<ExecuteService>());
 
-    let peer_registry = Arc::new(Mutex::new(PeerRegistry::default()));
+    let peer_registry = SharedPeerRegistry::default();
     let mut interrogations = JoinSet::new();
     let mut interrogated = HashSet::new();
 
@@ -293,7 +290,7 @@ fn handle_discovery_event(
 
 async fn interrogate_peer(
     node_pool: ConnectionPool,
-    peer_registry: Arc<Mutex<PeerRegistry>>,
+    peer_registry: SharedPeerRegistry,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
     let channel = node_pool
@@ -305,45 +302,26 @@ async fn interrogate_peer(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let node_info_permit = acquire_rpc(
+    let mut node_info_permit = acquire_rpc(
         &peer_registry,
         peer_id,
-        PeerRequestKind::new(NODE_SERVICE_NAME, "GetNodeInfo"),
+        NODE_SERVICE_NAME,
+        "GetNodeInfo",
         1.0,
     )?;
-    let node_info_started = std::time::Instant::now();
     let node_info = match timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {})).await {
         Ok(Ok(resp)) => {
-            observe_authenticated_service(&peer_registry, peer_id, NODE_SERVICE_NAME);
-            release_rpc(
-                &peer_registry,
-                node_info_permit,
-                Outcome::ok(duration_ms(node_info_started.elapsed())),
-            );
+            node_info_permit.finish_ok();
             resp.into_inner()
         }
         Ok(Err(status)) => {
             let error = format!("get_node_info RPC failed: {status}");
-            release_rpc(
-                &peer_registry,
-                node_info_permit,
-                Outcome::Err {
-                    rtt_ms: Some(duration_ms(node_info_started.elapsed())),
-                    error: error.clone(),
-                },
-            );
+            node_info_permit.finish_err(error.clone());
             return Err(anyhow::anyhow!(error));
         }
         Err(_) => {
             let error = format!("get_node_info timed out after {RPC_TIMEOUT:?}");
-            release_rpc(
-                &peer_registry,
-                node_info_permit,
-                Outcome::Err {
-                    rtt_ms: Some(duration_ms(node_info_started.elapsed())),
-                    error: error.clone(),
-                },
-            );
+            node_info_permit.finish_err(error.clone());
             return Err(anyhow::anyhow!(error));
         }
     };
@@ -355,11 +333,11 @@ async fn interrogate_peer(
     match acquire_rpc(
         &peer_registry,
         peer_id,
-        PeerRequestKind::new(NODE_SERVICE_NAME, "GetKnownPeers"),
+        NODE_SERVICE_NAME,
+        "GetKnownPeers",
         0.25,
     ) {
-        Ok(known_peers_permit) => {
-            let known_peers_started = std::time::Instant::now();
+        Ok(mut known_peers_permit) => {
             match timeout(
                 RPC_TIMEOUT,
                 client.get_known_peers(GetKnownPeersRequest {
@@ -369,11 +347,7 @@ async fn interrogate_peer(
             .await
             {
                 Ok(Ok(resp)) => {
-                    release_rpc(
-                        &peer_registry,
-                        known_peers_permit,
-                        Outcome::ok(duration_ms(known_peers_started.elapsed())),
-                    );
+                    known_peers_permit.finish_ok();
                     let mut dedupe = HashSet::new();
                     for raw_id in resp.into_inner().peer_ids {
                         match decode_endpoint_id(&raw_id) {
@@ -389,26 +363,12 @@ async fn interrogate_peer(
                 }
                 Ok(Err(status)) => {
                     let error = format!("get_known_peers RPC failed: {status}");
-                    release_rpc(
-                        &peer_registry,
-                        known_peers_permit,
-                        Outcome::Err {
-                            rtt_ms: Some(duration_ms(known_peers_started.elapsed())),
-                            error: error.clone(),
-                        },
-                    );
+                    known_peers_permit.finish_err(error.clone());
                     known_peers_error = Some(error);
                 }
                 Err(_) => {
                     let error = format!("get_known_peers timed out after {RPC_TIMEOUT:?}");
-                    release_rpc(
-                        &peer_registry,
-                        known_peers_permit,
-                        Outcome::Err {
-                            rtt_ms: Some(duration_ms(known_peers_started.elapsed())),
-                            error: error.clone(),
-                        },
-                    );
+                    known_peers_permit.finish_err(error.clone());
                     known_peers_error = Some(error);
                 }
             }
@@ -427,7 +387,7 @@ async fn interrogate_peer(
 }
 
 fn observe_discovered_service(
-    registry: &Arc<Mutex<PeerRegistry>>,
+    registry: &SharedPeerRegistry,
     peer_id: EndpointId,
     source: DiscoverySource,
     service: &'static str,
@@ -446,52 +406,6 @@ fn observe_discovered_service(
     })
 }
 
-fn acquire_rpc(
-    registry: &Arc<Mutex<PeerRegistry>>,
-    peer_id: EndpointId,
-    kind: PeerRequestKind,
-    cost: f32,
-) -> anyhow::Result<Permit> {
-    registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("peer registry is unavailable"))?
-        .try_acquire(now_ms(), peer_id_from_endpoint(peer_id), kind, cost)
-        .map_err(Into::into)
-}
-
-fn release_rpc(registry: &Arc<Mutex<PeerRegistry>>, permit: Permit, outcome: Outcome) {
-    if let Ok(mut registry) = registry.lock() {
-        registry.release(now_ms(), permit, outcome);
-    }
-}
-
-fn observe_authenticated_service(
-    registry: &Arc<Mutex<PeerRegistry>>,
-    peer_id: EndpointId,
-    service: &'static str,
-) {
-    if let Ok(mut registry) = registry.lock() {
-        let now = now_ms();
-        let peer_id = peer_id_from_endpoint(peer_id);
-        registry.apply(
-            now,
-            peer_id,
-            PeerEvent::Discovered {
-                source: DiscoverySource::Transport("iroh"),
-                transport_security: TransportSecurity::Authenticated,
-            },
-        );
-        registry.apply(
-            now,
-            peer_id,
-            PeerEvent::ServiceObserved {
-                service,
-                transport_security: TransportSecurity::Authenticated,
-            },
-        );
-    }
-}
-
 fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
     PeerId::from(*peer_id.as_bytes())
 }
@@ -502,10 +416,6 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
-}
-
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {
