@@ -109,5 +109,11 @@ tonic-prost = { version = "0.14", default-features = false, optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 
+[build-dependencies]
+prettyplease = "0.2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
+
 [dev-dependencies]
 tokio.workspace = true
