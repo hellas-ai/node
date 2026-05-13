@@ -30,10 +30,10 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::iroh_client::{IrohClientError, ManagedStreaming};
+use crate::iroh_client::ManagedStreaming;
 use crate::peers::{
-    GrpcMethodSpec, IrohPeerHandle, IrohRpcPoolError, IrohServiceSpec, PeerManagerError, RpcMethod,
-    RpcService,
+    GrpcMethodSpec, IrohPeerHandle, IrohRpcPoolError, IrohServiceSpec, PeerManagerError,
+    RpcMethod, RpcPermitGuard, RpcService,
 };
 
 // On wasm the iroh transport's response futures are `!Send` (single-threaded
@@ -100,12 +100,30 @@ impl RpcError {
         }
     }
 
-    pub(crate) fn from_client(err: IrohClientError) -> Self {
-        match err {
-            IrohClientError::Pool(e) => Self::from_pool("rpc", e),
-            IrohClientError::Status { method, source } => Self::from_status(method, source),
-        }
-    }
+}
+
+// Streaming-response helpers. Lift the tonic-shaped result into our typed
+// `RpcError`, finishing the method permit (success → `finish_ok` happens when
+// the stream end-of-frame is seen by `ManagedStreaming`; transport error →
+// `finish_err` here).
+fn wrap_streaming<M: GrpcMethodSpec>(
+    permit: RpcPermitGuard,
+    resp: tonic::Response<tonic::codec::Streaming<M::Response>>,
+) -> tonic::Response<ManagedStreaming<M::Response>> {
+    let (metadata, stream, extensions) = resp.into_parts();
+    tonic::Response::from_parts(
+        metadata,
+        ManagedStreaming::new(stream, permit, M::NAME),
+        extensions,
+    )
+}
+
+fn finish_streaming_err<M: GrpcMethodSpec>(
+    mut permit: RpcPermitGuard,
+    status: tonic::Status,
+) -> RpcError {
+    permit.finish_err(format!("{}: {status}", M::NAME));
+    RpcError::from_status(M::NAME, status)
 }
 
 // Helpers — these stay private; only the four call types use them.
@@ -125,7 +143,7 @@ where
 {
     let pool = handle.pool::<M::Service>();
     let (channel, mut permit) = pool
-        .channel::<M>(handle.peer_id())
+        .channel::<M>(handle.target())
         .await
         .map_err(|e| RpcError::from_pool(M::NAME, e))?;
     let mut grpc = tonic::client::Grpc::new(channel)
@@ -272,13 +290,10 @@ where
             if let Some(timeout) = timeout {
                 request.set_timeout(timeout);
             }
-            let result = grpc.server_streaming(request, path, codec).await;
-            crate::iroh_client::finish_streaming::<M, _>(permit, result)
-                .map(|resp| {
-                    let (meta, body, ext) = resp.into_parts();
-                    tonic::Response::from_parts(meta, body, ext)
-                })
-                .map_err(RpcError::from_client)
+            match grpc.server_streaming(request, path, codec).await {
+                Ok(resp) => Ok(wrap_streaming::<M>(permit, resp)),
+                Err(status) => Err(finish_streaming_err::<M>(permit, status)),
+            }
         })
     }
 }
@@ -407,13 +422,10 @@ where
             if let Some(timeout) = timeout {
                 request.set_timeout(timeout);
             }
-            let result = grpc.streaming(request, path, codec).await;
-            crate::iroh_client::finish_streaming::<M, _>(permit, result)
-                .map(|resp| {
-                    let (meta, body, ext) = resp.into_parts();
-                    tonic::Response::from_parts(meta, body, ext)
-                })
-                .map_err(RpcError::from_client)
+            match grpc.streaming(request, path, codec).await {
+                Ok(resp) => Ok(wrap_streaming::<M>(permit, resp)),
+                Err(status) => Err(finish_streaming_err::<M>(permit, status)),
+            }
         })
     }
 }
