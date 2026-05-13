@@ -23,7 +23,7 @@ pub mod call;
 /// ```
 #[cfg(feature = "iroh-client")]
 pub mod client {
-    include!(concat!(env!("OUT_DIR"), "/client_traits.rs"));
+    include!("generated/client_traits.rs");
 }
 #[cfg(feature = "iroh-client")]
 pub mod iroh_client;

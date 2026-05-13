@@ -5,4 +5,4 @@
 //! implement [`crate::peers::RpcService`] and `tonic::server::NamedService`;
 //! method markers implement [`crate::peers::RpcMethod`].
 
-include!(concat!(env!("OUT_DIR"), "/service_markers.rs"));
+include!("generated/service_markers.rs");
