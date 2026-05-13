@@ -54,7 +54,7 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::{IrohRpcPool, IrohTransport, PeerManager};
+use hellas_rpc::peers::{IrohRpcPool, IrohTransport, PeerManager, RpcPermitGuard};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -923,29 +923,12 @@ impl RemoteExecution {
             provenance: _,
             driver,
         } = self;
-        try_stream! {
-            // Hold the endpoint until the stream is dropped. Dropping the
-            // endpoint while the underlying QUIC connection is in-flight
-            // would tear down transport mid-execution.
-            let _endpoint = endpoint;
-            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
-            let inner = execute_stream(driver, request_commitment);
-            tokio::pin!(inner);
-            while let Some(event) = inner.next().await {
-                match event {
-                    Ok(ExecutionEvent::Done(outcome)) => {
-                        permit.finish_ok();
-                        yield ExecutionEvent::Done(outcome);
-                        return;
-                    }
-                    Ok(event) => yield event,
-                    Err(err) => {
-                        permit.finish_err(err.to_string());
-                        Err(err)?;
-                    }
-                }
-            }
-        }
+        track_remote_execution_stream(
+            endpoint,
+            peer_registry,
+            peer_id,
+            execute_stream(driver, request_commitment),
+        )
     }
 }
 
@@ -983,23 +966,70 @@ impl OpaqueRemoteExecution {
             request_commitment,
             driver,
         } = self;
-        try_stream! {
-            let _endpoint = endpoint;
-            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
-            let inner = execute_opaque_stream(driver, request_commitment, request);
-            tokio::pin!(inner);
-            while let Some(event) = inner.next().await {
-                match event {
-                    Ok(OpaqueExecutionEvent::Done(outcome)) => {
+        track_remote_execution_stream(
+            endpoint,
+            peer_registry,
+            peer_id,
+            execute_opaque_stream(driver, request_commitment, request),
+        )
+    }
+}
+
+/// Last-yielded variant of a remote-execution event stream. Both
+/// `ExecutionEvent` and `OpaqueExecutionEvent` carry a `Done(_)` terminal
+/// — the `track_remote_execution_stream` helper consults this to flush
+/// the permit before yielding the terminal event (so a consumer that
+/// drops on Done doesn't trigger a spurious `Cancelled`).
+trait IsTerminalExecutionEvent {
+    fn is_terminal(&self) -> bool;
+}
+
+impl IsTerminalExecutionEvent for ExecutionEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done(_))
+    }
+}
+
+impl IsTerminalExecutionEvent for OpaqueExecutionEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done(_))
+    }
+}
+
+/// Wrap a per-execution stream with the registry's `RunTicket` permit
+/// lifecycle: acquire on first poll, finish_ok before yielding the
+/// terminal event, finish_err on a transport error, and (via the
+/// `RpcPermitGuard` Drop) Cancelled if the consumer drops the stream
+/// before it terminates. Holds the endpoint alive for the duration so a
+/// concurrent endpoint drop doesn't tear down the underlying QUIC
+/// connection mid-execution.
+fn track_remote_execution_stream<E, S>(
+    endpoint: Arc<Endpoint>,
+    peer_registry: PeerManager,
+    peer_id: EndpointId,
+    inner: S,
+) -> impl Stream<Item = anyhow::Result<E>> + Send
+where
+    E: IsTerminalExecutionEvent + Send + 'static,
+    S: Stream<Item = anyhow::Result<E>> + Send + 'static,
+{
+    try_stream! {
+        let _endpoint = endpoint;
+        let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
+        tokio::pin!(inner);
+        while let Some(event) = inner.next().await {
+            match event {
+                Ok(event) => {
+                    if event.is_terminal() {
                         permit.finish_ok();
-                        yield OpaqueExecutionEvent::Done(outcome);
+                        yield event;
                         return;
                     }
-                    Ok(event) => yield event,
-                    Err(err) => {
-                        permit.finish_err(err.to_string());
-                        Err(err)?;
-                    }
+                    yield event;
+                }
+                Err(err) => {
+                    permit.finish_err(err.to_string());
+                    Err(err)?;
                 }
             }
         }
@@ -1304,6 +1334,29 @@ fn bind_remote_transport(endpoint: &Endpoint, peer_registry: PeerManager) -> Iro
     )
 }
 
+/// Dial a service `S` directly at the supplied address (bypassing
+/// discovery), folding the permit's `finish_connect_err` into the error
+/// path. Lets the quote-target helpers below avoid repeating the same
+/// 6-line match block for every service.
+async fn direct_channel<S: IrohConnect>(
+    permit: &mut RpcPermitGuard,
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    node_id: EndpointId,
+) -> anyhow::Result<IrohChannel> {
+    match S::connect(endpoint, addr)
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {node_id}"))
+    {
+        Ok(channel) => Ok(channel),
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            Err(err)
+        }
+    }
+}
+
 #[instrument(skip_all, fields(%peer_id, service = %request.service, method = %request.method))]
 async fn quote_opaque_remote_endpoint(
     request: &PbOpaqueRequest,
@@ -1467,28 +1520,12 @@ async fn quote_opaque_remote_target(
 
     let mut permit =
         peer_registry.acquire_iroh_method::<methods::OpaqueCreateTicket>(target.node_id)?;
-    let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))
-    {
-        Ok(channel) => channel,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
-    let opaque_channel = match OpaqueService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))
-    {
-        Ok(channel) => channel,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
+    let addr = target.endpoint_addr();
+    let execute_channel =
+        direct_channel::<ExecuteService>(&mut permit, endpoint, addr.clone(), target.node_id)
+            .await?;
+    let opaque_channel =
+        direct_channel::<OpaqueService>(&mut permit, endpoint, addr, target.node_id).await?;
     let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
         traced(execute_channel),
         traced(opaque_channel),
@@ -1529,28 +1566,12 @@ async fn quote_remote_target(
 
     let mut permit =
         peer_registry.acquire_iroh_method::<methods::QuotePreparedText>(target.node_id)?;
-    let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))
-    {
-        Ok(channel) => channel,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
-    let courtesy_channel = match CourtesyService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))
-    {
-        Ok(channel) => channel,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
+    let addr = target.endpoint_addr();
+    let execute_channel =
+        direct_channel::<ExecuteService>(&mut permit, endpoint, addr.clone(), target.node_id)
+            .await?;
+    let courtesy_channel =
+        direct_channel::<CourtesyService>(&mut permit, endpoint, addr, target.node_id).await?;
     let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
         traced(execute_channel),
         traced(courtesy_channel),
