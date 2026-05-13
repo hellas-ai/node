@@ -33,7 +33,17 @@ use thiserror::Error;
 use crate::iroh_client::{IrohClientError, ManagedStreaming};
 use crate::peers::{IrohPeerHandle, IrohRpcPoolError, PeerManagerError, RpcMethod, RpcService};
 
+// On wasm the iroh transport's response futures are `!Send` (single-threaded
+// runtime). Off wasm, we keep the `Send` bound so callers can drive these
+// futures on multi-threaded runtimes. The request-side `RequestStream` stays
+// `Send` everywhere — tonic's `Grpc::{client,bidi}_streaming` require it,
+// and user-supplied streams (e.g. wrapping a `Vec<T: Send>`) satisfy that
+// on wasm too.
+#[cfg(target_family = "wasm")]
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+#[cfg(not(target_family = "wasm"))]
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 type RequestStream<T> = Pin<Box<dyn futures_core::Stream<Item = T> + Send + 'static>>;
 
 /// Wire-agnostic error type returned by the typed call builders.
