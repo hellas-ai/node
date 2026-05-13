@@ -48,11 +48,19 @@ impl fmt::Debug for PeerId {
 }
 
 impl fmt::Display for PeerId {
+    /// Default: short hex (`9f3c1d77…4ab8c2e1`) — fits in logs without
+    /// dominating. Use the alternate `{:#}` form for the full 64-char hex.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            for byte in &self.0 {
+                write!(f, "{byte:02x}")?;
+            }
+            return Ok(());
+        }
         for byte in &self.0[..4] {
             write!(f, "{byte:02x}")?;
         }
-        write!(f, "...")?;
+        write!(f, "…")?;
         for byte in &self.0[28..] {
             write!(f, "{byte:02x}")?;
         }

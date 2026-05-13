@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::admission::TokenBucket;
 use super::{
-    DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
+    AuthLevel, DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
     PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
 };
 
@@ -74,6 +74,11 @@ pub struct PeerDirectoryConfig {
     pub global_known_peers_bucket_capacity: f64,
     pub global_known_peers_bucket_refill_per_sec: f64,
     pub service_aliases: Vec<ServiceAlias>,
+    /// Minimum `AuthLevel` a peer must hold to appear in
+    /// [`PeerDirectory::ranked_known_peers`]. Default is `Untrusted` (no
+    /// filtering); set higher to gate disclosure on transport-authenticated
+    /// or operator-trusted peers only.
+    pub min_disclosed_auth_level: AuthLevel,
 }
 
 impl Default for PeerDirectoryConfig {
@@ -92,6 +97,7 @@ impl Default for PeerDirectoryConfig {
             global_known_peers_bucket_capacity: DEFAULT_GLOBAL_BUCKET_CAPACITY,
             global_known_peers_bucket_refill_per_sec: DEFAULT_GLOBAL_BUCKET_REFILL_PER_SEC,
             service_aliases: default_service_aliases(),
+            min_disclosed_auth_level: AuthLevel::Untrusted,
         }
     }
 }
@@ -283,6 +289,9 @@ impl PeerDirectory {
                 .iter()
                 .filter_map(|peer| {
                     if peer.id == self.local_peer || peer.id == requester {
+                        return None;
+                    }
+                    if peer.auth_level < config.min_disclosed_auth_level {
                         return None;
                     }
                     let age_ms = now.saturating_sub(peer.last_seen_ms);
