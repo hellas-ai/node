@@ -1,5 +1,5 @@
 use crate::commands::CliResult;
-use crate::peer_rpc::{PeerManager, acquire_iroh_rpc};
+use crate::peer_rpc::{PeerManager, acquire_iroh_method};
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -8,7 +8,7 @@ use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResp
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, TransportSecurity};
-use hellas_rpc::service::{ExecuteService, NodeService};
+use hellas_rpc::service::{ExecuteService, NodeService, methods};
 use std::collections::HashSet;
 use std::future;
 use tokio::task::JoinSet;
@@ -298,13 +298,8 @@ async fn interrogate_peer(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let mut node_info_permit = acquire_iroh_rpc(
-        &peer_registry,
-        peer_id,
-        NODE_SERVICE_NAME,
-        "GetNodeInfo",
-        1.0,
-    )?;
+    let mut node_info_permit =
+        acquire_iroh_method::<methods::GetNodeInfo>(&peer_registry, peer_id, 1.0)?;
     let node_info = match timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {})).await {
         Ok(Ok(resp)) => {
             node_info_permit.finish_ok();
@@ -326,13 +321,7 @@ async fn interrogate_peer(
     let mut invalid_known_peers = 0usize;
     let mut known_peers_error = None;
 
-    match acquire_iroh_rpc(
-        &peer_registry,
-        peer_id,
-        NODE_SERVICE_NAME,
-        "GetKnownPeers",
-        0.25,
-    ) {
+    match acquire_iroh_method::<methods::GetKnownPeers>(&peer_registry, peer_id, 0.25) {
         Ok(mut known_peers_permit) => {
             match timeout(
                 RPC_TIMEOUT,

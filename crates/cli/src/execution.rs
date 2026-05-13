@@ -27,7 +27,7 @@
 //!   - Transport error after a chunk → propagate (committed work can't be retried).
 //!   - `Done(Failed)` (executor verdict) → propagate, never retry.
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_rpc, observe_iroh_discovered_service};
+use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_discovered_service};
 #[cfg(feature = "hellas-executor")]
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
@@ -59,7 +59,7 @@ use hellas_rpc::peers::ServiceKey;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
+use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService, methods};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -929,11 +929,9 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
-            let mut permit = acquire_iroh_rpc(
+            let mut permit = acquire_iroh_method::<methods::RunTicket>(
                 &peer_registry,
                 peer_id,
-                <ExecuteService as ServiceKey>::NAME,
-                "RunTicket",
                 1.0,
             )?;
             let inner = execute_stream(driver, request_commitment);
@@ -992,11 +990,9 @@ impl OpaqueRemoteExecution {
         } = self;
         try_stream! {
             let _endpoint = endpoint;
-            let mut permit = acquire_iroh_rpc(
+            let mut permit = acquire_iroh_method::<methods::RunTicket>(
                 &peer_registry,
                 peer_id,
-                <ExecuteService as ServiceKey>::NAME,
-                "RunTicket",
                 1.0,
             )?;
             let inner = execute_opaque_stream(driver, request_commitment, request);
@@ -1340,14 +1336,9 @@ async fn quote_opaque_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit = acquire_iroh_rpc(
-        &peer_registry,
-        peer_id,
-        <OpaqueService as ServiceKey>::NAME,
-        "CreateTicket",
-        1.0,
-    )
-    .map_err(QuoteCandidateError::Connect)?;
+    let mut permit =
+        acquire_iroh_method::<methods::OpaqueCreateTicket>(&peer_registry, peer_id, 1.0)
+            .map_err(QuoteCandidateError::Connect)?;
     let opaque_channel = match opaque_pool
         .channel(peer_id)
         .await
@@ -1405,14 +1396,9 @@ async fn quote_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit = acquire_iroh_rpc(
-        &peer_registry,
-        peer_id,
-        <CourtesyService as ServiceKey>::NAME,
-        "QuotePreparedText",
-        1.0,
-    )
-    .map_err(QuoteCandidateError::Connect)?;
+    let mut permit =
+        acquire_iroh_method::<methods::QuotePreparedText>(&peer_registry, peer_id, 1.0)
+            .map_err(QuoteCandidateError::Connect)?;
     let courtesy_channel = match courtesy_pool
         .channel(peer_id)
         .await
@@ -1515,13 +1501,8 @@ async fn quote_opaque_remote_target(
         return quote_opaque_remote_peer(request, endpoint, target.node_id, peer_registry).await;
     }
 
-    let mut permit = acquire_iroh_rpc(
-        &peer_registry,
-        target.node_id,
-        <OpaqueService as ServiceKey>::NAME,
-        "CreateTicket",
-        1.0,
-    )?;
+    let mut permit =
+        acquire_iroh_method::<methods::OpaqueCreateTicket>(&peer_registry, target.node_id, 1.0)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
@@ -1582,13 +1563,8 @@ async fn quote_remote_target(
         return quote_remote_peer(quote_req, endpoint, target.node_id, peer_registry).await;
     }
 
-    let mut permit = acquire_iroh_rpc(
-        &peer_registry,
-        target.node_id,
-        <CourtesyService as ServiceKey>::NAME,
-        "QuotePreparedText",
-        1.0,
-    )?;
+    let mut permit =
+        acquire_iroh_method::<methods::QuotePreparedText>(&peer_registry, target.node_id, 1.0)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await

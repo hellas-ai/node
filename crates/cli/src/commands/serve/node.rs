@@ -14,14 +14,13 @@ use hellas_pb::swarm::{
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::peers::{
-    DiscoverySource, InboundRequestPolicy, PeerDirectory, PeerId, RequestKind as PeerRequestKind,
-    ServiceKey, TransportSecurity,
+    DiscoverySource, InboundRequestPolicy, PeerDirectory, PeerId, ServiceKey, TransportSecurity,
 };
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::service::{
     CourtesyService as CourtesyRpcService, ExecuteService as ExecuteRpcService,
     NodeService as NodeRpcService, OpaqueService as OpaqueRpcService,
-    SymbolicService as SymbolicRpcService,
+    SymbolicService as SymbolicRpcService, methods,
 };
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
@@ -70,10 +69,7 @@ impl tonic::service::Interceptor for ExecutePeerInterceptor {
             let _ = self.peer_directory.observe_inbound_request(
                 peer_id_from_endpoint(peer_id),
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_only(
-                    PeerRequestKind::for_service::<ExecuteRpcService>("ExecuteRpc"),
-                    1.0,
-                ),
+                InboundRequestPolicy::account_method::<methods::RunTicket>(1.0),
             );
         }
         Ok(request)
@@ -90,10 +86,7 @@ impl Node for NodeService {
             let _ = self.peer_directory.observe_inbound_request(
                 peer_id_from_endpoint(peer_id),
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_only(
-                    PeerRequestKind::for_service::<NodeRpcService>("GetNodeInfo"),
-                    0.5,
-                ),
+                InboundRequestPolicy::account_method::<methods::GetNodeInfo>(0.5),
             );
         }
 
@@ -132,11 +125,7 @@ impl Node for NodeService {
             .observe_inbound_request(
                 requester,
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::rate_limited(
-                    PeerRequestKind::for_service::<NodeRpcService>("GetKnownPeers"),
-                    4.0,
-                    1.0,
-                ),
+                InboundRequestPolicy::rate_limited_method::<methods::GetKnownPeers>(4.0, 1.0),
             )
             .map_err(|_| Status::internal("peer directory is unavailable"))?;
         if !admission.allow {

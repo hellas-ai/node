@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::{PeerId, ServiceKey};
+use super::{MethodKey, PeerId, ServiceKey};
 
 /// Transport-independent RPC identity used for accounting and admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,6 +18,13 @@ impl RequestKind {
         Self {
             service: S::NAME,
             method,
+        }
+    }
+
+    pub const fn for_method<M: MethodKey>() -> Self {
+        Self {
+            service: <M::Service as ServiceKey>::NAME,
+            method: M::NAME,
         }
     }
 }
