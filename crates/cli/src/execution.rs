@@ -27,7 +27,7 @@
 //!   - Transport error after a chunk → propagate (committed work can't be retried).
 //!   - `Done(Failed)` (executor verdict) → propagate, never retry.
 
-use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc, observe_discovered_service};
+use crate::peer_rpc::{PeerManager, acquire_iroh_rpc, observe_iroh_discovered_service};
 #[cfg(feature = "hellas-executor")]
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
@@ -164,7 +164,7 @@ pub struct ExecutionRuntime {
     #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
     secret_key: Option<SecretKey>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ impl ExecutionRuntime {
         Self {
             local_executor: Some(local_executor),
             secret_key: None,
-            peer_registry: SharedPeerRegistry::default(),
+            peer_registry: PeerManager::default(),
         }
     }
 
@@ -581,7 +581,7 @@ enum PreparedRoute {
         quote_req: QuotePreparedTextRequest,
         retries: usize,
         secret_key: Option<SecretKey>,
-        peer_registry: SharedPeerRegistry,
+        peer_registry: PeerManager,
     },
 }
 
@@ -683,7 +683,7 @@ enum OpaquePreparedRoute {
         request: PbOpaqueRequest,
         retries: usize,
         secret_key: Option<SecretKey>,
-        peer_registry: SharedPeerRegistry,
+        peer_registry: PeerManager,
     },
 }
 
@@ -752,7 +752,7 @@ fn opaque_discovery_stream(
     request: PbOpaqueRequest,
     retries: usize,
     secret_key: Option<SecretKey>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
     try_stream! {
         let max_attempts = retries.saturating_add(1);
@@ -827,7 +827,7 @@ fn discovery_stream(
     quote_req: QuotePreparedTextRequest,
     retries: usize,
     secret_key: Option<SecretKey>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
     try_stream! {
         let max_attempts = retries.saturating_add(1);
@@ -897,7 +897,7 @@ fn discovery_stream(
 struct RemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
     request_commitment: Vec<u8>,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
@@ -929,7 +929,7 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
-            let mut permit = acquire_rpc(
+            let mut permit = acquire_iroh_rpc(
                 &peer_registry,
                 peer_id,
                 <ExecuteService as ServiceKey>::NAME,
@@ -959,7 +959,7 @@ impl RemoteExecution {
 struct OpaqueRemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
     request: PbOpaqueRequest,
     request_commitment: Vec<u8>,
     driver: TracedDriver,
@@ -992,7 +992,7 @@ impl OpaqueRemoteExecution {
         } = self;
         try_stream! {
             let _endpoint = endpoint;
-            let mut permit = acquire_rpc(
+            let mut permit = acquire_iroh_rpc(
                 &peer_registry,
                 peer_id,
                 <ExecuteService as ServiceKey>::NAME,
@@ -1212,7 +1212,7 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 
 struct QuotedRemoteDriver {
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
     quote: hellas_pb::hellas::Ticket,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
@@ -1338,9 +1338,9 @@ async fn quote_opaque_remote_endpoint(
     execute_pool: &ConnectionPool,
     opaque_pool: &ConnectionPool,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit = acquire_rpc(
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         peer_id,
         <OpaqueService as ServiceKey>::NAME,
@@ -1403,9 +1403,9 @@ async fn quote_remote_endpoint(
     execute_pool: &ConnectionPool,
     courtesy_pool: &ConnectionPool,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit = acquire_rpc(
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         peer_id,
         <CourtesyService as ServiceKey>::NAME,
@@ -1469,7 +1469,7 @@ async fn quote_opaque_remote_peer(
     request: &PbOpaqueRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
     let opaque_pool = bind_opaque_pool(endpoint);
@@ -1487,7 +1487,7 @@ async fn quote_remote_peer(
     quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
     let courtesy_pool = bind_courtesy_pool(endpoint);
@@ -1509,13 +1509,13 @@ async fn quote_opaque_remote_target(
     request: &PbOpaqueRequest,
     endpoint: &Endpoint,
     target: &RemoteNodeTarget,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     if target.node_addrs.is_empty() {
         return quote_opaque_remote_peer(request, endpoint, target.node_id, peer_registry).await;
     }
 
-    let mut permit = acquire_rpc(
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         target.node_id,
         <OpaqueService as ServiceKey>::NAME,
@@ -1576,13 +1576,13 @@ async fn quote_remote_target(
     quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     target: &RemoteNodeTarget,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     if target.node_addrs.is_empty() {
         return quote_remote_peer(quote_req, endpoint, target.node_id, peer_registry).await;
     }
 
-    let mut permit = acquire_rpc(
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         target.node_id,
         <CourtesyService as ServiceKey>::NAME,
@@ -1648,7 +1648,7 @@ async fn discover_opaque_remote_quote(
     endpoint: &Endpoint,
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let mut registry = ServiceRegistry::new(endpoint);
     registry.with_pool_options(PoolOptions {
@@ -1690,7 +1690,7 @@ async fn discover_opaque_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_discovered_service(
+                            observe_iroh_discovered_service(
                                 &peer_registry,
                                 peer_id,
                                 <OpaqueService as ServiceKey>::NAME,
@@ -1745,7 +1745,7 @@ async fn discover_remote_quote(
     endpoint: &Endpoint,
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let mut registry = ServiceRegistry::new(endpoint);
     registry.with_pool_options(PoolOptions {
@@ -1790,7 +1790,7 @@ async fn discover_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_discovered_service(
+                            observe_iroh_discovered_service(
                                 &peer_registry,
                                 peer_id,
                                 <CourtesyService as ServiceKey>::NAME,
@@ -1843,7 +1843,7 @@ async fn prepare_discovered_opaque_remote(
     request: &PbOpaqueRequest,
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<OpaqueRemoteExecution> {
     let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
     let quote =
@@ -1859,7 +1859,7 @@ async fn prepare_discovered_remote(
     quote_req: &QuotePreparedTextRequest,
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
 ) -> anyhow::Result<RemoteExecution> {
     let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
     let quote =
