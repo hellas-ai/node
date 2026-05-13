@@ -9,7 +9,29 @@ documentation.workspace = true
 
 [features]
 default = []
+
+# === Protocol modules ======================================================
+# Pick the protocols you want. Each pulls only its own hellas-pb feature, so
+# downstream binary size scales with the protocols you actually use.
+swarm    = ["hellas-pb/swarm"]
+courtesy = ["hellas-pb/courtesy"]
+execute  = ["hellas-pb/hellas"]   # `hellas.v1.Execute` service. Internal pb feature is named `hellas` for historical reasons.
+symbolic = ["hellas-pb/symbolic"]
+opaque   = ["hellas-pb/opaque"]
+all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
+
+# === Transports ============================================================
+iroh = ["dep:tonic-iroh-transport"]
+# websocket, uart, etc. — added when the transport adapters land.
+
+# === Other knobs ===========================================================
 compression = ["tonic/gzip", "tonic/zstd"]
+
+# TODO(step 8 cleanup): the four entries below are fat aliases that predate the
+# protocol × transport × role split. They keep working during the consumer
+# migration, but the role features (`client`, `server`) should stop pulling
+# protocol features, and `iroh-client` should be deleted once callers move to
+# explicit granular flags.
 client = [
   "tonic/channel",
   "hellas-pb/client",
@@ -18,6 +40,7 @@ client = [
   "hellas-pb/opaque",
   "hellas-pb/courtesy",
 ]
+server = ["tonic/server", "hellas-pb/server"]
 discovery = [
   "client",
   "dep:futures",
@@ -26,26 +49,18 @@ discovery = [
   "tonic-iroh-transport/discovery-mdns",
   "tonic-iroh-transport/discovery-dht",
 ]
-iroh = ["dep:tonic-iroh-transport"]
 iroh-client = [
   "iroh",
+  "client",
+  "all-protocols",
   "tonic-iroh-transport/client",
-  "hellas-pb/client",
-  "hellas-pb/hellas",
-  "hellas-pb/symbolic",
-  "hellas-pb/opaque",
-  "hellas-pb/courtesy",
-  "hellas-pb/swarm",
 ]
-server = ["tonic/server", "hellas-pb/server"]
 node = [
+  "server",
+  "all-protocols",
   "dep:catgrad",
   "dep:catgrad-llm",
   "dep:chatgrad",
-  "hellas-pb/hellas",
-  "hellas-pb/symbolic",
-  "hellas-pb/opaque",
-  "hellas-pb/courtesy",
   "dep:serde",
   "dep:serde_json",
   "dep:tokenizers",
