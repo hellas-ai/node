@@ -97,6 +97,21 @@ talk to `PeerManager`, not directly to `PeerRegistry`.
 - Returns the tonic channel plus `RpcPermitGuard` on success, so the caller can
   finish the guard when the unary call or stream actually ends.
 
+Generated `Iroh*Client` wrappers are also available under
+`hellas_rpc::iroh_client` with the same feature.
+
+- Generated from `proto/hellas/**/*.proto` by `crates/rpc/build.rs`.
+- Keep tonic/prost request and response types.
+- Use generated `MethodKey` markers internally; call sites do not pass method
+  strings.
+- Unary methods finish their permit before returning.
+- Streaming methods return `ManagedStreaming<T>`, which releases the permit on
+  stream end, stream error, explicit `finish_ok` / `finish_err`, or drop.
+
+Use `IrohRpcPool<S>` directly when building a higher-level driver that needs
+raw tonic channels. Use the generated `Iroh*Client` wrappers for simple RPC
+calls.
+
 `PeerDirectory` is server-side peer exchange policy.
 
 - Tracks inbound request accounting.
@@ -131,6 +146,11 @@ disambiguated with their service name, e.g. `SymbolicCreateTicket` and
 Downstream RPC codegen should emit the same shape for custom `.proto` files:
 one service marker implementing `ServiceKey`, plus one marker per RPC method
 implementing `MethodKey`.
+
+For iroh transports, downstream codegen can mirror the built-in generated
+clients: call `IrohRpcPool::<S>::channel::<M>` before constructing the tonic
+client, then use `hellas_rpc::iroh_client::finish_unary` or
+`finish_streaming` to release the permit around the RPC result.
 
 ## Calling Patterns
 
