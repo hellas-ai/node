@@ -54,13 +54,18 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
+use hellas_rpc::peers::{
+    DiscoverySource, Outcome as PeerOutcome, PeerEvent, PeerId, PeerRegistry, Permit,
+    RequestKind as PeerRequestKind, ServiceKey, TransportSecurity,
+};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
@@ -82,6 +87,7 @@ type TracedChannel = tonic::service::interceptor::InterceptedService<
 type TracedChannel = IrohChannel;
 
 type TracedDriver = RemoteExecuteDriver<TracedChannel>;
+type SharedPeerRegistry = Arc<Mutex<PeerRegistry>>;
 
 #[cfg(feature = "otel")]
 fn traced(channel: IrohChannel) -> TracedChannel {
@@ -162,6 +168,7 @@ pub struct ExecutionRuntime {
     #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
     secret_key: Option<SecretKey>,
+    peer_registry: SharedPeerRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +290,7 @@ impl ExecutionRuntime {
         Self {
             local_executor: Some(local_executor),
             secret_key: None,
+            peer_registry: SharedPeerRegistry::default(),
         }
     }
 
@@ -577,6 +585,7 @@ enum PreparedRoute {
         quote_req: QuotePreparedTextRequest,
         retries: usize,
         secret_key: Option<SecretKey>,
+        peer_registry: SharedPeerRegistry,
     },
 }
 
@@ -626,7 +635,13 @@ impl PreparedRoute {
             }
             ExecutionRoute::RemoteDirect(target) => {
                 let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
-                let quote = quote_remote_target(quote_req, &endpoint, target).await?;
+                let quote = quote_remote_target(
+                    quote_req,
+                    &endpoint,
+                    target,
+                    runtime.peer_registry.clone(),
+                )
+                .await?;
                 Ok(Self::RemoteDirect(Box::new(RemoteExecution::from_quoted(
                     endpoint, quote,
                 ))))
@@ -635,6 +650,7 @@ impl PreparedRoute {
                 quote_req: quote_req.clone(),
                 retries: *retries,
                 secret_key: runtime.secret_key.clone(),
+                peer_registry: runtime.peer_registry.clone(),
             }),
         }
     }
@@ -652,7 +668,8 @@ impl PreparedRoute {
                 quote_req,
                 retries,
                 secret_key,
-            } => discovery_stream(quote_req, retries, secret_key).boxed(),
+                peer_registry,
+            } => discovery_stream(quote_req, retries, secret_key, peer_registry).boxed(),
         }
     }
 }
@@ -670,6 +687,7 @@ enum OpaquePreparedRoute {
         request: PbOpaqueRequest,
         retries: usize,
         secret_key: Option<SecretKey>,
+        peer_registry: SharedPeerRegistry,
     },
 }
 
@@ -694,7 +712,13 @@ async fn prepare_opaque_route(
         }
         ExecutionRoute::RemoteDirect(target) => {
             let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
-            let quote = quote_opaque_remote_target(request, &endpoint, target).await?;
+            let quote = quote_opaque_remote_target(
+                request,
+                &endpoint,
+                target,
+                runtime.peer_registry.clone(),
+            )
+            .await?;
             Ok(OpaquePreparedRoute::RemoteDirect(Box::new(
                 OpaqueRemoteExecution::from_quoted(endpoint, request.clone(), quote),
             )))
@@ -703,6 +727,7 @@ async fn prepare_opaque_route(
             request: request.clone(),
             retries: *retries,
             secret_key: runtime.secret_key.clone(),
+            peer_registry: runtime.peer_registry.clone(),
         }),
     }
 }
@@ -721,7 +746,8 @@ impl OpaquePreparedRoute {
                 request,
                 retries,
                 secret_key,
-            } => opaque_discovery_stream(request, retries, secret_key).boxed(),
+                peer_registry,
+            } => opaque_discovery_stream(request, retries, secret_key, peer_registry).boxed(),
         }
     }
 }
@@ -730,6 +756,7 @@ fn opaque_discovery_stream(
     request: PbOpaqueRequest,
     retries: usize,
     secret_key: Option<SecretKey>,
+    peer_registry: SharedPeerRegistry,
 ) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
     try_stream! {
         let max_attempts = retries.saturating_add(1);
@@ -738,7 +765,12 @@ fn opaque_discovery_stream(
         info!("No node ID provided, discovering opaque executor");
 
         for attempt in 1..=max_attempts {
-            let remote = prepare_discovered_opaque_remote(&request, secret_key.as_ref(), &tried).await?;
+            let remote = prepare_discovered_opaque_remote(
+                &request,
+                secret_key.as_ref(),
+                &tried,
+                peer_registry.clone(),
+            ).await?;
             let peer_id = remote.peer_id;
             let mut committed = false;
             let mut transport_err: Option<anyhow::Error> = None;
@@ -799,6 +831,7 @@ fn discovery_stream(
     quote_req: QuotePreparedTextRequest,
     retries: usize,
     secret_key: Option<SecretKey>,
+    peer_registry: SharedPeerRegistry,
 ) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
     try_stream! {
         let max_attempts = retries.saturating_add(1);
@@ -807,7 +840,12 @@ fn discovery_stream(
         info!("No node ID provided, discovering executor");
 
         for attempt in 1..=max_attempts {
-            let remote = prepare_discovered_remote(&quote_req, secret_key.as_ref(), &tried).await?;
+            let remote = prepare_discovered_remote(
+                &quote_req,
+                secret_key.as_ref(),
+                &tried,
+                peer_registry.clone(),
+            ).await?;
             let peer_id = remote.peer_id;
             let mut committed = false;
             let mut transport_err: Option<anyhow::Error> = None;
@@ -863,6 +901,7 @@ fn discovery_stream(
 struct RemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
     request_commitment: Vec<u8>,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
@@ -873,6 +912,7 @@ impl RemoteExecution {
         Self {
             endpoint,
             peer_id: quoted.peer_id,
+            peer_registry: quoted.peer_registry,
             request_commitment: quoted.quote.request_commitment,
             provenance: quoted.provenance,
             driver: quoted.driver,
@@ -882,7 +922,8 @@ impl RemoteExecution {
     fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         let Self {
             endpoint,
-            peer_id: _,
+            peer_id,
+            peer_registry,
             request_commitment,
             provenance: _,
             driver,
@@ -892,10 +933,28 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
+            let mut permit = acquire_rpc(
+                &peer_registry,
+                peer_id,
+                <ExecuteService as ServiceKey>::NAME,
+                "RunTicket",
+                1.0,
+            )?;
             let inner = execute_stream(driver, request_commitment);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
-                yield event?;
+                match event {
+                    Ok(ExecutionEvent::Done(outcome)) => {
+                        permit.finish_ok();
+                        yield ExecutionEvent::Done(outcome);
+                        return;
+                    }
+                    Ok(event) => yield event,
+                    Err(err) => {
+                        permit.finish_err(err.to_string());
+                        Err(err)?;
+                    }
+                }
             }
         }
     }
@@ -904,6 +963,7 @@ impl RemoteExecution {
 struct OpaqueRemoteExecution {
     endpoint: Arc<Endpoint>,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
     request: PbOpaqueRequest,
     request_commitment: Vec<u8>,
     driver: TracedDriver,
@@ -918,6 +978,7 @@ impl OpaqueRemoteExecution {
         Self {
             endpoint,
             peer_id: quoted.peer_id,
+            peer_registry: quoted.peer_registry,
             request,
             request_commitment: quoted.quote.request_commitment,
             driver: quoted.driver,
@@ -927,17 +988,36 @@ impl OpaqueRemoteExecution {
     fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
         let Self {
             endpoint,
-            peer_id: _,
+            peer_id,
+            peer_registry,
             request,
             request_commitment,
             driver,
         } = self;
         try_stream! {
             let _endpoint = endpoint;
+            let mut permit = acquire_rpc(
+                &peer_registry,
+                peer_id,
+                <ExecuteService as ServiceKey>::NAME,
+                "RunTicket",
+                1.0,
+            )?;
             let inner = execute_opaque_stream(driver, request_commitment, request);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
-                yield event?;
+                match event {
+                    Ok(OpaqueExecutionEvent::Done(outcome)) => {
+                        permit.finish_ok();
+                        yield OpaqueExecutionEvent::Done(outcome);
+                        return;
+                    }
+                    Ok(event) => yield event,
+                    Err(err) => {
+                        permit.finish_err(err.to_string());
+                        Err(err)?;
+                    }
+                }
             }
         }
     }
@@ -1136,6 +1216,7 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 
 struct QuotedRemoteDriver {
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
     quote: hellas_pb::hellas::Ticket,
     provenance: ExecutionProvenance,
     driver: TracedDriver,
@@ -1145,6 +1226,109 @@ struct QuotedRemoteDriver {
 enum QuoteCandidateError {
     Declined(anyhow::Error),
     Connect(anyhow::Error),
+}
+
+struct PeerPermitGuard {
+    registry: SharedPeerRegistry,
+    permit: Option<Permit>,
+    started: Instant,
+}
+
+impl PeerPermitGuard {
+    fn finish_ok(&mut self) {
+        self.release(PeerOutcome::ok(duration_ms(self.started.elapsed())));
+    }
+
+    fn finish_err(&mut self, error: String) {
+        self.release(PeerOutcome::Err {
+            rtt_ms: Some(duration_ms(self.started.elapsed())),
+            error,
+        });
+    }
+
+    fn release(&mut self, outcome: PeerOutcome) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.release(now_ms(), permit, outcome);
+        }
+    }
+}
+
+impl Drop for PeerPermitGuard {
+    fn drop(&mut self) {
+        self.release(PeerOutcome::Cancelled);
+    }
+}
+
+fn acquire_rpc(
+    registry: &SharedPeerRegistry,
+    peer_id: EndpointId,
+    service: &'static str,
+    method: &'static str,
+    cost: f32,
+) -> anyhow::Result<PeerPermitGuard> {
+    let now = now_ms();
+    let registry_peer_id = peer_id_from_endpoint(peer_id);
+    let mut registry_guard = registry
+        .lock()
+        .map_err(|_| anyhow!("peer registry is unavailable"))?;
+    registry_guard.apply(
+        now,
+        registry_peer_id,
+        PeerEvent::Discovered {
+            source: DiscoverySource::Transport("iroh"),
+            transport_security: TransportSecurity::Authenticated,
+        },
+    );
+    let permit = registry_guard
+        .try_acquire(
+            now,
+            registry_peer_id,
+            PeerRequestKind::new(service, method),
+            cost,
+        )
+        .with_context(|| format!("RPC admission denied for {peer_id} {service}/{method}"))?;
+    drop(registry_guard);
+
+    Ok(PeerPermitGuard {
+        registry: registry.clone(),
+        permit: Some(permit),
+        started: Instant::now(),
+    })
+}
+
+fn observe_discovered_service(
+    registry: &SharedPeerRegistry,
+    peer_id: EndpointId,
+    service: &'static str,
+) {
+    if let Ok(mut registry) = registry.lock() {
+        registry.observe_discovered_service(
+            now_ms(),
+            peer_id_from_endpoint(peer_id),
+            DiscoverySource::Transport("discovery"),
+            service,
+            TransportSecurity::Untrusted,
+        );
+    }
+}
+
+fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
+    PeerId::from(*peer_id.as_bytes())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
@@ -1261,6 +1445,7 @@ async fn quote_opaque_remote_endpoint(
     execute_pool: &ConnectionPool,
     opaque_pool: &ConnectionPool,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let opaque_channel = opaque_pool
         .channel(peer_id)
@@ -1276,16 +1461,31 @@ async fn quote_opaque_remote_endpoint(
         traced(execute_channel),
         traced(opaque_channel),
     );
+    let mut permit = acquire_rpc(
+        &peer_registry,
+        peer_id,
+        <OpaqueService as ServiceKey>::NAME,
+        "CreateTicket",
+        1.0,
+    )
+    .map_err(QuoteCandidateError::Connect)?;
     let quoted = match quote_opaque_with_driver(request, &mut driver, || {
         format!("node {peer_id} declined opaque ticket")
     })
     .await
     {
-        Ok(quoted) => quoted,
-        Err(err) => return Err(QuoteCandidateError::Declined(err)),
+        Ok(quoted) => {
+            permit.finish_ok();
+            quoted
+        }
+        Err(err) => {
+            permit.finish_err(err.to_string());
+            return Err(QuoteCandidateError::Declined(err));
+        }
     };
     Ok(QuotedRemoteDriver {
         peer_id,
+        peer_registry,
         quote: quoted.response,
         provenance: quoted.provenance,
         driver,
@@ -1298,6 +1498,7 @@ async fn quote_remote_endpoint(
     execute_pool: &ConnectionPool,
     courtesy_pool: &ConnectionPool,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let courtesy_channel = courtesy_pool
         .channel(peer_id)
@@ -1313,19 +1514,35 @@ async fn quote_remote_endpoint(
         traced(execute_channel),
         traced(courtesy_channel),
     );
+    let mut permit = acquire_rpc(
+        &peer_registry,
+        peer_id,
+        <CourtesyService as ServiceKey>::NAME,
+        "QuotePreparedText",
+        1.0,
+    )
+    .map_err(QuoteCandidateError::Connect)?;
     let quoted = match quote_with_driver(quote_req, &mut driver, || {
         format!("node {peer_id} declined ticket")
     })
     .await
     {
         Ok(quoted) => quoted,
-        Err(err) => return Err(QuoteCandidateError::Declined(err)),
+        Err(err) => {
+            permit.finish_err(err.to_string());
+            return Err(QuoteCandidateError::Declined(err));
+        }
     };
+    let Some(ticket) = quoted.response.ticket else {
+        let err = anyhow!("quote_prepared_text response missing ticket");
+        permit.finish_err(err.to_string());
+        return Err(QuoteCandidateError::Declined(err));
+    };
+    permit.finish_ok();
     Ok(QuotedRemoteDriver {
         peer_id,
-        quote: quoted.response.ticket.ok_or_else(|| {
-            QuoteCandidateError::Declined(anyhow!("quote_prepared_text response missing ticket"))
-        })?,
+        peer_registry,
+        quote: ticket,
         provenance: quoted.provenance,
         driver,
     })
@@ -1335,10 +1552,11 @@ async fn quote_opaque_remote_peer(
     request: &PbOpaqueRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
     let opaque_pool = bind_opaque_pool(endpoint);
-    quote_opaque_remote_endpoint(request, &execute_pool, &opaque_pool, peer_id)
+    quote_opaque_remote_endpoint(request, &execute_pool, &opaque_pool, peer_id, peer_registry)
         .await
         .map_err(|err| match err {
             QuoteCandidateError::Declined(err) => {
@@ -1352,26 +1570,32 @@ async fn quote_remote_peer(
     quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     peer_id: EndpointId,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let execute_pool = bind_remote_pool(endpoint);
     let courtesy_pool = bind_courtesy_pool(endpoint);
-    quote_remote_endpoint(quote_req, &execute_pool, &courtesy_pool, peer_id)
-        .await
-        .map_err(|err| match err {
-            QuoteCandidateError::Declined(err) => {
-                err.context(format!("node {peer_id} declined quote"))
-            }
-            QuoteCandidateError::Connect(err) => err,
-        })
+    quote_remote_endpoint(
+        quote_req,
+        &execute_pool,
+        &courtesy_pool,
+        peer_id,
+        peer_registry,
+    )
+    .await
+    .map_err(|err| match err {
+        QuoteCandidateError::Declined(err) => err.context(format!("node {peer_id} declined quote")),
+        QuoteCandidateError::Connect(err) => err,
+    })
 }
 
 async fn quote_opaque_remote_target(
     request: &PbOpaqueRequest,
     endpoint: &Endpoint,
     target: &RemoteNodeTarget,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     if target.node_addrs.is_empty() {
-        return quote_opaque_remote_peer(request, endpoint, target.node_id).await;
+        return quote_opaque_remote_peer(request, endpoint, target.node_id, peer_registry).await;
     }
 
     let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
@@ -1386,13 +1610,31 @@ async fn quote_opaque_remote_target(
         traced(execute_channel),
         traced(opaque_channel),
     );
+    let mut permit = acquire_rpc(
+        &peer_registry,
+        target.node_id,
+        <OpaqueService as ServiceKey>::NAME,
+        "CreateTicket",
+        1.0,
+    )?;
     let quoted = quote_opaque_with_driver(request, &mut driver, || {
         format!("node {} declined opaque quote", target.node_id)
     })
-    .await?;
+    .await;
+    let quoted = match quoted {
+        Ok(quoted) => {
+            permit.finish_ok();
+            quoted
+        }
+        Err(err) => {
+            permit.finish_err(err.to_string());
+            return Err(err);
+        }
+    };
 
     Ok(QuotedRemoteDriver {
         peer_id: target.node_id,
+        peer_registry,
         quote: quoted.response,
         provenance: quoted.provenance,
         driver,
@@ -1403,9 +1645,10 @@ async fn quote_remote_target(
     quote_req: &QuotePreparedTextRequest,
     endpoint: &Endpoint,
     target: &RemoteNodeTarget,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     if target.node_addrs.is_empty() {
-        return quote_remote_peer(quote_req, endpoint, target.node_id).await;
+        return quote_remote_peer(quote_req, endpoint, target.node_id, peer_registry).await;
     }
 
     let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
@@ -1420,17 +1663,35 @@ async fn quote_remote_target(
         traced(execute_channel),
         traced(courtesy_channel),
     );
+    let mut permit = acquire_rpc(
+        &peer_registry,
+        target.node_id,
+        <CourtesyService as ServiceKey>::NAME,
+        "QuotePreparedText",
+        1.0,
+    )?;
     let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {} declined quote", target.node_id)
     })
-    .await?;
+    .await;
+    let quoted = match quoted {
+        Ok(quoted) => quoted,
+        Err(err) => {
+            permit.finish_err(err.to_string());
+            return Err(err);
+        }
+    };
+    let Some(ticket) = quoted.response.ticket else {
+        let err = anyhow!("quote_prepared_text response missing ticket");
+        permit.finish_err(err.to_string());
+        return Err(err);
+    };
+    permit.finish_ok();
 
     Ok(QuotedRemoteDriver {
         peer_id: target.node_id,
-        quote: quoted
-            .response
-            .ticket
-            .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?,
+        peer_registry,
+        quote: ticket,
         provenance: quoted.provenance,
         driver,
     })
@@ -1442,6 +1703,7 @@ async fn discover_opaque_remote_quote(
     endpoint: &Endpoint,
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let mut registry = ServiceRegistry::new(endpoint);
     registry.with_pool_options(PoolOptions {
@@ -1483,12 +1745,18 @@ async fn discover_opaque_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
+                            observe_discovered_service(
+                                &peer_registry,
+                                peer_id,
+                                <OpaqueService as ServiceKey>::NAME,
+                            );
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed opaque peer");
                                 continue;
                             }
                             let execute_pool = execute_pool.clone();
                             let opaque_pool = opaque_pool.clone();
+                            let peer_registry = peer_registry.clone();
                             let req = request.clone();
                             in_flight.push(async move {
                                 quote_opaque_remote_endpoint(
@@ -1496,6 +1764,7 @@ async fn discover_opaque_remote_quote(
                                     &execute_pool,
                                     &opaque_pool,
                                     peer_id,
+                                    peer_registry,
                                 ).await
                             });
                         }
@@ -1531,6 +1800,7 @@ async fn discover_remote_quote(
     endpoint: &Endpoint,
     bindings: DiscoveryBindings,
     exclude: &HashSet<EndpointId>,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<QuotedRemoteDriver> {
     let mut registry = ServiceRegistry::new(endpoint);
     registry.with_pool_options(PoolOptions {
@@ -1575,12 +1845,18 @@ async fn discover_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
+                            observe_discovered_service(
+                                &peer_registry,
+                                peer_id,
+                                <CourtesyService as ServiceKey>::NAME,
+                            );
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed peer");
                                 continue;
                             }
                             let execute_pool = execute_pool.clone();
                             let courtesy_pool = courtesy_pool.clone();
+                            let peer_registry = peer_registry.clone();
                             let req = quote_req.clone();
                             in_flight.push(async move {
                                 quote_remote_endpoint(
@@ -1588,6 +1864,7 @@ async fn discover_remote_quote(
                                     &execute_pool,
                                     &courtesy_pool,
                                     peer_id,
+                                    peer_registry,
                                 ).await
                             });
                         }
@@ -1621,9 +1898,11 @@ async fn prepare_discovered_opaque_remote(
     request: &PbOpaqueRequest,
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<OpaqueRemoteExecution> {
     let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
-    let quote = discover_opaque_remote_quote(request, &endpoint, bindings, exclude).await?;
+    let quote =
+        discover_opaque_remote_quote(request, &endpoint, bindings, exclude, peer_registry).await?;
     Ok(OpaqueRemoteExecution::from_quoted(
         endpoint,
         request.clone(),
@@ -1635,9 +1914,11 @@ async fn prepare_discovered_remote(
     quote_req: &QuotePreparedTextRequest,
     secret_key: Option<&SecretKey>,
     exclude: &HashSet<EndpointId>,
+    peer_registry: SharedPeerRegistry,
 ) -> anyhow::Result<RemoteExecution> {
     let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
-    let quote = discover_remote_quote(quote_req, &endpoint, bindings, exclude).await?;
+    let quote =
+        discover_remote_quote(quote_req, &endpoint, bindings, exclude, peer_registry).await?;
     Ok(RemoteExecution::from_quoted(endpoint, quote))
 }
 
