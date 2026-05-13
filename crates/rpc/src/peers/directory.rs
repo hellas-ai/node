@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::admission::TokenBucket;
+use super::admission::{RequestKind, TokenBucket};
 use super::{
     AuthLevel, DiscoverySource, PeerEntry, PeerId, PeerManager, PeerManagerError,
-    PeerRegistryConfig, RequestKind, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
+    PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
 };
 
 pub const NODE_SERVICE_ALPN: &str = "/hellas.swarm.v1.Node/1.0";
