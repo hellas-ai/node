@@ -72,6 +72,21 @@ impl PeerManager {
         Ok(self.lock()?.apply(now_ms(), peer, event))
     }
 
+    pub fn observe_discovered_peer(
+        &self,
+        peer: PeerId,
+        source: DiscoverySource,
+        transport_security: TransportSecurity,
+    ) -> Result<PeerChange, PeerManagerError> {
+        self.apply(
+            peer,
+            PeerEvent::Discovered {
+                source,
+                transport_security,
+            },
+        )
+    }
+
     pub fn observe_discovered_service_name(
         &self,
         peer: PeerId,
@@ -171,6 +186,15 @@ pub struct PeerSession {
 impl PeerSession {
     pub const fn peer_id(&self) -> PeerId {
         self.peer
+    }
+
+    pub fn observe_discovered(
+        &self,
+        source: DiscoverySource,
+        transport_security: TransportSecurity,
+    ) -> Result<PeerChange, PeerManagerError> {
+        self.manager
+            .observe_discovered_peer(self.peer, source, transport_security)
     }
 
     pub fn service<S: ServiceKey>(&self) -> PeerServiceSession<S> {
@@ -496,5 +520,24 @@ mod tests {
             .expect("node service should be recorded");
         assert_eq!(service.service, <NodeService as ServiceKey>::NAME);
         assert_eq!(service.success_count, 1);
+    }
+
+    #[test]
+    fn peer_session_records_discovery_without_service() {
+        let manager = PeerManager::with_config(config());
+        let id = peer(5);
+
+        let change = manager
+            .peer(id)
+            .observe_discovered(DiscoverySource::PeerExchange, TransportSecurity::Untrusted)
+            .expect("peer should be recorded");
+        assert!(change.inserted);
+
+        let entry = manager
+            .peer(id)
+            .entry_snapshot()
+            .expect("registry should be readable")
+            .expect("peer should exist");
+        assert!(entry.services.is_empty());
     }
 }
