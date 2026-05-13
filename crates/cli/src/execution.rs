@@ -27,6 +27,7 @@
 //!   - Transport error after a chunk → propagate (committed work can't be retried).
 //!   - `Done(Failed)` (executor verdict) → propagate, never retry.
 
+use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc, observe_discovered_service};
 #[cfg(feature = "hellas-executor")]
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
@@ -54,18 +55,14 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::{
-    DiscoverySource, Outcome as PeerOutcome, PeerEvent, PeerId, PeerRegistry, Permit,
-    RequestKind as PeerRequestKind, ServiceKey, TransportSecurity,
-};
+use hellas_rpc::peers::ServiceKey;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 use tokio::time::Duration;
 use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
 use tonic_iroh_transport::iroh::{
@@ -87,7 +84,6 @@ type TracedChannel = tonic::service::interceptor::InterceptedService<
 type TracedChannel = IrohChannel;
 
 type TracedDriver = RemoteExecuteDriver<TracedChannel>;
-type SharedPeerRegistry = Arc<Mutex<PeerRegistry>>;
 
 #[cfg(feature = "otel")]
 fn traced(channel: IrohChannel) -> TracedChannel {
@@ -1228,109 +1224,6 @@ enum QuoteCandidateError {
     Connect(anyhow::Error),
 }
 
-struct PeerPermitGuard {
-    registry: SharedPeerRegistry,
-    permit: Option<Permit>,
-    started: Instant,
-}
-
-impl PeerPermitGuard {
-    fn finish_ok(&mut self) {
-        self.release(PeerOutcome::ok(duration_ms(self.started.elapsed())));
-    }
-
-    fn finish_err(&mut self, error: String) {
-        self.release(PeerOutcome::Err {
-            rtt_ms: Some(duration_ms(self.started.elapsed())),
-            error,
-        });
-    }
-
-    fn release(&mut self, outcome: PeerOutcome) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.release(now_ms(), permit, outcome);
-        }
-    }
-}
-
-impl Drop for PeerPermitGuard {
-    fn drop(&mut self) {
-        self.release(PeerOutcome::Cancelled);
-    }
-}
-
-fn acquire_rpc(
-    registry: &SharedPeerRegistry,
-    peer_id: EndpointId,
-    service: &'static str,
-    method: &'static str,
-    cost: f32,
-) -> anyhow::Result<PeerPermitGuard> {
-    let now = now_ms();
-    let registry_peer_id = peer_id_from_endpoint(peer_id);
-    let mut registry_guard = registry
-        .lock()
-        .map_err(|_| anyhow!("peer registry is unavailable"))?;
-    registry_guard.apply(
-        now,
-        registry_peer_id,
-        PeerEvent::Discovered {
-            source: DiscoverySource::Transport("iroh"),
-            transport_security: TransportSecurity::Authenticated,
-        },
-    );
-    let permit = registry_guard
-        .try_acquire(
-            now,
-            registry_peer_id,
-            PeerRequestKind::new(service, method),
-            cost,
-        )
-        .with_context(|| format!("RPC admission denied for {peer_id} {service}/{method}"))?;
-    drop(registry_guard);
-
-    Ok(PeerPermitGuard {
-        registry: registry.clone(),
-        permit: Some(permit),
-        started: Instant::now(),
-    })
-}
-
-fn observe_discovered_service(
-    registry: &SharedPeerRegistry,
-    peer_id: EndpointId,
-    service: &'static str,
-) {
-    if let Ok(mut registry) = registry.lock() {
-        registry.observe_discovered_service(
-            now_ms(),
-            peer_id_from_endpoint(peer_id),
-            DiscoverySource::Transport("discovery"),
-            service,
-            TransportSecurity::Untrusted,
-        );
-    }
-}
-
-fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
-    PeerId::from(*peer_id.as_bytes())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
-}
-
 #[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
 async fn quote_with_driver<D>(
     quote_req: &QuotePreparedTextRequest,
@@ -1447,20 +1340,6 @@ async fn quote_opaque_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: SharedPeerRegistry,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let opaque_channel = opaque_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let execute_channel = execute_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        traced(execute_channel),
-        traced(opaque_channel),
-    );
     let mut permit = acquire_rpc(
         &peer_registry,
         peer_id,
@@ -1469,6 +1348,32 @@ async fn quote_opaque_remote_endpoint(
         1.0,
     )
     .map_err(QuoteCandidateError::Connect)?;
+    let opaque_channel = match opaque_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(QuoteCandidateError::Connect(err));
+        }
+    };
+    let execute_channel = match execute_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(QuoteCandidateError::Connect(err));
+        }
+    };
+    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        traced(execute_channel),
+        traced(opaque_channel),
+    );
     let quoted = match quote_opaque_with_driver(request, &mut driver, || {
         format!("node {peer_id} declined opaque ticket")
     })
@@ -1500,20 +1405,6 @@ async fn quote_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: SharedPeerRegistry,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let courtesy_channel = courtesy_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let execute_channel = execute_pool
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
-        traced(execute_channel),
-        traced(courtesy_channel),
-    );
     let mut permit = acquire_rpc(
         &peer_registry,
         peer_id,
@@ -1522,6 +1413,32 @@ async fn quote_remote_endpoint(
         1.0,
     )
     .map_err(QuoteCandidateError::Connect)?;
+    let courtesy_channel = match courtesy_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(QuoteCandidateError::Connect(err));
+        }
+    };
+    let execute_channel = match execute_pool
+        .channel(peer_id)
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(QuoteCandidateError::Connect(err));
+        }
+    };
+    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
+        traced(execute_channel),
+        traced(courtesy_channel),
+    );
     let quoted = match quote_with_driver(quote_req, &mut driver, || {
         format!("node {peer_id} declined ticket")
     })
@@ -1598,18 +1515,6 @@ async fn quote_opaque_remote_target(
         return quote_opaque_remote_peer(request, endpoint, target.node_id, peer_registry).await;
     }
 
-    let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let opaque_channel = OpaqueService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        traced(execute_channel),
-        traced(opaque_channel),
-    );
     let mut permit = acquire_rpc(
         &peer_registry,
         target.node_id,
@@ -1617,6 +1522,32 @@ async fn quote_opaque_remote_target(
         "CreateTicket",
         1.0,
     )?;
+    let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(err);
+        }
+    };
+    let opaque_channel = match OpaqueService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(err);
+        }
+    };
+    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        traced(execute_channel),
+        traced(opaque_channel),
+    );
     let quoted = quote_opaque_with_driver(request, &mut driver, || {
         format!("node {} declined opaque quote", target.node_id)
     })
@@ -1651,18 +1582,6 @@ async fn quote_remote_target(
         return quote_remote_peer(quote_req, endpoint, target.node_id, peer_registry).await;
     }
 
-    let execute_channel = ExecuteService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let courtesy_channel = CourtesyService::connect(endpoint, target.endpoint_addr())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {}", target.node_id))?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
-        traced(execute_channel),
-        traced(courtesy_channel),
-    );
     let mut permit = acquire_rpc(
         &peer_registry,
         target.node_id,
@@ -1670,6 +1589,32 @@ async fn quote_remote_target(
         "QuotePreparedText",
         1.0,
     )?;
+    let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(err);
+        }
+    };
+    let courtesy_channel = match CourtesyService::connect(endpoint, target.endpoint_addr())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| format!("failed to connect to node {}", target.node_id))
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(err);
+        }
+    };
+    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
+        traced(execute_channel),
+        traced(courtesy_channel),
+    );
     let quoted = quote_with_driver(quote_req, &mut driver, || {
         format!("node {} declined quote", target.node_id)
     })

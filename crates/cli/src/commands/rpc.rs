@@ -3,38 +3,61 @@ use anyhow::Context;
 use hellas_pb::swarm::GetNodeInfoRequest;
 use hellas_pb::swarm::node_client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
+use hellas_rpc::peers::ServiceKey;
 use hellas_rpc::service::NodeService;
 use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
+
+use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc};
 
 pub async fn run(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
     secret_key: SecretKey,
 ) -> CliResult<()> {
+    let peer_registry = SharedPeerRegistry::default();
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let channel = if node_addrs.is_empty() {
+    let mut permit = acquire_rpc(
+        &peer_registry,
+        node_id,
+        <NodeService as ServiceKey>::NAME,
+        "GetNodeInfo",
+        1.0,
+    )?;
+    let channel_result = if node_addrs.is_empty() {
         let pool =
             ConnectionPool::for_service::<NodeService>(endpoint.clone(), PoolOptions::default());
         pool.channel(node_id)
             .await
-            .with_context(|| format!("failed to connect to node {node_id}"))?
+            .with_context(|| format!("failed to connect to node {node_id}"))
     } else {
         NodeService::connect(
             &endpoint,
             EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip)),
         )
         .await
-        .with_context(|| format!("failed to connect to node {node_id}"))?
+        .with_context(|| format!("failed to connect to node {node_id}"))
+    };
+    let channel = match channel_result {
+        Ok(channel) => channel,
+        Err(err) => {
+            permit.finish_connect_err(err.to_string());
+            return Err(err);
+        }
     };
 
     let mut client = NodeClient::new(channel);
-    let response = client
-        .get_node_info(GetNodeInfoRequest {})
-        .await
-        .context("get_node_info RPC failed")?
-        .into_inner();
+    let response = match client.get_node_info(GetNodeInfoRequest {}).await {
+        Ok(response) => {
+            permit.finish_ok();
+            response.into_inner()
+        }
+        Err(err) => {
+            permit.finish_err(err.to_string());
+            return Err(err).context("get_node_info RPC failed");
+        }
+    };
 
     println!("Node ID:  {}", response.node_id);
     println!("Version:  {}", response.version);
