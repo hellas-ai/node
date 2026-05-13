@@ -724,7 +724,10 @@ impl RpcPermitGuard {
         let Ok(mut registry) = self.manager.lock() else {
             return;
         };
-        registry.apply(
+        // Completion notifications go via `apply_completion` so a peer
+        // forgotten mid-RPC stays tombstoned — the subsequent `release`
+        // must be free to purge the entry. Plain `apply` would revive.
+        registry.apply_completion(
             now,
             permit.peer(),
             PeerEvent::Discovered {
@@ -732,7 +735,7 @@ impl RpcPermitGuard {
                 transport_security: self.observation.completion_security,
             },
         );
-        registry.apply(
+        registry.apply_completion(
             now,
             permit.peer(),
             PeerEvent::ServiceObserved {

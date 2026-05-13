@@ -107,23 +107,33 @@ async fn open_grpc<M: RpcMethod>(
     RpcError,
 > {
     let pool = handle.pool::<M::Service>();
-    let (channel, permit) = pool
+    let (channel, mut permit) = pool
         .channel::<M>(handle.peer_id())
         .await
         .map_err(|e| RpcError::from_pool(M::NAME, e))?;
-    let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready().await.map_err(|e| RpcError::Transport {
-        method: M::NAME,
-        message: format!("service was not ready: {e}"),
-    })?;
+    let mut grpc = tonic::client::Grpc::new(channel)
+        // Match the GRPC_MESSAGE_LIMIT applied by the existing low-level
+        // tonic clients (`hellas-pb` / `cli::commands::artifact`). Without
+        // this, typed callers fall back to tonic's ~4 MB default and large
+        // responses (artifacts, model assets) silently get truncated.
+        .max_decoding_message_size(crate::GRPC_MESSAGE_LIMIT)
+        .max_encoding_message_size(crate::GRPC_MESSAGE_LIMIT);
+    if let Err(e) = grpc.ready().await {
+        // Mark the permit explicitly as a transport error — otherwise
+        // dropping the local guard would record `Cancelled`, masking a real
+        // failure as a user-driven abort.
+        let message = format!("service was not ready: {e}");
+        permit.finish_err(message.clone());
+        return Err(RpcError::Transport {
+            method: M::NAME,
+            message,
+        });
+    }
     Ok((grpc, permit))
 }
 
 fn stamp_request<M: RpcMethod, T>(request: tonic::Request<T>) -> tonic::Request<T> {
     let mut request = request;
-    request
-        .extensions_mut()
-        .insert(tonic::codegen::http::Extensions::default());
     request.extensions_mut().insert(tonic::codegen::GrpcMethod::new(
         <M::Service as RpcService>::NAME,
         M::NAME,

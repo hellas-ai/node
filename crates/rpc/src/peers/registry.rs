@@ -359,15 +359,33 @@ impl PeerEntry {
         });
     }
 
-    fn eviction_key(&self) -> (u8, u8, usize, u64, u64) {
+    /// Order: trust < transport security < #services < successes < last_seen
+    /// < PeerId. The trailing `PeerId` is a stable tie-breaker so eviction
+    /// stays deterministic even when every other key matches — HashMap
+    /// iteration order is randomized and would otherwise leak into output.
+    fn eviction_key(&self) -> (u8, u8, usize, u64, u64, PeerId) {
         (
             u8::from(self.trusted),
             self.transport_security.strength(),
             self.services.len(),
             self.success_count,
             self.last_seen_ms,
+            self.id,
         )
     }
+}
+
+/// How `apply_inner` should treat a tombstoned peer when handling a
+/// non-`Forgotten` event.
+#[derive(Clone, Copy, Debug)]
+enum TombstoneAction {
+    /// Clear `tombstoned` — the event is fresh observed activity overriding
+    /// the operator's earlier `forget`.
+    Revive,
+    /// Leave `tombstoned` alone — the event is a completion notification
+    /// from an RPC that started before the forget; should record stats but
+    /// not un-forget.
+    Preserve,
 }
 
 /// Bounded, sans-io registry for peer facts and request admission.
@@ -542,6 +560,31 @@ impl PeerRegistry {
     }
 
     pub fn apply(&mut self, now_ms: u64, peer: PeerId, event: PeerEvent) -> PeerChange {
+        self.apply_inner(now_ms, peer, event, TombstoneAction::Revive)
+    }
+
+    /// Apply a completion-side observation (a successful or failed RPC) to
+    /// the registry *without* reviving a tombstoned peer. The
+    /// `RpcPermitGuard` finishers call this so that an in-flight RPC
+    /// completing after `forget_peer` still credits stats correctly but
+    /// doesn't undo the operator's forget — otherwise the subsequent
+    /// `release` would no longer purge the entry.
+    pub fn apply_completion(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+        event: PeerEvent,
+    ) -> PeerChange {
+        self.apply_inner(now_ms, peer, event, TombstoneAction::Preserve)
+    }
+
+    fn apply_inner(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+        event: PeerEvent,
+        tombstone: TombstoneAction,
+    ) -> PeerChange {
         if matches!(event, PeerEvent::Forgotten) {
             // Defer removal while permits are still in flight so the release
             // path doesn't try to decrement counts on a missing entry. The
@@ -579,10 +622,12 @@ impl PeerRegistry {
             return PeerChange::dropped(peer);
         };
 
-        // Any non-Forgotten event on a tombstoned peer revives it — the
-        // operator's "forget" was overridden by fresh activity, which is a
-        // reasonable contract for a hide-and-purge tombstone.
-        entry.tombstoned = false;
+        // Apply-side events revive a tombstoned peer (fresh observation
+        // overrides operator's forget); completion-side events preserve the
+        // tombstone so the subsequent release still purges the entry.
+        if matches!(tombstone, TombstoneAction::Revive) {
+            entry.tombstoned = false;
+        }
         entry.last_seen_ms = now_ms;
 
         match event {

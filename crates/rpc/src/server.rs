@@ -93,8 +93,17 @@ where
 
     fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         let Some(policy) = S::inbound_policy(req.uri().path()) else {
-            // Path doesn't belong to this service — pass through, the inner
-            // tonic dispatcher will reply with UNIMPLEMENTED.
+            // Path doesn't belong to this service — pass through to the
+            // inner tonic dispatcher (which replies UNIMPLEMENTED), but
+            // first record the invalid-request hit against the peer so a
+            // hostile peer spamming unknown paths on a valid ALPN still
+            // shows up in the registry's counters.
+            if let Some(observation) = self.extractor.extract(&req) {
+                let _ = self
+                    .directory
+                    .manager()
+                    .observe_invalid_request(observation.peer);
+            }
             return ManagedFuture::pass(self.inner.call(req));
         };
 
