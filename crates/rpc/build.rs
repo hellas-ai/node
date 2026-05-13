@@ -288,9 +288,70 @@ mod compile {
             });
         }
 
+        // Single source of truth: every service and every rate-limited
+        // method known to the protocol, regardless of which features are
+        // compiled in. Lets transport-layer code (e.g.
+        // `PeerDirectory::default_service_aliases`) discover the universe
+        // of services without redeclaring it.
+        let known_service_entries: Vec<TokenStream> = services
+            .iter()
+            .map(|service| {
+                let service_name = format!("{}.{}", service.package, service.name);
+                let alpn = format!("/{service_name}/1.0");
+                quote! {
+                    KnownService {
+                        name: #service_name,
+                        alpn: #alpn,
+                    }
+                }
+            })
+            .collect();
+
+        let rate_limited_entries: Vec<TokenStream> = services
+            .iter()
+            .flat_map(|service| {
+                let service_name = format!("{}.{}", service.package, service.name);
+                service.methods.iter().filter_map(move |method| {
+                    if is_rate_limited(&service.package, &service.name, &method.name) {
+                        let path = format!("/{service_name}/{}", method.name);
+                        Some(quote! { #path })
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
         let tokens = quote! {
             #[allow(unused_imports)]
             use crate::peers::RpcService;
+
+            /// A protocol-level service entry — its FQN and the iroh ALPN
+            /// derived from it. Emitted for every `.proto` service the
+            /// build script saw, regardless of whether the matching feature
+            /// flag is enabled in this build.
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub struct KnownService {
+                pub name: &'static str,
+                pub alpn: &'static str,
+            }
+
+            /// Catalogue of every service this crate knows about. The
+            /// transport layer (peer-disclosure filters, ALPN registry,
+            /// etc.) iterates this to avoid hardcoding service identities
+            /// in multiple places.
+            pub const KNOWN_SERVICES: &[KnownService] = &[
+                #(#known_service_entries,)*
+            ];
+
+            /// gRPC paths of every method marked rate-limited at codegen
+            /// time. The `RpcServiceSpec::inbound_policy` match arms use the
+            /// same source-of-truth (the `is_rate_limited` table in
+            /// build.rs); this list lets runtime callers inspect the policy
+            /// without having to fabricate `InboundRequestPolicy` values.
+            pub const KNOWN_RATE_LIMITED_METHODS: &[&'static str] = &[
+                #(#rate_limited_entries,)*
+            ];
 
             #(#service_marker_impls)*
 
