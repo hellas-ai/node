@@ -774,4 +774,50 @@ mod tests {
             .expect("known peers should be ranked");
         assert_eq!(custom_peers, vec![custom]);
     }
+
+    #[test]
+    fn ranked_known_peers_tie_breaks_on_peer_id_for_determinism() {
+        // Equal recommendation scores must not surface in random
+        // HashMap-iteration order. The sort uses PeerId ascending as a
+        // tiebreaker so the public response is deterministic — repeated
+        // calls against the same state return the same vector, even when
+        // the registry contains many peers with identical scores.
+        let local = peer(0);
+        let requester = peer(99);
+
+        // Build identical peers (same service, same security, no traffic),
+        // so recommendation_score collapses to a tie across them.
+        let mut ids = vec![peer(5), peer(2), peer(7), peer(1), peer(3)];
+
+        // Run the sequence repeatedly with the peers inserted in different
+        // orders; the response order must remain identical.
+        let mut expected: Option<Vec<PeerId>> = None;
+        let id_count = ids.len();
+        for trial in 0..8 {
+            let directory = directory(local);
+            // Rotate insertion order each trial so any HashMap bias would
+            // show up as different observed output.
+            ids.rotate_left(trial % id_count);
+
+            for id in &ids {
+                mark_node(&directory, *id);
+            }
+
+            let peers = directory
+                .ranked_known_peers(requester, NODE_SERVICE_ALPN, 64)
+                .expect("known peers should be ranked");
+
+            match &expected {
+                None => expected = Some(peers),
+                Some(prev) => assert_eq!(
+                    &peers, prev,
+                    "ranked_known_peers must be deterministic across insertion orders"
+                ),
+            }
+        }
+
+        let result = expected.expect("at least one trial ran");
+        // PeerId ascending: peer(1) < peer(2) < peer(3) < peer(5) < peer(7).
+        assert_eq!(result, vec![peer(1), peer(2), peer(3), peer(5), peer(7)]);
+    }
 }
