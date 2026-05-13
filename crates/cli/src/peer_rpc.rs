@@ -13,11 +13,8 @@ pub(crate) fn acquire_iroh_method<M: MethodKey>(
     cost: f32,
 ) -> anyhow::Result<RpcPermitGuard> {
     registry
-        .acquire_method::<M>(
-            peer_id_from_endpoint(peer_id),
-            cost,
-            RpcObservation::authenticated_transport("iroh"),
-        )
+        .service_session::<<M as MethodKey>::Service>(peer_id_from_endpoint(peer_id))
+        .acquire_method::<M>(cost, RpcObservation::authenticated_transport("iroh"))
         .with_context(|| {
             format!(
                 "RPC admission denied for {peer_id} {}/{}",
