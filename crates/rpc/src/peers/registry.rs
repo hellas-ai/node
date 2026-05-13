@@ -1084,12 +1084,20 @@ mod tests {
 
     #[test]
     fn auth_level_ordering_matches_authority() {
-        // Variant declaration order in security.rs is load-bearing — these
-        // assertions catch any future reordering that flips the meaning of
-        // policy filters like `entry.auth_level >= AuthLevel::Authenticated`.
-        assert!(AuthLevel::Authenticated > AuthLevel::Local);
-        assert!(AuthLevel::Local > AuthLevel::Trusted);
-        assert!(AuthLevel::Trusted > AuthLevel::Untrusted);
+        // `allows_at_least` encodes the authority lattice explicitly so
+        // adding/reordering variants in security.rs can't silently flip
+        // filter semantics. Spot-check the strict chain and the reflexive
+        // case at every step.
+        assert!(AuthLevel::Authenticated.allows_at_least(AuthLevel::Local));
+        assert!(AuthLevel::Local.allows_at_least(AuthLevel::Trusted));
+        assert!(AuthLevel::Trusted.allows_at_least(AuthLevel::Untrusted));
+
+        assert!(!AuthLevel::Local.allows_at_least(AuthLevel::Authenticated));
+        assert!(!AuthLevel::Trusted.allows_at_least(AuthLevel::Local));
+        assert!(!AuthLevel::Untrusted.allows_at_least(AuthLevel::Trusted));
+
+        assert!(AuthLevel::Authenticated.allows_at_least(AuthLevel::Authenticated));
+        assert!(AuthLevel::Untrusted.allows_at_least(AuthLevel::Untrusted));
     }
 
     #[test]

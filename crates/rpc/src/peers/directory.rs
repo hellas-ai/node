@@ -294,7 +294,7 @@ impl PeerDirectory {
                     if peer.id == self.local_peer || peer.id == requester {
                         return None;
                     }
-                    if peer.auth_level < config.min_disclosed_auth_level {
+                    if !peer.auth_level.allows_at_least(config.min_disclosed_auth_level) {
                         return None;
                     }
                     let age_ms = now.saturating_sub(peer.last_seen_ms);
