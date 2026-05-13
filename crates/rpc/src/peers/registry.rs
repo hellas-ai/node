@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::ServiceKey;
 use super::admission::{AcquireDenied, Outcome, Permit, RequestKind, TokenBucket};
 use super::id::PeerId;
 use super::security::{AuthLevel, TransportSecurity};
@@ -264,8 +265,16 @@ impl PeerEntry {
         self.services.contains_key(service)
     }
 
+    pub fn has_service_key<S: ServiceKey>(&self) -> bool {
+        self.has_service(S::NAME)
+    }
+
     pub fn service_state(&self, service: &'static str) -> Option<&ServiceState> {
         self.services.get(service)
+    }
+
+    pub fn service<S: ServiceKey>(&self) -> Option<&ServiceState> {
+        self.service_state(S::NAME)
     }
 
     pub const fn latency_ms(&self) -> Option<f64> {
@@ -381,6 +390,10 @@ impl PeerRegistry {
 
     pub fn with_service(&self, service: &'static str) -> impl Iterator<Item = &PeerEntry> {
         self.iter().filter(move |peer| peer.has_service(service))
+    }
+
+    pub fn with_service_key<S: ServiceKey>(&self) -> impl Iterator<Item = &PeerEntry> {
+        self.with_service(S::NAME)
     }
 
     pub fn latency(&self, peer: PeerId) -> Option<f64> {
@@ -660,9 +673,10 @@ fn truncate_string(mut value: String, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::NodeService;
 
     const NODE: &str = "hellas.swarm.v1.Node";
-    const GET_NODE_INFO: RequestKind = RequestKind::new(NODE, "GetNodeInfo");
+    const GET_NODE_INFO: RequestKind = RequestKind::for_service::<NodeService>("GetNodeInfo");
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
@@ -708,6 +722,8 @@ mod tests {
         assert_eq!(entry.transport_security, TransportSecurity::Authenticated);
         assert_eq!(entry.auth_level, AuthLevel::Authenticated);
         assert!(entry.has_service(NODE));
+        assert!(entry.has_service_key::<NodeService>());
+        assert!(entry.service::<NodeService>().is_some());
     }
 
     #[test]
@@ -738,6 +754,7 @@ mod tests {
 
         let entry = registry.get(id).expect("peer should exist");
         assert!(entry.has_service(NODE));
+        assert_eq!(registry.with_service_key::<NodeService>().count(), 1);
     }
 
     #[test]

@@ -1,8 +1,37 @@
 //! Sans-io peer registry and admission policy primitives.
 //!
-//! This module intentionally has no transport or runtime dependencies. Callers
-//! feed it observations before and after they perform I/O, and the registry
-//! returns pure admission decisions plus derived peer state.
+//! This module is the pure state engine for peer facts. It intentionally has no
+//! transport, runtime, clock, or storage dependencies. Callers pass timestamps
+//! and observations in, and the registry returns deterministic state changes and
+//! admission decisions.
+//!
+//! Most application code should not call [`PeerRegistry::apply`] directly. The
+//! intended layering is:
+//!
+//! - a transport/discovery driver owns discovery streams and records facts here
+//!   before notifying application code;
+//! - generated or hand-written RPC clients acquire/release request permits here
+//!   around actual RPC calls;
+//! - application code queries the current registry view, usually through a
+//!   manager snapshot/view API, rather than hand-feeding events.
+//!
+//! In other words, the registry is the source of truth, not the discovery task
+//! and not an event stream. Events are useful for notification, but polling
+//! events should never be required to keep peer state correct.
+//!
+//! Querying from the pure registry returns borrowed entries:
+//!
+//! ```ignore
+//! if let Some(peer) = registry.get(peer_id) {
+//!     if let Some(courtesy) = peer.service::<CourtesyService>() {
+//!         println!("courtesy status: {:?}", courtesy.status);
+//!     }
+//! }
+//! ```
+//!
+//! A higher-level async manager should normally expose snapshots or read guards
+//! instead of long-lived `Arc<PeerEntry>` handles, so callers do not accidentally
+//! hold locks or depend on stale mutable state.
 
 mod admission;
 mod id;
@@ -16,3 +45,8 @@ pub use registry::{
     ServiceObservation, ServiceState, ServiceStatus,
 };
 pub use security::{AuthLevel, TransportSecurity};
+
+/// Type-level service identity used by typed peer queries and request kinds.
+pub trait ServiceKey {
+    const NAME: &'static str;
+}
