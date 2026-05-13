@@ -1,10 +1,8 @@
 //! Streaming-response wrapper used by the typed call builders.
 //!
 //! `ManagedStreaming<T>` keeps the request permit alive for the lifetime of
-//! the stream so cancellation and error mapping doesn't leak in-flight
-//! slots. All other outbound machinery lives in [`crate::call`] now — the
-//! previous `tracked_iroh_channel` / `finish_unary` / `finish_streaming`
-//! helpers were folded back into the typed call path.
+//! the stream so cancellation and error mapping don't leak in-flight slots.
+//! All other outbound machinery lives in [`crate::call`].
 
 use std::pin::Pin;
 use std::task::{Context, Poll};

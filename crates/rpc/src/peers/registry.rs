@@ -462,10 +462,9 @@ impl PeerRegistry {
     /// Pure stats — ensures the peer is tracked, bumps `total_requests`,
     /// updates the RTT EMA. Does *not* touch the per-peer rate-limit
     /// bucket; callers that actually reject on rate-limit must consult
-    /// [`Self::try_admit_inbound`] explicitly. (Previously this function
-    /// always spent a token, so account-only methods could drain the same
-    /// bucket as rate-limited ones — the kind parameter was already unused
-    /// and admission was service-wide, not method-wise.)
+    /// [`Self::try_admit_inbound`] explicitly. Splitting stats from the
+    /// bucket spend means `account_only` methods can't drain admission for
+    /// `rate_limited` disclosure-style methods like `Node/GetKnownPeers`.
     pub fn observe_inbound_request(
         &mut self,
         now_ms: u64,
@@ -1127,10 +1126,10 @@ mod tests {
 
     #[test]
     fn len_and_is_empty_hide_tombstoned_peers() {
-        // `get`/`iter`/`with_service` already filter tombstoned peers, but
-        // `len`/`is_empty` historically returned the raw HashMap counts —
-        // so a freshly-forgotten peer with an in-flight permit kept making
-        // the registry look "non-empty" until the permit released.
+        // `len`/`is_empty` must agree with `get`/`iter` visibility — a peer
+        // forgotten while a permit is still in flight is hidden from queries,
+        // so it must not be counted either. (The internal eviction path uses
+        // the raw HashMap len directly; that's what enforces `max_peers`.)
         let mut registry = PeerRegistry::with_config(config());
         let id = peer(42);
 

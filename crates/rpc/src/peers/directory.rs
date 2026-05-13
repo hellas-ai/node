@@ -814,11 +814,10 @@ mod tests {
 
     #[test]
     fn account_only_methods_do_not_drain_rate_limit_bucket() {
-        // Regression for H1: previously every inbound request spent one
-        // token from the per-peer bucket, so a flood of `account_only`
-        // calls (e.g. GetNodeInfo) could drain admission for the actually
-        // rate-limited methods (e.g. GetKnownPeers). Now `account_only`
-        // bypasses the bucket entirely.
+        // `account_only` requests bypass the per-peer rate-limit bucket
+        // entirely. Only `rate_limited` policies spend a token, so a flood
+        // of `GetNodeInfo` (account-only) can't starve admission for
+        // `GetKnownPeers` (rate-limited).
         let directory = PeerDirectory::with_config(
             peer(0),
             PeerDirectoryConfig {
