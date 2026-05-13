@@ -33,11 +33,12 @@ impl TransportSecurity {
 
 /// Policy-facing authentication view derived from transport facts and trust.
 ///
-/// Ordered most-to-least authoritative: `Authenticated > Local > Trusted >
-/// Untrusted`. Callers filter by minimum level with `entry.auth_level >=
-/// AuthLevel::Authenticated`. The variant order below is load-bearing —
-/// `PartialOrd` and `Ord` are derived from it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// Conceptually ordered most-to-least authoritative: `Authenticated > Local >
+/// Trusted > Untrusted`. The ordering is exposed only through explicit
+/// `allows_*_policy` and `allows_at_least` predicates — no `Ord`/`PartialOrd`
+/// is derived. Variant declaration order is therefore *not* load-bearing;
+/// reordering variants will not silently flip filter semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthLevel {
     #[default]
     Untrusted,
@@ -62,6 +63,25 @@ impl AuthLevel {
                 }
             }
         }
+    }
+
+    /// Numeric authority rank used internally by the policy predicates.
+    /// Lives in one place so adding a new variant only requires updating
+    /// this match — everywhere else uses `allows_at_least` and friends.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Untrusted => 0,
+            Self::Trusted => 1,
+            Self::Local => 2,
+            Self::Authenticated => 3,
+        }
+    }
+
+    /// True when `self`'s authority is at least as strong as `threshold`'s.
+    /// Use this in place of `auth_level >= threshold` — it documents intent
+    /// at the call site and keeps the ordering inside the type.
+    pub const fn allows_at_least(self, threshold: Self) -> bool {
+        self.rank() >= threshold.rank()
     }
 
     pub const fn allows_authenticated_policy(self) -> bool {
