@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+#[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
+use super::IrohServiceSpec;
 use super::admission::{Outcome, Permit, RequestKind};
 use super::{
     AcquireDenied, DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerId, PeerRegistry,
@@ -290,14 +292,14 @@ impl PeerManager {
 /// the [`RpcPermitGuard`] because the caller knows when the RPC body or stream
 /// has actually finished.
 #[cfg(feature = "iroh-client")]
-pub struct IrohRpcPool<S: RpcService> {
+pub struct IrohRpcPool<S: IrohServiceSpec> {
     pool: tonic_iroh_transport::ConnectionPool,
     manager: PeerManager,
     _service: PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: RpcService> Clone for IrohRpcPool<S> {
+impl<S: IrohServiceSpec> Clone for IrohRpcPool<S> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
@@ -308,7 +310,7 @@ impl<S: RpcService> Clone for IrohRpcPool<S> {
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: RpcService> std::fmt::Debug for IrohRpcPool<S> {
+impl<S: IrohServiceSpec> std::fmt::Debug for IrohRpcPool<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IrohRpcPool")
             .field("service", &S::NAME)
@@ -318,7 +320,7 @@ impl<S: RpcService> std::fmt::Debug for IrohRpcPool<S> {
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: RpcService> IrohRpcPool<S> {
+impl<S: IrohServiceSpec> IrohRpcPool<S> {
     #[must_use]
     pub fn new(
         endpoint: tonic_iroh_transport::iroh::Endpoint,
@@ -461,14 +463,14 @@ impl IrohTransport {
     /// Get-or-create the pool for service `S`. Pools are cached so repeated
     /// calls for the same service share a single tonic-iroh-transport pool
     /// (with its connection cache, dial timeouts, etc).
-    pub fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
+    pub fn pool<S: IrohServiceSpec>(&self) -> IrohRpcPool<S> {
         self.inner.pool::<S>()
     }
 }
 
 #[cfg(feature = "iroh-client")]
 impl IrohTransportInner {
-    fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
+    fn pool<S: IrohServiceSpec>(&self) -> IrohRpcPool<S> {
         let mut pools = self
             .pools
             .lock()
@@ -522,7 +524,7 @@ impl IrohPeerHandle {
 
     /// Lazily-materialised connection pool for a specific generated service.
     /// Codegen-emitted extension traits use this to dial.
-    pub fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
+    pub fn pool<S: IrohServiceSpec>(&self) -> IrohRpcPool<S> {
         self.transport.pool::<S>()
     }
 

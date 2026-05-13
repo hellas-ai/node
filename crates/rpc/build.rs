@@ -175,6 +175,10 @@ mod compile {
             let service_name = format!("{}.{}", service.package, service.name);
             let alpn = format!("/{service_name}/1.0");
             let feature = feature_for_package(&service.package);
+            // The iroh ALPN lives on `IrohServiceSpec` (a feature-gated trait
+            // companion to the transport-independent `RpcService`), so the
+            // codegen emits two impls per service when the iroh transport
+            // feature is on.
             quote! {
                 #[cfg(feature = #feature)]
                 pub struct #service_ident;
@@ -182,6 +186,13 @@ mod compile {
                 #[cfg(feature = #feature)]
                 impl RpcService for #service_ident {
                     const NAME: &'static str = #service_name;
+                }
+
+                #[cfg(all(
+                    feature = #feature,
+                    any(feature = "iroh-client", feature = "iroh-server"),
+                ))]
+                impl crate::peers::IrohServiceSpec for #service_ident {
                     const ALPN: &'static str = #alpn;
                 }
 
@@ -216,6 +227,10 @@ mod compile {
                 let grpc_path = format!("/{service_name}/{method_name}");
                 let request_streaming = method.request_stream;
                 let response_streaming = method.response_stream;
+                // Core marker carries only Service + NAME; gRPC wire details
+                // (path, prost types, streaming flags) live on the
+                // `GrpcMethodSpec` companion trait. This split keeps the core
+                // marker codec-independent for future non-gRPC transports.
                 method_marker_impls.push(quote! {
                     #[cfg(feature = #feature)]
                     pub struct #method_ident_tok;
@@ -223,9 +238,13 @@ mod compile {
                     #[cfg(feature = #feature)]
                     impl RpcMethod for #method_ident_tok {
                         type Service = #service_ident;
+                        const NAME: &'static str = #method_name;
+                    }
+
+                    #[cfg(feature = #feature)]
+                    impl crate::peers::GrpcMethodSpec for #method_ident_tok {
                         type Request = #request_ty;
                         type Response = #response_ty;
-                        const NAME: &'static str = #method_name;
                         const GRPC_PATH: &'static str = #grpc_path;
                         const REQUEST_STREAMING: bool = #request_streaming;
                         const RESPONSE_STREAMING: bool = #response_streaming;
@@ -252,7 +271,7 @@ mod compile {
                     format_ident!("account_method")
                 };
                 arms.push(quote! {
-                    <methods::#method_ident_tok as crate::peers::RpcMethod>::GRPC_PATH
+                    <methods::#method_ident_tok as crate::peers::GrpcMethodSpec>::GRPC_PATH
                         => Some(crate::peers::InboundRequestPolicy::#constructor::<methods::#method_ident_tok>()),
                 });
             }

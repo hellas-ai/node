@@ -7,6 +7,9 @@ pub struct ExecuteService;
 #[cfg(feature = "execute")]
 impl RpcService for ExecuteService {
     const NAME: &'static str = "hellas.v1.Execute";
+}
+#[cfg(all(feature = "execute", any(feature = "iroh-client", feature = "iroh-server")))]
+impl crate::peers::IrohServiceSpec for ExecuteService {
     const ALPN: &'static str = "/hellas.v1.Execute/1.0";
 }
 #[cfg(feature = "execute")]
@@ -18,6 +21,9 @@ pub struct SymbolicService;
 #[cfg(feature = "symbolic")]
 impl RpcService for SymbolicService {
     const NAME: &'static str = "hellas.symbolic.v1.Symbolic";
+}
+#[cfg(all(feature = "symbolic", any(feature = "iroh-client", feature = "iroh-server")))]
+impl crate::peers::IrohServiceSpec for SymbolicService {
     const ALPN: &'static str = "/hellas.symbolic.v1.Symbolic/1.0";
 }
 #[cfg(feature = "symbolic")]
@@ -29,6 +35,9 @@ pub struct CourtesyService;
 #[cfg(feature = "courtesy")]
 impl RpcService for CourtesyService {
     const NAME: &'static str = "hellas.courtesy.v1.Courtesy";
+}
+#[cfg(all(feature = "courtesy", any(feature = "iroh-client", feature = "iroh-server")))]
+impl crate::peers::IrohServiceSpec for CourtesyService {
     const ALPN: &'static str = "/hellas.courtesy.v1.Courtesy/1.0";
 }
 #[cfg(feature = "courtesy")]
@@ -40,6 +49,9 @@ pub struct OpaqueService;
 #[cfg(feature = "opaque")]
 impl RpcService for OpaqueService {
     const NAME: &'static str = "hellas.opaque.v1.Opaque";
+}
+#[cfg(all(feature = "opaque", any(feature = "iroh-client", feature = "iroh-server")))]
+impl crate::peers::IrohServiceSpec for OpaqueService {
     const ALPN: &'static str = "/hellas.opaque.v1.Opaque/1.0";
 }
 #[cfg(feature = "opaque")]
@@ -51,6 +63,9 @@ pub struct NodeService;
 #[cfg(feature = "swarm")]
 impl RpcService for NodeService {
     const NAME: &'static str = "hellas.swarm.v1.Node";
+}
+#[cfg(all(feature = "swarm", any(feature = "iroh-client", feature = "iroh-server")))]
+impl crate::peers::IrohServiceSpec for NodeService {
     const ALPN: &'static str = "/hellas.swarm.v1.Node/1.0";
 }
 #[cfg(feature = "swarm")]
@@ -75,9 +90,12 @@ pub mod methods {
     #[cfg(feature = "execute")]
     impl RpcMethod for RunTicket {
         type Service = ExecuteService;
+        const NAME: &'static str = "RunTicket";
+    }
+    #[cfg(feature = "execute")]
+    impl crate::peers::GrpcMethodSpec for RunTicket {
         type Request = ::hellas_pb::hellas::RunTicketRequest;
         type Response = ::hellas_pb::hellas::WorkEvent;
-        const NAME: &'static str = "RunTicket";
         const GRPC_PATH: &'static str = "/hellas.v1.Execute/RunTicket";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = true;
@@ -87,9 +105,12 @@ pub mod methods {
     #[cfg(feature = "symbolic")]
     impl RpcMethod for SymbolicCreateTicket {
         type Service = SymbolicService;
+        const NAME: &'static str = "CreateTicket";
+    }
+    #[cfg(feature = "symbolic")]
+    impl crate::peers::GrpcMethodSpec for SymbolicCreateTicket {
         type Request = ::hellas_pb::symbolic::SymbolicRequest;
         type Response = ::hellas_pb::hellas::Ticket;
-        const NAME: &'static str = "CreateTicket";
         const GRPC_PATH: &'static str = "/hellas.symbolic.v1.Symbolic/CreateTicket";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -99,9 +120,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for QuotePreparedText {
         type Service = CourtesyService;
+        const NAME: &'static str = "QuotePreparedText";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for QuotePreparedText {
         type Request = ::hellas_pb::courtesy::QuotePreparedTextRequest;
         type Response = ::hellas_pb::courtesy::QuotePreparedTextResponse;
-        const NAME: &'static str = "QuotePreparedText";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/QuotePreparedText";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -111,9 +135,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for QuotePrompt {
         type Service = CourtesyService;
+        const NAME: &'static str = "QuotePrompt";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for QuotePrompt {
         type Request = ::hellas_pb::courtesy::QuotePromptRequest;
         type Response = ::hellas_pb::courtesy::QuotePromptResponse;
-        const NAME: &'static str = "QuotePrompt";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/QuotePrompt";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -123,9 +150,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for QuoteChatPrompt {
         type Service = CourtesyService;
+        const NAME: &'static str = "QuoteChatPrompt";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for QuoteChatPrompt {
         type Request = ::hellas_pb::courtesy::QuoteChatPromptRequest;
         type Response = ::hellas_pb::courtesy::QuoteChatPromptResponse;
-        const NAME: &'static str = "QuoteChatPrompt";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/QuoteChatPrompt";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -135,9 +165,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for PutArtifact {
         type Service = CourtesyService;
+        const NAME: &'static str = "PutArtifact";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for PutArtifact {
         type Request = ::hellas_pb::courtesy::PutArtifactRequest;
         type Response = ::hellas_pb::courtesy::PutArtifactResponse;
-        const NAME: &'static str = "PutArtifact";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/PutArtifact";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -147,9 +180,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for GetArtifact {
         type Service = CourtesyService;
+        const NAME: &'static str = "GetArtifact";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for GetArtifact {
         type Request = ::hellas_pb::courtesy::GetArtifactRequest;
         type Response = ::hellas_pb::courtesy::GetArtifactResponse;
-        const NAME: &'static str = "GetArtifact";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/GetArtifact";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -159,9 +195,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for ListModels {
         type Service = CourtesyService;
+        const NAME: &'static str = "ListModels";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for ListModels {
         type Request = ::hellas_pb::courtesy::ListModelsRequest;
         type Response = ::hellas_pb::courtesy::ListModelsResponse;
-        const NAME: &'static str = "ListModels";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/ListModels";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -171,9 +210,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for DecodeTokens {
         type Service = CourtesyService;
+        const NAME: &'static str = "DecodeTokens";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for DecodeTokens {
         type Request = ::hellas_pb::courtesy::DecodeTokensRequest;
         type Response = ::hellas_pb::courtesy::DecodeTokensResponse;
-        const NAME: &'static str = "DecodeTokens";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/DecodeTokens";
         const REQUEST_STREAMING: bool = true;
         const RESPONSE_STREAMING: bool = true;
@@ -183,9 +225,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for GetStats {
         type Service = CourtesyService;
+        const NAME: &'static str = "GetStats";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for GetStats {
         type Request = ::hellas_pb::courtesy::GetStatsRequest;
         type Response = ::hellas_pb::courtesy::GetStatsResponse;
-        const NAME: &'static str = "GetStats";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/GetStats";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -195,9 +240,12 @@ pub mod methods {
     #[cfg(feature = "courtesy")]
     impl RpcMethod for GetModelStats {
         type Service = CourtesyService;
+        const NAME: &'static str = "GetModelStats";
+    }
+    #[cfg(feature = "courtesy")]
+    impl crate::peers::GrpcMethodSpec for GetModelStats {
         type Request = ::hellas_pb::courtesy::GetModelStatsRequest;
         type Response = ::hellas_pb::courtesy::GetModelStatsResponse;
-        const NAME: &'static str = "GetModelStats";
         const GRPC_PATH: &'static str = "/hellas.courtesy.v1.Courtesy/GetModelStats";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -207,9 +255,12 @@ pub mod methods {
     #[cfg(feature = "opaque")]
     impl RpcMethod for OpaqueCreateTicket {
         type Service = OpaqueService;
+        const NAME: &'static str = "CreateTicket";
+    }
+    #[cfg(feature = "opaque")]
+    impl crate::peers::GrpcMethodSpec for OpaqueCreateTicket {
         type Request = ::hellas_pb::opaque::OpaqueRequest;
         type Response = ::hellas_pb::hellas::Ticket;
-        const NAME: &'static str = "CreateTicket";
         const GRPC_PATH: &'static str = "/hellas.opaque.v1.Opaque/CreateTicket";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -219,9 +270,12 @@ pub mod methods {
     #[cfg(feature = "swarm")]
     impl RpcMethod for GetNodeInfo {
         type Service = NodeService;
+        const NAME: &'static str = "GetNodeInfo";
+    }
+    #[cfg(feature = "swarm")]
+    impl crate::peers::GrpcMethodSpec for GetNodeInfo {
         type Request = ::hellas_pb::swarm::GetNodeInfoRequest;
         type Response = ::hellas_pb::swarm::GetNodeInfoResponse;
-        const NAME: &'static str = "GetNodeInfo";
         const GRPC_PATH: &'static str = "/hellas.swarm.v1.Node/GetNodeInfo";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -231,9 +285,12 @@ pub mod methods {
     #[cfg(feature = "swarm")]
     impl RpcMethod for GetKnownPeers {
         type Service = NodeService;
+        const NAME: &'static str = "GetKnownPeers";
+    }
+    #[cfg(feature = "swarm")]
+    impl crate::peers::GrpcMethodSpec for GetKnownPeers {
         type Request = ::hellas_pb::swarm::GetKnownPeersRequest;
         type Response = ::hellas_pb::swarm::GetKnownPeersResponse;
-        const NAME: &'static str = "GetKnownPeers";
         const GRPC_PATH: &'static str = "/hellas.swarm.v1.Node/GetKnownPeers";
         const REQUEST_STREAMING: bool = false;
         const RESPONSE_STREAMING: bool = false;
@@ -243,7 +300,7 @@ pub mod methods {
 impl crate::peers::RpcServiceSpec for ExecuteService {
     fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
         match path {
-            <methods::RunTicket as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::RunTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::RunTicket,
@@ -258,7 +315,7 @@ impl crate::peers::RpcServiceSpec for ExecuteService {
 impl crate::peers::RpcServiceSpec for SymbolicService {
     fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
         match path {
-            <methods::SymbolicCreateTicket as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::SymbolicCreateTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::SymbolicCreateTicket,
@@ -273,63 +330,63 @@ impl crate::peers::RpcServiceSpec for SymbolicService {
 impl crate::peers::RpcServiceSpec for CourtesyService {
     fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
         match path {
-            <methods::QuotePreparedText as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::QuotePreparedText as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::QuotePreparedText,
                     >(),
                 )
             }
-            <methods::QuotePrompt as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::QuotePrompt as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::QuotePrompt,
                     >(),
                 )
             }
-            <methods::QuoteChatPrompt as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::QuoteChatPrompt as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::QuoteChatPrompt,
                     >(),
                 )
             }
-            <methods::PutArtifact as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::PutArtifact as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::PutArtifact,
                     >(),
                 )
             }
-            <methods::GetArtifact as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::GetArtifact as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::GetArtifact,
                     >(),
                 )
             }
-            <methods::ListModels as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::ListModels as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::ListModels,
                     >(),
                 )
             }
-            <methods::DecodeTokens as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::DecodeTokens as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::DecodeTokens,
                     >(),
                 )
             }
-            <methods::GetStats as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::GetStats as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::GetStats,
                     >(),
                 )
             }
-            <methods::GetModelStats as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::GetModelStats as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::GetModelStats,
@@ -344,7 +401,7 @@ impl crate::peers::RpcServiceSpec for CourtesyService {
 impl crate::peers::RpcServiceSpec for OpaqueService {
     fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
         match path {
-            <methods::OpaqueCreateTicket as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::OpaqueCreateTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::OpaqueCreateTicket,
@@ -359,14 +416,14 @@ impl crate::peers::RpcServiceSpec for OpaqueService {
 impl crate::peers::RpcServiceSpec for NodeService {
     fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
         match path {
-            <methods::GetNodeInfo as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::GetNodeInfo as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::account_method::<
                         methods::GetNodeInfo,
                     >(),
                 )
             }
-            <methods::GetKnownPeers as crate::peers::RpcMethod>::GRPC_PATH => {
+            <methods::GetKnownPeers as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
                     crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::GetKnownPeers,
