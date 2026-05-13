@@ -459,14 +459,17 @@ impl PeerRegistry {
     /// Record an inbound request from a peer without inferring that the peer
     /// provides the requested service.
     ///
-    /// This is for server-side accounting and admission. Outbound RPC clients
-    /// should use [`Self::try_acquire`] and [`Self::release`] instead, because a
-    /// successful outbound call proves the remote peer provides that service.
+    /// Pure stats — ensures the peer is tracked, bumps `total_requests`,
+    /// updates the RTT EMA. Does *not* touch the per-peer rate-limit
+    /// bucket; callers that actually reject on rate-limit must consult
+    /// [`Self::try_admit_inbound`] explicitly. (Previously this function
+    /// always spent a token, so account-only methods could drain the same
+    /// bucket as rate-limited ones — the kind parameter was already unused
+    /// and admission was service-wide, not method-wise.)
     pub fn observe_inbound_request(
         &mut self,
         now_ms: u64,
         peer: PeerId,
-        _kind: RequestKind,
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, AcquireDenied> {
         let (inserted, evicted) =
@@ -489,6 +492,32 @@ impl PeerRegistry {
             entry.record_rtt(rtt_ms, self.config.rtt_ema_alpha);
         }
 
+        Ok(PeerChange {
+            peer,
+            inserted,
+            updated: !inserted,
+            removed: false,
+            evicted,
+            dropped: false,
+        })
+    }
+
+    /// Spend one token from the per-peer rate-limit bucket. The directory
+    /// invokes this only for methods marked `rate_limited` — `account_only`
+    /// methods stay out of the bucket so they can't drain admission for
+    /// disclosure-style methods (`GetKnownPeers`, etc.). Returns `Err` with
+    /// retry-after when the bucket is empty.
+    pub fn try_admit_inbound(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+    ) -> Result<(), AcquireDenied> {
+        let Some(entry) = self.peers.get_mut(&peer) else {
+            return Err(AcquireDenied::PeerLimit {
+                peer,
+                max_peers: self.config.max_peers,
+            });
+        };
         if let Err(retry_after_ms) = entry.bucket.try_take(
             now_ms,
             self.config.bucket_capacity,
@@ -500,15 +529,7 @@ impl PeerRegistry {
                 retry_after_ms,
             });
         }
-
-        Ok(PeerChange {
-            peer,
-            inserted,
-            updated: !inserted,
-            removed: false,
-            evicted,
-            dropped: false,
-        })
+        Ok(())
     }
 
     pub fn observe_invalid_request(&mut self, now_ms: u64, peer: PeerId) -> PeerChange {
@@ -1064,7 +1085,7 @@ mod tests {
         let id = peer(9);
 
         registry
-            .observe_inbound_request(10, id, GET_NODE_INFO, Some(25.0))
+            .observe_inbound_request(10, id, Some(25.0))
             .expect("inbound request should be recorded");
 
         let entry = registry.get(id).expect("peer should exist");
