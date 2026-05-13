@@ -2,25 +2,12 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 use tonic::Status;
-#[cfg(feature = "compression")]
-use tonic::codec::CompressionEncoding;
-use tonic::codegen::*;
-#[cfg(feature = "discovery")]
-use tonic_iroh_transport::IrohChannel;
 
-use crate::GRPC_MESSAGE_LIMIT;
-use crate::provenance::{ExecutionProvenance, read_provenance_metadata};
-use hellas_pb::courtesy::courtesy_client::CourtesyClient;
-use hellas_pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, PutArtifactRequest, PutArtifactResponse,
-    QuotePreparedTextRequest, QuotePreparedTextResponse,
-};
-use hellas_pb::hellas::execute_client::ExecuteClient;
+use crate::provenance::ExecutionProvenance;
+use hellas_pb::courtesy::{QuotePreparedTextRequest, QuotePreparedTextResponse};
 use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_pb::opaque::OpaqueRequest;
-use hellas_pb::opaque::opaque_client::OpaqueClient;
 use hellas_pb::symbolic::SymbolicRequest;
-use hellas_pb::symbolic::symbolic_client::SymbolicClient;
 
 pub type ExecuteEventStream = Pin<Box<dyn Stream<Item = Result<WorkEvent, Status>> + Send>>;
 
@@ -68,6 +55,32 @@ pub trait ExecuteDriver: Send {
     ) -> Result<StreamedExecution, Status>;
 }
 
+#[cfg(feature = "iroh-client")]
+pub use remote::RemoteExecuteDriver;
+
+/// Tonic-client-based [`ExecuteDriver`] for outbound iroh RPC. Lives in its
+/// own module because it imports `hellas_pb::*::client_stubs::*` (only
+/// available with `hellas-pb/client`) and `IrohChannel` from the iroh
+/// transport — both gated by `iroh-client`.
+#[cfg(feature = "iroh-client")]
+mod remote {
+    use super::*;
+
+    #[cfg(feature = "compression")]
+    use tonic::codec::CompressionEncoding;
+    use tonic::codegen::*;
+    use tonic_iroh_transport::IrohChannel;
+
+    use crate::GRPC_MESSAGE_LIMIT;
+    use crate::provenance::read_provenance_metadata;
+    use hellas_pb::courtesy::courtesy_client::CourtesyClient;
+    use hellas_pb::courtesy::{
+        GetArtifactRequest, GetArtifactResponse, PutArtifactRequest, PutArtifactResponse,
+    };
+    use hellas_pb::hellas::execute_client::ExecuteClient;
+    use hellas_pb::opaque::opaque_client::OpaqueClient;
+    use hellas_pb::symbolic::symbolic_client::SymbolicClient;
+
 pub struct RemoteExecuteDriver<T> {
     execute: ExecuteClient<T>,
     symbolic: Option<SymbolicClient<T>>,
@@ -75,7 +88,6 @@ pub struct RemoteExecuteDriver<T> {
     courtesy: Option<CourtesyClient<T>>,
 }
 
-#[cfg(feature = "discovery")]
 impl RemoteExecuteDriver<IrohChannel> {
     pub fn new(channel: IrohChannel) -> Self {
         Self::with_service(channel)
@@ -277,4 +289,5 @@ where
             provenance,
         })
     }
+}
 }

@@ -6,7 +6,14 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
 
 #[cfg(feature = "discovery")]
 pub mod discovery;
-#[cfg(feature = "client")]
+// `driver` defines `ExecuteDriver` (trait) + value types referenced by both
+// local executors (`hellas-executor`) and remote dial sites (cli/gateway).
+// It's gated on `all-protocols` because the value types live in
+// `hellas_pb::{courtesy,hellas,opaque,symbolic}`. The remote-side
+// `RemoteExecuteDriver` impl is further gated on `iroh-client` inside the
+// module — see `driver::remote` — so executor (server-only) sees the trait
+// without dragging in the iroh client stack.
+#[cfg(feature = "all-protocols")]
 pub mod driver;
 #[cfg(feature = "node")]
 pub mod error;

@@ -30,8 +30,6 @@ hellas-pb = { workspace = true, features = [
   "server",
 ] }
 hellas-rpc = { workspace = true, features = [
-  "server",
-  "client",
   "compression",
   "node",
 ] }
