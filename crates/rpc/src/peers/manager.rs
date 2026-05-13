@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -15,11 +15,17 @@ use super::{
 ///
 /// `PeerRegistry` stays the deterministic sans-io state machine. `PeerManager`
 /// is the small ergonomic wrapper used by clients, servers, and discovery
-/// drivers that want shared state, wall-clock timestamps, and Drop-based request
-/// release.
+/// drivers that want shared state, monotonic timestamps, and Drop-based
+/// request release.
+///
+/// Timestamps are milliseconds since the manager was constructed — not wall
+/// clock. This means age and latency arithmetic is immune to NTP/manual clock
+/// changes. Absolute calendar timestamps must be carried in caller-owned
+/// fields, not derived from `PeerEntry::{first_seen_ms, last_seen_ms}`.
 #[derive(Clone, Debug)]
 pub struct PeerManager {
     registry: Arc<Mutex<PeerRegistry>>,
+    base: Instant,
 }
 
 impl Default for PeerManager {
@@ -36,13 +42,25 @@ impl PeerManager {
     pub fn with_config(config: PeerRegistryConfig) -> Self {
         Self {
             registry: Arc::new(Mutex::new(PeerRegistry::with_config(config))),
+            base: Instant::now(),
         }
     }
 
     pub fn from_registry(registry: PeerRegistry) -> Self {
         Self {
             registry: Arc::new(Mutex::new(registry)),
+            base: Instant::now(),
         }
+    }
+
+    /// Milliseconds since this manager was constructed.
+    ///
+    /// Monotonic: never goes backward, never jumps forward across NTP / DST /
+    /// manual clock changes. All timestamps stored in `PeerEntry` and used
+    /// for admission/EMA/eviction are produced by this method.
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(Instant::now().duration_since(self.base).as_millis())
+            .unwrap_or(u64::MAX)
     }
 
     pub fn snapshot(&self) -> Result<PeerRegistry, PeerManagerError> {
@@ -69,7 +87,8 @@ impl PeerManager {
     }
 
     fn apply(&self, peer: PeerId, event: PeerEvent) -> Result<PeerChange, PeerManagerError> {
-        Ok(self.lock()?.apply(now_ms(), peer, event))
+        let now = self.now_ms();
+        Ok(self.lock()?.apply(now, peer, event))
     }
 
     pub fn observe_discovered_peer(
@@ -94,13 +113,10 @@ impl PeerManager {
         service: &'static str,
         transport_security: TransportSecurity,
     ) -> Result<ServiceObservation, PeerManagerError> {
-        Ok(self.lock()?.observe_discovered_service(
-            now_ms(),
-            peer,
-            source,
-            service,
-            transport_security,
-        ))
+        let now = self.now_ms();
+        Ok(self
+            .lock()?
+            .observe_discovered_service(now, peer, source, service, transport_security))
     }
 
     pub fn observe_discovered_service<S: ServiceKey>(
@@ -119,13 +135,15 @@ impl PeerManager {
         cost: f32,
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, PeerManagerError> {
+        let now = self.now_ms();
         Ok(self
             .lock()?
-            .observe_inbound_request(now_ms(), peer, kind, cost, rtt_ms)?)
+            .observe_inbound_request(now, peer, kind, cost, rtt_ms)?)
     }
 
     pub fn observe_invalid_request(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
-        Ok(self.lock()?.observe_invalid_request(now_ms(), peer))
+        let now = self.now_ms();
+        Ok(self.lock()?.observe_invalid_request(now, peer))
     }
 
     pub fn observe_rate_limited(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
@@ -164,7 +182,7 @@ impl PeerManager {
         cost: f32,
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
-        let now = now_ms();
+        let now = self.now_ms();
         let mut registry = self.lock()?;
         registry.apply(
             now,
@@ -526,10 +544,10 @@ impl RpcPermitGuard {
         let Some(permit) = self.permit.as_ref() else {
             return;
         };
+        let now = self.manager.now_ms();
         let Ok(mut registry) = self.manager.lock() else {
             return;
         };
-        let now = now_ms();
         registry.apply(
             now,
             permit.peer(),
@@ -552,8 +570,9 @@ impl RpcPermitGuard {
         let Some(permit) = self.permit.take() else {
             return;
         };
+        let now = self.manager.now_ms();
         if let Ok(mut registry) = self.manager.lock() {
-            registry.release(now_ms(), permit, outcome);
+            registry.release(now, permit, outcome);
         }
     }
 }
@@ -570,14 +589,6 @@ pub enum PeerManagerError {
     Unavailable,
     #[error(transparent)]
     Admission(#[from] AcquireDenied),
-}
-
-pub(super) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 pub(super) fn duration_ms(duration: Duration) -> f64 {

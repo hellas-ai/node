@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::manager::now_ms;
+use super::admission::TokenBucket;
 use super::{
     DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
     PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
@@ -174,13 +174,12 @@ impl PeerDirectory {
 
     pub fn with_config(local_peer: PeerId, config: PeerDirectoryConfig) -> Self {
         let config = config.normalized();
+        let manager = PeerManager::with_config(config.registry);
+        let bucket = TokenBucket::new(manager.now_ms(), config.global_known_peers_bucket_capacity);
         Self {
             local_peer,
-            manager: PeerManager::with_config(config.registry),
-            known_peers_global_bucket: Arc::new(Mutex::new(TokenBucket::new(
-                config.global_known_peers_bucket_capacity,
-                config.global_known_peers_bucket_refill_per_sec,
-            ))),
+            manager,
+            known_peers_global_bucket: Arc::new(Mutex::new(bucket)),
             config: Arc::new(config),
         }
     }
@@ -214,17 +213,24 @@ impl PeerDirectory {
             Err(err) => return Err(err),
         };
 
+        let now = self.manager.now_ms();
         let disclosure_limit = self.manager.with_registry(|registry| {
-            registry.get(peer).map_or(8, |entry| {
-                disclosure_limit(entry, now_ms(), self.config.as_ref())
-            })
+            registry
+                .get(peer)
+                .map_or(8, |entry| disclosure_limit(entry, now, self.config.as_ref()))
         })?;
 
         let global_ok = if policy.global_cost > 0.0 {
             self.known_peers_global_bucket
                 .lock()
                 .map_err(|_| PeerManagerError::Unavailable)?
-                .take(policy.global_cost, Instant::now())
+                .try_take(
+                    now,
+                    self.config.global_known_peers_bucket_capacity,
+                    self.config.global_known_peers_bucket_refill_per_sec,
+                    policy.global_cost as f32,
+                )
+                .is_ok()
         } else {
             true
         };
@@ -276,7 +282,7 @@ impl PeerDirectory {
         requested_service_filter: &str,
         disclosure_limit: usize,
     ) -> Result<Vec<PeerId>, PeerManagerError> {
-        let now = now_ms();
+        let now = self.manager.now_ms();
         let response_limit = disclosure_limit.min(self.config.max_known_peers_response);
         let config = self.config.as_ref();
         self.manager.with_registry(|registry| {
@@ -381,41 +387,6 @@ fn latency_score(rtt_ms: f64) -> i64 {
 
 fn bounded_penalty(count: u64, weight: i64) -> i64 {
     count.saturating_mul(weight as u64).min(i64::MAX as u64) as i64
-}
-
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    capacity: f64,
-    refill_per_sec: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(capacity: f64, refill_per_sec: f64) -> Self {
-        Self {
-            tokens: capacity,
-            capacity,
-            refill_per_sec,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn take(&mut self, cost: f64, now: Instant) -> bool {
-        let elapsed = now
-            .saturating_duration_since(self.last_refill)
-            .as_secs_f64();
-        if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-            self.last_refill = now;
-        }
-        if self.tokens >= cost {
-            self.tokens -= cost;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 #[cfg(test)]
