@@ -202,6 +202,11 @@ impl PeerManager {
 }
 
 #[cfg(feature = "iroh")]
+pub fn iroh_service_alpn<S: ServiceKey>() -> String {
+    format!("/{}/1.0", S::NAME)
+}
+
+#[cfg(feature = "iroh")]
 impl PeerManager {
     pub fn iroh_peer(&self, peer: tonic_iroh_transport::iroh::EndpointId) -> PeerSession {
         self.peer(PeerId::from(peer))
@@ -232,6 +237,107 @@ impl PeerManager {
         self.iroh_service_session::<<M as MethodKey>::Service>(peer)
             .acquire_method::<M>(cost, RpcObservation::authenticated_transport("iroh"))
     }
+}
+
+/// Managed outbound iroh pool for one generated service.
+///
+/// This is the transport-side companion to [`PeerManager`]. It acquires a
+/// typed request permit before opening the tonic channel and records connection
+/// failures itself, so callers cannot accidentally leave the registry with a
+/// leaked in-flight request when dialing fails. Successful calls still return
+/// the [`RpcPermitGuard`] because the caller knows when the RPC body or stream
+/// has actually finished.
+#[cfg(feature = "iroh-client")]
+pub struct IrohRpcPool<S: ServiceKey> {
+    pool: tonic_iroh_transport::ConnectionPool,
+    manager: PeerManager,
+    _service: PhantomData<fn() -> S>,
+}
+
+#[cfg(feature = "iroh-client")]
+impl<S: ServiceKey> Clone for IrohRpcPool<S> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            manager: self.manager.clone(),
+            _service: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+impl<S: ServiceKey> std::fmt::Debug for IrohRpcPool<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohRpcPool")
+            .field("service", &S::NAME)
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+impl<S: ServiceKey> IrohRpcPool<S> {
+    #[must_use]
+    pub fn new(
+        endpoint: tonic_iroh_transport::iroh::Endpoint,
+        manager: PeerManager,
+        options: tonic_iroh_transport::PoolOptions,
+    ) -> Self {
+        let alpn = iroh_service_alpn::<S>();
+        Self::from_pool(
+            tonic_iroh_transport::ConnectionPool::new(endpoint, alpn.as_bytes(), options),
+            manager,
+        )
+    }
+
+    #[must_use]
+    pub fn from_pool(pool: tonic_iroh_transport::ConnectionPool, manager: PeerManager) -> Self {
+        Self {
+            pool,
+            manager,
+            _service: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn manager(&self) -> &PeerManager {
+        &self.manager
+    }
+
+    #[must_use]
+    pub const fn pool(&self) -> &tonic_iroh_transport::ConnectionPool {
+        &self.pool
+    }
+
+    pub async fn channel<M: MethodKey<Service = S>>(
+        &self,
+        peer: tonic_iroh_transport::iroh::EndpointId,
+        cost: f32,
+    ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohRpcPoolError> {
+        let mut permit = self.manager.acquire_iroh_method::<M>(peer, cost)?;
+        match self.pool.channel(peer).await {
+            Ok(channel) => Ok((channel, permit)),
+            Err(source) => {
+                permit.finish_connect_err(source.to_string());
+                Err(IrohRpcPoolError::Connect {
+                    service: S::NAME,
+                    source,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+#[derive(Debug, Error)]
+pub enum IrohRpcPoolError {
+    #[error(transparent)]
+    Peer(#[from] PeerManagerError),
+    #[error("connect to {service}: {source}")]
+    Connect {
+        service: &'static str,
+        source: tonic_iroh_transport::Error,
+    },
 }
 
 /// Logical session view for one remote peer.

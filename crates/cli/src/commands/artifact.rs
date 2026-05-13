@@ -6,13 +6,12 @@ use hellas_pb::courtesy::courtesy_client::CourtesyClient;
 use hellas_pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
+use hellas_rpc::peers::{IrohRpcPool, MethodKey, PeerManager, RpcPermitGuard};
 use hellas_rpc::service::{CourtesyService, methods};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
-use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
-
-use hellas_rpc::peers::PeerManager;
+use tonic_iroh_transport::{IrohChannel, IrohConnect, PoolOptions};
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
@@ -67,14 +66,8 @@ async fn put(
         .await
         .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
     let peer_registry = PeerManager::default();
-    let mut permit = peer_registry.acquire_iroh_method::<methods::PutArtifact>(node_id, 1.0)?;
-    let mut client = match connect(node_id, node_addrs, secret_key).await {
-        Ok(client) => client,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
+    let (mut client, mut permit) =
+        connect::<methods::PutArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
     let response = match client
         .put_artifact(PutArtifactRequest { canonical_artifact })
         .await
@@ -103,14 +96,8 @@ async fn get(
 ) -> CliResult<()> {
     let cid = parse_digest_hex(&cid)?;
     let peer_registry = PeerManager::default();
-    let mut permit = peer_registry.acquire_iroh_method::<methods::GetArtifact>(node_id, 1.0)?;
-    let mut client = match connect(node_id, node_addrs, secret_key).await {
-        Ok(client) => client,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(err);
-        }
-    };
+    let (mut client, mut permit) =
+        connect::<methods::GetArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
     let response = match client
         .get_artifact(GetArtifactRequest {
             cid: cid.as_bytes().to_vec(),
@@ -136,31 +123,46 @@ async fn get(
     Ok(())
 }
 
-async fn connect(
+async fn connect<M>(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
     secret_key: SecretKey,
-) -> CliResult<CourtesyClient<IrohChannel>> {
+    peer_registry: &PeerManager,
+) -> CliResult<(CourtesyClient<IrohChannel>, RpcPermitGuard)>
+where
+    M: MethodKey<Service = CourtesyService>,
+{
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let channel = if node_addrs.is_empty() {
-        let pool = ConnectionPool::for_service::<CourtesyService>(
+    let (channel, permit) = if node_addrs.is_empty() {
+        let pool = IrohRpcPool::<CourtesyService>::new(
             endpoint.clone(),
+            peer_registry.clone(),
             PoolOptions::default(),
         );
-        pool.channel(node_id)
+        pool.channel::<M>(node_id, 1.0)
             .await
             .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))?
     } else {
-        CourtesyService::connect(
+        let mut permit = peer_registry.acquire_iroh_method::<M>(node_id, 1.0)?;
+        let channel = match CourtesyService::connect(
             &endpoint,
             EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip)),
         )
         .await
-        .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))?
+        .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))
+        {
+            Ok(channel) => channel,
+            Err(err) => {
+                permit.finish_connect_err(err.to_string());
+                return Err(err);
+            }
+        };
+        (channel, permit)
     };
-    Ok(CourtesyClient::new(channel)
+    let client = CourtesyClient::new(channel)
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT))
+        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+    Ok((client, permit))
 }
 
 fn parse_digest_hex(raw: &str) -> CliResult<Digest> {
