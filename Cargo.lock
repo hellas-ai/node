@@ -2643,6 +2643,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost",
+ "prost-build",
  "quote",
  "serde",
  "serde_json",
