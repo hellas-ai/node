@@ -132,13 +132,12 @@ impl PeerManager {
         &self,
         peer: PeerId,
         kind: RequestKind,
-        cost: f32,
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, PeerManagerError> {
         let now = self.now_ms();
         Ok(self
             .lock()?
-            .observe_inbound_request(now, peer, kind, cost, rtt_ms)?)
+            .observe_inbound_request(now, peer, kind, rtt_ms)?)
     }
 
     pub fn observe_invalid_request(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
@@ -179,7 +178,6 @@ impl PeerManager {
         &self,
         peer: PeerId,
         kind: RequestKind,
-        cost: f32,
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
         let now = self.now_ms();
@@ -192,7 +190,7 @@ impl PeerManager {
                 transport_security: observation.initial_security,
             },
         );
-        let permit = registry.try_acquire(now, peer, kind, cost)?;
+        let permit = registry.try_acquire(now, peer, kind)?;
         drop(registry);
 
         Ok(RpcPermitGuard {
@@ -206,10 +204,9 @@ impl PeerManager {
     pub fn acquire_method<M: MethodKey>(
         &self,
         peer: PeerId,
-        cost: f32,
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
-        self.acquire_rpc(peer, RequestKind::for_method::<M>(), cost, observation)
+        self.acquire_rpc(peer, RequestKind::for_method::<M>(), observation)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PeerRegistry>, PeerManagerError> {
@@ -282,10 +279,9 @@ impl PeerManager {
     pub fn acquire_iroh_method<M: MethodKey>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
-        cost: f32,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
         self.iroh_service_session::<<M as MethodKey>::Service>(peer)
-            .acquire_method::<M>(cost, RpcObservation::authenticated_transport("iroh"))
+            .acquire_method::<M>(RpcObservation::authenticated_transport("iroh"))
     }
 }
 
@@ -362,9 +358,8 @@ impl<S: ServiceKey> IrohRpcPool<S> {
     pub async fn channel<M: MethodKey<Service = S>>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
-        cost: f32,
     ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohRpcPoolError> {
-        let mut permit = self.manager.acquire_iroh_method::<M>(peer, cost)?;
+        let mut permit = self.manager.acquire_iroh_method::<M>(peer)?;
         match self.pool.channel(peer).await {
             Ok(channel) => Ok((channel, permit)),
             Err(source) => {
@@ -480,11 +475,10 @@ impl<S: ServiceKey> PeerServiceSession<S> {
 
     pub fn acquire_method<M: MethodKey<Service = S>>(
         &self,
-        cost: f32,
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
         self.manager
-            .acquire_rpc(self.peer, RequestKind::for_method::<M>(), cost, observation)
+            .acquire_rpc(self.peer, RequestKind::for_method::<M>(), observation)
     }
 
     pub fn state(&self) -> Result<Option<ServiceState>, PeerManagerError> {
@@ -657,7 +651,6 @@ mod tests {
             .acquire_rpc(
                 id,
                 RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
-                1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -687,7 +680,6 @@ mod tests {
             .acquire_rpc(
                 id,
                 RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
-                1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -710,7 +702,6 @@ mod tests {
             .acquire_rpc(
                 id,
                 RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
-                1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -731,7 +722,6 @@ mod tests {
 
         let mut permit = node
             .acquire_method::<crate::service::methods::GetNodeInfo>(
-                1.0,
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");

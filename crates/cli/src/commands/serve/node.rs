@@ -69,7 +69,7 @@ impl tonic::service::Interceptor for ExecutePeerInterceptor {
             let _ = self.peer_directory.observe_inbound_request(
                 PeerId::from(peer_id),
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_method::<methods::RunTicket>(1.0),
+                InboundRequestPolicy::account_method::<methods::RunTicket>(),
             );
         }
         Ok(request)
@@ -86,7 +86,7 @@ impl Node for NodeService {
             let _ = self.peer_directory.observe_inbound_request(
                 PeerId::from(peer_id),
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_method::<methods::GetNodeInfo>(0.5),
+                InboundRequestPolicy::account_method::<methods::GetNodeInfo>(),
             );
         }
 
@@ -125,7 +125,7 @@ impl Node for NodeService {
             .observe_inbound_request(
                 requester,
                 observed_rtt.map(duration_ms),
-                InboundRequestPolicy::rate_limited_method::<methods::GetKnownPeers>(4.0, 1.0),
+                InboundRequestPolicy::rate_limited_method::<methods::GetKnownPeers>(),
             )
             .map_err(|_| Status::internal("peer directory is unavailable"))?;
         if !admission.allow {

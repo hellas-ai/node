@@ -130,13 +130,13 @@ where
             peer_registry.clone(),
             PoolOptions::default(),
         );
-        pool.channel::<M>(node_id, 1.0)
+        pool.channel::<M>(node_id)
             .await
             .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))?
     } else {
         let endpoint_addr =
             EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
-        tracked_iroh_channel::<M, _, _>(peer_registry, node_id, 1.0, async {
+        tracked_iroh_channel::<M, _, _>(peer_registry, node_id, async {
             CourtesyService::connect(&endpoint, endpoint_addr)
                 .await
                 .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))

@@ -116,36 +116,30 @@ impl PeerDirectoryConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InboundRequestPolicy {
     pub kind: RequestKind,
-    pub cost: f32,
     pub reject_when_limited: bool,
-    pub global_cost: f64,
 }
 
 impl InboundRequestPolicy {
-    pub const fn account_only(kind: RequestKind, cost: f32) -> Self {
+    pub const fn account_only(kind: RequestKind) -> Self {
         Self {
             kind,
-            cost,
             reject_when_limited: false,
-            global_cost: 0.0,
         }
     }
 
-    pub const fn rate_limited(kind: RequestKind, cost: f32, global_cost: f64) -> Self {
+    pub const fn rate_limited(kind: RequestKind) -> Self {
         Self {
             kind,
-            cost,
             reject_when_limited: true,
-            global_cost,
         }
     }
 
-    pub const fn account_method<M: MethodKey>(cost: f32) -> Self {
-        Self::account_only(RequestKind::for_method::<M>(), cost)
+    pub const fn account_method<M: MethodKey>() -> Self {
+        Self::account_only(RequestKind::for_method::<M>())
     }
 
-    pub const fn rate_limited_method<M: MethodKey>(cost: f32, global_cost: f64) -> Self {
-        Self::rate_limited(RequestKind::for_method::<M>(), cost, global_cost)
+    pub const fn rate_limited_method<M: MethodKey>() -> Self {
+        Self::rate_limited(RequestKind::for_method::<M>())
     }
 }
 
@@ -206,7 +200,6 @@ impl PeerDirectory {
         let per_peer_ok = match self.manager.observe_inbound_request(
             peer,
             policy.kind,
-            policy.cost,
             observed_rtt_ms,
         ) {
             Ok(_) => true,
@@ -221,7 +214,7 @@ impl PeerDirectory {
                 .map_or(8, |entry| disclosure_limit(entry, now, self.config.as_ref()))
         })?;
 
-        let global_ok = if policy.global_cost > 0.0 {
+        let global_ok = if policy.reject_when_limited {
             self.known_peers_global_bucket
                 .lock()
                 .map_err(|_| PeerManagerError::Unavailable)?
@@ -229,7 +222,6 @@ impl PeerDirectory {
                     now,
                     self.config.global_known_peers_bucket_capacity,
                     self.config.global_known_peers_bucket_refill_per_sec,
-                    policy.global_cost as f32,
                 )
                 .is_ok()
         } else {
@@ -448,13 +440,13 @@ mod tests {
         let _ = directory.observe_inbound_request(
             server_a,
             Some(duration_ms(Duration::from_millis(20))),
-            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
         );
         mark_node(&directory, server_b);
         let _ = directory.observe_inbound_request(
             server_b,
             Some(duration_ms(Duration::from_millis(80))),
-            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
         );
 
         let browsers: Vec<_> = (10..13).map(peer).collect();
@@ -462,13 +454,13 @@ mod tests {
             let _ = directory.observe_inbound_request(
                 browser,
                 None,
-                InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+                InboundRequestPolicy::account_only(GET_NODE_INFO),
             );
             let admission = directory
                 .observe_inbound_request(
                     browser,
                     None,
-                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
                 )
                 .expect("request should be accounted");
             assert!(admission.allow);
@@ -485,12 +477,12 @@ mod tests {
         let _ = directory.observe_inbound_request(
             cli,
             Some(duration_ms(Duration::from_millis(5))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         let _ = directory.observe_inbound_request(
             cli,
             Some(duration_ms(Duration::from_millis(5))),
-            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
         );
 
         let peers = directory
@@ -511,13 +503,13 @@ mod tests {
             let _ = directory.observe_inbound_request(
                 browser,
                 None,
-                InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+                InboundRequestPolicy::account_only(GET_NODE_INFO),
             );
             let admission = directory
                 .observe_inbound_request(
                     browser,
                     None,
-                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
                 )
                 .expect("request should be accounted");
             if !admission.allow {
@@ -535,20 +527,20 @@ mod tests {
         let _ = directory.observe_inbound_request(
             server,
             Some(duration_ms(Duration::from_millis(30))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
 
         let browser2 = peer(11);
         let _ = directory.observe_inbound_request(
             browser2,
             None,
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         let admission = directory
             .observe_inbound_request(
                 browser2,
                 None,
-                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
             )
             .expect("request should be accounted");
         if admission.allow {
@@ -581,17 +573,17 @@ mod tests {
         let _ = directory.observe_inbound_request(
             a,
             Some(duration_ms(Duration::from_millis(40))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         let _ = directory.observe_inbound_request(
             b,
             Some(duration_ms(Duration::from_millis(10))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         let _ = directory.observe_inbound_request(
             c,
             Some(duration_ms(Duration::from_millis(2000))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
 
         for _ in 0..15 {
@@ -604,7 +596,7 @@ mod tests {
         let _ = directory.observe_inbound_request(
             requester,
             None,
-            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+            InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
         );
 
         let peers = directory
@@ -629,7 +621,7 @@ mod tests {
             let _ = directory.observe_inbound_request(
                 server,
                 Some(duration_ms(Duration::from_millis(50))),
-                InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+                InboundRequestPolicy::account_only(GET_NODE_INFO),
             );
         }
 
@@ -638,7 +630,7 @@ mod tests {
             .observe_inbound_request(
                 good_peer,
                 Some(duration_ms(Duration::from_millis(20))),
-                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
             )
             .expect("request should be accounted");
         assert!(good_admission.allow);
@@ -647,7 +639,7 @@ mod tests {
         let _ = directory.observe_inbound_request(
             bad_peer,
             Some(duration_ms(Duration::from_millis(20))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         for _ in 0..20 {
             directory
@@ -658,7 +650,7 @@ mod tests {
             .observe_inbound_request(
                 bad_peer,
                 Some(duration_ms(Duration::from_millis(20))),
-                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
             )
             .expect("request should be accounted");
 
@@ -682,12 +674,12 @@ mod tests {
         let _ = directory.observe_inbound_request(
             server_a,
             Some(duration_ms(Duration::from_millis(25))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
         let _ = directory.observe_inbound_request(
             server_b,
             Some(duration_ms(Duration::from_millis(30))),
-            InboundRequestPolicy::account_only(GET_NODE_INFO, 0.5),
+            InboundRequestPolicy::account_only(GET_NODE_INFO),
         );
 
         for round in 0..10 {
@@ -695,7 +687,7 @@ mod tests {
                 .observe_inbound_request(
                     server_a,
                     Some(duration_ms(Duration::from_millis(25))),
-                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS, 4.0, 1.0),
+                    InboundRequestPolicy::rate_limited(GET_KNOWN_PEERS),
                 )
                 .expect("request should be accounted");
             if admission.allow {
