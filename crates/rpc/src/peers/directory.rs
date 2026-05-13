@@ -216,7 +216,11 @@ impl PeerDirectory {
                 .map_or(8, |entry| disclosure_limit(entry, now, self.config.as_ref()))
         })?;
 
-        let global_ok = if policy.reject_when_limited {
+        // Only spend a global-bucket token if the per-peer check passed.
+        // Otherwise an abusive peer past its own limit could keep calling
+        // and drain the shared bucket, denying unrelated well-behaved peers
+        // by collateral damage.
+        let global_ok = if policy.reject_when_limited && per_peer_ok {
             self.known_peers_global_bucket
                 .lock()
                 .map_err(|_| PeerManagerError::Unavailable)?
@@ -227,10 +231,13 @@ impl PeerDirectory {
                 )
                 .is_ok()
         } else {
-            true
+            // When the per-peer bucket already denied, the global decision
+            // doesn't matter — the request is already going to be rejected
+            // (if rate-limited) or accepted (if account-only).
+            per_peer_ok
         };
 
-        if policy.reject_when_limited && !global_ok {
+        if policy.reject_when_limited && !(per_peer_ok && global_ok) {
             let _ = self.manager.observe_rate_limited(peer);
         }
 
@@ -305,7 +312,16 @@ impl PeerDirectory {
                 })
                 .collect();
 
-            candidates.sort_by(|(_, left_score), (_, right_score)| right_score.cmp(left_score));
+            // Higher score first; PeerId ascending tie-breaks. The PeerId
+            // disambiguator is load-bearing — without it, equal-score peers
+            // came back in HashMap iteration order, leaking randomness into
+            // a public response that callers (and tests) rely on being
+            // deterministic.
+            candidates.sort_by(|(left_id, left_score), (right_id, right_score)| {
+                right_score
+                    .cmp(left_score)
+                    .then_with(|| left_id.cmp(right_id))
+            });
             candidates
                 .into_iter()
                 .take(response_limit)

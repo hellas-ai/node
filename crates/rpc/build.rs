@@ -443,9 +443,14 @@ fn render_service_markers(services: &[RpcService]) -> String {
         let mut arms = String::new();
         for method in &service.methods {
             let method_ident = method_ident(method, &method_counts);
+            let constructor = if is_rate_limited(&service.package, &service.name, &method.name) {
+                "rate_limited_method"
+            } else {
+                "account_method"
+            };
             arms.push_str(&format!(
                 "            <methods::{method_ident} as crate::peers::RpcMethod>::GRPC_PATH \
-                  => Some(crate::peers::InboundRequestPolicy::account_method::<methods::{method_ident}>()),\n",
+                  => Some(crate::peers::InboundRequestPolicy::{constructor}::<methods::{method_ident}>()),\n",
             ));
         }
         output.push_str(&format!(
@@ -462,6 +467,23 @@ fn render_service_markers(services: &[RpcService]) -> String {
     }
 
     output
+}
+
+/// Per-method opt-in to *enforcement* (per-peer + global rate limit, deny
+/// when over). The default is `account_only` — observe but never reject.
+///
+/// Pre-refactor `node.rs` rate-limited `swarm.v1.Node/GetKnownPeers` via
+/// `InboundRequestPolicy::rate_limited_method`. The codegen-emitted
+/// `RpcServiceSpec` must preserve that or the `ManagedServer` denial path
+/// becomes unreachable in production.
+///
+/// Add other entries here, or move the table to a `.proto` annotation once
+/// the parser learns to read `option (hellas.inbound) = …`.
+fn is_rate_limited(package: &str, service: &str, method: &str) -> bool {
+    matches!(
+        (package, service, method),
+        ("hellas.swarm.v1", "Node", "GetKnownPeers")
+    )
 }
 
 fn feature_for_package(package: &str) -> &'static str {
