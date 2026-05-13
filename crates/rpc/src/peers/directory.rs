@@ -12,8 +12,6 @@ pub const EXECUTE_SERVICE_ALPN: &str = "/hellas.v1.Execute/1.0";
 pub const SYMBOLIC_SERVICE_ALPN: &str = "/hellas.symbolic.v1.Symbolic/1.0";
 pub const OPAQUE_SERVICE_ALPN: &str = "/hellas.opaque.v1.Opaque/1.0";
 pub const COURTESY_SERVICE_ALPN: &str = "/hellas.courtesy.v1.Courtesy/1.0";
-pub const LEGACY_NODE_SERVICE_ALPN: &str = "/hellas.Node/1.0";
-pub const LEGACY_EXECUTE_SERVICE_ALPN: &str = "/hellas.Execute/1.0";
 
 // Bare service FQNs. Hardcoded here so the directory module compiles without
 // any protocol feature: it's purely transport-side machinery that needs to
@@ -49,10 +47,8 @@ impl ServiceAlias {
 fn default_service_aliases() -> Vec<ServiceAlias> {
     vec![
         ServiceAlias::new(NODE_SERVICE_ALPN, NODE_SERVICE_NAME),
-        ServiceAlias::new(LEGACY_NODE_SERVICE_ALPN, NODE_SERVICE_NAME),
         ServiceAlias::new(NODE_SERVICE_NAME, NODE_SERVICE_NAME),
         ServiceAlias::new(EXECUTE_SERVICE_ALPN, EXECUTE_SERVICE_NAME),
-        ServiceAlias::new(LEGACY_EXECUTE_SERVICE_ALPN, EXECUTE_SERVICE_NAME),
         ServiceAlias::new(EXECUTE_SERVICE_NAME, EXECUTE_SERVICE_NAME),
         ServiceAlias::new(SYMBOLIC_SERVICE_ALPN, SYMBOLIC_SERVICE_NAME),
         ServiceAlias::new(SYMBOLIC_SERVICE_NAME, SYMBOLIC_SERVICE_NAME),
