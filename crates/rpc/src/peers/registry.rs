@@ -204,7 +204,7 @@ impl ServiceState {
 }
 
 /// Per-peer facts and counters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PeerEntry {
     pub id: PeerId,
     pub first_seen_ms: u64,
@@ -318,7 +318,7 @@ impl PeerEntry {
 }
 
 /// Bounded, sans-io registry for peer facts and request admission.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PeerRegistry {
     config: PeerRegistryConfig,
     peers: HashMap<PeerId, PeerEntry>,
