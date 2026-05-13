@@ -89,6 +89,14 @@ Use it directly only when a target needs strict sans-io control.
 Generated clients, hand-written clients, and transport adapters should generally
 talk to `PeerManager`, not directly to `PeerRegistry`.
 
+`IrohRpcPool<S>` is the optional iroh client helper (`iroh-client` feature).
+
+- Owns a `tonic-iroh-transport::ConnectionPool` for one typed service.
+- Acquires a typed method permit before dialing.
+- Records connection failures as connect errors automatically.
+- Returns the tonic channel plus `RpcPermitGuard` on success, so the caller can
+  finish the guard when the unary call or stream actually ends.
+
 `PeerDirectory` is server-side peer exchange policy.
 
 - Tracks inbound request accounting.

@@ -27,6 +27,7 @@ discovery = [
   "tonic-iroh-transport/discovery-dht",
 ]
 iroh = ["dep:tonic-iroh-transport"]
+iroh-client = ["iroh", "tonic-iroh-transport/client"]
 server = ["tonic/server", "hellas-pb/server"]
 node = [
   "dep:catgrad",

@@ -6,7 +6,9 @@ use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::{DiscoverySource, PeerId, PeerManager, ServiceKey, TransportSecurity};
+use hellas_rpc::peers::{
+    DiscoverySource, IrohRpcPool, PeerId, PeerManager, ServiceKey, TransportSecurity,
+};
 use hellas_rpc::service::{ExecuteService, NodeService, methods};
 use std::collections::HashSet;
 use std::future;
@@ -279,8 +281,9 @@ async fn interrogate_peer(
     peer_registry: PeerManager,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
-    let channel = node_pool
-        .channel(peer_id)
+    let node_pool = IrohRpcPool::<NodeService>::from_pool(node_pool, peer_registry.clone());
+    let (channel, mut node_info_permit) = node_pool
+        .channel::<methods::GetNodeInfo>(peer_id, 1.0)
         .await
         .with_context(|| format!("failed to connect to node service on {peer_id}"))?;
 
@@ -288,8 +291,6 @@ async fn interrogate_peer(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let mut node_info_permit =
-        peer_registry.acquire_iroh_method::<methods::GetNodeInfo>(peer_id, 1.0)?;
     let node_info = match timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {})).await {
         Ok(Ok(resp)) => {
             node_info_permit.finish_ok();
