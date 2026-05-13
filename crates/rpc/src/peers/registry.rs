@@ -419,7 +419,6 @@ impl PeerRegistry {
         now_ms: u64,
         peer: PeerId,
         _kind: RequestKind,
-        cost: f32,
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, AcquireDenied> {
         let (inserted, evicted) =
@@ -446,7 +445,6 @@ impl PeerRegistry {
             now_ms,
             self.config.bucket_capacity,
             self.config.bucket_refill_per_sec,
-            cost,
         ) {
             entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             return Err(AcquireDenied::RateLimited {
@@ -592,7 +590,6 @@ impl PeerRegistry {
         now_ms: u64,
         peer: PeerId,
         kind: RequestKind,
-        cost: f32,
     ) -> Result<Permit, AcquireDenied> {
         if self.total_in_flight >= self.config.max_in_flight_total {
             return Err(AcquireDenied::InFlightTotal {
@@ -624,7 +621,6 @@ impl PeerRegistry {
             now_ms,
             self.config.bucket_capacity,
             self.config.bucket_refill_per_sec,
-            cost,
         ) {
             entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             return Err(AcquireDenied::RateLimited {
@@ -638,7 +634,7 @@ impl PeerRegistry {
         entry.last_seen_ms = now_ms;
         self.total_in_flight += 1;
 
-        Ok(Permit::new(peer, kind, now_ms, cost))
+        Ok(Permit::new(peer, kind, now_ms))
     }
 
     pub fn release(&mut self, now_ms: u64, permit: Permit, outcome: Outcome) -> PeerChange {
@@ -843,16 +839,16 @@ mod tests {
         let id = peer(2);
 
         let permit = registry
-            .try_acquire(0, id, GET_NODE_INFO, 1.0)
+            .try_acquire(0, id, GET_NODE_INFO)
             .expect("first request should be admitted");
         let denied = registry
-            .try_acquire(1, id, GET_NODE_INFO, 1.0)
+            .try_acquire(1, id, GET_NODE_INFO)
             .expect_err("second request should exceed peer in-flight limit");
         assert_eq!(denied, AcquireDenied::InFlightPeer { peer: id, limit: 1 });
 
         registry.release(2, permit, Outcome::ok(5.0));
         let permit = registry
-            .try_acquire(3, id, GET_NODE_INFO, 1.0)
+            .try_acquire(3, id, GET_NODE_INFO)
             .expect("slot should reopen after release");
         registry.release(4, permit, Outcome::ok(5.0));
     }
@@ -867,12 +863,12 @@ mod tests {
         let id = peer(3);
 
         let permit = registry
-            .try_acquire(0, id, GET_NODE_INFO, 1.0)
+            .try_acquire(0, id, GET_NODE_INFO)
             .expect("first request should spend the only token");
         registry.release(1, permit, Outcome::ok(5.0));
 
         let denied = registry
-            .try_acquire(2, id, GET_NODE_INFO, 1.0)
+            .try_acquire(2, id, GET_NODE_INFO)
             .expect_err("second request should be rate limited");
         assert_eq!(
             denied,
@@ -888,9 +884,9 @@ mod tests {
         let mut registry = PeerRegistry::with_config(config());
         let id = peer(4);
 
-        let first = registry.try_acquire(0, id, GET_NODE_INFO, 1.0).unwrap();
+        let first = registry.try_acquire(0, id, GET_NODE_INFO).unwrap();
         registry.release(10, first, Outcome::ok(100.0));
-        let second = registry.try_acquire(20, id, GET_NODE_INFO, 1.0).unwrap();
+        let second = registry.try_acquire(20, id, GET_NODE_INFO).unwrap();
         registry.release(30, second, Outcome::ok(200.0));
 
         let entry = registry.get(id).unwrap();
@@ -960,7 +956,7 @@ mod tests {
         let id = peer(9);
 
         registry
-            .observe_inbound_request(10, id, GET_NODE_INFO, 1.0, Some(25.0))
+            .observe_inbound_request(10, id, GET_NODE_INFO, Some(25.0))
             .expect("inbound request should be recorded");
 
         let entry = registry.get(id).expect("peer should exist");

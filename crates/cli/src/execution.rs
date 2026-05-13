@@ -928,7 +928,7 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
-            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id, 1.0)?;
+            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
             let inner = execute_stream(driver, request_commitment);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -985,7 +985,7 @@ impl OpaqueRemoteExecution {
         } = self;
         try_stream! {
             let _endpoint = endpoint;
-            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id, 1.0)?;
+            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id)?;
             let inner = execute_opaque_stream(driver, request_commitment, request);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -1343,7 +1343,7 @@ async fn quote_opaque_remote_endpoint(
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let (opaque_channel, mut permit) = opaque_pool
-        .channel::<methods::OpaqueCreateTicket>(peer_id, 1.0)
+        .channel::<methods::OpaqueCreateTicket>(peer_id)
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
@@ -1395,7 +1395,7 @@ async fn quote_remote_endpoint(
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
     let (courtesy_channel, mut permit) = courtesy_pool
-        .channel::<methods::QuotePreparedText>(peer_id, 1.0)
+        .channel::<methods::QuotePreparedText>(peer_id)
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
@@ -1492,7 +1492,7 @@ async fn quote_opaque_remote_target(
     }
 
     let mut permit =
-        peer_registry.acquire_iroh_method::<methods::OpaqueCreateTicket>(target.node_id, 1.0)?;
+        peer_registry.acquire_iroh_method::<methods::OpaqueCreateTicket>(target.node_id)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
@@ -1554,7 +1554,7 @@ async fn quote_remote_target(
     }
 
     let mut permit =
-        peer_registry.acquire_iroh_method::<methods::QuotePreparedText>(target.node_id, 1.0)?;
+        peer_registry.acquire_iroh_method::<methods::QuotePreparedText>(target.node_id)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await

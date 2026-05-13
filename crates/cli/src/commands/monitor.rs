@@ -283,7 +283,7 @@ async fn interrogate_peer(
 ) -> anyhow::Result<PeerInterrogationOutcome> {
     let node_pool = IrohRpcPool::<NodeService>::from_pool(node_pool, peer_registry.clone());
     let (channel, mut node_info_permit) = node_pool
-        .channel::<methods::GetNodeInfo>(peer_id, 1.0)
+        .channel::<methods::GetNodeInfo>(peer_id)
         .await
         .with_context(|| format!("failed to connect to node service on {peer_id}"))?;
 
@@ -312,7 +312,7 @@ async fn interrogate_peer(
     let mut invalid_known_peers = 0usize;
     let mut known_peers_error = None;
 
-    match peer_registry.acquire_iroh_method::<methods::GetKnownPeers>(peer_id, 0.25) {
+    match peer_registry.acquire_iroh_method::<methods::GetKnownPeers>(peer_id) {
         Ok(mut known_peers_permit) => {
             match timeout(
                 RPC_TIMEOUT,

@@ -423,7 +423,6 @@ fn render_service_markers(services: &[RpcService]) -> String {
                      type Response = {response_ty};\n\
                      const NAME: &'static str = \"{}\";\n\
                      const GRPC_PATH: &'static str = \"{grpc_path}\";\n\
-                     const DEFAULT_COST: f32 = 1.0;\n\
                      const REQUEST_STREAMING: bool = {};\n\
                      const RESPONSE_STREAMING: bool = {};\n\
                  }}\n\n",
@@ -484,7 +483,6 @@ fn render_iroh_clients(services: &[RpcService]) -> String {
 
         for method in &service.methods {
             let fn_name = to_snake_case(&method.name);
-            let with_cost_name = format!("{fn_name}_with_cost");
             let marker_ident = method_ident(method, &method_counts);
             let request_ty = rust_type(&service.package, &method.request);
             let response_ty = rust_type(&service.package, &method.response);
@@ -514,17 +512,9 @@ fn render_iroh_clients(services: &[RpcService]) -> String {
                          peer: tonic_iroh_transport::iroh::EndpointId,\n\
                          request: {request_arg},\n\
                      ) -> {return_ty} {{\n\
-                         self.{with_cost_name}(peer, 1.0, request).await\n\
-                     }}\n\n\
-                     pub async fn {with_cost_name}(\n\
-                         &self,\n\
-                         peer: tonic_iroh_transport::iroh::EndpointId,\n\
-                         cost: f32,\n\
-                         request: {request_arg},\n\
-                     ) -> {return_ty} {{\n\
                          let (channel, permit) = self\n\
                              .pool\n\
-                             .channel::<crate::service::methods::{marker_ident}>(peer, cost)\n\
+                             .channel::<crate::service::methods::{marker_ident}>(peer)\n\
                              .await?;\n\
                          let mut client = hellas_pb::{pb_module}::{client_module}::{client_ident}::new(channel);\n\
                          crate::iroh_client::{finish_fn}::<crate::service::methods::{marker_ident}, _>(\n\

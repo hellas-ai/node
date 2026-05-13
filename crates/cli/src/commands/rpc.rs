@@ -33,7 +33,6 @@ pub async fn run(
         let (channel, permit) = tracked_iroh_channel::<methods::GetNodeInfo, _, _>(
             &peer_registry,
             node_id,
-            1.0,
             async {
                 NodeService::connect(&endpoint, endpoint_addr)
                     .await
