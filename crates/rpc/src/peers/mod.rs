@@ -50,6 +50,10 @@ pub use directory::{
     PeerDirectory, PeerDirectoryConfig, SYMBOLIC_SERVICE_ALPN, ServiceAlias,
 };
 pub use id::PeerId;
+#[cfg(feature = "iroh")]
+pub use manager::iroh_service_alpn;
+#[cfg(feature = "iroh-client")]
+pub use manager::{IrohRpcPool, IrohRpcPoolError};
 pub use manager::{
     PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
 };
