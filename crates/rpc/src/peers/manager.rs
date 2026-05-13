@@ -72,7 +72,7 @@ impl PeerManager {
         Ok(self.lock()?.apply(now_ms(), peer, event))
     }
 
-    pub fn observe_discovered_service(
+    pub fn observe_discovered_service_name(
         &self,
         peer: PeerId,
         source: DiscoverySource,
@@ -88,13 +88,13 @@ impl PeerManager {
         ))
     }
 
-    pub fn observe_discovered_service_key<S: ServiceKey>(
+    pub fn observe_discovered_service<S: ServiceKey>(
         &self,
         peer: PeerId,
         source: DiscoverySource,
         transport_security: TransportSecurity,
     ) -> Result<ServiceObservation, PeerManagerError> {
-        self.observe_discovered_service(peer, source, S::NAME, transport_security)
+        self.observe_discovered_service_name(peer, source, S::NAME, transport_security)
     }
 
     pub fn observe_inbound_request(
@@ -221,7 +221,7 @@ impl<S: ServiceKey> PeerServiceSession<S> {
         transport_security: TransportSecurity,
     ) -> Result<ServiceObservation, PeerManagerError> {
         self.manager
-            .observe_discovered_service_key::<S>(self.peer, source, transport_security)
+            .observe_discovered_service::<S>(self.peer, source, transport_security)
     }
 
     pub fn acquire_method<M: MethodKey<Service = S>>(

@@ -249,7 +249,7 @@ impl PeerDirectory {
         self.manager.observe_invalid_request(peer).map(|_| ())
     }
 
-    pub fn observe_discovered_service(
+    pub fn observe_discovered_service_name(
         &self,
         peer: PeerId,
         source: DiscoverySource,
@@ -257,7 +257,17 @@ impl PeerDirectory {
         transport_security: TransportSecurity,
     ) -> Result<ServiceObservation, PeerManagerError> {
         self.manager
-            .observe_discovered_service(peer, source, service, transport_security)
+            .observe_discovered_service_name(peer, source, service, transport_security)
+    }
+
+    pub fn observe_discovered_service<S: ServiceKey>(
+        &self,
+        peer: PeerId,
+        source: DiscoverySource,
+        transport_security: TransportSecurity,
+    ) -> Result<ServiceObservation, PeerManagerError> {
+        self.manager
+            .observe_discovered_service::<S>(peer, source, transport_security)
     }
 
     pub fn ranked_known_peers(
@@ -442,10 +452,9 @@ mod tests {
 
     fn mark_node(directory: &PeerDirectory, peer: PeerId) {
         directory
-            .observe_discovered_service(
+            .observe_discovered_service::<NodeService>(
                 peer,
                 DiscoverySource::Transport("discovery"),
-                NODE_SERVICE_NAME,
                 TransportSecurity::Untrusted,
             )
             .expect("service should be recorded");
@@ -736,15 +745,14 @@ mod tests {
         mark_node(&directory, node_only);
         mark_node(&directory, executor);
         directory
-            .observe_discovered_service(
+            .observe_discovered_service::<ExecuteService>(
                 executor,
                 DiscoverySource::Transport("discovery"),
-                EXECUTE_SERVICE_NAME,
                 TransportSecurity::Untrusted,
             )
             .expect("service should be recorded");
         directory
-            .observe_discovered_service(
+            .observe_discovered_service_name(
                 custom,
                 DiscoverySource::Transport("discovery"),
                 "example.Custom",

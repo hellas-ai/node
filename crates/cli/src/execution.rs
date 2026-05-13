@@ -27,7 +27,7 @@
 //!   - Transport error after a chunk → propagate (committed work can't be retried).
 //!   - `Done(Failed)` (executor verdict) → propagate, never retry.
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_discovered_service};
+use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_service};
 #[cfg(feature = "hellas-executor")]
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
@@ -55,7 +55,6 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::ServiceKey;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -1666,10 +1665,9 @@ async fn discover_opaque_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_iroh_discovered_service(
+                            observe_iroh_service::<OpaqueService>(
                                 &peer_registry,
                                 peer_id,
-                                <OpaqueService as ServiceKey>::NAME,
                             );
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed opaque peer");
@@ -1766,10 +1764,9 @@ async fn discover_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_iroh_discovered_service(
+                            observe_iroh_service::<CourtesyService>(
                                 &peer_registry,
                                 peer_id,
-                                <CourtesyService as ServiceKey>::NAME,
                             );
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed peer");
