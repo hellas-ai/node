@@ -58,6 +58,7 @@ iroh-client = [
   "iroh",
   "client",
   "all-protocols",
+  "dep:tonic-prost",
   "tonic-iroh-transport/client",
 ]
 node = [
@@ -104,6 +105,7 @@ tokenizers = { version = "0.21", default-features = false, features = [
 ], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
+tonic-prost = { version = "0.14", default-features = false, optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 
