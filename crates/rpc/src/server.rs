@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 
 use pin_project::pin_project;
 
-use crate::peers::{PeerDirectory, PeerExtractor, RpcServiceSpec};
+use crate::peers::{PeerDirectory, PeerExtractor, RpcService, RpcServiceSpec};
 
 /// Pin-projected tower::Service wrapper around a tonic-generated server.
 ///
@@ -36,8 +36,26 @@ pub struct ManagedServer<S, Inner, E> {
     _service: PhantomData<fn() -> S>,
 }
 
-impl<S, Inner, E> ManagedServer<S, Inner, E> {
+impl<S, Inner, E> ManagedServer<S, Inner, E>
+where
+    S: RpcServiceSpec,
+    Inner: tonic::server::NamedService,
+{
     pub fn new(inner: Inner, directory: PeerDirectory, extractor: E) -> Self {
+        // Catch wiring mistakes where the spec marker `S` and the tonic
+        // server `Inner` disagree on which service this is. The path
+        // dispatch comes from `S::inbound_policy`, but `Inner` is what
+        // actually serves bytes — if they're crossed, every request would
+        // hit `UNIMPLEMENTED` on the inner side while the policy lookup
+        // either silently misclassifies or misses entirely. This is purely
+        // a developer-error tripwire, so debug-only.
+        debug_assert_eq!(
+            <S as RpcService>::NAME,
+            Inner::NAME,
+            "ManagedServer spec/server mismatch: spec={} inner={}",
+            <S as RpcService>::NAME,
+            Inner::NAME,
+        );
         Self {
             inner,
             directory,
