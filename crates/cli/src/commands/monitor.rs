@@ -1,5 +1,5 @@
 use crate::commands::CliResult;
-use crate::peer_rpc::{PeerManager, acquire_iroh_method};
+use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_service};
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -7,7 +7,7 @@ use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, TransportSecurity};
+use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, ServiceKey, TransportSecurity};
 use hellas_rpc::service::{ExecuteService, NodeService, methods};
 use std::collections::HashSet;
 use std::future;
@@ -21,9 +21,6 @@ use tonic_iroh_transport::{ConnectionPool, PoolOptions};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
-const NODE_SERVICE_NAME: &str = "hellas.swarm.v1.Node";
-const EXECUTE_SERVICE_NAME: &str = "hellas.v1.Execute";
-
 struct PeerInterrogationOutcome {
     node_info: GetNodeInfoResponse,
     known_peers: Vec<EndpointId>,
@@ -105,9 +102,8 @@ pub async fn run(
             peer = node_discovery.next(), if !node_done => {
                 match peer {
                     Some(Ok(peer)) => {
-                        handle_discovery_event(
+                        handle_discovery_event::<NodeService>(
                             "node",
-                            NODE_SERVICE_NAME,
                             &peer,
                             DiscoveryEventContext {
                                 node_pool: &node_pool,
@@ -130,9 +126,8 @@ pub async fn run(
             peer = execute_discovery.next(), if !execute_done => {
                 match peer {
                     Some(Ok(peer)) => {
-                        handle_discovery_event(
+                        handle_discovery_event::<ExecuteService>(
                             "execute",
-                            EXECUTE_SERVICE_NAME,
                             &peer,
                             DiscoveryEventContext {
                                 node_pool: &node_pool,
@@ -226,8 +221,8 @@ pub async fn run(
         .with_registry(|registry| {
             (
                 registry.len(),
-                registry.with_service(NODE_SERVICE_NAME).count(),
-                registry.with_service(EXECUTE_SERVICE_NAME).count(),
+                registry.with_service_key::<NodeService>().count(),
+                registry.with_service_key::<ExecuteService>().count(),
             )
         })
         .unwrap_or((0, 0, 0));
@@ -246,20 +241,13 @@ pub async fn run(
     Ok(())
 }
 
-fn handle_discovery_event(
+fn handle_discovery_event<S: ServiceKey>(
     service: &str,
-    service_name: &'static str,
     peer: &Peer,
     context: DiscoveryEventContext<'_>,
 ) {
     let peer_id = peer.id();
-    if !observe_iroh_discovered_service(
-        context.peer_registry,
-        peer_id,
-        DiscoverySource::Transport("discovery"),
-        service_name,
-        TransportSecurity::Untrusted,
-    ) {
+    if !observe_iroh_service::<S>(context.peer_registry, peer_id) {
         return;
     }
 
@@ -369,23 +357,6 @@ async fn interrogate_peer(
         invalid_known_peers,
         known_peers_error,
     })
-}
-
-fn observe_iroh_discovered_service(
-    registry: &PeerManager,
-    peer_id: EndpointId,
-    source: DiscoverySource,
-    service: &'static str,
-    transport_security: TransportSecurity,
-) -> bool {
-    registry
-        .observe_discovered_service(
-            peer_id_from_endpoint(peer_id),
-            source,
-            service,
-            transport_security,
-        )
-        .map_or(true, |observation| observation.service_inserted)
 }
 
 fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {

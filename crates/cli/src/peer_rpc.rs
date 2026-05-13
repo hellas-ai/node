@@ -24,17 +24,17 @@ pub(crate) fn acquire_iroh_method<M: MethodKey>(
         })
 }
 
-pub(crate) fn observe_iroh_discovered_service(
+pub(crate) fn observe_iroh_service<S: ServiceKey>(
     registry: &PeerManager,
     peer_id: EndpointId,
-    service: &'static str,
-) {
-    let _ = registry.observe_discovered_service(
-        peer_id_from_endpoint(peer_id),
-        DiscoverySource::Transport("discovery"),
-        service,
-        TransportSecurity::Untrusted,
-    );
+) -> bool {
+    registry
+        .service_session::<S>(peer_id_from_endpoint(peer_id))
+        .observe_discovered(
+            DiscoverySource::Transport("discovery"),
+            TransportSecurity::Untrusted,
+        )
+        .map_or(true, |observation| observation.service_inserted)
 }
 
 fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {

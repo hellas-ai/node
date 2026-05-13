@@ -168,6 +168,17 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn observe_discovered_peer_service<S: ServiceKey>(
+    peer_directory: &PeerDirectory,
+    peer_id: EndpointId,
+) {
+    let _ = peer_directory.observe_discovered_service::<S>(
+        peer_id_from_endpoint(peer_id),
+        DiscoverySource::Transport("discovery"),
+        TransportSecurity::Untrusted,
+    );
+}
+
 async fn bind_endpoint(
     secret_key: tonic_iroh_transport::iroh::SecretKey,
     port: u16,
@@ -353,20 +364,24 @@ pub(super) async fn spawn_node(
             let mut opaque_peers = Box::pin(registry.discover::<OpaqueRpcService>());
             let mut courtesy_peers = Box::pin(registry.discover::<CourtesyRpcService>());
             loop {
-                let (peer_id, service) = tokio::select! {
-                    Some(Ok(peer)) = node_peers.next() => (peer.id(), <NodeRpcService as ServiceKey>::NAME),
-                    Some(Ok(peer)) = exec_peers.next() => (peer.id(), <ExecuteRpcService as ServiceKey>::NAME),
-                    Some(Ok(peer)) = symbolic_peers.next() => (peer.id(), <SymbolicRpcService as ServiceKey>::NAME),
-                    Some(Ok(peer)) = opaque_peers.next() => (peer.id(), <OpaqueRpcService as ServiceKey>::NAME),
-                    Some(Ok(peer)) = courtesy_peers.next() => (peer.id(), <CourtesyRpcService as ServiceKey>::NAME),
+                tokio::select! {
+                    Some(Ok(peer)) = node_peers.next() => {
+                        observe_discovered_peer_service::<NodeRpcService>(&peer_directory, peer.id());
+                    }
+                    Some(Ok(peer)) = exec_peers.next() => {
+                        observe_discovered_peer_service::<ExecuteRpcService>(&peer_directory, peer.id());
+                    }
+                    Some(Ok(peer)) = symbolic_peers.next() => {
+                        observe_discovered_peer_service::<SymbolicRpcService>(&peer_directory, peer.id());
+                    }
+                    Some(Ok(peer)) = opaque_peers.next() => {
+                        observe_discovered_peer_service::<OpaqueRpcService>(&peer_directory, peer.id());
+                    }
+                    Some(Ok(peer)) = courtesy_peers.next() => {
+                        observe_discovered_peer_service::<CourtesyRpcService>(&peer_directory, peer.id());
+                    }
                     else => break,
                 };
-                let _ = peer_directory.observe_discovered_service(
-                    peer_id_from_endpoint(peer_id),
-                    DiscoverySource::Transport("discovery"),
-                    service,
-                    TransportSecurity::Untrusted,
-                );
             }
         });
     }
