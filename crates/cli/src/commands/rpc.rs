@@ -3,13 +3,12 @@ use anyhow::Context;
 use hellas_pb::swarm::GetNodeInfoRequest;
 use hellas_pb::swarm::node_client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::ServiceKey;
-use hellas_rpc::service::NodeService;
+use hellas_rpc::service::{NodeService, methods};
 use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_rpc};
+use crate::peer_rpc::{PeerManager, acquire_iroh_method};
 
 pub async fn run(
     node_id: EndpointId,
@@ -18,13 +17,7 @@ pub async fn run(
 ) -> CliResult<()> {
     let peer_registry = PeerManager::default();
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let mut permit = acquire_iroh_rpc(
-        &peer_registry,
-        node_id,
-        <NodeService as ServiceKey>::NAME,
-        "GetNodeInfo",
-        1.0,
-    )?;
+    let mut permit = acquire_iroh_method::<methods::GetNodeInfo>(&peer_registry, node_id, 1.0)?;
     let channel_result = if node_addrs.is_empty() {
         let pool =
             ConnectionPool::for_service::<NodeService>(endpoint.clone(), PoolOptions::default());

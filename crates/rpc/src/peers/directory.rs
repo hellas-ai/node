@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::manager::now_ms;
 use super::{
-    DiscoverySource, PeerEntry, PeerEvent, PeerId, PeerManager, PeerManagerError,
+    DiscoverySource, MethodKey, PeerEntry, PeerEvent, PeerId, PeerManager, PeerManagerError,
     PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
 };
 use crate::service::{
@@ -137,6 +137,14 @@ impl InboundRequestPolicy {
             reject_when_limited: true,
             global_cost,
         }
+    }
+
+    pub const fn account_method<M: MethodKey>(cost: f32) -> Self {
+        Self::account_only(RequestKind::for_method::<M>(), cost)
+    }
+
+    pub const fn rate_limited_method<M: MethodKey>(cost: f32, global_cost: f64) -> Self {
+        Self::rate_limited(RequestKind::for_method::<M>(), cost, global_cost)
     }
 }
 
@@ -404,8 +412,10 @@ impl TokenBucket {
 mod tests {
     use super::*;
 
-    const GET_NODE_INFO: RequestKind = RequestKind::for_service::<NodeService>("GetNodeInfo");
-    const GET_KNOWN_PEERS: RequestKind = RequestKind::for_service::<NodeService>("GetKnownPeers");
+    const GET_NODE_INFO: RequestKind =
+        RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
+    const GET_KNOWN_PEERS: RequestKind =
+        RequestKind::for_method::<crate::service::methods::GetKnownPeers>();
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])

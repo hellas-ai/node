@@ -751,7 +751,8 @@ mod tests {
     use crate::service::NodeService;
 
     const NODE: &str = "hellas.swarm.v1.Node";
-    const GET_NODE_INFO: RequestKind = RequestKind::for_service::<NodeService>("GetNodeInfo");
+    const GET_NODE_INFO: RequestKind =
+        RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
