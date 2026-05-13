@@ -43,7 +43,9 @@ mod manager;
 mod registry;
 mod security;
 
-pub use admission::{AcquireDenied, Outcome, Permit, RequestKind};
+pub use admission::{
+    AcquireDenied, InboundPeerObservation, Outcome, PeerExtractor, Permit, RequestKind,
+};
 pub use directory::{
     COURTESY_SERVICE_ALPN, EXECUTE_SERVICE_ALPN, InboundAdmission, InboundRequestPolicy,
     LEGACY_EXECUTE_SERVICE_ALPN, LEGACY_NODE_SERVICE_ALPN, NODE_SERVICE_ALPN, OPAQUE_SERVICE_ALPN,
@@ -52,6 +54,8 @@ pub use directory::{
 pub use id::PeerId;
 #[cfg(feature = "iroh")]
 pub use manager::iroh_service_alpn;
+#[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
+pub use manager::IrohPeerExtractor;
 #[cfg(feature = "iroh-client")]
 pub use manager::{IrohRpcPool, IrohRpcPoolError};
 pub use manager::{
@@ -74,6 +78,20 @@ pub trait RpcService {
     /// Iroh ALPN derived as `/{NAME}/1.0`. Constant so it can be referenced
     /// without allocation from transport adapters.
     const ALPN: &'static str;
+}
+
+/// Server-side adapter that the generated managed server wrappers use to
+/// translate a gRPC path string into a typed inbound admission policy.
+///
+/// Exists because bytes off the network arrive as a path string and only
+/// codegen can know which method that string corresponds to. The trait makes
+/// that translation private to the generated impl — callers never write
+/// method paths or method names themselves.
+pub trait RpcServiceSpec: RpcService {
+    /// Return the policy for a request landing at `path`, or `None` if the
+    /// path does not match any of this service's methods (in which case the
+    /// inner tonic dispatcher will reply with `UNIMPLEMENTED`).
+    fn inbound_policy(path: &str) -> Option<directory::InboundRequestPolicy>;
 }
 
 /// Type-level RPC method identity.

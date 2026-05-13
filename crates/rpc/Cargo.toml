@@ -21,7 +21,12 @@ opaque   = ["hellas-pb/opaque"]
 all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
 
 # === Transports ============================================================
-iroh = ["dep:tonic-iroh-transport"]
+# Bare `iroh` brings the dep with no sub-features — useful when you only need
+# the `PeerId: From<EndpointId>` conversion. For a real client/server you also
+# enable `iroh-client`/`iroh-server`, which switch on the matching sub-feature
+# in `tonic-iroh-transport` (channel + pool / accepter + IrohContext).
+iroh        = ["dep:tonic-iroh-transport"]
+iroh-server = ["iroh", "tonic-iroh-transport/server"]
 # websocket, uart, etc. — added when the transport adapters land.
 
 # === Other knobs ===========================================================
@@ -85,6 +90,7 @@ hellas-pb.workspace = true
 hf-hub = { version = "0.5", default-features = false, features = [
   "ureq",
 ], optional = true }
+http = "1"
 mainline = { version = "6", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
