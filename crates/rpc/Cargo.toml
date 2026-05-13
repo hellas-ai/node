@@ -88,6 +88,7 @@ hf-hub = { version = "0.5", default-features = false, features = [
 mainline = { version = "6", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+prost = { version = "0.14", default-features = false }
 thiserror = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = [
   "progressbar",

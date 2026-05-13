@@ -745,7 +745,7 @@ fn truncate_string(mut value: String, max_len: usize) -> String {
     value
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "swarm"))]
 mod tests {
     use super::*;
     use crate::service::NodeService;
