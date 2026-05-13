@@ -420,12 +420,16 @@ impl PeerRegistry {
         self.config
     }
 
+    /// Visible peer count — matches what `get`/`iter`/`with_service` would
+    /// see. Tombstoned entries (still bookkeeping their in-flight permits)
+    /// are excluded so an operator counting "how many peers do I know?"
+    /// after a `forget_peer` doesn't see the leftover state.
     pub fn len(&self) -> usize {
-        self.peers.len()
+        self.iter().count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
+        self.iter().next().is_none()
     }
 
     pub const fn total_in_flight(&self) -> usize {
@@ -1098,6 +1102,36 @@ mod tests {
 
         assert!(AuthLevel::Authenticated.allows_at_least(AuthLevel::Authenticated));
         assert!(AuthLevel::Untrusted.allows_at_least(AuthLevel::Untrusted));
+    }
+
+    #[test]
+    fn len_and_is_empty_hide_tombstoned_peers() {
+        // `get`/`iter`/`with_service` already filter tombstoned peers, but
+        // `len`/`is_empty` historically returned the raw HashMap counts —
+        // so a freshly-forgotten peer with an in-flight permit kept making
+        // the registry look "non-empty" until the permit released.
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(42);
+
+        let permit = registry.try_acquire(0, id, GET_NODE_INFO).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty());
+
+        // Tombstone while in flight: visible queries say "no peer", but the
+        // internal map still has the entry until release.
+        let _ = registry.apply(5, id, PeerEvent::Forgotten);
+        assert!(registry.get(id).is_none());
+        assert_eq!(
+            registry.len(),
+            0,
+            "len must match the visible view (no tombstoned entries)",
+        );
+        assert!(registry.is_empty());
+
+        // Release drops the underlying entry too.
+        let _ = registry.release(10, permit, Outcome::ok(5.0));
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
     }
 
     #[test]
