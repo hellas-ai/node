@@ -25,7 +25,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use hellas_kernel::{Context, Tx};
 use support::{
     FAKE_VERIFIER,
-    itf::{State, context_for, op_for},
+    itf::{State, context_for_height, op_for},
     l1::{TraceState, initial_state},
 };
 
@@ -66,7 +66,9 @@ fn workload(json: &str) -> Vec<(Context, Tx)> {
         .states
         .iter()
         .filter_map(|state| {
-            op_for(&state.value.last_input).map(|op| (context_for(&state.value.last_input), op))
+            let context =
+                context_for_height(state.value.height).expect("ITF height is nonnegative");
+            op_for(&state.value.last_input).map(|op| (context, op))
         })
         .collect()
 }

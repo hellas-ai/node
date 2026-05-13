@@ -33,7 +33,7 @@ use itf::Runner as ItfRunner;
 use support::{
     FAKE_VERIFIER, coin_view,
     itf::PartyTag,
-    itf::{CoinTag, EdgeTag, Event, Input, State, edge_key, op_for},
+    itf::{CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for},
     itf_l1_fees as fee_itf,
     l1::{
         MAKER, MAKER_ID, TAKER, TAKER_ID, TraceState, TraceView, edge_id, edge_value,
@@ -42,7 +42,7 @@ use support::{
     l1_fees as fee_model,
 };
 
-use hellas_kernel::{BlockHash, BlockHeight, Context, EventKind, Fees};
+use hellas_kernel::{EventKind, Fees};
 
 // -- Runner -----------------------------------------------------------------
 
@@ -70,7 +70,7 @@ impl ItfRunner for L1Runner {
             Input::OpenInput(_) | Input::CloseInput(_) => {
                 let op = op_for(&expected.last_input)
                     .expect("op_for returned None for input that should have produced one");
-                let context = l1_context(expected.height)?;
+                let context = context_for_height(expected.height)?;
                 let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected input {:?}: {err:?}", expected.last_input)
                 })?;
@@ -387,14 +387,6 @@ const fn canonical_auth(tag: EdgeTag) -> (PartyTag, PartyTag) {
     match tag {
         EdgeTag::Edge1 | EdgeTag::Edge2 => (PartyTag::Maker, PartyTag::Taker),
     }
-}
-
-fn l1_context(height: i64) -> Result<Context, String> {
-    let height = u64::try_from(height).map_err(|_| format!("negative l1 height: {height}"))?;
-    Ok(Context::new(
-        BlockHeight::new(height),
-        BlockHash::from_bytes([0; BlockHash::LENGTH]),
-    ))
 }
 
 fn expected_shape(expected: &fee_itf::State) -> Result<fee_model::FundingShape, String> {

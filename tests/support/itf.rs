@@ -8,11 +8,10 @@
 //! the `itf` crate validates the trace's variable list against this
 //! struct's fields at parse time.
 //!
-//! The conversion functions (`op_for`, `context_for`, `close_op`) turn
-//! an abstract `Input` into the concrete `(Context, Op)` the kernel
-//! consumes. Both `tests/itf.rs` (validation replay) and
-//! `benches/apply.rs` (throughput) drive the kernel through the same
-//! conversion, so a fixture replayed in either place exercises the same
+//! The conversion functions turn abstract ITF state into the concrete
+//! `(Context, Op)` the kernel consumes. Both `tests/itf.rs` (validation
+//! replay) and `benches/apply.rs` (throughput) drive the kernel through the
+//! same conversion, so a fixture replayed in either place exercises the same
 //! kernel paths.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +20,8 @@ use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
 use hellas_kernel::{
-    CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof, ProtocolCode, Seal, Sig, Tx,
+    BlockHash, BlockHeight, CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof,
+    ProtocolCode, Seal, Sig, Tx,
 };
 
 use super::l1;
@@ -134,18 +134,13 @@ pub(crate) const fn edge_key(tag: EdgeTag) -> l1::EdgeKey {
     }
 }
 
-/// Synthesizes the kernel `Context` for an input. Timeout closes need
-/// `Context::block_height >= terms.timeout`; everything else uses the
-/// genesis context.
-pub(crate) fn context_for(input: &Input) -> Context {
-    if matches!(
-        input,
-        Input::CloseInput(body) if body.proof == ProofTag::Timeout,
-    ) {
-        l1::TIMEOUT_CONTEXT
-    } else {
-        l1::CONTEXT
-    }
+/// Synthesizes the kernel `Context` from the height carried by an ITF state.
+pub(crate) fn context_for_height(height: i64) -> Result<Context, String> {
+    let height = u64::try_from(height).map_err(|_| format!("negative l1 height: {height}"))?;
+    Ok(Context::new(
+        BlockHeight::new(height),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    ))
 }
 
 /// Concrete `Tx` (when the input maps to one). `NoInput`, `TickInput`,
