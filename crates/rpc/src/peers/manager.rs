@@ -132,6 +132,31 @@ impl PeerManager {
         self.apply(peer, PeerEvent::RateLimited)
     }
 
+    pub fn forget_peer(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
+        self.apply(peer, PeerEvent::Forgotten)
+    }
+
+    pub fn set_peer_label(
+        &self,
+        peer: PeerId,
+        label: impl Into<String>,
+    ) -> Result<PeerChange, PeerManagerError> {
+        self.apply(
+            peer,
+            PeerEvent::LabelSet {
+                label: label.into(),
+            },
+        )
+    }
+
+    pub fn set_peer_trusted(
+        &self,
+        peer: PeerId,
+        trusted: bool,
+    ) -> Result<PeerChange, PeerManagerError> {
+        self.apply(peer, PeerEvent::TrustSet { trusted })
+    }
+
     pub fn acquire_rpc(
         &self,
         peer: PeerId,
@@ -232,6 +257,18 @@ impl PeerSession {
     ) -> Result<PeerChange, PeerManagerError> {
         self.manager
             .observe_discovered_peer(self.peer, source, transport_security)
+    }
+
+    pub fn forget(&self) -> Result<PeerChange, PeerManagerError> {
+        self.manager.forget_peer(self.peer)
+    }
+
+    pub fn set_label(&self, label: impl Into<String>) -> Result<PeerChange, PeerManagerError> {
+        self.manager.set_peer_label(self.peer, label)
+    }
+
+    pub fn set_trusted(&self, trusted: bool) -> Result<PeerChange, PeerManagerError> {
+        self.manager.set_peer_trusted(self.peer, trusted)
     }
 
     pub fn service<S: ServiceKey>(&self) -> PeerServiceSession<S> {
@@ -576,5 +613,32 @@ mod tests {
             .expect("registry should be readable")
             .expect("peer should exist");
         assert!(entry.services.is_empty());
+    }
+
+    #[test]
+    fn peer_session_records_label_trust_and_forget() {
+        let manager = PeerManager::with_config(config());
+        let id = peer(6);
+        let peer = manager.peer(id);
+
+        peer.observe_discovered(DiscoverySource::Manual, TransportSecurity::Untrusted)
+            .expect("peer should be recorded");
+        peer.set_label("local gpu")
+            .expect("label should be recorded");
+        peer.set_trusted(true).expect("trust should be recorded");
+
+        let entry = peer
+            .entry_snapshot()
+            .expect("registry should be readable")
+            .expect("peer should exist");
+        assert_eq!(entry.label.as_deref(), Some("local gpu"));
+        assert!(entry.trusted);
+
+        peer.forget().expect("peer should be forgotten");
+        assert!(
+            peer.entry_snapshot()
+                .expect("registry should be readable")
+                .is_none()
+        );
     }
 }
