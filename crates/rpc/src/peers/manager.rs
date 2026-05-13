@@ -283,6 +283,44 @@ impl PeerManager {
     }
 }
 
+/// Where to reach a peer over iroh: either by id alone (the discovery /
+/// connection-cache path) or by id plus explicit addresses (direct dial,
+/// bypassing the cache). One target shape across the whole stack so dial
+/// callers don't reach for `direct_channel`-style side paths.
+#[cfg(feature = "iroh-client")]
+#[derive(Clone, Debug)]
+pub struct IrohTarget {
+    pub peer_id: tonic_iroh_transport::iroh::EndpointId,
+    /// `Some(addr)` ⇒ direct dial (bypass the cached ConnectionPool).
+    /// `None`       ⇒ dial through the cache; discovery resolves addrs.
+    pub addrs: Option<tonic_iroh_transport::iroh::EndpointAddr>,
+}
+
+#[cfg(feature = "iroh-client")]
+impl IrohTarget {
+    /// Discovered target — dial through the cached connection pool, let
+    /// discovery resolve addresses for the peer id.
+    #[must_use]
+    pub const fn discovered(peer_id: tonic_iroh_transport::iroh::EndpointId) -> Self {
+        Self {
+            peer_id,
+            addrs: None,
+        }
+    }
+
+    /// Direct target — bypass the cache and dial these addresses.
+    #[must_use]
+    pub const fn direct(
+        peer_id: tonic_iroh_transport::iroh::EndpointId,
+        addrs: tonic_iroh_transport::iroh::EndpointAddr,
+    ) -> Self {
+        Self {
+            peer_id,
+            addrs: Some(addrs),
+        }
+    }
+}
+
 /// Managed outbound iroh pool for one generated service.
 ///
 /// This is the transport-side companion to [`PeerManager`]. It acquires a
@@ -293,6 +331,7 @@ impl PeerManager {
 /// has actually finished.
 #[cfg(feature = "iroh-client")]
 pub struct IrohRpcPool<S: IrohServiceSpec> {
+    endpoint: tonic_iroh_transport::iroh::Endpoint,
     pool: tonic_iroh_transport::ConnectionPool,
     manager: PeerManager,
     _service: PhantomData<fn() -> S>,
@@ -302,6 +341,7 @@ pub struct IrohRpcPool<S: IrohServiceSpec> {
 impl<S: IrohServiceSpec> Clone for IrohRpcPool<S> {
     fn clone(&self) -> Self {
         Self {
+            endpoint: self.endpoint.clone(),
             pool: self.pool.clone(),
             manager: self.manager.clone(),
             _service: PhantomData,
@@ -313,7 +353,7 @@ impl<S: IrohServiceSpec> Clone for IrohRpcPool<S> {
 impl<S: IrohServiceSpec> std::fmt::Debug for IrohRpcPool<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IrohRpcPool")
-            .field("service", &S::NAME)
+            .field("service", &<S as RpcService>::NAME)
             .field("pool", &self.pool)
             .finish_non_exhaustive()
     }
@@ -327,15 +367,22 @@ impl<S: IrohServiceSpec> IrohRpcPool<S> {
         manager: PeerManager,
         options: tonic_iroh_transport::PoolOptions,
     ) -> Self {
-        Self::from_pool(
-            tonic_iroh_transport::ConnectionPool::new(endpoint, S::ALPN.as_bytes(), options),
-            manager,
-        )
+        let pool = tonic_iroh_transport::ConnectionPool::new(
+            endpoint.clone(),
+            S::ALPN.as_bytes(),
+            options,
+        );
+        Self::from_pool(endpoint, pool, manager)
     }
 
     #[must_use]
-    pub fn from_pool(pool: tonic_iroh_transport::ConnectionPool, manager: PeerManager) -> Self {
+    pub fn from_pool(
+        endpoint: tonic_iroh_transport::iroh::Endpoint,
+        pool: tonic_iroh_transport::ConnectionPool,
+        manager: PeerManager,
+    ) -> Self {
         Self {
+            endpoint,
             pool,
             manager,
             _service: PhantomData,
@@ -352,17 +399,27 @@ impl<S: IrohServiceSpec> IrohRpcPool<S> {
         &self.pool
     }
 
+    /// Dial the service at `target`, acquiring an `M`-method permit before
+    /// I/O starts. Direct targets bypass the cached pool; discovered
+    /// targets reuse the pool's cache. Each dial gets its own permit, so
+    /// (for example) failing to dial Execute on the way to a Courtesy RPC
+    /// can't bill the Courtesy method.
     pub async fn channel<M: RpcMethod<Service = S>>(
         &self,
-        peer: tonic_iroh_transport::iroh::EndpointId,
+        target: IrohTarget,
     ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohRpcPoolError> {
-        let mut permit = self.manager.acquire_iroh_method::<M>(peer)?;
-        match self.pool.channel(peer).await {
+        use tonic_iroh_transport::IrohConnect;
+        let mut permit = self.manager.acquire_iroh_method::<M>(target.peer_id)?;
+        let result = match target.addrs {
+            Some(addr) => S::connect(&self.endpoint, addr).await,
+            None => self.pool.channel(target.peer_id).await,
+        };
+        match result {
             Ok(channel) => Ok((channel, permit)),
             Err(source) => {
                 permit.finish_connect_err(source.to_string());
                 Err(IrohRpcPoolError::Connect {
-                    service: S::NAME,
+                    service: <S as RpcService>::NAME,
                     source,
                 })
             }
@@ -444,11 +501,26 @@ impl IrohTransport {
         }
     }
 
-    /// Typed handle for a remote peer reachable over this transport.
+    /// Typed handle for a remote peer reachable via discovery — pools cache
+    /// the connection and discovery resolves the addresses.
     pub fn peer(&self, peer_id: tonic_iroh_transport::iroh::EndpointId) -> IrohPeerHandle {
         IrohPeerHandle {
             transport: self.inner.clone(),
-            peer_id,
+            target: IrohTarget::discovered(peer_id),
+        }
+    }
+
+    /// Typed handle for a remote peer with explicit transport addresses —
+    /// bypasses the cached pool and dials direct. Useful for tests, CLI
+    /// `--node-addr` flags, or any case where discovery isn't set up.
+    pub fn peer_at(
+        &self,
+        peer_id: tonic_iroh_transport::iroh::EndpointId,
+        addrs: tonic_iroh_transport::iroh::EndpointAddr,
+    ) -> IrohPeerHandle {
+        IrohPeerHandle {
+            transport: self.inner.clone(),
+            target: IrohTarget::direct(peer_id, addrs),
         }
     }
 
@@ -475,14 +547,14 @@ impl IrohTransportInner {
             .pools
             .lock()
             .expect("IrohTransport::pools mutex poisoned");
-        let pool = pools.entry(S::NAME).or_insert_with(|| {
+        let pool = pools.entry(<S as RpcService>::NAME).or_insert_with(|| {
             tonic_iroh_transport::ConnectionPool::new(
                 self.endpoint.clone(),
                 S::ALPN.as_bytes(),
                 self.pool_options.clone(),
             )
         });
-        IrohRpcPool::from_pool(pool.clone(), self.manager.clone())
+        IrohRpcPool::from_pool(self.endpoint.clone(), pool.clone(), self.manager.clone())
     }
 }
 
@@ -496,14 +568,14 @@ impl IrohTransportInner {
 #[derive(Clone)]
 pub struct IrohPeerHandle {
     transport: Arc<IrohTransportInner>,
-    peer_id: tonic_iroh_transport::iroh::EndpointId,
+    target: IrohTarget,
 }
 
 #[cfg(feature = "iroh-client")]
 impl std::fmt::Debug for IrohPeerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IrohPeerHandle")
-            .field("peer_id", &self.peer_id)
+            .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
@@ -511,7 +583,14 @@ impl std::fmt::Debug for IrohPeerHandle {
 #[cfg(feature = "iroh-client")]
 impl IrohPeerHandle {
     pub const fn peer_id(&self) -> tonic_iroh_transport::iroh::EndpointId {
-        self.peer_id
+        self.target.peer_id
+    }
+
+    /// Full dial target carried by this handle — either discovered or direct.
+    /// Generated call types pass this to `IrohRpcPool::channel` so both
+    /// dial shapes go through one code path.
+    pub fn target(&self) -> IrohTarget {
+        self.target.clone()
     }
 
     pub fn manager(&self) -> &PeerManager {
@@ -532,7 +611,7 @@ impl IrohPeerHandle {
     /// `self.manager().acquire_iroh_method::<M>(self.peer_id())` but reads
     /// better at typed call sites.
     pub fn acquire_method<M: RpcMethod>(&self) -> Result<RpcPermitGuard, PeerManagerError> {
-        self.manager().acquire_iroh_method::<M>(self.peer_id)
+        self.manager().acquire_iroh_method::<M>(self.peer_id())
     }
 }
 

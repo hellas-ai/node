@@ -51,7 +51,7 @@ pub use id::PeerId;
 #[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
 pub use manager::IrohPeerExtractor;
 #[cfg(feature = "iroh-client")]
-pub use manager::{IrohPeerHandle, IrohRpcPool, IrohRpcPoolError, IrohTransport};
+pub use manager::{IrohPeerHandle, IrohRpcPool, IrohRpcPoolError, IrohTarget, IrohTransport};
 pub use manager::{
     PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
 };
@@ -84,8 +84,13 @@ pub trait RpcService {
 
 /// Iroh-transport-specific service facts. Generated alongside the
 /// [`RpcService`] impl for any service that participates in iroh dialing.
+///
+/// `tonic::server::NamedService` is a supertrait because the iroh transport's
+/// `IrohConnect` blanket impl is keyed by `NamedService::NAME`, so we want any
+/// `IrohServiceSpec` marker to be directly dialable as `S::connect(endpoint,
+/// addr)` without a second bound at every call site.
 #[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
-pub trait IrohServiceSpec: RpcService {
+pub trait IrohServiceSpec: RpcService + tonic::server::NamedService {
     /// Iroh ALPN derived as `/{NAME}/1.0`. Constant so it can be referenced
     /// without allocation from transport adapters.
     const ALPN: &'static str;
