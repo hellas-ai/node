@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::PeerId;
+use super::{PeerId, ServiceKey};
 
 /// Transport-independent RPC identity used for accounting and admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13,12 +13,24 @@ impl RequestKind {
     pub const fn new(service: &'static str, method: &'static str) -> Self {
         Self { service, method }
     }
+
+    pub const fn for_service<S: ServiceKey>(method: &'static str) -> Self {
+        Self {
+            service: S::NAME,
+            method,
+        }
+    }
 }
 
 /// Admission token returned before a request starts.
 ///
 /// The caller must pass this value to `PeerRegistry::release` when the request
 /// completes so in-flight counters and latency stats stay accurate.
+///
+/// This low-level permit is intentionally explicit because it has no registry
+/// owner, clock, or interior mutability. Higher-level managers should wrap it in
+/// an RAII guard: `Drop` records [`Outcome::Cancelled`], while successful or
+/// failed RPC completion consumes the guard and records the final [`Outcome`].
 #[must_use = "permits must be released through PeerRegistry::release"]
 #[derive(Debug)]
 pub struct Permit {
