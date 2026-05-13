@@ -57,7 +57,7 @@ pub use manager::iroh_service_alpn;
 #[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
 pub use manager::IrohPeerExtractor;
 #[cfg(feature = "iroh-client")]
-pub use manager::{IrohRpcPool, IrohRpcPoolError};
+pub use manager::{IrohPeerHandle, IrohRpcPool, IrohRpcPoolError, IrohTransport};
 pub use manager::{
     PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
 };
