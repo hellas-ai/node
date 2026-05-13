@@ -52,8 +52,6 @@ pub use directory::{
     SYMBOLIC_SERVICE_ALPN, ServiceAlias,
 };
 pub use id::PeerId;
-#[cfg(feature = "iroh")]
-pub use manager::iroh_service_alpn;
 #[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
 pub use manager::IrohPeerExtractor;
 #[cfg(feature = "iroh-client")]
