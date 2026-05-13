@@ -6,9 +6,6 @@ use super::{
     DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
     PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
 };
-use crate::service::{
-    CourtesyService, ExecuteService, NodeService, OpaqueService, SymbolicService,
-};
 
 pub const NODE_SERVICE_ALPN: &str = "/hellas.swarm.v1.Node/1.0";
 pub const EXECUTE_SERVICE_ALPN: &str = "/hellas.v1.Execute/1.0";
@@ -18,6 +15,16 @@ pub const COURTESY_SERVICE_ALPN: &str = "/hellas.courtesy.v1.Courtesy/1.0";
 pub const LEGACY_NODE_SERVICE_ALPN: &str = "/hellas.Node/1.0";
 pub const LEGACY_EXECUTE_SERVICE_ALPN: &str = "/hellas.Execute/1.0";
 
+// Bare service FQNs. Hardcoded here so the directory module compiles without
+// any protocol feature: it's purely transport-side machinery that needs to
+// recognize service-by-name in peer-disclosure filters, regardless of whether
+// the local crate actually carries that service's typed marker.
+const NODE_SERVICE_NAME: &str = "hellas.swarm.v1.Node";
+const EXECUTE_SERVICE_NAME: &str = "hellas.v1.Execute";
+const SYMBOLIC_SERVICE_NAME: &str = "hellas.symbolic.v1.Symbolic";
+const OPAQUE_SERVICE_NAME: &str = "hellas.opaque.v1.Opaque";
+const COURTESY_SERVICE_NAME: &str = "hellas.courtesy.v1.Courtesy";
+
 const DEFAULT_MAX_TRACKED_PEERS: usize = 2048;
 const DEFAULT_MAX_KNOWN_PEERS_RESPONSE: usize = 64;
 const DEFAULT_STALE_PEER_AFTER_MS: u64 = 15 * 60 * 1000;
@@ -25,12 +32,6 @@ const DEFAULT_LATENCY_SCORE: i64 = 450;
 const DEFAULT_MAX_SERVICE_FILTER_LEN: usize = 128;
 const DEFAULT_GLOBAL_BUCKET_CAPACITY: f64 = 16.0;
 const DEFAULT_GLOBAL_BUCKET_REFILL_PER_SEC: f64 = 4.0;
-
-const NODE_SERVICE_NAME: &str = <NodeService as ServiceKey>::NAME;
-const EXECUTE_SERVICE_NAME: &str = <ExecuteService as ServiceKey>::NAME;
-const SYMBOLIC_SERVICE_NAME: &str = <SymbolicService as ServiceKey>::NAME;
-const OPAQUE_SERVICE_NAME: &str = <OpaqueService as ServiceKey>::NAME;
-const COURTESY_SERVICE_NAME: &str = <CourtesyService as ServiceKey>::NAME;
 
 /// Alias accepted by peer-disclosure service filters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,9 +390,14 @@ fn bounded_penalty(count: u64, weight: i64) -> i64 {
     count.saturating_mul(weight as u64).min(i64::MAX as u64) as i64
 }
 
-#[cfg(test)]
+// Directory behaviour is meaningful only when there are concrete services to
+// observe, so the tests assume both swarm (for Node/get_known_peers) and
+// execute (for cross-service filtering). With either off, the tests compile
+// out — the impl above still works at any feature subset.
+#[cfg(all(test, feature = "swarm", feature = "execute"))]
 mod tests {
     use super::*;
+    use crate::service::{ExecuteService, NodeService};
 
     const GET_NODE_INFO: RequestKind =
         RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
