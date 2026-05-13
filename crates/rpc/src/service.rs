@@ -126,4 +126,25 @@ pub mod methods {
         type Service = CourtesyService;
         const NAME: &'static str = "ListModels";
     }
+
+    pub struct QuotePrompt;
+
+    impl MethodKey for QuotePrompt {
+        type Service = CourtesyService;
+        const NAME: &'static str = "QuotePrompt";
+    }
+
+    pub struct QuoteChatPrompt;
+
+    impl MethodKey for QuoteChatPrompt {
+        type Service = CourtesyService;
+        const NAME: &'static str = "QuoteChatPrompt";
+    }
+
+    pub struct DecodeTokens;
+
+    impl MethodKey for DecodeTokens {
+        type Service = CourtesyService;
+        const NAME: &'static str = "DecodeTokens";
+    }
 }
