@@ -80,100 +80,273 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse_proto_services(path: &Path) -> Vec<RpcService> {
-    let source = fs::read_to_string(path).expect("proto file should be readable");
-    let mut package = String::new();
-    let mut services = Vec::new();
-    let mut current: Option<RpcService> = None;
+/// Brace- and string-aware scanner over a comment-stripped `.proto` source.
+///
+/// We only need enough proto3 to find `package`, `service`, and `rpc` decls;
+/// everything else (messages, enums, options, nested types, method bodies)
+/// is skipped past balanced braces with string-literal awareness so that
+/// neither `option some.key = "{...};";` nor `rpc Foo (...) returns (...) { option ...; }`
+/// can mis-close a service body.
+struct Scanner<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
 
-    for raw_line in source.lines() {
-        let line = raw_line
-            .split_once("//")
-            .map_or(raw_line, |(prefix, _)| prefix)
-            .trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("package ") {
-            package = rest.trim_end_matches(';').trim().to_owned();
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("service ") {
-            let name = rest
-                .split(|ch: char| ch == '{' || ch.is_whitespace())
-                .find(|part| !part.is_empty())
-                .expect("service name should be present")
-                .to_owned();
-            current = Some(RpcService {
-                package: package.clone(),
-                name,
-                methods: Vec::new(),
-            });
-            continue;
-        }
-
-        if line.starts_with('}') {
-            if let Some(service) = current.take() {
-                services.push(service);
-            }
-            continue;
-        }
-
-        if let Some(service) = current.as_mut()
-            && let Some(rest) = line.strip_prefix("rpc ")
-        {
-            let parsed = parse_rpc_method(rest);
-            service.methods.push(RpcMethod {
-                service: service.name.clone(),
-                name: parsed.name,
-                request: parsed.request,
-                response: parsed.response,
-                request_stream: parsed.request_stream,
-                response_stream: parsed.response_stream,
-            });
+impl<'a> Scanner<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            pos: 0,
         }
     }
 
-    if let Some(service) = current {
-        services.push(service);
+    fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let c = self.peek();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Consume an identifier (alnum + `_` + `.` for dotted type names).
+    /// Returns empty if the cursor isn't at an identifier start.
+    fn read_ident(&mut self) -> String {
+        self.skip_whitespace();
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned()
+    }
+
+    fn expect(&mut self, ch: u8) {
+        self.skip_whitespace();
+        if self.peek() != Some(ch) {
+            let lo = self.pos.saturating_sub(24);
+            let hi = (self.pos + 24).min(self.bytes.len());
+            panic!(
+                "expected '{}' at byte {}, near: …{}…",
+                ch as char,
+                self.pos,
+                String::from_utf8_lossy(&self.bytes[lo..hi]),
+            );
+        }
+        self.pos += 1;
+    }
+
+    /// Walk past a string literal (cursor positioned AFTER the opening `"`).
+    fn skip_string(&mut self) {
+        while let Some(c) = self.bump() {
+            match c {
+                b'"' => return,
+                b'\\' => {
+                    self.bump();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Walk past a balanced `{ ... }` block (cursor positioned AFTER the opening `{`).
+    fn skip_brace_block(&mut self) {
+        let mut depth = 1;
+        while depth > 0 {
+            match self.bump() {
+                Some(b'"') => self.skip_string(),
+                Some(b'{') => depth += 1,
+                Some(b'}') => depth -= 1,
+                Some(_) => {}
+                None => return,
+            }
+        }
+    }
+
+    /// Skip past the rest of a top-level statement — either `;` or a balanced
+    /// `{ ... }` block. Used to discard non-`rpc` declarations inside service
+    /// bodies and non-`service`/`package` declarations at file scope.
+    fn skip_statement(&mut self) {
+        loop {
+            match self.bump() {
+                Some(b';') => return,
+                Some(b'{') => {
+                    self.skip_brace_block();
+                    return;
+                }
+                Some(b'"') => self.skip_string(),
+                Some(b'}') | None => return,
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Strip `//` line comments and `/* … */` block comments. String literals are
+/// passed through verbatim so a `"//"` or `"/*"` inside a string isn't elided.
+fn strip_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match (c, next) {
+            (b'/', Some(b'/')) => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            (b'/', Some(b'*')) => {
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    if bytes[i] == b'\n' {
+                        // Preserve newlines so panic-site context still lines up.
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+            }
+            (b'"', _) => {
+                out.push('"');
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        out.push(bytes[i] as char);
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                    } else {
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() {
+                    out.push('"');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn parse_proto_services(path: &Path) -> Vec<RpcService> {
+    let raw = fs::read_to_string(path).expect("proto file should be readable");
+    let source = strip_comments(&raw);
+    let mut scanner = Scanner::new(&source);
+    let mut package = String::new();
+    let mut services = Vec::new();
+
+    while !scanner.at_end() {
+        scanner.skip_whitespace();
+        if scanner.at_end() {
+            break;
+        }
+        let keyword = scanner.read_ident();
+        if keyword.is_empty() {
+            // Stray punctuation at top level — discard one byte and retry.
+            scanner.bump();
+            continue;
+        }
+        match keyword.as_str() {
+            "package" => {
+                let pkg = scanner.read_ident();
+                scanner.expect(b';');
+                package = pkg;
+            }
+            "service" => {
+                let name = scanner.read_ident();
+                scanner.expect(b'{');
+                let methods = parse_service_body(&mut scanner, &name);
+                services.push(RpcService {
+                    package: package.clone(),
+                    name,
+                    methods,
+                });
+            }
+            _ => scanner.skip_statement(),
+        }
     }
 
     services
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ParsedRpcMethod {
-    name: String,
-    request: String,
-    response: String,
-    request_stream: bool,
-    response_stream: bool,
+fn parse_service_body(scanner: &mut Scanner<'_>, service_name: &str) -> Vec<RpcMethod> {
+    let mut methods = Vec::new();
+    loop {
+        scanner.skip_whitespace();
+        match scanner.peek() {
+            Some(b'}') => {
+                scanner.bump();
+                return methods;
+            }
+            None => return methods,
+            _ => {}
+        }
+        let keyword = scanner.read_ident();
+        if keyword == "rpc" {
+            methods.push(parse_rpc_method(scanner, service_name));
+        } else {
+            scanner.skip_statement();
+        }
+    }
 }
 
-fn parse_rpc_method(rest: &str) -> ParsedRpcMethod {
-    let (name, after_name) = rest
-        .split_once('(')
-        .expect("rpc method should include request type");
-    let name = name.trim().to_owned();
-    let (request, after_request) = after_name
-        .split_once(')')
-        .expect("rpc method request should be closed");
-    let after_returns = after_request
-        .trim()
-        .strip_prefix("returns")
-        .expect("rpc method should include returns")
-        .trim();
-    let after_open = after_returns
-        .strip_prefix('(')
-        .expect("rpc return type should open with paren");
-    let (response, _) = after_open
-        .split_once(')')
-        .expect("rpc return type should be closed");
-    let (request_stream, request) = parse_stream_type(request);
-    let (response_stream, response) = parse_stream_type(response);
-    ParsedRpcMethod {
+fn parse_rpc_method(scanner: &mut Scanner<'_>, service_name: &str) -> RpcMethod {
+    let name = scanner.read_ident();
+    scanner.expect(b'(');
+    let (request_stream, request) = parse_rpc_type(scanner);
+    scanner.expect(b')');
+    let returns = scanner.read_ident();
+    assert_eq!(
+        returns, "returns",
+        "expected 'returns' after rpc request type in {service_name}.{name}",
+    );
+    scanner.expect(b'(');
+    let (response_stream, response) = parse_rpc_type(scanner);
+    scanner.expect(b')');
+    scanner.skip_whitespace();
+    // Trailing `;` or an optional method body `{ option … = …; … }`.
+    match scanner.peek() {
+        Some(b';') => {
+            scanner.bump();
+        }
+        Some(b'{') => {
+            scanner.bump();
+            scanner.skip_brace_block();
+        }
+        _ => {}
+    }
+    RpcMethod {
+        service: service_name.to_owned(),
         name,
         request,
         response,
@@ -182,12 +355,12 @@ fn parse_rpc_method(rest: &str) -> ParsedRpcMethod {
     }
 }
 
-fn parse_stream_type(raw: &str) -> (bool, String) {
-    let raw = raw.trim();
-    if let Some(rest) = raw.strip_prefix("stream ") {
-        (true, rest.trim().to_owned())
+fn parse_rpc_type(scanner: &mut Scanner<'_>) -> (bool, String) {
+    let first = scanner.read_ident();
+    if first == "stream" {
+        (true, scanner.read_ident())
     } else {
-        (false, raw.to_owned())
+        (false, first)
     }
 }
 
