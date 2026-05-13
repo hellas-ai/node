@@ -123,12 +123,13 @@ Discovery and transport adapters record capabilities before application code
 needs them:
 
 ```rust
-manager.observe_discovered_service(
-    peer,
-    DiscoverySource::Transport("discovery"),
-    <CourtesyService as ServiceKey>::NAME,
-    TransportSecurity::Untrusted,
-)?;
+manager
+    .peer(peer)
+    .service::<CourtesyService>()
+    .observe_discovered(
+        DiscoverySource::Transport("discovery"),
+        TransportSecurity::Untrusted,
+    )?;
 ```
 
 Outbound RPCs acquire admission before I/O and finish exactly once:
