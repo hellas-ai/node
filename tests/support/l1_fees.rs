@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
@@ -16,14 +14,8 @@ pub(crate) const MAKER_ID: CoinId = coin_id(1);
 pub(crate) const TAKER_ID: CoinId = coin_id(2);
 pub(crate) const MAKER_VALUE: u64 = 40;
 pub(crate) const TAKER_VALUE: u64 = 40;
-pub(crate) const OPEN_FEE: i64 = 10;
-pub(crate) const ONE_INPUT_OPEN_FEE: i64 = 7;
-pub(crate) const LIFETIME_FEE: i64 = 3;
-pub(crate) const CLOSE_RESERVE: i64 = 16;
 pub(crate) const BASE_CLOSE_FEE: i64 = 10;
 pub(crate) const RAISED_CLOSE_FEE: i64 = 18;
-pub(crate) const INITIAL_STAKE: i64 = 12;
-pub(crate) const VIOLATION_PENALTY: i64 = 4;
 
 pub(crate) const BASE_FEES: Fees = Fees::new(1, 3, 0, 3);
 pub(crate) const RAISED_FEES: Fees = Fees::new(18, 0, 0, 0);
@@ -179,46 +171,6 @@ pub(crate) const fn parties(shape: FundingShape) -> Parties {
         | FundingShape::MakerOnly
         | FundingShape::TakerOnly
         | FundingShape::Empty => Parties::new(MAKER, TAKER),
-    }
-}
-
-pub(crate) const fn open_fee(shape: FundingShape) -> i64 {
-    match shape {
-        FundingShape::Empty => 0,
-        FundingShape::Full => OPEN_FEE,
-        FundingShape::MakerOnly | FundingShape::TakerOnly | FundingShape::SelfEdge => {
-            ONE_INPUT_OPEN_FEE
-        }
-    }
-}
-
-pub(crate) const fn lifetime_fee(shape: FundingShape) -> i64 {
-    match shape {
-        FundingShape::Empty => 0,
-        FundingShape::Full
-        | FundingShape::MakerOnly
-        | FundingShape::TakerOnly
-        | FundingShape::SelfEdge => LIFETIME_FEE,
-    }
-}
-
-pub(crate) const fn committed_close_fee(shape: FundingShape) -> i64 {
-    match shape {
-        FundingShape::Empty => 0,
-        FundingShape::Full
-        | FundingShape::MakerOnly
-        | FundingShape::TakerOnly
-        | FundingShape::SelfEdge => BASE_CLOSE_FEE,
-    }
-}
-
-pub(crate) const fn close_reserve(shape: FundingShape) -> i64 {
-    match shape {
-        FundingShape::Empty => 0,
-        FundingShape::Full
-        | FundingShape::MakerOnly
-        | FundingShape::TakerOnly
-        | FundingShape::SelfEdge => CLOSE_RESERVE,
     }
 }
 
