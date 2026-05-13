@@ -1,5 +1,4 @@
 use crate::commands::CliResult;
-use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_service};
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -7,7 +6,7 @@ use hellas_pb::swarm::node_client::NodeClient;
 use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::peers::{DiscoverySource, PeerId, ServiceKey, TransportSecurity};
+use hellas_rpc::peers::{DiscoverySource, PeerId, PeerManager, ServiceKey, TransportSecurity};
 use hellas_rpc::service::{ExecuteService, NodeService, methods};
 use std::collections::HashSet;
 use std::future;
@@ -185,7 +184,7 @@ pub async fn run(
                             hinted_peers += outcome.known_peers.len();
                             for hinted in &outcome.known_peers {
                                 let _ = peer_registry
-                                    .peer(peer_id_from_endpoint(*hinted))
+                                    .peer(PeerId::from(*hinted))
                                     .observe_discovered(
                                         DiscoverySource::PeerExchange,
                                         TransportSecurity::Untrusted,
@@ -246,7 +245,11 @@ fn handle_discovery_event<S: ServiceKey>(
     context: DiscoveryEventContext<'_>,
 ) {
     let peer_id = peer.id();
-    if !observe_iroh_service::<S>(context.peer_registry, peer_id) {
+    let service_inserted = context
+        .peer_registry
+        .observe_iroh_service::<S>(peer_id)
+        .map_or(true, |observation| observation.service_inserted);
+    if !service_inserted {
         return;
     }
 
@@ -286,7 +289,7 @@ async fn interrogate_peer(
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
     let mut node_info_permit =
-        acquire_iroh_method::<methods::GetNodeInfo>(&peer_registry, peer_id, 1.0)?;
+        peer_registry.acquire_iroh_method::<methods::GetNodeInfo>(peer_id, 1.0)?;
     let node_info = match timeout(RPC_TIMEOUT, client.get_node_info(GetNodeInfoRequest {})).await {
         Ok(Ok(resp)) => {
             node_info_permit.finish_ok();
@@ -308,7 +311,7 @@ async fn interrogate_peer(
     let mut invalid_known_peers = 0usize;
     let mut known_peers_error = None;
 
-    match acquire_iroh_method::<methods::GetKnownPeers>(&peer_registry, peer_id, 0.25) {
+    match peer_registry.acquire_iroh_method::<methods::GetKnownPeers>(peer_id, 0.25) {
         Ok(mut known_peers_permit) => {
             match timeout(
                 RPC_TIMEOUT,
@@ -356,10 +359,6 @@ async fn interrogate_peer(
         invalid_known_peers,
         known_peers_error,
     })
-}
-
-fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
-    PeerId::from(*peer_id.as_bytes())
 }
 
 fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {

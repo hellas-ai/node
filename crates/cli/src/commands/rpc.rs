@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_method};
+use hellas_rpc::peers::PeerManager;
 
 pub async fn run(
     node_id: EndpointId,
@@ -17,7 +17,7 @@ pub async fn run(
 ) -> CliResult<()> {
     let peer_registry = PeerManager::default();
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let mut permit = acquire_iroh_method::<methods::GetNodeInfo>(&peer_registry, node_id, 1.0)?;
+    let mut permit = peer_registry.acquire_iroh_method::<methods::GetNodeInfo>(node_id, 1.0)?;
     let channel_result = if node_addrs.is_empty() {
         let pool =
             ConnectionPool::for_service::<NodeService>(endpoint.clone(), PoolOptions::default());
