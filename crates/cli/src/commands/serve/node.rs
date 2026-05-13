@@ -14,26 +14,27 @@ use hellas_pb::swarm::{
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::peers::{
-    DiscoverySource, InboundRequestPolicy, PeerDirectory, PeerId, ServiceKey, TransportSecurity,
+    DiscoverySource, InboundAdmission, IrohPeerExtractor, PeerDirectory, PeerId, ServiceKey,
+    TransportSecurity,
 };
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::server::ManagedServer;
 use hellas_rpc::service::{
     CourtesyService as CourtesyRpcService, ExecuteService as ExecuteRpcService,
     NodeService as NodeRpcService, OpaqueService as OpaqueRpcService,
-    SymbolicService as SymbolicRpcService, methods,
+    SymbolicService as SymbolicRpcService,
 };
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tonic::codec::CompressionEncoding;
-use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
 use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
-use tonic_iroh_transport::iroh::endpoint::{PathId, presets};
+use tonic_iroh_transport::iroh::endpoint::presets;
 use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::{IrohContext, PoolOptions, TransportBuilder};
+use tonic_iroh_transport::{PoolOptions, TransportBuilder};
 
 // `traced_service` wraps a tonic service with W3C trace context extraction when
 // the `otel` feature is on; with the feature off it returns the service
@@ -58,38 +59,14 @@ struct NodeService {
     peer_directory: PeerDirectory,
 }
 
-#[derive(Clone)]
-struct ExecutePeerInterceptor {
-    peer_directory: PeerDirectory,
-}
-
-impl tonic::service::Interceptor for ExecutePeerInterceptor {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
-            let _ = self.peer_directory.observe_inbound_request(
-                PeerId::from(peer_id),
-                observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_method::<methods::RunTicket>(),
-            );
-        }
-        Ok(request)
-    }
-}
-
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn get_node_info(
         &self,
-        request: Request<GetNodeInfoRequest>,
+        _request: Request<GetNodeInfoRequest>,
     ) -> Result<Response<GetNodeInfoResponse>, Status> {
-        if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
-            let _ = self.peer_directory.observe_inbound_request(
-                PeerId::from(peer_id),
-                observed_rtt.map(duration_ms),
-                InboundRequestPolicy::account_method::<methods::GetNodeInfo>(),
-            );
-        }
-
+        // Admission is handled by the `ManagedServer<NodeService, …>` wrapper
+        // around this tonic server — no per-method observe call needed here.
         Ok(Response::new(GetNodeInfoResponse {
             node_id: self.node_id.clone(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
@@ -104,38 +81,31 @@ impl Node for NodeService {
         &self,
         request: Request<GetKnownPeersRequest>,
     ) -> Result<Response<GetKnownPeersResponse>, Status> {
-        let Some((requester_id, observed_rtt)) = peer_observation(&request) else {
-            return Err(Status::unauthenticated("missing peer context"));
-        };
+        // Admission ran in the wrapper and stashed the result. If it didn't
+        // (no wrapper installed, e.g. a future direct-mount path) we fall
+        // back to the most conservative defaults.
+        let admission = request
+            .extensions()
+            .get::<InboundAdmission>()
+            .copied()
+            .unwrap_or(InboundAdmission {
+                allow: true,
+                disclosure_limit: 8,
+            });
+        let requester_id = request
+            .extensions()
+            .get::<tonic_iroh_transport::IrohContext>()
+            .map(|ctx| ctx.node_id)
+            .ok_or_else(|| Status::unauthenticated("missing peer context"))?;
+        let requester = PeerId::from(requester_id);
 
         let req = request.into_inner();
         let max_service_filter_len = self.peer_directory.max_service_filter_len();
         if req.service_alpn.len() > max_service_filter_len {
-            let _ = self
-                .peer_directory
-                .observe_invalid_request(PeerId::from(requester_id));
+            let _ = self.peer_directory.observe_invalid_request(requester);
             return Err(Status::invalid_argument(format!(
                 "service_alpn too long (max {max_service_filter_len} bytes)"
             )));
-        }
-
-        let requester = PeerId::from(requester_id);
-        let admission = self
-            .peer_directory
-            .observe_inbound_request(
-                requester,
-                observed_rtt.map(duration_ms),
-                InboundRequestPolicy::rate_limited_method::<methods::GetKnownPeers>(),
-            )
-            .map_err(|_| Status::internal("peer directory is unavailable"))?;
-        if !admission.allow {
-            warn!(
-                peer = %requester_id,
-                "rate-limited get_known_peers request"
-            );
-            return Err(Status::resource_exhausted(
-                "rate-limited get_known_peers request",
-            ));
         }
 
         let peers = self
@@ -153,15 +123,6 @@ impl Node for NodeService {
 
         Ok(Response::new(GetKnownPeersResponse { peer_ids }))
     }
-}
-
-fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::time::Duration>)> {
-    let context = request.extensions().get::<IrohContext>()?;
-    Some((context.node_id, context.connection.rtt(PathId::ZERO)))
-}
-
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 fn observe_discovered_peer_service<S: ServiceKey>(
@@ -273,10 +234,6 @@ pub(super) async fn spawn_node(
 
     let peer_directory = node_service.peer_directory.clone();
 
-    let execute_interceptor = ExecutePeerInterceptor {
-        peer_directory: peer_directory.clone(),
-    };
-
     info!(
         path = %artifact_store_path.display(),
         "using persistent artifact blob store"
@@ -314,21 +271,43 @@ pub(super) async fn spawn_node(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
+    // Every inbound RPC is gated through the typed admission wrapper; the
+    // service impls themselves are free of per-method observe_inbound_request
+    // calls and method-name strings.
     let mut transport = TransportBuilder::new(endpoint.clone())
-        .add_rpc(traced_service(NodeServer::new(node_service)))
-        .add_rpc(InterceptedService::new(
-            traced_service(execute_service),
-            execute_interceptor.clone(),
+        .add_rpc(traced_service(ManagedServer::<NodeRpcService, _, _>::new(
+            NodeServer::new(node_service),
+            peer_directory.clone(),
+            IrohPeerExtractor,
+        )))
+        .add_rpc(traced_service(
+            ManagedServer::<ExecuteRpcService, _, _>::new(
+                execute_service,
+                peer_directory.clone(),
+                IrohPeerExtractor,
+            ),
         ))
-        .add_rpc(InterceptedService::new(
-            traced_service(symbolic_service),
-            execute_interceptor.clone(),
+        .add_rpc(traced_service(
+            ManagedServer::<SymbolicRpcService, _, _>::new(
+                symbolic_service,
+                peer_directory.clone(),
+                IrohPeerExtractor,
+            ),
         ))
-        .add_rpc(InterceptedService::new(
-            traced_service(opaque_service),
-            execute_interceptor,
+        .add_rpc(traced_service(
+            ManagedServer::<OpaqueRpcService, _, _>::new(
+                opaque_service,
+                peer_directory.clone(),
+                IrohPeerExtractor,
+            ),
         ))
-        .add_rpc(traced_service(courtesy_service));
+        .add_rpc(traced_service(
+            ManagedServer::<CourtesyRpcService, _, _>::new(
+                courtesy_service,
+                peer_directory.clone(),
+                IrohPeerExtractor,
+            ),
+        ));
 
     let dht = DhtBackend::with_dht(&endpoint, Arc::clone(&shared_dht));
     let publisher = dht.create_publisher(Default::default());
