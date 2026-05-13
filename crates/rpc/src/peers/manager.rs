@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use super::admission::{Outcome, Permit, RequestKind};
 use super::{
-    AcquireDenied, DiscoverySource, Outcome, PeerChange, PeerEntry, PeerEvent, PeerId,
-    PeerRegistry, PeerRegistryConfig, Permit, RequestKind, RpcMethod, RpcService,
-    ServiceObservation, ServiceState, TransportSecurity,
+    AcquireDenied, DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerId, PeerRegistry,
+    PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, ServiceState, TransportSecurity,
 };
 
 /// Shared peer-state owner for application code.

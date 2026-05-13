@@ -43,13 +43,9 @@ mod manager;
 mod registry;
 mod security;
 
-pub use admission::{
-    AcquireDenied, InboundPeerObservation, Outcome, PeerExtractor, Permit, RequestKind,
-};
+pub use admission::{AcquireDenied, InboundPeerObservation, PeerExtractor};
 pub use directory::{
-    COURTESY_SERVICE_ALPN, EXECUTE_SERVICE_ALPN, InboundAdmission, InboundRequestPolicy,
-    NODE_SERVICE_ALPN, OPAQUE_SERVICE_ALPN, PeerDirectory, PeerDirectoryConfig,
-    SYMBOLIC_SERVICE_ALPN, ServiceAlias,
+    InboundAdmission, InboundRequestPolicy, PeerDirectory, PeerDirectoryConfig,
 };
 pub use id::PeerId;
 #[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
