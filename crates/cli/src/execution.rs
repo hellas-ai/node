@@ -54,7 +54,7 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::{IrohRpcPool, IrohTransport, PeerManager, RpcPermitGuard};
+use hellas_rpc::peers::{IrohRpcPool, IrohTarget, IrohTransport, PeerManager};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -68,7 +68,7 @@ use tonic_iroh_transport::iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::{IrohChannel, IrohConnect, PoolOptions};
+use tonic_iroh_transport::{IrohChannel, PoolOptions};
 use tracing::instrument;
 
 // `TracedChannel` swaps under the `otel` feature: with otel on it wraps the
@@ -1334,104 +1334,37 @@ fn bind_remote_transport(endpoint: &Endpoint, peer_registry: PeerManager) -> Iro
     )
 }
 
-/// Dial a service `S` directly at the supplied address (bypassing
-/// discovery), folding the permit's `finish_connect_err` into the error
-/// path. Lets the quote-target helpers below avoid repeating the same
-/// 6-line match block for every service.
-async fn direct_channel<S: IrohConnect>(
-    permit: &mut RpcPermitGuard,
-    endpoint: &Endpoint,
-    addr: EndpointAddr,
-    node_id: EndpointId,
-) -> anyhow::Result<IrohChannel> {
-    match S::connect(endpoint, addr)
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| format!("failed to connect to node {node_id}"))
-    {
-        Ok(channel) => Ok(channel),
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            Err(err)
-        }
-    }
-}
-
-#[instrument(skip_all, fields(%peer_id, service = %request.service, method = %request.method))]
-async fn quote_opaque_remote_endpoint(
-    request: &PbOpaqueRequest,
-    execute_pool: &IrohRpcPool<ExecuteService>,
-    opaque_pool: &IrohRpcPool<OpaqueService>,
-    peer_id: EndpointId,
-    peer_registry: PeerManager,
-) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let (opaque_channel, mut permit) = opaque_pool
-        .channel::<methods::OpaqueCreateTicket>(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let execute_channel = match execute_pool
-        .pool()
-        .channel(peer_id)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-    {
-        Ok(channel) => channel,
-        Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(QuoteCandidateError::Connect(err));
-        }
-    };
-    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        traced(execute_channel),
-        traced(opaque_channel),
-    );
-    let quoted = match quote_opaque_with_driver(request, &mut driver, || {
-        format!("node {peer_id} declined opaque ticket")
-    })
-    .await
-    {
-        Ok(quoted) => {
-            permit.finish_ok();
-            quoted
-        }
-        Err(err) => {
-            permit.finish_err(err.to_string());
-            return Err(QuoteCandidateError::Declined(err));
-        }
-    };
-    Ok(QuotedRemoteDriver {
-        peer_id,
-        peer_registry,
-        quote: quoted.response,
-        provenance: quoted.provenance,
-        driver,
-    })
-}
-
-#[instrument(skip_all, fields(%peer_id, model = %quote_req.huggingface_model_id))]
-async fn quote_remote_endpoint(
+/// Dial Execute + Courtesy at `target`, then issue `QuotePreparedText`
+/// across the courtesy channel. Each dial acquires its own service-level
+/// permit (billed to the representative method per service), so a failed
+/// dial on one service can't cross-bill the other. `target.addrs` selects
+/// direct vs discovered.
+#[instrument(skip_all, fields(peer_id = %target.peer_id, model = %quote_req.huggingface_model_id))]
+async fn quote_remote_via_pools(
     quote_req: &QuotePreparedTextRequest,
     execute_pool: &IrohRpcPool<ExecuteService>,
     courtesy_pool: &IrohRpcPool<CourtesyService>,
-    peer_id: EndpointId,
+    target: IrohTarget,
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let (courtesy_channel, mut permit) = courtesy_pool
-        .channel::<methods::QuotePreparedText>(peer_id)
+    let peer_id = target.peer_id;
+    let (execute_channel, mut execute_permit) = execute_pool
+        .channel::<methods::RunTicket>(target.clone())
         .await
         .with_context(|| format!("failed to connect to node {peer_id}"))
         .map_err(QuoteCandidateError::Connect)?;
-    let execute_channel = match execute_pool
-        .pool()
-        .channel(peer_id)
+    let (courtesy_channel, mut courtesy_permit) = match courtesy_pool
+        .channel::<methods::QuotePreparedText>(target)
         .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
     {
-        Ok(channel) => channel,
+        Ok(channels) => channels,
         Err(err) => {
-            permit.finish_connect_err(err.to_string());
-            return Err(QuoteCandidateError::Connect(err));
+            // The Execute dial already succeeded — release its permit so the
+            // RAII guard doesn't record Cancelled.
+            execute_permit.finish_ok();
+            return Err(QuoteCandidateError::Connect(
+                anyhow::Error::from(err).context(format!("failed to connect to node {peer_id}")),
+            ));
         }
     };
     let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
@@ -1445,16 +1378,19 @@ async fn quote_remote_endpoint(
     {
         Ok(quoted) => quoted,
         Err(err) => {
-            permit.finish_err(err.to_string());
+            execute_permit.finish_ok();
+            courtesy_permit.finish_err(err.to_string());
             return Err(QuoteCandidateError::Declined(err));
         }
     };
     let Some(ticket) = quoted.response.ticket else {
         let err = anyhow!("quote_prepared_text response missing ticket");
-        permit.finish_err(err.to_string());
+        execute_permit.finish_ok();
+        courtesy_permit.finish_err(err.to_string());
         return Err(QuoteCandidateError::Declined(err));
     };
-    permit.finish_ok();
+    execute_permit.finish_ok();
+    courtesy_permit.finish_ok();
     Ok(QuotedRemoteDriver {
         peer_id,
         peer_registry,
@@ -1464,47 +1400,59 @@ async fn quote_remote_endpoint(
     })
 }
 
-async fn quote_opaque_remote_peer(
+/// Opaque counterpart of [`quote_remote_via_pools`].
+#[instrument(skip_all, fields(peer_id = %target.peer_id, service = %request.service, method = %request.method))]
+async fn quote_opaque_remote_via_pools(
     request: &PbOpaqueRequest,
-    endpoint: &Endpoint,
-    peer_id: EndpointId,
+    execute_pool: &IrohRpcPool<ExecuteService>,
+    opaque_pool: &IrohRpcPool<OpaqueService>,
+    target: IrohTarget,
     peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let transport = bind_remote_transport(endpoint, peer_registry.clone());
-    quote_opaque_remote_endpoint(
-        request,
-        &transport.pool::<ExecuteService>(),
-        &transport.pool::<OpaqueService>(),
-        peer_id,
-        peer_registry,
-    )
-    .await
-    .map_err(|err| match err {
-        QuoteCandidateError::Declined(err) => {
-            err.context(format!("node {peer_id} declined opaque quote"))
+) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
+    let peer_id = target.peer_id;
+    let (execute_channel, mut execute_permit) = execute_pool
+        .channel::<methods::RunTicket>(target.clone())
+        .await
+        .with_context(|| format!("failed to connect to node {peer_id}"))
+        .map_err(QuoteCandidateError::Connect)?;
+    let (opaque_channel, mut opaque_permit) = match opaque_pool
+        .channel::<methods::OpaqueCreateTicket>(target)
+        .await
+    {
+        Ok(channels) => channels,
+        Err(err) => {
+            execute_permit.finish_ok();
+            return Err(QuoteCandidateError::Connect(
+                anyhow::Error::from(err).context(format!("failed to connect to node {peer_id}")),
+            ));
         }
-        QuoteCandidateError::Connect(err) => err,
+    };
+    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
+        traced(execute_channel),
+        traced(opaque_channel),
+    );
+    let quoted = match quote_opaque_with_driver(request, &mut driver, || {
+        format!("node {peer_id} declined opaque ticket")
     })
-}
-
-async fn quote_remote_peer(
-    quote_req: &QuotePreparedTextRequest,
-    endpoint: &Endpoint,
-    peer_id: EndpointId,
-    peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let transport = bind_remote_transport(endpoint, peer_registry.clone());
-    quote_remote_endpoint(
-        quote_req,
-        &transport.pool::<ExecuteService>(),
-        &transport.pool::<CourtesyService>(),
+    .await
+    {
+        Ok(quoted) => {
+            execute_permit.finish_ok();
+            opaque_permit.finish_ok();
+            quoted
+        }
+        Err(err) => {
+            execute_permit.finish_ok();
+            opaque_permit.finish_err(err.to_string());
+            return Err(QuoteCandidateError::Declined(err));
+        }
+    };
+    Ok(QuotedRemoteDriver {
         peer_id,
         peer_registry,
-    )
-    .await
-    .map_err(|err| match err {
-        QuoteCandidateError::Declined(err) => err.context(format!("node {peer_id} declined quote")),
-        QuoteCandidateError::Connect(err) => err,
+        quote: quoted.response,
+        provenance: quoted.provenance,
+        driver,
     })
 }
 
@@ -1514,43 +1462,21 @@ async fn quote_opaque_remote_target(
     target: &RemoteNodeTarget,
     peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    if target.node_addrs.is_empty() {
-        return quote_opaque_remote_peer(request, endpoint, target.node_id, peer_registry).await;
-    }
-
-    let mut permit =
-        peer_registry.acquire_iroh_method::<methods::OpaqueCreateTicket>(target.node_id)?;
-    let addr = target.endpoint_addr();
-    let execute_channel =
-        direct_channel::<ExecuteService>(&mut permit, endpoint, addr.clone(), target.node_id)
-            .await?;
-    let opaque_channel =
-        direct_channel::<OpaqueService>(&mut permit, endpoint, addr, target.node_id).await?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_opaque(
-        traced(execute_channel),
-        traced(opaque_channel),
-    );
-    let quoted = quote_opaque_with_driver(request, &mut driver, || {
-        format!("node {} declined opaque quote", target.node_id)
-    })
-    .await;
-    let quoted = match quoted {
-        Ok(quoted) => {
-            permit.finish_ok();
-            quoted
-        }
-        Err(err) => {
-            permit.finish_err(err.to_string());
-            return Err(err);
-        }
-    };
-
-    Ok(QuotedRemoteDriver {
-        peer_id: target.node_id,
+    let transport = bind_remote_transport(endpoint, peer_registry.clone());
+    let iroh_target = remote_node_iroh_target(target);
+    quote_opaque_remote_via_pools(
+        request,
+        &transport.pool::<ExecuteService>(),
+        &transport.pool::<OpaqueService>(),
+        iroh_target,
         peer_registry,
-        quote: quoted.response,
-        provenance: quoted.provenance,
-        driver,
+    )
+    .await
+    .map_err(|err| match err {
+        QuoteCandidateError::Declined(err) => {
+            err.context(format!("node {} declined opaque quote", target.node_id))
+        }
+        QuoteCandidateError::Connect(err) => err,
     })
 }
 
@@ -1560,47 +1486,30 @@ async fn quote_remote_target(
     target: &RemoteNodeTarget,
     peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    if target.node_addrs.is_empty() {
-        return quote_remote_peer(quote_req, endpoint, target.node_id, peer_registry).await;
-    }
-
-    let mut permit =
-        peer_registry.acquire_iroh_method::<methods::QuotePreparedText>(target.node_id)?;
-    let addr = target.endpoint_addr();
-    let execute_channel =
-        direct_channel::<ExecuteService>(&mut permit, endpoint, addr.clone(), target.node_id)
-            .await?;
-    let courtesy_channel =
-        direct_channel::<CourtesyService>(&mut permit, endpoint, addr, target.node_id).await?;
-    let mut driver = RemoteExecuteDriver::with_execute_and_courtesy(
-        traced(execute_channel),
-        traced(courtesy_channel),
-    );
-    let quoted = quote_with_driver(quote_req, &mut driver, || {
-        format!("node {} declined quote", target.node_id)
-    })
-    .await;
-    let quoted = match quoted {
-        Ok(quoted) => quoted,
-        Err(err) => {
-            permit.finish_err(err.to_string());
-            return Err(err);
-        }
-    };
-    let Some(ticket) = quoted.response.ticket else {
-        let err = anyhow!("quote_prepared_text response missing ticket");
-        permit.finish_err(err.to_string());
-        return Err(err);
-    };
-    permit.finish_ok();
-
-    Ok(QuotedRemoteDriver {
-        peer_id: target.node_id,
+    let transport = bind_remote_transport(endpoint, peer_registry.clone());
+    let iroh_target = remote_node_iroh_target(target);
+    quote_remote_via_pools(
+        quote_req,
+        &transport.pool::<ExecuteService>(),
+        &transport.pool::<CourtesyService>(),
+        iroh_target,
         peer_registry,
-        quote: ticket,
-        provenance: quoted.provenance,
-        driver,
+    )
+    .await
+    .map_err(|err| match err {
+        QuoteCandidateError::Declined(err) => {
+            err.context(format!("node {} declined quote", target.node_id))
+        }
+        QuoteCandidateError::Connect(err) => err,
     })
+}
+
+fn remote_node_iroh_target(target: &RemoteNodeTarget) -> IrohTarget {
+    if target.node_addrs.is_empty() {
+        IrohTarget::discovered(target.node_id)
+    } else {
+        IrohTarget::direct(target.node_id, target.endpoint_addr())
+    }
 }
 
 #[instrument(skip_all, fields(service = %request.service, method = %request.method, excluded = exclude.len()))]
@@ -1619,10 +1528,12 @@ async fn discover_opaque_remote_quote(
     registry.add(MdnsBackend::new(bindings.mdns));
     registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
     let execute_pool = IrohRpcPool::<ExecuteService>::from_pool(
+        endpoint.clone(),
         registry.pool::<ExecuteService>(),
         peer_registry.clone(),
     );
     let opaque_pool = IrohRpcPool::<OpaqueService>::from_pool(
+        endpoint.clone(),
         registry.pool::<OpaqueService>(),
         peer_registry.clone(),
     );
@@ -1667,11 +1578,11 @@ async fn discover_opaque_remote_quote(
                             let peer_registry = peer_registry.clone();
                             let req = request.clone();
                             in_flight.push(async move {
-                                quote_opaque_remote_endpoint(
+                                quote_opaque_remote_via_pools(
                                     &req,
                                     &execute_pool,
                                     &opaque_pool,
-                                    peer_id,
+                                    IrohTarget::discovered(peer_id),
                                     peer_registry,
                                 ).await
                             });
@@ -1718,10 +1629,12 @@ async fn discover_remote_quote(
     registry.add(MdnsBackend::new(bindings.mdns));
     registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
     let execute_pool = IrohRpcPool::<ExecuteService>::from_pool(
+        endpoint.clone(),
         registry.pool::<ExecuteService>(),
         peer_registry.clone(),
     );
     let courtesy_pool = IrohRpcPool::<CourtesyService>::from_pool(
+        endpoint.clone(),
         registry.pool::<CourtesyService>(),
         peer_registry.clone(),
     );
@@ -1769,11 +1682,11 @@ async fn discover_remote_quote(
                             let peer_registry = peer_registry.clone();
                             let req = quote_req.clone();
                             in_flight.push(async move {
-                                quote_remote_endpoint(
+                                quote_remote_via_pools(
                                     &req,
                                     &execute_pool,
                                     &courtesy_pool,
-                                    peer_id,
+                                    IrohTarget::discovered(peer_id),
                                     peer_registry,
                                 ).await
                             });

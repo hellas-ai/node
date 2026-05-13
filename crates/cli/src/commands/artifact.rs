@@ -2,17 +2,13 @@ use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use hellas_core::Digest;
-use hellas_pb::courtesy::courtesy_client::CourtesyClient;
 use hellas_pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
-use hellas_rpc::GRPC_MESSAGE_LIMIT;
+use hellas_rpc::client::CourtesyClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
-use hellas_rpc::iroh_client::{finish_unary, tracked_iroh_channel};
-use hellas_rpc::peers::{IrohRpcPool, RpcMethod, PeerManager, RpcPermitGuard};
-use hellas_rpc::service::{CourtesyService, methods};
+use hellas_rpc::peers::{IrohPeerHandle, IrohTransport, PeerManager};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
-use tonic_iroh_transport::{IrohChannel, IrohConnect, PoolOptions};
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
@@ -66,17 +62,12 @@ async fn put(
     let canonical_artifact = tokio::fs::read(&path)
         .await
         .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
-    let peer_registry = PeerManager::default();
-    let (mut client, permit) =
-        connect::<methods::PutArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
-    let response = finish_unary::<methods::PutArtifact, _>(
-        permit,
-        client
-            .put_artifact(PutArtifactRequest { canonical_artifact })
-            .await,
-    )
-    .context("put_artifact RPC failed")?
-    .into_inner();
+    let handle = connect(node_id, node_addrs, secret_key).await?;
+    let response = handle
+        .put_artifact(PutArtifactRequest { canonical_artifact })
+        .await
+        .context("put_artifact RPC failed")?
+        .into_inner();
     let cid =
         Digest::from_slice(&response.cid).context("provider returned invalid artifact cid")?;
     println!("{cid}");
@@ -91,19 +82,14 @@ async fn get(
     secret_key: SecretKey,
 ) -> CliResult<()> {
     let cid = parse_digest_hex(&cid)?;
-    let peer_registry = PeerManager::default();
-    let (mut client, permit) =
-        connect::<methods::GetArtifact>(node_id, node_addrs, secret_key, &peer_registry).await?;
-    let response = finish_unary::<methods::GetArtifact, _>(
-        permit,
-        client
-            .get_artifact(GetArtifactRequest {
-                cid: cid.as_bytes().to_vec(),
-            })
-            .await,
-    )
-    .context("get_artifact RPC failed")?
-    .into_inner();
+    let handle = connect(node_id, node_addrs, secret_key).await?;
+    let response = handle
+        .get_artifact(GetArtifactRequest {
+            cid: cid.as_bytes().to_vec(),
+        })
+        .await
+        .context("get_artifact RPC failed")?
+        .into_inner();
     let actual = Digest::hash(&response.canonical_artifact);
     if actual != cid {
         bail!("provider returned bytes with cid {actual}, expected {cid}");
@@ -114,39 +100,21 @@ async fn get(
     Ok(())
 }
 
-async fn connect<M>(
+async fn connect(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
     secret_key: SecretKey,
-    peer_registry: &PeerManager,
-) -> CliResult<(CourtesyClient<IrohChannel>, RpcPermitGuard)>
-where
-    M: RpcMethod<Service = CourtesyService>,
-{
+) -> CliResult<IrohPeerHandle> {
+    let peer_registry = PeerManager::default();
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let (channel, permit) = if node_addrs.is_empty() {
-        let pool = IrohRpcPool::<CourtesyService>::new(
-            endpoint.clone(),
-            peer_registry.clone(),
-            PoolOptions::default(),
-        );
-        pool.channel::<M>(node_id)
-            .await
-            .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))?
+    let transport = IrohTransport::new(endpoint, peer_registry);
+    Ok(if node_addrs.is_empty() {
+        transport.peer(node_id)
     } else {
         let endpoint_addr =
             EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
-        tracked_iroh_channel::<M, _, _>(peer_registry, node_id, async {
-            CourtesyService::connect(&endpoint, endpoint_addr)
-                .await
-                .with_context(|| format!("failed to connect to courtesy service on node {node_id}"))
-        })
-        .await?
-    };
-    let client = CourtesyClient::new(channel)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
-    Ok((client, permit))
+        transport.peer_at(node_id, endpoint_addr)
+    })
 }
 
 fn parse_digest_hex(raw: &str) -> CliResult<Digest> {
