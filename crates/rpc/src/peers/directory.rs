@@ -92,7 +92,28 @@ impl PeerDirectoryConfig {
         {
             self.global_known_peers_bucket_refill_per_sec = 0.0;
         }
+        self.registry = self.registry.normalized();
         self
+    }
+
+    /// Combinations that would make the directory behave nonsensically.
+    /// Bubbles up the per-peer registry's reasons plus the directory's
+    /// own global-disclosure-bucket check, so a config check at startup
+    /// reports every violation at once.
+    pub fn validate(&self) -> Vec<String> {
+        let mut reasons = self.registry.validate();
+        if self.global_known_peers_bucket_capacity > 0.0
+            && self.global_known_peers_bucket_capacity < 1.0
+        {
+            reasons.push(format!(
+                "global_known_peers_bucket_capacity {:.3} is in (0, 1): the \
+                 shared disclosure bucket can never hold a full token, so \
+                 every rate-limited disclosure-style request would be \
+                 rejected. Set it >= 1.0 or 0.0.",
+                self.global_known_peers_bucket_capacity
+            ));
+        }
+        reasons
     }
 }
 
@@ -153,6 +174,12 @@ impl PeerDirectory {
 
     pub fn with_config(local_peer: PeerId, config: PeerDirectoryConfig) -> Self {
         let config = config.normalized();
+        let reasons = config.validate();
+        assert!(
+            reasons.is_empty(),
+            "PeerDirectoryConfig is invalid:\n  - {}",
+            reasons.join("\n  - "),
+        );
         let manager = PeerManager::with_config(config.registry);
         let bucket = TokenBucket::new(manager.now_ms(), config.global_known_peers_bucket_capacity);
         Self {
@@ -810,6 +837,22 @@ mod tests {
         let result = expected.expect("at least one trial ran");
         // PeerId ascending: peer(1) < peer(2) < peer(3) < peer(5) < peer(7).
         assert_eq!(result, vec![peer(1), peer(2), peer(3), peer(5), peer(7)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "PeerDirectoryConfig is invalid")]
+    fn with_config_panics_on_unsatisfiable_global_bucket() {
+        // Sub-unit global disclosure bucket with positive refill — the
+        // shared rate-limited bucket can never hold a full token, so
+        // every disclosure-style request would be rejected.
+        let _ = PeerDirectory::with_config(
+            peer(0),
+            PeerDirectoryConfig {
+                global_known_peers_bucket_capacity: 0.5,
+                global_known_peers_bucket_refill_per_sec: 1.0,
+                ..PeerDirectoryConfig::default()
+            },
+        );
     }
 
     #[test]
