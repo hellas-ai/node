@@ -1,3 +1,5 @@
+#[cfg(feature = "iroh-client")]
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -383,6 +385,161 @@ pub enum IrohRpcPoolError {
         service: &'static str,
         source: tonic_iroh_transport::Error,
     },
+}
+
+/// Iroh-transport façade — the user-facing entry point for outbound RPCs.
+///
+/// One `IrohTransport` owns the endpoint, a shared `PeerManager`, and a lazy
+/// cache of `ConnectionPool`s keyed by service ALPN. Each `peer(id)` call
+/// returns a cheap `IrohPeerHandle` that callers chain typed RPC methods on
+/// (via codegen-emitted extension traits like `CourtesyClient for
+/// IrohPeerHandle`). The pool for a service is materialized on first use,
+/// so binaries only pay for the protocols they actually call.
+#[cfg(feature = "iroh-client")]
+#[derive(Clone, Debug)]
+pub struct IrohTransport {
+    inner: Arc<IrohTransportInner>,
+}
+
+#[cfg(feature = "iroh-client")]
+struct IrohTransportInner {
+    endpoint: tonic_iroh_transport::iroh::Endpoint,
+    manager: PeerManager,
+    pools: Mutex<HashMap<&'static str, tonic_iroh_transport::ConnectionPool>>,
+    pool_options: tonic_iroh_transport::PoolOptions,
+}
+
+#[cfg(feature = "iroh-client")]
+impl std::fmt::Debug for IrohTransportInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pool_alpns: Vec<&str> = self
+            .pools
+            .lock()
+            .map(|map| map.keys().copied().collect())
+            .unwrap_or_default();
+        f.debug_struct("IrohTransport")
+            .field("endpoint", &self.endpoint.id())
+            .field("pools", &pool_alpns)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+impl IrohTransport {
+    pub fn new(endpoint: tonic_iroh_transport::iroh::Endpoint, manager: PeerManager) -> Self {
+        Self::with_options(
+            endpoint,
+            manager,
+            tonic_iroh_transport::PoolOptions::default(),
+        )
+    }
+
+    pub fn with_options(
+        endpoint: tonic_iroh_transport::iroh::Endpoint,
+        manager: PeerManager,
+        pool_options: tonic_iroh_transport::PoolOptions,
+    ) -> Self {
+        Self {
+            inner: Arc::new(IrohTransportInner {
+                endpoint,
+                manager,
+                pools: Mutex::new(HashMap::new()),
+                pool_options,
+            }),
+        }
+    }
+
+    /// Typed handle for a remote peer reachable over this transport.
+    pub fn peer(&self, peer_id: tonic_iroh_transport::iroh::EndpointId) -> IrohPeerHandle {
+        IrohPeerHandle {
+            transport: self.inner.clone(),
+            peer_id,
+        }
+    }
+
+    pub fn manager(&self) -> &PeerManager {
+        &self.inner.manager
+    }
+
+    pub fn endpoint(&self) -> &tonic_iroh_transport::iroh::Endpoint {
+        &self.inner.endpoint
+    }
+
+    /// Get-or-create the pool for service `S`. Pools are cached so repeated
+    /// calls for the same service share a single tonic-iroh-transport pool
+    /// (with its connection cache, dial timeouts, etc).
+    pub fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+        self.inner.pool::<S>()
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+impl IrohTransportInner {
+    fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+        let alpn = iroh_service_alpn::<S>();
+        let mut pools = self
+            .pools
+            .lock()
+            .expect("IrohTransport::pools mutex poisoned");
+        let pool = pools.entry(S::NAME).or_insert_with(|| {
+            tonic_iroh_transport::ConnectionPool::new(
+                self.endpoint.clone(),
+                alpn.as_bytes(),
+                self.pool_options.clone(),
+            )
+        });
+        IrohRpcPool::from_pool(pool.clone(), self.manager.clone())
+    }
+}
+
+/// Typed handle for one (transport, peer) pair.
+///
+/// Cheap to clone. The actual outbound RPC machinery (per-service pool dialing,
+/// admission, finishing the permit) is reached through codegen-emitted
+/// extension traits like `CourtesyClient for IrohPeerHandle`, which sit
+/// alongside this type and pick up the right pool via `pool::<CourtesyService>()`.
+#[cfg(feature = "iroh-client")]
+#[derive(Clone)]
+pub struct IrohPeerHandle {
+    transport: Arc<IrohTransportInner>,
+    peer_id: tonic_iroh_transport::iroh::EndpointId,
+}
+
+#[cfg(feature = "iroh-client")]
+impl std::fmt::Debug for IrohPeerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohPeerHandle")
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "iroh-client")]
+impl IrohPeerHandle {
+    pub const fn peer_id(&self) -> tonic_iroh_transport::iroh::EndpointId {
+        self.peer_id
+    }
+
+    pub fn manager(&self) -> &PeerManager {
+        &self.transport.manager
+    }
+
+    pub fn endpoint(&self) -> &tonic_iroh_transport::iroh::Endpoint {
+        &self.transport.endpoint
+    }
+
+    /// Lazily-materialised connection pool for a specific generated service.
+    /// Codegen-emitted extension traits use this to dial.
+    pub fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+        self.transport.pool::<S>()
+    }
+
+    /// Service-typed permit-acquisition shortcut: equivalent to
+    /// `self.manager().acquire_iroh_method::<M>(self.peer_id())` but reads
+    /// better at typed call sites.
+    pub fn acquire_method<M: MethodKey>(&self) -> Result<RpcPermitGuard, PeerManagerError> {
+        self.manager().acquire_iroh_method::<M>(self.peer_id)
+    }
 }
 
 /// Logical session view for one remote peer.
