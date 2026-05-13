@@ -50,7 +50,9 @@ pub use directory::{
     PeerDirectory, PeerDirectoryConfig, SYMBOLIC_SERVICE_ALPN, ServiceAlias,
 };
 pub use id::PeerId;
-pub use manager::{PeerManager, PeerManagerError, RpcObservation, RpcPermitGuard};
+pub use manager::{
+    PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
+};
 pub use registry::{
     DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerRegistry, PeerRegistryConfig,
     ServiceObservation, ServiceState, ServiceStatus,
