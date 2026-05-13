@@ -12,7 +12,7 @@ use futures_core::Stream;
 use thiserror::Error;
 
 use crate::call::RpcError;
-use crate::peers::{IrohRpcPoolError, MethodKey, PeerManager, PeerManagerError, RpcPermitGuard};
+use crate::peers::{IrohRpcPoolError, RpcMethod, PeerManager, PeerManagerError, RpcPermitGuard};
 
 /// Streaming response wrapper that owns the RPC permit for the duration of
 /// the stream and surfaces transport errors as the crate's typed [`RpcError`]
@@ -128,7 +128,7 @@ pub async fn tracked_iroh_channel<M, Fut, E>(
     connect: Fut,
 ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohChannelError<E>>
 where
-    M: MethodKey,
+    M: RpcMethod,
     Fut: std::future::Future<Output = Result<tonic_iroh_transport::IrohChannel, E>>,
     E: std::fmt::Display,
 {
@@ -150,7 +150,7 @@ pub fn finish_unary<M, T>(
     result: Result<tonic::Response<T>, tonic::Status>,
 ) -> Result<tonic::Response<T>, IrohClientError>
 where
-    M: MethodKey,
+    M: RpcMethod,
 {
     match result {
         Ok(response) => {
@@ -172,7 +172,7 @@ pub fn finish_streaming<M, T>(
     result: Result<tonic::Response<tonic::codec::Streaming<T>>, tonic::Status>,
 ) -> Result<tonic::Response<ManagedStreaming<T>>, IrohClientError>
 where
-    M: MethodKey,
+    M: RpcMethod,
 {
     match result {
         Ok(response) => {

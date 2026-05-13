@@ -14,7 +14,7 @@ use hellas_pb::swarm::{
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::peers::{
-    DiscoverySource, InboundAdmission, IrohPeerExtractor, PeerDirectory, PeerId, ServiceKey,
+    DiscoverySource, InboundAdmission, IrohPeerExtractor, PeerDirectory, PeerId, RpcService,
     TransportSecurity,
 };
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
@@ -125,7 +125,7 @@ impl Node for NodeService {
     }
 }
 
-fn observe_discovered_peer_service<S: ServiceKey>(
+fn observe_discovered_peer_service<S: RpcService>(
     peer_directory: &PeerDirectory,
     peer_id: EndpointId,
 ) {

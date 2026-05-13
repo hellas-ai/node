@@ -7,7 +7,7 @@ use hellas_pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::iroh_client::{finish_unary, tracked_iroh_channel};
-use hellas_rpc::peers::{IrohRpcPool, MethodKey, PeerManager, RpcPermitGuard};
+use hellas_rpc::peers::{IrohRpcPool, RpcMethod, PeerManager, RpcPermitGuard};
 use hellas_rpc::service::{CourtesyService, methods};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ async fn connect<M>(
     peer_registry: &PeerManager,
 ) -> CliResult<(CourtesyClient<IrohChannel>, RpcPermitGuard)>
 where
-    M: MethodKey<Service = CourtesyService>,
+    M: RpcMethod<Service = CourtesyService>,
 {
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
     let (channel, permit) = if node_addrs.is_empty() {
