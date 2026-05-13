@@ -12,6 +12,19 @@ pub mod driver;
 pub mod error;
 #[cfg(feature = "iroh-client")]
 pub mod call;
+/// Generated per-service client extension traits.
+///
+/// Bring the trait for the service you want into scope and call methods
+/// directly on `IrohPeerHandle`:
+///
+/// ```ignore
+/// use hellas_rpc::client::CourtesyClient;
+/// let resp = transport.peer(id).list_models(req).await?;
+/// ```
+#[cfg(feature = "iroh-client")]
+pub mod client {
+    include!(concat!(env!("OUT_DIR"), "/client_traits.rs"));
+}
 #[cfg(feature = "iroh-client")]
 pub mod iroh_client;
 #[cfg(feature = "node")]
