@@ -27,7 +27,6 @@
 //!   - Transport error after a chunk → propagate (committed work can't be retried).
 //!   - `Done(Failed)` (executor verdict) → propagate, never retry.
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_method, observe_iroh_service};
 #[cfg(feature = "hellas-executor")]
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
@@ -55,6 +54,7 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
+use hellas_rpc::peers::PeerManager;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -928,11 +928,7 @@ impl RemoteExecution {
             // endpoint while the underlying QUIC connection is in-flight
             // would tear down transport mid-execution.
             let _endpoint = endpoint;
-            let mut permit = acquire_iroh_method::<methods::RunTicket>(
-                &peer_registry,
-                peer_id,
-                1.0,
-            )?;
+            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id, 1.0)?;
             let inner = execute_stream(driver, request_commitment);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -989,11 +985,7 @@ impl OpaqueRemoteExecution {
         } = self;
         try_stream! {
             let _endpoint = endpoint;
-            let mut permit = acquire_iroh_method::<methods::RunTicket>(
-                &peer_registry,
-                peer_id,
-                1.0,
-            )?;
+            let mut permit = peer_registry.acquire_iroh_method::<methods::RunTicket>(peer_id, 1.0)?;
             let inner = execute_opaque_stream(driver, request_commitment, request);
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -1335,9 +1327,9 @@ async fn quote_opaque_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit =
-        acquire_iroh_method::<methods::OpaqueCreateTicket>(&peer_registry, peer_id, 1.0)
-            .map_err(QuoteCandidateError::Connect)?;
+    let mut permit = peer_registry
+        .acquire_iroh_method::<methods::OpaqueCreateTicket>(peer_id, 1.0)
+        .map_err(|err| QuoteCandidateError::Connect(err.into()))?;
     let opaque_channel = match opaque_pool
         .channel(peer_id)
         .await
@@ -1395,9 +1387,9 @@ async fn quote_remote_endpoint(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let mut permit =
-        acquire_iroh_method::<methods::QuotePreparedText>(&peer_registry, peer_id, 1.0)
-            .map_err(QuoteCandidateError::Connect)?;
+    let mut permit = peer_registry
+        .acquire_iroh_method::<methods::QuotePreparedText>(peer_id, 1.0)
+        .map_err(|err| QuoteCandidateError::Connect(err.into()))?;
     let courtesy_channel = match courtesy_pool
         .channel(peer_id)
         .await
@@ -1501,7 +1493,7 @@ async fn quote_opaque_remote_target(
     }
 
     let mut permit =
-        acquire_iroh_method::<methods::OpaqueCreateTicket>(&peer_registry, target.node_id, 1.0)?;
+        peer_registry.acquire_iroh_method::<methods::OpaqueCreateTicket>(target.node_id, 1.0)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
@@ -1563,7 +1555,7 @@ async fn quote_remote_target(
     }
 
     let mut permit =
-        acquire_iroh_method::<methods::QuotePreparedText>(&peer_registry, target.node_id, 1.0)?;
+        peer_registry.acquire_iroh_method::<methods::QuotePreparedText>(target.node_id, 1.0)?;
     let execute_channel = match ExecuteService::connect(endpoint, target.endpoint_addr())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .await
@@ -1665,10 +1657,7 @@ async fn discover_opaque_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_iroh_service::<OpaqueService>(
-                                &peer_registry,
-                                peer_id,
-                            );
+                            let _ = peer_registry.observe_iroh_service::<OpaqueService>(peer_id);
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed opaque peer");
                                 continue;
@@ -1764,10 +1753,7 @@ async fn discover_remote_quote(
                     match peer {
                         Some(Ok(peer)) => {
                             let peer_id = peer.id();
-                            observe_iroh_service::<CourtesyService>(
-                                &peer_registry,
-                                peer_id,
-                            );
+                            let _ = peer_registry.observe_iroh_service::<CourtesyService>(peer_id);
                             if exclude.contains(&peer_id) {
                                 debug!(%peer_id, "skipping previously-failed peer");
                                 continue;

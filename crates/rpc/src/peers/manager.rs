@@ -68,7 +68,7 @@ impl PeerManager {
         self.peer(peer).service::<S>()
     }
 
-    pub fn apply(&self, peer: PeerId, event: PeerEvent) -> Result<PeerChange, PeerManagerError> {
+    fn apply(&self, peer: PeerId, event: PeerEvent) -> Result<PeerChange, PeerManagerError> {
         Ok(self.lock()?.apply(now_ms(), peer, event))
     }
 
@@ -128,6 +128,10 @@ impl PeerManager {
         Ok(self.lock()?.observe_invalid_request(now_ms(), peer))
     }
 
+    pub fn observe_rate_limited(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
+        self.apply(peer, PeerEvent::RateLimited)
+    }
+
     pub fn acquire_rpc(
         &self,
         peer: PeerId,
@@ -169,6 +173,39 @@ impl PeerManager {
         self.registry
             .lock()
             .map_err(|_| PeerManagerError::Unavailable)
+    }
+}
+
+#[cfg(feature = "iroh")]
+impl PeerManager {
+    pub fn iroh_peer(&self, peer: tonic_iroh_transport::iroh::EndpointId) -> PeerSession {
+        self.peer(PeerId::from(peer))
+    }
+
+    pub fn iroh_service_session<S: ServiceKey>(
+        &self,
+        peer: tonic_iroh_transport::iroh::EndpointId,
+    ) -> PeerServiceSession<S> {
+        self.iroh_peer(peer).service::<S>()
+    }
+
+    pub fn observe_iroh_service<S: ServiceKey>(
+        &self,
+        peer: tonic_iroh_transport::iroh::EndpointId,
+    ) -> Result<ServiceObservation, PeerManagerError> {
+        self.iroh_service_session::<S>(peer).observe_discovered(
+            DiscoverySource::Transport("discovery"),
+            TransportSecurity::Untrusted,
+        )
+    }
+
+    pub fn acquire_iroh_method<M: MethodKey>(
+        &self,
+        peer: tonic_iroh_transport::iroh::EndpointId,
+        cost: f32,
+    ) -> Result<RpcPermitGuard, PeerManagerError> {
+        self.iroh_service_session::<<M as MethodKey>::Service>(peer)
+            .acquire_method::<M>(cost, RpcObservation::authenticated_transport("iroh"))
     }
 }
 

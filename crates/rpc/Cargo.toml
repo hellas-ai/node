@@ -22,10 +22,11 @@ discovery = [
   "client",
   "dep:futures",
   "dep:mainline",
-  "dep:tonic-iroh-transport",
+  "iroh",
   "tonic-iroh-transport/discovery-mdns",
   "tonic-iroh-transport/discovery-dht",
 ]
+iroh = ["dep:tonic-iroh-transport"]
 server = ["tonic/server", "hellas-pb/server"]
 node = [
   "dep:catgrad",

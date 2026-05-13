@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::manager::now_ms;
 use super::{
-    DiscoverySource, MethodKey, PeerEntry, PeerEvent, PeerId, PeerManager, PeerManagerError,
+    DiscoverySource, MethodKey, PeerEntry, PeerId, PeerManager, PeerManagerError,
     PeerRegistryConfig, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
 };
 use crate::service::{
@@ -230,7 +230,7 @@ impl PeerDirectory {
         };
 
         if policy.reject_when_limited && !global_ok {
-            let _ = self.manager.apply(peer, PeerEvent::RateLimited);
+            let _ = self.manager.observe_rate_limited(peer);
         }
 
         let allow = if policy.reject_when_limited {

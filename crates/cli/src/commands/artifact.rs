@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
 
-use crate::peer_rpc::{PeerManager, acquire_iroh_method};
+use hellas_rpc::peers::PeerManager;
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
@@ -67,7 +67,7 @@ async fn put(
         .await
         .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
     let peer_registry = PeerManager::default();
-    let mut permit = acquire_iroh_method::<methods::PutArtifact>(&peer_registry, node_id, 1.0)?;
+    let mut permit = peer_registry.acquire_iroh_method::<methods::PutArtifact>(node_id, 1.0)?;
     let mut client = match connect(node_id, node_addrs, secret_key).await {
         Ok(client) => client,
         Err(err) => {
@@ -103,7 +103,7 @@ async fn get(
 ) -> CliResult<()> {
     let cid = parse_digest_hex(&cid)?;
     let peer_registry = PeerManager::default();
-    let mut permit = acquire_iroh_method::<methods::GetArtifact>(&peer_registry, node_id, 1.0)?;
+    let mut permit = peer_registry.acquire_iroh_method::<methods::GetArtifact>(node_id, 1.0)?;
     let mut client = match connect(node_id, node_addrs, secret_key).await {
         Ok(client) => client,
         Err(err) => {

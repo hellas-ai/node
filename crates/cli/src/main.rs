@@ -12,7 +12,6 @@ mod commands;
 mod execution;
 mod identity;
 mod metrics;
-mod peer_rpc;
 mod text_output;
 mod tracing_config;
 

@@ -67,7 +67,7 @@ impl tonic::service::Interceptor for ExecutePeerInterceptor {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
             let _ = self.peer_directory.observe_inbound_request(
-                peer_id_from_endpoint(peer_id),
+                PeerId::from(peer_id),
                 observed_rtt.map(duration_ms),
                 InboundRequestPolicy::account_method::<methods::RunTicket>(1.0),
             );
@@ -84,7 +84,7 @@ impl Node for NodeService {
     ) -> Result<Response<GetNodeInfoResponse>, Status> {
         if let Some((peer_id, observed_rtt)) = peer_observation(&request) {
             let _ = self.peer_directory.observe_inbound_request(
-                peer_id_from_endpoint(peer_id),
+                PeerId::from(peer_id),
                 observed_rtt.map(duration_ms),
                 InboundRequestPolicy::account_method::<methods::GetNodeInfo>(0.5),
             );
@@ -113,13 +113,13 @@ impl Node for NodeService {
         if req.service_alpn.len() > max_service_filter_len {
             let _ = self
                 .peer_directory
-                .observe_invalid_request(peer_id_from_endpoint(requester_id));
+                .observe_invalid_request(PeerId::from(requester_id));
             return Err(Status::invalid_argument(format!(
                 "service_alpn too long (max {max_service_filter_len} bytes)"
             )));
         }
 
-        let requester = peer_id_from_endpoint(requester_id);
+        let requester = PeerId::from(requester_id);
         let admission = self
             .peer_directory
             .observe_inbound_request(
@@ -160,10 +160,6 @@ fn peer_observation<T>(request: &Request<T>) -> Option<(EndpointId, Option<std::
     Some((context.node_id, context.connection.rtt(PathId::ZERO)))
 }
 
-fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
-    PeerId::from(*peer_id.as_bytes())
-}
-
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
@@ -173,7 +169,7 @@ fn observe_discovered_peer_service<S: ServiceKey>(
     peer_id: EndpointId,
 ) {
     let _ = peer_directory.observe_discovered_service::<S>(
-        peer_id_from_endpoint(peer_id),
+        PeerId::from(peer_id),
         DiscoverySource::Transport("discovery"),
         TransportSecurity::Untrusted,
     );
@@ -272,7 +268,7 @@ pub(super) async fn spawn_node(
         node_id: endpoint.id().to_string(),
         build,
         graffiti,
-        peer_directory: PeerDirectory::new(peer_id_from_endpoint(endpoint.id())),
+        peer_directory: PeerDirectory::new(PeerId::from(endpoint.id())),
     };
 
     let peer_directory = node_service.peer_directory.clone();
