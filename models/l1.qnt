@@ -37,7 +37,7 @@ module l1 {
   // — i.e. that the claimed parties actually own the consumed coins.
   // Dead-edge entries are meaningless; the invariant only ranges over
   // `liveEdges`.
-  var openAuth: Edge -> { maker: Party, taker: Party }
+  var openAuth: Edge -> OpenAuth
 
   // Recording vars: the action that produced the current state and the
   // abstract event it emitted. The Rust ITF runner reads these to drive
@@ -59,8 +59,16 @@ module l1 {
     liveEdges.size()
 
   // ---------------------------------------------------------------------
-  // Close precondition (combines verifier policy + state shape)
+  // Preconditions (combine verifier/auth policy + state shape)
   // ---------------------------------------------------------------------
+
+  def canOpen(e: Edge, asMaker: Party, asTaker: Party): bool =
+    not(liveEdges.contains(e))
+      and edges.get(e) == 0
+      and height < TimeoutHeight
+      and liveCoins.contains(makerInput(e))
+      and liveCoins.contains(takerInput(e))
+      and openAuthOk(e, { maker: asMaker, taker: asTaker })
 
   def canClose(e: Edge, p: Proof, makerPay: int, takerPay: int): bool =
     liveEdges.contains(e)
@@ -92,7 +100,7 @@ module l1 {
     liveCoins' = Set(MakerCoin, TakerCoin),
     liveEdges' = Set(),
     height' = 1,
-    openAuth' = AllEdges.mapBy(_ => { maker: Adversary, taker: Adversary }),
+    openAuth' = AllEdges.mapBy(_ => NoOpenAuth),
     lastInput' = NoInput,
     lastEvent' = NoEvent,
   }
@@ -100,7 +108,7 @@ module l1 {
   // Open consumes the canonical input coins for an edge and creates the
   // edge with their summed value, recording the parties the submitter
   // claimed (`asMaker`, `asTaker`). Fees/reserves are abstracted away
-  // here and modelled separately in `fees.qnt`.
+  // here and modelled in `l1_fees.qnt`.
   //
   // The action requires the claimed parties to actually own the coins
   // being consumed: `asMaker == coinOwner(makerInput(e))` and likewise
@@ -110,11 +118,7 @@ module l1 {
   // landing in live state, and `fundingAuthorized` holds in every
   // reachable state.
   action openEdge(e, asMaker, asTaker) = all {
-    not(liveEdges.contains(e)),
-    liveCoins.contains(makerInput(e)),
-    liveCoins.contains(takerInput(e)),
-    asMaker == coinOwner(makerInput(e)),
-    asTaker == coinOwner(takerInput(e)),
+    canOpen(e, asMaker, asTaker),
     coins' = coins
       .set(makerInput(e), 0)
       .set(takerInput(e), 0),
@@ -222,19 +226,23 @@ module l1 {
   val atMostOneLiveEdge = inv::atMostOneLiveEdge(liveEdges)
   val liveCoinsAreKnown = inv::liveCoinsAreKnown(liveCoins)
   val liveEdgesAreKnown = inv::liveEdgesAreKnown(liveEdges)
+  val wiringIsExpected = inv::wiringIsExpected
+  val liveCoinsHaveCanonicalValue = inv::liveCoinsHaveCanonicalValue(coins, liveCoins)
   val payoutsHonorBindings = inv::payoutsHonorBindings(coins, liveCoins)
+  val payoutOutputsPaired = inv::payoutOutputsPaired(liveCoins)
+  val deadSlotsAreZero = inv::deadSlotsAreZero(coins, edges, liveCoins, liveEdges)
+  val liveEdgesHaveCanonicalValue = inv::liveEdgesHaveCanonicalValue(edges, liveEdges)
+  val fundingInputsConsumed = inv::fundingInputsConsumed(liveCoins, liveEdges)
+  val heightAtLeastGenesis = inv::heightAtLeastGenesis(height)
 
   // Every live edge's (asMaker, asTaker) authorization must match the
   // canonical owners of the coins that funded it. A correct kernel
   // enforces this on open; reaching a state where it fails means an
-  // unauthorized open went through. The current Rust kernel does NOT
-  // enforce this — Apalache should find a counterexample reachable in
-  // ≤2 steps (`init → openEdge(_, Adversary, _)`).
-  val fundingAuthorized =
-    AllEdges.forall(e =>
-      not(liveEdges.contains(e))
-        or (openAuth.get(e).maker == coinOwner(makerInput(e))
-              and openAuth.get(e).taker == coinOwner(takerInput(e))))
+  // unauthorized open went through. The Rust kernel enforces this through
+  // owner-match plus typed open authorization (`OpenAuth::Native` or
+  // `OpenAuth::WebAuthn`), both abstracted here as "the named party
+  // authorized this edge".
+  val fundingAuthorized = inv::fundingAuthorized(liveEdges, openAuth)
 
   // ---------------------------------------------------------------------
   // Trace tests — exported as ITF fixtures via `npm run quint:fixtures`
@@ -248,7 +256,8 @@ module l1 {
       .expect(valueConserved
         and atMostOneLiveEdge
         and noNegativeValue
-        and fundingAuthorized)
+        and fundingAuthorized
+        and deadSlotsAreZero)
 
 
   // Multi-edge: mutual close on Edge1, then handoff to Edge2 funded by
@@ -260,7 +269,7 @@ module l1 {
       .then(openEdge(Edge2, Maker, Taker))
       .then(tick)
       .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
 
   // Violation closes on both edges.
   run violationTraceTest =
@@ -269,7 +278,7 @@ module l1 {
       .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
       .then(openEdge(Edge2, Maker, Taker))
       .then(closeEdge(Edge2, Violation, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
 
   // Negative trace: an open without a tick cannot Timeout.
   run earlyTimeoutRejectedTest =
@@ -277,17 +286,77 @@ module l1 {
       .then(openEdge(Edge1, Maker, Taker))
       .expect(not(canClose(Edge1, Timeout, MakerPayout, TakerPayout)))
 
-  // Both edges closed by Timeout. Demonstrates the timeout-only path
-  // without any cooperative or dispute witness — production Rust uses
-  // exactly this path when no one signed and no one disputed.
-  run bothEdgesTimeoutTraceTest =
+  // Negative trace: each unauthorized open shape is disabled from genesis.
+  run unauthorizedOpenRejectedTest =
+    init
+      .expect(not(canOpen(Edge1, Adversary, Adversary))
+        and not(canOpen(Edge1, Adversary, Taker))
+        and not(canOpen(Edge1, Maker, Adversary)))
+
+  // Negative trace: authorization is checked again for Edge2 after its
+  // funding coins exist, so this is not just a missing-input rejection.
+  run edge2UnauthorizedOpenRejectedTest =
+    init
+      .then(openEdge(Edge1, Maker, Taker))
+      .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
+      .expect(canOpen(Edge2, Maker, Taker)
+        and not(canOpen(Edge2, Adversary, Adversary))
+        and not(canOpen(Edge2, Adversary, Taker))
+        and not(canOpen(Edge2, Maker, Adversary)))
+
+  // Negative trace: Edge2 cannot open until Edge1's payout coins exist.
+  run edge2BeforeFundingRejectedTest =
+    init
+      .expect(not(canOpen(Edge2, Maker, Taker)))
+
+  // Negative trace: a value-conserving but non-canonical payout split is
+  // rejected for close proof kinds that are enabled without height advance.
+  run nonCanonicalCloseRejectedTest =
+    init
+      .then(openEdge(Edge1, Maker, Taker))
+      .expect(not(canClose(Edge1, Mutual, EdgeValue, 0))
+        and not(canClose(Edge1, Violation, EdgeValue, 0)))
+
+  // Negative trace: timeout close rejects the same non-canonical split even
+  // after the height guard is satisfied.
+  run nonCanonicalTimeoutRejectedTest =
+    init
+      .then(openEdge(Edge1, Maker, Taker))
+      .then(tick)
+      .expect(height >= TimeoutHeight
+        and not(canClose(Edge1, Timeout, EdgeValue, 0)))
+
+  // Negative trace: once Edge1 has closed, its consumed genesis funding
+  // cannot be reused to reopen it.
+  run consumedFundingCannotReopenTest =
+    init
+      .then(openEdge(Edge1, Maker, Taker))
+      .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
+      .expect(not(canOpen(Edge1, Maker, Taker)))
+
+  // Timeout closes the edge after paid lifetime expires. With this small model's
+  // single absolute timeout height, a later handoff open is rejected unless a
+  // richer per-edge timeout is introduced.
+  run timeoutExpiryTraceTest =
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
       .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2, Maker, Taker))
-      .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+      .expect(valueConserved
+        and atMostOneLiveEdge
+        and noNegativeValue
+        and deadSlotsAreZero
+        and not(canOpen(Edge2, Maker, Taker)))
+
+  // Negative trace: pre-expiry proof paths are not accepted once timeout is
+  // available.
+  run expiredMutualAndViolationRejectedTest =
+    init
+      .then(openEdge(Edge1, Maker, Taker))
+      .then(tick)
+      .expect(height >= TimeoutHeight
+        and not(canClose(Edge1, Mutual, MakerPayout, TakerPayout))
+        and not(canClose(Edge1, Violation, MakerPayout, TakerPayout)))
 
   // Mixed proof kinds across edges: violation close on the first,
   // mutual on the second. Catches kernel paths that assume the
@@ -298,17 +367,19 @@ module l1 {
       .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
       .then(openEdge(Edge2, Maker, Taker))
       .then(closeEdge(Edge2, Mutual, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue)
+      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
 
   // Height accumulates across multiple ticks; idle stutter does not
-  // disturb live state. The Rust runner advances its tracked height on
-  // tick and asserts the model's height matches at every step.
+  // disturb live state. Once the single model timeout is reached, new opens
+  // are disabled until a richer per-edge timeout vocabulary exists.
   run heightAccumulationTraceTest =
     init
       .then(tick)
       .then(idle)
       .then(tick)
-      .then(openEdge(Edge1, Maker, Taker))
-      .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
-      .expect(valueConserved and noNegativeValue and height == 3)
+      .expect(valueConserved
+        and noNegativeValue
+        and height == 3
+        and heightAtLeastGenesis
+        and not(canOpen(Edge1, Maker, Taker)))
 }

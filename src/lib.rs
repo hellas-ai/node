@@ -21,13 +21,14 @@
 //!
 //! # Verifier boundary
 //!
-//! The kernel implements no cryptography. Two narrow caller-wired traits
-//! draw the kernel/crypto seam: [`SigVerifier`] decides cooperative-close
-//! signatures, [`SealVerifier`] decides dispute seals. [`Proof::Timeout`]
+//! The transition core delegates cryptography to caller-wired traits:
+//! [`SigVerifier`] decides cooperative-close signatures and open
+//! authorizations, [`SealVerifier`] decides dispute seals. [`Proof::Timeout`]
 //! needs neither — its admissibility is purely structural and the kernel
 //! checks it inline. Test verifiers accept the deterministic placeholders
 //! documented on [`Sig::placeholder`] and [`Seal::placeholder`]; production
-//! verifiers wire real cryptography. The kernel does not see the difference.
+//! verifiers wire real cryptography. Optional feature-gated helpers provide
+//! concrete native/`WebAuthn` verification without changing the apply path.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!
@@ -68,10 +69,12 @@ mod terms;
 mod tx;
 mod verifier;
 mod view;
+#[cfg(feature = "webauthn")]
+mod webauthn;
 
 pub use block::Block;
 pub use canonical::{BufferWriter, Decode, DecodeError, Encode, Writer};
-pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS};
+pub use consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_WEBAUTHN_DATA_LENGTH};
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
 pub use error::{
     ApplyError, BatchError, InsertError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason,
@@ -80,12 +83,16 @@ pub use error::{
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
-pub use primitive::{CloseHash, CoinId, EdgeId, Key, Party, ProtocolCode, Sig, TermsHash};
+pub use primitive::{CoinId, EdgeId, Key, Party, PayloadHash, ProtocolCode, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]
 pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::Terms;
-pub use tx::{CloseKind, Funding, Payout, Proof, Seal, Tx};
+pub use tx::{
+    CloseKind, Funding, OpenAuth, Payout, Proof, Seal, Tx, WebAuthnAssertion, WebAuthnData,
+};
 pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};
+#[cfg(feature = "webauthn")]
+pub use webauthn::{WebAuthnError, p256_key, verify_webauthn_assertion};

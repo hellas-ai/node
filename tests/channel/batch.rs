@@ -3,13 +3,10 @@ use super::*;
 #[test]
 fn apply_all_opens_and_closes_one_batch() {
     let mut state = funded_state();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     let ops = List::all([
         open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms()),
-        Tx::close(
-            edge(),
-            proof(),
-            payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-        ),
+        Tx::close(edge(), mutual_proof(edge(), &outputs), outputs),
     ]);
 
     let block = Block::new(CONTEXT, ops);
@@ -61,13 +58,13 @@ fn apply_all_allows_empty_batch() {
 #[test]
 fn apply_all_rolls_back_on_error() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms_value = terms_with(&outputs);
-    let funding_value = funding(MAKER_COIN, TAKER_COIN);
-    let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = open_tx(funding_value, terms_value.clone());
+    let open = open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store = *state.store();
-    let ops = List::all([open, Tx::close(edge, Proof::timeout(terms_value), outputs)]);
+    let ops = List::all([
+        open,
+        Tx::close(edge(), Proof::timeout(basic_terms()), outputs),
+    ]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
         panic!("invalid batch accepted");
@@ -77,7 +74,7 @@ fn apply_all_rolls_back_on_error() {
     assert_eq!(
         error.source(),
         ApplyError::InvalidClose {
-            input: edge,
+            input: edge(),
             reason: InvalidCloseReason::ValueMismatch,
         },
     );
@@ -90,13 +87,10 @@ fn apply_iter_emits_events_per_op() {
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge_id = Tx::edge_id_of(&funding_value, &basic_terms());
     let open = open_tx(funding_value, basic_terms());
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     let ops = [
         open,
-        Tx::close(
-            edge_id,
-            proof(),
-            payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-        ),
+        Tx::close(edge_id, mutual_proof(edge_id, &outputs), outputs),
     ];
 
     let mut observed: Vec<(usize, EventKind)> = Vec::new();
@@ -125,17 +119,31 @@ fn apply_iter_emits_events_per_op() {
 }
 
 #[test]
+fn apply_iter_accepts_borrowed_ops() {
+    let mut state = funded_state();
+    let ops = [open_op()];
+
+    let mut observed: Vec<usize> = Vec::new();
+    let Ok(()) = state.apply_iter(CONTEXT, &FAKE_VERIFIER, ops.iter(), |i, _| {
+        observed.push(i);
+    }) else {
+        panic!("valid borrowed batch rejected");
+    };
+
+    assert_eq!(observed, vec![0]);
+    assert!(state.store().edge(edge()).is_some());
+}
+
+#[test]
 fn apply_iter_rolls_back_on_mid_batch_failure() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms_value = terms_with(&outputs);
-    let funding_value = funding(MAKER_COIN, TAKER_COIN);
-    let edge_id = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = open_tx(funding_value, terms_value.clone());
+    let edge_id = edge();
+    let open = open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let store_before = *state.store();
     let ops = [
         open,
-        Tx::close(edge_id, Proof::timeout(terms_value), outputs),
+        Tx::close(edge_id, Proof::timeout(basic_terms()), outputs),
     ];
 
     let mut observed = Vec::new();

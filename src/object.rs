@@ -7,6 +7,7 @@
 //! `models/deps/assumptions.qnt`.
 
 use crate::{
+    context::{BlockHeight, Cost, Fees},
     error::{InsertError, InvalidCloseReason, InvalidOpenReason, KernelResult},
     list::List,
     primitive::{CoinId, Key, TermsHash},
@@ -77,15 +78,26 @@ impl Parties {
 pub struct Edge {
     value: u64,
     reserve: u64,
+    close_fees: Fees,
+    timeout: BlockHeight,
     parties: Parties,
     terms: TermsHash,
 }
 
 impl Edge {
-    const fn new(value: u64, reserve: u64, parties: Parties, terms: TermsHash) -> Self {
+    const fn new(
+        value: u64,
+        reserve: u64,
+        close_fees: Fees,
+        timeout: BlockHeight,
+        parties: Parties,
+        terms: TermsHash,
+    ) -> Self {
         Self {
             value,
             reserve,
+            close_fees,
+            timeout,
             parties,
             terms,
         }
@@ -95,37 +107,46 @@ impl Edge {
         coins: &List<(CoinId, Coin), N>,
         parties: Parties,
         terms: TermsHash,
-        open_fee: u64,
-        reserve: u64,
+        debits: (u64, u64, u64, Fees),
+        timeout: BlockHeight,
     ) -> Result<Self, InvalidOpenReason> {
+        let (open_fee, lifetime_fee, reserve, close_fees) = debits;
         let total = Self::total(coins).ok_or(InvalidOpenReason::FundingOverflow)?;
         let value = total
             .checked_sub(open_fee)
+            .and_then(|after_open_fee| after_open_fee.checked_sub(lifetime_fee))
             .and_then(|after_fee| after_fee.checked_sub(reserve))
             .ok_or(InvalidOpenReason::FundingInsufficient)?;
-        Ok(Self::new(value, reserve, parties, terms))
+        Ok(Self::new(
+            value, reserve, close_fees, timeout, parties, terms,
+        ))
     }
 
     /// Validates a close against the edge's locked principal and reserve.
     ///
-    /// Payouts must sum to exactly `self.value` (the principal locked at
-    /// open). The reserve covers the close fee; any unspent reserve
-    /// (`self.reserve - fee`) is *burned*, not refunded — this is the
-    /// protocol's deflationary tip, modelled by the `paid` accumulator
-    /// in `models/fees.qnt`.
+    /// Payouts must sum to the principal locked at open plus the part of the
+    /// open-time close reserve not consumed by this close kind. The committed
+    /// close fee is priced by the fee schedule stored on the edge at open time,
+    /// so current block fees cannot make an already-open edge unclosable.
     pub(super) fn closes<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,
-        fee: u64,
+        close_cost: Cost,
     ) -> Result<(), InvalidCloseReason> {
-        if fee > self.reserve {
-            return Err(InvalidCloseReason::ReserveTooSmall);
-        }
+        let expected = self
+            .close_value(close_cost)
+            .ok_or(InvalidCloseReason::ReserveTooSmall)?;
         match Self::total(coins) {
             None => Err(InvalidCloseReason::PayoutOverflow),
-            Some(total) if total != self.value => Err(InvalidCloseReason::ValueMismatch),
+            Some(total) if total != expected => Err(InvalidCloseReason::ValueMismatch),
             Some(_) => Ok(()),
         }
+    }
+
+    pub(super) fn close_value(self, close_cost: Cost) -> Option<u64> {
+        let fee = self.close_fees.charge(close_cost)?;
+        let surplus = self.reserve.checked_sub(fee)?;
+        self.value.checked_add(surplus)
     }
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {
@@ -143,10 +164,22 @@ impl Edge {
         self.value
     }
 
-    /// Returns the prepaid reserve consumed when this edge closes.
+    /// Returns the close reserve locked when this edge opened.
     #[must_use]
     pub const fn reserve(self) -> u64 {
         self.reserve
+    }
+
+    /// Returns the fee schedule committed for future close execution.
+    #[must_use]
+    pub const fn close_fees(self) -> Fees {
+        self.close_fees
+    }
+
+    /// Returns the block height at which timeout fallback becomes available.
+    #[must_use]
+    pub const fn timeout(self) -> BlockHeight {
+        self.timeout
     }
 
     /// Returns the positional parties committed by this edge.

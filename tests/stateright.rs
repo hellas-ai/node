@@ -125,8 +125,8 @@ impl ChannelModel {
                 Tx::Open {
                     funding,
                     terms,
-                    maker_sig: _,
-                    taker_sig: _,
+                    maker_auth: _,
+                    taker_auth: _,
                 },
                 EventKind::EdgeOpened {
                     inputs: event_inputs,

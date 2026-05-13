@@ -14,7 +14,7 @@
 // ── Identifier and hash sizes (bytes) ─────────────────────────────────
 
 /// Length of every kernel hash output. BLAKE3-256 produces a 32-byte
-/// digest; every commitment ([`crate::TermsHash`], [`crate::CloseHash`])
+/// digest; every commitment ([`crate::TermsHash`], [`crate::PayloadHash`])
 /// and every derived identifier ([`crate::CoinId`], [`crate::EdgeId`],
 /// [`crate::BlockHash`]) is this size.
 pub(crate) const HASH_LENGTH: usize = 32;
@@ -23,9 +23,9 @@ pub(crate) const HASH_LENGTH: usize = 32;
 /// every id is derived as a BLAKE3 commitment over canonical fields.
 pub(crate) const ID_LENGTH: usize = HASH_LENGTH;
 
-/// Length of a compressed secp256k1 settlement key. 33 bytes is the
-/// SEC1 compressed form (`02` / `03` prefix byte plus the 32-byte
-/// x-coordinate).
+/// Length of a compressed settlement key. 33 bytes is the SEC1
+/// compressed form (`02` / `03` prefix byte plus the 32-byte
+/// x-coordinate) used by native secp256k1 keys and passkey P-256 keys.
 pub(crate) const KEY_LENGTH: usize = 33;
 
 /// Length of a compact ECDSA settlement signature: `r ‖ s`, 32 bytes
@@ -37,6 +37,14 @@ pub(crate) const SIG_LENGTH: usize = 64;
 /// seal is a commitment to that artifact and the verifier resolves it
 /// out of band.
 pub(crate) const SEAL_LENGTH: usize = 32;
+
+/// Maximum bytes of `authenticatorData || clientDataJSON` carried by one
+/// `WebAuthn` open assertion.
+///
+/// Mirrors Tempo's 2 KiB bound: large enough for browser-produced
+/// assertion metadata, small enough to keep every kernel transaction
+/// payload statically bounded.
+pub const MAX_WEBAUTHN_DATA_LENGTH: usize = 2048;
 
 // ── Operation bounds ──────────────────────────────────────────────────
 

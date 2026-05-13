@@ -15,9 +15,9 @@ mod support;
 use support::{FAKE_VERIFIER, FixedStore};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CoinId, Context, Event, EventKind, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Sig,
-    State, Terms, Tx,
+    BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis, Key,
+    List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
+    ProtocolCode, Sig, State, Terms, Tx,
 };
 
 const CONTEXT: Context = Context::new(
@@ -36,13 +36,22 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let terms_value = Terms::basic(
         ProtocolCode::new(1),
         parties,
-        BlockHeight::new(1),
+        BlockHeight::new(2),
         payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
     );
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
     let expected_open = open_tx(funding_value, terms_value.clone(), maker_key, taker_key);
     let close_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
-    let expected_close = Tx::close(edge, Proof::timeout(terms_value), close_outputs.clone());
+    let expected_close_hash =
+        Tx::payload_hash(edge, CloseKind::Mutual, terms_value.hash(), &close_outputs);
+    let expected_close = Tx::close(
+        edge,
+        Proof::mutual(
+            Sig::placeholder(maker_key, expected_close_hash),
+            Sig::placeholder(taker_key, expected_close_hash),
+        ),
+        close_outputs.clone(),
+    );
     let output_id_list = Tx::close_output_ids(edge, &close_outputs);
     let maker_out = nth(&output_id_list, 0);
     let taker_out = nth(&output_id_list, 1);
@@ -57,10 +66,14 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         let terms = Terms::basic(
             ProtocolCode::new(1),
             parties,
-            BlockHeight::new(1),
+            BlockHeight::new(2),
             outputs.clone(),
         );
-        let proof = Proof::timeout(terms.clone());
+        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+        let proof = Proof::mutual(
+            Sig::placeholder(maker_key, close_hash),
+            Sig::placeholder(taker_key, close_hash),
+        );
         let open = open_tx(funding(maker, taker), terms, maker_key, taker_key);
         assert_eq!(open, expected_open.clone());
         let is_open = matches!(open, Tx::Open { .. });

@@ -120,14 +120,18 @@ impl Cost {
     }
 }
 
-/// Deterministic fee schedule for kernel operation costs.
+/// Deterministic fee schedule for kernel operation costs and live edge
+/// lifetime.
 ///
-/// One price per [`Cost`] dimension.
+/// `base`, `slot`, and `proof` price [`Cost`] dimensions. `lifetime` prices
+/// each live edge slot per prepaid block and is charged explicitly on open;
+/// it is not part of [`Cost`].
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Fees {
     base: u64,
     slot: u64,
     proof: u64,
+    lifetime: u64,
 }
 
 impl Fees {
@@ -136,12 +140,18 @@ impl Fees {
         base: 0,
         slot: 0,
         proof: 0,
+        lifetime: 0,
     };
 
     /// Creates a fee schedule.
     #[must_use]
-    pub const fn new(base: u64, slot: u64, proof: u64) -> Self {
-        Self { base, slot, proof }
+    pub const fn new(base: u64, slot: u64, proof: u64, lifetime: u64) -> Self {
+        Self {
+            base,
+            slot,
+            proof,
+            lifetime,
+        }
     }
 
     /// Returns the price per fixed operation unit.
@@ -160,6 +170,12 @@ impl Fees {
     #[must_use]
     pub const fn proof(self) -> u64 {
         self.proof
+    }
+
+    /// Returns the price per live edge slot per prepaid block.
+    #[must_use]
+    pub const fn lifetime(self) -> u64 {
+        self.lifetime
     }
 
     /// Calculates the fee for `cost`.

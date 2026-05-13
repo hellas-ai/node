@@ -111,8 +111,9 @@ fn view_tracks_live_objects() {
     );
 
     let mut resolved = open_state();
-    let _event = apply(
+    let _event = apply_with(
         &mut resolved,
+        TIMEOUT_CONTEXT,
         &Tx::close(
             edge(),
             proof(),

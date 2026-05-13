@@ -6,11 +6,13 @@
 //! `apply` here implements the same validate-then-fold discipline the model
 //! captures by primed-variable assignments inside an `action` block.
 
+mod auth;
 mod funding;
 mod payout;
 mod proof;
 
 pub use self::{
+    auth::{OpenAuth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
     payout::Payout,
     proof::{CloseKind, Proof, Seal},
@@ -24,7 +26,7 @@ use crate::{
     event::Change,
     list::List,
     object::{Coin, Edge},
-    primitive::{CloseHash, CoinId, EdgeId, Sig, TermsHash},
+    primitive::{CoinId, EdgeId, PayloadHash, Sig, TermsHash},
     store::Batch,
     terms::Terms,
     verifier::{SealPublicInputs, SealVerifier, SigVerifier},
@@ -36,6 +38,10 @@ type Payouts = List<Payout, MAX_EDGE_OUTPUTS>;
 type CloseCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 
 /// A protocol transaction submitted to the Hellas kernel.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Open transactions may carry two inline WebAuthn assertions in this no-alloc kernel"
+)]
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Tx {
     /// Open one edge by locking bounded bilateral funding under both
@@ -47,13 +53,13 @@ pub enum Tx {
         funding: Funding,
         /// Concrete terms committing the produced edge.
         terms: Terms,
-        /// Maker's signature over [`Tx::open_hash`]. Required even when
+        /// Maker's authorization over [`Tx::open_hash`]. Required even when
         /// the maker funding list is empty — opening an edge that names
         /// the maker as a party requires the maker's consent.
-        maker_sig: Sig,
-        /// Taker's signature over [`Tx::open_hash`]. Same authorization
-        /// rule as `maker_sig`.
-        taker_sig: Sig,
+        maker_auth: OpenAuth,
+        /// Taker's authorization over [`Tx::open_hash`]. Same
+        /// authorization rule as `maker_auth`.
+        taker_auth: OpenAuth,
     },
 
     /// Close one edge into bounded owner-only coin payouts.
@@ -74,8 +80,25 @@ impl Tx {
         Self::Open {
             funding,
             terms,
-            maker_sig,
-            taker_sig,
+            maker_auth: OpenAuth::native(maker_sig),
+            taker_auth: OpenAuth::native(taker_sig),
+        }
+    }
+
+    /// Creates an open transaction from concrete terms and typed party
+    /// authorizations.
+    #[must_use]
+    pub const fn open_with_auth(
+        funding: Funding,
+        terms: Terms,
+        maker_auth: OpenAuth,
+        taker_auth: OpenAuth,
+    ) -> Self {
+        Self::Open {
+            funding,
+            terms,
+            maker_auth,
+            taker_auth,
         }
     }
 
@@ -107,11 +130,11 @@ impl Tx {
     /// be replayed as anything else (a close signature, a different
     /// edge's open, etc.).
     #[must_use]
-    pub fn open_hash(funding: &Funding, terms: &Terms) -> CloseHash {
+    pub fn open_hash(funding: &Funding, terms: &Terms) -> PayloadHash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::OPEN);
         Self::edge_id_of(funding, terms).encode_to(&mut hasher);
-        CloseHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
     /// Returns the canonical ids of the payout coins a close would produce.
@@ -136,14 +159,14 @@ impl Tx {
         kind: CloseKind,
         terms: TermsHash,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-    ) -> CloseHash {
+    ) -> PayloadHash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::CLOSE);
         input.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         terms.encode_to(&mut hasher);
         outputs.encode_to(&mut hasher);
-        CloseHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
     }
 
     /// Returns the deterministic resource cost of this transaction.
@@ -169,10 +192,10 @@ impl Tx {
             Self::Open {
                 funding,
                 terms,
-                maker_sig,
-                taker_sig,
+                maker_auth,
+                taker_auth,
             } => apply_open(
-                funding, terms, *maker_sig, *taker_sig, context, verifier, batch,
+                funding, terms, maker_auth, taker_auth, context, verifier, batch,
             ),
             Self::Close {
                 input,
@@ -203,8 +226,8 @@ fn close_cost(outputs: usize, kind: CloseKind) -> Cost {
 fn apply_open<B, V>(
     funding: &Funding,
     terms: &Terms,
-    maker_sig: Sig,
-    taker_sig: Sig,
+    maker_auth: &OpenAuth,
+    taker_auth: &OpenAuth,
     context: Context,
     verifier: &V,
     batch: &B,
@@ -234,13 +257,22 @@ where
     let open_fee = context
         .fee(open_cost(funding))
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::FeeOverflow))?;
+    let lifetime_fee =
+        open_lifetime_fee(context, terms).map_err(|reason| invalid_open(output, reason))?;
     let reserve = context
         .fee(open_reserve_cost())
         .ok_or_else(|| invalid_open(output, InvalidOpenReason::ReserveOverflow))?;
-    let edge = Edge::open(&coins, parties, terms.hash(), open_fee, reserve)
-        .map_err(|reason| invalid_open(output, reason))?;
+    let edge = Edge::open(
+        &coins,
+        parties,
+        terms.hash(),
+        (open_fee, lifetime_fee, reserve, context.fees()),
+        terms.timeout(),
+    )
+    .map_err(|reason| invalid_open(output, reason))?;
+    check_open_terms(output, &edge, terms, context)?;
     check_open_signatures(
-        output, funding, terms, parties, maker_sig, taker_sig, verifier,
+        output, funding, terms, parties, maker_auth, taker_auth, verifier,
     )?;
     Ok(Change::open(&coins, (output, edge)))
 }
@@ -268,18 +300,58 @@ fn check_funding_ownership(
     Ok(())
 }
 
+fn check_open_terms(
+    output: EdgeId,
+    edge: &Edge,
+    terms: &Terms,
+    context: Context,
+) -> KernelResult<()> {
+    if terms.timeout() <= context.block_height() {
+        return Err(invalid_open(output, InvalidOpenReason::TimeoutNotFuture));
+    }
+    let Some(timeout_value) = payout_total(terms.timeout_outputs()) else {
+        return Err(invalid_open(output, InvalidOpenReason::TermsPayoutOverflow));
+    };
+    let timeout_cost = close_cost(terms.timeout_outputs().len(), CloseKind::Timeout);
+    let Some(expected_timeout_value) = edge.close_value(timeout_cost) else {
+        return Err(invalid_open(output, InvalidOpenReason::ReserveOverflow));
+    };
+    if timeout_value != expected_timeout_value {
+        return Err(invalid_open(output, InvalidOpenReason::TermsValueMismatch));
+    }
+    Ok(())
+}
+
+fn open_lifetime_fee(context: Context, terms: &Terms) -> Result<u64, InvalidOpenReason> {
+    let Some(blocks) = terms
+        .timeout()
+        .get()
+        .checked_sub(context.block_height().get())
+    else {
+        return Err(InvalidOpenReason::TimeoutNotFuture);
+    };
+    if blocks == 0 {
+        return Err(InvalidOpenReason::TimeoutNotFuture);
+    }
+    context
+        .fees()
+        .lifetime()
+        .checked_mul(blocks)
+        .ok_or(InvalidOpenReason::LifetimeFeeOverflow)
+}
+
 fn check_open_signatures<V: SigVerifier + ?Sized>(
     output: EdgeId,
     funding: &Funding,
     terms: &Terms,
     parties: crate::object::Parties,
-    maker_sig: Sig,
-    taker_sig: Sig,
+    maker_auth: &OpenAuth,
+    taker_auth: &OpenAuth,
     verifier: &V,
 ) -> KernelResult<()> {
     let hash = Tx::open_hash(funding, terms);
-    if !verifier.verify_sig(maker_sig, parties.maker(), hash)
-        || !verifier.verify_sig(taker_sig, parties.taker(), hash)
+    if !verifier.verify_open_auth(maker_auth, parties.maker(), hash)
+        || !verifier.verify_open_auth(taker_auth, parties.taker(), hash)
     {
         return Err(invalid_open(output, InvalidOpenReason::BadSignature));
     }
@@ -304,19 +376,26 @@ where
     let edge = batch
         .edge(input)
         .ok_or(ApplyError::MissingEdge { id: input })?;
-    // Cheap structural checks first: fee, reserve coverage, value
-    // conservation. Verifier comes last because real `SealVerifier`
-    // impls may resolve and check expensive ZK artifacts, and we don't
-    // want to pay for that on closes that fail trivial checks.
-    let fee = context
-        .fee(close_cost(outputs.len(), proof.kind()))
-        .ok_or_else(|| invalid_close(input, InvalidCloseReason::FeeOverflow))?;
-    edge.closes(&coins, fee)
+    // Cheap structural checks first: output freshness and value conservation.
+    // Close has no marginal monetary fee: the reserve was committed when the
+    // edge opened, while `Tx::cost()` still counts close resources for block
+    // admission. Verifier comes last because real `SealVerifier` impls may
+    // resolve and check expensive ZK artifacts, and we don't want to pay for
+    // that on closes that fail trivial checks.
+    edge.closes(&coins, close_cost(outputs.len(), proof.kind()))
         .map_err(|reason| invalid_close(input, reason))?;
     check_proof(input, &edge, outputs, proof, context, verifier)
         .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
 
     Ok(Change::close((input, edge), &coins))
+}
+
+fn payout_total<const N: usize>(outputs: &List<Payout, N>) -> Option<u64> {
+    let mut total = 0_u64;
+    for output in outputs {
+        total = total.checked_add(output.value())?;
+    }
+    Some(total)
 }
 
 // Timeout is checked structurally because none of its rules — terms-hash
@@ -334,6 +413,9 @@ where
 {
     match proof {
         Proof::Mutual { maker, taker } => {
+            if context.block_height() >= edge.timeout() {
+                return Err(InvalidProofReason::ProofExpired);
+            }
             let hash = Tx::payload_hash(input, CloseKind::Mutual, edge.terms(), outputs);
             let parties = edge.parties();
             if verifier.verify_sig(*maker, parties.maker(), hash)
@@ -348,7 +430,7 @@ where
             if terms.hash() != edge.terms() {
                 return Err(InvalidProofReason::TermsMismatch);
             }
-            if context.block_height() < terms.timeout() {
+            if context.block_height() < edge.timeout() {
                 return Err(InvalidProofReason::TimeoutNotReached);
             }
             if outputs != terms.timeout_outputs() {
@@ -360,6 +442,9 @@ where
             let terms_hash = terms.hash();
             if terms_hash != edge.terms() {
                 return Err(InvalidProofReason::TermsMismatch);
+            }
+            if context.block_height() >= edge.timeout() {
+                return Err(InvalidProofReason::ProofExpired);
             }
             let public = SealPublicInputs {
                 edge_id: input,

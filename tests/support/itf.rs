@@ -44,6 +44,7 @@ pub(crate) struct State {
     pub(crate) last_input: Input,
     pub(crate) live_coins: BTreeSet<CoinTag>,
     pub(crate) live_edges: BTreeSet<EdgeTag>,
+    pub(crate) open_auth: BTreeMap<EdgeTag, OpenAuthBody>,
 }
 
 /// Quint `Coin` enum.
@@ -73,6 +74,22 @@ pub(crate) enum ProofTag {
     Mutual,
     Timeout,
     Violation,
+}
+
+/// Quint `Party` enum.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub(crate) enum PartyTag {
+    Maker,
+    Taker,
+    Adversary,
+}
+
+/// Quint `OpenAuth` record.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+pub(crate) struct OpenAuthBody {
+    pub(crate) maker: PartyTag,
+    pub(crate) taker: PartyTag,
 }
 
 /// Quint `Input` ADT.

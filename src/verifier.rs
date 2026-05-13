@@ -1,10 +1,10 @@
 //! Witness verification boundary.
 //!
-//! The kernel implements no cryptography. Two narrow traits draw the
-//! kernel/crypto seam:
+//! The transition core delegates cryptography through two narrow traits:
 //!
-//!   - [`SigVerifier`] decides whether a settlement signature is valid
-//!     over a close payload hash. Used for [`Proof::Mutual`].
+//!   - [`SigVerifier`] decides whether a settlement signature or open
+//!     authorization is valid over a canonical payload hash. Used for
+//!     [`Proof::Mutual`] and [`crate::Tx::Open`].
 //!   - [`SealVerifier`] decides whether a protocol-specific dispute
 //!     seal is admissible over the canonical close public inputs.
 //!     Used for [`Proof::Violation`].
@@ -32,8 +32,8 @@
 
 use crate::consts::MAX_EDGE_OUTPUTS;
 use crate::list::List;
-use crate::primitive::{CloseHash, EdgeId, Key, ProtocolCode, Sig, TermsHash};
-use crate::tx::{Payout, Seal};
+use crate::primitive::{EdgeId, Key, PayloadHash, ProtocolCode, Sig, TermsHash};
+use crate::tx::{OpenAuth, Payout, Seal};
 
 /// Decides whether one settlement signature is admissible over a close
 /// payload hash.
@@ -46,7 +46,21 @@ use crate::tx::{Payout, Seal};
 pub trait SigVerifier {
     /// Returns true when `sig` is a valid witness from `key` over `hash`.
     #[must_use]
-    fn verify_sig(&self, sig: Sig, key: Key, hash: CloseHash) -> bool;
+    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool;
+
+    /// Returns true when `auth` is a valid open authorization from `key`
+    /// over `hash`.
+    ///
+    /// Native open authorizations reuse [`Self::verify_sig`]. `WebAuthn` is
+    /// rejected by default so existing native-only verifiers do not
+    /// accidentally start accepting a new signature scheme.
+    #[must_use]
+    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+        match auth {
+            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::WebAuthn(_) => false,
+        }
+    }
 }
 
 /// Canonical public inputs that a dispute seal commits to.

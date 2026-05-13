@@ -15,7 +15,7 @@ use crate::{
     canonical::Encode,
     consts::SEAL_LENGTH,
     context::Cost,
-    primitive::{CloseHash, ProtocolCode, Sig},
+    primitive::{PayloadHash, ProtocolCode, Sig},
     terms::Terms,
 };
 
@@ -88,7 +88,7 @@ impl Seal {
     /// accepts this shape is decided by the [`crate::SealVerifier`] passed
     /// at apply time.
     #[must_use]
-    pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: CloseHash) -> Self {
+    pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: PayloadHash) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::SEAL_PLACEHOLDER);
         protocol.encode_to(&mut hasher);
