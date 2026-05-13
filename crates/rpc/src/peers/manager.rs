@@ -218,11 +218,6 @@ impl PeerManager {
     }
 }
 
-#[cfg(feature = "iroh")]
-pub fn iroh_service_alpn<S: ServiceKey>() -> String {
-    format!("/{}/1.0", S::NAME)
-}
-
 /// `PeerExtractor` for the iroh transport.
 ///
 /// Reads `tonic_iroh_transport::IrohContext` from request extensions — the
@@ -331,9 +326,8 @@ impl<S: ServiceKey> IrohRpcPool<S> {
         manager: PeerManager,
         options: tonic_iroh_transport::PoolOptions,
     ) -> Self {
-        let alpn = iroh_service_alpn::<S>();
         Self::from_pool(
-            tonic_iroh_transport::ConnectionPool::new(endpoint, alpn.as_bytes(), options),
+            tonic_iroh_transport::ConnectionPool::new(endpoint, S::ALPN.as_bytes(), options),
             manager,
         )
     }
@@ -476,7 +470,6 @@ impl IrohTransport {
 #[cfg(feature = "iroh-client")]
 impl IrohTransportInner {
     fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
-        let alpn = iroh_service_alpn::<S>();
         let mut pools = self
             .pools
             .lock()
@@ -484,7 +477,7 @@ impl IrohTransportInner {
         let pool = pools.entry(S::NAME).or_insert_with(|| {
             tonic_iroh_transport::ConnectionPool::new(
                 self.endpoint.clone(),
-                alpn.as_bytes(),
+                S::ALPN.as_bytes(),
                 self.pool_options.clone(),
             )
         });
