@@ -130,7 +130,7 @@ impl fmt::Display for AcquireDenied {
 
 impl std::error::Error for AcquireDenied {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct TokenBucket {
     tokens: f64,
     last_refill_ms: u64,
