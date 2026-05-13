@@ -595,7 +595,7 @@ pub(super) fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "swarm"))]
 mod tests {
     use super::*;
     use crate::service::NodeService;
