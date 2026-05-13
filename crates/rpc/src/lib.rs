@@ -11,6 +11,8 @@ pub mod driver;
 #[cfg(feature = "node")]
 pub mod error;
 #[cfg(feature = "iroh-client")]
+pub mod call;
+#[cfg(feature = "iroh-client")]
 pub mod iroh_client;
 #[cfg(feature = "node")]
 pub mod model;
