@@ -37,12 +37,18 @@
 //! depend on stale mutable state.
 
 mod admission;
+mod directory;
 mod id;
 mod manager;
 mod registry;
 mod security;
 
 pub use admission::{AcquireDenied, Outcome, Permit, RequestKind};
+pub use directory::{
+    COURTESY_SERVICE_ALPN, EXECUTE_SERVICE_ALPN, InboundAdmission, InboundRequestPolicy,
+    LEGACY_EXECUTE_SERVICE_ALPN, LEGACY_NODE_SERVICE_ALPN, NODE_SERVICE_ALPN, OPAQUE_SERVICE_ALPN,
+    PeerDirectory, PeerDirectoryConfig, SYMBOLIC_SERVICE_ALPN, ServiceAlias,
+};
 pub use id::PeerId;
 pub use manager::{PeerManager, PeerManagerError, RpcObservation, RpcPermitGuard};
 pub use registry::{

@@ -83,6 +83,22 @@ impl PeerManager {
         self.observe_discovered_service(peer, source, S::NAME, transport_security)
     }
 
+    pub fn observe_inbound_request(
+        &self,
+        peer: PeerId,
+        kind: RequestKind,
+        cost: f32,
+        rtt_ms: Option<f64>,
+    ) -> Result<PeerChange, PeerManagerError> {
+        Ok(self
+            .lock()?
+            .observe_inbound_request(now_ms(), peer, kind, cost, rtt_ms)?)
+    }
+
+    pub fn observe_invalid_request(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
+        Ok(self.lock()?.observe_invalid_request(now_ms(), peer))
+    }
+
     pub fn acquire_rpc(
         &self,
         peer: PeerId,
@@ -243,7 +259,7 @@ pub enum PeerManagerError {
     Admission(#[from] AcquireDenied),
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -251,7 +267,7 @@ fn now_ms() -> u64 {
         })
 }
 
-fn duration_ms(duration: Duration) -> f64 {
+pub(super) fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
