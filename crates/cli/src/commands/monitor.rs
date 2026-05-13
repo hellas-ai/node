@@ -260,36 +260,13 @@ fn handle_discovery_event(
     context: DiscoveryEventContext<'_>,
 ) {
     let peer_id = peer.id();
-    let registry_peer_id = peer_id_from_endpoint(peer_id);
-    let first_service_observation = context.peer_registry.lock().map_or(true, |mut registry| {
-        let already_seen = registry
-            .get(registry_peer_id)
-            .is_some_and(|entry| entry.has_service(service_name));
-        if already_seen {
-            return false;
-        }
-
-        let now = now_ms();
-        registry.apply(
-            now,
-            registry_peer_id,
-            PeerEvent::Discovered {
-                source: DiscoverySource::Transport("discovery"),
-                transport_security: TransportSecurity::Untrusted,
-            },
-        );
-        registry.apply(
-            now,
-            registry_peer_id,
-            PeerEvent::ServiceObserved {
-                service: service_name,
-                transport_security: TransportSecurity::Untrusted,
-            },
-        );
-        true
-    });
-
-    if !first_service_observation {
+    if !observe_discovered_service(
+        context.peer_registry,
+        peer_id,
+        DiscoverySource::Transport("discovery"),
+        service_name,
+        TransportSecurity::Untrusted,
+    ) {
         return;
     }
 
@@ -446,6 +423,26 @@ async fn interrogate_peer(
         known_peers,
         invalid_known_peers,
         known_peers_error,
+    })
+}
+
+fn observe_discovered_service(
+    registry: &Arc<Mutex<PeerRegistry>>,
+    peer_id: EndpointId,
+    source: DiscoverySource,
+    service: &'static str,
+    transport_security: TransportSecurity,
+) -> bool {
+    registry.lock().map_or(true, |mut registry| {
+        registry
+            .observe_discovered_service(
+                now_ms(),
+                peer_id_from_endpoint(peer_id),
+                source,
+                service,
+                transport_security,
+            )
+            .service_inserted
     })
 }
 
