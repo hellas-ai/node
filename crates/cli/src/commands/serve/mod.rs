@@ -12,7 +12,6 @@ use tonic_iroh_transport::iroh::SecretKey;
 use tracing::warn;
 
 mod node;
-mod peer_tracker;
 
 pub async fn run(
     port: Option<u16>,
