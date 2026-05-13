@@ -3,9 +3,9 @@
 use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseHash, CloseKind, CoinId, Context, Edge, EdgeId, EventKind,
-    Funding, Genesis, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, Tx, View,
+    BlockHash, BlockHeight, CloseKind, CoinId, Context, Edge, EdgeId, EventKind, Funding, Genesis,
+    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, PayloadHash, Payout,
+    Proof, ProtocolCode, Seal, Sig, State, Terms, Tx, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -152,7 +152,7 @@ pub(crate) fn open(edge: EdgeKey) -> Tx {
 
 pub(crate) fn open_case(key: OpenKey) -> Tx {
     let funding = open_funding(key);
-    let terms = terms();
+    let terms = open_terms(key);
     let (maker_sig, taker_sig) = open_sigs(&funding, &terms, MAKER, TAKER);
     Tx::open(funding, terms, maker_sig, taker_sig)
 }
@@ -173,7 +173,7 @@ pub(crate) fn open_case_op(key: OpenKey) -> Tx {
 }
 
 pub(crate) fn open_case_id(key: OpenKey) -> EdgeId {
-    Tx::edge_id_of(&open_funding(key), &terms())
+    Tx::edge_id_of(&open_funding(key), &open_terms(key))
 }
 
 pub(crate) fn open_case_inputs(key: OpenKey) -> List<CoinId, MAX_EDGE_INPUTS> {
@@ -350,6 +350,19 @@ fn open_funding(key: OpenKey) -> Funding {
     }
 }
 
+fn open_terms(key: OpenKey) -> Terms {
+    match key {
+        OpenKey::Full => terms(),
+        OpenKey::MakerOnly => terms_with(MAKER_VALUE, 0),
+        OpenKey::TakerOnly => terms_with(0, TAKER_VALUE),
+        OpenKey::Empty => terms_with(0, 0),
+    }
+}
+
+fn terms_with(maker: u64, taker: u64) -> Terms {
+    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, payouts_with(maker, taker))
+}
+
 fn seal(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
     Seal::placeholder(terms().protocol(), kind, hash(edge, kind, outputs))
 }
@@ -367,6 +380,6 @@ fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
     Seal::placeholder(terms().protocol(), CloseKind::Violation, bad_hash)
 }
 
-fn hash(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> CloseHash {
+fn hash(edge: EdgeKey, kind: CloseKind, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> PayloadHash {
     Tx::payload_hash(edge_id(edge), kind, terms().hash(), outputs)
 }

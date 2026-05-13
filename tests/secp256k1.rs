@@ -37,7 +37,7 @@ fn keypair(seed: u8) -> (SecretKey, Key) {
     (secret, Key::from_bytes(public.serialize()))
 }
 
-fn sign(secret: &SecretKey, hash: hellas_kernel::CloseHash) -> Sig {
+fn sign(secret: &SecretKey, hash: hellas_kernel::PayloadHash) -> Sig {
     let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);

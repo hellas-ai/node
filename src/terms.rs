@@ -97,7 +97,8 @@ impl Terms {
         }
     }
 
-    /// Returns the deterministic timeout payout shape.
+    /// Returns the deterministic timeout payout shape, including any reserve
+    /// surplus left after the open-time committed timeout close fee.
     #[must_use]
     pub const fn timeout_outputs(&self) -> &List<Payout, MAX_EDGE_OUTPUTS> {
         match &self.body {
@@ -110,6 +111,10 @@ impl Terms {
 
 impl TermsBody {
     fn compute_hash(&self) -> TermsHash {
+        // The hash domain is the structural tag for this body shape. If a
+        // second terms body shape is introduced, it must use a distinct domain
+        // separator or a chain-versioned tagged encoding, so different
+        // semantics cannot share the same canonical bytes.
         TermsHash::from_bytes(crate::canonical::hash(crate::consts::TERMS_BASIC, self))
     }
 }
@@ -151,5 +156,30 @@ impl Encode for TermsBody {
                 timeout_outputs.encode_to(writer);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{canonical::hash, consts::TERMS_BASIC, primitive::Key};
+
+    #[test]
+    fn basic_terms_hash_is_bound_to_basic_terms_domain() {
+        let maker = Key::from_bytes([1; Key::LENGTH]);
+        let taker = Key::from_bytes([2; Key::LENGTH]);
+        let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+        outputs[0] = Payout::new(maker, 7);
+        outputs[1] = Payout::new(taker, 8);
+        let outputs = List::take(outputs, 2);
+        let terms = Terms::basic(
+            ProtocolCode::new(1),
+            Parties::new(maker, taker),
+            BlockHeight::new(99),
+            outputs,
+        );
+
+        let expected = TermsHash::from_bytes(hash(TERMS_BASIC, &terms.body));
+        assert_eq!(terms.hash(), expected);
     }
 }

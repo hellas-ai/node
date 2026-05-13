@@ -8,8 +8,9 @@ fn close_zero_edge_without_outputs() {
     let open = open_tx(funding_value, terms_value.clone());
     let mut state = funded_state_for(&open);
     let _event = apply(&mut state, &open);
-    let event = apply(
+    let event = apply_with(
         &mut state,
+        TIMEOUT_CONTEXT,
         &Tx::close(edge, Proof::timeout(terms_value), no_payouts()),
     );
 
@@ -34,8 +35,9 @@ fn close_zero_edge_without_outputs() {
 #[test]
 fn close_spends_edge_into_two_payout_coins() {
     let mut state = open_state();
-    let event = apply(
+    let event = apply_with(
         &mut state,
+        TIMEOUT_CONTEXT,
         &Tx::close(
             edge(),
             proof(),
@@ -63,7 +65,7 @@ fn close_spends_edge_into_two_payout_coins() {
 
 #[test]
 fn close_uses_prepaid_reserve() {
-    let outputs = payouts(Payout::new(MAKER, 12), Payout::new(TAKER, 12));
+    let outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 13));
     let terms_value = terms_with(&outputs);
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
@@ -82,11 +84,17 @@ fn close_uses_prepaid_reserve() {
     let Some(open_fee) = RESOURCE_CONTEXT.fee(open.cost()) else {
         panic!("open fee overflow");
     };
+    let Some(lifetime_fee) = lifetime_fee_for(RESOURCE_CONTEXT, TIMEOUT) else {
+        panic!("lifetime fee overflow");
+    };
     let Some(reserve) = RESOURCE_CONTEXT.fee(worst_case_close_cost(edge)) else {
         panic!("reserve fee overflow");
     };
+    let Some(committed_close_fee) = RESOURCE_CONTEXT.fee(close.cost()) else {
+        panic!("committed close fee overflow");
+    };
     let _event = apply_with(&mut state, RESOURCE_CONTEXT, &open);
-    let event = apply_with(&mut state, RESOURCE_CONTEXT, &close);
+    let event = apply_with(&mut state, TIMEOUT_CONTEXT, &close);
 
     assert_eq!(
         event.kind(),
@@ -98,51 +106,49 @@ fn close_uses_prepaid_reserve() {
     assert_eq!(state.store().edge(edge), None);
     assert_eq!(
         state.store().coin(maker_out).map(coin_view),
-        Some((MAKER, 12)),
+        Some((MAKER, 14)),
     );
     assert_eq!(
         state.store().coin(taker_out).map(coin_view),
-        Some((TAKER, 12)),
+        Some((TAKER, 13)),
     );
-    assert_eq!(12 + 12 + open_fee + reserve, 50);
+    assert_eq!(14 + 13 + open_fee + lifetime_fee + committed_close_fee, 50);
+    assert_eq!(reserve - committed_close_fee, 6);
 }
 
 #[test]
-fn close_rejects_unpaid_fee_without_mutation() {
+fn close_has_no_marginal_fee_after_zero_fee_open() {
     let mut state = open_state();
-    let store = *state.store();
+    let close = Tx::close(
+        edge(),
+        proof(),
+        payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
+    );
+    let event = apply_with(&mut state, RESOURCE_TIMEOUT_CONTEXT, &close);
 
     assert_eq!(
-        state.apply(
-            RESOURCE_CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(
-                edge(),
-                proof(),
-                payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-            ),
-        ),
-        Err(ApplyError::InvalidClose {
+        event.kind(),
+        &EventKind::EdgeClosed {
             input: edge(),
-            reason: InvalidCloseReason::ReserveTooSmall,
-        }),
+            outputs: output_ids2(maker_out(), taker_out()),
+        },
     );
-    assert_eq!(*state.store(), store);
+    assert_eq!(state.store().edge(edge()), None);
 }
 
 #[test]
-fn close_rejects_when_current_fee_exceeds_reserve_without_mutation() {
+fn close_accepts_when_current_fee_exceeds_open_reserve() {
     let cheap = Context::with_fees(
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
-        Fees::new(0, 0, 1),
+        Fees::new(0, 0, 1, 0),
     );
     let expensive = Context::with_fees(
-        BlockHeight::new(1),
+        TIMEOUT,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
-        Fees::new(0, 0, 3),
+        Fees::new(0, 0, 3, 0),
     );
-    let outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
+    let outputs = payouts(Payout::new(MAKER, 15), Payout::new(TAKER, 14));
     let terms_value = terms_with(&outputs);
     let terms_hash = terms_value.hash();
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
@@ -157,24 +163,89 @@ fn close_rejects_when_current_fee_exceeds_reserve_without_mutation() {
         ],
     );
     let _event = apply_with(&mut state, cheap, &open);
-    let store = *state.store();
-    let close = Tx::close(edge, Proof::timeout(terms_value), outputs);
+    let close = Tx::close(edge, Proof::timeout(terms_value), outputs.clone());
     let close_cost = close.cost();
+    let output_ids = Tx::close_output_ids(edge, &outputs);
+    let maker_out = nth(&output_ids, 0);
+    let taker_out = nth(&output_ids, 1);
 
     assert_eq!(cheap.fee(reserve_cost), Some(2));
     assert_eq!(
         state.store().edge(edge).map(edge_view),
-        Some((28, 2, PARTIES, terms_hash)),
+        Some((28, 2, TIMEOUT, PARTIES, terms_hash)),
     );
     assert_eq!(expensive.fee(close_cost), Some(3));
+    let event = apply_with(&mut state, expensive, &close);
+
     assert_eq!(
-        state.apply(expensive, &FAKE_VERIFIER, &close),
-        Err(ApplyError::InvalidClose {
+        event.kind(),
+        &EventKind::EdgeClosed {
             input: edge,
-            reason: InvalidCloseReason::ReserveTooSmall,
-        }),
+            outputs: output_ids2(maker_out, taker_out),
+        },
     );
-    assert_eq!(*state.store(), store);
+    assert_eq!(state.store().edge(edge), None);
+    assert_eq!(
+        state.store().coin(maker_out).map(coin_view),
+        Some((MAKER, 15)),
+    );
+    assert_eq!(
+        state.store().coin(taker_out).map(coin_view),
+        Some((TAKER, 14)),
+    );
+}
+
+#[test]
+fn close_surplus_uses_selected_close_kind() {
+    let proof_priced = Context::with_fees(
+        BlockHeight::new(1),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+        Fees::new(0, 0, 1, 0),
+    );
+    let timeout_outputs = payouts(Payout::new(MAKER, 15), Payout::new(TAKER, 14));
+    let terms_value = terms_with(&timeout_outputs);
+    let funding_value = funding(MAKER_COIN, TAKER_COIN);
+    let edge = Tx::edge_id_of(&funding_value, &terms_value);
+    let terms_hash = terms_value.hash();
+    let open = open_tx(funding_value, terms_value);
+    let mutual_outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
+    let mutual_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &mutual_outputs);
+    let close = Tx::close(
+        edge,
+        Proof::mutual(
+            Sig::placeholder(MAKER, mutual_hash),
+            Sig::placeholder(TAKER, mutual_hash),
+        ),
+        mutual_outputs.clone(),
+    );
+    let output_ids = Tx::close_output_ids(edge, &mutual_outputs);
+    let maker_out = nth(&output_ids, 0);
+    let taker_out = nth(&output_ids, 1);
+    let mut state = state(
+        store_for_close(&open, &mutual_outputs),
+        [
+            Genesis::coin(MAKER_COIN, MAKER, 20),
+            Genesis::coin(TAKER_COIN, TAKER, 10),
+        ],
+    );
+    let _event = apply_with(&mut state, proof_priced, &open);
+    let event = apply_with(&mut state, proof_priced, &close);
+
+    assert_eq!(
+        event.kind(),
+        &EventKind::EdgeClosed {
+            input: edge,
+            outputs: output_ids2(maker_out, taker_out),
+        },
+    );
+    assert_eq!(
+        state.store().coin(maker_out).map(coin_view),
+        Some((MAKER, 14)),
+    );
+    assert_eq!(
+        state.store().coin(taker_out).map(coin_view),
+        Some((TAKER, 14)),
+    );
 }
 
 #[test]
@@ -202,6 +273,26 @@ fn close_accepts_mutual_witness() {
         state.store().coin(taker_out()).map(coin_view),
         Some((TAKER, 8)),
     );
+}
+
+#[test]
+fn close_rejects_mutual_after_deadline_without_mutation() {
+    let mut state = open_state();
+    let store = *state.store();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+
+    assert_eq!(
+        state.apply(
+            TIMEOUT_CONTEXT,
+            &FAKE_VERIFIER,
+            &Tx::close(edge(), mutual_proof(edge(), &outputs), outputs),
+        ),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::ProofExpired,
+        }),
+    );
+    assert_eq!(*state.store(), store);
 }
 
 #[test]
@@ -337,6 +428,26 @@ fn close_accepts_violation_witness() {
 }
 
 #[test]
+fn close_rejects_violation_after_deadline_without_mutation() {
+    let mut state = open_state();
+    let store = *state.store();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+
+    assert_eq!(
+        state.apply(
+            TIMEOUT_CONTEXT,
+            &FAKE_VERIFIER,
+            &Tx::close(edge(), violation_proof(edge(), &outputs), outputs),
+        ),
+        Err(ApplyError::InvalidProof {
+            input: edge(),
+            reason: InvalidProofReason::ProofExpired,
+        }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
 fn placeholder_witnesses_do_not_verify_under_reject_verifier() {
     let mut state = open_state();
     let store = *state.store();
@@ -423,7 +534,7 @@ fn close_spends_edge_into_three_payout_coins() {
             output: edge,
         },
     );
-    let event = apply(&mut state, &close);
+    let event = apply_with(&mut state, TIMEOUT_CONTEXT, &close);
 
     assert_eq!(
         event.kind(),
@@ -452,7 +563,7 @@ fn close_allows_zero_value_payout_coin() {
     let taker_out = nth(&output_ids, 1);
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &open);
-    let event = apply(&mut state, &close);
+    let event = apply_with(&mut state, TIMEOUT_CONTEXT, &close);
 
     assert_eq!(
         event.kind(),
@@ -474,10 +585,8 @@ fn close_allows_zero_value_payout_coin() {
 #[test]
 fn close_rejects_non_conserving_payouts_without_mutation() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 9));
-    let terms_value = terms_with(&outputs);
-    let funding_value = funding(MAKER_COIN, TAKER_COIN);
-    let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = open_tx(funding_value, terms_value.clone());
+    let edge = edge();
+    let open = open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms());
     let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &open);
     let store = *state.store();
@@ -486,7 +595,7 @@ fn close_rejects_non_conserving_payouts_without_mutation() {
         state.apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &Tx::close(edge, Proof::timeout(terms_value), outputs),
+            &Tx::close(edge, Proof::timeout(basic_terms()), outputs),
         ),
         Err(ApplyError::InvalidClose {
             input: edge,

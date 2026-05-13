@@ -17,9 +17,9 @@
 //!   integrity story is at the *derivation site*: the kernel's
 //!   `CoinId::genesis`/`CoinId::payout`/`Tx::edge_id_of` helpers are the
 //!   canonical ways to produce *fresh* ids.
-//! - **Cryptographic commitments** ([`TermsHash`], [`CloseHash`]).
-//!   These are pure derived outputs of `Terms::hash()` /
-//!   `Tx::payload_hash`. They implement [`Encode`] only — you can
+//! - **Cryptographic commitments** ([`TermsHash`], [`PayloadHash`]).
+//!   These are pure derived outputs of `Terms::hash()`,
+//!   `Tx::open_hash`, and `Tx::payload_hash`. They implement [`Encode`] only — you can
 //!   serialize a commitment you hold, you cannot deserialize one in
 //!   isolation. The `pub(crate) from_bytes` constructor is reserved for
 //!   the kernel's own round-trip decoders on object types containing
@@ -41,7 +41,7 @@ impl Default for Key {
 }
 
 impl Key {
-    /// Encoded length of a compressed secp256k1 settlement key.
+    /// Encoded length of a compressed settlement key.
     pub const LENGTH: usize = KEY_LENGTH;
 
     /// Creates a settlement key from canonical bytes.
@@ -240,15 +240,15 @@ impl Encode for TermsHash {
 
 // TermsHash deliberately does *not* implement `Decode`.
 
-/// Commitment to one concrete close payload.
+/// Commitment to one concrete transaction authorization payload.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CloseHash([u8; Self::LENGTH]);
+pub struct PayloadHash([u8; Self::LENGTH]);
 
-impl CloseHash {
-    /// Encoded length of a close commitment.
+impl PayloadHash {
+    /// Encoded length of a payload commitment.
     pub const LENGTH: usize = HASH_LENGTH;
 
-    /// Reconstructs a close commitment from canonical bytes.
+    /// Reconstructs a payload commitment from canonical bytes.
     ///
     /// `pub(crate)` by design: see [`CoinId::from_bytes`].
     pub(crate) const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
@@ -268,7 +268,7 @@ impl CloseHash {
     }
 }
 
-impl Encode for CloseHash {
+impl Encode for PayloadHash {
     const MAX_ENCODED_SIZE: usize = Self::LENGTH;
     fn encoded_size(&self) -> usize {
         Self::LENGTH
@@ -278,7 +278,7 @@ impl Encode for CloseHash {
     }
 }
 
-// CloseHash deliberately does *not* implement `Decode`.
+// PayloadHash deliberately does *not* implement `Decode`.
 
 /// Compact settlement signature bytes.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -318,18 +318,18 @@ impl Sig {
     /// accepts this shape is decided by the [`crate::SigVerifier`] passed at
     /// apply time.
     #[must_use]
-    pub fn placeholder(key: Key, hash: CloseHash) -> Self {
+    pub fn placeholder(key: Key, hash: PayloadHash) -> Self {
         let mut out = [0_u8; Self::LENGTH];
         let first = Self::half(key, hash, 0);
         let second = Self::half(key, hash, 1);
 
-        out[..CloseHash::LENGTH].copy_from_slice(&first);
-        out[CloseHash::LENGTH..].copy_from_slice(&second);
+        out[..PayloadHash::LENGTH].copy_from_slice(&first);
+        out[PayloadHash::LENGTH..].copy_from_slice(&second);
 
         Self(out)
     }
 
-    fn half(key: Key, hash: CloseHash, index: u8) -> [u8; CloseHash::LENGTH] {
+    fn half(key: Key, hash: PayloadHash, index: u8) -> [u8; PayloadHash::LENGTH] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::SIG_PLACEHOLDER);
         index.encode_to(&mut hasher);

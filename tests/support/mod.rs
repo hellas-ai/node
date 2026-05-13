@@ -6,13 +6,15 @@
 #![allow(dead_code)]
 
 pub(crate) mod itf;
+pub(crate) mod itf_l1_fees;
 pub(crate) mod l1;
+pub(crate) mod l1_fees;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
-    Batch, CloseKind, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Key, Parties,
-    Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, TermsHash, Tx,
-    View,
+    Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult,
+    Key, Parties, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store,
+    TermsHash, Tx, View,
 };
 
 /// Forgeable verifier used by every test in this crate. Accepts the
@@ -26,7 +28,7 @@ pub(crate) struct FakeVerifier;
 pub(crate) const FAKE_VERIFIER: FakeVerifier = FakeVerifier;
 
 impl SigVerifier for FakeVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::CloseHash) -> bool {
+    fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::PayloadHash) -> bool {
         sig == Sig::placeholder(key, hash)
     }
 }
@@ -52,7 +54,7 @@ pub(crate) struct RejectVerifier;
 pub(crate) const REJECT_VERIFIER: RejectVerifier = RejectVerifier;
 
 impl SigVerifier for RejectVerifier {
-    fn verify_sig(&self, _sig: Sig, _key: Key, _hash: hellas_kernel::CloseHash) -> bool {
+    fn verify_sig(&self, _sig: Sig, _key: Key, _hash: hellas_kernel::PayloadHash) -> bool {
         false
     }
 }
@@ -245,8 +247,14 @@ pub(crate) const fn coin_view(coin: Coin) -> (Key, u64) {
     (coin.owner(), coin.value())
 }
 
-pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, Parties, TermsHash) {
-    (edge.value(), edge.reserve(), edge.parties(), edge.terms())
+pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, BlockHeight, Parties, TermsHash) {
+    (
+        edge.value(),
+        edge.reserve(),
+        edge.timeout(),
+        edge.parties(),
+        edge.terms(),
+    )
 }
 
 /// One-coin party funding: a `MAX_PARTY_INPUTS`-sized list with `id` in

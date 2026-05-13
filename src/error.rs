@@ -154,8 +154,19 @@ pub enum InvalidOpenReason {
     ReserveOverflow,
     /// Sum of funding coin values overflowed `u64`.
     FundingOverflow,
-    /// Sum of funding coin values is less than open fee + locked reserve.
+    /// Sum of funding coin values is less than open fee + lifetime fee +
+    /// locked reserve.
     FundingInsufficient,
+    /// The committed timeout height is not strictly after the open block.
+    TimeoutNotFuture,
+    /// `context.fees().lifetime() * paid_lifetime_blocks` overflowed.
+    LifetimeFeeOverflow,
+    /// Sum of deterministic payouts committed by the open terms overflowed.
+    TermsPayoutOverflow,
+    /// Deterministic timeout payouts committed by the open terms do not equal
+    /// edge principal plus timeout reserve surplus under the open-time close
+    /// fee schedule.
+    TermsValueMismatch,
     /// A funding coin's owner does not match its party's settlement key.
     /// The maker funding list must contain coins owned by
     /// `terms.parties().maker()`; the taker funding list, by
@@ -170,14 +181,15 @@ pub enum InvalidOpenReason {
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidCloseReason {
-    /// `context.fee(close.cost())` overflowed.
-    FeeOverflow,
     /// Sum of payout values overflowed `u64`.
     PayoutOverflow,
-    /// Locked reserve does not cover the current priced close cost. Under v1
-    /// fee semantics this is the deliberate stale-edge collection signal.
+    /// The edge's open-time reserve does not cover this close path's
+    /// open-time committed fee. Edges opened by this kernel reserve the
+    /// worst-case close path, so this indicates corrupted preloaded state or
+    /// an incompatible future cost rule rather than current fee repricing.
     ReserveTooSmall,
-    /// Sum of payout values does not equal the edge's principal.
+    /// Sum of payout values does not equal principal plus reserve surplus for
+    /// the selected close path.
     ValueMismatch,
 }
 
@@ -185,8 +197,8 @@ pub enum InvalidCloseReason {
 ///
 /// `BadSignature` and `BadSeal` come from the wired
 /// [`crate::SigVerifier`] / [`crate::SealVerifier`]; `TermsMismatch`,
-/// `TimeoutNotReached`, and `PayoutMismatch` come from the kernel's
-/// inline Timeout/Violation structural checks.
+/// `ProofExpired`, `TimeoutNotReached`, and `PayoutMismatch` come from the
+/// kernel's inline lifetime and Timeout/Violation structural checks.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidProofReason {
     /// The proof's terms commitment does not match the edge's `TermsHash`.
@@ -195,6 +207,9 @@ pub enum InvalidProofReason {
     BadSignature,
     /// A dispute seal was rejected.
     BadSeal,
+    /// A pre-expiry close proof (`Mutual` or `Violation`) was submitted at or
+    /// after the committed timeout height.
+    ProofExpired,
     /// A `Proof::Timeout` was submitted before the committed timeout height.
     TimeoutNotReached,
     /// A `Proof::Timeout` carries payouts that do not equal
