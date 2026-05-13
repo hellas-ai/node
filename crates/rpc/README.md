@@ -114,8 +114,15 @@ impl MethodKey for ListModels {
 }
 ```
 
-Built-in Hellas method markers live under `hellas_rpc::service::methods`. Future
-RPC codegen should emit the same shape for downstream `.proto` files.
+Built-in Hellas service and method markers are generated from
+`proto/hellas/**/*.proto` by `crates/rpc/build.rs` and live under
+`hellas_rpc::service` and `hellas_rpc::service::methods`. Duplicate RPC names are
+disambiguated with their service name, e.g. `SymbolicCreateTicket` and
+`OpaqueCreateTicket`.
+
+Downstream RPC codegen should emit the same shape for custom `.proto` files:
+one service marker implementing `ServiceKey`, plus one marker per RPC method
+implementing `MethodKey`.
 
 ## Calling Patterns
 
