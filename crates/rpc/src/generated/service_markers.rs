@@ -43,6 +43,14 @@ pub const KNOWN_SERVICES: &[KnownService] = &[
 /// build.rs); this list lets runtime callers inspect the policy
 /// without having to fabricate `InboundRequestPolicy` values.
 pub const KNOWN_RATE_LIMITED_METHODS: &[&'static str] = &[
+    "/hellas.v1.Execute/RunTicket",
+    "/hellas.symbolic.v1.Symbolic/CreateTicket",
+    "/hellas.courtesy.v1.Courtesy/QuotePreparedText",
+    "/hellas.courtesy.v1.Courtesy/QuotePrompt",
+    "/hellas.courtesy.v1.Courtesy/QuoteChatPrompt",
+    "/hellas.courtesy.v1.Courtesy/PutArtifact",
+    "/hellas.courtesy.v1.Courtesy/DecodeTokens",
+    "/hellas.opaque.v1.Opaque/CreateTicket",
     "/hellas.swarm.v1.Node/GetKnownPeers",
 ];
 #[cfg(feature = "execute")]
@@ -345,7 +353,7 @@ impl crate::peers::RpcServiceSpec for ExecuteService {
         match path {
             <methods::RunTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::RunTicket,
                     >(),
                 )
@@ -360,7 +368,7 @@ impl crate::peers::RpcServiceSpec for SymbolicService {
         match path {
             <methods::SymbolicCreateTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::SymbolicCreateTicket,
                     >(),
                 )
@@ -375,28 +383,28 @@ impl crate::peers::RpcServiceSpec for CourtesyService {
         match path {
             <methods::QuotePreparedText as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::QuotePreparedText,
                     >(),
                 )
             }
             <methods::QuotePrompt as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::QuotePrompt,
                     >(),
                 )
             }
             <methods::QuoteChatPrompt as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::QuoteChatPrompt,
                     >(),
                 )
             }
             <methods::PutArtifact as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::PutArtifact,
                     >(),
                 )
@@ -417,7 +425,7 @@ impl crate::peers::RpcServiceSpec for CourtesyService {
             }
             <methods::DecodeTokens as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::DecodeTokens,
                     >(),
                 )
@@ -446,7 +454,7 @@ impl crate::peers::RpcServiceSpec for OpaqueService {
         match path {
             <methods::OpaqueCreateTicket as crate::peers::GrpcMethodSpec>::GRPC_PATH => {
                 Some(
-                    crate::peers::InboundRequestPolicy::account_method::<
+                    crate::peers::InboundRequestPolicy::rate_limited_method::<
                         methods::OpaqueCreateTicket,
                     >(),
                 )

@@ -372,10 +372,31 @@ mod compile {
 
     /// Per-method opt-in to *enforcement* (per-peer + global rate limit, deny
     /// when over). The default is `account_only` — observe but never reject.
+    ///
+    /// Methods that commit server-side resources on first call (quotes,
+    /// writes, expensive streams) are rate-limited so a single peer can't
+    /// flood admission. Methods that are cheap reads / observability stay
+    /// account-only — they get tracked but not rejected. RunTicket is
+    /// rate-limited even though the executor queue is the primary gate;
+    /// belt-and-braces against admission flooding.
     fn is_rate_limited(package: &str, service: &str, method: &str) -> bool {
         matches!(
             (package, service, method),
+            // Peer-disclosure flood gate.
             ("hellas.swarm.v1", "Node", "GetKnownPeers")
+            // Execute: ticket processing commits compute.
+            | ("hellas.v1", "Execute", "RunTicket")
+            // Quote endpoints: server commits to staging work.
+            | ("hellas.opaque.v1", "Opaque", "CreateTicket")
+            | ("hellas.symbolic.v1", "Symbolic", "CreateTicket")
+            | ("hellas.courtesy.v1", "Courtesy", "QuotePreparedText")
+            | ("hellas.courtesy.v1", "Courtesy", "QuotePrompt")
+            | ("hellas.courtesy.v1", "Courtesy", "QuoteChatPrompt")
+            // Writes: storage flooding.
+            | ("hellas.courtesy.v1", "Courtesy", "PutArtifact")
+            // Bidi-stream opens are expensive even if individual frames are
+            // small.
+            | ("hellas.courtesy.v1", "Courtesy", "DecodeTokens")
         )
     }
 
