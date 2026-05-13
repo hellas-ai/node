@@ -1,5 +1,5 @@
 use crate::commands::CliResult;
-use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc};
+use crate::peer_rpc::{PeerManager, acquire_iroh_rpc};
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -11,7 +11,6 @@ use hellas_rpc::peers::{DiscoverySource, PeerEvent, PeerId, TransportSecurity};
 use hellas_rpc::service::{ExecuteService, NodeService};
 use std::collections::HashSet;
 use std::future;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
@@ -34,7 +33,7 @@ struct PeerInterrogationOutcome {
 
 struct DiscoveryEventContext<'a> {
     node_pool: &'a ConnectionPool,
-    peer_registry: &'a SharedPeerRegistry,
+    peer_registry: &'a PeerManager,
     interrogate: bool,
     interrogated: &'a mut HashSet<EndpointId>,
     interrogations: &'a mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
@@ -64,7 +63,7 @@ pub async fn run(
     let mut node_discovery = Box::pin(registry.discover::<NodeService>());
     let mut execute_discovery = Box::pin(registry.discover::<ExecuteService>());
 
-    let peer_registry = SharedPeerRegistry::default();
+    let peer_registry = PeerManager::default();
     let mut interrogations = JoinSet::new();
     let mut interrogated = HashSet::new();
 
@@ -189,18 +188,14 @@ pub async fn run(
 
                         if !outcome.known_peers.is_empty() {
                             hinted_peers += outcome.known_peers.len();
-                            if let Ok(mut registry) = peer_registry.lock() {
-                                let now = now_ms();
-                                for hinted in &outcome.known_peers {
-                                    registry.apply(
-                                        now,
-                                        peer_id_from_endpoint(*hinted),
-                                        PeerEvent::Discovered {
-                                            source: DiscoverySource::PeerExchange,
-                                            transport_security: TransportSecurity::Untrusted,
-                                        },
-                                    );
-                                }
+                            for hinted in &outcome.known_peers {
+                                let _ = peer_registry.apply(
+                                    peer_id_from_endpoint(*hinted),
+                                    PeerEvent::Discovered {
+                                        source: DiscoverySource::PeerExchange,
+                                        transport_security: TransportSecurity::Untrusted,
+                                    },
+                                );
                             }
                             for hinted in &outcome.known_peers {
                                 println!("event=peer-hint from={} peer={}", peer_id, hinted);
@@ -227,14 +222,15 @@ pub async fn run(
         }
     }
 
-    let (unique_peers, node_service_peers, execute_service_peers) =
-        peer_registry.lock().map_or((0, 0, 0), |registry| {
+    let (unique_peers, node_service_peers, execute_service_peers) = peer_registry
+        .with_registry(|registry| {
             (
                 registry.len(),
                 registry.with_service(NODE_SERVICE_NAME).count(),
                 registry.with_service(EXECUTE_SERVICE_NAME).count(),
             )
-        });
+        })
+        .unwrap_or((0, 0, 0));
 
     println!(
         "event=monitor-summary unique_peers={} node_service_peers={} execute_service_peers={} interrogated={} interrogation_ok={} interrogation_failed={} hinted_peers={}",
@@ -257,7 +253,7 @@ fn handle_discovery_event(
     context: DiscoveryEventContext<'_>,
 ) {
     let peer_id = peer.id();
-    if !observe_discovered_service(
+    if !observe_iroh_discovered_service(
         context.peer_registry,
         peer_id,
         DiscoverySource::Transport("discovery"),
@@ -290,7 +286,7 @@ fn handle_discovery_event(
 
 async fn interrogate_peer(
     node_pool: ConnectionPool,
-    peer_registry: SharedPeerRegistry,
+    peer_registry: PeerManager,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
     let channel = node_pool
@@ -302,7 +298,7 @@ async fn interrogate_peer(
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
-    let mut node_info_permit = acquire_rpc(
+    let mut node_info_permit = acquire_iroh_rpc(
         &peer_registry,
         peer_id,
         NODE_SERVICE_NAME,
@@ -330,7 +326,7 @@ async fn interrogate_peer(
     let mut invalid_known_peers = 0usize;
     let mut known_peers_error = None;
 
-    match acquire_rpc(
+    match acquire_iroh_rpc(
         &peer_registry,
         peer_id,
         NODE_SERVICE_NAME,
@@ -386,36 +382,25 @@ async fn interrogate_peer(
     })
 }
 
-fn observe_discovered_service(
-    registry: &SharedPeerRegistry,
+fn observe_iroh_discovered_service(
+    registry: &PeerManager,
     peer_id: EndpointId,
     source: DiscoverySource,
     service: &'static str,
     transport_security: TransportSecurity,
 ) -> bool {
-    registry.lock().map_or(true, |mut registry| {
-        registry
-            .observe_discovered_service(
-                now_ms(),
-                peer_id_from_endpoint(peer_id),
-                source,
-                service,
-                transport_security,
-            )
-            .service_inserted
-    })
+    registry
+        .observe_discovered_service(
+            peer_id_from_endpoint(peer_id),
+            source,
+            service,
+            transport_security,
+        )
+        .map_or(true, |observation| observation.service_inserted)
 }
 
 fn peer_id_from_endpoint(peer_id: EndpointId) -> PeerId {
     PeerId::from(*peer_id.as_bytes())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {

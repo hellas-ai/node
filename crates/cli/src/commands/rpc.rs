@@ -9,16 +9,16 @@ use std::net::SocketAddr;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohConnect, PoolOptions};
 
-use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc};
+use crate::peer_rpc::{PeerManager, acquire_iroh_rpc};
 
 pub async fn run(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
     secret_key: SecretKey,
 ) -> CliResult<()> {
-    let peer_registry = SharedPeerRegistry::default();
+    let peer_registry = PeerManager::default();
     let endpoint = DiscoveryEndpoint::bind(Some(secret_key)).await?.endpoint;
-    let mut permit = acquire_rpc(
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         node_id,
         <NodeService as ServiceKey>::NAME,

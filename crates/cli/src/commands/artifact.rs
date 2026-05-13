@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
 
-use crate::peer_rpc::{SharedPeerRegistry, acquire_rpc};
+use crate::peer_rpc::{PeerManager, acquire_iroh_rpc};
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
@@ -67,8 +67,8 @@ async fn put(
     let canonical_artifact = tokio::fs::read(&path)
         .await
         .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
-    let peer_registry = SharedPeerRegistry::default();
-    let mut permit = acquire_rpc(
+    let peer_registry = PeerManager::default();
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         node_id,
         <CourtesyService as ServiceKey>::NAME,
@@ -109,8 +109,8 @@ async fn get(
     secret_key: SecretKey,
 ) -> CliResult<()> {
     let cid = parse_digest_hex(&cid)?;
-    let peer_registry = SharedPeerRegistry::default();
-    let mut permit = acquire_rpc(
+    let peer_registry = PeerManager::default();
+    let mut permit = acquire_iroh_rpc(
         &peer_registry,
         node_id,
         <CourtesyService as ServiceKey>::NAME,
