@@ -237,6 +237,12 @@ pub struct PeerEntry {
     pub rate_limited_count: u64,
     pub in_flight: usize,
     pub last_error: Option<String>,
+    /// Set by `PeerEvent::Forgotten` when the peer still has outstanding
+    /// permits. The entry is excluded from public queries (`get`, `iter`,
+    /// `with_service`) but stays in the underlying map so the `release`
+    /// path for the in-flight permits keeps decrementing counts correctly.
+    /// The entry is removed for real once `in_flight` reaches zero.
+    tombstoned: bool,
     bucket: TokenBucket,
 }
 
@@ -261,6 +267,7 @@ impl PeerEntry {
             rate_limited_count: 0,
             in_flight: 0,
             last_error: None,
+            tombstoned: false,
             bucket: TokenBucket::new(now_ms, bucket_capacity),
         }
     }
@@ -299,27 +306,46 @@ impl PeerEntry {
         self.update_auth_level();
     }
 
+    /// Record a service observation. When the per-peer service cap is hit,
+    /// evict the lowest-value service (fewest successes, oldest last_seen,
+    /// then alphabetical name) to make room — silent drop-on-cap would
+    /// silently lose per-service accounting for the *new* service every
+    /// time, which is the wrong tradeoff. Returns `Some(evicted_name)` if
+    /// an eviction occurred, `None` otherwise.
     fn observe_service(
         &mut self,
         service: &'static str,
         now_ms: u64,
         transport_security: TransportSecurity,
         max_services: usize,
-    ) -> bool {
+    ) -> Option<&'static str> {
         if let Some(state) = self.services.get_mut(service) {
             state.observe(now_ms, transport_security);
-            return true;
+            return None;
         }
 
-        if self.services.len() >= max_services {
-            return false;
-        }
+        let max = max_services.max(1);
+        let evicted = if self.services.len() >= max {
+            let evict = self
+                .services
+                .values()
+                .min_by_key(|s| (s.success_count, s.last_seen_ms, s.service))
+                .map(|s| s.service);
+            if let Some(name) = evict {
+                self.services.remove(name);
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         self.services.insert(
             service,
             ServiceState::observed(service, now_ms, transport_security),
         );
-        true
+        evicted
     }
 
     fn record_rtt(&mut self, rtt_ms: f64, alpha: f64) {
@@ -389,11 +415,11 @@ impl PeerRegistry {
     }
 
     pub fn get(&self, peer: PeerId) -> Option<&PeerEntry> {
-        self.peers.get(&peer)
+        self.peers.get(&peer).filter(|e| !e.tombstoned)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &PeerEntry> {
-        self.peers.values()
+        self.peers.values().filter(|e| !e.tombstoned)
     }
 
     pub fn with_service(&self, service: &'static str) -> impl Iterator<Item = &PeerEntry> {
@@ -517,7 +543,22 @@ impl PeerRegistry {
 
     pub fn apply(&mut self, now_ms: u64, peer: PeerId, event: PeerEvent) -> PeerChange {
         if matches!(event, PeerEvent::Forgotten) {
-            let removed = self.peers.remove(&peer).is_some();
+            // Defer removal while permits are still in flight so the release
+            // path doesn't try to decrement counts on a missing entry. The
+            // peer is excluded from `get`/`iter`/`with_service` immediately
+            // (tombstoned), and the final `release` that drops in_flight to
+            // zero purges the entry for real.
+            let removed = match self.peers.get_mut(&peer) {
+                Some(entry) if entry.in_flight == 0 => {
+                    self.peers.remove(&peer);
+                    true
+                }
+                Some(entry) => {
+                    entry.tombstoned = true;
+                    true
+                }
+                None => false,
+            };
             return PeerChange {
                 peer,
                 inserted: false,
@@ -538,8 +579,11 @@ impl PeerRegistry {
             return PeerChange::dropped(peer);
         };
 
+        // Any non-Forgotten event on a tombstoned peer revives it — the
+        // operator's "forget" was overridden by fresh activity, which is a
+        // reasonable contract for a hide-and-purge tombstone.
+        entry.tombstoned = false;
         entry.last_seen_ms = now_ms;
-        let mut dropped = false;
 
         match event {
             PeerEvent::Discovered {
@@ -554,7 +598,7 @@ impl PeerRegistry {
                 transport_security,
             } => {
                 entry.observe_transport(transport_security);
-                dropped = !entry.observe_service(service, now_ms, transport_security, max_services);
+                let _ = entry.observe_service(service, now_ms, transport_security, max_services);
             }
             PeerEvent::RttSample { rtt_ms } => {
                 entry.record_rtt(rtt_ms, self.config.rtt_ema_alpha);
@@ -581,7 +625,7 @@ impl PeerRegistry {
             updated: !inserted,
             removed: false,
             evicted,
-            dropped,
+            dropped: false,
         }
     }
 
@@ -637,7 +681,8 @@ impl PeerRegistry {
         Ok(Permit::new(peer, kind, now_ms))
     }
 
-    pub fn release(&mut self, now_ms: u64, permit: Permit, outcome: Outcome) -> PeerChange {
+    pub fn release(&mut self, now_ms: u64, mut permit: Permit, outcome: Outcome) -> PeerChange {
+        permit.disarm();
         self.total_in_flight = self.total_in_flight.saturating_sub(1);
 
         let peer = permit.peer();
@@ -656,13 +701,13 @@ impl PeerRegistry {
             Outcome::Ok { rtt_ms } => {
                 entry.success_count = entry.success_count.saturating_add(1);
                 entry.record_rtt(rtt_ms, alpha);
-                if entry.observe_service(
+                let _ = entry.observe_service(
                     permit.kind().service,
                     now_ms,
                     entry.transport_security,
                     max_services,
-                ) && let Some(service) = entry.services.get_mut(permit.kind().service)
-                {
+                );
+                if let Some(service) = entry.services.get_mut(permit.kind().service) {
                     service.record_success(now_ms, rtt_ms);
                 }
                 entry.last_error = None;
@@ -681,6 +726,20 @@ impl PeerRegistry {
             Outcome::Cancelled => {
                 entry.cancelled_count = entry.cancelled_count.saturating_add(1);
             }
+        }
+
+        // Final-release purge for tombstoned peers: once the last in-flight
+        // permit clears, the entry is gone.
+        if entry.tombstoned && entry.in_flight == 0 {
+            self.peers.remove(&peer);
+            return PeerChange {
+                peer,
+                inserted: false,
+                updated: false,
+                removed: true,
+                evicted: None,
+                dropped: false,
+            };
         }
 
         PeerChange::updated(peer)
@@ -976,5 +1035,118 @@ mod tests {
 
         let entry = registry.get(id).expect("peer should exist");
         assert_eq!(entry.invalid_request_count, 2);
+    }
+
+    #[test]
+    fn auth_level_ordering_matches_authority() {
+        // Variant declaration order in security.rs is load-bearing — these
+        // assertions catch any future reordering that flips the meaning of
+        // policy filters like `entry.auth_level >= AuthLevel::Authenticated`.
+        assert!(AuthLevel::Authenticated > AuthLevel::Local);
+        assert!(AuthLevel::Local > AuthLevel::Trusted);
+        assert!(AuthLevel::Trusted > AuthLevel::Untrusted);
+    }
+
+    #[test]
+    fn forgotten_with_in_flight_defers_until_release() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(11);
+
+        let permit = registry.try_acquire(0, id, GET_NODE_INFO).unwrap();
+        // Peer is in queries while in flight.
+        assert!(registry.get(id).is_some());
+        assert_eq!(registry.total_in_flight(), 1);
+
+        // Forget while in flight: hidden from queries, but still alive
+        // internally so the release path doesn't double-count.
+        let change = registry.apply(5, id, PeerEvent::Forgotten);
+        assert!(change.removed, "Forgotten reports removed even when deferred");
+        assert!(registry.get(id).is_none(), "tombstoned peer hidden from get");
+        assert_eq!(registry.iter().count(), 0, "tombstoned peer hidden from iter");
+        assert_eq!(registry.total_in_flight(), 1);
+
+        // Release the permit: now the entry is actually gone.
+        let change = registry.release(10, permit, Outcome::ok(5.0));
+        assert!(change.removed);
+        assert_eq!(registry.total_in_flight(), 0);
+    }
+
+    #[test]
+    fn forgotten_immediate_when_idle() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(12);
+
+        registry.apply(
+            0,
+            id,
+            PeerEvent::Discovered {
+                source: DiscoverySource::Manual,
+                transport_security: TransportSecurity::Untrusted,
+            },
+        );
+
+        let change = registry.apply(5, id, PeerEvent::Forgotten);
+        assert!(change.removed);
+        assert!(registry.get(id).is_none());
+    }
+
+    #[test]
+    fn rediscovery_revives_tombstoned_peer() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(13);
+
+        let permit = registry.try_acquire(0, id, GET_NODE_INFO).unwrap();
+        registry.apply(5, id, PeerEvent::Forgotten);
+        assert!(registry.get(id).is_none());
+
+        registry.apply(
+            10,
+            id,
+            PeerEvent::Discovered {
+                source: DiscoverySource::Mdns,
+                transport_security: TransportSecurity::Authenticated,
+            },
+        );
+        // Re-discovery un-tombstones; release doesn't purge a live entry.
+        registry.release(15, permit, Outcome::ok(5.0));
+        let entry = registry.get(id).expect("peer should be live again");
+        assert_eq!(entry.transport_security, TransportSecurity::Authenticated);
+    }
+
+    #[test]
+    fn service_cap_evicts_lowest_value() {
+        let mut registry = PeerRegistry::with_config(PeerRegistryConfig {
+            max_services_per_peer: 2,
+            ..config()
+        });
+        let id = peer(14);
+
+        // Three services; the cap is two. The first observed should be
+        // evicted (zero successes, oldest last_seen).
+        for (i, name) in ["svc.A", "svc.B", "svc.C"].iter().enumerate() {
+            registry.apply(
+                (i as u64) * 10,
+                id,
+                PeerEvent::ServiceObserved {
+                    service: name,
+                    transport_security: TransportSecurity::Untrusted,
+                },
+            );
+        }
+        let entry = registry.get(id).expect("peer should exist");
+        assert_eq!(entry.services.len(), 2);
+        assert!(!entry.has_service("svc.A"), "lowest-value service evicted");
+        assert!(entry.has_service("svc.B"));
+        assert!(entry.has_service("svc.C"));
+    }
+
+    #[test]
+    fn peer_id_display_alternate_emits_full_hex() {
+        let id = peer(0xab);
+        let short = format!("{id}");
+        let full = format!("{id:#}");
+        assert!(short.contains('…'), "default Display truncates");
+        assert_eq!(full.len(), 64, "alternate emits 64 hex chars");
+        assert!(full.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
