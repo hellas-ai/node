@@ -144,6 +144,16 @@ impl PeerChange {
     }
 }
 
+/// Result of recording that a discovered peer offers a service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceObservation {
+    pub peer: PeerId,
+    pub peer_inserted: bool,
+    pub service_inserted: bool,
+    pub evicted: Option<PeerId>,
+    pub dropped: bool,
+}
+
 /// Last-known state for a service on a peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceStatus {
@@ -375,6 +385,54 @@ impl PeerRegistry {
 
     pub fn latency(&self, peer: PeerId) -> Option<f64> {
         self.get(peer).and_then(PeerEntry::latency_ms)
+    }
+
+    pub fn observe_discovered_service(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+        source: DiscoverySource,
+        service: &'static str,
+        transport_security: TransportSecurity,
+    ) -> ServiceObservation {
+        let service_was_known = self
+            .get(peer)
+            .is_some_and(|entry| entry.has_service(service));
+
+        let discovery_change = self.apply(
+            now_ms,
+            peer,
+            PeerEvent::Discovered {
+                source,
+                transport_security,
+            },
+        );
+        if discovery_change.dropped {
+            return ServiceObservation {
+                peer,
+                peer_inserted: false,
+                service_inserted: false,
+                evicted: discovery_change.evicted,
+                dropped: true,
+            };
+        }
+
+        let service_change = self.apply(
+            now_ms,
+            peer,
+            PeerEvent::ServiceObserved {
+                service,
+                transport_security,
+            },
+        );
+
+        ServiceObservation {
+            peer,
+            peer_inserted: discovery_change.inserted,
+            service_inserted: !service_was_known && !service_change.dropped,
+            evicted: discovery_change.evicted.or(service_change.evicted),
+            dropped: service_change.dropped,
+        }
     }
 
     pub fn apply(&mut self, now_ms: u64, peer: PeerId, event: PeerEvent) -> PeerChange {
@@ -649,6 +707,36 @@ mod tests {
         let entry = registry.get(id).expect("peer should exist");
         assert_eq!(entry.transport_security, TransportSecurity::Authenticated);
         assert_eq!(entry.auth_level, AuthLevel::Authenticated);
+        assert!(entry.has_service(NODE));
+    }
+
+    #[test]
+    fn observe_discovered_service_reports_new_service_once() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(8);
+
+        let first = registry.observe_discovered_service(
+            10,
+            id,
+            DiscoverySource::Mdns,
+            NODE,
+            TransportSecurity::Untrusted,
+        );
+        assert!(first.peer_inserted);
+        assert!(first.service_inserted);
+        assert!(!first.dropped);
+
+        let second = registry.observe_discovered_service(
+            20,
+            id,
+            DiscoverySource::Mdns,
+            NODE,
+            TransportSecurity::Untrusted,
+        );
+        assert!(!second.peer_inserted);
+        assert!(!second.service_inserted);
+
+        let entry = registry.get(id).expect("peer should exist");
         assert!(entry.has_service(NODE));
     }
 
