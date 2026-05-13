@@ -54,7 +54,7 @@ use hellas_rpc::driver::{
     ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, RemoteExecuteDriver,
 };
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::{IrohRpcPool, PeerManager};
+use hellas_rpc::peers::{IrohRpcPool, IrohTransport, PeerManager};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -68,7 +68,7 @@ use tonic_iroh_transport::iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::{ConnectionPool, IrohChannel, IrohConnect, PoolOptions};
+use tonic_iroh_transport::{IrohChannel, IrohConnect, PoolOptions};
 use tracing::instrument;
 
 // `TracedChannel` swaps under the `otel` feature: with otel on it wraps the
@@ -1289,48 +1289,18 @@ async fn bind_remote_endpoint_with_bindings(
     Ok((Arc::new(endpoint), bindings))
 }
 
-fn bind_remote_pool(
-    endpoint: &Endpoint,
-    peer_registry: PeerManager,
-) -> IrohRpcPool<ExecuteService> {
-    IrohRpcPool::from_pool(
-        ConnectionPool::for_service::<ExecuteService>(
-            endpoint.clone(),
-            PoolOptions {
-                connect_timeout: REMOTE_CONNECT_TIMEOUT,
-                ..PoolOptions::default()
-            },
-        ),
+/// Build an `IrohTransport` for outbound RPCs against remote nodes. The
+/// quote/execute paths pull `pool::<ExecuteService>()` / `pool::<CourtesyService>()`
+/// / `pool::<OpaqueService>()` off this transport on demand; pools are cached
+/// so repeated lookups share a single underlying `ConnectionPool`.
+fn bind_remote_transport(endpoint: &Endpoint, peer_registry: PeerManager) -> IrohTransport {
+    IrohTransport::with_options(
+        endpoint.clone(),
         peer_registry,
-    )
-}
-
-fn bind_courtesy_pool(
-    endpoint: &Endpoint,
-    peer_registry: PeerManager,
-) -> IrohRpcPool<CourtesyService> {
-    IrohRpcPool::from_pool(
-        ConnectionPool::for_service::<CourtesyService>(
-            endpoint.clone(),
-            PoolOptions {
-                connect_timeout: REMOTE_CONNECT_TIMEOUT,
-                ..PoolOptions::default()
-            },
-        ),
-        peer_registry,
-    )
-}
-
-fn bind_opaque_pool(endpoint: &Endpoint, peer_registry: PeerManager) -> IrohRpcPool<OpaqueService> {
-    IrohRpcPool::from_pool(
-        ConnectionPool::for_service::<OpaqueService>(
-            endpoint.clone(),
-            PoolOptions {
-                connect_timeout: REMOTE_CONNECT_TIMEOUT,
-                ..PoolOptions::default()
-            },
-        ),
-        peer_registry,
+        PoolOptions {
+            connect_timeout: REMOTE_CONNECT_TIMEOUT,
+            ..PoolOptions::default()
+        },
     )
 }
 
@@ -1447,16 +1417,21 @@ async fn quote_opaque_remote_peer(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let execute_pool = bind_remote_pool(endpoint, peer_registry.clone());
-    let opaque_pool = bind_opaque_pool(endpoint, peer_registry.clone());
-    quote_opaque_remote_endpoint(request, &execute_pool, &opaque_pool, peer_id, peer_registry)
-        .await
-        .map_err(|err| match err {
-            QuoteCandidateError::Declined(err) => {
-                err.context(format!("node {peer_id} declined opaque quote"))
-            }
-            QuoteCandidateError::Connect(err) => err,
-        })
+    let transport = bind_remote_transport(endpoint, peer_registry.clone());
+    quote_opaque_remote_endpoint(
+        request,
+        &transport.pool::<ExecuteService>(),
+        &transport.pool::<OpaqueService>(),
+        peer_id,
+        peer_registry,
+    )
+    .await
+    .map_err(|err| match err {
+        QuoteCandidateError::Declined(err) => {
+            err.context(format!("node {peer_id} declined opaque quote"))
+        }
+        QuoteCandidateError::Connect(err) => err,
+    })
 }
 
 async fn quote_remote_peer(
@@ -1465,12 +1440,11 @@ async fn quote_remote_peer(
     peer_id: EndpointId,
     peer_registry: PeerManager,
 ) -> anyhow::Result<QuotedRemoteDriver> {
-    let execute_pool = bind_remote_pool(endpoint, peer_registry.clone());
-    let courtesy_pool = bind_courtesy_pool(endpoint, peer_registry.clone());
+    let transport = bind_remote_transport(endpoint, peer_registry.clone());
     quote_remote_endpoint(
         quote_req,
-        &execute_pool,
-        &courtesy_pool,
+        &transport.pool::<ExecuteService>(),
+        &transport.pool::<CourtesyService>(),
         peer_id,
         peer_registry,
     )
