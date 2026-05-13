@@ -107,6 +107,8 @@ pub enum PeerEvent {
     TrustSet {
         trusted: bool,
     },
+    InvalidRequest,
+    RateLimited,
     Forgotten,
 }
 
@@ -231,6 +233,7 @@ pub struct PeerEntry {
     pub error_count: u64,
     pub cancelled_count: u64,
     pub total_requests: u64,
+    pub invalid_request_count: u64,
     pub rate_limited_count: u64,
     pub in_flight: usize,
     pub last_error: Option<String>,
@@ -254,6 +257,7 @@ impl PeerEntry {
             error_count: 0,
             cancelled_count: 0,
             total_requests: 0,
+            invalid_request_count: 0,
             rate_limited_count: 0,
             in_flight: 0,
             last_error: None,
@@ -262,6 +266,10 @@ impl PeerEntry {
     }
 
     pub fn has_service(&self, service: &'static str) -> bool {
+        self.services.contains_key(service)
+    }
+
+    pub fn has_service_name(&self, service: &str) -> bool {
         self.services.contains_key(service)
     }
 
@@ -400,6 +408,67 @@ impl PeerRegistry {
         self.get(peer).and_then(PeerEntry::latency_ms)
     }
 
+    /// Record an inbound request from a peer without inferring that the peer
+    /// provides the requested service.
+    ///
+    /// This is for server-side accounting and admission. Outbound RPC clients
+    /// should use [`Self::try_acquire`] and [`Self::release`] instead, because a
+    /// successful outbound call proves the remote peer provides that service.
+    pub fn observe_inbound_request(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+        _kind: RequestKind,
+        cost: f32,
+        rtt_ms: Option<f64>,
+    ) -> Result<PeerChange, AcquireDenied> {
+        let (inserted, evicted) =
+            self.ensure_peer(now_ms, peer)
+                .map_err(|_| AcquireDenied::PeerLimit {
+                    peer,
+                    max_peers: self.config.max_peers,
+                })?;
+
+        let Some(entry) = self.peers.get_mut(&peer) else {
+            return Err(AcquireDenied::PeerLimit {
+                peer,
+                max_peers: self.config.max_peers,
+            });
+        };
+
+        entry.last_seen_ms = now_ms;
+        entry.total_requests = entry.total_requests.saturating_add(1);
+        if let Some(rtt_ms) = rtt_ms {
+            entry.record_rtt(rtt_ms, self.config.rtt_ema_alpha);
+        }
+
+        if let Err(retry_after_ms) = entry.bucket.try_take(
+            now_ms,
+            self.config.bucket_capacity,
+            self.config.bucket_refill_per_sec,
+            cost,
+        ) {
+            entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
+            return Err(AcquireDenied::RateLimited {
+                peer,
+                retry_after_ms,
+            });
+        }
+
+        Ok(PeerChange {
+            peer,
+            inserted,
+            updated: !inserted,
+            removed: false,
+            evicted,
+            dropped: false,
+        })
+    }
+
+    pub fn observe_invalid_request(&mut self, now_ms: u64, peer: PeerId) -> PeerChange {
+        self.apply(now_ms, peer, PeerEvent::InvalidRequest)
+    }
+
     pub fn observe_discovered_service(
         &mut self,
         now_ms: u64,
@@ -498,6 +567,12 @@ impl PeerRegistry {
             PeerEvent::TrustSet { trusted } => {
                 entry.trusted = trusted;
                 entry.update_auth_level();
+            }
+            PeerEvent::InvalidRequest => {
+                entry.invalid_request_count = entry.invalid_request_count.saturating_add(1);
+            }
+            PeerEvent::RateLimited => {
+                entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             }
             PeerEvent::Forgotten => unreachable!("forgotten events are handled before insert"),
         }
@@ -876,5 +951,33 @@ mod tests {
         assert_eq!(registry.config().bucket_capacity, 0.0);
         assert_eq!(registry.config().bucket_refill_per_sec, 0.0);
         assert_eq!(registry.config().rtt_ema_alpha, 1.0);
+    }
+
+    #[test]
+    fn inbound_requests_do_not_imply_service_capability() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(9);
+
+        registry
+            .observe_inbound_request(10, id, GET_NODE_INFO, 1.0, Some(25.0))
+            .expect("inbound request should be recorded");
+
+        let entry = registry.get(id).expect("peer should exist");
+        assert_eq!(entry.total_requests, 1);
+        assert_eq!(entry.success_count, 0);
+        assert_eq!(entry.latency_ms(), Some(25.0));
+        assert!(!entry.has_service(NODE));
+    }
+
+    #[test]
+    fn tracks_invalid_requests() {
+        let mut registry = PeerRegistry::with_config(config());
+        let id = peer(10);
+
+        registry.observe_invalid_request(10, id);
+        registry.observe_invalid_request(20, id);
+
+        let entry = registry.get(id).expect("peer should exist");
+        assert_eq!(entry.invalid_request_count, 2);
     }
 }

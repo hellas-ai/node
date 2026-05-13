@@ -314,6 +314,7 @@ pub(super) async fn spawn_node(
         let disc_endpoint = endpoint.clone();
         let disc_dht = DhtBackend::with_dht(&disc_endpoint, Arc::clone(&shared_dht));
         tokio::spawn(async move {
+            use hellas_rpc::peers::ServiceKey;
             use hellas_rpc::service::{
                 CourtesyService as CourtesySvc, ExecuteService as ExecSvc, NodeService as NodeSvc,
                 OpaqueService as OpaqueSvc, SymbolicService as SymbolicSvc,
@@ -332,16 +333,16 @@ pub(super) async fn spawn_node(
             let mut opaque_peers = Box::pin(registry.discover::<OpaqueSvc>());
             let mut courtesy_peers = Box::pin(registry.discover::<CourtesySvc>());
             loop {
-                let peer_id = tokio::select! {
-                    Some(Ok(peer)) = node_peers.next() => peer.id(),
-                    Some(Ok(peer)) = exec_peers.next() => peer.id(),
-                    Some(Ok(peer)) = symbolic_peers.next() => peer.id(),
-                    Some(Ok(peer)) = opaque_peers.next() => peer.id(),
-                    Some(Ok(peer)) = courtesy_peers.next() => peer.id(),
+                let (peer_id, service) = tokio::select! {
+                    Some(Ok(peer)) = node_peers.next() => (peer.id(), <NodeSvc as ServiceKey>::NAME),
+                    Some(Ok(peer)) = exec_peers.next() => (peer.id(), <ExecSvc as ServiceKey>::NAME),
+                    Some(Ok(peer)) = symbolic_peers.next() => (peer.id(), <SymbolicSvc as ServiceKey>::NAME),
+                    Some(Ok(peer)) = opaque_peers.next() => (peer.id(), <OpaqueSvc as ServiceKey>::NAME),
+                    Some(Ok(peer)) = courtesy_peers.next() => (peer.id(), <CourtesySvc as ServiceKey>::NAME),
                     else => break,
                 };
                 if let Ok(mut tracker) = peer_tracker.lock() {
-                    tracker.mark_service_provider(peer_id);
+                    tracker.mark_service(peer_id, service);
                 }
             }
         });
