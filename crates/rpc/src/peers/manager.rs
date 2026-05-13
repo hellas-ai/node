@@ -224,6 +224,38 @@ pub fn iroh_service_alpn<S: ServiceKey>() -> String {
     format!("/{}/1.0", S::NAME)
 }
 
+/// `PeerExtractor` for the iroh transport.
+///
+/// Reads `tonic_iroh_transport::IrohContext` from request extensions — the
+/// transport injects it on every accepted bidi stream so the managed server
+/// wrappers can match the request to a peer identity without seeing iroh
+/// types themselves.
+///
+/// Gated on `iroh-client` or `iroh-server` because `IrohContext` is only
+/// re-exported by `tonic-iroh-transport` when one of its `client`/`server`
+/// sub-features is on. Bare `iroh` (just `From<EndpointId> for PeerId`) is
+/// not enough.
+#[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IrohPeerExtractor;
+
+#[cfg(any(feature = "iroh-client", feature = "iroh-server"))]
+impl super::PeerExtractor for IrohPeerExtractor {
+    fn extract<B>(&self, request: &http::Request<B>) -> Option<super::InboundPeerObservation> {
+        use tonic_iroh_transport::iroh::endpoint::PathId;
+        let context = request
+            .extensions()
+            .get::<tonic_iroh_transport::IrohContext>()?;
+        Some(super::InboundPeerObservation {
+            peer: PeerId::from(context.node_id),
+            rtt_ms: context
+                .connection
+                .rtt(PathId::ZERO)
+                .map(|d| d.as_secs_f64() * 1000.0),
+        })
+    }
+}
+
 #[cfg(feature = "iroh")]
 impl PeerManager {
     pub fn iroh_peer(&self, peer: tonic_iroh_transport::iroh::EndpointId) -> PeerSession {
