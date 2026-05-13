@@ -31,7 +31,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::iroh_client::{IrohClientError, ManagedStreaming};
-use crate::peers::{IrohPeerHandle, IrohRpcPoolError, PeerManagerError, RpcMethod, RpcService};
+use crate::peers::{
+    GrpcMethodSpec, IrohPeerHandle, IrohRpcPoolError, IrohServiceSpec, PeerManagerError, RpcMethod,
+    RpcService,
+};
 
 // On wasm the iroh transport's response futures are `!Send` (single-threaded
 // runtime). Off wasm, we keep the `Send` bound so callers can drive these
@@ -107,7 +110,7 @@ impl RpcError {
 
 // Helpers — these stay private; only the four call types use them.
 
-async fn open_grpc<M: RpcMethod>(
+async fn open_grpc<M>(
     handle: &IrohPeerHandle,
 ) -> Result<
     (
@@ -115,7 +118,11 @@ async fn open_grpc<M: RpcMethod>(
         crate::peers::RpcPermitGuard,
     ),
     RpcError,
-> {
+>
+where
+    M: GrpcMethodSpec,
+    M::Service: IrohServiceSpec,
+{
     let pool = handle.pool::<M::Service>();
     let (channel, mut permit) = pool
         .channel::<M>(handle.peer_id())
@@ -151,7 +158,7 @@ fn stamp_request<M: RpcMethod, T>(request: tonic::Request<T>) -> tonic::Request<
     request
 }
 
-fn path_for<M: RpcMethod>() -> tonic::codegen::http::uri::PathAndQuery {
+fn path_for<M: GrpcMethodSpec>() -> tonic::codegen::http::uri::PathAndQuery {
     tonic::codegen::http::uri::PathAndQuery::from_static(M::GRPC_PATH)
 }
 
@@ -159,13 +166,13 @@ fn path_for<M: RpcMethod>() -> tonic::codegen::http::uri::PathAndQuery {
 // UnaryCall<M> — unary request, unary response
 // ---------------------------------------------------------------------------
 
-pub struct UnaryCall<M: RpcMethod> {
+pub struct UnaryCall<M: GrpcMethodSpec> {
     handle: IrohPeerHandle,
     request: tonic::Request<M::Request>,
     timeout: Option<Duration>,
 }
 
-impl<M: RpcMethod> UnaryCall<M> {
+impl<M: GrpcMethodSpec> UnaryCall<M> {
     pub fn new(handle: IrohPeerHandle, request: impl tonic::IntoRequest<M::Request>) -> Self {
         Self {
             handle,
@@ -183,7 +190,8 @@ impl<M: RpcMethod> UnaryCall<M> {
 
 impl<M> IntoFuture for UnaryCall<M>
 where
-    M: RpcMethod + 'static,
+    M: GrpcMethodSpec + 'static,
+    M::Service: IrohServiceSpec,
 {
     type Output = Result<tonic::Response<M::Response>, RpcError>;
     type IntoFuture = BoxFuture<'static, Self::Output>;
@@ -220,13 +228,13 @@ where
 // ServerStreamingCall<M> — unary request, streaming response
 // ---------------------------------------------------------------------------
 
-pub struct ServerStreamingCall<M: RpcMethod> {
+pub struct ServerStreamingCall<M: GrpcMethodSpec> {
     handle: IrohPeerHandle,
     request: tonic::Request<M::Request>,
     timeout: Option<Duration>,
 }
 
-impl<M: RpcMethod> ServerStreamingCall<M> {
+impl<M: GrpcMethodSpec> ServerStreamingCall<M> {
     pub fn new(handle: IrohPeerHandle, request: impl tonic::IntoRequest<M::Request>) -> Self {
         Self {
             handle,
@@ -244,7 +252,8 @@ impl<M: RpcMethod> ServerStreamingCall<M> {
 
 impl<M> IntoFuture for ServerStreamingCall<M>
 where
-    M: RpcMethod + 'static,
+    M: GrpcMethodSpec + 'static,
+    M::Service: IrohServiceSpec,
 {
     type Output = Result<tonic::Response<ManagedStreaming<M::Response>>, RpcError>;
     type IntoFuture = BoxFuture<'static, Self::Output>;
@@ -278,13 +287,13 @@ where
 // ClientStreamingCall<M> — streaming request, unary response
 // ---------------------------------------------------------------------------
 
-pub struct ClientStreamingCall<M: RpcMethod> {
+pub struct ClientStreamingCall<M: GrpcMethodSpec> {
     handle: IrohPeerHandle,
     request: tonic::Request<RequestStream<M::Request>>,
     timeout: Option<Duration>,
 }
 
-impl<M: RpcMethod> ClientStreamingCall<M> {
+impl<M: GrpcMethodSpec> ClientStreamingCall<M> {
     pub fn new(
         handle: IrohPeerHandle,
         request: impl tonic::IntoStreamingRequest<Message = M::Request>,
@@ -309,7 +318,8 @@ impl<M: RpcMethod> ClientStreamingCall<M> {
 
 impl<M> IntoFuture for ClientStreamingCall<M>
 where
-    M: RpcMethod + 'static,
+    M: GrpcMethodSpec + 'static,
+    M::Service: IrohServiceSpec,
 {
     type Output = Result<tonic::Response<M::Response>, RpcError>;
     type IntoFuture = BoxFuture<'static, Self::Output>;
@@ -346,13 +356,13 @@ where
 // BidiStreamingCall<M> — streaming request, streaming response
 // ---------------------------------------------------------------------------
 
-pub struct BidiStreamingCall<M: RpcMethod> {
+pub struct BidiStreamingCall<M: GrpcMethodSpec> {
     handle: IrohPeerHandle,
     request: tonic::Request<RequestStream<M::Request>>,
     timeout: Option<Duration>,
 }
 
-impl<M: RpcMethod> BidiStreamingCall<M> {
+impl<M: GrpcMethodSpec> BidiStreamingCall<M> {
     pub fn new(
         handle: IrohPeerHandle,
         request: impl tonic::IntoStreamingRequest<Message = M::Request>,
@@ -377,7 +387,8 @@ impl<M: RpcMethod> BidiStreamingCall<M> {
 
 impl<M> IntoFuture for BidiStreamingCall<M>
 where
-    M: RpcMethod + 'static,
+    M: GrpcMethodSpec + 'static,
+    M::Service: IrohServiceSpec,
 {
     type Output = Result<tonic::Response<ManagedStreaming<M::Response>>, RpcError>;
     type IntoFuture = BoxFuture<'static, Self::Output>;
