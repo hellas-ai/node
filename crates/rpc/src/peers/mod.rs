@@ -114,8 +114,3 @@ pub trait RpcMethod {
     /// True if the response side is `stream`-typed in the .proto.
     const RESPONSE_STREAMING: bool = false;
 }
-
-// Back-compat aliases — old name still resolves while consumers migrate.
-// TODO(step 8 cleanup): delete once no caller references ServiceKey/MethodKey.
-pub use RpcMethod as MethodKey;
-pub use RpcService as ServiceKey;

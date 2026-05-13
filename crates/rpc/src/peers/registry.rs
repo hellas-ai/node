@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ServiceKey;
+use super::RpcService;
 use super::admission::{AcquireDenied, Outcome, Permit, RequestKind, TokenBucket};
 use super::id::PeerId;
 use super::security::{AuthLevel, TransportSecurity};
@@ -280,7 +280,7 @@ impl PeerEntry {
         self.services.contains_key(service)
     }
 
-    pub fn has_service_key<S: ServiceKey>(&self) -> bool {
+    pub fn has_service_key<S: RpcService>(&self) -> bool {
         self.has_service(S::NAME)
     }
 
@@ -288,7 +288,7 @@ impl PeerEntry {
         self.services.get(service)
     }
 
-    pub fn service<S: ServiceKey>(&self) -> Option<&ServiceState> {
+    pub fn service<S: RpcService>(&self) -> Option<&ServiceState> {
         self.service_state(S::NAME)
     }
 
@@ -444,7 +444,7 @@ impl PeerRegistry {
         self.iter().filter(move |peer| peer.has_service(service))
     }
 
-    pub fn with_service_key<S: ServiceKey>(&self) -> impl Iterator<Item = &PeerEntry> {
+    pub fn with_service_key<S: RpcService>(&self) -> impl Iterator<Item = &PeerEntry> {
         self.with_service(S::NAME)
     }
 

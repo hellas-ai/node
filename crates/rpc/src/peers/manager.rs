@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use super::MethodKey;
 use super::{
     AcquireDenied, DiscoverySource, Outcome, PeerChange, PeerEntry, PeerEvent, PeerId,
-    PeerRegistry, PeerRegistryConfig, Permit, RequestKind, ServiceKey, ServiceObservation,
-    ServiceState, TransportSecurity,
+    PeerRegistry, PeerRegistryConfig, Permit, RequestKind, RpcMethod, RpcService,
+    ServiceObservation, ServiceState, TransportSecurity,
 };
 
 /// Shared peer-state owner for application code.
@@ -84,7 +83,7 @@ impl PeerManager {
         }
     }
 
-    pub fn service_session<S: ServiceKey>(&self, peer: PeerId) -> PeerServiceSession<S> {
+    pub fn service_session<S: RpcService>(&self, peer: PeerId) -> PeerServiceSession<S> {
         self.peer(peer).service::<S>()
     }
 
@@ -121,7 +120,7 @@ impl PeerManager {
             .observe_discovered_service(now, peer, source, service, transport_security))
     }
 
-    pub fn observe_discovered_service<S: ServiceKey>(
+    pub fn observe_discovered_service<S: RpcService>(
         &self,
         peer: PeerId,
         source: DiscoverySource,
@@ -203,7 +202,7 @@ impl PeerManager {
         })
     }
 
-    pub fn acquire_method<M: MethodKey>(
+    pub fn acquire_method<M: RpcMethod>(
         &self,
         peer: PeerId,
         observation: RpcObservation,
@@ -256,14 +255,14 @@ impl PeerManager {
         self.peer(PeerId::from(peer))
     }
 
-    pub fn iroh_service_session<S: ServiceKey>(
+    pub fn iroh_service_session<S: RpcService>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
     ) -> PeerServiceSession<S> {
         self.iroh_peer(peer).service::<S>()
     }
 
-    pub fn observe_iroh_service<S: ServiceKey>(
+    pub fn observe_iroh_service<S: RpcService>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
     ) -> Result<ServiceObservation, PeerManagerError> {
@@ -273,11 +272,11 @@ impl PeerManager {
         )
     }
 
-    pub fn acquire_iroh_method<M: MethodKey>(
+    pub fn acquire_iroh_method<M: RpcMethod>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
-        self.iroh_service_session::<<M as MethodKey>::Service>(peer)
+        self.iroh_service_session::<<M as RpcMethod>::Service>(peer)
             .acquire_method::<M>(RpcObservation::authenticated_transport("iroh"))
     }
 }
@@ -291,14 +290,14 @@ impl PeerManager {
 /// the [`RpcPermitGuard`] because the caller knows when the RPC body or stream
 /// has actually finished.
 #[cfg(feature = "iroh-client")]
-pub struct IrohRpcPool<S: ServiceKey> {
+pub struct IrohRpcPool<S: RpcService> {
     pool: tonic_iroh_transport::ConnectionPool,
     manager: PeerManager,
     _service: PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: ServiceKey> Clone for IrohRpcPool<S> {
+impl<S: RpcService> Clone for IrohRpcPool<S> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
@@ -309,7 +308,7 @@ impl<S: ServiceKey> Clone for IrohRpcPool<S> {
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: ServiceKey> std::fmt::Debug for IrohRpcPool<S> {
+impl<S: RpcService> std::fmt::Debug for IrohRpcPool<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IrohRpcPool")
             .field("service", &S::NAME)
@@ -319,7 +318,7 @@ impl<S: ServiceKey> std::fmt::Debug for IrohRpcPool<S> {
 }
 
 #[cfg(feature = "iroh-client")]
-impl<S: ServiceKey> IrohRpcPool<S> {
+impl<S: RpcService> IrohRpcPool<S> {
     #[must_use]
     pub fn new(
         endpoint: tonic_iroh_transport::iroh::Endpoint,
@@ -351,7 +350,7 @@ impl<S: ServiceKey> IrohRpcPool<S> {
         &self.pool
     }
 
-    pub async fn channel<M: MethodKey<Service = S>>(
+    pub async fn channel<M: RpcMethod<Service = S>>(
         &self,
         peer: tonic_iroh_transport::iroh::EndpointId,
     ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohRpcPoolError> {
@@ -462,14 +461,14 @@ impl IrohTransport {
     /// Get-or-create the pool for service `S`. Pools are cached so repeated
     /// calls for the same service share a single tonic-iroh-transport pool
     /// (with its connection cache, dial timeouts, etc).
-    pub fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+    pub fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
         self.inner.pool::<S>()
     }
 }
 
 #[cfg(feature = "iroh-client")]
 impl IrohTransportInner {
-    fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+    fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
         let mut pools = self
             .pools
             .lock()
@@ -523,14 +522,14 @@ impl IrohPeerHandle {
 
     /// Lazily-materialised connection pool for a specific generated service.
     /// Codegen-emitted extension traits use this to dial.
-    pub fn pool<S: ServiceKey>(&self) -> IrohRpcPool<S> {
+    pub fn pool<S: RpcService>(&self) -> IrohRpcPool<S> {
         self.transport.pool::<S>()
     }
 
     /// Service-typed permit-acquisition shortcut: equivalent to
     /// `self.manager().acquire_iroh_method::<M>(self.peer_id())` but reads
     /// better at typed call sites.
-    pub fn acquire_method<M: MethodKey>(&self) -> Result<RpcPermitGuard, PeerManagerError> {
+    pub fn acquire_method<M: RpcMethod>(&self) -> Result<RpcPermitGuard, PeerManagerError> {
         self.manager().acquire_iroh_method::<M>(self.peer_id)
     }
 }
@@ -572,7 +571,7 @@ impl PeerSession {
         self.manager.set_peer_trusted(self.peer, trusted)
     }
 
-    pub fn service<S: ServiceKey>(&self) -> PeerServiceSession<S> {
+    pub fn service<S: RpcService>(&self) -> PeerServiceSession<S> {
         PeerServiceSession {
             manager: self.manager.clone(),
             peer: self.peer,
@@ -599,13 +598,13 @@ impl PeerSession {
 /// It keeps service capability explicit while preserving the global peer state
 /// underneath.
 #[derive(Clone, Debug)]
-pub struct PeerServiceSession<S: ServiceKey> {
+pub struct PeerServiceSession<S: RpcService> {
     manager: PeerManager,
     peer: PeerId,
     _service: PhantomData<fn() -> S>,
 }
 
-impl<S: ServiceKey> PeerServiceSession<S> {
+impl<S: RpcService> PeerServiceSession<S> {
     pub const fn peer_id(&self) -> PeerId {
         self.peer
     }
@@ -623,7 +622,7 @@ impl<S: ServiceKey> PeerServiceSession<S> {
             .observe_discovered_service::<S>(self.peer, source, transport_security)
     }
 
-    pub fn acquire_method<M: MethodKey<Service = S>>(
+    pub fn acquire_method<M: RpcMethod<Service = S>>(
         &self,
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
@@ -884,7 +883,7 @@ mod tests {
             .state()
             .expect("registry should be readable")
             .expect("node service should be recorded");
-        assert_eq!(service.service, <NodeService as ServiceKey>::NAME);
+        assert_eq!(service.service, <NodeService as RpcService>::NAME);
         assert_eq!(service.success_count, 1);
     }
 
