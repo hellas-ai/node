@@ -11,8 +11,14 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use thiserror::Error;
 
+use crate::call::RpcError;
 use crate::peers::{IrohRpcPoolError, MethodKey, PeerManager, PeerManagerError, RpcPermitGuard};
 
+/// Streaming response wrapper that owns the RPC permit for the duration of
+/// the stream and surfaces transport errors as the crate's typed [`RpcError`]
+/// rather than the underlying `tonic::Status`. Callers can therefore handle
+/// every streaming error consistently with the unary call surface without
+/// pulling in tonic types.
 pub struct ManagedStreaming<T> {
     inner: tonic::codec::Streaming<T>,
     permit: Option<RpcPermitGuard>,
@@ -32,9 +38,9 @@ impl<T> ManagedStreaming<T> {
         }
     }
 
-    pub async fn message(&mut self) -> Result<Option<T>, tonic::Status>
+    pub async fn message(&mut self) -> Result<Option<T>, RpcError>
     where
-        Self: Stream<Item = Result<T, tonic::Status>> + Unpin,
+        Self: Stream<Item = Result<T, RpcError>> + Unpin,
     {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx))
             .await
@@ -58,7 +64,7 @@ impl<T> Stream for ManagedStreaming<T>
 where
     tonic::codec::Streaming<T>: Stream<Item = Result<T, tonic::Status>> + Unpin,
 {
-    type Item = Result<T, tonic::Status>;
+    type Item = Result<T, RpcError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
@@ -66,7 +72,7 @@ where
             Poll::Ready(Some(Err(status))) => {
                 let method = self.method;
                 self.finish_err(format!("{method}: {status}"));
-                Poll::Ready(Some(Err(status)))
+                Poll::Ready(Some(Err(RpcError::from_status(method, status))))
             }
             Poll::Ready(None) => {
                 self.finish_ok();
