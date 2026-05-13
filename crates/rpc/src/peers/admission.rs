@@ -44,21 +44,14 @@ pub struct Permit {
     peer: PeerId,
     kind: RequestKind,
     started_at_ms: u64,
-    cost: f32,
 }
 
 impl Permit {
-    pub(super) const fn new(
-        peer: PeerId,
-        kind: RequestKind,
-        started_at_ms: u64,
-        cost: f32,
-    ) -> Self {
+    pub(super) const fn new(peer: PeerId, kind: RequestKind, started_at_ms: u64) -> Self {
         Self {
             peer,
             kind,
             started_at_ms,
-            cost,
         }
     }
 
@@ -72,10 +65,6 @@ impl Permit {
 
     pub const fn started_at_ms(&self) -> u64 {
         self.started_at_ms
-    }
-
-    pub const fn cost(&self) -> f32 {
-        self.cost
     }
 }
 
@@ -184,22 +173,22 @@ impl TokenBucket {
         }
     }
 
+    /// Try to consume one token. Returns `Err(retry_after_ms)` when empty —
+    /// `None` retry-after means "never" (refill rate is zero).
     pub(super) fn try_take(
         &mut self,
         now_ms: u64,
         capacity: f64,
         refill_per_sec: f64,
-        cost: f32,
     ) -> Result<(), Option<u64>> {
-        let cost = f64::from(cost.max(0.0));
         self.refill(now_ms, capacity, refill_per_sec);
 
-        if cost <= self.tokens {
-            self.tokens -= cost;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
             return Ok(());
         }
 
-        let missing = cost - self.tokens;
+        let missing = 1.0 - self.tokens;
         let retry_after_ms = if refill_per_sec > 0.0 {
             Some(((missing / refill_per_sec) * 1000.0).ceil() as u64)
         } else {

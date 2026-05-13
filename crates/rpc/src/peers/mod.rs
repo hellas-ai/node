@@ -100,8 +100,7 @@ pub trait RpcServiceSpec: RpcService {
 /// code never passes method names, gRPC paths, or request/response types as
 /// raw strings. The trait carries everything codegen needs to lower a typed
 /// call site into the right wire shape: the typed message types, the gRPC
-/// path string the transport speaks, default admission cost, and unary-vs-
-/// streaming flags.
+/// path the transport speaks, and unary-vs-streaming flags.
 pub trait RpcMethod {
     type Service: RpcService;
     type Request: prost::Message + Default + 'static;
@@ -112,9 +111,6 @@ pub trait RpcMethod {
     /// inbound admission layer to match incoming requests and by codegen
     /// to construct outbound tonic calls.
     const GRPC_PATH: &'static str;
-    /// Per-method admission cost. Codegen seeds this from the schema;
-    /// callers can override per-call via the future `with_cost` builder.
-    const DEFAULT_COST: f32 = 1.0;
     /// True if the request side is `stream`-typed in the .proto.
     const REQUEST_STREAMING: bool = false;
     /// True if the response side is `stream`-typed in the .proto.

@@ -119,7 +119,6 @@ impl<E> From<PeerManagerError> for IrohChannelError<E> {
 pub async fn tracked_iroh_channel<M, Fut, E>(
     manager: &PeerManager,
     peer: tonic_iroh_transport::iroh::EndpointId,
-    cost: f32,
     connect: Fut,
 ) -> Result<(tonic_iroh_transport::IrohChannel, RpcPermitGuard), IrohChannelError<E>>
 where
@@ -127,7 +126,7 @@ where
     Fut: std::future::Future<Output = Result<tonic_iroh_transport::IrohChannel, E>>,
     E: std::fmt::Display,
 {
-    let mut permit = manager.acquire_iroh_method::<M>(peer, cost)?;
+    let mut permit = manager.acquire_iroh_method::<M>(peer)?;
     match connect.await {
         Ok(channel) => Ok((channel, permit)),
         Err(source) => {
