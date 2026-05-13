@@ -32,18 +32,23 @@ impl RequestKind {
 /// Admission token returned before a request starts.
 ///
 /// The caller must pass this value to `PeerRegistry::release` when the request
-/// completes so in-flight counters and latency stats stay accurate.
+/// completes so in-flight counters and latency stats stay accurate. The
+/// registry disarms the permit inside `release`; if a debug build drops an
+/// armed permit (i.e. neither released nor disarmed), it panics — that
+/// indicates a leaked in-flight slot, which the registry has no way to clean
+/// up on its own from sans-io state alone.
 ///
-/// This low-level permit is intentionally explicit because it has no registry
-/// owner, clock, or interior mutability. Higher-level managers should wrap it in
-/// an RAII guard: `Drop` records [`Outcome::Cancelled`], while successful or
-/// failed RPC completion consumes the guard and records the final [`Outcome`].
+/// Higher-level managers wrap this in an RAII guard so dropping the guard
+/// records [`Outcome::Cancelled`] and consumes the permit before its `Drop`
+/// fires; successful or failed RPC completion consumes the guard and records
+/// the final [`Outcome`].
 #[must_use = "permits must be released through PeerRegistry::release"]
 #[derive(Debug)]
 pub struct Permit {
     peer: PeerId,
     kind: RequestKind,
     started_at_ms: u64,
+    armed: bool,
 }
 
 impl Permit {
@@ -52,6 +57,7 @@ impl Permit {
             peer,
             kind,
             started_at_ms,
+            armed: true,
         }
     }
 
@@ -65,6 +71,27 @@ impl Permit {
 
     pub const fn started_at_ms(&self) -> u64 {
         self.started_at_ms
+    }
+
+    /// Internal disarm called by `PeerRegistry::release` before dropping the
+    /// permit. Application code should not call this directly.
+    pub(super) const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(debug_assertions)]
+            panic!(
+                "Permit for peer {} method {}::{} dropped without being released. \
+                 Did you forget to call `PeerRegistry::release` (or use an RAII guard)?",
+                self.peer, self.kind.service, self.kind.method
+            );
+            // In release builds we eat the leak silently — the alternative
+            // is panicking servers in production over a missing release call.
+        }
     }
 }
 

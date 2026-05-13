@@ -32,13 +32,18 @@ impl TransportSecurity {
 }
 
 /// Policy-facing authentication view derived from transport facts and trust.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Ordered most-to-least authoritative: `Authenticated > Local > Trusted >
+/// Untrusted`. Callers filter by minimum level with `entry.auth_level >=
+/// AuthLevel::Authenticated`. The variant order below is load-bearing —
+/// `PartialOrd` and `Ord` are derived from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthLevel {
-    Authenticated,
-    Local,
-    Trusted,
     #[default]
     Untrusted,
+    Trusted,
+    Local,
+    Authenticated,
 }
 
 impl AuthLevel {
