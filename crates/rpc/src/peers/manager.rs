@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5,8 +6,9 @@ use thiserror::Error;
 
 use super::MethodKey;
 use super::{
-    AcquireDenied, DiscoverySource, Outcome, PeerChange, PeerEvent, PeerId, PeerRegistry,
-    PeerRegistryConfig, Permit, RequestKind, ServiceKey, ServiceObservation, TransportSecurity,
+    AcquireDenied, DiscoverySource, Outcome, PeerChange, PeerEntry, PeerEvent, PeerId,
+    PeerRegistry, PeerRegistryConfig, Permit, RequestKind, ServiceKey, ServiceObservation,
+    ServiceState, TransportSecurity,
 };
 
 /// Shared peer-state owner for application code.
@@ -53,6 +55,17 @@ impl PeerManager {
     ) -> Result<R, PeerManagerError> {
         let registry = self.lock()?;
         Ok(read(&registry))
+    }
+
+    pub fn peer(&self, peer: PeerId) -> PeerSession {
+        PeerSession {
+            manager: self.clone(),
+            peer,
+        }
+    }
+
+    pub fn service_session<S: ServiceKey>(&self, peer: PeerId) -> PeerServiceSession<S> {
+        self.peer(peer).service::<S>()
     }
 
     pub fn apply(&self, peer: PeerId, event: PeerEvent) -> Result<PeerChange, PeerManagerError> {
@@ -141,6 +154,92 @@ impl PeerManager {
         self.registry
             .lock()
             .map_err(|_| PeerManagerError::Unavailable)
+    }
+}
+
+/// Logical session view for one remote peer.
+///
+/// This is not a transport connection handle. It is a typed view over shared
+/// peer facts. A transport may have zero, one, or many physical links for the
+/// peer while all observations still converge here.
+#[derive(Clone, Debug)]
+pub struct PeerSession {
+    manager: PeerManager,
+    peer: PeerId,
+}
+
+impl PeerSession {
+    pub const fn peer_id(&self) -> PeerId {
+        self.peer
+    }
+
+    pub fn service<S: ServiceKey>(&self) -> PeerServiceSession<S> {
+        PeerServiceSession {
+            manager: self.manager.clone(),
+            peer: self.peer,
+            _service: PhantomData,
+        }
+    }
+
+    pub fn with_entry<R>(
+        &self,
+        read: impl FnOnce(Option<&PeerEntry>) -> R,
+    ) -> Result<R, PeerManagerError> {
+        self.manager
+            .with_registry(|registry| read(registry.get(self.peer)))
+    }
+
+    pub fn entry_snapshot(&self) -> Result<Option<PeerEntry>, PeerManagerError> {
+        self.with_entry(|entry| entry.cloned())
+    }
+}
+
+/// Logical session view for one `(peer, service)` pair.
+///
+/// This is the API shape application and generated client code should prefer.
+/// It keeps service capability explicit while preserving the global peer state
+/// underneath.
+#[derive(Clone, Debug)]
+pub struct PeerServiceSession<S: ServiceKey> {
+    manager: PeerManager,
+    peer: PeerId,
+    _service: PhantomData<fn() -> S>,
+}
+
+impl<S: ServiceKey> PeerServiceSession<S> {
+    pub const fn peer_id(&self) -> PeerId {
+        self.peer
+    }
+
+    pub const fn service_name(&self) -> &'static str {
+        S::NAME
+    }
+
+    pub fn observe_discovered(
+        &self,
+        source: DiscoverySource,
+        transport_security: TransportSecurity,
+    ) -> Result<ServiceObservation, PeerManagerError> {
+        self.manager
+            .observe_discovered_service_key::<S>(self.peer, source, transport_security)
+    }
+
+    pub fn acquire_method<M: MethodKey<Service = S>>(
+        &self,
+        cost: f32,
+        observation: RpcObservation,
+    ) -> Result<RpcPermitGuard, PeerManagerError> {
+        self.manager
+            .acquire_rpc(self.peer, RequestKind::for_method::<M>(), cost, observation)
+    }
+
+    pub fn state(&self) -> Result<Option<ServiceState>, PeerManagerError> {
+        self.manager.with_registry(|registry| {
+            registry
+                .get(self.peer)
+                .and_then(|entry| entry.service::<S>())
+                .cloned()
+        })
     }
 }
 
@@ -375,5 +474,27 @@ mod tests {
         assert_eq!(entry.cancelled_count, 1);
         assert_eq!(entry.in_flight, 0);
         assert_eq!(registry.total_in_flight(), 0);
+    }
+
+    #[test]
+    fn service_session_ties_method_to_service() {
+        let manager = PeerManager::with_config(config());
+        let id = peer(4);
+        let node = manager.peer(id).service::<NodeService>();
+
+        let mut permit = node
+            .acquire_method::<crate::service::methods::GetNodeInfo>(
+                1.0,
+                RpcObservation::authenticated_transport("iroh"),
+            )
+            .expect("request should be admitted");
+        permit.finish_ok();
+
+        let service = node
+            .state()
+            .expect("registry should be readable")
+            .expect("node service should be recorded");
+        assert_eq!(service.service, <NodeService as ServiceKey>::NAME);
+        assert_eq!(service.success_count, 1);
     }
 }

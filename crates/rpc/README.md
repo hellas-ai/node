@@ -83,6 +83,7 @@ Use it directly only when a target needs strict sans-io control.
 - Owns shared registry state.
 - Supplies wall-clock timestamps.
 - Provides closure-based reads and snapshots.
+- Exposes `PeerSession` and `PeerServiceSession<S>` views over the shared state.
 - Provides RAII RPC guards so dropped requests release in-flight slots.
 
 Generated clients, hand-written clients, and transport adapters should generally
@@ -133,8 +134,8 @@ manager.observe_discovered_service(
 Outbound RPCs acquire admission before I/O and finish exactly once:
 
 ```rust
-let mut permit = manager.acquire_method::<methods::ListModels>(
-    peer,
+let courtesy = manager.peer(peer).service::<CourtesyService>();
+let mut permit = courtesy.acquire_method::<methods::ListModels>(
     1.0,
     RpcObservation::authenticated_transport("iroh"),
 )?;
