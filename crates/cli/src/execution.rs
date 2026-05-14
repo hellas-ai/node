@@ -606,9 +606,12 @@ impl PreparedRoute {
                         anyhow!(err)
                             .context(format!("failed to dial Courtesy on {}", target.node_id))
                     })?;
-                let client = CourtesyClientImpl::new(transport);
-                let response = client
-                    .quote_prepared_text(quote_req.clone())
+                // Use unary_with_trailer to receive both the response and
+                // the server's End-frame metadata (provenance headers).
+                let with_trailer = hellas_rpc::call::unary_with_trailer::<
+                    _,
+                    hellas_rpc::services::courtesy::QuotePreparedText,
+                >(&transport, quote_req.clone(), hellas_wire::Metadata::new())
                     .await
                     .map_err(|status| {
                         anyhow!(status).context(format!(
@@ -616,13 +619,19 @@ impl PreparedRoute {
                             target.node_id
                         ))
                     })?;
-                let ticket = response.ticket.ok_or_else(|| {
+                let ticket = with_trailer.response.ticket.ok_or_else(|| {
                     anyhow!("quote_prepared_text response from {} missing ticket", target.node_id)
                 })?;
+                // Pull provenance from the trailer; fall back to a zero
+                // digest if the transport didn't surface trailer metadata.
+                let provenance = hellas_rpc::provenance::read_provenance_metadata(
+                    &with_trailer.metadata,
+                )
+                .unwrap_or(ExecutionProvenance {
+                    commitment_id: [0; 32],
+                });
 
                 // Open a fresh Execute-ALPN transport for the run step.
-                // (CourtesyClient holds the courtesy substream — the run
-                // happens on a different service ALPN.)
                 let execute_pool = registry.pool::<Execute>();
                 let execute_transport =
                     execute_pool.transport(target.node_id).await.map_err(|err| {
@@ -632,14 +641,7 @@ impl PreparedRoute {
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
                     request_commitment: ticket.request_commitment,
-                    // FINDING: the wire codegen does not yet surface
-                    // response trailers to the client side, so the
-                    // commitment_id we record at quote time is the
-                    // ticket's request_commitment-derived placeholder.
-                    // Tracked in CUTOVER_FINDINGS.
-                    provenance: ExecutionProvenance {
-                        commitment_id: [0; 32],
-                    },
+                    provenance,
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {

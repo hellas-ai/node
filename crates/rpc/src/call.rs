@@ -14,7 +14,7 @@ use prost::Message;
 use hellas_wire::metadata::{Metadata, Trailer};
 use hellas_wire::status::{WireCode, WireStatus};
 use hellas_wire::transport::{
-    MethodMarker, SendHalf, Stream as WireStream, StreamTransport,
+    MethodMarker, RecvHalf, SendHalf, Stream as WireStream, StreamTransport,
 };
 use hellas_wire::TransportError;
 
@@ -28,6 +28,28 @@ pub async fn unary<T, M>(
     request: M::Request,
     headers: Metadata,
 ) -> Result<M::Response, WireStatus>
+where
+    T: StreamTransport + Sync,
+    M: MethodMarker,
+    M::Request: Message,
+    M::Response: Message + Default,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    unary_with_trailer::<T, M>(transport, request, headers)
+        .await
+        .map(|wt| wt.response)
+}
+
+/// Unary call returning both the response and the terminal trailer
+/// metadata. Server-side handlers populate the trailer via
+/// `WithTrailer<R>`; this surfaces those bytes to the client so it
+/// can read `x-hellas-commitment-bin` / receipts / OTel response
+/// context.
+pub async fn unary_with_trailer<T, M>(
+    transport: &T,
+    request: M::Request,
+    headers: Metadata,
+) -> Result<WithTrailer<M::Response>, WireStatus>
 where
     T: StreamTransport + Sync,
     M: MethodMarker,
@@ -67,7 +89,13 @@ where
         .map_err(|e| WireStatus::internal(format!("prost decode: {e}")))?;
     // Drain to terminal.
     while recv.next().await.is_some() {}
-    Ok(response)
+
+    // Pull trailer metadata if the recv-half captured one (set on End
+    // frame). Falls back to an empty Metadata when the transport
+    // didn't surface trailer info (e.g. mux flavors without trailer
+    // plumbing).
+    let metadata = recv.trailer().map(|t| t.metadata.clone()).unwrap_or_default();
+    Ok(WithTrailer::with_metadata(response, metadata))
 }
 
 /// Server-streaming call: send one request, receive a stream of responses.
