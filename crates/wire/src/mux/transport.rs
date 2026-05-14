@@ -320,13 +320,15 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
     }
 
     async fn flush_outbound(&mut self) {
+        // Replenish credit BEFORE draining outbound so the Credit
+        // frames ship in this same flush. (Doing this after the drain
+        // would defer the Credit frame to the next inbound activity.)
+        let _credit_slots = self.mux.prepare_credit_updates();
         while let Some(bytes) = self.mux.next_outbound() {
             if let Err(e) = self.pipe.send_message(bytes).await {
                 tracing::warn!("pipe send: {e}");
                 break;
             }
         }
-        // Replenish credit on slots that have drained.
-        let _credit_slots = self.mux.prepare_credit_updates();
     }
 }
