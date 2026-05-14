@@ -10,6 +10,7 @@ pub mod error;
 #[cfg(feature = "node")]
 pub mod model;
 
+pub mod call;
 pub mod peers;
 
 #[cfg(feature = "node")]

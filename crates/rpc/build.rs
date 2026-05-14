@@ -665,7 +665,7 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
         let (sig_req, sig_resp) = client_signature(method, &request_ty, &response_ty);
         out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::TransportError>> + Send;\n",
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::WireStatus>> + Send;\n",
         ));
     }
     out.push_str("    }\n\n");
@@ -686,18 +686,101 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
         let (sig_req, sig_resp) = server_signature(method, &request_ty, &response_ty);
         out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::TransportError>> + Send;\n",
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::WireStatus>> + Send;\n",
         ));
     }
     out.push_str("    }\n\n");
 
-    // -- Server dispatcher (stub) --
+    // -- Generic Client impl over any StreamTransport, using rpc::call helpers --
+    let client_impl_name = format!("{}ClientImpl", service.proto_name);
     out.push_str(&format!(
-        "    /// Wraps a `{server_trait}` and routes inbound streams to it.\n\
-        \x20   ///\n\
-        \x20   /// TODO(hellas-wire v2): dispatch is currently a stub; the\n\
-        \x20   /// consumer migration phase fills in the decode → handler →\n\
-        \x20   /// encode → trailer pipeline.\n\
+        "    /// Generic client over any `StreamTransport`. Wraps a transport\n\
+        \x20   /// handle by reference; clone to share. Uses the prost-aware\n\
+        \x20   /// helpers in `crate::call`.\n\
+        \x20   #[derive(Clone, Debug)]\n\
+        \x20   pub struct {client_impl_name}<T> {{\n\
+        \x20       transport: T,\n\
+        \x20   }}\n\n\
+        \x20   impl<T> {client_impl_name}<T> {{\n\
+        \x20       pub fn new(transport: T) -> Self {{\n\
+        \x20           Self {{ transport }}\n\
+        \x20       }}\n\
+        \x20   }}\n\n",
+        client_impl_name = client_impl_name,
+    ));
+    // Client trait impl bodies that delegate to the call helpers.
+    out.push_str(&format!(
+        "    impl<T> {client_trait}<T> for {client_impl_name}<T>\n\
+        \x20   where\n\
+        \x20       T: ::hellas_wire::StreamTransport + Sync,\n\
+        \x20       T::Error: ::std::error::Error + Send + Sync + 'static,\n\
+        \x20       T::Stream: 'static,\n\
+        \x20   {{\n",
+        client_trait = client_trait,
+        client_impl_name = client_impl_name,
+    ));
+    for method in &service.methods {
+        let fn_name = to_snake_case(&method.proto_name);
+        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
+        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
+        let (sig_req, sig_resp) = client_signature(method, &request_ty, &response_ty);
+        let method_marker = &method.proto_name;
+        // For now, only unary and server-streaming have real impls; others stub.
+        let body = match (method.request_streaming, method.response_streaming) {
+            (false, false) => format!(
+                "            async move {{\n\
+                \x20               crate::call::unary::<T, {method_marker}>(\n\
+                \x20                   &self.transport, request, ::hellas_wire::Metadata::new()).await\n\
+                \x20           }}",
+                method_marker = method_marker,
+            ),
+            (false, true) => "            async move { unimplemented!(\"adapter built below\") }".to_string(),
+            _ => "            async move { unimplemented!(\"client/bidi streaming pending\") }".to_string(),
+        };
+        // Pure server-streaming (unary request, streaming response) gets a
+        // real impl via `crate::call::server_streaming`. All other streaming
+        // shapes (client-stream, bidi) stay stubbed pending more helpers.
+        let (real_sig_resp, body) = if method.response_streaming && !method.request_streaming {
+            (
+                format!(
+                    "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>",
+                    resp = response_ty
+                ),
+                format!(
+                    "            async move {{\n\
+                    \x20               crate::call::server_streaming::<T, {method_marker}>(\n\
+                    \x20                   &self.transport, request, ::hellas_wire::Metadata::new()).await\n\
+                    \x20           }}",
+                    method_marker = method_marker,
+                ),
+            )
+        } else if method.response_streaming {
+            // client-stream/bidi: keep the streaming response signature but stub the body.
+            (
+                format!(
+                    "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>",
+                    resp = response_ty
+                ),
+                "            async move { let _ = request; unimplemented!(\"client/bidi streaming pending\") }".to_string(),
+            )
+        } else {
+            (sig_resp.clone(), body)
+        };
+        out.push_str(&format!(
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{real_sig_resp}, ::hellas_wire::WireStatus>> + Send {{\n\
+            {body}\n\
+            \x20       }}\n",
+        ));
+    }
+    out.push_str("    }\n\n");
+
+    // -- Server dispatcher --
+    out.push_str(&format!(
+        "    /// Wraps a `{server_trait}` and routes inbound streams to it\n\
+        \x20   /// by `method_id`. For unary methods the dispatch decodes the\n\
+        \x20   /// request, invokes the handler, encodes the response, and\n\
+        \x20   /// emits a terminal trailer. Streaming methods are stubbed\n\
+        \x20   /// pending wire-v2 ergonomics.\n\
         \x20   pub struct {service}Server<H>(pub H);\n\n\
         \x20   impl<T, H> ::hellas_wire::Dispatcher<T> for {service}Server<H>\n\
         \x20   where\n\
@@ -709,13 +792,45 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         \x20           &self,\n\
         \x20           inbound: ::hellas_wire::Inbound<T::Stream>,\n\
         \x20       ) -> ::core::result::Result<(), Self::Error> {{\n\
-        \x20           let _ = (&self.0, inbound);\n\
-        \x20           unimplemented!(\"{service}Server::dispatch — wire v2 pipeline pending\");\n\
-        \x20       }}\n\
-        \x20   }}\n\n",
+        \x20           match inbound.method_id {{\n",
         service = service.proto_name,
         server_trait = server_trait,
     ));
+    for method in &service.methods {
+        let fn_name = to_snake_case(&method.proto_name);
+        let method_marker = &method.proto_name;
+        let case_body = match (method.request_streaming, method.response_streaming) {
+            (false, false) => format!(
+                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
+                \x20                   crate::call::dispatch_unary::<T, {method_marker}, _, _>(inbound, |req| {{\n\
+                \x20                       let h = &self.0;\n\
+                \x20                       async move {{ h.{fn_name}(req).await }}\n\
+                \x20                   }}).await\n\
+                \x20               }}",
+                method_marker = method_marker,
+                fn_name = fn_name,
+            ),
+            _ => format!(
+                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
+                \x20                   let _ = (&self.0, inbound);\n\
+                \x20                   ::core::result::Result::Err(::hellas_wire::TransportError::Protocol(\n\
+                \x20                       \"streaming dispatch pending for {method_marker}\".to_string()\n\
+                \x20                   ))\n\
+                \x20               }}",
+                method_marker = method_marker,
+            ),
+        };
+        out.push_str(&case_body);
+        out.push('\n');
+    }
+    out.push_str(
+        "                other => Err(::hellas_wire::TransportError::Protocol(\n\
+        \x20                   format!(\"unknown method_id 0x{:08x}\", other)\n\
+        \x20               )),\n\
+        \x20           }\n\
+        \x20       }\n\
+        \x20   }\n\n",
+    );
 
     out.push_str("}\n\n");
 }
@@ -768,7 +883,7 @@ fn client_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, Strin
         req.to_string()
     };
     let resp_sig = if method.response_streaming {
-        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::TransportError>> + Send>>")
+        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>")
     } else {
         resp.to_string()
     };
@@ -782,7 +897,7 @@ fn server_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, Strin
         req.to_string()
     };
     let resp_sig = if method.response_streaming {
-        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::TransportError>> + Send>>")
+        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>")
     } else {
         resp.to_string()
     };
