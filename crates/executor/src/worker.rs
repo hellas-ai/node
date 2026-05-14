@@ -3,7 +3,7 @@ use crate::state::{Invocation, ModelLocator, StopReason};
 use chatgrad::PreparedPrompt;
 use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
 use hellas_core::SymbolicRequest;
-use hellas_pb::hellas::{
+use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
-use tonic::Status;
+use hellas_wire::WireStatus;
 use tracing::warn;
 
 pub(crate) struct ExecuteWorker {
@@ -34,7 +34,7 @@ pub(crate) struct ExecuteJob {
     pub stream_batch_size: u32,
     pub accepted_at: Instant,
     pub cancel: CancellationToken,
-    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
+    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
 }
 
 struct DecodeOutcome {
@@ -47,7 +47,7 @@ pub(crate) struct WorkerCompletion {
     pub model_id: String,
     pub symbolic_request: SymbolicRequest,
     pub invocation: Invocation,
-    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
+    pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub result: WorkerCompletionResult,
 }
 
@@ -246,7 +246,7 @@ fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, hellas_rpc::ExecutorE
 
 fn make_on_progress(
     position: Arc<AtomicU64>,
-    sender: tokio_mpsc::Sender<Result<PbWorkEvent, Status>>,
+    sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     cancel: CancellationToken,
     execution_id: String,
 ) -> impl FnMut(u64, &[u8]) + Send {

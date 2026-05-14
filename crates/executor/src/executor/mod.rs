@@ -1,19 +1,19 @@
 mod actor;
 mod handle;
 
-use hellas_pb::courtesy::{
+use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
     GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
-use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
-use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
-use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
+use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
 use tokio::sync::{mpsc, oneshot};
-use tonic::Status;
+use hellas_wire::WireStatus;
 
 use crate::worker::WorkerCompletion;
 pub use actor::Executor;
@@ -21,7 +21,7 @@ pub use actor::Executor;
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the
 /// worker observes on its next chunk send and converts into a cancel.
-pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, Status>>;
+pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, WireStatus>>;
 
 /// Quote response paired with the provenance the executor committed to.
 /// `provenance` is the same value the executor logs at quote/accept time;

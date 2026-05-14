@@ -3,7 +3,7 @@ use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use hellas_core::{Digest, Opaque, SignedReceipt, canonical_dag_cbor};
 use hellas_core::{Symbolic, SymbolicOutput};
-use hellas_pb::hellas::{
+use hellas_rpc::pb::execute::{
     FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
     work_event,
 };
