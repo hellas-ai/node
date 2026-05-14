@@ -490,6 +490,102 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     pub fn recv_trailer(&self, idx: SlotIndex) -> Option<Trailer> {
         self.slot(idx).and_then(|s| s.recv_trailer.clone())
     }
+
+    // -- Hibernation snapshot/restore ---------------------------------------
+    //
+    // These helpers expose just enough internal state for transports that
+    // hibernate (notably CF Durable Objects) to serialize the Multiplexer
+    // and restore it on wake. Application drivers should not call them
+    // directly; use the transport adapter's `serialize_mux` /
+    // `deserialize_mux` instead.
+
+    /// The free-mask backing store. Each `u64` covers 64 slot indices.
+    pub(crate) fn free_mask_words(&self) -> &[u64] {
+        &self.free_mask
+    }
+
+    /// Overwrite the free mask in-place during restore.
+    pub(crate) fn set_free_mask_words(&mut self, words: &[u64]) {
+        let len = self.free_mask.len().min(words.len());
+        self.free_mask[..len].copy_from_slice(&words[..len]);
+    }
+
+    /// Current pending wire write (`Some` iff a write was prepared but not
+    /// yet handed to the transport, or a previously-handed write reported
+    /// backpressure and was re-stashed).
+    pub(crate) fn pending_write_ref(&self) -> Option<&bytes::Bytes> {
+        self.pending_write.as_ref()
+    }
+
+    /// Replace `pending_write`. Used by the CF DO restore path.
+    pub(crate) fn set_pending_write(&mut self, pending: Option<bytes::Bytes>) {
+        self.pending_write = pending;
+    }
+
+    /// Sample the mux's clock. Snapshot serializers use this to capture a
+    /// single consistent `now` against which `opened_at`/`deadline` are
+    /// converted to durations.
+    pub(crate) fn clock_now(&self) -> web_time::Instant {
+        self.clock.now()
+    }
+
+    /// Iterate occupied slots so the transport can snapshot them.
+    pub(crate) fn iter_occupied_slots(
+        &self,
+    ) -> impl Iterator<Item = (SlotIndex, &StreamSlot)> + '_ {
+        self.streams
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i as SlotIndex, s)))
+    }
+
+    /// Restore one occupied slot. Caller is expected to have already reset
+    /// the multiplexer to the post-`new()` state and applied the free mask;
+    /// each slot restored here will additionally mark the slot busy in the
+    /// free mask if owned by our parity (peer-owned slots are tracked but
+    /// the peer's free mask is implicit).
+    pub(crate) fn restore_slot(&mut self, idx: SlotIndex, slot: StreamSlot) {
+        if (idx as usize) >= N {
+            return;
+        }
+        self.streams[idx as usize] = Some(slot);
+        // Free-mask is the caller's responsibility (restored above).
+    }
+
+    /// Construct a `StreamSlot` from a snapshot. The caller supplies the
+    /// post-wake `opened_at` (so `Instant`s reconstitute relative to the
+    /// new clock). `recv_buf`, `recv_trailer`, and `send_queued` are reset:
+    /// the hibernation contract is that no per-frame buffered state
+    /// survives — only the slot's accounting fields.
+    pub(crate) fn make_restored_slot(
+        generation: u16,
+        state: SlotState,
+        method_id: u32,
+        opened_at: web_time::Instant,
+        deadline: Option<web_time::Instant>,
+        peer_recv_credit: u32,
+        local_recv_credit: u32,
+        local_credit_high_water: u32,
+    ) -> StreamSlot {
+        StreamSlot {
+            generation,
+            state,
+            method_id,
+            opened_at,
+            deadline,
+            peer_recv_credit,
+            local_recv_credit,
+            local_credit_high_water,
+            send_queued: None,
+            // HalfClosedLocal: we sent our terminal frame → local_terminal.
+            // HalfClosedRemote: peer sent theirs → peer_terminal.
+            // Closed: both. Open*/Open: neither.
+            local_terminal: matches!(state, SlotState::HalfClosedLocal | SlotState::Closed),
+            peer_terminal: matches!(state, SlotState::HalfClosedRemote | SlotState::Closed),
+            recv_buf: Default::default(),
+            recv_trailer: None,
+        }
+    }
 }
 
 #[cfg(test)]

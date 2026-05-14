@@ -5,7 +5,7 @@ use catgrad_llm::LLMError;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
-use hellas_pb::courtesy::{
+use crate::pb::generated::hellas::courtesy::{
     QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
 };
 use serde_json::Value;

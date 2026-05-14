@@ -29,8 +29,8 @@ impl From<[u8; 32]> for PeerId {
 }
 
 #[cfg(feature = "iroh")]
-impl From<tonic_iroh_transport::iroh::EndpointId> for PeerId {
-    fn from(peer_id: tonic_iroh_transport::iroh::EndpointId) -> Self {
+impl From<iroh::EndpointId> for PeerId {
+    fn from(peer_id: iroh::EndpointId) -> Self {
         Self::from_bytes(*peer_id.as_bytes())
     }
 }
