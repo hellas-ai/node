@@ -10,10 +10,10 @@ mod worker;
 
 pub use artifacts::ArtifactStoreConfig;
 pub use executor::{Executor, ExecutorHandle};
-pub use hellas_pb::courtesy::courtesy_server::CourtesyServer;
-pub use hellas_pb::hellas::execute_server::ExecuteServer;
-pub use hellas_pb::opaque::opaque_server::OpaqueServer;
-pub use hellas_pb::symbolic::symbolic_server::SymbolicServer;
+pub use hellas_rpc::services::courtesy::CourtesyServer;
+pub use hellas_rpc::services::execute::ExecuteServer;
+pub use hellas_rpc::services::opaque::OpaqueServer;
+pub use hellas_rpc::services::symbolic::SymbolicServer;
 pub use metrics::ExecutorMetrics;
 
 pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;
