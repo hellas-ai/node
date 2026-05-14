@@ -54,7 +54,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
   "all-protocols",
 ] }
 hellas-wire = { workspace = true, features = ["iroh"] }
-iroh = { version = "0.98", default-features = false }
+iroh = { workspace = true, features = ["tls-ring"] }
 iroh-metrics = { version = "0.38", default-features = false, features = [
   "metrics",
 ], optional = true }
