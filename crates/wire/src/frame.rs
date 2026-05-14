@@ -253,14 +253,34 @@ fn encode_metadata(meta: &Metadata, out: &mut bytes::BytesMut) {
     }
 }
 
+/// Hard cap on Metadata entries in a single frame. The plan calls for
+/// 64 entries; cap at 256 to leave headroom while preventing
+/// DoS-by-headers allocations.
+const METADATA_MAX_ENTRIES: u64 = 256;
+/// Hard cap on per-key / per-value byte length in a single frame.
+/// 64 KiB is well over what any sane RPC header carries.
+const METADATA_MAX_FIELD_LEN: usize = 64 * 1024;
+
 fn decode_metadata(buf: &[u8]) -> Result<(Metadata, usize), FrameError> {
     let (count, consumed) = read_varint(buf)?;
+    if count > METADATA_MAX_ENTRIES {
+        return Err(FrameError::BodyTooLarge {
+            len: count as usize,
+            limit: METADATA_MAX_ENTRIES as usize,
+        });
+    }
     let mut pos = consumed;
     let mut meta = Metadata::with_capacity(count as usize);
     for _ in 0..count {
         let (key_len, c) = read_varint(&buf[pos..])?;
         pos += c;
         let key_len = key_len as usize;
+        if key_len > METADATA_MAX_FIELD_LEN {
+            return Err(FrameError::BodyTooLarge {
+                len: key_len,
+                limit: METADATA_MAX_FIELD_LEN,
+            });
+        }
         if buf.len() < pos + key_len {
             return Err(FrameError::Short {
                 needed: pos + key_len,
@@ -282,6 +302,12 @@ fn decode_metadata(buf: &[u8]) -> Result<(Metadata, usize), FrameError> {
         let (val_len, c) = read_varint(&buf[pos..])?;
         pos += c;
         let val_len = val_len as usize;
+        if val_len > METADATA_MAX_FIELD_LEN {
+            return Err(FrameError::BodyTooLarge {
+                len: val_len,
+                limit: METADATA_MAX_FIELD_LEN,
+            });
+        }
         if buf.len() < pos + val_len {
             return Err(FrameError::Short {
                 needed: pos + val_len,

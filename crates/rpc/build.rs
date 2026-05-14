@@ -863,7 +863,9 @@ fn build_method_schema(
     let request_msg = index.message_schema(&method.request_proto_type);
     let response_msg = index.message_schema(&method.response_proto_type);
     OwnedMethodSchema {
-        fqn: format!("{service_fqn}.{}", method.proto_name),
+        // FQN matches HELLAS_WIRE_PLAN_v2.md's "Service/Method"
+        // convention — same shape as the gRPC :path on h2/h3.
+        fqn: format!("{service_fqn}/{}", method.proto_name),
         request: OwnedTypeSchema::Message(request_msg),
         response: OwnedTypeSchema::Message(response_msg),
         request_streaming: method.request_streaming,

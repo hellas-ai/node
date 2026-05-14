@@ -4,13 +4,14 @@
 //! - Per-feed priority, trust, and scope
 //! - Merged, deduped stream consumed by the [`ServiceRegistry`]
 //!
-//! ## Backend status
+//! ## Backends
 //!
-//! * `StaticBackend` and `PeerExchangeBackend` — fully implemented.
-//! * `MdnsBackend` (`discovery-mdns`) and `DhtBackend` (`discovery-dht`)
-//!   are scope-deferred for the wire v1 cutover; the modules exist as
-//!   empty stubs behind their feature flags so future work can land
-//!   without churning consumers.
+//! * `StaticBackend` and `PeerExchangeBackend` — always available.
+//! * `DhtBackend` (`discovery-dht`) — mainline-DHT shard buckets with
+//!   signed service ads.
+//! * `MdnsBackend` (`discovery-mdns`) — local-network discovery via the
+//!   external `iroh-mdns-address-lookup` crate (in iroh 1.0.0-rc.0 mDNS
+//!   moved out of the core iroh crate).
 
 pub mod discovery;
 pub mod engine;
@@ -26,3 +27,8 @@ pub use discovery::{DiscoveredPeer, Discovery, Peer, PeerExchangeBackend, Static
 pub use engine::SwarmEngine;
 pub use peers::{PeerFeed, PeerFeedSpec, Scope};
 pub use registry::ServiceRegistry;
+
+#[cfg(feature = "discovery-dht")]
+pub use dht::{DhtBackend, DhtPublisher, DhtPublisherConfig};
+#[cfg(feature = "discovery-mdns")]
+pub use mdns::MdnsBackend;

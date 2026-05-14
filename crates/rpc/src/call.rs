@@ -75,25 +75,33 @@ where
         .await
         .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
 
-    let chunk = match recv.next().await {
-        Some(Ok(b)) => b,
+    let chunk_opt = match recv.next().await {
+        Some(Ok(b)) => Some(b),
         Some(Err(e)) => return Err(WireStatus::internal(format!("recv: {e}"))),
-        None => {
-            return Err(WireStatus::new(
-                WireCode::Internal,
-                "empty unary response",
-            ));
-        }
+        None => None,
     };
+    // Drain to terminal so the trailer is populated.
+    while recv.next().await.is_some() {}
+    // If the server emitted an error trailer, surface it as the call
+    // result — don't conflate "no body" with "Internal".
+    if let Some(trailer) = recv.trailer() {
+        if trailer.status != WireCode::Ok {
+            return Err(WireStatus {
+                code: trailer.status,
+                message: trailer.message.clone(),
+                details: bytes::Bytes::new(),
+                metadata: trailer.metadata.clone(),
+            });
+        }
+    }
+    let chunk = chunk_opt.ok_or_else(|| {
+        WireStatus::new(
+            WireCode::Internal,
+            "empty unary response with Ok trailer",
+        )
+    })?;
     let response = M::Response::decode(&chunk[..])
         .map_err(|e| WireStatus::internal(format!("prost decode: {e}")))?;
-    // Drain to terminal.
-    while recv.next().await.is_some() {}
-
-    // Pull trailer metadata if the recv-half captured one (set on End
-    // frame). Falls back to an empty Metadata when the transport
-    // didn't surface trailer info (e.g. mux flavors without trailer
-    // plumbing).
     let metadata = recv.trailer().map(|t| t.metadata.clone()).unwrap_or_default();
     Ok(WithTrailer::with_metadata(response, metadata))
 }
