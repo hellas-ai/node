@@ -30,7 +30,6 @@ hellas-pb = { workspace = true, features = [
   "server",
 ] }
 hellas-rpc = { workspace = true, features = [
-  "compression",
   "node",
 ] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
