@@ -67,6 +67,22 @@ pub struct WireStatus {
 }
 
 impl WireStatus {
+    pub fn code(&self) -> WireCode {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn details(&self) -> &bytes::Bytes {
+        &self.details
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
     pub fn ok() -> Self {
         Self {
             code: WireCode::Ok,
