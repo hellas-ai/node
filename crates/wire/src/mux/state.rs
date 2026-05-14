@@ -544,10 +544,27 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     pub(crate) fn iter_occupied_slots(
         &self,
     ) -> impl Iterator<Item = (SlotIndex, &StreamSlot)> + '_ {
+        // A slot is "occupied" iff it has a record AND is NOT in the
+        // free_mask. After reset/close the slot stays `Some` (we keep
+        // the generation counter so the next allocator round bumps it)
+        // but is marked free in the bitmap. Those records are not
+        // serialized — they'd round-trip back as the bogus "slot is
+        // both in free_mask and listed as occupied" state.
         self.streams
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|s| (i as SlotIndex, s)))
+            .filter_map(move |(i, s)| {
+                let s = s.as_ref()?;
+                let idx = i as SlotIndex;
+                let word = self.free_mask.get((idx / 64) as usize).copied().unwrap_or(0);
+                let bit = 1u64 << (idx % 64);
+                if word & bit != 0 {
+                    // In free_mask → not currently occupied.
+                    None
+                } else {
+                    Some((idx, s))
+                }
+            })
     }
 
     /// Restore one occupied slot. Caller is expected to have already reset
