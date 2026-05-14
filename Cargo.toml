@@ -36,6 +36,10 @@ harness = false
 name = "end_to_end"
 required-features = ["secp256k1"]
 
+[[example]]
+name = "mixed_open_auth"
+required-features = ["secp256k1", "webauthn"]
+
 [lints.rust]
 elided-lifetimes-in-paths = "deny"
 missing-copy-implementations = "deny"
