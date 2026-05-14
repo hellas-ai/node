@@ -66,3 +66,12 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# External crates that path-depend `iroh` / `iroh-base` (e.g.
+# `iroh-mdns-address-lookup`) would otherwise pull the published copies
+# from crates.io alongside our local fork, splitting the type graph. Patch
+# them to the same path-deps so `PublicKey` (and friends) resolve to a
+# single crate.
+[patch.crates-io]
+iroh = { path = "../iroh/iroh" }
+iroh-base = { path = "../iroh/iroh-base" }

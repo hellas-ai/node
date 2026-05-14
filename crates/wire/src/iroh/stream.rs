@@ -25,6 +25,10 @@ const STREAM_ERROR_CODE: u32 = 1;
 pub struct IrohStream {
     send: Option<SendStream>,
     recv: Option<RecvStream>,
+    /// Bytes already read off the wire that haven't been consumed yet —
+    /// happens when the OPEN frame and the first Body frame arrive in
+    /// the same TCP segment and the accept loop reads past OPEN.
+    prefix: BytesMut,
     reset_flag: Arc<AtomicBool>,
 }
 
@@ -33,6 +37,19 @@ impl IrohStream {
         Self {
             send: Some(send),
             recv: Some(recv),
+            prefix: BytesMut::new(),
+            reset_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Construct with bytes already pre-read off the wire. The recv-half
+    /// will yield these bytes before pulling anything new from the
+    /// underlying RecvStream.
+    pub(crate) fn with_prefix(send: SendStream, recv: RecvStream, prefix: BytesMut) -> Self {
+        Self {
+            send: Some(send),
+            recv: Some(recv),
+            prefix,
             reset_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -79,7 +96,7 @@ impl crate::transport::Stream for IrohStream {
             },
             IrohRecvHalf {
                 recv: Some(recv),
-                read_buf: BytesMut::new(),
+                read_buf: std::mem::take(&mut self.prefix),
                 trailer: None,
                 reset_flag: flag2,
                 done: false,
