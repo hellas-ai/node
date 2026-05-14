@@ -115,3 +115,60 @@ pub trait RecvHalf: FuturesStream<Item = Result<Bytes, <Self as RecvHalf>::Error
     /// Cancel both directions of the underlying stream. Idempotent.
     fn reset(&mut self, code: WireCode);
 }
+
+// -- Codegen marker traits ---------------------------------------------------
+//
+// The `hellas-rpc` build script emits one marker type per proto service and
+// one per proto method. The markers carry compile-time identity (name, id,
+// streaming flags, request/response types) so call sites never spell wire
+// names as strings.
+
+/// Compile-time identity of a proto service. The build script emits one
+/// implementor per `service` block.
+pub trait ServiceMarker {
+    /// Fully-qualified service name (`package.Service`).
+    const NAME: &'static str;
+    /// Wire ALPN derived from `NAME` (e.g. `/hellas.swarm.v1.Node/1.0`).
+    const ALPN: &'static str;
+    /// Truncated 32-bit service id (blake3-of-schema, low 4 bytes LE).
+    const SERVICE_ID: u32;
+}
+
+/// Compile-time identity of a proto rpc method. The build script emits one
+/// implementor per `rpc` line.
+pub trait MethodMarker {
+    type Service: ServiceMarker;
+    /// Wire-decodable request type (prost message).
+    type Request;
+    /// Wire-decodable response type (prost message).
+    type Response;
+
+    /// Method name as it appears in the `.proto` (e.g. `"GetNodeInfo"`).
+    const NAME: &'static str;
+    /// Truncated 32-bit method id (blake3-of-MethodSchema, low 4 bytes LE).
+    const METHOD_ID: u32;
+    /// True for `stream Foo` requests.
+    const REQUEST_STREAMING: bool;
+    /// True for `stream Foo` responses.
+    const RESPONSE_STREAMING: bool;
+}
+
+/// Server-side dispatch entry point. Concrete implementors (the
+/// `<Service>Server<H>` types emitted by codegen) match on `method_id` and
+/// route to the relevant handler.
+///
+/// The shape here is intentionally minimal — the v2 wire layer is still
+/// settling. Once handler ergonomics stabilize, this trait will gain
+/// proper request/response stream types. For now it exists so the codegen
+/// has a stable hook to implement.
+pub trait Dispatcher<T: StreamTransport> {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Dispatch a single inbound stream to the matching method handler.
+    /// `method_id` selects the handler; `inbound` carries headers and the
+    /// raw byte stream.
+    fn dispatch(
+        &self,
+        inbound: Inbound<T::Stream>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}

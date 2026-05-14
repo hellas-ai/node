@@ -1,6 +1,9 @@
 //! `MuxTransport`: glues the sans-io `Multiplexer` to a concrete bidi
 //! byte pipe + spawns the I/O loop. Used by `ws::native`. The CF DO
-//! flavor drives the mux directly without this wrapper (callback I/O).
+//! flavor drives the mux directly without this wrapper (callback I/O);
+//! wasm targets don't have a tokio runtime to spawn into.
+
+#![cfg(not(target_family = "wasm"))]
 
 use std::sync::Arc;
 

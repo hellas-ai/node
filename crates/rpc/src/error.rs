@@ -1,14 +1,11 @@
-use crate::TokenBytesError;
-use crate::model::ModelAssetsError;
 use catgrad_llm::LLMError;
+use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
-use tonic::Status;
+
+use crate::model::ModelAssetsError;
+use crate::TokenBytesError;
 
 /// Error returned when the backend fails to initialize.
-///
-/// Defined here (rather than alongside the concrete backend) so that
-/// `ExecutorError` — which the CLI carries across feature configurations —
-/// stays in a single backend-free crate.
 #[derive(Clone, Debug, Error)]
 #[error("{message}")]
 pub struct BackendInitError {
@@ -71,48 +68,48 @@ pub enum ExecutorError {
     State(#[from] StateError),
 }
 
-fn model_assets_status_code(err: &ModelAssetsError) -> tonic::Code {
+fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
     match err {
         ModelAssetsError::Spec(_)
         | ModelAssetsError::ParseModelConfig { .. }
         | ModelAssetsError::ConstructModelConfig { .. }
         | ModelAssetsError::NegativePromptTokenId { .. }
-        | ModelAssetsError::NegativeStopTokenId { .. } => tonic::Code::InvalidArgument,
-        _ => tonic::Code::Internal,
+        | ModelAssetsError::NegativeStopTokenId { .. } => WireCode::InvalidArgument,
+        _ => WireCode::Internal,
     }
 }
 
-fn executor_status_code(err: &ExecutorError) -> tonic::Code {
+fn executor_wire_code(err: &ExecutorError) -> WireCode {
     match err {
-        ExecutorError::QueueFull { .. } => tonic::Code::ResourceExhausted,
+        ExecutorError::QueueFull { .. } => WireCode::ResourceExhausted,
         ExecutorError::InvalidQuoteRequest(_)
         | ExecutorError::InvalidTokenPayload(_)
-        | ExecutorError::TokenBytes(_) => tonic::Code::InvalidArgument,
-        ExecutorError::DtypeNotSupported { .. } => tonic::Code::FailedPrecondition,
-        ExecutorError::ModelAssets(model_err) => model_assets_status_code(model_err),
+        | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
+        ExecutorError::DtypeNotSupported { .. } => WireCode::FailedPrecondition,
+        ExecutorError::ModelAssets(model_err) => model_assets_wire_code(model_err),
         ExecutorError::WeightsNotReady(_) | ExecutorError::State(StateError::QuoteExpired(_)) => {
-            tonic::Code::FailedPrecondition
+            WireCode::FailedPrecondition
         }
-        ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
+        ExecutorError::PolicyDenied(_) => WireCode::PermissionDenied,
         ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
-            tonic::Code::NotFound
+            WireCode::NotFound
         }
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::Llm(_)
         | ExecutorError::WeightsError(_)
-        | ExecutorError::ArtifactStore(_) => tonic::Code::Internal,
+        | ExecutorError::ArtifactStore(_) => WireCode::Internal,
     }
 }
 
-impl From<ModelAssetsError> for Status {
+impl From<ModelAssetsError> for WireStatus {
     fn from(err: ModelAssetsError) -> Self {
-        Status::new(model_assets_status_code(&err), err.to_string())
+        WireStatus::new(model_assets_wire_code(&err), err.to_string())
     }
 }
 
-impl From<ExecutorError> for Status {
+impl From<ExecutorError> for WireStatus {
     fn from(err: ExecutorError) -> Self {
-        Status::new(executor_status_code(&err), err.to_string())
+        WireStatus::new(executor_wire_code(&err), err.to_string())
     }
 }

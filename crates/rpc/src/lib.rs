@@ -4,57 +4,45 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
     None => "unknown",
 };
 
-#[cfg(feature = "discovery")]
-pub mod discovery;
-// `driver` defines `ExecuteDriver` (trait) + value types referenced by both
-// local executors (`hellas-executor`) and remote dial sites (cli/gateway).
-// It's gated on `all-protocols` because the value types live in
-// `hellas_pb::{courtesy,hellas,opaque,symbolic}`. The remote-side
-// `RemoteExecuteDriver` impl is further gated on `iroh-client` inside the
-// module — see `driver::remote` — so executor (server-only) sees the trait
-// without dragging in the iroh client stack.
-#[cfg(feature = "all-protocols")]
-pub mod driver;
 #[cfg(feature = "node")]
 pub mod error;
-#[cfg(feature = "iroh-client")]
-pub mod call;
-/// Generated per-service client extension traits.
-///
-/// Bring the trait for the service you want into scope and call methods
-/// directly on `IrohPeerHandle`:
-///
-/// ```ignore
-/// use hellas_rpc::client::CourtesyClient;
-/// let resp = transport.peer(id).list_models(req).await?;
-/// ```
-#[cfg(feature = "iroh-client")]
-pub mod client {
-    include!("generated/client_traits.rs");
-}
-#[cfg(feature = "iroh-client")]
-pub mod iroh_client;
+
 #[cfg(feature = "node")]
 pub mod model;
+
 pub mod peers;
+
 #[cfg(feature = "node")]
 pub mod policy;
-pub mod provenance;
-#[cfg(feature = "server")]
-pub mod server;
-/// Generated per-service / per-method type markers (e.g. `NodeService`,
-/// `methods::GetNodeInfo`). Implement `RpcService` / `RpcMethod` and
-/// `tonic::server::NamedService`; emitted by `crates/rpc/build.rs` with the
-/// `compile` feature and checked into `src/generated/`.
-pub mod service {
-    include!("generated/service_markers.rs");
-}
-pub mod spec;
 
-pub use spec::ModelSpec;
+pub mod provenance;
+
+/// Protobuf-generated message types. Doc-hidden; consumers use the
+/// re-exports from per-service modules (`client::courtesy`,
+/// `client::swarm`, etc.).
+#[doc(hidden)]
+pub mod pb;
+
+/// Generated per-service typed clients and dispatchers.
+///
+/// Each service has a marker type, method markers, and a typed client
+/// trait + server dispatcher. Generic over any `T: StreamTransport`
+/// from `hellas_wire`.
+pub mod client {
+    include!(concat!(env!("OUT_DIR"), "/clients.rs"));
+}
+
+pub mod server {
+    include!(concat!(env!("OUT_DIR"), "/servers.rs"));
+}
+
+pub mod service {
+    include!(concat!(env!("OUT_DIR"), "/service_markers.rs"));
+}
 
 #[cfg(feature = "node")]
 pub use error::ExecutorError;
+
 #[cfg(feature = "node")]
 pub use model::ModelAssetsError;
 
@@ -62,8 +50,10 @@ pub use model::ModelAssetsError;
 #[cfg(feature = "node")]
 pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
-// Graph execution requests can carry full serialized model graphs for large models.
-pub const GRPC_MESSAGE_LIMIT: usize = 128 * 1024 * 1024;
+/// Body-frame size cap for the wire layer's per-call payloads. Matches
+/// the historical gRPC message limit so legacy paths see no regression.
+pub const MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,9 +73,12 @@ impl std::fmt::Display for TokenBytesError {
 
 impl std::error::Error for TokenBytesError {}
 
-impl From<TokenBytesError> for tonic::Status {
+impl From<TokenBytesError> for hellas_wire::WireStatus {
     fn from(err: TokenBytesError) -> Self {
-        tonic::Status::invalid_argument(err.to_string())
+        hellas_wire::WireStatus::new(
+            hellas_wire::WireCode::InvalidArgument,
+            err.to_string(),
+        )
     }
 }
 
@@ -111,7 +104,7 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>, TokenBytesError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenBytesError, decode_token_ids, encode_token_ids};
+    use super::{decode_token_ids, encode_token_ids, TokenBytesError};
 
     #[test]
     fn token_ids_round_trip_through_bytes() {

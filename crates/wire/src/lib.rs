@@ -38,6 +38,6 @@ pub use crate::schema::{
 };
 pub use crate::status::{WireCode, WireStatus};
 pub use crate::transport::{
-    AuthLevel, Inbound, PeerIdentity, RecvHalf, SendHalf, Stream, StreamTransport,
-    TransportContext,
+    AuthLevel, Dispatcher, Inbound, MethodMarker, PeerIdentity, RecvHalf, SendHalf,
+    ServiceMarker, Stream, StreamTransport, TransportContext,
 };
