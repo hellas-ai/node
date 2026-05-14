@@ -1,24 +1,40 @@
 //! Node server bootstrap.
 //!
-//! NOTE (hellas-wire v2 cutover): the body of `spawn_node` currently
-//! returns `unimplemented!()`. The legacy implementation depended on
-//! `tonic-iroh-transport::{TransportBuilder, swarm::{ServiceRegistry,
-//! DhtBackend, MdnsBackend}}` plus the per-service `ManagedServer`
-//! wrappers, none of which have been ported to `hellas-wire` /
-//! `hellas-rpc` yet. The `NodeHandle` public surface and the
-//! `spawn_node` signature are preserved so the binary still
-//! type-checks. See `HELLAS_WIRE_CUTOVER_FINDINGS.md` finding #5.
+//! Binds an iroh `Endpoint` with all service ALPNs, runs the executor,
+//! and spawns a per-connection accept loop that routes each inbound
+//! stream to the right service's dispatcher (selected by ALPN).
+//!
+//! Discovery (DHT publish, mDNS, peer-exchange) is NOT yet wired —
+//! see CUTOVER_FINDINGS finding #5. Peers can reach this node only by
+//! direct address until `hellas_wire::iroh::swarm::ServiceRegistry`
+//! lands and we publish through it.
 
-use catgrad::prelude::Dtype;
-use hellas_core::ProducerSigningKey;
-use hellas_executor::ExecutorMetrics;
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use iroh::EndpointId;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
+use catgrad::prelude::Dtype;
+use hellas_core::ProducerSigningKey;
+use hellas_executor::{
+    ArtifactStoreConfig, CourtesyServer, Executor, ExecuteServer, ExecutorMetrics,
+    OpaqueServer, SymbolicServer,
+};
+use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::services::courtesy::Courtesy;
+use hellas_rpc::services::execute::Execute;
+use hellas_rpc::services::opaque::Opaque;
+use hellas_rpc::services::symbolic::Symbolic;
+// hellas_rpc::services::node::Node — server impl pending (CUTOVER_FINDINGS).
+use hellas_wire::iroh::IrohTransport;
+use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+use iroh::{endpoint::Connection, endpoint::presets, Endpoint, EndpointId, SecretKey};
+use tokio::task::JoinHandle;
+use tracing::warn;
+
 pub(super) struct NodeHandle {
     node_id: EndpointId,
+    accept_task: Option<JoinHandle<()>>,
+    endpoint: Endpoint,
 }
 
 impl NodeHandle {
@@ -26,35 +42,157 @@ impl NodeHandle {
         self.node_id
     }
 
-    /// Snapshot of iroh's internal metrics. The returned `EndpointMetrics`
-    /// contains `Arc`s into the live metric storage, so values continue to
-    /// update as iroh records them.
     #[cfg(feature = "otel")]
     pub(super) fn iroh_metrics(&self) -> iroh::metrics::EndpointMetrics {
-        unimplemented!("iroh metrics pending discovery/pool port — see CUTOVER_FINDINGS.md")
+        self.endpoint.metrics().clone()
     }
 
-    pub(super) async fn shutdown(self) -> anyhow::Result<()> {
+    pub(super) async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self.accept_task.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        self.endpoint.close().await;
         Ok(())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_node(
-    _port: Option<u16>,
-    _download_policy: DownloadPolicy,
-    _execute_policy: ExecutePolicy,
-    _queue_size: usize,
-    _preload_weights: Vec<String>,
-    _build: String,
-    _graffiti: Vec<u8>,
-    _supported_dtypes: Vec<Dtype>,
-    _artifact_store_path: PathBuf,
-    _secret_key: iroh::SecretKey,
-    _producer_key: ProducerSigningKey,
-    _metrics: Arc<ExecutorMetrics>,
+    port: Option<u16>,
+    download_policy: DownloadPolicy,
+    execute_policy: ExecutePolicy,
+    queue_size: usize,
+    preload_weights: Vec<String>,
+    build: String,
+    graffiti: Vec<u8>,
+    supported_dtypes: Vec<Dtype>,
+    artifact_store_path: PathBuf,
+    secret_key: SecretKey,
+    producer_key: ProducerSigningKey,
+    metrics: Arc<ExecutorMetrics>,
 ) -> anyhow::Result<NodeHandle> {
-    unimplemented!(
-        "node server pending hellas-wire discovery/pool port — see CUTOVER_FINDINGS.md"
+    // -- Spawn the executor (the local handler that backs all four RPC services).
+    let handle = Executor::spawn_with_metrics_and_producer_key_and_artifact_store(
+        download_policy,
+        execute_policy,
+        queue_size,
+        supported_dtypes,
+        metrics.clone(),
+        Arc::new(producer_key),
+        ArtifactStoreConfig::Fs(artifact_store_path),
     )
+    .await
+    .context("failed to spawn executor")?;
+    // Currently unused: preload_weights, build, graffiti. The pre-cutover
+    // node bootstrap wired these into discovery / status. Re-wire them
+    // once `hellas_wire::iroh::swarm::ServiceRegistry` publishes node
+    // metadata.
+    let _ = (preload_weights, build, graffiti);
+
+    // -- Bind iroh Endpoint with one ALPN per service we serve.
+    let alpns: Vec<Vec<u8>> = vec![
+        <Execute as ServiceMarker>::ALPN.as_bytes().to_vec(),
+        <Symbolic as ServiceMarker>::ALPN.as_bytes().to_vec(),
+        <Opaque as ServiceMarker>::ALPN.as_bytes().to_vec(),
+        <Courtesy as ServiceMarker>::ALPN.as_bytes().to_vec(),
+    ];
+
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(alpns);
+    if let Some(port) = port {
+        builder = builder
+            .bind_addr(format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?)
+            .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+    }
+    let endpoint = builder
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+    let node_id = endpoint.id();
+
+    // -- Accept loop: one task per inbound Connection; per-Connection
+    //    dispatch routed by ALPN to the matching service handler.
+    let accept_handle = handle.clone();
+    let accept_endpoint = endpoint.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let incoming = match accept_endpoint.accept().await {
+                Some(inc) => inc,
+                None => break, // endpoint closed
+            };
+            let accepting = match incoming.accept() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("incoming accept failed: {e}");
+                    continue;
+                }
+            };
+            let handle_for_conn = accept_handle.clone();
+            tokio::spawn(async move {
+                let conn = match accepting.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("connection handshake failed: {e}");
+                        return;
+                    }
+                };
+                let alpn = conn.alpn().to_vec();
+                if let Err(e) = serve_connection(alpn, conn, handle_for_conn).await {
+                    warn!("serve_connection error: {e}");
+                }
+            });
+        }
+    });
+
+    Ok(NodeHandle {
+        node_id,
+        accept_task: Some(accept_task),
+        endpoint,
+    })
+}
+
+/// Per-connection serve: each inbound substream becomes an `Inbound`
+/// dispatched to the right `XServer<ExecutorHandle>` based on the
+/// connection's negotiated ALPN.
+async fn serve_connection(
+    alpn: Vec<u8>,
+    conn: Connection,
+    handle: hellas_executor::ExecutorHandle,
+) -> anyhow::Result<()> {
+    let transport = IrohTransport::new(conn);
+
+    if alpn == <Execute as ServiceMarker>::ALPN.as_bytes() {
+        let server = ExecuteServer(handle);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Symbolic as ServiceMarker>::ALPN.as_bytes() {
+        let server = SymbolicServer(handle);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Opaque as ServiceMarker>::ALPN.as_bytes() {
+        let server = OpaqueServer(handle);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
+        let server = CourtesyServer(handle);
+        serve_loop(&transport, &server).await
+    } else {
+        warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
+        Ok(())
+    }
+}
+
+async fn serve_loop<S>(
+    transport: &IrohTransport,
+    server: &S,
+) -> anyhow::Result<()>
+where
+    S: Dispatcher<IrohTransport> + Send + Sync,
+    S::Error: Send + Sync + 'static,
+{
+    while let Ok(Some(inbound)) = transport.accept().await {
+        if let Err(e) = server.dispatch(inbound).await {
+            warn!("dispatch error: {e}");
+        }
+    }
+    Ok(())
 }
