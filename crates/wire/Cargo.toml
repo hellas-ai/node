@@ -11,7 +11,17 @@ documentation.workspace = true
 default = []
 
 # Transports
-iroh = ["dep:iroh", "dep:n0-future"]
+iroh = [
+    "dep:iroh",
+    "dep:n0-future",
+    "dep:portable-atomic",
+    "dep:tokio-stream",
+]
+# Discovery backends (DHT and mDNS are scope-deferred for v1; the
+# modules exist behind these feature flags as empty stubs so callers
+# don't need to gate their use-sites yet).
+discovery-dht = ["iroh"]
+discovery-mdns = ["iroh"]
 h2 = ["dep:h2", "dep:http"]
 h3 = []  # scaffold only
 
@@ -39,8 +49,15 @@ tracing = { workspace = true }
 web-time = "1"
 
 # Optional transport deps
-iroh = { version = "0.98", default-features = false, optional = true }
+iroh = { workspace = true, optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
+# Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic
+# provides a mutex-fallback `AtomicU64` so the iroh ConnectionPool's
+# generation counter compiles on embedded targets.
+portable-atomic = { version = "1", default-features = false, features = [
+    "fallback",
+], optional = true }
+tokio-stream = { workspace = true, optional = true }
 h2 = { version = "0.4", optional = true }
 http = { version = "1", optional = true }
 tokio-tungstenite = { version = "0.27", optional = true }
@@ -51,7 +68,13 @@ worker = { version = "0.6", optional = true, default-features = false }
 opentelemetry = { workspace = true, optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-tokio = { workspace = true, features = ["io-util", "sync", "macros", "rt"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "sync",
+    "macros",
+    "rt",
+    "time",
+] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
