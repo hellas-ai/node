@@ -15,6 +15,7 @@ fn apply_all_opens_and_closes_one_batch() {
     };
 
     assert_eq!(diff.len(), 2);
+    assert!(!diff.is_empty());
     assert_eq!(
         diff.event(0).map(Event::kind),
         Some(&EventKind::EdgeOpened {
@@ -39,6 +40,20 @@ fn apply_all_opens_and_closes_one_batch() {
         state.store().coin(taker_out()).map(coin_view),
         Some((TAKER, 8)),
     );
+}
+
+#[test]
+fn apply_all_reports_first_operation_error_index() {
+    let mut state = funded_state();
+    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+    let ops = List::all([Tx::close(edge(), Proof::timeout(basic_terms()), outputs)]);
+
+    let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
+        panic!("invalid first operation accepted");
+    };
+
+    assert_eq!(error.index(), 0);
+    assert_eq!(error.source(), ApplyError::MissingEdge { id: edge() });
 }
 
 #[test]
