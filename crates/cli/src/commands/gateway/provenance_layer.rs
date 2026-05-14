@@ -12,7 +12,10 @@
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
 use futures::future::BoxFuture;
-use hellas_rpc::provenance::{COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex};
+use hellas_rpc::provenance::{
+    COMMITMENT_KEY as COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_KEY as RECEIPT_HEADER,
+    encode_hex,
+};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
