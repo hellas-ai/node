@@ -74,6 +74,7 @@ chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+smol_str = "0.3"
 hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
   "ureq",
