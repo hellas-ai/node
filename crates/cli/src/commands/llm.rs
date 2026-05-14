@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 #[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
 use std::sync::Arc;
-use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
+use iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
@@ -39,7 +39,7 @@ pub struct ExecuteOptions {
 
 /// Returns `true` if `err`'s chain carries an executor's
 /// `DtypeNotSupported` decision — either as a local `ExecutorError` (the
-/// `--local` route) or as a remote `tonic::Status` with `FailedPrecondition`
+/// `--local` route) or as a remote `hellas_wire::WireStatus` with `FailedPrecondition`
 /// and the canonical message prefix.
 fn is_dtype_not_supported(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
@@ -47,8 +47,8 @@ fn is_dtype_not_supported(err: &anyhow::Error) -> bool {
         {
             return true;
         }
-        if let Some(status) = cause.downcast_ref::<tonic::Status>()
-            && status.code() == tonic::Code::FailedPrecondition
+        if let Some(status) = cause.downcast_ref::<hellas_wire::WireStatus>()
+            && status.code() == hellas_wire::WireCode::FailedPrecondition
             && status.message().starts_with("program was built for dtype")
         {
             return true;

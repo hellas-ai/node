@@ -7,8 +7,8 @@ use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, OpaqueServer,
     SymbolicServer,
 };
-use hellas_pb::swarm::node_server::{Node, NodeServer};
-use hellas_pb::swarm::{
+use hellas_rpc::pb::swarm::node_server::{Node, NodeServer};
+use hellas_rpc::pb::swarm::{
     GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 };
 use hellas_rpc::GRPC_MESSAGE_LIMIT;
@@ -30,9 +30,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tonic_iroh_transport::iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
-use tonic_iroh_transport::iroh::endpoint::presets;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId};
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointId};
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
 use tonic_iroh_transport::{PoolOptions, TransportBuilder};
 
@@ -137,7 +137,7 @@ fn observe_discovered_peer_service<S: RpcService>(
 }
 
 async fn bind_endpoint(
-    secret_key: tonic_iroh_transport::iroh::SecretKey,
+    secret_key: iroh::SecretKey,
     port: u16,
 ) -> anyhow::Result<Endpoint> {
     Endpoint::builder(presets::N0)
@@ -166,7 +166,7 @@ impl NodeHandle {
     /// contains `Arc`s into the live metric storage, so values continue to
     /// update as iroh records them.
     #[cfg(feature = "otel")]
-    pub(super) fn iroh_metrics(&self) -> tonic_iroh_transport::iroh::metrics::EndpointMetrics {
+    pub(super) fn iroh_metrics(&self) -> iroh::metrics::EndpointMetrics {
         self.guard.endpoint().metrics().clone()
     }
 
@@ -188,7 +188,7 @@ pub(super) async fn spawn_node(
     graffiti: Vec<u8>,
     supported_dtypes: Vec<Dtype>,
     artifact_store_path: PathBuf,
-    secret_key: tonic_iroh_transport::iroh::SecretKey,
+    secret_key: iroh::SecretKey,
     producer_key: ProducerSigningKey,
     metrics: Arc<ExecutorMetrics>,
 ) -> anyhow::Result<NodeHandle> {

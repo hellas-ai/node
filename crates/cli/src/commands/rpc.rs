@@ -1,11 +1,11 @@
 use crate::commands::CliResult;
 use anyhow::Context;
-use hellas_pb::swarm::GetNodeInfoRequest;
+use hellas_rpc::pb::swarm::GetNodeInfoRequest;
 use hellas_rpc::client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{IrohTransport, PeerManager};
 use std::net::SocketAddr;
-use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 pub async fn run(
     node_id: EndpointId,

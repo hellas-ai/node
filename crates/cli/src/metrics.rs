@@ -12,7 +12,7 @@ use tracing::info;
 pub struct MetricsBundle {
     pub prometheus: Arc<Registry>,
     #[cfg(feature = "otel")]
-    pub iroh: Option<tonic_iroh_transport::iroh::metrics::EndpointMetrics>,
+    pub iroh: Option<iroh::metrics::EndpointMetrics>,
 }
 
 impl MetricsBundle {
@@ -30,7 +30,7 @@ impl MetricsBundle {
     /// `Endpoint` handle to expose.
     #[cfg(feature = "otel")]
     #[allow(dead_code)] // unused in `--features otel` without `candle`
-    pub fn with_iroh(mut self, iroh: tonic_iroh_transport::iroh::metrics::EndpointMetrics) -> Self {
+    pub fn with_iroh(mut self, iroh: iroh::metrics::EndpointMetrics) -> Self {
         self.iroh = Some(iroh);
         self
     }
