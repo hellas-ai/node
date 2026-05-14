@@ -13,14 +13,21 @@ mod slot;
 mod state;
 mod wire;
 
+#[cfg(not(target_family = "wasm"))]
 pub mod stream;
+
+#[cfg(not(target_family = "wasm"))]
 pub mod transport;
 
 pub use slot::{Role, SlotIndex, SlotState, StreamSlot};
 pub use state::{Event, MuxConfig, MuxError, Multiplexer};
-pub use stream::{MuxRecvHalf, MuxSendHalf, MuxStream, MuxStreamError};
-pub use transport::{MessagePipe, MuxTransport, MuxTransportError};
 pub use wire::{decode_keyed_frame, encode_keyed_frame, KeyedFrame, StreamKey};
+
+#[cfg(not(target_family = "wasm"))]
+pub use stream::{MuxRecvHalf, MuxSendHalf, MuxStream, MuxStreamError};
+
+#[cfg(not(target_family = "wasm"))]
+pub use transport::{MessagePipe, MuxTransport, MuxTransportError};
 
 /// Default body-frame max in bytes. Configurable per-transport.
 pub const DEFAULT_BODY_FRAME_MAX: usize = 1024 * 1024; // 1 MiB
