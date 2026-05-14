@@ -1,9 +1,7 @@
 //! `MuxTransport`: glues the sans-io `Multiplexer` to a concrete bidi
-//! byte pipe + spawns the I/O loop. Used by `ws::native`. The CF DO
-//! flavor drives the mux directly without this wrapper (callback I/O);
-//! wasm targets don't have a tokio runtime to spawn into.
-
-#![cfg(not(target_family = "wasm"))]
+//! byte pipe + spawns the I/O loop. Used by `ws::native` (tokio spawn)
+//! and `ws::wasm` (wasm_bindgen spawn_local). The CF DO flavor drives
+//! the mux directly without this wrapper (callback I/O).
 
 use std::sync::Arc;
 
@@ -76,8 +74,10 @@ pub enum MuxTransportError {
 }
 
 impl MuxTransport {
-    /// Spawn the I/O loop. Returns a transport handle. The loop runs
-    /// until either side closes.
+    /// Spawn the I/O loop using the default native spawn (tokio).
+    /// Wasm callers use `spawn_with` instead, passing
+    /// `wasm_bindgen_futures::spawn_local`.
+    #[cfg(not(target_family = "wasm"))]
     pub fn spawn<const N: usize, C: Clock + Clone, P: MessagePipe>(
         role: Role,
         clock: C,
@@ -85,6 +85,30 @@ impl MuxTransport {
         pipe: P,
         peer: Option<PeerIdentity>,
     ) -> Self {
+        Self::spawn_with::<N, C, P, _>(role, clock, config, pipe, peer, |fut| {
+            tokio::spawn(fut);
+        })
+    }
+
+    /// Spawn the I/O loop using a caller-provided spawn function.
+    /// Native callers pass `tokio::spawn`; wasm callers pass
+    /// `wasm_bindgen_futures::spawn_local`.
+    ///
+    /// The spawn function MUST poll the future to completion in
+    /// the background — it should not block.
+    pub fn spawn_with<const N: usize, C: Clock + Clone, P: MessagePipe, F>(
+        role: Role,
+        clock: C,
+        config: MuxConfig,
+        pipe: P,
+        peer: Option<PeerIdentity>,
+        spawn: F,
+    ) -> Self
+    where
+        F: FnOnce(
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        ),
+    {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
@@ -98,7 +122,7 @@ impl MuxTransport {
             slot_to_chans: Default::default(),
             peer: peer.clone(),
         };
-        tokio::spawn(driver.run());
+        spawn(Box::pin(driver.run()));
 
         Self {
             cmd_tx,

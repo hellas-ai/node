@@ -48,8 +48,8 @@ fn is_dtype_not_supported(err: &anyhow::Error) -> bool {
             return true;
         }
         if let Some(status) = cause.downcast_ref::<hellas_wire::WireStatus>()
-            && status.code() == hellas_wire::WireCode::FailedPrecondition
-            && status.message().starts_with("program was built for dtype")
+            && status.code == hellas_wire::WireCode::FailedPrecondition
+            && status.message.starts_with("program was built for dtype")
         {
             return true;
         }

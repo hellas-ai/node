@@ -12,6 +12,9 @@ pub mod native;
 #[cfg(all(feature = "ws", not(target_family = "wasm")))]
 pub use native::{accept_upgraded, connect, WsError, WsPipe};
 
+#[cfg(all(feature = "ws-wasm", target_family = "wasm"))]
+pub mod wasm;
+
 #[cfg(feature = "ws-cf-do")]
 pub mod cf_do;
 

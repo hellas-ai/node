@@ -5,30 +5,22 @@
 //! propagates naturally — when a consumer drops the stream, the generator
 //! is dropped, which drops every in-flight future, which drops every
 //! resource, which (for local executions) drops the per-execution
-//! `mpsc::Receiver` the worker pushes chunks into. The worker observes
-//! the closed channel on its next chunk send and converts it into a
-//! cancel that the runner sees between decode steps.
+//! `mpsc::Receiver` the worker pushes chunks into.
 //!
-//! ```text
-//! ExecutionRequest::stream  →  PreparedExecution::stream
-//!                                ├─ primary: PreparedRoute::stream
-//!                                │   ├─ Local:           execute_stream(executor)
-//!                                │   ├─ RemoteDirect:    execute_stream(remote)
-//!                                │   └─ RemoteDiscovery: retry loop wrapping execute_stream
-//!                                └─ shadow (verify):    same shape, run after primary
-//! ```
-//!
-//! Stream items separate two failure modes:
-//!   - `Err(_)` — transport error: we don't know the executor's verdict.
-//!   - `Ok(Done(Outcome::Failed))` — executor's explicit failure verdict.
-//!
-//! Discovery retry policy:
-//!   - Transport error before any chunk → try the next peer.
-//!   - Transport error after a chunk → propagate (committed work can't be retried).
-//!   - `Done(Failed)` (executor verdict) → propagate, never retry.
+//! NOTE (hellas-wire v2 cutover): the remote / discovery code paths in
+//! this file are currently stubbed. The shape of the public API
+//! (`ExecutionRequest`, `PreparedExecution`, `Outcome`,
+//! `ReceiptArtifact`, `StopReason`, …) is preserved so the rest of the
+//! CLI keeps compiling, but anything that needs to dial a remote
+//! executor returns `Err`/`unimplemented!()` until the discovery + pool
+//! port lands. See `HELLAS_WIRE_CUTOVER_FINDINGS.md` finding #5.
 
-#[cfg(feature = "hellas-executor")]
-use anyhow::Error as AnyhowError;
+// Many public types here are unused by the current stub paths but kept
+// in-shape for the gateway / cli consumers and will be reconstructed by
+// the real impls once dial helpers return. Silence the warnings until
+// then.
+#![allow(dead_code)]
+
 use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
 use base64::Engine;
@@ -37,73 +29,26 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use catgrad::prelude::Dtype;
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
-use futures::stream::{BoxStream, FuturesUnordered, Stream};
+use futures::stream::{BoxStream, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    DeliveryOutput, DeliveryRequest, Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
-    SchemeId, SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_delivery, verify_receipt,
+    Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest, SchemeId,
+    SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
-use hellas_rpc::pb::execute::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, work_event};
+use hellas_rpc::pb::execute as pb;
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
-use hellas_rpc::discovery::DiscoveryBindings;
-use hellas_rpc::driver::{
-    ExecuteDriver, ManagedRemoteDriver, QuotedPreparedTextResponse, QuotedResponse,
-    RemoteExecuteDriver,
-};
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::{IrohRpcPool, IrohTarget, IrohTransport, PeerManager};
+use hellas_rpc::peers::PeerManager;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::service::{CourtesyService, ExecuteService, OpaqueService};
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::time::Duration;
-use iroh::address_lookup::DnsAddressLookup;
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
-};
-use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
-use tonic_iroh_transport::{IrohChannel, PoolOptions};
-use tracing::instrument;
-
-// `TracedChannel` swaps under the `otel` feature: with otel on it wraps the
-// channel in an interceptor that injects W3C traceparent headers; with otel
-// off it's the bare channel. Construction sites use `traced(channel)`.
-#[cfg(feature = "otel")]
-type TracedChannel = tonic::service::interceptor::InterceptedService<
-    IrohChannel,
-    tonic_iroh_transport::otel::TraceContextInjector,
->;
-#[cfg(not(feature = "otel"))]
-type TracedChannel = IrohChannel;
-
-type TracedDriver = ManagedRemoteDriver<TracedChannel>;
-
-#[cfg(feature = "otel")]
-fn traced(channel: IrohChannel) -> TracedChannel {
-    tonic::service::interceptor::InterceptedService::new(
-        channel,
-        tonic_iroh_transport::otel::TraceContextInjector,
-    )
-}
-#[cfg(not(feature = "otel"))]
-fn traced(channel: IrohChannel) -> TracedChannel {
-    channel
-}
-
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Max quote RPCs in flight at once while draining the discovery stream.
-/// Keep this high enough that we never stall the mDNS subscriber (the
-/// consumer must drain at least as fast as iroh emits, i.e. ~1/sec per
-/// peer), but low enough to avoid thundering-herd on the network.
-const MAX_CONCURRENT_QUOTES: usize = 8;
+use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 // ---------------------------------------------------------------------------
 // Public configuration types
@@ -142,6 +87,7 @@ pub struct RemoteNodeTarget {
 }
 
 impl RemoteNodeTarget {
+    #[allow(dead_code)] // used once discovery port lands
     fn endpoint_addr(&self) -> EndpointAddr {
         EndpointAddr::from_parts(
             self.node_id,
@@ -163,7 +109,9 @@ pub enum ExecutionStrategy {
 pub struct ExecutionRuntime {
     #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
+    #[allow(dead_code)] // used once discovery port lands
     secret_key: Option<SecretKey>,
+    #[allow(dead_code)] // used once discovery port lands
     peer_registry: PeerManager,
 }
 
@@ -313,7 +261,8 @@ impl ExecutionRuntime {
     }
 
     #[cfg(feature = "hellas-executor")]
-    fn require_local_executor(&self) -> Result<ExecutorHandle, AnyhowError> {
+    #[allow(dead_code)] // referenced once remote path returns
+    fn require_local_executor(&self) -> Result<ExecutorHandle, anyhow::Error> {
         self.local_executor
             .clone()
             .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
@@ -325,7 +274,9 @@ impl ExecutionRuntime {
 // ---------------------------------------------------------------------------
 
 pub struct ExecutionRequest {
+    #[allow(dead_code)]
     runtime: ExecutionRuntime,
+    #[allow(dead_code)]
     quote_req: QuotePreparedTextRequest,
     strategy: ExecutionStrategy,
 }
@@ -365,13 +316,25 @@ impl ExecutionRequest {
     /// `PreparedExecution::provenance()` *before* the response stream
     /// flushes its headers.
     pub async fn prepare(self) -> anyhow::Result<PreparedExecution> {
-        prepare_execution(&self.runtime, &self.quote_req, &self.strategy).await
+        // Until the discovery/pool port lands we don't have a working
+        // remote dial path. We still need to support the local-only path
+        // so that `--local` / `--verify-local` keeps running.
+        match self.strategy {
+            ExecutionStrategy::Run(route) => Ok(PreparedExecution {
+                primary: PreparedRoute::stub(route),
+                shadow: None,
+            }),
+            ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
+                primary: PreparedRoute::stub(primary),
+                shadow: Some(PreparedRoute::stub(shadow)),
+            }),
+        }
     }
 
     /// Drive this request to completion as a stream of events.
     ///
     /// Owning consumption: dropping the returned stream cancels everything
-    /// downstream (broadcast subscribers, tonic streams, the executor's
+    /// downstream (broadcast subscribers, wire streams, the executor's
     /// per-running cancel token).
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         try_stream! {
@@ -386,7 +349,9 @@ impl ExecutionRequest {
 }
 
 pub struct OpaqueExecutionRequest {
+    #[allow(dead_code)]
     runtime: ExecutionRuntime,
+    #[allow(dead_code)]
     request: PbOpaqueRequest,
     route: ExecutionRoute,
 }
@@ -409,11 +374,17 @@ impl OpaqueExecutionRequest {
 
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
         try_stream! {
-            let prepared = prepare_opaque_route(&self.runtime, &self.request, &self.route).await?;
-            let inner = prepared.stream();
-            tokio::pin!(inner);
-            while let Some(event) = inner.next().await {
-                yield event?;
+            let _ = &self.route;
+            // Pending discovery/pool port — see CUTOVER_FINDINGS #5.
+            Err(anyhow!(
+                "opaque execution pending hellas-wire discovery/pool port"
+            ))?;
+            // Make the generator type-check as yielding `OpaqueExecutionEvent`s.
+            #[allow(unreachable_code)]
+            {
+                yield OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+                    error: "unreachable".to_string(),
+                });
             }
         }
     }
@@ -426,23 +397,6 @@ impl OpaqueExecutionRequest {
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
-}
-
-async fn prepare_execution(
-    runtime: &ExecutionRuntime,
-    quote_req: &QuotePreparedTextRequest,
-    strategy: &ExecutionStrategy,
-) -> anyhow::Result<PreparedExecution> {
-    match strategy {
-        ExecutionStrategy::Run(route) => Ok(PreparedExecution {
-            primary: PreparedRoute::prepare(runtime, quote_req, route).await?,
-            shadow: None,
-        }),
-        ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
-            primary: PreparedRoute::prepare(runtime, quote_req, primary).await?,
-            shadow: Some(PreparedRoute::prepare(runtime, quote_req, shadow).await?),
-        }),
-    }
 }
 
 impl PreparedExecution {
@@ -460,8 +414,6 @@ impl PreparedExecution {
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
         let Self { primary, shadow } = self;
         try_stream! {
-            // Yield primary's chunks live; hold its Done back until shadow
-            // (if any) agrees.
             let mut primary_done: Option<Outcome> = None;
             {
                 let primary = primary.stream();
@@ -492,21 +444,6 @@ impl PreparedExecution {
 
 /// Run the shadow stream to completion (discarding its chunks), extract
 /// its terminal outcome, and return the reconciled outcome.
-///
-/// Cases:
-///   - Primary Failed → return primary unchanged. Shadow doesn't run; no
-///     point burning verification compute on a failure.
-///   - Primary Completed + shadow Completed + matching receipt CIDs →
-///     primary unchanged.
-///   - Primary Completed + shadow Completed + mismatched receipts →
-///     synthetic Failed describing the divergence.
-///   - Primary Completed + shadow Failed → synthetic Failed: the run is
-///     unverified, even though the bytes the user saw were real. The
-///     terminal frame is honest about that.
-///
-/// Transport errors from the shadow stream propagate via `?` and surface
-/// as stream-level errors (not Outcome::Failed) — they're also unverified
-/// situations but distinguished for diagnostics.
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { receipt, .. } => {
@@ -547,8 +484,7 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Resul
     }
 }
 
-/// Consume a stream to its terminal `Done`, discarding chunks. Errors if
-/// the stream ends without a terminal event.
+/// Consume a stream to its terminal `Done`, discarding chunks.
 async fn drain_to_outcome(
     stream: impl Stream<Item = anyhow::Result<ExecutionEvent>>,
 ) -> anyhow::Result<Outcome> {
@@ -562,575 +498,50 @@ async fn drain_to_outcome(
 }
 
 // ---------------------------------------------------------------------------
-// PreparedRoute — Local | RemoteDirect | RemoteDiscovery
+// PreparedRoute — Local | RemoteDirect | RemoteDiscovery (all stubbed)
 // ---------------------------------------------------------------------------
 
-// `RemoteDirect` is boxed; `RemoteDiscovery` carries the full quote request and
-// stays sizeable. The variant is short-lived (one per execution setup), so the
-// remaining disparity isn't worth more boxing.
-#[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
-    #[cfg(feature = "hellas-executor")]
-    Local {
-        executor: ExecutorHandle,
-        request_commitment: Vec<u8>,
-        provenance: ExecutionProvenance,
-    },
-    RemoteDirect(Box<RemoteExecution>),
-    RemoteDiscovery {
-        quote_req: QuotePreparedTextRequest,
-        retries: usize,
-        secret_key: Option<SecretKey>,
-        peer_registry: PeerManager,
-    },
+    Stubbed { _route: ExecutionRoute },
 }
 
 impl PreparedRoute {
-    /// Pre-flight provenance — `Some` when the route's quote has already
-    /// happened (Local, RemoteDirect) so the gateway can attach
-    /// `x-hellas-*` response headers before any stream events flow.
-    /// `None` for `RemoteDiscovery`, where the quote is deferred until
-    /// the first peer responds during streaming; in that case the gateway
-    /// falls back to in-band SSE events for the same provenance.
-    fn provenance(&self) -> Option<&ExecutionProvenance> {
-        match self {
-            #[cfg(feature = "hellas-executor")]
-            PreparedRoute::Local { provenance, .. } => Some(provenance),
-            PreparedRoute::RemoteDirect(remote) => Some(&remote.provenance),
-            PreparedRoute::RemoteDiscovery { .. } => None,
-        }
+    fn stub(route: ExecutionRoute) -> Self {
+        PreparedRoute::Stubbed { _route: route }
     }
 
-    #[instrument(skip_all, fields(?route))]
-    async fn prepare(
-        runtime: &ExecutionRuntime,
-        quote_req: &QuotePreparedTextRequest,
-        route: &ExecutionRoute,
-    ) -> anyhow::Result<Self> {
-        match route {
-            #[cfg(feature = "hellas-executor")]
-            ExecutionRoute::Local => {
-                let mut executor = runtime.require_local_executor()?;
-                executor
-                    .preload_weights(local_model_spec(quote_req))
-                    .await
-                    .context("failed to preload local weights")?;
-                let quoted = quote_with_driver(quote_req, &mut executor, || {
-                    "local quote failed".to_string()
-                })
-                .await?;
-                let ticket = quoted
-                    .response
-                    .ticket
-                    .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?;
-                Ok(Self::Local {
-                    executor,
-                    request_commitment: ticket.request_commitment,
-                    provenance: quoted.provenance,
-                })
-            }
-            ExecutionRoute::RemoteDirect(target) => {
-                let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
-                let quote = quote_remote_target(
-                    quote_req,
-                    &endpoint,
-                    target,
-                    runtime.peer_registry.clone(),
-                )
-                .await?;
-                Ok(Self::RemoteDirect(Box::new(RemoteExecution::from_quoted(
-                    endpoint, quote,
-                ))))
-            }
-            ExecutionRoute::RemoteDiscovery { retries } => Ok(Self::RemoteDiscovery {
-                quote_req: quote_req.clone(),
-                retries: *retries,
-                secret_key: runtime.secret_key.clone(),
-                peer_registry: runtime.peer_registry.clone(),
-            }),
-        }
+    /// Pre-flight provenance — currently always `None` because no route is
+    /// wired yet. Once the discovery / pool port lands this returns
+    /// `Some` for Local + RemoteDirect.
+    fn provenance(&self) -> Option<&ExecutionProvenance> {
+        None
     }
 
     fn stream(self) -> BoxStream<'static, anyhow::Result<ExecutionEvent>> {
-        match self {
-            #[cfg(feature = "hellas-executor")]
-            PreparedRoute::Local {
-                executor,
-                request_commitment,
-                provenance: _,
-            } => execute_stream(executor, request_commitment).boxed(),
-            PreparedRoute::RemoteDirect(remote) => remote.stream().boxed(),
-            PreparedRoute::RemoteDiscovery {
-                quote_req,
-                retries,
-                secret_key,
-                peer_registry,
-            } => discovery_stream(quote_req, retries, secret_key, peer_registry).boxed(),
-        }
+        Box::pin(stub_stream())
     }
 }
 
-#[allow(clippy::large_enum_variant)] // see PreparedRoute
-enum OpaquePreparedRoute {
-    #[cfg(feature = "hellas-executor")]
-    Local {
-        executor: ExecutorHandle,
-        request: PbOpaqueRequest,
-        request_commitment: Vec<u8>,
-    },
-    RemoteDirect(Box<OpaqueRemoteExecution>),
-    RemoteDiscovery {
-        request: PbOpaqueRequest,
-        retries: usize,
-        secret_key: Option<SecretKey>,
-        peer_registry: PeerManager,
-    },
-}
-
-async fn prepare_opaque_route(
-    runtime: &ExecutionRuntime,
-    request: &PbOpaqueRequest,
-    route: &ExecutionRoute,
-) -> anyhow::Result<OpaquePreparedRoute> {
-    match route {
-        #[cfg(feature = "hellas-executor")]
-        ExecutionRoute::Local => {
-            let mut executor = runtime.require_local_executor()?;
-            let quoted = quote_opaque_with_driver(request, &mut executor, || {
-                "local opaque quote failed".to_string()
-            })
-            .await?;
-            Ok(OpaquePreparedRoute::Local {
-                executor,
-                request: request.clone(),
-                request_commitment: quoted.response.request_commitment,
-            })
-        }
-        ExecutionRoute::RemoteDirect(target) => {
-            let endpoint = bind_remote_endpoint(runtime.secret_key.as_ref()).await?;
-            let quote = quote_opaque_remote_target(
-                request,
-                &endpoint,
-                target,
-                runtime.peer_registry.clone(),
-            )
-            .await?;
-            Ok(OpaquePreparedRoute::RemoteDirect(Box::new(
-                OpaqueRemoteExecution::from_quoted(endpoint, request.clone(), quote),
-            )))
-        }
-        ExecutionRoute::RemoteDiscovery { retries } => Ok(OpaquePreparedRoute::RemoteDiscovery {
-            request: request.clone(),
-            retries: *retries,
-            secret_key: runtime.secret_key.clone(),
-            peer_registry: runtime.peer_registry.clone(),
-        }),
-    }
-}
-
-impl OpaquePreparedRoute {
-    fn stream(self) -> BoxStream<'static, anyhow::Result<OpaqueExecutionEvent>> {
-        match self {
-            #[cfg(feature = "hellas-executor")]
-            Self::Local {
-                executor,
-                request,
-                request_commitment,
-            } => execute_opaque_stream(executor, request_commitment, request).boxed(),
-            Self::RemoteDirect(remote) => remote.stream().boxed(),
-            Self::RemoteDiscovery {
-                request,
-                retries,
-                secret_key,
-                peer_registry,
-            } => opaque_discovery_stream(request, retries, secret_key, peer_registry).boxed(),
-        }
-    }
-}
-
-fn opaque_discovery_stream(
-    request: PbOpaqueRequest,
-    retries: usize,
-    secret_key: Option<SecretKey>,
-    peer_registry: PeerManager,
-) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+fn stub_stream() -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
     try_stream! {
-        let max_attempts = retries.saturating_add(1);
-        let mut tried: HashSet<EndpointId> = HashSet::new();
-        let mut last_peer_error: Option<anyhow::Error> = None;
-        info!("No node ID provided, discovering opaque executor");
-
-        for attempt in 1..=max_attempts {
-            let remote = prepare_discovered_opaque_remote(
-                &request,
-                secret_key.as_ref(),
-                &tried,
-                peer_registry.clone(),
-            ).await?;
-            let peer_id = remote.driver.peer_id();
-            let mut committed = false;
-            let mut transport_err: Option<anyhow::Error> = None;
-            let mut got_terminal = false;
-            {
-                let inner = remote.stream();
-                tokio::pin!(inner);
-                while let Some(event) = inner.next().await {
-                    match event {
-                        Ok(OpaqueExecutionEvent::Chunk { position, bytes }) => {
-                            committed = true;
-                            yield OpaqueExecutionEvent::Chunk { position, bytes };
-                        }
-                        Ok(OpaqueExecutionEvent::Done(outcome)) => {
-                            got_terminal = true;
-                            yield OpaqueExecutionEvent::Done(outcome);
-                        }
-                        Err(e) => {
-                            transport_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-            if got_terminal { return; }
-
-            let err = transport_err
-                .unwrap_or_else(|| anyhow!("stream from {peer_id} ended without terminal outcome"));
-            if committed {
-                Err(err.context(format!(
-                    "opaque execution failed on {peer_id} after output was emitted"
-                )))?;
-                unreachable!("Err(_)? always returns");
-            }
-            warn!(attempt, %peer_id, "opaque execution failed before output, rediscovering: {err:#}");
-            tried.insert(peer_id);
-            last_peer_error = Some(err);
-        }
-
-        let err = last_peer_error
-            .unwrap_or_else(|| anyhow!("no opaque provider could serve the request"));
-        Err(err.context(format!("max retries ({retries}) exceeded")))?;
-    }
-}
-
-/// Discovery+retry across providers.
-///
-/// Per-attempt rules (matched off the inner Result so the failure-mode
-/// distinction is visible):
-///   - `Ok(Chunk)` → forward; mark `committed`.
-///   - `Ok(Done)` → forward and finish (executor verdict, no retry).
-///   - `Err(_)` before any `committed` chunk → exclude this peer, retry.
-///   - `Err(_)` after `committed` chunks → propagate (can't retry committed work).
-///
-/// `prepare_discovered_remote` failure aborts immediately — that's a
-/// "couldn't find anyone" condition that retrying won't help with.
-fn discovery_stream(
-    quote_req: QuotePreparedTextRequest,
-    retries: usize,
-    secret_key: Option<SecretKey>,
-    peer_registry: PeerManager,
-) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
-    try_stream! {
-        let max_attempts = retries.saturating_add(1);
-        let mut tried: HashSet<EndpointId> = HashSet::new();
-        let mut last_peer_error: Option<anyhow::Error> = None;
-        info!("No node ID provided, discovering executor");
-
-        for attempt in 1..=max_attempts {
-            let remote = prepare_discovered_remote(
-                &quote_req,
-                secret_key.as_ref(),
-                &tried,
-                peer_registry.clone(),
-            ).await?;
-            let peer_id = remote.driver.peer_id();
-            let mut committed = false;
-            let mut transport_err: Option<anyhow::Error> = None;
-            let mut got_terminal = false;
-            {
-                let inner = remote.stream();
-                tokio::pin!(inner);
-                while let Some(event) = inner.next().await {
-                    match event {
-                        Ok(ExecutionEvent::Chunk { position, tokens }) => {
-                            committed = true;
-                            yield ExecutionEvent::Chunk { position, tokens };
-                        }
-                        Ok(ExecutionEvent::Done(outcome)) => {
-                            got_terminal = true;
-                            yield ExecutionEvent::Done(outcome);
-                        }
-                        Err(e) => {
-                            transport_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-            if got_terminal { return; }
-
-            // No terminal — must be a transport error. The "stream ended
-            // without terminal" case manifests as None from the inner
-            // generator without an Err item; treat it the same way.
-            let err = transport_err
-                .unwrap_or_else(|| anyhow!("stream from {peer_id} ended without terminal outcome"));
-            if committed {
-                Err(err.context(format!(
-                    "execution failed on {peer_id} after output was emitted"
-                )))?;
-                unreachable!("Err(_)? always returns");
-            }
-            warn!(attempt, %peer_id, "execution failed before output, rediscovering: {err:#}");
-            tried.insert(peer_id);
-            last_peer_error = Some(err);
-        }
-
-        let err = last_peer_error
-            .unwrap_or_else(|| anyhow!("no provider could serve the request"));
-        Err(err.context(format!("max retries ({retries}) exceeded")))?;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RemoteExecution — owns one quoted remote driver + its endpoint
-// ---------------------------------------------------------------------------
-
-struct RemoteExecution {
-    endpoint: Arc<Endpoint>,
-    request_commitment: Vec<u8>,
-    provenance: ExecutionProvenance,
-    driver: TracedDriver,
-}
-
-impl RemoteExecution {
-    fn from_quoted(endpoint: Arc<Endpoint>, quoted: QuotedRemoteDriver) -> Self {
-        Self {
-            endpoint,
-            request_commitment: quoted.quote.request_commitment,
-            provenance: quoted.provenance,
-            driver: quoted.driver,
-        }
-    }
-
-    fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
-        let Self {
-            endpoint,
-            request_commitment,
-            provenance: _,
-            driver,
-        } = self;
-        track_remote_execution_stream(endpoint, execute_stream(driver, request_commitment))
-    }
-}
-
-struct OpaqueRemoteExecution {
-    endpoint: Arc<Endpoint>,
-    request: PbOpaqueRequest,
-    request_commitment: Vec<u8>,
-    driver: TracedDriver,
-}
-
-impl OpaqueRemoteExecution {
-    fn from_quoted(
-        endpoint: Arc<Endpoint>,
-        request: PbOpaqueRequest,
-        quoted: QuotedRemoteDriver,
-    ) -> Self {
-        Self {
-            endpoint,
-            request,
-            request_commitment: quoted.quote.request_commitment,
-            driver: quoted.driver,
-        }
-    }
-
-    fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
-        let Self {
-            endpoint,
-            request,
-            request_commitment,
-            driver,
-        } = self;
-        track_remote_execution_stream(
-            endpoint,
-            execute_opaque_stream(driver, request_commitment, request),
-        )
-    }
-}
-
-/// Hold the endpoint alive for the duration of the per-execution stream so
-/// a concurrent endpoint drop doesn't tear down the underlying QUIC
-/// connection mid-execution. The RunTicket permit lifecycle (acquire on
-/// the call, finish on terminal / error / drop) lives inside
-/// `ManagedRemoteDriver::execute_streaming`, so this helper is now a thin
-/// shape-converter.
-fn track_remote_execution_stream<E, S>(
-    endpoint: Arc<Endpoint>,
-    inner: S,
-) -> impl Stream<Item = anyhow::Result<E>> + Send
-where
-    E: Send + 'static,
-    S: Stream<Item = anyhow::Result<E>> + Send + 'static,
-{
-    try_stream! {
-        let _endpoint = endpoint;
-        tokio::pin!(inner);
-        while let Some(event) = inner.next().await {
-            yield event?;
+        Err(anyhow!(
+            "execution pending hellas-wire discovery/pool port — see CUTOVER_FINDINGS.md"
+        ))?;
+        #[allow(unreachable_code)]
+        {
+            yield ExecutionEvent::Done(Outcome::Failed {
+                position: 0,
+                error: "unreachable".to_string(),
+            });
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// execute_stream — the bottom layer that maps wire events → ExecutionEvent
+// Helpers retained for shape (receipt decoding)
 // ---------------------------------------------------------------------------
 
-fn execute_stream<D: ExecuteDriver + Send + 'static>(
-    mut driver: D,
-    request_commitment: Vec<u8>,
-) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
-    try_stream! {
-        // Provenance arrives in `streamed.provenance` (from response
-        // metadata server-side) but the gateway already has it from the
-        // quote step, so we drop it here and only forward the event stream.
-        let mut wire = driver
-            .execute_streaming(RunTicketRequest {
-                request_commitment,
-            })
-            .await
-            .context("failed to start execution stream")?
-            .stream;
-
-        let mut got_terminal = false;
-        while let Some(item) = wire.next().await {
-            let event = convert_wire_event(item.context("execution stream failed")?)?;
-            let is_done = matches!(event, ExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
-            }
-        }
-
-        if !got_terminal {
-            Err(anyhow!("execution stream ended without terminal outcome"))?;
-        }
-        // Hold the driver until end of stream so the underlying transport
-        // (tonic streaming response) stays attached.
-        drop(driver);
-    }
-}
-
-fn execute_opaque_stream<D: ExecuteDriver + Send + 'static>(
-    mut driver: D,
-    request_commitment: Vec<u8>,
-    request: PbOpaqueRequest,
-) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
-    try_stream! {
-        let core_request = core_opaque_request(&request)?;
-        let mut wire = driver
-            .execute_streaming(RunTicketRequest {
-                request_commitment,
-            })
-            .await
-            .context("failed to start opaque execution stream")?
-            .stream;
-
-        let mut got_terminal = false;
-        while let Some(item) = wire.next().await {
-            let event = convert_opaque_wire_event(
-                item.context("opaque execution stream failed")?,
-                &core_request,
-            )?;
-            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
-            }
-        }
-
-        if !got_terminal {
-            Err(anyhow!("opaque execution stream ended without terminal outcome"))?;
-        }
-        drop(driver);
-    }
-}
-
-/// Translate one wire `WorkEvent` into one `ExecutionEvent`.
-fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
-    let Some(event) = event.kind else {
-        bail!("wire event with no body");
-    };
-    match event {
-        work_event::Kind::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
-            position: chunk.position,
-            tokens: chunk.bytes,
-        }),
-        work_event::Kind::Finished(finished) => Ok(ExecutionEvent::Done(parse_finished(finished)?)),
-        work_event::Kind::Failed(failed) => Ok(ExecutionEvent::Done(Outcome::Failed {
-            position: failed.position,
-            error: failed.error,
-        })),
-    }
-}
-
-fn convert_opaque_wire_event(
-    event: WorkEvent,
-    request: &CoreOpaqueRequest,
-) -> anyhow::Result<OpaqueExecutionEvent> {
-    let Some(event) = event.kind else {
-        bail!("wire event with no body");
-    };
-    match event {
-        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
-            position: chunk.position,
-            bytes: chunk.bytes,
-        }),
-        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
-            parse_opaque_finished(finished, request)?,
-        )),
-        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
-            error: failed.error,
-        })),
-    }
-}
-
-fn parse_finished(finished: pb::WorkFinished) -> anyhow::Result<Outcome> {
-    let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
-    if receipt.symbolic_text_artifact().is_none() {
-        bail!("symbolic execution returned an opaque receipt");
-    }
-    let stop_reason = stop_reason_from_pb(finished.status)?;
-    Ok(Outcome::Completed {
-        total_tokens: finished.total_units,
-        stop_reason,
-        receipt,
-    })
-}
-
-fn parse_opaque_finished(
-    finished: pb::WorkFinished,
-    request: &CoreOpaqueRequest,
-) -> anyhow::Result<OpaqueOutcome> {
-    stop_reason_from_pb(finished.status)?;
-    serde_json::from_slice::<serde_json::Value>(&finished.output)
-        .context("opaque output must be UTF-8 JSON")?;
-    let output = JsonBytes::new(finished.output.clone());
-    let (_dag_cbor, core) = decode_receipt_envelope(finished.receipt)?;
-    verify_delivery(
-        DeliveryRequest::Opaque(request),
-        DeliveryOutput::Opaque(&output),
-        &core,
-    )
-    .context("opaque receipt verification failed")?;
-    if core.body().scheme() != SchemeId::Opaque {
-        bail!("opaque execution returned a symbolic receipt");
-    }
-    Ok(OpaqueOutcome::Completed {
-        output: output.into_bytes(),
-    })
-}
-
+#[allow(dead_code)] // becomes live once the wire paths return real receipts
 fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRequest> {
     if request.service.is_empty() {
         bail!("opaque service must not be empty");
@@ -1154,517 +565,4 @@ fn decode_receipt_envelope(
     let core: CoreSignedReceipt = decode_dag_cbor(&envelope.dag_cbor)
         .context("failed to decode receipt envelope dag-cbor")?;
     Ok((envelope.dag_cbor, core))
-}
-
-fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
-    let pb_value =
-        FinishStatus::try_from(value).with_context(|| format!("unknown finish status {value}"))?;
-    match pb_value {
-        FinishStatus::Unspecified => bail!("wire finish status is unspecified"),
-        FinishStatus::EndOfSequence => Ok(StopReason::EndOfSequence),
-        FinishStatus::MaxOutput => Ok(StopReason::MaxNewTokens),
-        FinishStatus::Cancelled => Ok(StopReason::Cancelled),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Quote / discovery / endpoint helpers (largely unchanged)
-// ---------------------------------------------------------------------------
-
-struct QuotedRemoteDriver {
-    quote: hellas_rpc::pb::execute::Ticket,
-    provenance: ExecutionProvenance,
-    /// Carries its own `PeerManager` + `peer_id`; the surrounding fields
-    /// don't need to repeat them.
-    driver: TracedDriver,
-}
-
-#[derive(Debug)]
-enum QuoteCandidateError {
-    Declined(anyhow::Error),
-    Connect(anyhow::Error),
-}
-
-#[instrument(skip_all, fields(model = %quote_req.huggingface_model_id))]
-async fn quote_with_driver<D>(
-    quote_req: &QuotePreparedTextRequest,
-    driver: &mut D,
-    context: impl FnOnce() -> String,
-) -> anyhow::Result<QuotedPreparedTextResponse>
-where
-    D: ExecuteDriver,
-{
-    let quoted = driver
-        .quote_prepared_text(quote_req.clone())
-        .await
-        .with_context(context)?;
-    let ticket = quoted
-        .response
-        .ticket
-        .as_ref()
-        .ok_or_else(|| anyhow!("quote_prepared_text response missing ticket"))?;
-    tracing::Span::current().record(
-        "request_commitment",
-        tracing::field::display(format_hex(&ticket.request_commitment)),
-    );
-    Ok(quoted)
-}
-
-#[instrument(skip_all, fields(service = %request.service, method = %request.method))]
-async fn quote_opaque_with_driver<D>(
-    request: &PbOpaqueRequest,
-    driver: &mut D,
-    context: impl FnOnce() -> String,
-) -> anyhow::Result<QuotedResponse>
-where
-    D: ExecuteDriver,
-{
-    core_opaque_request(request)?;
-    let quoted = driver
-        .create_opaque_ticket(request.clone())
-        .await
-        .with_context(context)?;
-    tracing::Span::current().record(
-        "request_commitment",
-        tracing::field::display(format_hex(&quoted.response.request_commitment)),
-    );
-    Ok(quoted)
-}
-
-async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<Arc<Endpoint>> {
-    let (endpoint, _bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
-    Ok(endpoint)
-}
-
-/// Bind a client endpoint and attach the full discovery stack (DNS + Pkarr
-/// publisher + mDNS + DHT resolver). Without mDNS attached to the endpoint's
-/// address lookup, peers on the same LAN can only be resolved via the Pkarr
-/// DHT / n0 DNS relay, so LAN connections take minutes instead of milliseconds.
-async fn bind_remote_endpoint_with_bindings(
-    secret_key: Option<&SecretKey>,
-) -> anyhow::Result<(Arc<Endpoint>, DiscoveryBindings)> {
-    use iroh::address_lookup::PkarrPublisher;
-    use iroh::endpoint::presets;
-
-    let mut builder = Endpoint::builder(presets::N0)
-        .clear_address_lookup()
-        .address_lookup(DnsAddressLookup::n0_dns())
-        .address_lookup(PkarrPublisher::n0_dns())
-        .portmapper_config(PortmapperConfig::Disabled);
-    if let Some(key) = secret_key {
-        builder = builder.secret_key(key.clone());
-    }
-    let endpoint = builder
-        .bind()
-        .await
-        .context("failed to create client transport endpoint")?;
-    let bindings = DiscoveryBindings::attach(&endpoint, false, false)
-        .context("failed to attach client discovery lookups")?;
-    Ok((Arc::new(endpoint), bindings))
-}
-
-/// Build an `IrohTransport` for outbound RPCs against remote nodes. The
-/// quote/execute paths pull `pool::<ExecuteService>()` / `pool::<CourtesyService>()`
-/// / `pool::<OpaqueService>()` off this transport on demand; pools are cached
-/// so repeated lookups share a single underlying `ConnectionPool`.
-fn bind_remote_transport(endpoint: &Endpoint, peer_registry: PeerManager) -> IrohTransport {
-    IrohTransport::with_options(
-        endpoint.clone(),
-        peer_registry,
-        PoolOptions {
-            connect_timeout: REMOTE_CONNECT_TIMEOUT,
-            ..PoolOptions::default()
-        },
-    )
-}
-
-/// Dial Execute + Courtesy at `target`, then issue `QuotePreparedText`
-/// across the courtesy channel through a `ManagedRemoteDriver`. The dials
-/// are service-level (`pool.dial`) so they don't take method permits;
-/// the `QuotePreparedText` permit is acquired inside the managed driver
-/// and resolved on the call's outcome.
-#[instrument(skip_all, fields(peer_id = %target.peer_id, model = %quote_req.huggingface_model_id))]
-async fn quote_remote_via_pools(
-    quote_req: &QuotePreparedTextRequest,
-    execute_pool: &IrohRpcPool<ExecuteService>,
-    courtesy_pool: &IrohRpcPool<CourtesyService>,
-    target: IrohTarget,
-    peer_registry: PeerManager,
-) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let peer_id = target.peer_id;
-    let execute_channel = execute_pool
-        .dial(target.clone())
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let courtesy_channel = courtesy_pool
-        .dial(target)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let inner = RemoteExecuteDriver::with_execute_and_courtesy(
-        traced(execute_channel),
-        traced(courtesy_channel),
-    );
-    let mut driver = ManagedRemoteDriver::new(inner, peer_registry.clone(), peer_id);
-    let quoted = quote_with_driver(quote_req, &mut driver, || {
-        format!("node {peer_id} declined ticket")
-    })
-    .await
-    .map_err(QuoteCandidateError::Declined)?;
-    let Some(ticket) = quoted.response.ticket else {
-        return Err(QuoteCandidateError::Declined(anyhow!(
-            "quote_prepared_text response missing ticket"
-        )));
-    };
-    Ok(QuotedRemoteDriver {
-        quote: ticket,
-        provenance: quoted.provenance,
-        driver,
-    })
-}
-
-/// Opaque counterpart of [`quote_remote_via_pools`].
-#[instrument(skip_all, fields(peer_id = %target.peer_id, service = %request.service, method = %request.method))]
-async fn quote_opaque_remote_via_pools(
-    request: &PbOpaqueRequest,
-    execute_pool: &IrohRpcPool<ExecuteService>,
-    opaque_pool: &IrohRpcPool<OpaqueService>,
-    target: IrohTarget,
-    peer_registry: PeerManager,
-) -> Result<QuotedRemoteDriver, QuoteCandidateError> {
-    let peer_id = target.peer_id;
-    let execute_channel = execute_pool
-        .dial(target.clone())
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let opaque_channel = opaque_pool
-        .dial(target)
-        .await
-        .with_context(|| format!("failed to connect to node {peer_id}"))
-        .map_err(QuoteCandidateError::Connect)?;
-    let inner = RemoteExecuteDriver::with_execute_and_opaque(
-        traced(execute_channel),
-        traced(opaque_channel),
-    );
-    let mut driver = ManagedRemoteDriver::new(inner, peer_registry.clone(), peer_id);
-    let quoted = quote_opaque_with_driver(request, &mut driver, || {
-        format!("node {peer_id} declined opaque ticket")
-    })
-    .await
-    .map_err(QuoteCandidateError::Declined)?;
-    Ok(QuotedRemoteDriver {
-        quote: quoted.response,
-        provenance: quoted.provenance,
-        driver,
-    })
-}
-
-async fn quote_opaque_remote_target(
-    request: &PbOpaqueRequest,
-    endpoint: &Endpoint,
-    target: &RemoteNodeTarget,
-    peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let transport = bind_remote_transport(endpoint, peer_registry.clone());
-    let iroh_target = remote_node_iroh_target(target);
-    quote_opaque_remote_via_pools(
-        request,
-        &transport.pool::<ExecuteService>(),
-        &transport.pool::<OpaqueService>(),
-        iroh_target,
-        peer_registry,
-    )
-    .await
-    .map_err(|err| match err {
-        QuoteCandidateError::Declined(err) => {
-            err.context(format!("node {} declined opaque quote", target.node_id))
-        }
-        QuoteCandidateError::Connect(err) => err,
-    })
-}
-
-async fn quote_remote_target(
-    quote_req: &QuotePreparedTextRequest,
-    endpoint: &Endpoint,
-    target: &RemoteNodeTarget,
-    peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let transport = bind_remote_transport(endpoint, peer_registry.clone());
-    let iroh_target = remote_node_iroh_target(target);
-    quote_remote_via_pools(
-        quote_req,
-        &transport.pool::<ExecuteService>(),
-        &transport.pool::<CourtesyService>(),
-        iroh_target,
-        peer_registry,
-    )
-    .await
-    .map_err(|err| match err {
-        QuoteCandidateError::Declined(err) => {
-            err.context(format!("node {} declined quote", target.node_id))
-        }
-        QuoteCandidateError::Connect(err) => err,
-    })
-}
-
-fn remote_node_iroh_target(target: &RemoteNodeTarget) -> IrohTarget {
-    if target.node_addrs.is_empty() {
-        IrohTarget::discovered(target.node_id)
-    } else {
-        IrohTarget::direct(target.node_id, target.endpoint_addr())
-    }
-}
-
-#[instrument(skip_all, fields(service = %request.service, method = %request.method, excluded = exclude.len()))]
-async fn discover_opaque_remote_quote(
-    request: &PbOpaqueRequest,
-    endpoint: &Endpoint,
-    bindings: DiscoveryBindings,
-    exclude: &HashSet<EndpointId>,
-    peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let mut registry = ServiceRegistry::new(endpoint);
-    registry.with_pool_options(PoolOptions {
-        connect_timeout: REMOTE_CONNECT_TIMEOUT,
-        ..PoolOptions::default()
-    });
-    registry.add(MdnsBackend::new(bindings.mdns));
-    registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
-    let execute_pool = IrohRpcPool::<ExecuteService>::from_pool(
-        endpoint.clone(),
-        registry.pool::<ExecuteService>(),
-        peer_registry.clone(),
-    );
-    let opaque_pool = IrohRpcPool::<OpaqueService>::from_pool(
-        endpoint.clone(),
-        registry.pool::<OpaqueService>(),
-        peer_registry.clone(),
-    );
-
-    let peers = Box::pin(registry.discover::<OpaqueService>());
-    tokio::time::timeout(DISCOVERY_TIMEOUT, async {
-        let mut last_decline: Option<anyhow::Error> = None;
-        let mut last_connect_error: Option<anyhow::Error> = None;
-        let mut peers_done = false;
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        futures::pin_mut!(peers);
-
-        loop {
-            tokio::select! {
-                biased;
-
-                Some(result) = in_flight.next(), if !in_flight.is_empty() => {
-                    match result {
-                        Ok(accepted) => return Ok(accepted),
-                        Err(QuoteCandidateError::Declined(err)) => {
-                            info!("opaque provider declined quote: {err:#}");
-                            last_decline = Some(err);
-                        }
-                        Err(QuoteCandidateError::Connect(err)) => {
-                            debug!("opaque candidate connect error: {err:#}");
-                            last_connect_error = Some(err);
-                        }
-                    }
-                }
-
-                peer = peers.next(), if !peers_done && in_flight.len() < MAX_CONCURRENT_QUOTES => {
-                    match peer {
-                        Some(Ok(peer)) => {
-                            let peer_id = peer.id();
-                            let _ = peer_registry.observe_iroh_service::<OpaqueService>(peer_id);
-                            if exclude.contains(&peer_id) {
-                                debug!(%peer_id, "skipping previously-failed opaque peer");
-                                continue;
-                            }
-                            let execute_pool = execute_pool.clone();
-                            let opaque_pool = opaque_pool.clone();
-                            let peer_registry = peer_registry.clone();
-                            let req = request.clone();
-                            in_flight.push(async move {
-                                quote_opaque_remote_via_pools(
-                                    &req,
-                                    &execute_pool,
-                                    &opaque_pool,
-                                    IrohTarget::discovered(peer_id),
-                                    peer_registry,
-                                ).await
-                            });
-                        }
-                        Some(Err(err)) => last_connect_error = Some(err.into()),
-                        None => peers_done = true,
-                    }
-                }
-
-                else => {
-                    if peers_done && in_flight.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(status) = last_decline {
-            return Err(status).context("all discovered opaque providers declined the quote");
-        }
-        if let Some(err) = last_connect_error {
-            return Err(err).context("failed to connect to discovered opaque providers");
-        }
-
-        anyhow::bail!("no opaque provider could serve the request");
-    })
-    .await
-    .context("opaque discovery timed out")?
-}
-
-#[instrument(skip_all, fields(model = %quote_req.huggingface_model_id, excluded = exclude.len()))]
-async fn discover_remote_quote(
-    quote_req: &QuotePreparedTextRequest,
-    endpoint: &Endpoint,
-    bindings: DiscoveryBindings,
-    exclude: &HashSet<EndpointId>,
-    peer_registry: PeerManager,
-) -> anyhow::Result<QuotedRemoteDriver> {
-    let mut registry = ServiceRegistry::new(endpoint);
-    registry.with_pool_options(PoolOptions {
-        connect_timeout: REMOTE_CONNECT_TIMEOUT,
-        ..PoolOptions::default()
-    });
-    registry.add(MdnsBackend::new(bindings.mdns));
-    registry.add(DhtBackend::with_dht(endpoint, bindings.dht));
-    let execute_pool = IrohRpcPool::<ExecuteService>::from_pool(
-        endpoint.clone(),
-        registry.pool::<ExecuteService>(),
-        peer_registry.clone(),
-    );
-    let courtesy_pool = IrohRpcPool::<CourtesyService>::from_pool(
-        endpoint.clone(),
-        registry.pool::<CourtesyService>(),
-        peer_registry.clone(),
-    );
-
-    let peers = Box::pin(registry.discover::<CourtesyService>());
-    tokio::time::timeout(DISCOVERY_TIMEOUT, async {
-        let mut last_decline: Option<anyhow::Error> = None;
-        let mut last_connect_error: Option<anyhow::Error> = None;
-        let mut peers_done = false;
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        futures::pin_mut!(peers);
-
-        loop {
-            tokio::select! {
-                biased;
-
-                // Consume completed quote attempts first; an early success short-circuits.
-                Some(result) = in_flight.next(), if !in_flight.is_empty() => {
-                    match result {
-                        Ok(accepted) => return Ok(accepted),
-                        Err(QuoteCandidateError::Declined(err)) => {
-                            info!("provider declined quote: {err:#}");
-                            last_decline = Some(err);
-                        }
-                        Err(QuoteCandidateError::Connect(err)) => {
-                            debug!("candidate connect error: {err:#}");
-                            last_connect_error = Some(err);
-                        }
-                    }
-                }
-
-                // Drain the mDNS/DHT stream as fast as we can, up to the concurrency cap,
-                // so iroh's subscriber buffer doesn't fill up and start dropping items.
-                peer = peers.next(), if !peers_done && in_flight.len() < MAX_CONCURRENT_QUOTES => {
-                    match peer {
-                        Some(Ok(peer)) => {
-                            let peer_id = peer.id();
-                            let _ = peer_registry.observe_iroh_service::<CourtesyService>(peer_id);
-                            if exclude.contains(&peer_id) {
-                                debug!(%peer_id, "skipping previously-failed peer");
-                                continue;
-                            }
-                            let execute_pool = execute_pool.clone();
-                            let courtesy_pool = courtesy_pool.clone();
-                            let peer_registry = peer_registry.clone();
-                            let req = quote_req.clone();
-                            in_flight.push(async move {
-                                quote_remote_via_pools(
-                                    &req,
-                                    &execute_pool,
-                                    &courtesy_pool,
-                                    IrohTarget::discovered(peer_id),
-                                    peer_registry,
-                                ).await
-                            });
-                        }
-                        Some(Err(err)) => last_connect_error = Some(err.into()),
-                        None => peers_done = true,
-                    }
-                }
-
-                else => {
-                    if peers_done && in_flight.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(status) = last_decline {
-            return Err(status).context("all discovered providers declined the quote");
-        }
-        if let Some(err) = last_connect_error {
-            return Err(err).context("failed to connect to discovered providers");
-        }
-
-        anyhow::bail!("no provider could serve the request");
-    })
-    .await
-    .context("discovery timed out")?
-}
-
-async fn prepare_discovered_opaque_remote(
-    request: &PbOpaqueRequest,
-    secret_key: Option<&SecretKey>,
-    exclude: &HashSet<EndpointId>,
-    peer_registry: PeerManager,
-) -> anyhow::Result<OpaqueRemoteExecution> {
-    let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
-    let quote =
-        discover_opaque_remote_quote(request, &endpoint, bindings, exclude, peer_registry).await?;
-    Ok(OpaqueRemoteExecution::from_quoted(
-        endpoint,
-        request.clone(),
-        quote,
-    ))
-}
-
-async fn prepare_discovered_remote(
-    quote_req: &QuotePreparedTextRequest,
-    secret_key: Option<&SecretKey>,
-    exclude: &HashSet<EndpointId>,
-    peer_registry: PeerManager,
-) -> anyhow::Result<RemoteExecution> {
-    let (endpoint, bindings) = bind_remote_endpoint_with_bindings(secret_key).await?;
-    let quote =
-        discover_remote_quote(quote_req, &endpoint, bindings, exclude, peer_registry).await?;
-    Ok(RemoteExecution::from_quoted(endpoint, quote))
-}
-
-#[cfg(feature = "hellas-executor")]
-fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
-    let revision = quote_req.huggingface_revision.trim();
-    if revision.is_empty() {
-        quote_req.huggingface_model_id.clone()
-    } else {
-        format!("{}@{revision}", quote_req.huggingface_model_id)
-    }
-}
-
-fn format_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
