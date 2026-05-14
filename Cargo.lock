@@ -2651,6 +2651,7 @@ dependencies = [
  "chatgrad",
  "futures",
  "futures-core",
+ "futures-util",
  "hellas-wire",
  "hf-hub 0.5.0",
  "http",
