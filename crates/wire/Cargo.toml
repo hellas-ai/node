@@ -1,0 +1,63 @@
+[package]
+name = "hellas-wire"
+description = "Transport-agnostic RPC wire layer for the Hellas protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+
+# Transports
+iroh = ["dep:iroh", "dep:n0-future"]
+h2 = ["dep:h2", "dep:http"]
+h3 = []  # scaffold only
+
+# Mux is shared infrastructure for transports without native substreams.
+mux = []
+ws = ["mux", "dep:tokio-tungstenite"]
+ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
+ws-cf-do = ["mux", "dep:worker"]
+
+# OpenTelemetry header propagation on Metadata
+otel = ["dep:opentelemetry"]
+
+# Server role (accept side; non-wasm)
+server = []
+
+[dependencies]
+blake3 = { workspace = true }
+bytes = "1"
+futures = "0.3"
+futures-core = "0.3"
+pin-project-lite = "0.2"
+smol_str = "0.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+web-time = "1"
+
+# Optional transport deps
+iroh = { version = "0.98", default-features = false, optional = true }
+n0-future = { version = "0.3", default-features = false, optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+tokio-tungstenite = { version = "0.27", optional = true }
+ws_stream_wasm = { version = "0.7", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+worker = { version = "0.6", optional = true, default-features = false }
+
+opentelemetry = { workspace = true, optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "rt"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["full"] }
