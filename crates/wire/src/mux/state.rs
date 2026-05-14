@@ -424,21 +424,15 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 // Forward the chunk via the event channel; do NOT also
                 // retain it in recv_buf. The driver that surfaces
                 // BodyChunk events is responsible for forwarding bytes
-                // to the application; keeping them in recv_buf as well
-                // wastes memory and never gets drained because the
-                // app reads via the event channel.
+                // to the application; recv_buf is dead code in the
+                // events-flow path.
                 //
-                // Flow control: refill local credit eagerly here.
-                // Once the chunk is queued for the application, we
-                // consider it "consumed" from a flow-control POV —
-                // backpressure on the app layer is the app's job to
-                // surface upstream. This is a simplification; see
-                // CUTOVER_FINDINGS for a proper consumer-acknowledged
-                // flow-control TODO.
-                slot.local_recv_credit = slot
-                    .local_recv_credit
-                    .saturating_add(n)
-                    .min(slot.local_credit_high_water);
+                // Credit does NOT refill here. `prepare_credit_updates`
+                // runs after each `recv()` in the driver loop and
+                // queues a `Frame::Credit` once `local_recv_credit`
+                // drops below `local_credit_high_water /
+                // credit_refill_ratio`. The driver ships the Credit
+                // frame on the very next outbound flush.
                 events.push(Event::BodyChunk {
                     slot: idx,
                     payload,

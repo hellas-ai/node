@@ -18,9 +18,10 @@
 //!                                └─ shadow (verify):  same shape, run after primary
 //! ```
 //!
-//! NOTE (hellas-wire v2 cutover): RemoteDiscovery is still stubbed — the
-//! mDNS/DHT/Pkarr feed plumbing wasn't ported yet. RemoteDirect and Local
-//! work. See `HELLAS_WIRE_CUTOVER_FINDINGS.md`.
+//! NOTE: RemoteDiscovery races peers from `ServiceRegistry::discover` and
+//! takes the first that returns a successful quote. The pre-cutover impl
+//! drove the same race over `IrohRpcPool::dial` + `discover_remote_quote`;
+//! the new shape uses the wire crate's pooled `transport()` API directly.
 
 // A few "kept for shape" helpers are reachable from one feature combination
 // but not the other. Keep dead_code muted at the file level so we don't end
