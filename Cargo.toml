@@ -1,10 +1,12 @@
 [workspace]
 members = [
+  "crates/catnix",
   "crates/cli",
   "crates/core",
   "crates/executor",
   "crates/pb",
   "crates/rpc",
+  "crates/wire",
 ]
 default-members = ["crates/cli"]
 resolver = "2"
@@ -23,16 +25,20 @@ catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat
   "serde",
 ] }
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
-catnix = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
+catnix = { path = "crates/catnix", default-features = false }
 chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 half = "2.7.1"
 hellas-core = { path = "crates/core", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-pb = { path = "crates/pb", default-features = false }
-# tonic-iroh-transport = { path = "../tonic-iroh-transport", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
-# tonic-iroh-transport = { git = "https://github.com/hellas-ai/tonic-iroh-transport", branch = "grw/feat/iroh-0.98", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
-
 hellas-rpc = { path = "crates/rpc", default-features = false }
+hellas-wire = { path = "crates/wire", default-features = false }
+tonic = { version = "0.14", features = ["gzip"] }
+tonic-iroh-transport = { version = "0.9.2", default-features = false, features = [
+  "tls-ring",
+  "portmapper",
+  "fast-apple-datapath",
+] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh-blobs = { version = "0.100", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
@@ -63,19 +69,6 @@ tokio = { version = "1", features = [
   "process",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tonic = { version = "0.14", features = ["gzip"] }
-tonic-iroh-transport = { version = "0.9.2", default-features = false, features = [
-  "tls-ring",
-  "portmapper",
-  "fast-apple-datapath",
-] }
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# [patch."https://github.com/hellas-ai/catgrad"]
-# catgrad = { path = "../catgrad/catgrad" }
-# catgrad-llm = { path = "../catgrad/catgrad-llm" }
-
-# [patch.crates-io]
-# tonic-iroh-transport = { path = "../tonic-iroh-transport" }
