@@ -352,16 +352,34 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
     // The free_mask must only have bits set for slots of our parity.
     // A poisoned snapshot that marks peer-parity slots "free" would
     // let our allocator hand out slots in the peer's domain.
-    let peer_parity_mask: u64 = if role.parity() == 0 { 0xAAAA_AAAA_AAAA_AAAA } else { 0x5555_5555_5555_5555 };
+    // Also: NO bits beyond N may be set — `lowest_free()` doesn't
+    // bound its index against N, so a tail bit would let `open()`
+    // index out of range and panic.
+    let peer_parity_mask: u64 = if role.parity() == 0 {
+        0xAAAA_AAAA_AAAA_AAAA
+    } else {
+        0x5555_5555_5555_5555
+    };
     for (word_idx, word) in words.iter().enumerate() {
-        if word & peer_parity_mask != 0 {
-            // Allow leniency on the LAST word: bits beyond N are masked off below.
-            let tail_bits_in_word = (word_idx + 1) * 64;
-            if tail_bits_in_word <= N || (word & peer_parity_mask) & ((1u64 << (N - word_idx * 64)) - 1) != 0 {
-                return Err(CfDoError::SnapshotCorrupt(
-                    "free_mask sets a bit owned by peer parity",
-                ));
+        let valid_bits: u64 = {
+            let start_bit = word_idx * 64;
+            if start_bit >= N {
+                0
+            } else if start_bit + 64 <= N {
+                u64::MAX
+            } else {
+                (1u64 << (N - start_bit)) - 1
             }
+        };
+        if word & !valid_bits != 0 {
+            return Err(CfDoError::SnapshotCorrupt(
+                "free_mask sets a bit beyond N",
+            ));
+        }
+        if word & peer_parity_mask & valid_bits != 0 {
+            return Err(CfDoError::SnapshotCorrupt(
+                "free_mask sets a bit owned by peer parity",
+            ));
         }
     }
     mux.set_free_mask_words(&words);
@@ -405,6 +423,14 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
         if local_recv_credit > local_credit_high_water {
             return Err(CfDoError::SnapshotCorrupt(
                 "local_recv_credit > high_water",
+            ));
+        }
+        // high_water itself must not exceed the configured initial
+        // credit — otherwise a forged snapshot could persuade us to
+        // mint enormous Credit frames on prepare_credit_updates.
+        if local_credit_high_water > mux_config.initial_credit {
+            return Err(CfDoError::SnapshotCorrupt(
+                "high_water > config.initial_credit",
             ));
         }
         // Sanity: peer_recv_credit shouldn't exceed config's initial
@@ -456,6 +482,32 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
                 ));
             }
             let bytes = cur.take_bytes(len)?;
+            // pending_write is one outbound mux frame that didn't make
+            // it to the wire before suspension. Decode it and validate
+            // its (stream_id, generation) matches a known slot. A
+            // poisoned attachment that injected arbitrary bytes here
+            // would let the DO ship one attacker-controlled frame on
+            // wake; the decode guards against that.
+            let keyed = crate::mux::decode_keyed_frame(bytes).map_err(|_| {
+                CfDoError::SnapshotCorrupt("pending_write not a valid keyed frame")
+            })?;
+            if (keyed.key.stream_id as usize) >= N {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "pending_write stream_id out of range",
+                ));
+            }
+            // The frame must reference a slot we already restored, and
+            // the slot's generation must match.
+            let slot_match = mux
+                .iter_occupied_slots()
+                .find(|(idx, _)| *idx == keyed.key.stream_id)
+                .map(|(_, slot)| slot.generation == keyed.key.generation)
+                .unwrap_or(false);
+            if !slot_match {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "pending_write key does not match any restored slot",
+                ));
+            }
             mux.set_pending_write(Some(Bytes::copy_from_slice(bytes)));
         }
         _ => return Err(CfDoError::SnapshotCorrupt("bad has_pending flag")),
