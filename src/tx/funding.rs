@@ -45,10 +45,6 @@ impl Funding {
         self.maker.len()
     }
 
-    pub(super) fn first(&self) -> Option<CoinId> {
-        self.iter().next()
-    }
-
     pub(super) fn iter(&self) -> impl Iterator<Item = CoinId> + '_ {
         self.maker.iter().chain(self.taker.iter()).copied()
     }
