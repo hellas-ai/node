@@ -5,20 +5,26 @@
 //! propagates naturally — when a consumer drops the stream, the generator
 //! is dropped, which drops every in-flight future, which drops every
 //! resource, which (for local executions) drops the per-execution
-//! `mpsc::Receiver` the worker pushes chunks into.
+//! `mpsc::Receiver` the worker pushes chunks into. The worker observes
+//! the closed channel on its next chunk send and converts it into a
+//! cancel that the runner sees between decode steps.
 //!
-//! NOTE (hellas-wire v2 cutover): the remote / discovery code paths in
-//! this file are currently stubbed. The shape of the public API
-//! (`ExecutionRequest`, `PreparedExecution`, `Outcome`,
-//! `ReceiptArtifact`, `StopReason`, …) is preserved so the rest of the
-//! CLI keeps compiling, but anything that needs to dial a remote
-//! executor returns `Err`/`unimplemented!()` until the discovery + pool
-//! port lands. See `HELLAS_WIRE_CUTOVER_FINDINGS.md` finding #5.
+//! ```text
+//! ExecutionRequest::stream  →  PreparedExecution::stream
+//!                                ├─ primary: PreparedRoute::stream
+//!                                │   ├─ Local:        local stream over ExecutorHandle
+//!                                │   ├─ RemoteDirect: ExecuteClientImpl over IrohTransport
+//!                                │   └─ RemoteDiscovery: still stubbed (see CUTOVER_FINDINGS)
+//!                                └─ shadow (verify):  same shape, run after primary
+//! ```
+//!
+//! NOTE (hellas-wire v2 cutover): RemoteDiscovery is still stubbed — the
+//! mDNS/DHT/Pkarr feed plumbing wasn't ported yet. RemoteDirect and Local
+//! work. See `HELLAS_WIRE_CUTOVER_FINDINGS.md`.
 
-// Many public types here are unused by the current stub paths but kept
-// in-shape for the gateway / cli consumers and will be reconstructed by
-// the real impls once dial helpers return. Silence the warnings until
-// then.
+// A few "kept for shape" helpers are reachable from one feature combination
+// but not the other. Keep dead_code muted at the file level so we don't end
+// up sprinkling cfg-gated allows everywhere.
 #![allow(dead_code)]
 
 use anyhow::{Context, anyhow, bail};
@@ -33,22 +39,33 @@ use futures::stream::{BoxStream, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest, SchemeId,
-    SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_receipt,
+    DeliveryOutput, DeliveryRequest, Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
+    SchemeId, SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_delivery, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
-use hellas_rpc::pb::execute as pb;
+use hellas_rpc::pb::execute::{
+    self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
+};
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::peers::PeerManager;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::services::courtesy::{Courtesy, CourtesyClient, CourtesyClientImpl};
+use hellas_rpc::services::execute::{Execute, ExecuteClient, ExecuteClientImpl};
+use hellas_rpc::services::opaque::Opaque;
+use hellas_wire::WireStatus;
+use hellas_wire::iroh::swarm::ServiceRegistry;
+use hellas_wire::iroh::{IrohTransport, PoolError};
+use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
+#[cfg(feature = "hellas-executor")]
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::instrument;
 
 // ---------------------------------------------------------------------------
 // Public configuration types
@@ -87,7 +104,7 @@ pub struct RemoteNodeTarget {
 }
 
 impl RemoteNodeTarget {
-    #[allow(dead_code)] // used once discovery port lands
+    #[allow(dead_code)] // used once the registry supports static-addr feeds
     fn endpoint_addr(&self) -> EndpointAddr {
         EndpointAddr::from_parts(
             self.node_id,
@@ -109,9 +126,19 @@ pub enum ExecutionStrategy {
 pub struct ExecutionRuntime {
     #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
-    #[allow(dead_code)] // used once discovery port lands
+    /// Optional secret key for the iroh client endpoint. Held so callers can
+    /// thread an identity through `with_secret_key` even if no registry is
+    /// supplied; used by external code that constructs its own registry.
+    #[allow(dead_code)]
     secret_key: Option<SecretKey>,
-    #[allow(dead_code)] // used once discovery port lands
+    /// Registry-backed connection pools per service ALPN. `None` means no
+    /// remote dial path is configured; `RemoteDirect` quotes/streams will
+    /// surface a clear error in that case.
+    registry: Option<ServiceRegistry>,
+    /// Carried for parity with the pre-cutover runtime; no longer load-
+    /// bearing on the local hot path now that the executor's handle
+    /// implements the service handler traits directly.
+    #[allow(dead_code)]
     peer_registry: PeerManager,
 }
 
@@ -234,12 +261,21 @@ impl ExecutionRuntime {
         Self {
             local_executor: Some(local_executor),
             secret_key: None,
+            registry: None,
             peer_registry: PeerManager::default(),
         }
     }
 
     pub fn with_secret_key(mut self, secret_key: SecretKey) -> Self {
         self.secret_key = Some(secret_key);
+        self
+    }
+
+    /// Attach a `ServiceRegistry` (which owns pooled iroh connections per
+    /// service ALPN). Required for `RemoteDirect` routes; `Local` works
+    /// without one.
+    pub fn with_registry(mut self, registry: ServiceRegistry) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -261,11 +297,18 @@ impl ExecutionRuntime {
     }
 
     #[cfg(feature = "hellas-executor")]
-    #[allow(dead_code)] // referenced once remote path returns
     fn require_local_executor(&self) -> Result<ExecutorHandle, anyhow::Error> {
         self.local_executor
             .clone()
             .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
+    }
+
+    fn require_registry(&self) -> Result<&ServiceRegistry, anyhow::Error> {
+        self.registry
+            .as_ref()
+            .ok_or_else(|| anyhow!(
+                "remote execution requested but no iroh ServiceRegistry is configured on the runtime"
+            ))
     }
 }
 
@@ -274,9 +317,7 @@ impl ExecutionRuntime {
 // ---------------------------------------------------------------------------
 
 pub struct ExecutionRequest {
-    #[allow(dead_code)]
     runtime: ExecutionRuntime,
-    #[allow(dead_code)]
     quote_req: QuotePreparedTextRequest,
     strategy: ExecutionStrategy,
 }
@@ -316,17 +357,16 @@ impl ExecutionRequest {
     /// `PreparedExecution::provenance()` *before* the response stream
     /// flushes its headers.
     pub async fn prepare(self) -> anyhow::Result<PreparedExecution> {
-        // Until the discovery/pool port lands we don't have a working
-        // remote dial path. We still need to support the local-only path
-        // so that `--local` / `--verify-local` keeps running.
         match self.strategy {
             ExecutionStrategy::Run(route) => Ok(PreparedExecution {
-                primary: PreparedRoute::stub(route),
+                primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, &route).await?,
                 shadow: None,
             }),
             ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
-                primary: PreparedRoute::stub(primary),
-                shadow: Some(PreparedRoute::stub(shadow)),
+                primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, &primary).await?,
+                shadow: Some(
+                    PreparedRoute::prepare(&self.runtime, &self.quote_req, &shadow).await?,
+                ),
             }),
         }
     }
@@ -349,9 +389,7 @@ impl ExecutionRequest {
 }
 
 pub struct OpaqueExecutionRequest {
-    #[allow(dead_code)]
     runtime: ExecutionRuntime,
-    #[allow(dead_code)]
     request: PbOpaqueRequest,
     route: ExecutionRoute,
 }
@@ -374,17 +412,16 @@ impl OpaqueExecutionRequest {
 
     pub fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
         try_stream! {
-            let _ = &self.route;
-            // Pending discovery/pool port — see CUTOVER_FINDINGS #5.
-            Err(anyhow!(
-                "opaque execution pending hellas-wire discovery/pool port"
-            ))?;
-            // Make the generator type-check as yielding `OpaqueExecutionEvent`s.
-            #[allow(unreachable_code)]
-            {
-                yield OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
-                    error: "unreachable".to_string(),
-                });
+            let prepared = OpaquePreparedRoute::prepare(
+                &self.runtime,
+                &self.request,
+                &self.route,
+            )
+            .await?;
+            let inner = prepared.stream();
+            tokio::pin!(inner);
+            while let Some(event) = inner.next().await {
+                yield event?;
             }
         }
     }
@@ -498,50 +535,498 @@ async fn drain_to_outcome(
 }
 
 // ---------------------------------------------------------------------------
-// PreparedRoute — Local | RemoteDirect | RemoteDiscovery (all stubbed)
+// PreparedRoute — Local | RemoteDirect | RemoteDiscovery (last still stubbed)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)] // see PreparedRoute (pre-cutover)
 enum PreparedRoute {
-    Stubbed { _route: ExecutionRoute },
+    #[cfg(feature = "hellas-executor")]
+    Local {
+        handle: ExecutorHandle,
+        request_commitment: Vec<u8>,
+        provenance: ExecutionProvenance,
+    },
+    RemoteDirect {
+        transport: IrohTransport,
+        request_commitment: Vec<u8>,
+        provenance: ExecutionProvenance,
+    },
+    /// Discovery-driven route: still stubbed. The legacy implementation
+    /// drove a `tokio::select!` loop across mDNS/DHT feeds and pooled
+    /// connect attempts; the equivalent on top of `ServiceRegistry` lands
+    /// in a follow-up.
+    #[allow(dead_code)]
+    RemoteDiscoveryStub { retries: usize },
 }
 
 impl PreparedRoute {
-    fn stub(route: ExecutionRoute) -> Self {
-        PreparedRoute::Stubbed { _route: route }
+    fn provenance(&self) -> Option<&ExecutionProvenance> {
+        match self {
+            #[cfg(feature = "hellas-executor")]
+            PreparedRoute::Local { provenance, .. } => Some(provenance),
+            PreparedRoute::RemoteDirect { provenance, .. } => Some(provenance),
+            PreparedRoute::RemoteDiscoveryStub { .. } => None,
+        }
     }
 
-    /// Pre-flight provenance — currently always `None` because no route is
-    /// wired yet. Once the discovery / pool port lands this returns
-    /// `Some` for Local + RemoteDirect.
-    fn provenance(&self) -> Option<&ExecutionProvenance> {
-        None
+    #[instrument(skip_all, fields(?route))]
+    async fn prepare(
+        runtime: &ExecutionRuntime,
+        quote_req: &QuotePreparedTextRequest,
+        route: &ExecutionRoute,
+    ) -> anyhow::Result<Self> {
+        match route {
+            #[cfg(feature = "hellas-executor")]
+            ExecutionRoute::Local => {
+                let handle = runtime.require_local_executor()?;
+                handle
+                    .preload_weights(local_model_spec(quote_req))
+                    .await
+                    .context("failed to preload local weights")?;
+                let outcome = handle
+                    .quote_prepared_text(quote_req.clone())
+                    .await
+                    .context("local quote_prepared_text failed")?;
+                let ticket = outcome.response.ticket.clone().ok_or_else(|| {
+                    anyhow!("local quote_prepared_text response missing ticket")
+                })?;
+                Ok(Self::Local {
+                    handle,
+                    request_commitment: ticket.request_commitment,
+                    provenance: outcome.provenance,
+                })
+            }
+            ExecutionRoute::RemoteDirect(target) => {
+                let registry = runtime.require_registry()?;
+                let pool = registry.pool::<Courtesy>();
+                let transport = pool
+                    .transport(target.node_id)
+                    .await
+                    .map_err(|err: PoolError| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Courtesy on {}", target.node_id))
+                    })?;
+                let client = CourtesyClientImpl::new(transport);
+                let response = client
+                    .quote_prepared_text(quote_req.clone())
+                    .await
+                    .map_err(|status| {
+                        anyhow!(status).context(format!(
+                            "node {} declined quote_prepared_text",
+                            target.node_id
+                        ))
+                    })?;
+                let ticket = response.ticket.ok_or_else(|| {
+                    anyhow!("quote_prepared_text response from {} missing ticket", target.node_id)
+                })?;
+
+                // Open a fresh Execute-ALPN transport for the run step.
+                // (CourtesyClient holds the courtesy substream — the run
+                // happens on a different service ALPN.)
+                let execute_pool = registry.pool::<Execute>();
+                let execute_transport =
+                    execute_pool.transport(target.node_id).await.map_err(|err| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Execute on {}", target.node_id))
+                    })?;
+                Ok(Self::RemoteDirect {
+                    transport: execute_transport,
+                    request_commitment: ticket.request_commitment,
+                    // FINDING: the wire codegen does not yet surface
+                    // response trailers to the client side, so the
+                    // commitment_id we record at quote time is the
+                    // ticket's request_commitment-derived placeholder.
+                    // Tracked in CUTOVER_FINDINGS.
+                    provenance: ExecutionProvenance {
+                        commitment_id: [0; 32],
+                    },
+                })
+            }
+            ExecutionRoute::RemoteDiscovery { retries } => {
+                Ok(Self::RemoteDiscoveryStub { retries: *retries })
+            }
+        }
     }
 
     fn stream(self) -> BoxStream<'static, anyhow::Result<ExecutionEvent>> {
-        Box::pin(stub_stream())
-    }
-}
-
-fn stub_stream() -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
-    try_stream! {
-        Err(anyhow!(
-            "execution pending hellas-wire discovery/pool port — see CUTOVER_FINDINGS.md"
-        ))?;
-        #[allow(unreachable_code)]
-        {
-            yield ExecutionEvent::Done(Outcome::Failed {
-                position: 0,
-                error: "unreachable".to_string(),
-            });
+        match self {
+            #[cfg(feature = "hellas-executor")]
+            PreparedRoute::Local {
+                handle,
+                request_commitment,
+                provenance: _,
+            } => local_execute_stream(handle, request_commitment).boxed(),
+            PreparedRoute::RemoteDirect {
+                transport,
+                request_commitment,
+                provenance: _,
+            } => remote_execute_stream(transport, request_commitment).boxed(),
+            PreparedRoute::RemoteDiscoveryStub { retries: _ } => {
+                discovery_stub_stream::<ExecutionEvent>().boxed()
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers retained for shape (receipt decoding)
+// OpaquePreparedRoute — Local | RemoteDirect | RemoteDiscovery (last stubbed)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // becomes live once the wire paths return real receipts
+#[allow(clippy::large_enum_variant)]
+enum OpaquePreparedRoute {
+    #[cfg(feature = "hellas-executor")]
+    Local {
+        handle: ExecutorHandle,
+        request: PbOpaqueRequest,
+        request_commitment: Vec<u8>,
+    },
+    RemoteDirect {
+        transport: IrohTransport,
+        request: PbOpaqueRequest,
+        request_commitment: Vec<u8>,
+    },
+    #[allow(dead_code)]
+    RemoteDiscoveryStub { retries: usize },
+}
+
+impl OpaquePreparedRoute {
+    async fn prepare(
+        runtime: &ExecutionRuntime,
+        request: &PbOpaqueRequest,
+        route: &ExecutionRoute,
+    ) -> anyhow::Result<Self> {
+        match route {
+            #[cfg(feature = "hellas-executor")]
+            ExecutionRoute::Local => {
+                let handle = runtime.require_local_executor()?;
+                let outcome = handle
+                    .create_opaque_ticket(request.clone())
+                    .await
+                    .context("local create_opaque_ticket failed")?;
+                Ok(Self::Local {
+                    handle,
+                    request: request.clone(),
+                    request_commitment: outcome.response.request_commitment,
+                })
+            }
+            ExecutionRoute::RemoteDirect(target) => {
+                let registry = runtime.require_registry()?;
+                let opaque_pool = registry.pool::<Opaque>();
+                let opaque_transport = opaque_pool.transport(target.node_id).await.map_err(
+                    |err: PoolError| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Opaque on {}", target.node_id))
+                    },
+                )?;
+                let client = hellas_rpc::services::opaque::OpaqueClientImpl::new(opaque_transport);
+                use hellas_rpc::services::opaque::OpaqueClient;
+                let ticket =
+                    client
+                        .create_ticket(request.clone())
+                        .await
+                        .map_err(|status| {
+                            anyhow!(status).context(format!(
+                                "node {} declined opaque create_ticket",
+                                target.node_id
+                            ))
+                        })?;
+                let execute_pool = registry.pool::<Execute>();
+                let execute_transport = execute_pool.transport(target.node_id).await.map_err(
+                    |err| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Execute on {}", target.node_id))
+                    },
+                )?;
+                Ok(Self::RemoteDirect {
+                    transport: execute_transport,
+                    request: request.clone(),
+                    request_commitment: ticket.request_commitment,
+                })
+            }
+            ExecutionRoute::RemoteDiscovery { retries } => {
+                Ok(Self::RemoteDiscoveryStub { retries: *retries })
+            }
+        }
+    }
+
+    fn stream(self) -> BoxStream<'static, anyhow::Result<OpaqueExecutionEvent>> {
+        match self {
+            #[cfg(feature = "hellas-executor")]
+            Self::Local {
+                handle,
+                request,
+                request_commitment,
+            } => local_execute_opaque_stream(handle, request_commitment, request).boxed(),
+            Self::RemoteDirect {
+                transport,
+                request,
+                request_commitment,
+            } => remote_execute_opaque_stream(transport, request_commitment, request).boxed(),
+            Self::RemoteDiscoveryStub { retries: _ } => {
+                discovery_stub_stream::<OpaqueExecutionEvent>().boxed()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery stub
+// ---------------------------------------------------------------------------
+
+fn discovery_stub_stream<E>() -> impl Stream<Item = anyhow::Result<E>> + Send
+where
+    E: Send + 'static,
+{
+    // Use `futures::stream::once` over a future that resolves to the error.
+    // try_stream!'s "must yield at least one value" type-inference quirk
+    // makes it awkward to express a "single error, no items" generator
+    // without a phantom yield; this is the cleaner shape.
+    futures::stream::once(async {
+        Err(anyhow!(
+            "RemoteDiscovery execution route pending discovery port — see CUTOVER_FINDINGS.md"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Local execute streams — talk directly to `ExecutorHandle`
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "hellas-executor")]
+fn local_execute_stream(
+    handle: ExecutorHandle,
+    request_commitment: Vec<u8>,
+) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    try_stream! {
+        let outcome = handle
+            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .await
+            .context("failed to start local execution stream")?;
+        let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
+        let mut events = ReceiverStream::new(outcome.events);
+        let mut got_terminal = false;
+        while let Some(item) = events.next().await {
+            let wire = item.map_err(|status: WireStatus| {
+                anyhow!(status).context("local execution stream failed")
+            })?;
+            let event = convert_wire_event(wire)?;
+            let is_done = matches!(event, ExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+        if !got_terminal {
+            Err(anyhow!("local execution stream ended without terminal outcome"))?;
+        }
+        // Keep the handle alive for the lifetime of the stream so the
+        // worker's per-execution sender doesn't trip the channel-closed
+        // cancel path before the terminal event flushes.
+        drop(handle);
+    }
+}
+
+#[cfg(feature = "hellas-executor")]
+fn local_execute_opaque_stream(
+    handle: ExecutorHandle,
+    request_commitment: Vec<u8>,
+    request: PbOpaqueRequest,
+) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+    try_stream! {
+        let core_request = core_opaque_request(&request)?;
+        let outcome = handle
+            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .await
+            .context("failed to start local opaque execution stream")?;
+        let _provenance = outcome.provenance;
+        let mut events = ReceiverStream::new(outcome.events);
+        let mut got_terminal = false;
+        while let Some(item) = events.next().await {
+            let wire = item.map_err(|status: WireStatus| {
+                anyhow!(status).context("local opaque execution stream failed")
+            })?;
+            let event = convert_opaque_wire_event(wire, &core_request)?;
+            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+        if !got_terminal {
+            Err(anyhow!(
+                "local opaque execution stream ended without terminal outcome"
+            ))?;
+        }
+        drop(handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote execute streams — dial Execute service via IrohTransport
+// ---------------------------------------------------------------------------
+
+fn remote_execute_stream(
+    transport: IrohTransport,
+    request_commitment: Vec<u8>,
+) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    try_stream! {
+        let client = ExecuteClientImpl::new(transport);
+        let mut wire = client
+            .run_ticket(RunTicketRequest { request_commitment })
+            .await
+            .map_err(|status| anyhow!(status).context("failed to start remote execute stream"))?;
+        let mut got_terminal = false;
+        while let Some(item) = wire.next().await {
+            let event = convert_wire_event(item.map_err(|status: WireStatus| {
+                anyhow!(status).context("remote execute stream failed")
+            })?)?;
+            let is_done = matches!(event, ExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+        if !got_terminal {
+            Err(anyhow!("remote execute stream ended without terminal outcome"))?;
+        }
+        drop(client);
+    }
+}
+
+fn remote_execute_opaque_stream(
+    transport: IrohTransport,
+    request_commitment: Vec<u8>,
+    request: PbOpaqueRequest,
+) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+    try_stream! {
+        let core_request = core_opaque_request(&request)?;
+        let client = ExecuteClientImpl::new(transport);
+        let mut wire = client
+            .run_ticket(RunTicketRequest { request_commitment })
+            .await
+            .map_err(|status| {
+                anyhow!(status).context("failed to start remote opaque execute stream")
+            })?;
+        let mut got_terminal = false;
+        while let Some(item) = wire.next().await {
+            let event = convert_opaque_wire_event(
+                item.map_err(|status: WireStatus| {
+                    anyhow!(status).context("remote opaque execute stream failed")
+                })?,
+                &core_request,
+            )?;
+            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            yield event;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
+        }
+        if !got_terminal {
+            Err(anyhow!(
+                "remote opaque execute stream ended without terminal outcome"
+            ))?;
+        }
+        drop(client);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkEvent → ExecutionEvent / OpaqueExecutionEvent
+// ---------------------------------------------------------------------------
+
+fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
+    let Some(event) = event.kind else {
+        bail!("wire event with no body");
+    };
+    match event {
+        work_event::Kind::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
+            position: chunk.position,
+            tokens: chunk.bytes,
+        }),
+        work_event::Kind::Finished(finished) => Ok(ExecutionEvent::Done(parse_finished(finished)?)),
+        work_event::Kind::Failed(failed) => Ok(ExecutionEvent::Done(Outcome::Failed {
+            position: failed.position,
+            error: failed.error,
+        })),
+    }
+}
+
+fn convert_opaque_wire_event(
+    event: WorkEvent,
+    request: &CoreOpaqueRequest,
+) -> anyhow::Result<OpaqueExecutionEvent> {
+    let Some(event) = event.kind else {
+        bail!("wire event with no body");
+    };
+    match event {
+        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
+            position: chunk.position,
+            bytes: chunk.bytes,
+        }),
+        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
+            parse_opaque_finished(finished, request)?,
+        )),
+        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+            error: failed.error,
+        })),
+    }
+}
+
+fn parse_finished(finished: WorkFinished) -> anyhow::Result<Outcome> {
+    let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
+    if receipt.symbolic_text_artifact().is_none() {
+        bail!("symbolic execution returned an opaque receipt");
+    }
+    let stop_reason = stop_reason_from_pb(finished.status)?;
+    Ok(Outcome::Completed {
+        total_tokens: finished.total_units,
+        stop_reason,
+        receipt,
+    })
+}
+
+fn parse_opaque_finished(
+    finished: WorkFinished,
+    request: &CoreOpaqueRequest,
+) -> anyhow::Result<OpaqueOutcome> {
+    stop_reason_from_pb(finished.status)?;
+    serde_json::from_slice::<serde_json::Value>(&finished.output)
+        .context("opaque output must be UTF-8 JSON")?;
+    let output = JsonBytes::new(finished.output.clone());
+    let (_dag_cbor, core) = decode_receipt_envelope(finished.receipt)?;
+    verify_delivery(
+        DeliveryRequest::Opaque(request),
+        DeliveryOutput::Opaque(&output),
+        &core,
+    )
+    .context("opaque receipt verification failed")?;
+    if core.body().scheme() != SchemeId::Opaque {
+        bail!("opaque execution returned a symbolic receipt");
+    }
+    Ok(OpaqueOutcome::Completed {
+        output: output.into_bytes(),
+    })
+}
+
+fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
+    let pb_value =
+        FinishStatus::try_from(value).with_context(|| format!("unknown finish status {value}"))?;
+    match pb_value {
+        FinishStatus::Unspecified => bail!("wire finish status is unspecified"),
+        FinishStatus::EndOfSequence => Ok(StopReason::EndOfSequence),
+        FinishStatus::MaxOutput => Ok(StopReason::MaxNewTokens),
+        FinishStatus::Cancelled => Ok(StopReason::Cancelled),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
+
 fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRequest> {
     if request.service.is_empty() {
         bail!("opaque service must not be empty");
@@ -565,4 +1050,14 @@ fn decode_receipt_envelope(
     let core: CoreSignedReceipt = decode_dag_cbor(&envelope.dag_cbor)
         .context("failed to decode receipt envelope dag-cbor")?;
     Ok((envelope.dag_cbor, core))
+}
+
+#[cfg(feature = "hellas-executor")]
+fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
+    let revision = quote_req.huggingface_revision.trim();
+    if revision.is_empty() {
+        quote_req.huggingface_model_id.clone()
+    } else {
+        format!("{}@{revision}", quote_req.huggingface_model_id)
+    }
 }
