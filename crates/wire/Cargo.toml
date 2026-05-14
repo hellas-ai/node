@@ -17,11 +17,26 @@ iroh = [
     "dep:portable-atomic",
     "dep:tokio-stream",
 ]
-# Discovery backends (DHT and mDNS are scope-deferred for v1; the
-# modules exist behind these feature flags as empty stubs so callers
-# don't need to gate their use-sites yet).
-discovery-dht = ["iroh"]
-discovery-mdns = ["iroh"]
+# Discovery backends. `discovery-dht` pulls in `mainline` for the
+# shared shard buckets, plus the small crypto/encoding deps shared with
+# `discovery-mdns` (postcard, sha2, async-stream, serde). `discovery-mdns`
+# pulls in the external `iroh-mdns-address-lookup` crate (iroh 1.0.0-rc.0
+# moved mDNS out of the core iroh crate into its own crate).
+discovery-dht = [
+    "iroh",
+    "dep:mainline",
+    "dep:async-stream",
+    "dep:postcard",
+    "dep:serde",
+    "dep:sha2",
+]
+discovery-mdns = [
+    "iroh",
+    "dep:async-stream",
+    "dep:data-encoding",
+    "dep:iroh-mdns-address-lookup",
+    "dep:postcard",
+]
 h2 = ["dep:h2", "dep:http"]
 h3 = []  # scaffold only
 
@@ -66,6 +81,17 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 worker = { version = "0.6", optional = true, default-features = false }
 
 opentelemetry = { workspace = true, optional = true }
+
+# Discovery backend deps (gated behind discovery-{dht,mdns}).
+async-stream = { version = "0.3", optional = true }
+data-encoding = { version = "2", optional = true }
+iroh-mdns-address-lookup = { version = "0.2", optional = true }
+mainline = { version = "6", optional = true }
+postcard = { version = "1", default-features = false, features = [
+    "alloc",
+], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = [

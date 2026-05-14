@@ -80,12 +80,12 @@ impl StreamTransport for IrohTransport {
 
         // Read the OpenFrame off the wire to populate Inbound metadata.
         let mut read_buf = BytesMut::new();
-        let (method_id, headers) = loop {
+        let (method_id, headers, consumed) = loop {
             // Try to pop OpenFrame
             if !read_buf.is_empty() {
                 match try_peek_open(&read_buf) {
-                    Ok(Some((mid, hdr, _consumed))) => {
-                        break (mid, hdr);
+                    Ok(Some((mid, hdr, consumed))) => {
+                        break (mid, hdr, consumed);
                     }
                     Ok(None) => {}
                     Err(e) => return Err(e.into()),
@@ -99,33 +99,11 @@ impl StreamTransport for IrohTransport {
             }
         };
 
-        // We've peeked the open frame from `read_buf`; the rest of
-        // read_buf is body data the recv-half will continue from.
-        // To keep this simple, re-construct an IrohStream and stash
-        // residual bytes via a prefix-channel pattern. For the first
-        // pass, we re-encode the residual via a small wrapper... but
-        // iroh::endpoint::RecvStream doesn't support unread. We
-        // accept this limitation by requiring writers to flush the
-        // OPEN frame before sending body bytes (most code paths do
-        // this naturally).
-        //
-        // Therefore: after pop-up, we need to ensure any leftover
-        // bytes (a body chunk that already arrived) is replayed to
-        // the IrohStream's recv half. Approach: use a small wrapper
-        // recv that yields residual bytes first, then defers.
-
-        let residual = read_buf.freeze();
-        let stream = if residual.is_empty() {
-            IrohStream::new(send, recv)
-        } else {
-            // Writers MUST flush OPEN before sending body bytes so we
-            // don't have to buffer residual. Surface this as a
-            // protocol error rather than silently dropping or
-            // mis-routing bytes.
-            return Err(IrohTransportError::Connection(
-                "OPEN frame must be flushed before body bytes".to_string(),
-            ));
-        };
+        // Drop the OPEN frame's bytes; any residual is body data that
+        // the IrohStream's recv-half will consume before pulling more
+        // off the wire.
+        let residual = read_buf.split_off(consumed);
+        let stream = IrohStream::with_prefix(send, recv, residual);
 
         Ok(Some(Inbound {
             method_id,

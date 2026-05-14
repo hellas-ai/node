@@ -109,6 +109,11 @@ pub fn handle_websocket_message<const N: usize, C: Clock>(
         batch.events = events;
     }
 
+    // 2a. Refill peer-side credit on slots that drained below the
+    //     threshold. This queues `Frame::Credit` frames into the slot's
+    //     send queue; they ship in step 3 below.
+    let _credited = mux.prepare_credit_updates();
+
     // 3. Drain outbound. Each frame is its own WS message.
     while let Some(frame_bytes) = mux.next_outbound() {
         match ws.send_with_bytes(&frame_bytes[..]) {
