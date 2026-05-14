@@ -17,7 +17,7 @@ use crate::transport::{
 
 use super::slot::{Role, SlotIndex};
 use super::state::{Event, MuxConfig, MuxError, Multiplexer};
-use super::stream::{MuxRecvHalf, MuxSendHalf, MuxStream};
+use super::stream::MuxStream;
 
 /// Trait for the underlying message-oriented byte pipe (one WS message
 /// = one mux frame). Implemented by ws-native + ws-cf-do adapters.
@@ -62,7 +62,6 @@ pub(crate) enum Command {
 pub struct MuxTransport {
     cmd_tx: mpsc::UnboundedSender<Command>,
     inbound_rx: Arc<Mutex<mpsc::UnboundedReceiver<Inbound<MuxStream>>>>,
-    peer: Option<PeerIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,14 +119,13 @@ impl MuxTransport {
             cmd_tx: cmd_tx.clone(),
             inbound_tx,
             slot_to_chans: Default::default(),
-            peer: peer.clone(),
+            peer,
         };
         spawn(Box::pin(driver.run()));
 
         Self {
             cmd_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
-            peer,
         }
     }
 }

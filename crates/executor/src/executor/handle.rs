@@ -164,6 +164,10 @@ impl ExecuteHandler for ExecutorHandle {
 
 // -- SymbolicHandler / OpaqueHandler -----------------------------------------
 
+// The generated trait method declares `impl Into<WithTrailer<T>> + Send`
+// as its return; we provide `WithTrailer<T>` directly. The refinement is
+// intentional — handler-emitted trailers are concrete, not opaque.
+#[allow(refining_impl_trait)]
 impl SymbolicHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
@@ -177,6 +181,7 @@ impl SymbolicHandler for ExecutorHandle {
     }
 }
 
+#[allow(refining_impl_trait)]
 impl OpaqueHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
@@ -190,6 +195,7 @@ impl OpaqueHandler for ExecutorHandle {
 
 // -- CourtesyHandler ---------------------------------------------------------
 
+#[allow(refining_impl_trait)]
 impl CourtesyHandler for ExecutorHandle {
     async fn quote_prompt(
         &self,
