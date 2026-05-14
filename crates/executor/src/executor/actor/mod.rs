@@ -8,7 +8,7 @@ use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
-use hellas_pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
+use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::{HashMap, VecDeque};

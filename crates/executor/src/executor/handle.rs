@@ -1,30 +1,38 @@
-use hellas_pb::courtesy::courtesy_server::Courtesy;
-use hellas_pb::courtesy::{
+//! Server-side handler implementations.
+//!
+//! `ExecutorHandle` implements one Handler trait per service (Execute,
+//! Symbolic, Opaque, Courtesy) — the codegen-emitted dispatcher routes
+//! inbound RPCs here.
+
+use std::pin::Pin;
+
+use futures_core::Stream;
+use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
     GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
     ListModelsRequest, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
-use hellas_pb::hellas::execute_server::Execute;
-use hellas_pb::hellas::{RunTicketRequest, Ticket, WorkEvent};
-use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
-use hellas_pb::opaque::opaque_server::Opaque;
-use hellas_pb::symbolic::SymbolicRequest as PbSymbolicRequest;
-use hellas_pb::symbolic::symbolic_server::Symbolic;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::driver::{
-    ExecuteDriver, QuotedPreparedTextResponse, QuotedResponse, StreamedExecution,
-};
+use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
-use std::pin::Pin;
+use hellas_rpc::services::courtesy::CourtesyHandler;
+use hellas_rpc::services::execute::ExecuteHandler;
+use hellas_rpc::services::opaque::OpaqueHandler;
+use hellas_rpc::services::symbolic::SymbolicHandler;
+use hellas_rpc::ExecutorError;
+use hellas_wire::{Metadata, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
 
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
 
-type ExecuteStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<WorkEvent, Status>> + Send>>;
+type ExecuteStream =
+    Pin<Box<dyn Stream<Item = Result<WorkEvent, WireStatus>> + Send>>;
+type DecodeTokensStream =
+    Pin<Box<dyn Stream<Item = Result<DecodeTokensResponse, WireStatus>> + Send>>;
 
 impl ExecutorHandle {
     async fn send<T>(
@@ -78,7 +86,7 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn put_artifact(
+    pub async fn put_artifact_handle(
         &self,
         request: PutArtifactRequest,
     ) -> Result<PutArtifactResponse, ExecutorError> {
@@ -86,7 +94,7 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn get_artifact(
+    pub async fn get_artifact_handle(
         &self,
         request: GetArtifactRequest,
     ) -> Result<GetArtifactResponse, ExecutorError> {
@@ -94,7 +102,7 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn list_models(&self) -> Result<ListModelsResponse, ExecutorError> {
+    pub async fn list_models_handle(&self) -> Result<ListModelsResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::ListModels { reply })
             .await
     }
@@ -104,7 +112,7 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn run_ticket(
+    pub async fn run_ticket_handle(
         &self,
         request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
@@ -112,11 +120,11 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn get_stats(&self) -> Result<GetStatsResponse, ExecutorError> {
+    pub async fn get_stats_handle(&self) -> Result<GetStatsResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::GetStats { reply }).await
     }
 
-    pub async fn get_model_stats(
+    pub async fn get_model_stats_handle(
         &self,
         request: GetModelStatsRequest,
     ) -> Result<GetModelStatsResponse, ExecutorError> {
@@ -125,242 +133,137 @@ impl ExecutorHandle {
     }
 }
 
-fn response_with_provenance<R>(outcome: TicketOutcome<R>) -> Response<R> {
-    let mut response = Response::new(outcome.response);
-    write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-    response
+fn with_provenance<R>(outcome: TicketOutcome<R>) -> (R, Metadata) {
+    let mut metadata = Metadata::new();
+    write_provenance_metadata(&mut metadata, &outcome.provenance);
+    (outcome.response, metadata)
 }
 
-fn stream_response_with_provenance(outcome: ExecuteOutcome) -> Response<ExecuteStream> {
-    let mut response =
-        Response::new(Box::pin(ReceiverStream::new(outcome.events)) as ExecuteStream);
-    write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
-    response
-}
+// -- ExecuteHandler -----------------------------------------------------------
+//
+// `run_ticket` is server-streaming. We return a `WorkEvent` stream; the
+// codegen wraps it via the call helpers for the wire layer.
 
-#[tonic::async_trait]
-impl Execute for ExecutorHandle {
-    type RunTicketStream = ExecuteStream;
-
+impl ExecuteHandler for ExecutorHandle {
     async fn run_ticket(
         &self,
-        request: Request<RunTicketRequest>,
-    ) -> Result<Response<Self::RunTicketStream>, Status> {
-        let outcome = self.run_ticket(request.into_inner()).await?;
-        Ok(stream_response_with_provenance(outcome))
+        request: RunTicketRequest,
+    ) -> Result<ExecuteStream, WireStatus> {
+        let outcome = self.run_ticket_handle(request).await?;
+        let stream: ExecuteStream =
+            Box::pin(ReceiverStream::new(outcome.events));
+        // Provenance metadata loss: the new wire layer doesn't expose
+        // per-response trailer plumbing through the codegen-emitted
+        // server traits yet. Callers that need provenance read it
+        // off the terminal `WorkEvent::Finished` payload directly.
+        let _ = outcome.provenance;
+        Ok(stream)
     }
 }
 
-#[tonic::async_trait]
-impl Symbolic for ExecutorHandle {
+// -- SymbolicHandler / OpaqueHandler -----------------------------------------
+
+impl SymbolicHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
-        request: Request<PbSymbolicRequest>,
-    ) -> Result<Response<Ticket>, Status> {
-        let outcome = self.create_symbolic_ticket(request.into_inner()).await?;
-        Ok(response_with_provenance(outcome))
+        request: PbSymbolicRequest,
+    ) -> Result<Ticket, WireStatus> {
+        let outcome = self.create_symbolic_ticket(request).await?;
+        let (response, _metadata) = with_provenance(outcome);
+        // Provenance not yet plumbed into the wire-layer trailer; see
+        // CUTOVER_FINDINGS for the follow-up.
+        Ok(response)
     }
 }
 
-#[tonic::async_trait]
-impl Opaque for ExecutorHandle {
+impl OpaqueHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
-        request: Request<PbOpaqueRequest>,
-    ) -> Result<Response<Ticket>, Status> {
-        let outcome = self.create_opaque_ticket(request.into_inner()).await?;
-        Ok(response_with_provenance(outcome))
+        request: PbOpaqueRequest,
+    ) -> Result<Ticket, WireStatus> {
+        let outcome = self.create_opaque_ticket(request).await?;
+        let (response, _metadata) = with_provenance(outcome);
+        Ok(response)
     }
 }
 
-#[tonic::async_trait]
-impl Courtesy for ExecutorHandle {
+// -- CourtesyHandler ---------------------------------------------------------
+
+impl CourtesyHandler for ExecutorHandle {
     async fn quote_prompt(
         &self,
-        request: Request<QuotePromptRequest>,
-    ) -> Result<Response<QuotePromptResponse>, Status> {
-        let outcome = self.quote_prompt(request.into_inner()).await?;
-        Ok(response_with_provenance(outcome))
+        request: QuotePromptRequest,
+    ) -> Result<QuotePromptResponse, WireStatus> {
+        let outcome = self.quote_prompt(request).await?;
+        let (response, _metadata) = with_provenance(outcome);
+        Ok(response)
     }
 
     async fn quote_prepared_text(
         &self,
-        request: Request<QuotePreparedTextRequest>,
-    ) -> Result<Response<QuotePreparedTextResponse>, Status> {
-        let outcome = self.quote_prepared_text(request.into_inner()).await?;
-        Ok(response_with_provenance(outcome))
+        request: QuotePreparedTextRequest,
+    ) -> Result<QuotePreparedTextResponse, WireStatus> {
+        let outcome = self.quote_prepared_text(request).await?;
+        let (response, _metadata) = with_provenance(outcome);
+        Ok(response)
     }
 
     async fn quote_chat_prompt(
         &self,
-        request: Request<QuoteChatPromptRequest>,
-    ) -> Result<Response<QuoteChatPromptResponse>, Status> {
-        let outcome = self.quote_chat_prompt(request.into_inner()).await?;
-        Ok(response_with_provenance(outcome))
+        request: QuoteChatPromptRequest,
+    ) -> Result<QuoteChatPromptResponse, WireStatus> {
+        let outcome = self.quote_chat_prompt(request).await?;
+        let (response, _metadata) = with_provenance(outcome);
+        Ok(response)
     }
 
     async fn put_artifact(
         &self,
-        request: Request<PutArtifactRequest>,
-    ) -> Result<Response<PutArtifactResponse>, Status> {
-        Ok(Response::new(
-            self.put_artifact(request.into_inner()).await?,
-        ))
+        request: PutArtifactRequest,
+    ) -> Result<PutArtifactResponse, WireStatus> {
+        Ok(self.put_artifact_handle(request).await?)
     }
 
     async fn get_artifact(
         &self,
-        request: Request<GetArtifactRequest>,
-    ) -> Result<Response<GetArtifactResponse>, Status> {
-        Ok(Response::new(
-            self.get_artifact(request.into_inner()).await?,
-        ))
+        request: GetArtifactRequest,
+    ) -> Result<GetArtifactResponse, WireStatus> {
+        Ok(self.get_artifact_handle(request).await?)
     }
 
     async fn list_models(
         &self,
-        _request: Request<ListModelsRequest>,
-    ) -> Result<Response<ListModelsResponse>, Status> {
-        Ok(Response::new(self.list_models().await?))
+        _request: ListModelsRequest,
+    ) -> Result<ListModelsResponse, WireStatus> {
+        Ok(self.list_models_handle().await?)
     }
 
     async fn get_stats(
         &self,
-        _request: Request<GetStatsRequest>,
-    ) -> Result<Response<GetStatsResponse>, Status> {
-        Ok(Response::new(self.get_stats().await?))
+        _request: GetStatsRequest,
+    ) -> Result<GetStatsResponse, WireStatus> {
+        Ok(self.get_stats_handle().await?)
     }
 
     async fn get_model_stats(
         &self,
-        request: Request<GetModelStatsRequest>,
-    ) -> Result<Response<GetModelStatsResponse>, Status> {
-        Ok(Response::new(
-            self.get_model_stats(request.into_inner()).await?,
-        ))
+        request: GetModelStatsRequest,
+    ) -> Result<GetModelStatsResponse, WireStatus> {
+        Ok(self.get_model_stats_handle(request).await?)
     }
 
-    type DecodeTokensStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<DecodeTokensResponse, Status>> + Send>>;
-
-    async fn decode_tokens(
+    fn decode_tokens(
         &self,
-        request: Request<tonic::Streaming<DecodeTokensRequest>>,
-    ) -> Result<Response<Self::DecodeTokensStream>, Status> {
-        use hellas_rpc::decode_token_ids;
-        use hellas_rpc::model::ModelAssets;
-        use tokio_stream::StreamExt;
-
-        let mut stream = request.into_inner();
-
-        // First message must contain the model ID.
-        let first = stream
-            .next()
-            .await
-            .ok_or_else(|| Status::invalid_argument("empty stream"))??;
-
-        let model_spec = if first.huggingface_revision.is_empty() {
-            first.huggingface_model_id.clone()
-        } else {
-            format!(
-                "{}@{}",
-                first.huggingface_model_id, first.huggingface_revision
-            )
-        };
-        // Tokenizer-only path. The dtype is irrelevant for `decode_tokens`;
-        // F32 is just the cheapest valid value for the model-graph build that
-        // `ModelAssets::load` does for EOS-id extraction.
-        let assets = ModelAssets::load(&model_spec, catgrad::prelude::Dtype::F32)?;
-
-        let output_stream = async_stream::stream! {
-            let decode = |bytes: &[u8]| -> Result<DecodeTokensResponse, Status> {
-                let ids = decode_token_ids(bytes)?;
-                let text = assets.decode_tokens(&ids)?;
-                Ok(DecodeTokensResponse { text })
-            };
-
-            if !first.token_bytes.is_empty() {
-                yield decode(&first.token_bytes);
-            }
-
-            tokio::pin!(stream);
-            while let Some(result) = stream.next().await {
-                let req = match result {
-                    Ok(req) => req,
-                    Err(status) => {
-                        yield Err(status);
-                        break;
-                    }
-                };
-                if req.token_bytes.is_empty() {
-                    continue;
-                }
-                let response = decode(&req.token_bytes);
-                let stop = response.is_err();
-                yield response;
-                if stop {
-                    break;
-                }
-            }
-        };
-
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::DecodeTokensStream
-        ))
-    }
-}
-
-#[tonic::async_trait]
-impl ExecuteDriver for ExecutorHandle {
-    async fn create_symbolic_ticket(
-        &mut self,
-        request: PbSymbolicRequest,
-    ) -> Result<QuotedResponse, Status> {
-        let outcome = ExecutorHandle::create_symbolic_ticket(self, request)
-            .await
-            .map_err(<ExecutorError as Into<Status>>::into)?;
-        Ok(QuotedResponse {
-            response: outcome.response,
-            provenance: outcome.provenance,
-        })
-    }
-
-    async fn create_opaque_ticket(
-        &mut self,
-        request: PbOpaqueRequest,
-    ) -> Result<QuotedResponse, Status> {
-        let outcome = ExecutorHandle::create_opaque_ticket(self, request)
-            .await
-            .map_err(<ExecutorError as Into<Status>>::into)?;
-        Ok(QuotedResponse {
-            response: outcome.response,
-            provenance: outcome.provenance,
-        })
-    }
-
-    async fn quote_prepared_text(
-        &mut self,
-        request: QuotePreparedTextRequest,
-    ) -> Result<QuotedPreparedTextResponse, Status> {
-        let outcome = ExecutorHandle::quote_prepared_text(self, request)
-            .await
-            .map_err(<ExecutorError as Into<Status>>::into)?;
-        Ok(QuotedPreparedTextResponse {
-            response: outcome.response,
-            provenance: outcome.provenance,
-        })
-    }
-
-    async fn execute_streaming(
-        &mut self,
-        request: RunTicketRequest,
-    ) -> Result<StreamedExecution, Status> {
-        let outcome = ExecutorHandle::run_ticket(self, request)
-            .await
-            .map_err(<ExecutorError as Into<Status>>::into)?;
-        Ok(StreamedExecution {
-            stream: Box::pin(ReceiverStream::new(outcome.events)),
-            provenance: outcome.provenance,
-        })
+        _request: Pin<Box<dyn Stream<Item = DecodeTokensRequest> + Send>>,
+    ) -> impl std::future::Future<Output = Result<DecodeTokensStream, WireStatus>> + Send
+    {
+        // The codegen does not yet emit a bidi-streaming dispatcher; this
+        // handler is unreachable until the wire-v2 streaming helpers
+        // land. See CUTOVER_FINDINGS.
+        async move {
+            Err(WireStatus::unimplemented(
+                "decode_tokens: bidi streaming pending wire-v2 helpers",
+            ))
+        }
     }
 }

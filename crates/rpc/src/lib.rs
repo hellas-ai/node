@@ -12,6 +12,8 @@ pub mod model;
 
 pub mod call;
 pub mod peers;
+pub mod spec;
+pub use spec::ModelSpec;
 
 #[cfg(feature = "node")]
 pub mod policy;

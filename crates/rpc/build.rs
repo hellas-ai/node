@@ -84,9 +84,10 @@ fn regenerate() {
     };
 
     let mut config = prost_build::Config::new();
-    // Zero-copy bytes everywhere — every proto-side `bytes` field becomes
-    // `bytes::Bytes` in the generated Rust type.
-    config.bytes(["."]);
+    // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
+    // for zero-copy) is currently disabled because every consumer has
+    // call sites that produce `Vec<u8>` and migrating them is a
+    // separate, mechanical pass. See CUTOVER_FINDINGS.
     config.out_dir(&out_dir);
     config.service_generator(Box::new(generator));
 
