@@ -2,7 +2,7 @@ use crate::commands::CliResult;
 
 use anyhow::Context;
 use futures::StreamExt;
-use hellas_pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
+use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::client::NodeClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{
@@ -14,7 +14,7 @@ use std::future;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 use tonic_iroh_transport::PoolOptions;
-use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
+use iroh::{EndpointId, SecretKey};
 use tonic_iroh_transport::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
 };

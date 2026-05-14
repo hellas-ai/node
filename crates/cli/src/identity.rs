@@ -3,7 +3,7 @@ use hellas_core::ProducerSigningKey;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use tonic_iroh_transport::iroh::SecretKey;
+use iroh::SecretKey;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";

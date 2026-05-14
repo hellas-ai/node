@@ -5,12 +5,12 @@ use crate::execution::{
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
 use futures::StreamExt;
-use hellas_pb::opaque::OpaqueRequest;
+use hellas_rpc::pb::opaque::OpaqueRequest;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
-use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
+use iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,

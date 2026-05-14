@@ -1,6 +1,6 @@
 use crate::commands::CliResult;
 use hellas_core::ProducerSigningKey;
-use tonic_iroh_transport::iroh::SecretKey;
+use iroh::SecretKey;
 
 pub fn show_node_id(secret_key: &SecretKey) -> CliResult<()> {
     println!("{}", secret_key.public());

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
-use tonic_iroh_transport::iroh::SecretKey;
+use iroh::SecretKey;
 use tracing::warn;
 
 mod node;

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tonic_iroh_transport::iroh::EndpointId;
+use iroh::EndpointId;
 
 mod commands;
 mod execution;

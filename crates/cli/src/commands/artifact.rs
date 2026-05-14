@@ -2,13 +2,13 @@ use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use hellas_core::Digest;
-use hellas_pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
+use hellas_rpc::pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::client::CourtesyClient;
 use hellas_rpc::discovery::DiscoveryEndpoint;
 use hellas_rpc::peers::{IrohPeerHandle, IrohTransport, PeerManager};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tonic_iroh_transport::iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
