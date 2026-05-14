@@ -55,7 +55,7 @@ use hellas_rpc::peers::PeerManager;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::services::courtesy::{Courtesy, CourtesyClient, CourtesyClientImpl};
+use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClient, ExecuteClientImpl};
 use hellas_rpc::services::opaque::Opaque;
 use hellas_wire::WireStatus;
@@ -552,12 +552,6 @@ enum PreparedRoute {
         request_commitment: Vec<u8>,
         provenance: ExecutionProvenance,
     },
-    /// Discovery-driven route: still stubbed. The legacy implementation
-    /// drove a `tokio::select!` loop across mDNS/DHT feeds and pooled
-    /// connect attempts; the equivalent on top of `ServiceRegistry` lands
-    /// in a follow-up.
-    #[allow(dead_code)]
-    RemoteDiscoveryStub { retries: usize },
 }
 
 impl PreparedRoute {
@@ -566,7 +560,6 @@ impl PreparedRoute {
             #[cfg(feature = "hellas-executor")]
             PreparedRoute::Local { provenance, .. } => Some(provenance),
             PreparedRoute::RemoteDirect { provenance, .. } => Some(provenance),
-            PreparedRoute::RemoteDiscoveryStub { .. } => None,
         }
     }
 
@@ -646,7 +639,22 @@ impl PreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
-                Ok(Self::RemoteDiscoveryStub { retries: *retries })
+                let registry = runtime.require_registry()?;
+                let (target, request_commitment, provenance) =
+                    discover_and_quote(registry, quote_req, *retries).await?;
+                let execute_pool = registry.pool::<Execute>();
+                let execute_transport = execute_pool
+                    .transport(target.node_id)
+                    .await
+                    .map_err(|err: PoolError| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Execute on {}", target.node_id))
+                    })?;
+                Ok(Self::RemoteDirect {
+                    transport: execute_transport,
+                    request_commitment,
+                    provenance,
+                })
             }
         }
     }
@@ -664,9 +672,6 @@ impl PreparedRoute {
                 request_commitment,
                 provenance: _,
             } => remote_execute_stream(transport, request_commitment).boxed(),
-            PreparedRoute::RemoteDiscoveryStub { retries: _ } => {
-                discovery_stub_stream::<ExecutionEvent>().boxed()
-            }
         }
     }
 }
@@ -688,8 +693,6 @@ enum OpaquePreparedRoute {
         request: PbOpaqueRequest,
         request_commitment: Vec<u8>,
     },
-    #[allow(dead_code)]
-    RemoteDiscoveryStub { retries: usize },
 }
 
 impl OpaquePreparedRoute {
@@ -747,7 +750,22 @@ impl OpaquePreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
-                Ok(Self::RemoteDiscoveryStub { retries: *retries })
+                let registry = runtime.require_registry()?;
+                let (target, request_commitment) =
+                    discover_and_opaque_quote(registry, request, *retries).await?;
+                let execute_pool = registry.pool::<Execute>();
+                let execute_transport = execute_pool
+                    .transport(target.node_id)
+                    .await
+                    .map_err(|err: PoolError| {
+                        anyhow!(err)
+                            .context(format!("failed to dial Execute on {}", target.node_id))
+                    })?;
+                Ok(Self::RemoteDirect {
+                    transport: execute_transport,
+                    request: request.clone(),
+                    request_commitment,
+                })
             }
         }
     }
@@ -765,30 +783,161 @@ impl OpaquePreparedRoute {
                 request,
                 request_commitment,
             } => remote_execute_opaque_stream(transport, request_commitment, request).boxed(),
-            Self::RemoteDiscoveryStub { retries: _ } => {
-                discovery_stub_stream::<OpaqueExecutionEvent>().boxed()
-            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Discovery stub
+// Discovery — race the registry's Courtesy/Opaque feed and take the first
+// peer that returns a successful quote.
 // ---------------------------------------------------------------------------
 
-fn discovery_stub_stream<E>() -> impl Stream<Item = anyhow::Result<E>> + Send
-where
-    E: Send + 'static,
-{
-    // Use `futures::stream::once` over a future that resolves to the error.
-    // try_stream!'s "must yield at least one value" type-inference quirk
-    // makes it awkward to express a "single error, no items" generator
-    // without a phantom yield; this is the cleaner shape.
-    futures::stream::once(async {
-        Err(anyhow!(
-            "RemoteDiscovery execution route pending discovery port — see CUTOVER_FINDINGS.md"
-        ))
-    })
+/// Drain `ServiceRegistry::discover::<Courtesy>()` until we get a quote,
+/// returning the responding peer and the resolved ticket commitment +
+/// provenance.
+async fn discover_and_quote(
+    registry: &ServiceRegistry,
+    quote_req: &QuotePreparedTextRequest,
+    retries: usize,
+) -> anyhow::Result<(RemoteNodeTarget, Vec<u8>, ExecutionProvenance)> {
+    let mut stream = Box::pin(registry.discover::<Courtesy>());
+    let pool = registry.pool::<Courtesy>();
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut attempts: usize = 0;
+    let max_attempts = retries.saturating_add(1);
+
+    while let Some(peer) = stream.next().await {
+        let peer = match peer {
+            Ok(p) => p,
+            Err(err) => {
+                last_error = Some(anyhow!("discovery feed error: {err}"));
+                continue;
+            }
+        };
+        let peer_id = peer.id();
+        attempts += 1;
+
+        let transport = match pool.transport(peer_id).await {
+            Ok(t) => t,
+            Err(err) => {
+                last_error = Some(
+                    anyhow!(err).context(format!("failed to dial Courtesy on {peer_id}")),
+                );
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let with_trailer = match hellas_rpc::call::unary_with_trailer::<
+            _,
+            hellas_rpc::services::courtesy::QuotePreparedText,
+        >(&transport, quote_req.clone(), hellas_wire::Metadata::new())
+        .await
+        {
+            Ok(t) => t,
+            Err(status) => {
+                last_error = Some(
+                    anyhow!(status)
+                        .context(format!("node {peer_id} declined quote_prepared_text")),
+                );
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let Some(ticket) = with_trailer.response.ticket else {
+            last_error = Some(anyhow!(
+                "quote_prepared_text response from {peer_id} missing ticket"
+            ));
+            if attempts >= max_attempts {
+                break;
+            }
+            continue;
+        };
+
+        let provenance = hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
+            .unwrap_or(ExecutionProvenance {
+                commitment_id: [0; 32],
+            });
+
+        let target = RemoteNodeTarget {
+            node_id: peer_id,
+            node_addrs: Vec::new(),
+        };
+        return Ok((target, ticket.request_commitment, provenance));
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!("discovery stream exhausted without a successful quote (no peers found)")
+    }))
+}
+
+/// Same shape as [`discover_and_quote`] for opaque tickets.
+async fn discover_and_opaque_quote(
+    registry: &ServiceRegistry,
+    request: &PbOpaqueRequest,
+    retries: usize,
+) -> anyhow::Result<(RemoteNodeTarget, Vec<u8>)> {
+    use hellas_rpc::services::opaque::{OpaqueClient, OpaqueClientImpl};
+    let mut stream = Box::pin(registry.discover::<Opaque>());
+    let pool = registry.pool::<Opaque>();
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut attempts: usize = 0;
+    let max_attempts = retries.saturating_add(1);
+
+    while let Some(peer) = stream.next().await {
+        let peer = match peer {
+            Ok(p) => p,
+            Err(err) => {
+                last_error = Some(anyhow!("discovery feed error: {err}"));
+                continue;
+            }
+        };
+        let peer_id = peer.id();
+        attempts += 1;
+
+        let transport = match pool.transport(peer_id).await {
+            Ok(t) => t,
+            Err(err) => {
+                last_error = Some(
+                    anyhow!(err).context(format!("failed to dial Opaque on {peer_id}")),
+                );
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let client = OpaqueClientImpl::new(transport);
+        match client.create_ticket(request.clone()).await {
+            Ok(ticket) => {
+                let target = RemoteNodeTarget {
+                    node_id: peer_id,
+                    node_addrs: Vec::new(),
+                };
+                return Ok((target, ticket.request_commitment));
+            }
+            Err(status) => {
+                last_error = Some(
+                    anyhow!(status)
+                        .context(format!("node {peer_id} declined opaque create_ticket")),
+                );
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!("discovery stream exhausted without a successful opaque quote")
+    }))
 }
 
 // ---------------------------------------------------------------------------
