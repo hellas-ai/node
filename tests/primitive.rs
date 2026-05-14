@@ -57,7 +57,7 @@ fn terms_hash_commits_to_basic_fields() {
 #[test]
 fn context_prices_resource_costs() {
     let fees = Fees::new(3, 5, 7, 11);
-    let block_hash_bytes = [1; BlockHash::LENGTH];
+    let block_hash_bytes = [9; BlockHash::LENGTH];
     let context = Context::with_fees(
         BlockHeight::new(7),
         BlockHash::from_bytes(block_hash_bytes),
