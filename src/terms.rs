@@ -162,7 +162,11 @@ impl Encode for TermsBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{canonical::hash, consts::TERMS_BASIC, primitive::Key};
+    use crate::{
+        canonical::{BufferWriter, hash},
+        consts::TERMS_BASIC,
+        primitive::Key,
+    };
 
     #[test]
     fn basic_terms_hash_is_bound_to_basic_terms_domain() {
@@ -181,5 +185,36 @@ mod tests {
 
         let expected = TermsHash::from_bytes(hash(TERMS_BASIC, &terms.body));
         assert_eq!(terms.hash(), expected);
+    }
+
+    #[test]
+    fn basic_terms_body_size_matches_canonical_encoding() {
+        let maker = Key::from_bytes([1; Key::LENGTH]);
+        let taker = Key::from_bytes([2; Key::LENGTH]);
+        let outputs = List::all([Payout::new(maker, 7); MAX_EDGE_OUTPUTS]);
+        let body = TermsBody::Basic {
+            protocol: ProtocolCode::new(1),
+            parties: Parties::new(maker, taker),
+            timeout: BlockHeight::new(99),
+            timeout_outputs: outputs,
+        };
+        let mut buf = [0; TermsBody::MAX_ENCODED_SIZE];
+        let mut writer = BufferWriter::new(&mut buf);
+
+        body.encode_to(&mut writer);
+
+        assert_eq!(
+            TermsBody::MAX_ENCODED_SIZE,
+            1 + Key::LENGTH + Key::LENGTH + 8 + 8 + MAX_EDGE_OUTPUTS * (Key::LENGTH + 8),
+        );
+        assert_eq!(body.encoded_size(), writer.position());
+        assert_eq!(body.encoded_size(), TermsBody::MAX_ENCODED_SIZE);
+        let maker_start = 1;
+        let taker_start = maker_start + Key::LENGTH;
+        let timeout_start = taker_start + Key::LENGTH;
+
+        assert_eq!(buf[0], 1);
+        assert_eq!(&buf[maker_start..taker_start], maker.as_bytes());
+        assert_eq!(&buf[taker_start..timeout_start], taker.as_bytes());
     }
 }

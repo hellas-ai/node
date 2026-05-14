@@ -462,8 +462,7 @@ where
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
-    let fill = funding.first().unwrap_or(CoinId::ZERO);
-    let mut ids = [fill; MAX_EDGE_INPUTS];
+    let mut ids = [CoinId::ZERO; MAX_EDGE_INPUTS];
 
     for (index, id) in funding.iter().enumerate() {
         ids[index] = id;

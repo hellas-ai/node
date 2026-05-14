@@ -57,13 +57,16 @@ fn terms_hash_commits_to_basic_fields() {
 #[test]
 fn context_prices_resource_costs() {
     let fees = Fees::new(3, 5, 7, 11);
+    let block_hash_bytes = [1; BlockHash::LENGTH];
     let context = Context::with_fees(
         BlockHeight::new(7),
-        BlockHash::from_bytes([1; BlockHash::LENGTH]),
+        BlockHash::from_bytes(block_hash_bytes),
         fees,
     );
     let cost = Cost::new(1, 4, 3);
 
+    assert_eq!(context.previous_hash().to_bytes(), block_hash_bytes);
+    assert_eq!(context.previous_hash().as_bytes(), &block_hash_bytes);
     assert_eq!(cost.base(), 1);
     assert_eq!(cost.slots(), 4);
     assert_eq!(cost.proofs(), 3);

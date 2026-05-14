@@ -90,8 +90,11 @@ pub(crate) const fn fees_for_open(shape: FundingShape) -> Fees {
 }
 
 pub(crate) fn context(height: i64, fees: Fees) -> Context {
+    let Ok(height) = u64::try_from(height) else {
+        panic!("negative l1_fees height");
+    };
     Context::with_fees(
-        BlockHeight::new(u64::try_from(height).expect("negative l1_fees height")),
+        BlockHeight::new(height),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         fees,
     )
@@ -153,10 +156,9 @@ pub(crate) fn output_ids(shape: FundingShape) -> List<CoinId, MAX_EDGE_OUTPUTS> 
 pub(crate) fn payouts(shape: FundingShape) -> List<Payout, MAX_EDGE_OUTPUTS> {
     match shape {
         FundingShape::Full => payouts_with(MAKER, 29, TAKER, 28),
-        FundingShape::MakerOnly => payouts_with(MAKER, 20, TAKER, 0),
+        FundingShape::MakerOnly | FundingShape::SelfEdge => payouts_with(MAKER, 20, TAKER, 0),
         FundingShape::TakerOnly => payouts_with(MAKER, 0, TAKER, 20),
         FundingShape::Empty => payouts_with(MAKER, 0, TAKER, 0),
-        FundingShape::SelfEdge => payouts_with(MAKER, 20, TAKER, 0),
     }
 }
 

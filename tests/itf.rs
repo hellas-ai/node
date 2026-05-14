@@ -196,8 +196,10 @@ impl ItfRunner for L1FeesRunner {
         expected: &Self::ExpectedState,
     ) -> Result<Self::Result, Self::Error> {
         match expected.last_input {
-            fee_itf::Input::NoInput | fee_itf::Input::IdleInput => Ok(None),
-            fee_itf::Input::TickInput | fee_itf::Input::RaiseFeeInput => Ok(None),
+            fee_itf::Input::NoInput
+            | fee_itf::Input::IdleInput
+            | fee_itf::Input::TickInput
+            | fee_itf::Input::RaiseFeeInput => Ok(None),
             fee_itf::Input::OpenInput(shape_tag) => {
                 let shape = shape_tag.to_model();
                 let op = fee_model::open(shape);
@@ -216,10 +218,7 @@ impl ItfRunner for L1FeesRunner {
                     fees_for_close(expected.current_close_fee)?,
                 );
                 let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
-                    format!(
-                        "kernel rejected l1_fees close {:?} for {:?}: {err:?}",
-                        proof, shape
-                    )
+                    format!("kernel rejected l1_fees close {proof:?} for {shape:?}: {err:?}")
                 })?;
                 Ok(Some(event.kind().clone()))
             }
