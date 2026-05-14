@@ -5,7 +5,10 @@
 //! encoding of the canonical open hash. It intentionally does not enforce
 //! `origin` or `rpIdHash`; those bytes are still signed by the authenticator,
 //! but the verifier treats `WebAuthn` as a portable P-256 transaction-signing
-//! envelope.
+//! envelope. The accepted `clientDataJSON` grammar is deliberately narrower
+//! than arbitrary JSON: a top-level object with required `type` and
+//! `challenge`, plus known ignored browser fields (`origin`, `crossOrigin`,
+//! `topOrigin`).
 
 use p256::{
     EncodedPoint,
@@ -23,7 +26,6 @@ const UP: u8 = 0x01;
 const UV: u8 = 0x04;
 const AT: u8 = 0x40;
 const ED: u8 = 0x80;
-const MAX_JSON_DEPTH: usize = 16;
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -245,7 +247,13 @@ fn validate_client_data_json(
                     return Err(WebAuthnError::InvalidChallenge);
                 }
             }
-            FieldName::Other => parser.skip_value(0)?,
+            FieldName::Origin | FieldName::TopOrigin => {
+                parser.parse_string()?;
+            }
+            FieldName::CrossOrigin => {
+                parser.parse_bool()?;
+            }
+            FieldName::Unknown => return Err(WebAuthnError::InvalidClientDataJson),
         }
 
         parser.skip_ws();
@@ -276,17 +284,23 @@ struct JsonString<'a> {
 enum FieldName {
     Type,
     Challenge,
-    Other,
+    Origin,
+    CrossOrigin,
+    TopOrigin,
+    Unknown,
 }
 
 fn field_name(value: JsonString<'_>) -> FieldName {
     if value.escaped {
-        return FieldName::Other;
+        return FieldName::Unknown;
     }
     match value.bytes {
         b"type" => FieldName::Type,
         b"challenge" => FieldName::Challenge,
-        _ => FieldName::Other,
+        b"origin" => FieldName::Origin,
+        b"crossOrigin" => FieldName::CrossOrigin,
+        b"topOrigin" => FieldName::TopOrigin,
+        _ => FieldName::Unknown,
     }
 }
 
@@ -385,56 +399,11 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn skip_value(&mut self, depth: usize) -> Result<(), WebAuthnError> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(WebAuthnError::InvalidClientDataJson);
-        }
-        self.skip_ws();
+    fn parse_bool(&mut self) -> Result<(), WebAuthnError> {
         match self.peek() {
-            Some(b'"') => self.parse_string().map(|_| ()),
-            Some(b'{') => self.skip_object(depth + 1),
-            Some(b'[') => self.skip_array(depth + 1),
             Some(b't') => self.consume_literal(b"true"),
             Some(b'f') => self.consume_literal(b"false"),
-            Some(b'n') => self.consume_literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => self.skip_number(),
             _ => Err(WebAuthnError::InvalidClientDataJson),
-        }
-    }
-
-    fn skip_object(&mut self, depth: usize) -> Result<(), WebAuthnError> {
-        self.expect(b'{')?;
-        self.skip_ws();
-        if self.consume(b'}') {
-            return Ok(());
-        }
-        loop {
-            self.skip_ws();
-            self.parse_string()?;
-            self.skip_ws();
-            self.expect(b':')?;
-            self.skip_value(depth)?;
-            self.skip_ws();
-            if self.consume(b'}') {
-                return Ok(());
-            }
-            self.expect(b',')?;
-        }
-    }
-
-    fn skip_array(&mut self, depth: usize) -> Result<(), WebAuthnError> {
-        self.expect(b'[')?;
-        self.skip_ws();
-        if self.consume(b']') {
-            return Ok(());
-        }
-        loop {
-            self.skip_value(depth)?;
-            self.skip_ws();
-            if self.consume(b']') {
-                return Ok(());
-            }
-            self.expect(b',')?;
         }
     }
 
@@ -447,20 +416,6 @@ impl<'a> JsonParser<'a> {
         }
         self.pos += literal.len();
         Ok(())
-    }
-
-    fn skip_number(&mut self) -> Result<(), WebAuthnError> {
-        let start = self.pos;
-        while let Some(byte) = self.peek()
-            && matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-        {
-            self.pos += 1;
-        }
-        if self.pos == start {
-            Err(WebAuthnError::InvalidClientDataJson)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -500,13 +455,18 @@ mod tests {
     }
 
     #[test]
-    fn client_data_accepts_ignored_json_values_and_whitespace() {
+    fn client_data_accepts_known_ignored_fields_and_whitespace() {
         let input = br#" {
-            "other": [false, null, -12.5e+2, {"escaped":"a\u0041", "simple":"a\nb", "array":[]}],
+            "origin": "https://example.invalid",
             "type": "webauthn.get",
             "challenge": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "tail": true
+            "crossOrigin": false,
+            "topOrigin": "https:\/\/top.example.invalid"
         } "#;
+
+        assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
+
+        let input = br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":true}"#;
 
         assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
     }
@@ -551,6 +511,13 @@ mod tests {
         );
         assert_eq!(
             validate_client_data_json(
+                br#"{"type":"not-webauthn","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataType),
+        );
+        assert_eq!(
+            validate_client_data_json(
                 br#"{"type":"webauthn\u002eget","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
                 &ZERO_CHALLENGE,
             ),
@@ -561,12 +528,12 @@ mod tests {
                 br#"{"ty\u0070e":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
                 &ZERO_CHALLENGE,
             ),
-            Err(WebAuthnError::MissingClientDataField),
+            Err(WebAuthnError::InvalidClientDataJson),
         );
     }
 
     #[test]
-    fn client_data_rejects_malformed_ignored_values() {
+    fn client_data_rejects_unknown_fields_and_malformed_ignored_values() {
         assert_eq!(
             validate_client_data_json(
                 br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":truex}"#,
@@ -576,14 +543,42 @@ mod tests {
         );
         assert_eq!(
             validate_client_data_json(
-                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":"\u12x4"}"#,
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#,
                 &ZERO_CHALLENGE,
             ),
             Err(WebAuthnError::InvalidClientDataJson),
         );
         assert_eq!(
             validate_client_data_json(
-                b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"extra\":\"\n\"}",
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":true}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":"false"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":tru"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","topOrigin":"\u12x4"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"origin\":\"\n\"}",
                 &ZERO_CHALLENGE,
             ),
             Err(WebAuthnError::InvalidClientDataJson),
