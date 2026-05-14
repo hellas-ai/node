@@ -9,7 +9,7 @@
 //! are the entire I/O-shaped surface; transports glue them to actual
 //! sockets.
 
-mod slot;
+pub(crate) mod slot;
 mod state;
 mod wire;
 

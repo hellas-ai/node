@@ -155,15 +155,23 @@ pub fn handle_websocket_message<const N: usize, C: Clock>(
 //     [opened_age_ns: u64 LE]
 //     [deadline_flag: u8]        // 0 = None, 1 = Some
 //     [deadline_remaining_ns: u64 LE]?   // present iff flag == 1
+//     [send_queue_len: u8]       // bounded by SLOT_QUEUE_CAP
+//     for each queued frame:
+//       [frame_len: varint]
+//       [frame_bytes]            // encoded `Frame` (keyless)
 //   [has_pending: u8]
 //   [pending_len: varint]?       // present iff has_pending == 1
 //   [pending_bytes]?
+//   [pending_terminal_free_len: u8]
+//   [terminal_free_idx: u16 LE]* // present pending_terminal_free_len times
 //
 // `Instant`s are captured as deltas relative to the clock's `now()` at
 // serialize time, and re-anchored relative to `now()` at deserialize
 // time — `Instant` is opaque and not stable across hibernation.
 
-const SNAPSHOT_MAGIC: u8 = 0xA1;
+// 0xA1 → 0xA2: added per-slot send_queue persistence + the
+// `pending_terminal_free` deferred-free list at the snapshot tail.
+const SNAPSHOT_MAGIC: u8 = 0xA2;
 
 const ROLE_CLIENT: u8 = 0;
 const ROLE_SERVER: u8 = 1;
@@ -290,6 +298,21 @@ pub fn serialize_mux<const N: usize, C: Clock>(mux: &Multiplexer<N, C>) -> Vec<u
                 out.push(0);
             }
         }
+
+        // Per-slot send_queue: persist all queued frames in order.
+        // Without this, a backed-up queue (e.g. Credit + Body waiting
+        // behind a backpressured send) would be silently dropped on
+        // restore. Each queue entry is `[len: varint] [Frame bytes]`;
+        // the encoded Frame is keyless (the slot index + generation
+        // come from the slot record itself).
+        out.push(slot.send_queue.len() as u8);
+        let mut tmp = bytes::BytesMut::new();
+        for frame in &slot.send_queue {
+            tmp.clear();
+            crate::frame::encode_frame(frame, &mut tmp);
+            write_varint(tmp.len() as u64, &mut out);
+            out.extend_from_slice(&tmp);
+        }
     }
 
     match mux.pending_write_ref() {
@@ -299,6 +322,25 @@ pub fn serialize_mux<const N: usize, C: Clock>(mux: &Multiplexer<N, C>) -> Vec<u
             out.extend_from_slice(pending);
         }
         None => out.push(0),
+    }
+
+    // Deferred terminal-free list. Each entry is a slot index whose
+    // local terminal frame has been emitted by `next_outbound` but
+    // not yet confirmed shipped. Bounded by N (one entry per slot
+    // at most), and in practice ≤ 1 because each emit cycle drains
+    // the previous entry before pushing the next — the u8 length
+    // prefix accommodates this with margin. The debug assert
+    // guards against future invariant drift (e.g. if next_outbound
+    // ever batches multiple terminal emits per call).
+    let term_free = mux.pending_terminal_free_slice();
+    debug_assert!(
+        term_free.len() <= u8::MAX as usize,
+        "pending_terminal_free length {} exceeds u8 prefix capacity",
+        term_free.len()
+    );
+    out.push(term_free.len() as u8);
+    for idx in term_free {
+        out.extend_from_slice(&idx.to_le_bytes());
     }
 
     out
@@ -457,7 +499,7 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
             .checked_sub(std::time::Duration::from_nanos(opened_age_ns))
             .unwrap_or(now);
 
-        let slot = Multiplexer::<N, C>::make_restored_slot(
+        let mut slot = Multiplexer::<N, C>::make_restored_slot(
             generation,
             state,
             method_id,
@@ -467,6 +509,32 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
             local_recv_credit,
             local_credit_high_water,
         );
+
+        // Per-slot send_queue: restore frames in order.
+        let queue_len = cur.take_u8()? as usize;
+        if queue_len > crate::mux::slot::SLOT_QUEUE_CAP {
+            return Err(CfDoError::SnapshotCorrupt(
+                "slot send_queue exceeds cap",
+            ));
+        }
+        for _ in 0..queue_len {
+            let (frame_len, _) = cur.take_varint()?;
+            let frame_len = frame_len as usize;
+            // Each frame must fit within the per-frame body cap so a
+            // poisoned snapshot can't allocate a huge frame per slot
+            // and bloat the attachment past budget.
+            if frame_len > mux_config.body_frame_max {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "queued frame exceeds body_frame_max",
+                ));
+            }
+            let bytes = cur.take_bytes(frame_len)?;
+            let frame = crate::frame::decode_frame(bytes).map_err(|_| {
+                CfDoError::SnapshotCorrupt("queued frame fails decode")
+            })?;
+            slot.send_queue.push_back(frame);
+        }
+
         mux.restore_slot(idx, slot);
     }
 
@@ -512,6 +580,91 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
         }
         _ => return Err(CfDoError::SnapshotCorrupt("bad has_pending flag")),
     }
+
+    // Deferred terminal-free list. Each entry must reference a slot
+    // currently occupied — that's the entire purpose of deferring
+    // the free in the first place. A poisoned attachment could
+    // claim a freed slot is "in-flight terminal" to confuse the
+    // free-on-next-emit logic; reject any idx not in the occupied
+    // table. We also require local_terminal=true (i.e. state ∈
+    // {HalfClosedLocal, Closed}); otherwise the list entry is
+    // nonsensical (we couldn't have emitted a terminal frame from
+    // a slot that hasn't yet observed its own close_send / reset).
+    let term_free_len = cur.take_u8()? as usize;
+    if term_free_len > N {
+        return Err(CfDoError::SnapshotCorrupt(
+            "pending_terminal_free exceeds N",
+        ));
+    }
+    let mut term_free: Vec<SlotIndex> = Vec::with_capacity(term_free_len);
+    for _ in 0..term_free_len {
+        let idx = cur.take_u16()?;
+        if (idx as usize) >= N {
+            return Err(CfDoError::SnapshotCorrupt(
+                "pending_terminal_free idx out of range",
+            ));
+        }
+        let slot_state = mux
+            .iter_occupied_slots()
+            .find(|(occ_idx, _)| *occ_idx == idx)
+            .map(|(_, slot)| slot.state);
+        let slot_state = match slot_state {
+            Some(s) => s,
+            None => {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "pending_terminal_free idx is not occupied",
+                ));
+            }
+        };
+        if !matches!(slot_state, SlotState::HalfClosedLocal | SlotState::Closed) {
+            return Err(CfDoError::SnapshotCorrupt(
+                "pending_terminal_free idx slot is not local-terminal",
+            ));
+        }
+        if term_free.contains(&idx) {
+            return Err(CfDoError::SnapshotCorrupt(
+                "pending_terminal_free has duplicate idx",
+            ));
+        }
+        term_free.push(idx);
+    }
+
+    // Any "occupied" slot we OWN that's in state=Closed must reach
+    // a path that eventually frees it. Three legitimate ways:
+    //   (a) idx in pending_terminal_free — its terminal frame was
+    //       emitted and the deferred-free drain will reclaim it.
+    //   (b) send_queue is non-empty — there's still a frame to ship
+    //       (e.g. a Reset queued by `reset()` from a non-terminal
+    //       state, or by the body-overrun handler). The next
+    //       `next_outbound` will emit it and queue the idx into
+    //       pending_terminal_free; the call after that frees it.
+    //   (c) NEITHER → permanent leak. `lowest_free` ignores the
+    //       slot (bit clear); recv won't re-fire `maybe_free_slot`
+    //       (already Closed); `next_outbound` never adds it. Fail
+    //       closed.
+    //
+    // Peer-parity slots stay `Some` with state=Closed indefinitely
+    // after the peer's terminal — `mark_free` only sets bits we
+    // own, so the slot record is retained for generation-rollover
+    // tracking. They are not orphans; the peer governs their
+    // lifecycle. Scope the check to our parity.
+    let our_role = mux.role();
+    let closed_orphans: Vec<SlotIndex> = mux
+        .iter_occupied_slots()
+        .filter(|(idx, slot)| {
+            our_role.owns_slot(*idx)
+                && slot.state == SlotState::Closed
+                && slot.send_queue.is_empty()
+        })
+        .map(|(idx, _)| idx)
+        .filter(|idx| !term_free.contains(idx))
+        .collect();
+    if !closed_orphans.is_empty() {
+        return Err(CfDoError::SnapshotCorrupt(
+            "closed slot not queued in pending_terminal_free",
+        ));
+    }
+    mux.set_pending_terminal_free(term_free);
 
     // Trailing-bytes check: the snapshot must be exactly the right
     // length. Extra bytes mean someone appended a payload we don't
@@ -720,7 +873,7 @@ mod tests {
         // a newer magic byte. The current code must NOT silently parse
         // it as the legacy format.
         let (_, mut bytes) = client_with_open_slot();
-        bytes[0] = 0xA2;
+        bytes[0] = 0xA3;
         assert!(matches!(
             deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default()),
             Err(CfDoError::SnapshotCorrupt("bad magic"))
@@ -840,10 +993,15 @@ mod tests {
         let mux: Multiplexer<32, _> =
             Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
         let mut bytes = serialize_mux(&mux);
-        // Replace the has_pending=0 trailer with has_pending=1 + 1 MiB.
-        // The has_pending byte is the LAST byte before any pending data.
-        // Find and overwrite.
-        assert_eq!(*bytes.last().unwrap(), 0); // pending=None
+        // Snapshot tail layout for an empty mux with no pending_write
+        // and no deferred terminal-free entries:
+        //   ... [has_pending=0] [terminal_free_len=0]
+        // We want to flip has_pending → 1 and inject an oversized
+        // pending_len. Truncate the trailing [terminal_free_len=0]
+        // first, then overwrite the has_pending byte.
+        assert_eq!(*bytes.last().unwrap(), 0); // terminal_free_len=0
+        bytes.pop();
+        assert_eq!(*bytes.last().unwrap(), 0); // has_pending=0
         let last = bytes.len() - 1;
         bytes[last] = 1;
         let mut len_varint = Vec::new();
@@ -925,6 +1083,413 @@ mod tests {
     }
 
     #[test]
+    fn send_queue_survives_round_trip() {
+        // Hibernation contract: if a slot has frames queued (Credit
+        // ahead of a Body, or Body queued behind a backpressured
+        // pending_write), those frames must survive
+        // serialize→deserialize. Otherwise a DO that suspends while
+        // backed up loses the queued Body silently.
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let s = mux.open(0xCAFE, Metadata::new()).unwrap();
+        // The OPEN frame is now queued on the slot. Add a Body on top
+        // (queue depth: OPEN + Body = 2). Don't drain — we want the
+        // queue populated at snapshot time.
+        mux.send_body(s, Bytes::from_static(b"hello-after-wake")).unwrap();
+
+        let pre_queue_len = mux
+            .iter_occupied_slots()
+            .find(|(idx, _)| *idx == s)
+            .map(|(_, slot)| slot.send_queue.len())
+            .unwrap();
+        assert_eq!(pre_queue_len, 2, "OPEN + Body should be queued");
+
+        let bytes = serialize_mux(&mux);
+        let mut restored: Multiplexer<32, _> =
+            deserialize_mux(&bytes, DefaultClock, MuxConfig::default()).unwrap();
+        let post_queue_len = restored
+            .iter_occupied_slots()
+            .find(|(idx, _)| *idx == s)
+            .map(|(_, slot)| slot.send_queue.len())
+            .unwrap();
+        assert_eq!(post_queue_len, 2, "queue must round-trip intact");
+
+        // Drain on the restored side and confirm both frames come out
+        // in order (OPEN first, then the Body payload).
+        let first = restored.next_outbound().expect("OPEN survives");
+        let second = restored.next_outbound().expect("Body survives");
+        assert!(
+            second.windows(b"hello-after-wake".len()).any(|w| w == b"hello-after-wake"),
+            "queued Body payload must survive hibernation"
+        );
+        let _ = first;
+    }
+
+    #[test]
+    fn send_queue_exceeds_cap_rejected() {
+        // Poisoned attachment claims a slot has more queued frames
+        // than SLOT_QUEUE_CAP — restore must reject so a tampered
+        // attachment can't blow past the bounded-queue invariant on
+        // wake.
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        mux.open(0x1, Metadata::new()).unwrap();
+        let mut bytes = serialize_mux(&mux);
+        // The queue_len byte sits right after the deadline_flag (which
+        // is 0 here — no deadline). Slot record stride to deadline_flag:
+        //   13 (free_mask + count) + 2 (idx) + 2 (gen) + 1 (state)
+        //   + 4 (mid) + 4 (peer_credit) + 4 (local_credit)
+        //   + 4 (high_water) + 8 (opened_age) = 42 → +1 (deadline_flag)
+        //   = 43, so queue_len is at offset 43.
+        // Just blast every byte from 43..end looking for the 0x01 OPEN
+        // queue_len byte and bump it past CAP. Simpler: rebuild the
+        // expected offset from spec; if it ever drifts the test fails
+        // loudly which is fine.
+        let queue_len_offset = 13 + 2 + 2 + 1 + 4 + 4 + 4 + 4 + 8 + 1;
+        assert_eq!(bytes[queue_len_offset], 1, "expected 1 queued OPEN frame");
+        bytes[queue_len_offset] = (crate::mux::slot::SLOT_QUEUE_CAP + 1) as u8;
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("queue_len > CAP must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("slot send_queue exceeds cap")
+        ));
+    }
+
+    #[test]
+    fn terminal_frame_with_backpressure_survives_round_trip() {
+        // The motivating race: both peers have called close_send, so
+        // the next local terminal frame triggers `maybe_free_slot`.
+        // The transport backpressures and the driver re-stashes the
+        // terminal bytes via `set_pending_write`. The slot must
+        // remain occupied so the snapshot validator can match
+        // `pending_write` against a known (idx, generation). Before
+        // the deferred-free fix this rejected with "pending_write
+        // key does not match any restored slot".
+        let cfg = MuxConfig::default();
+        let mut client: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> =
+            Multiplexer::new(Role::Server, DefaultClock, cfg);
+
+        // Client opens; deliver OPEN to server.
+        let s = client.open(0x42, Metadata::new()).unwrap();
+        let open_bytes = client.next_outbound().unwrap();
+        let _ = server.recv(&open_bytes).unwrap();
+
+        // Server closes-send; deliver the End frame to client. Now
+        // client has peer_terminal=true.
+        server.close_send(s, None).unwrap();
+        let srv_end = server.next_outbound().unwrap();
+        let _ = client.recv(&srv_end).unwrap();
+
+        // Client closes-send; the End frame is queued. Emit it.
+        // Both terminals are now set on the client's slot, so the
+        // OLD eager-free behavior would free the slot inside
+        // next_outbound BEFORE the caller has a chance to confirm
+        // the bytes shipped.
+        client.close_send(s, None).unwrap();
+        let end_bytes = client.next_outbound().expect("End frame");
+        // Simulate transport backpressure.
+        client.set_pending_write(Some(end_bytes));
+
+        assert!(
+            client.iter_occupied_slots().any(|(idx, _)| idx == s),
+            "slot should remain occupied while terminal frame is in flight"
+        );
+        assert_eq!(client.pending_terminal_free_slice(), &[s]);
+
+        let bytes = serialize_mux(&client);
+        let mut restored: Multiplexer<32, _> =
+            deserialize_mux(&bytes, DefaultClock, cfg).unwrap();
+        assert!(
+            restored.pending_write_ref().is_some(),
+            "terminal frame must survive in pending_write"
+        );
+        assert_eq!(
+            restored.pending_terminal_free_slice(),
+            &[s],
+            "deferred-free list must round-trip"
+        );
+        // Drain pending_write; slot still occupied because we haven't
+        // confirmed shipment yet.
+        let _ = restored.next_outbound().expect("pending_write resumes");
+        assert!(
+            restored.iter_occupied_slots().any(|(idx, _)| idx == s),
+            "slot stays occupied until ship is confirmed"
+        );
+        // Calling next_outbound again (with no pending_write) acts as
+        // the implicit ship-confirm and frees the slot.
+        let _ = restored.next_outbound();
+        assert!(
+            !restored.iter_occupied_slots().any(|(idx, _)| idx == s),
+            "slot frees once caller asks for next frame after a clean drain"
+        );
+    }
+
+    #[test]
+    fn pending_terminal_free_points_at_freed_slot_rejected() {
+        // Poisoned attachment: claims a slot that's NOT in the
+        // occupied list is "in flight terminal". Restore must reject
+        // — otherwise the lazy free would silently target a slot
+        // owned by a future open.
+        let mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let mut bytes = serialize_mux(&mux);
+        // Tail: [has_pending=0] [terminal_free_len=0]
+        assert_eq!(*bytes.last().unwrap(), 0); // terminal_free_len
+        let last = bytes.len() - 1;
+        bytes[last] = 1; // claim one entry
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // idx=0
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("free-slot idx in terminal_free must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("pending_terminal_free idx is not occupied")
+        ));
+    }
+
+    #[test]
+    fn reset_before_terminal_emit_survives_round_trip() {
+        // Bug 1 from round-6 review: app calls open + reset before
+        // the OPEN frame has even shipped. Slot enters state=Closed
+        // with send_queue=[Reset], NOT in pending_terminal_free
+        // (reset() doesn't pre-emit). A snapshot in this window
+        // previously failed the closed-orphan check; now legitimate.
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let s = mux.open(0xCAFE, Metadata::new()).unwrap();
+        // Don't drain — OPEN is still queued.
+        mux.reset(s, crate::WireCode::Cancelled);
+        // Slot is now Closed with send_queue=[Reset].
+        let bytes = serialize_mux(&mux);
+        let mut restored: Multiplexer<32, _> =
+            deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .expect("Closed-with-queued-Reset must round-trip");
+        // Drain on the restored side: Reset must come out.
+        let out = restored.next_outbound().expect("Reset must emit");
+        let decoded = crate::mux::decode_keyed_frame(&out).unwrap();
+        assert!(matches!(decoded.frame, crate::frame::Frame::Reset(_)));
+        // Then one more next_outbound call frees the slot.
+        let _ = restored.next_outbound();
+        assert!(!restored.iter_occupied_slots().any(|(idx, _)| idx == s));
+    }
+
+    #[test]
+    fn recv_end_after_terminal_emit_drops_terminal_free_entry() {
+        // Bug 2 from round-6 review: client emits End (slot enters
+        // pending_terminal_free); peer's End arrives via recv before
+        // the next_outbound drain. recv-End calls maybe_free_slot —
+        // both terminals + empty queue → succeeds and frees the
+        // slot. The stale pending_terminal_free entry must be
+        // cleared (mirror of recv-Reset's retain pattern); otherwise
+        // a snapshot in this window has an idx in term_free that
+        // iter_occupied_slots no longer surfaces, failing restore.
+        let cfg = MuxConfig::default();
+        let mut client: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> =
+            Multiplexer::new(Role::Server, DefaultClock, cfg);
+        let s = client.open(0x1, Metadata::new()).unwrap();
+        let open_bytes = client.next_outbound().unwrap();
+        let _ = server.recv(&open_bytes).unwrap();
+
+        client.close_send(s, None).unwrap();
+        let end_bytes = client.next_outbound().expect("client End");
+        assert!(client.pending_terminal_free_slice().contains(&s));
+        let _ = server.recv(&end_bytes).unwrap();
+
+        server.close_send(s, None).unwrap();
+        let srv_end = server.next_outbound().expect("server End");
+        let _ = client.recv(&srv_end).unwrap();
+
+        // After recv-End, client's slot is freed AND the stale
+        // term_free entry should be gone.
+        assert!(
+            !client.pending_terminal_free_slice().contains(&s),
+            "stale pending_terminal_free entry must be removed"
+        );
+        // Round-trip the snapshot.
+        let bytes = serialize_mux(&client);
+        let _restored: Multiplexer<32, _> =
+            deserialize_mux::<32, _>(&bytes, DefaultClock, cfg)
+            .expect("snapshot must round-trip");
+    }
+
+    #[test]
+    fn recv_reset_drops_pending_write_keyed_to_freed_slot() {
+        // Bug 3 from round-6 review: client emits End for slot s,
+        // ws.send backpressures, driver re-stashes via
+        // set_pending_write. Peer-Reset arrives via recv — both
+        // terminals true, send_queue.clear(), maybe_free_slot frees
+        // s. pending_write still contains the End bytes keyed to s.
+        // A snapshot here previously failed restore with
+        // "pending_write key does not match any restored slot".
+        let cfg = MuxConfig::default();
+        let mut client: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> =
+            Multiplexer::new(Role::Server, DefaultClock, cfg);
+        let s = client.open(0x1, Metadata::new()).unwrap();
+        let open_bytes = client.next_outbound().unwrap();
+        let _ = server.recv(&open_bytes).unwrap();
+        client.close_send(s, None).unwrap();
+        let end_bytes = client.next_outbound().expect("End");
+        // Simulate transport backpressure: re-stash.
+        client.set_pending_write(Some(end_bytes));
+        assert!(client.pending_terminal_free_slice().contains(&s));
+        // Server independently resets the same slot.
+        server.reset(s, crate::WireCode::Cancelled);
+        let server_reset = server.next_outbound().expect("server Reset");
+        // Client recvs the Reset.
+        let _ = client.recv(&server_reset).unwrap();
+        // pending_write must now be cleared (Bug 3 fix).
+        assert!(
+            client.pending_write_ref().is_none(),
+            "pending_write keyed to freed slot must be cleared"
+        );
+        // And pending_terminal_free must be drained.
+        assert!(
+            !client.pending_terminal_free_slice().contains(&s),
+            "term_free entry must be removed"
+        );
+        // Snapshot must round-trip cleanly.
+        let bytes = serialize_mux(&client);
+        let _restored: Multiplexer<32, _> =
+            deserialize_mux::<32, _>(&bytes, DefaultClock, cfg)
+            .expect("snapshot must round-trip after recv-Reset cleared pending_write");
+    }
+
+    #[test]
+    fn credit_then_recv_end_doesnt_orphan_slot() {
+        // Bug 4 from round-6 review: slot is HalfClosedLocal (we
+        // close-sent and shipped End). prepare_credit_updates
+        // queues a Credit. Peer's End arrives — maybe_free_slot
+        // fails (queue non-empty). next_outbound ships the Credit
+        // (non-terminal). With the as-fixed code, the post-pop
+        // both-terminal-empty-queue check re-queues the idx into
+        // pending_terminal_free; the call after that frees it.
+        // Pre-fix, the slot would have orphaned.
+        let cfg = MuxConfig {
+            initial_credit: 100,
+            credit_refill_ratio: 2,
+            body_frame_max: 1024,
+        };
+        let mut client: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> =
+            Multiplexer::new(Role::Server, DefaultClock, cfg);
+        let s = client.open(0x1, Metadata::new()).unwrap();
+        let open_bytes = client.next_outbound().unwrap();
+        let _ = server.recv(&open_bytes).unwrap();
+        // Server sends body to client to drop client's local credit.
+        server.send_body(s, Bytes::from(vec![0u8; 60])).unwrap();
+        let body_bytes = server.next_outbound().unwrap();
+        let _ = client.recv(&body_bytes).unwrap();
+        // Client close_send + emit End. Slot enters term_free.
+        client.close_send(s, None).unwrap();
+        let end_bytes = client.next_outbound().expect("client End");
+        let _ = server.recv(&end_bytes).unwrap();
+        assert!(client.pending_terminal_free_slice().contains(&s));
+        // Queue a Credit refresh: local_recv_credit is below
+        // threshold from the inbound Body, so prepare_credit_updates
+        // will push a Credit frame to the front of the slot's queue.
+        client.prepare_credit_updates();
+        // Server's End arrives BEFORE the Credit ships. recv-End
+        // tries to free; queue is non-empty (Credit) → no free yet.
+        server.close_send(s, None).unwrap();
+        let srv_end = server.next_outbound().expect("server End");
+        let _ = client.recv(&srv_end).unwrap();
+        // Slot is now state=Closed but holds the Credit in its
+        // send_queue. term_free entry is still present (from our
+        // earlier End emit).
+        assert!(client.pending_terminal_free_slice().contains(&s));
+        // Drain the Credit. After the pop, queue is empty and both
+        // terminals are true → the post-pop check would push idx
+        // (already present, dedupe keeps it at 1).
+        let _credit = client.next_outbound().expect("Credit");
+        assert!(client.pending_terminal_free_slice().contains(&s));
+        // Next call frees the slot via drain_pending_terminal_free.
+        let _ = client.next_outbound();
+        assert!(
+            !client.iter_occupied_slots().any(|(idx, _)| idx == s),
+            "slot must free, not orphan"
+        );
+    }
+
+    #[test]
+    fn pending_terminal_free_idx_not_local_terminal_rejected() {
+        // Poisoned attachment: the listed slot is occupied but in
+        // state=OpenLocal — it can't be "in flight terminal" because
+        // local_terminal is false. Restore must reject so a tampered
+        // attachment can't trick the deferred-free machinery into
+        // freeing a still-live slot on the next emit.
+        let (_, mut bytes) = client_with_open_slot();
+        // Tail layout for one occupied OpenLocal slot:
+        //   ... [has_pending=0] [terminal_free_len=0]
+        let last = bytes.len() - 1;
+        assert_eq!(bytes[last], 0); // terminal_free_len
+        bytes[last] = 1;
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // idx=0, OpenLocal
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("non-local-terminal slot in list must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("pending_terminal_free idx slot is not local-terminal")
+        ));
+    }
+
+    #[test]
+    fn closed_slot_not_in_terminal_free_rejected() {
+        // Poisoned attachment: a slot record claims state=Closed
+        // with an empty send_queue, and the slot is NOT in
+        // pending_terminal_free. There's no path to free it
+        // (lowest_free ignores it because the bit is clear, recv
+        // side won't re-fire maybe_free_slot on a Closed slot
+        // whose state has already moved, and next_outbound won't
+        // re-queue terminal_free without a fresh emission). It
+        // would leak forever.
+        //
+        // A Closed slot with a NON-empty queue is legitimate (the
+        // queue may hold a Reset queued by `reset()` from a
+        // non-terminal state, awaiting a future emit). That case
+        // is covered by other tests; here we craft the empty-queue
+        // variant which is the actual orphan shape.
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        mux.open(0x1, Metadata::new()).unwrap();
+        // Drain the OPEN so send_queue is empty when we snapshot.
+        let _ = mux.next_outbound().unwrap();
+        let mut bytes = serialize_mux(&mux);
+        // Slot record state byte sits at:
+        //   13 (free_mask+count) + 2 (idx) + 2 (gen) = 17
+        let state_offset = 13 + 2 + 2;
+        bytes[state_offset] = STATE_CLOSED;
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("orphan Closed slot must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("closed slot not queued in pending_terminal_free")
+        ));
+    }
+
+    #[test]
+    fn pending_terminal_free_out_of_range_rejected() {
+        let mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let mut bytes = serialize_mux(&mux);
+        let last = bytes.len() - 1;
+        bytes[last] = 1;
+        bytes.extend_from_slice(&999u16.to_le_bytes()); // > N=32
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("oob idx must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("pending_terminal_free idx out of range")
+        ));
+    }
+
+    #[test]
     fn generation_survives_round_trip() {
         // Open + reset a slot N times so its generation rolls forward,
         // then snapshot + restore. Generation must come back identical.
@@ -954,5 +1519,283 @@ mod tests {
             .map(|(_, slot)| slot.generation)
             .unwrap();
         assert_eq!(pre_gen, post_gen, "generation must round-trip");
+    }
+
+    // ----------------------------------------------------------------
+    // Property-based fuzz of paired-mux operation sequences.
+    //
+    // The targeted tests above each exercise one narrow scenario.
+    // This harness runs RANDOMIZED sequences against paired client+
+    // server muxes, snapshotting either side at each step and
+    // restoring, then asserting:
+    //
+    //   I1. role + free_mask + slot table are bit-for-bit
+    //       reproducible (snapshot → restore → re-snapshot is
+    //       byte-equal).
+    //   I2. every `pending_terminal_free` entry points at an
+    //       occupied slot whose state is `HalfClosedLocal` or
+    //       `Closed`.
+    //   I3. every Closed slot that's iter_occupied has EITHER a
+    //       non-empty send_queue OR an entry in
+    //       `pending_terminal_free`.
+    //   I4. `pending_write`, if Some, decodes as a keyed frame
+    //       whose stream_id+generation match an iter_occupied slot.
+    //
+    // If any of these fail under random input, there's a
+    // state-machine path we haven't covered.
+    // ----------------------------------------------------------------
+
+    /// A single op the fuzz applies to (client, server). Slot
+    /// indices are bounded by `MAX_SLOTS` and applied modulo any
+    /// existing slot table on the target side; out-of-range ops
+    /// become no-ops, which is fine — proptest cares about state
+    /// diversity, not coverage of every branch.
+    #[derive(Debug, Clone)]
+    enum FuzzOp {
+        ClientOpen,
+        ServerOpen,
+        ClientSendBody { slot: u16, len: u16 },
+        ServerSendBody { slot: u16, len: u16 },
+        ClientCloseSend { slot: u16 },
+        ServerCloseSend { slot: u16 },
+        ClientReset { slot: u16 },
+        ServerReset { slot: u16 },
+        DeliverOneToServer,
+        DeliverOneToClient,
+        SnapshotClient,
+        SnapshotServer,
+    }
+
+    const FUZZ_N: usize = 16;
+
+    fn fuzz_op_strategy() -> proptest::strategy::BoxedStrategy<FuzzOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(FuzzOp::ClientOpen),
+            Just(FuzzOp::ServerOpen),
+            (0u16..FUZZ_N as u16, 0u16..64).prop_map(|(slot, len)| FuzzOp::ClientSendBody { slot, len }),
+            (0u16..FUZZ_N as u16, 0u16..64).prop_map(|(slot, len)| FuzzOp::ServerSendBody { slot, len }),
+            (0u16..FUZZ_N as u16).prop_map(|slot| FuzzOp::ClientCloseSend { slot }),
+            (0u16..FUZZ_N as u16).prop_map(|slot| FuzzOp::ServerCloseSend { slot }),
+            (0u16..FUZZ_N as u16).prop_map(|slot| FuzzOp::ClientReset { slot }),
+            (0u16..FUZZ_N as u16).prop_map(|slot| FuzzOp::ServerReset { slot }),
+            Just(FuzzOp::DeliverOneToServer),
+            Just(FuzzOp::DeliverOneToClient),
+            Just(FuzzOp::SnapshotClient),
+            Just(FuzzOp::SnapshotServer),
+        ]
+        .boxed()
+    }
+
+    fn apply_op(
+        client: &mut Multiplexer<FUZZ_N, DefaultClock>,
+        server: &mut Multiplexer<FUZZ_N, DefaultClock>,
+        cfg: MuxConfig,
+        op: &FuzzOp,
+    ) {
+        match op {
+            FuzzOp::ClientOpen => {
+                let _ = client.open(0xC0FFEE, crate::metadata::Metadata::new());
+            }
+            FuzzOp::ServerOpen => {
+                let _ = server.open(0xC0FFEE, crate::metadata::Metadata::new());
+            }
+            FuzzOp::ClientSendBody { slot, len } => {
+                let _ = client.send_body(*slot, Bytes::from(vec![0u8; *len as usize]));
+            }
+            FuzzOp::ServerSendBody { slot, len } => {
+                let _ = server.send_body(*slot, Bytes::from(vec![0u8; *len as usize]));
+            }
+            FuzzOp::ClientCloseSend { slot } => {
+                let _ = client.close_send(*slot, None);
+            }
+            FuzzOp::ServerCloseSend { slot } => {
+                let _ = server.close_send(*slot, None);
+            }
+            FuzzOp::ClientReset { slot } => {
+                client.reset(*slot, crate::WireCode::Cancelled);
+            }
+            FuzzOp::ServerReset { slot } => {
+                server.reset(*slot, crate::WireCode::Cancelled);
+            }
+            FuzzOp::DeliverOneToServer => {
+                if let Some(bytes) = client.next_outbound() {
+                    let _ = server.recv(&bytes);
+                }
+            }
+            FuzzOp::DeliverOneToClient => {
+                if let Some(bytes) = server.next_outbound() {
+                    let _ = client.recv(&bytes);
+                }
+            }
+            FuzzOp::SnapshotClient => snapshot_roundtrip_in_place(client, cfg),
+            FuzzOp::SnapshotServer => snapshot_roundtrip_in_place(server, cfg),
+        }
+    }
+
+    /// Round-trip a mux through serialize → deserialize → re-
+    /// serialize → re-deserialize. The full chain must succeed
+    /// (invariant I1: serializer always produces a snapshot the
+    /// deserializer accepts) and the logical state must match the
+    /// original up to time-relative fields (`opened_age_ns` and
+    /// the deadline delta are reanchored to whichever `now()` the
+    /// serializer captures, so byte equality is intentionally
+    /// not stable across calls). Replaces the mux in place with
+    /// the restored copy so subsequent ops drive restored state.
+    fn snapshot_roundtrip_in_place(
+        mux: &mut Multiplexer<FUZZ_N, DefaultClock>,
+        cfg: MuxConfig,
+    ) {
+        let bytes_a = serialize_mux(mux);
+        let restored: Multiplexer<FUZZ_N, _> = match deserialize_mux(&bytes_a, DefaultClock, cfg)
+        {
+            Ok(m) => m,
+            Err(e) => panic!(
+                "snapshot of live mux must round-trip; got {e:?}; bytes len={}",
+                bytes_a.len()
+            ),
+        };
+        // Re-serialize the restored mux and re-deserialize once
+        // more: the chain must remain stable. Bytes may differ
+        // from `bytes_a` only in the `opened_age_ns` and (optional)
+        // `deadline_remaining_ns` per-slot deltas — both are
+        // captured at serialize-time `now()` and are not part of
+        // the logical state.
+        let bytes_b = serialize_mux(&restored);
+        let _restored2: Multiplexer<FUZZ_N, _> =
+            deserialize_mux(&bytes_b, DefaultClock, cfg)
+                .expect("re-serialize of restored mux must also round-trip");
+        // Logical-state equivalence: same role, same free_mask,
+        // same occupied slot table (by everything except opened_at).
+        assert_eq!(mux.role(), restored.role(), "role must round-trip");
+        assert_eq!(
+            mux.free_mask_words(),
+            restored.free_mask_words(),
+            "free_mask must round-trip",
+        );
+        let live: Vec<_> = mux
+            .iter_occupied_slots()
+            .map(|(idx, s)| {
+                (
+                    idx,
+                    s.generation,
+                    s.state,
+                    s.method_id,
+                    s.peer_recv_credit,
+                    s.local_recv_credit,
+                    s.local_credit_high_water,
+                    s.local_terminal,
+                    s.peer_terminal,
+                    s.send_queue.len(),
+                )
+            })
+            .collect();
+        let post: Vec<_> = restored
+            .iter_occupied_slots()
+            .map(|(idx, s)| {
+                (
+                    idx,
+                    s.generation,
+                    s.state,
+                    s.method_id,
+                    s.peer_recv_credit,
+                    s.local_recv_credit,
+                    s.local_credit_high_water,
+                    s.local_terminal,
+                    s.peer_terminal,
+                    s.send_queue.len(),
+                )
+            })
+            .collect();
+        assert_eq!(live, post, "slot table must round-trip (mod time)");
+        assert_eq!(
+            mux.pending_terminal_free_slice(),
+            restored.pending_terminal_free_slice(),
+            "term_free must round-trip",
+        );
+        assert_eq!(
+            mux.pending_write_ref().map(|b| b.as_ref()),
+            restored.pending_write_ref().map(|b| b.as_ref()),
+            "pending_write must round-trip",
+        );
+        *mux = restored;
+    }
+
+    /// Assert all per-mux invariants I2/I3/I4.
+    fn check_invariants(mux: &Multiplexer<FUZZ_N, DefaultClock>, side: &str) {
+        // I2: every term_free entry points at occupied slot with
+        // state in {HalfClosedLocal, Closed}.
+        for &idx in mux.pending_terminal_free_slice() {
+            let slot_state = mux
+                .iter_occupied_slots()
+                .find(|(occ_idx, _)| *occ_idx == idx)
+                .map(|(_, slot)| slot.state);
+            assert!(
+                slot_state.is_some(),
+                "[{side}] term_free idx {idx} is not occupied"
+            );
+            let slot_state = slot_state.unwrap();
+            assert!(
+                matches!(slot_state, SlotState::HalfClosedLocal | SlotState::Closed),
+                "[{side}] term_free idx {idx} has unexpected state {slot_state:?}"
+            );
+        }
+
+        // I3: every OWN-PARITY Closed slot in iter_occupied has
+        // either a non-empty send_queue OR is in term_free.
+        // Peer-parity Closed slots are normal — `mark_free` only
+        // sets bits we own, so peer-owned slot records persist
+        // with state=Closed across their post-terminal lifetime
+        // (the peer reopens with a bumped gen to overwrite).
+        let term_free: Vec<SlotIndex> = mux.pending_terminal_free_slice().to_vec();
+        let role = mux.role();
+        for (idx, slot) in mux.iter_occupied_slots() {
+            if role.owns_slot(idx) && slot.state == SlotState::Closed {
+                let has_queue = !slot.send_queue.is_empty();
+                let in_term_free = term_free.contains(&idx);
+                assert!(
+                    has_queue || in_term_free,
+                    "[{side}] orphan Closed slot {idx}: queue empty AND not in term_free",
+                );
+            }
+        }
+
+        // I4: pending_write, if Some, decodes to a keyed frame
+        // whose stream_id matches an occupied slot.
+        if let Some(bytes) = mux.pending_write_ref() {
+            let keyed = crate::mux::decode_keyed_frame(bytes)
+                .expect("live pending_write must decode");
+            let matched = mux
+                .iter_occupied_slots()
+                .any(|(idx, slot)| idx == keyed.key.stream_id && slot.generation == keyed.key.generation);
+            assert!(
+                matched,
+                "[{side}] pending_write stream_id {} gen {} doesn't match any occupied slot",
+                keyed.key.stream_id, keyed.key.generation
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_paired_mux_state_invariants() {
+        let cfg = MuxConfig::default();
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(
+                &proptest::collection::vec(fuzz_op_strategy(), 0..96),
+                |ops| {
+                    let mut client: Multiplexer<FUZZ_N, _> =
+                        Multiplexer::new(Role::Client, DefaultClock, cfg);
+                    let mut server: Multiplexer<FUZZ_N, _> =
+                        Multiplexer::new(Role::Server, DefaultClock, cfg);
+                    for op in &ops {
+                        apply_op(&mut client, &mut server, cfg, op);
+                        check_invariants(&client, "client");
+                        check_invariants(&server, "server");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 }
