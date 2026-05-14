@@ -2581,6 +2581,7 @@ dependencies = [
  "hellas-rpc",
  "hellas-wire",
  "iroh",
+ "iroh-mdns-address-lookup",
  "iroh-metrics",
  "libc",
  "minijinja",
