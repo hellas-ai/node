@@ -17,6 +17,7 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
+use hellas_rpc::call::WithTrailer;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
 use hellas_rpc::services::execute::ExecuteHandler;
@@ -133,10 +134,10 @@ impl ExecutorHandle {
     }
 }
 
-fn with_provenance<R>(outcome: TicketOutcome<R>) -> (R, Metadata) {
+fn with_provenance<R>(outcome: TicketOutcome<R>) -> WithTrailer<R> {
     let mut metadata = Metadata::new();
     write_provenance_metadata(&mut metadata, &outcome.provenance);
-    (outcome.response, metadata)
+    WithTrailer::with_metadata(outcome.response, metadata)
 }
 
 // -- ExecuteHandler -----------------------------------------------------------
@@ -167,12 +168,12 @@ impl SymbolicHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
         request: PbSymbolicRequest,
-    ) -> Result<Ticket, WireStatus> {
+    ) -> Result<WithTrailer<Ticket>, WireStatus> {
         let outcome = self.create_symbolic_ticket(request).await?;
-        let (response, _metadata) = with_provenance(outcome);
+        let result = with_provenance(outcome);
         // Provenance not yet plumbed into the wire-layer trailer; see
         // CUTOVER_FINDINGS for the follow-up.
-        Ok(response)
+        Ok(result)
     }
 }
 
@@ -180,10 +181,10 @@ impl OpaqueHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
         request: PbOpaqueRequest,
-    ) -> Result<Ticket, WireStatus> {
+    ) -> Result<WithTrailer<Ticket>, WireStatus> {
         let outcome = self.create_opaque_ticket(request).await?;
-        let (response, _metadata) = with_provenance(outcome);
-        Ok(response)
+        let result = with_provenance(outcome);
+        Ok(result)
     }
 }
 
@@ -193,28 +194,28 @@ impl CourtesyHandler for ExecutorHandle {
     async fn quote_prompt(
         &self,
         request: QuotePromptRequest,
-    ) -> Result<QuotePromptResponse, WireStatus> {
+    ) -> Result<WithTrailer<QuotePromptResponse>, WireStatus> {
         let outcome = self.quote_prompt(request).await?;
-        let (response, _metadata) = with_provenance(outcome);
-        Ok(response)
+        let result = with_provenance(outcome);
+        Ok(result)
     }
 
     async fn quote_prepared_text(
         &self,
         request: QuotePreparedTextRequest,
-    ) -> Result<QuotePreparedTextResponse, WireStatus> {
+    ) -> Result<WithTrailer<QuotePreparedTextResponse>, WireStatus> {
         let outcome = self.quote_prepared_text(request).await?;
-        let (response, _metadata) = with_provenance(outcome);
-        Ok(response)
+        let result = with_provenance(outcome);
+        Ok(result)
     }
 
     async fn quote_chat_prompt(
         &self,
         request: QuoteChatPromptRequest,
-    ) -> Result<QuoteChatPromptResponse, WireStatus> {
+    ) -> Result<WithTrailer<QuoteChatPromptResponse>, WireStatus> {
         let outcome = self.quote_chat_prompt(request).await?;
-        let (response, _metadata) = with_provenance(outcome);
-        Ok(response)
+        let result = with_provenance(outcome);
+        Ok(result)
     }
 
     async fn put_artifact(
