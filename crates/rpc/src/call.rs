@@ -169,3 +169,73 @@ where
     }
     Ok(())
 }
+
+/// Server-side helper for server-streaming methods: decode the single
+/// request frame, invoke the handler, then forward each yielded
+/// response back over the wire.
+pub async fn dispatch_server_streaming<T, M, F, Fut, S>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message + Send + 'static,
+    F: FnOnce(M::Request) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<S, WireStatus>> + Send,
+    S: futures_util::Stream<Item = Result<M::Response, WireStatus>> + Send + Unpin,
+{
+    let (mut send, recv) = WireStream::split(inbound.stream);
+    let mut recv = Box::pin(recv);
+    let req_bytes = match recv.next().await {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return Err(TransportError::Io(format!("recv: {e}"))),
+        None => return Err(TransportError::Protocol("empty stream request".into())),
+    };
+    let request = M::Request::decode(&req_bytes[..])
+        .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
+
+    let mut stream = match handler(request).await {
+        Ok(s) => s,
+        Err(status) => {
+            send.close_send(Some(Trailer {
+                status: status.code,
+                message: status.message,
+                metadata: status.metadata,
+            }))
+            .await
+            .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+            return Ok(());
+        }
+    };
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(response) => {
+                let mut buf = BytesMut::with_capacity(response.encoded_len());
+                response
+                    .encode(&mut buf)
+                    .map_err(|e| TransportError::Protocol(format!("prost encode: {e}")))?;
+                send.send_body(buf.freeze())
+                    .await
+                    .map_err(|e| TransportError::Io(format!("send: {e}")))?;
+            }
+            Err(status) => {
+                send.close_send(Some(Trailer {
+                    status: status.code,
+                    message: status.message,
+                    metadata: status.metadata,
+                }))
+                .await
+                .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+                return Ok(());
+            }
+        }
+    }
+
+    send.close_send(Some(Trailer::ok()))
+        .await
+        .map_err(|e| TransportError::Io(format!("close: {e}")))?;
+    Ok(())
+}

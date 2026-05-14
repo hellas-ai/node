@@ -811,11 +811,21 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
                 method_marker = method_marker,
                 fn_name = fn_name,
             ),
+            (false, true) => format!(
+                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
+                \x20                   crate::call::dispatch_server_streaming::<T, {method_marker}, _, _, _>(inbound, |req| {{\n\
+                \x20                       let h = &self.0;\n\
+                \x20                       async move {{ h.{fn_name}(req).await }}\n\
+                \x20                   }}).await\n\
+                \x20               }}",
+                method_marker = method_marker,
+                fn_name = fn_name,
+            ),
             _ => format!(
                 "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
                 \x20                   let _ = (&self.0, inbound);\n\
                 \x20                   ::core::result::Result::Err(::hellas_wire::TransportError::Protocol(\n\
-                \x20                       \"streaming dispatch pending for {method_marker}\".to_string()\n\
+                \x20                       \"client/bidi streaming dispatch pending for {method_marker}\".to_string()\n\
                 \x20                   ))\n\
                 \x20               }}",
                 method_marker = method_marker,
