@@ -1,13 +1,12 @@
 //! Discovery / peer-interrogation monitor.
 //!
-//! NOTE (hellas-wire v2 cutover): `run` returns `unimplemented!()` until
-//! the discovery + pool port lands. The old implementation depended on
-//! `tonic-iroh-transport::swarm::{ServiceRegistry, DhtBackend,
-//! MdnsBackend, PeerExchangeBackend}` plus the per-peer
-//! `hellas_rpc::peers::IrohTransport`, neither of which has a
-//! `hellas-wire` equivalent yet. The CLI subcommand surface (`run`'s
-//! signature) is preserved so the binary still type-checks. See
-//! `HELLAS_WIRE_CUTOVER_FINDINGS.md` finding #5.
+//! `monitor` raced peer-discovery feeds (DHT + mDNS + peer-exchange) and
+//! interrogated each peer over the Node service. `hellas_wire::iroh::swarm`
+//! has the trait surface (`ServiceRegistry`, `Discovery`, `PeerExchangeBackend`,
+//! `StaticBackend`) but the actual DHT and mDNS backends are scope-deferred
+//! stubs. Until they land, this subcommand prints a guidance message and
+//! exits 0; use `hellas rpc <node-id> --node-addr <addr>` to query a known
+//! peer directly. See CUTOVER_FINDINGS #5.
 
 use crate::commands::CliResult;
 use iroh::SecretKey;
@@ -17,7 +16,12 @@ pub async fn run(
     _interrogate: bool,
     _secret_key: SecretKey,
 ) -> CliResult<()> {
-    unimplemented!(
-        "monitor pending hellas-wire discovery/pool port — see CUTOVER_FINDINGS.md"
-    )
+    eprintln!(
+        "monitor: discovery backends (DHT, mDNS) are pending — \
+         hellas_wire::iroh::swarm::{{dht, mdns}} modules are scope-deferred stubs."
+    );
+    eprintln!(
+        "Use `hellas rpc <node-id> --node-addr <ip:port>` to query a known peer directly."
+    );
+    Ok(())
 }
