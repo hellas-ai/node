@@ -911,11 +911,11 @@ fn truncate_string(mut value: String, max_len: usize) -> String {
 #[cfg(all(test, feature = "swarm"))]
 mod tests {
     use super::*;
-    use crate::service::NodeService;
+    use crate::services::node::Node;
 
     const NODE: &str = "hellas.swarm.v1.Node";
     const GET_NODE_INFO: RequestKind =
-        RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
+        RequestKind::for_method::<crate::services::node::GetNodeInfo>();
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
@@ -961,8 +961,8 @@ mod tests {
         assert_eq!(entry.transport_security, TransportSecurity::Authenticated);
         assert_eq!(entry.auth_level, AuthLevel::Authenticated);
         assert!(entry.has_service(NODE));
-        assert!(entry.has_service_key::<NodeService>());
-        assert!(entry.service::<NodeService>().is_some());
+        assert!(entry.has_service_key::<Node>());
+        assert!(entry.service::<Node>().is_some());
     }
 
     #[test]
@@ -993,7 +993,7 @@ mod tests {
 
         let entry = registry.get(id).expect("peer should exist");
         assert!(entry.has_service(NODE));
-        assert_eq!(registry.with_service_key::<NodeService>().count(), 1);
+        assert_eq!(registry.with_service_key::<Node>().count(), 1);
     }
 
     #[test]

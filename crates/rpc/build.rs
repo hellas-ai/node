@@ -1,10 +1,33 @@
+//! Build script for `hellas-rpc`.
+//!
+//! Pipeline:
+//!
+//! 1. Parse all `.proto` files at the workspace `proto/` root with `protox`
+//!    (pure-Rust, no `protoc` dependency).
+//! 2. Walk the resulting `FileDescriptorSet` to build an in-memory schema
+//!    table and to derive per-method 32-bit IDs via
+//!    `hellas_wire::MethodSchema::method_id()`.
+//! 3. Hand the same `FileDescriptorSet` to `prost-build::Config::compile_fds`
+//!    to emit the prost message types, and install a custom service
+//!    generator (`HellasGenerator`) that emits typed service / method
+//!    markers and client/server traits speaking the `hellas_wire` API.
+//!
+//! All output goes to `OUT_DIR`. The library `include!()`s the per-package
+//! files from `src/pb/`.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use hellas_wire::schema::PrimKind;
+use prost_build::{Method, Service, ServiceGenerator};
+use prost_types::field_descriptor_proto::{Label, Type as FieldType};
+use prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet};
+
 fn main() {
     emit_git_rev();
-
-    #[cfg(feature = "compile")]
-    compile::regenerate(std::path::Path::new(
-        &std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
-    ));
+    regenerate();
 }
 
 fn emit_git_rev() {
@@ -25,546 +48,807 @@ fn emit_git_rev() {
     println!("cargo:rerun-if-changed=../../.git/refs");
 }
 
-#[cfg(feature = "compile")]
-mod compile {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+// =============================================================================
+// Pipeline
+// =============================================================================
 
-    use proc_macro2::TokenStream;
-    use quote::{ToTokens, format_ident, quote};
+fn regenerate() {
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+    );
+    let proto_root = manifest_dir.join("../../proto");
+    let mut protos = Vec::new();
+    collect_proto_files(&proto_root.join("hellas"), &mut protos);
+    protos.sort();
 
-    /// One captured service, decoupled from `prost_build::Service` so the
-    /// rendering code stays pure.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct RpcService {
-        package: String,
-        name: String,
-        methods: Vec<RpcMethod>,
+    for proto in &protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct RpcMethod {
-        service: String,
-        name: String,
-        /// Already-resolved Rust path (`::hellas_pb::swarm::...`). prost-build
-        /// rewrites these via `Config::extern_path` before our generator runs.
-        request: String,
-        response: String,
-        request_stream: bool,
-        response_stream: bool,
+    // 1. Parse with protox.
+    let fds: FileDescriptorSet = protox::compile(&protos, &[&proto_root])
+        .expect("protox failed to parse hellas .proto files");
+
+    // 2. Build a schema table so we can resolve `.package.Name` references
+    //    into `MessageSchema` (or `EnumRef`) and derive method IDs.
+    let schema_index = SchemaIndex::build(&fds);
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+
+    // 3. Run prost-build with our custom generator. Generated message files
+    //    land directly in OUT_DIR; per-package service-marker / trait code
+    //    is emitted to OUT_DIR/hellas_rpc_services.rs by the generator.
+    let services: Arc<Mutex<Vec<RpcService>>> = Arc::new(Mutex::new(Vec::new()));
+    let generator = HellasGenerator {
+        services: services.clone(),
+    };
+
+    let mut config = prost_build::Config::new();
+    // Zero-copy bytes everywhere — every proto-side `bytes` field becomes
+    // `bytes::Bytes` in the generated Rust type.
+    config.bytes(["."]);
+    config.out_dir(&out_dir);
+    config.service_generator(Box::new(generator));
+
+    // prost-build needs a Clone-able copy because we also walked the same
+    // FDS for schema indexing.
+    config
+        .compile_fds(fds.clone())
+        .expect("prost-build failed to emit message types");
+
+    // 4. Render and write the service / marker / client / server modules,
+    //    keyed off the collected `RpcService` list and the schema index.
+    let services_snapshot = services
+        .lock()
+        .expect("service collector mutex poisoned")
+        .clone();
+
+    let body = render_generated(&services_snapshot, &schema_index);
+    let out_path = out_dir.join("hellas_rpc_services.rs");
+    fs::write(&out_path, body).expect("failed to write hellas_rpc_services.rs");
+}
+
+fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_proto_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "proto") {
+            out.push(path);
+        }
     }
+}
 
-    pub fn regenerate(manifest_dir: &Path) {
-        // Imports inside .proto files name siblings like `hellas/v1/hellas.proto`,
-        // so the include root protoc walks must be `proto/`, not `proto/hellas/`.
-        let proto_includes = manifest_dir.join("../../proto");
-        let proto_search = proto_includes.join("hellas");
-        let mut protos = Vec::new();
-        collect_proto_files(&proto_search, &mut protos);
-        protos.sort();
+// =============================================================================
+// Service collection
+// =============================================================================
 
-        for proto in &protos {
-            println!("cargo:rerun-if-changed={}", proto.display());
-        }
+/// Mirror of `prost_build::Service` decoupled from the generator lifetime so
+/// the rendering code can run after `compile_fds` returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcService {
+    /// `hellas.courtesy.v1`.
+    package: String,
+    /// `Courtesy`.
+    proto_name: String,
+    methods: Vec<RpcMethod>,
+}
 
-        // The Arc<Mutex> is just plumbing — prost-build runs its generator
-        // single-threaded, but we need to recover the collected services
-        // after `compile_protos` returns.
-        let services: Arc<Mutex<Vec<RpcService>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut config = prost_build::Config::new();
-        for (proto_pkg, rust_path) in pb_module_table() {
-            config.extern_path(format!(".{proto_pkg}"), *rust_path);
-        }
-        config.service_generator(Box::new(RpcServiceCollector {
-            services: services.clone(),
-        }));
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcMethod {
+    /// `QuotePrompt` (as it appears in the .proto).
+    proto_name: String,
+    /// Rust path of the request type (`super::QuotePromptRequest`, post-prost rewrites).
+    request_rust_type: String,
+    /// Rust path of the response type.
+    response_rust_type: String,
+    /// Fully-qualified proto request type, e.g. `.hellas.courtesy.v1.QuotePromptRequest`.
+    request_proto_type: String,
+    /// Fully-qualified proto response type, e.g. `.hellas.courtesy.v1.QuotePromptResponse`.
+    response_proto_type: String,
+    request_streaming: bool,
+    response_streaming: bool,
+}
 
-        // prost-build always emits per-package message files. We ignore them
-        // (hellas-pb owns the message types) and steer the output to a
-        // sentinel subdir of OUT_DIR that nothing `include!`s.
-        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
-        let discard_dir = out_dir.join("prost-discard");
-        fs::create_dir_all(&discard_dir).expect("failed to create prost-discard dir");
-        config.out_dir(&discard_dir);
+struct HellasGenerator {
+    services: Arc<Mutex<Vec<RpcService>>>,
+}
 
-        config
-            .compile_protos(&protos, &[proto_includes])
-            .expect("prost-build failed to parse hellas .proto files");
-
-        // prost-build keeps the boxed generator alive past compile_protos, so
-        // unwrap is out — just clone the collected list out of the mutex.
-        let services = services
+impl ServiceGenerator for HellasGenerator {
+    fn generate(&mut self, service: Service, _buf: &mut String) {
+        let methods = service
+            .methods
+            .iter()
+            .map(|m: &Method| RpcMethod {
+                proto_name: m.proto_name.clone(),
+                request_rust_type: m.input_type.clone(),
+                response_rust_type: m.output_type.clone(),
+                request_proto_type: ensure_dotted(&m.input_proto_type),
+                response_proto_type: ensure_dotted(&m.output_proto_type),
+                request_streaming: m.client_streaming,
+                response_streaming: m.server_streaming,
+            })
+            .collect();
+        self.services
             .lock()
-            .expect("service collector mutex poisoned")
-            .clone();
-
-        let service_markers = render_service_markers(&services);
-        let client_traits = render_client_traits(&services);
-
-        let generated_dir = manifest_dir.join("src/generated");
-        fs::create_dir_all(&generated_dir).expect("failed to create src/generated");
-        fs::write(generated_dir.join("service_markers.rs"), service_markers)
-            .expect("failed to write src/generated/service_markers.rs");
-        fs::write(generated_dir.join("client_traits.rs"), client_traits)
-            .expect("failed to write src/generated/client_traits.rs");
-    }
-
-    fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_proto_files(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "proto") {
-                out.push(path);
-            }
-        }
-    }
-
-    /// Bridges prost-build's `ServiceGenerator` callback to our `Vec<RpcService>`.
-    /// We deliberately leave `buf` untouched so prost-build's per-package files
-    /// only contain the discarded message types — nothing to mix-and-match.
-    struct RpcServiceCollector {
-        services: Arc<Mutex<Vec<RpcService>>>,
-    }
-
-    impl prost_build::ServiceGenerator for RpcServiceCollector {
-        fn generate(&mut self, service: prost_build::Service, buf: &mut String) {
-            // prost-build deletes per-package modules whose buffer is empty
-            // after code generation, then later iterates the package list to
-            // call `finalize_package`. The lookup panics for the deleted
-            // entry. Since we extern_path every hellas package, the message
-            // side never emits anything, so we must write *something* to
-            // `buf` to keep the module alive long enough for prost-build's
-            // own bookkeeping to complete. A comment line is the smallest
-            // safe payload.
-            buf.push_str("// captured by hellas-rpc/build.rs RpcServiceCollector\n");
-
-            let methods = service
-                .methods
-                .iter()
-                .map(|method| RpcMethod {
-                    service: service.proto_name.clone(),
-                    name: method.proto_name.clone(),
-                    request: method.input_type.clone(),
-                    response: method.output_type.clone(),
-                    request_stream: method.client_streaming,
-                    response_stream: method.server_streaming,
-                })
-                .collect();
-            self.services
-                .lock()
-                .expect("service vec poisoned")
-                .push(RpcService {
-                    package: service.package.clone(),
-                    name: service.proto_name.clone(),
-                    methods,
-                });
-        }
-    }
-
-    fn render_service_markers(services: &[RpcService]) -> String {
-        let method_counts = method_counts(services);
-
-        let service_marker_impls = services.iter().map(|service| {
-            let service_ident = format_ident!("{}Service", service.name);
-            let service_name = format!("{}.{}", service.package, service.name);
-            let alpn = format!("/{service_name}/1.0");
-            let feature = feature_for_package(&service.package);
-            // The iroh ALPN lives on `IrohServiceSpec` (a feature-gated trait
-            // companion to the transport-independent `RpcService`), so the
-            // codegen emits two impls per service when the iroh transport
-            // feature is on.
-            quote! {
-                #[cfg(feature = #feature)]
-                pub struct #service_ident;
-
-                #[cfg(feature = #feature)]
-                impl RpcService for #service_ident {
-                    const NAME: &'static str = #service_name;
-                }
-
-                #[cfg(all(
-                    feature = #feature,
-                    any(feature = "iroh-client", feature = "iroh-server"),
-                ))]
-                impl crate::peers::IrohServiceSpec for #service_ident {
-                    const ALPN: &'static str = #alpn;
-                }
-
-                #[cfg(feature = #feature)]
-                impl tonic::server::NamedService for #service_ident {
-                    const NAME: &'static str = <Self as RpcService>::NAME;
-                }
-            }
-        });
-
-        let method_module_imports = services.iter().map(|service| {
-            let feature = feature_for_package(&service.package);
-            let service_ident = format_ident!("{}Service", service.name);
-            quote! {
-                #[cfg(feature = #feature)]
-                use super::#service_ident;
-            }
-        });
-
-        let mut method_marker_impls: Vec<TokenStream> = Vec::new();
-        for service in services {
-            let feature = feature_for_package(&service.package);
-            let service_ident = format_ident!("{}Service", service.name);
-            let service_name = format!("{}.{}", service.package, service.name);
-            for method in &service.methods {
-                let method_ident_tok = format_ident!("{}", method_ident(method, &method_counts));
-                let request_ty: syn::Type =
-                    syn::parse_str(&method.request).expect("request type parses as Rust");
-                let response_ty: syn::Type =
-                    syn::parse_str(&method.response).expect("response type parses as Rust");
-                let method_name = &method.name;
-                let grpc_path = format!("/{service_name}/{method_name}");
-                let request_streaming = method.request_stream;
-                let response_streaming = method.response_stream;
-                // Core marker carries only Service + NAME; gRPC wire details
-                // (path, prost types, streaming flags) live on the
-                // `GrpcMethodSpec` companion trait. This split keeps the core
-                // marker codec-independent for future non-gRPC transports.
-                method_marker_impls.push(quote! {
-                    #[cfg(feature = #feature)]
-                    pub struct #method_ident_tok;
-
-                    #[cfg(feature = #feature)]
-                    impl RpcMethod for #method_ident_tok {
-                        type Service = #service_ident;
-                        const NAME: &'static str = #method_name;
-                    }
-
-                    #[cfg(feature = #feature)]
-                    impl crate::peers::GrpcMethodSpec for #method_ident_tok {
-                        type Request = #request_ty;
-                        type Response = #response_ty;
-                        const GRPC_PATH: &'static str = #grpc_path;
-                        const REQUEST_STREAMING: bool = #request_streaming;
-                        const RESPONSE_STREAMING: bool = #response_streaming;
-                    }
-                });
-            }
-        }
-
-        // RpcServiceSpec impls — the only string-keyed dispatch in the system.
-        // Each service emits one match arm per method so the inbound admission
-        // layer can translate a gRPC path into a typed RequestKind without any
-        // call site ever spelling a method name as a string.
-        let mut spec_impls: Vec<TokenStream> = Vec::new();
-        for service in services {
-            let service_ident = format_ident!("{}Service", service.name);
-            let feature = feature_for_package(&service.package);
-            let mut arms: Vec<TokenStream> = Vec::new();
-            for method in &service.methods {
-                let method_ident_tok = format_ident!("{}", method_ident(method, &method_counts));
-                let constructor = if is_rate_limited(&service.package, &service.name, &method.name)
-                {
-                    format_ident!("rate_limited_method")
-                } else {
-                    format_ident!("account_method")
-                };
-                arms.push(quote! {
-                    <methods::#method_ident_tok as crate::peers::GrpcMethodSpec>::GRPC_PATH
-                        => Some(crate::peers::InboundRequestPolicy::#constructor::<methods::#method_ident_tok>()),
-                });
-            }
-            spec_impls.push(quote! {
-                #[cfg(feature = #feature)]
-                impl crate::peers::RpcServiceSpec for #service_ident {
-                    fn inbound_policy(path: &str) -> Option<crate::peers::InboundRequestPolicy> {
-                        match path {
-                            #(#arms)*
-                            _ => None,
-                        }
-                    }
-                }
+            .expect("service vec poisoned")
+            .push(RpcService {
+                package: service.package.clone(),
+                proto_name: service.proto_name.clone(),
+                methods,
             });
-        }
+    }
+}
 
-        // Single source of truth: every service and every rate-limited
-        // method known to the protocol, regardless of which features are
-        // compiled in. Lets transport-layer code (e.g.
-        // `PeerDirectory::default_service_aliases`) discover the universe
-        // of services without redeclaring it.
-        let known_service_entries: Vec<TokenStream> = services
+fn ensure_dotted(name: &str) -> String {
+    if name.starts_with('.') {
+        name.to_string()
+    } else {
+        format!(".{name}")
+    }
+}
+
+// =============================================================================
+// Schema index — walks the FileDescriptorSet to resolve message refs.
+// =============================================================================
+
+/// Owns the in-memory representation of every proto message and enum the
+/// build script sees. The keys are fully-qualified names with a leading
+/// dot (matching how prost reports `input_proto_type`).
+struct SchemaIndex {
+    messages: HashMap<String, IndexedMessage>,
+    enums: HashMap<String, IndexedEnum>,
+}
+
+#[derive(Clone, Debug)]
+struct IndexedMessage {
+    /// Short proto name (`QuotePromptRequest`).
+    short_name: String,
+    fields: Vec<IndexedField>,
+}
+
+#[derive(Clone, Debug)]
+struct IndexedField {
+    number: u32,
+    label: Label,
+    ty: IndexedFieldType,
+}
+
+#[derive(Clone, Debug)]
+enum IndexedFieldType {
+    Primitive(PrimKind),
+    Message(String), // FQN with leading dot
+    Enum(String),    // FQN with leading dot
+}
+
+#[derive(Clone, Debug)]
+struct IndexedEnum {
+    short_name: String,
+    variants: Vec<(String, i32)>,
+}
+
+impl SchemaIndex {
+    fn build(fds: &FileDescriptorSet) -> Self {
+        let mut messages = HashMap::new();
+        let mut enums = HashMap::new();
+        for file in &fds.file {
+            let package = file.package.as_deref().unwrap_or("");
+            for msg in &file.message_type {
+                Self::index_message(package, "", msg, &mut messages, &mut enums);
+            }
+            for en in &file.enum_type {
+                Self::index_enum(package, "", en, &mut enums);
+            }
+        }
+        Self { messages, enums }
+    }
+
+    fn index_message(
+        package: &str,
+        parent_path: &str,
+        msg: &DescriptorProto,
+        messages: &mut HashMap<String, IndexedMessage>,
+        enums: &mut HashMap<String, IndexedEnum>,
+    ) {
+        let short = msg.name.as_deref().unwrap_or_default();
+        let fqn = compose_fqn(package, parent_path, short);
+        let nested_path = if parent_path.is_empty() {
+            short.to_string()
+        } else {
+            format!("{parent_path}.{short}")
+        };
+        let fields = msg
+            .field
             .iter()
-            .map(|service| {
-                let service_name = format!("{}.{}", service.package, service.name);
-                let alpn = format!("/{service_name}/1.0");
-                quote! {
-                    KnownService {
-                        name: #service_name,
-                        alpn: #alpn,
-                    }
-                }
+            .map(|f: &FieldDescriptorProto| IndexedField {
+                number: f.number.unwrap_or_default() as u32,
+                label: f
+                    .label
+                    .and_then(|v| Label::try_from(v).ok())
+                    .unwrap_or(Label::Optional),
+                ty: classify_field(f),
             })
             .collect();
+        messages.insert(
+            fqn.clone(),
+            IndexedMessage {
+                short_name: short.to_string(),
+                fields,
+            },
+        );
+        for nested in &msg.nested_type {
+            Self::index_message(package, &nested_path, nested, messages, enums);
+        }
+        for nested_en in &msg.enum_type {
+            Self::index_enum(package, &nested_path, nested_en, enums);
+        }
+    }
 
-        let rate_limited_entries: Vec<TokenStream> = services
+    fn index_enum(
+        package: &str,
+        parent_path: &str,
+        en: &EnumDescriptorProto,
+        enums: &mut HashMap<String, IndexedEnum>,
+    ) {
+        let short = en.name.as_deref().unwrap_or_default();
+        let fqn = compose_fqn(package, parent_path, short);
+        let variants = en
+            .value
             .iter()
-            .flat_map(|service| {
-                let service_name = format!("{}.{}", service.package, service.name);
-                service.methods.iter().filter_map(move |method| {
-                    if is_rate_limited(&service.package, &service.name, &method.name) {
-                        let path = format!("/{service_name}/{}", method.name);
-                        Some(quote! { #path })
-                    } else {
-                        None
-                    }
-                })
+            .map(|v| {
+                (
+                    v.name.clone().unwrap_or_default(),
+                    v.number.unwrap_or_default(),
+                )
             })
             .collect();
+        enums.insert(
+            fqn,
+            IndexedEnum {
+                short_name: short.to_string(),
+                variants,
+            },
+        );
+    }
 
-        let tokens = quote! {
-            #[allow(unused_imports)]
-            use crate::peers::RpcService;
+    /// Resolve a fully-qualified type reference (e.g. `.hellas.v1.Ticket`)
+    /// into a `MessageSchema` recursively, owning all referenced strings.
+    fn message_schema(&self, fqn: &str) -> OwnedMessageSchema {
+        let msg = self
+            .messages
+            .get(fqn)
+            .unwrap_or_else(|| panic!("missing message in schema index: {fqn}"));
+        let mut visiting: Vec<String> = Vec::new();
+        self.message_schema_inner(fqn, msg, &mut visiting)
+    }
 
-            /// A protocol-level service entry — its FQN and the iroh ALPN
-            /// derived from it. Emitted for every `.proto` service the
-            /// build script saw, regardless of whether the matching feature
-            /// flag is enabled in this build.
-            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-            pub struct KnownService {
-                pub name: &'static str,
-                pub alpn: &'static str,
+    fn message_schema_inner(
+        &self,
+        fqn: &str,
+        msg: &IndexedMessage,
+        visiting: &mut Vec<String>,
+    ) -> OwnedMessageSchema {
+        // Self-referential / mutually-recursive messages would diverge
+        // here. We rely on the proto layer to keep service-facing trees
+        // acyclic for now; emit a panic if violated so it surfaces
+        // immediately rather than blowing the stack.
+        if visiting.contains(&fqn.to_string()) {
+            panic!("cyclic message schema at {fqn}; method-id derivation requires acyclic trees");
+        }
+        visiting.push(fqn.to_string());
+        let fields = msg
+            .fields
+            .iter()
+            .map(|f| OwnedFieldSchema {
+                number: f.number,
+                ty: self.field_schema(&f.ty, f.label, visiting),
+            })
+            .collect();
+        visiting.pop();
+        OwnedMessageSchema {
+            name: msg.short_name.clone(),
+            fields,
+        }
+    }
+
+    fn field_schema(
+        &self,
+        ty: &IndexedFieldType,
+        label: Label,
+        visiting: &mut Vec<String>,
+    ) -> OwnedTypeSchema {
+        let base = match ty {
+            IndexedFieldType::Primitive(p) => OwnedTypeSchema::Primitive(*p),
+            IndexedFieldType::Message(fqn) => {
+                let msg = self
+                    .messages
+                    .get(fqn)
+                    .unwrap_or_else(|| panic!("missing message in schema index: {fqn}"));
+                OwnedTypeSchema::Message(self.message_schema_inner(fqn, msg, visiting))
             }
-
-            /// Catalogue of every service this crate knows about. The
-            /// transport layer (peer-disclosure filters, ALPN registry,
-            /// etc.) iterates this to avoid hardcoding service identities
-            /// in multiple places.
-            pub const KNOWN_SERVICES: &[KnownService] = &[
-                #(#known_service_entries,)*
-            ];
-
-            /// gRPC paths of every method marked rate-limited at codegen
-            /// time. The `RpcServiceSpec::inbound_policy` match arms use the
-            /// same source-of-truth (the `is_rate_limited` table in
-            /// build.rs); this list lets runtime callers inspect the policy
-            /// without having to fabricate `InboundRequestPolicy` values.
-            pub const KNOWN_RATE_LIMITED_METHODS: &[&'static str] = &[
-                #(#rate_limited_entries,)*
-            ];
-
-            #(#service_marker_impls)*
-
-            pub mod methods {
-                #[allow(unused_imports)]
-                use crate::peers::RpcMethod;
-
-                #(#method_module_imports)*
-
-                #(#method_marker_impls)*
+            IndexedFieldType::Enum(fqn) => {
+                let en = self
+                    .enums
+                    .get(fqn)
+                    .unwrap_or_else(|| panic!("missing enum in schema index: {fqn}"));
+                OwnedTypeSchema::EnumRef {
+                    name: en.short_name.clone(),
+                    variants: en.variants.clone(),
+                }
             }
-
-            #(#spec_impls)*
         };
-
-        prepend_generated_header(format_tokens(tokens))
-    }
-
-    /// Per-method opt-in to *enforcement* (per-peer + global rate limit, deny
-    /// when over). The default is `account_only` — observe but never reject.
-    ///
-    /// Methods that commit server-side resources on first call (quotes,
-    /// writes, expensive streams) are rate-limited so a single peer can't
-    /// flood admission. Methods that are cheap reads / observability stay
-    /// account-only — they get tracked but not rejected. RunTicket is
-    /// rate-limited even though the executor queue is the primary gate;
-    /// belt-and-braces against admission flooding.
-    fn is_rate_limited(package: &str, service: &str, method: &str) -> bool {
-        matches!(
-            (package, service, method),
-            // Peer-disclosure flood gate.
-            ("hellas.swarm.v1", "Node", "GetKnownPeers")
-            // Execute: ticket processing commits compute.
-            | ("hellas.v1", "Execute", "RunTicket")
-            // Quote endpoints: server commits to staging work.
-            | ("hellas.opaque.v1", "Opaque", "CreateTicket")
-            | ("hellas.symbolic.v1", "Symbolic", "CreateTicket")
-            | ("hellas.courtesy.v1", "Courtesy", "QuotePreparedText")
-            | ("hellas.courtesy.v1", "Courtesy", "QuotePrompt")
-            | ("hellas.courtesy.v1", "Courtesy", "QuoteChatPrompt")
-            // Writes: storage flooding.
-            | ("hellas.courtesy.v1", "Courtesy", "PutArtifact")
-            // Bidi-stream opens are expensive even if individual frames are
-            // small.
-            | ("hellas.courtesy.v1", "Courtesy", "DecodeTokens")
-        )
-    }
-
-    fn feature_for_package(package: &str) -> &'static str {
-        match package {
-            "hellas.v1" => "execute",
-            "hellas.courtesy.v1" => "courtesy",
-            "hellas.opaque.v1" => "opaque",
-            "hellas.swarm.v1" => "swarm",
-            "hellas.symbolic.v1" => "symbolic",
-            _ => panic!("no rpc-crate feature defined for protobuf package {package}"),
+        match label {
+            Label::Repeated => OwnedTypeSchema::Repeated(Box::new(base)),
+            _ => base,
         }
     }
+}
 
-    /// Per-service extension trait + `impl <Trait> for IrohPeerHandle`.
-    fn render_client_traits(services: &[RpcService]) -> String {
-        let method_counts = method_counts(services);
+fn compose_fqn(package: &str, parent_path: &str, short: &str) -> String {
+    let mut out = String::with_capacity(package.len() + parent_path.len() + short.len() + 3);
+    out.push('.');
+    if !package.is_empty() {
+        out.push_str(package);
+        out.push('.');
+    }
+    if !parent_path.is_empty() {
+        out.push_str(parent_path);
+        out.push('.');
+    }
+    out.push_str(short);
+    out
+}
 
-        let service_blocks = services.iter().map(|service| {
-            let trait_name = format_ident!("{}Client", service.name);
-            let feature = feature_for_package(&service.package);
+fn classify_field(f: &FieldDescriptorProto) -> IndexedFieldType {
+    let ty = f
+        .r#type
+        .and_then(|v| FieldType::try_from(v).ok())
+        .expect("field has a type");
+    match ty {
+        FieldType::Double => IndexedFieldType::Primitive(PrimKind::Double),
+        FieldType::Float => IndexedFieldType::Primitive(PrimKind::Float),
+        FieldType::Int64 => IndexedFieldType::Primitive(PrimKind::I64),
+        FieldType::Uint64 => IndexedFieldType::Primitive(PrimKind::U64),
+        FieldType::Int32 => IndexedFieldType::Primitive(PrimKind::I32),
+        FieldType::Fixed64 => IndexedFieldType::Primitive(PrimKind::Fixed64),
+        FieldType::Fixed32 => IndexedFieldType::Primitive(PrimKind::Fixed32),
+        FieldType::Bool => IndexedFieldType::Primitive(PrimKind::Bool),
+        FieldType::String => IndexedFieldType::Primitive(PrimKind::String),
+        FieldType::Bytes => IndexedFieldType::Primitive(PrimKind::Bytes),
+        FieldType::Uint32 => IndexedFieldType::Primitive(PrimKind::U32),
+        FieldType::Sfixed32 => IndexedFieldType::Primitive(PrimKind::Sfixed32),
+        FieldType::Sfixed64 => IndexedFieldType::Primitive(PrimKind::Sfixed64),
+        FieldType::Sint32 => IndexedFieldType::Primitive(PrimKind::Sint32),
+        FieldType::Sint64 => IndexedFieldType::Primitive(PrimKind::Sint64),
+        FieldType::Enum => IndexedFieldType::Enum(
+            f.type_name
+                .clone()
+                .expect("enum field carries a type_name"),
+        ),
+        FieldType::Message | FieldType::Group => IndexedFieldType::Message(
+            f.type_name
+                .clone()
+                .expect("message field carries a type_name"),
+        ),
+    }
+}
 
-            let trait_methods = service
-                .methods
-                .iter()
-                .map(|method| client_trait_method(method, &method_counts));
-            let impl_methods = service
-                .methods
-                .iter()
-                .map(|method| client_impl_method(method, &method_counts));
+// =============================================================================
+// Owned schema mirror (heap-backed; `MethodSchema<'a>` only borrows from
+// these for the duration of the digest computation).
+// =============================================================================
 
-            quote! {
-                #[cfg(all(feature = #feature, feature = "iroh-client"))]
-                pub trait #trait_name {
-                    #(#trait_methods)*
-                }
+struct OwnedMethodSchema {
+    fqn: String,
+    request: OwnedTypeSchema,
+    response: OwnedTypeSchema,
+    request_streaming: bool,
+    response_streaming: bool,
+}
 
-                #[cfg(all(feature = #feature, feature = "iroh-client"))]
-                impl #trait_name for crate::peers::IrohPeerHandle {
-                    #(#impl_methods)*
-                }
+#[derive(Clone)]
+struct OwnedMessageSchema {
+    name: String,
+    fields: Vec<OwnedFieldSchema>,
+}
+
+#[derive(Clone)]
+struct OwnedFieldSchema {
+    number: u32,
+    ty: OwnedTypeSchema,
+}
+
+#[derive(Clone)]
+enum OwnedTypeSchema {
+    Primitive(PrimKind),
+    Message(OwnedMessageSchema),
+    EnumRef {
+        name: String,
+        variants: Vec<(String, i32)>,
+    },
+    Repeated(Box<OwnedTypeSchema>),
+}
+
+impl OwnedMethodSchema {
+    fn method_id(&self) -> u32 {
+        // Encode directly to a blake3::Hasher in the same byte order as
+        // `hellas_wire::schema::MethodSchema::encode_to`. Sidesteps the
+        // self-referential lifetime gymnastics of building borrowed
+        // `MethodSchema<'a>` values.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(hellas_wire::schema::METHOD_DOMAIN);
+        encode_str(&self.fqn, &mut hasher);
+        encode_owned_type(&self.request, &mut hasher);
+        encode_owned_type(&self.response, &mut hasher);
+        hasher.update(&[u8::from(self.request_streaming)]);
+        hasher.update(&[u8::from(self.response_streaming)]);
+        let d = *hasher.finalize().as_bytes();
+        u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+    }
+}
+
+fn encode_str(s: &str, hasher: &mut blake3::Hasher) {
+    let len = u32::try_from(s.len()).expect("str length fits u32");
+    hasher.update(&len.to_be_bytes());
+    hasher.update(s.as_bytes());
+}
+
+fn encode_owned_type(ty: &OwnedTypeSchema, hasher: &mut blake3::Hasher) {
+    match ty {
+        OwnedTypeSchema::Primitive(p) => {
+            hasher.update(&[0]);
+            hasher.update(&[*p as u8]);
+        }
+        OwnedTypeSchema::Message(msg) => {
+            hasher.update(&[1]);
+            encode_str(&msg.name, hasher);
+            let len = u32::try_from(msg.fields.len()).expect("fields fit u32");
+            hasher.update(&len.to_be_bytes());
+            for f in &msg.fields {
+                hasher.update(&f.number.to_be_bytes());
+                encode_owned_type(&f.ty, hasher);
             }
-        });
-
-        let tokens = quote! {
-            #(#service_blocks)*
-        };
-
-        prepend_generated_header(format_tokens(tokens))
-    }
-
-    fn client_trait_method(
-        method: &RpcMethod,
-        method_counts: &HashMap<String, usize>,
-    ) -> TokenStream {
-        let fn_name = format_ident!("{}", to_snake_case(&method.name));
-        let request_arg = client_request_arg(method);
-        let call_ty = call_type_for(method, method_counts);
-        quote! {
-            fn #fn_name(&self, request: #request_arg) -> #call_ty;
         }
-    }
-
-    fn client_impl_method(
-        method: &RpcMethod,
-        method_counts: &HashMap<String, usize>,
-    ) -> TokenStream {
-        let fn_name = format_ident!("{}", to_snake_case(&method.name));
-        let request_arg = client_request_arg(method);
-        let call_ty = call_type_for(method, method_counts);
-        let call_prefix = format_ident!("{}", call_prefix(method));
-        let marker_ident = format_ident!("{}", method_ident(method, method_counts));
-        quote! {
-            fn #fn_name(&self, request: #request_arg) -> #call_ty {
-                crate::call::#call_prefix::<crate::service::methods::#marker_ident>::new(self.clone(), request)
+        OwnedTypeSchema::EnumRef { name, variants } => {
+            hasher.update(&[2]);
+            encode_str(name, hasher);
+            let len = u32::try_from(variants.len()).expect("variants fit u32");
+            hasher.update(&len.to_be_bytes());
+            for (n, v) in variants {
+                encode_str(n, hasher);
+                hasher.update(&v.to_be_bytes());
             }
         }
+        OwnedTypeSchema::Repeated(inner) => {
+            hasher.update(&[3]);
+            encode_owned_type(inner, hasher);
+        }
+    }
+}
+
+// =============================================================================
+// Code generation
+// =============================================================================
+
+fn render_generated(services: &[RpcService], index: &SchemaIndex) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "// @generated by `hellas-rpc` build.rs. Do not edit by hand.\n\
+         //\n\
+         // Service / method markers, typed client traits, and server\n\
+         // dispatcher stubs. The wrapping module sets allow-lints.\n\n",
+    );
+
+    // The generated file is included from `src/pb/services.rs`. Every type
+    // reference is rooted at the corresponding `crate::pb::<package>` module
+    // (see `package_rust_path`). The pb modules in turn `include!()` the
+    // prost-generated `<package>.rs` files from OUT_DIR.
+
+    // Inventory: every service and every rate-limited method, regardless of
+    // feature gating. Transport-layer code iterates these without
+    // re-declaring service names.
+    out.push_str("/// A protocol-level service entry — its FQN and the wire ALPN.\n");
+    out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
+    out.push_str("pub struct KnownService {\n    pub name: &'static str,\n    pub alpn: &'static str,\n}\n\n");
+
+    out.push_str("/// Catalogue of every service this crate knows about.\n");
+    out.push_str("pub const KNOWN_SERVICES: &[KnownService] = &[\n");
+    for service in services {
+        let fqn = format!("{}.{}", service.package, service.proto_name);
+        let alpn = format!("/{fqn}/1.0");
+        out.push_str(&format!(
+            "    KnownService {{ name: {:?}, alpn: {:?} }},\n",
+            fqn, alpn
+        ));
+    }
+    out.push_str("];\n\n");
+
+    // Method ID table (string → u32). Used by inbound dispatch to
+    // translate legacy gRPC paths during the migration. Kept independently
+    // of the cfg-gated marker impls so callers always see the full table.
+    out.push_str("/// All method IDs known at codegen time, keyed by `service_fqn/method_name`.\n");
+    out.push_str("pub const KNOWN_METHOD_IDS: &[(&'static str, u32)] = &[\n");
+    for service in services {
+        let fqn = format!("{}.{}", service.package, service.proto_name);
+        for method in &service.methods {
+            let method_fqn = format!("{fqn}.{}", method.proto_name);
+            let owned = build_method_schema(&fqn, method, index);
+            let id = owned.method_id();
+            out.push_str(&format!(
+                "    ({:?}, 0x{:08x}),\n",
+                format!("/{fqn}/{}", method.proto_name),
+                id
+            ));
+            // Suppress unused-variable warning for symmetry.
+            let _ = method_fqn;
+        }
+    }
+    out.push_str("];\n\n");
+
+    for service in services {
+        render_service_block(&mut out, service, index);
     }
 
-    fn client_request_arg(method: &RpcMethod) -> TokenStream {
-        let request_ty: syn::Type =
-            syn::parse_str(&method.request).expect("request type parses as Rust");
-        if method.request_stream {
-            quote! { impl tonic::IntoStreamingRequest<Message = #request_ty> }
+    out
+}
+
+fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIndex) {
+    let feature = feature_for_package(&service.package);
+    let fqn = format!("{}.{}", service.package, service.proto_name);
+    let alpn = format!("/{fqn}/1.0");
+    let module_name = service_module_ident(&service.proto_name);
+
+    // Service ID (low-32 of blake3 of canonicalized ServiceSchema).
+    let service_id = compute_service_id(&fqn, service, index);
+
+    out.push_str(&format!(
+        "#[cfg(feature = \"{feature}\")]\npub mod {module_name} {{\n"
+    ));
+    out.push_str("    use ::hellas_wire::{MethodMarker, ServiceMarker};\n\n");
+
+    // -- Service marker --
+    out.push_str(&format!("    pub struct {};\n\n", service.proto_name));
+    out.push_str(&format!(
+        "    impl ServiceMarker for {} {{\n\
+        \x20       const NAME: &'static str = {:?};\n\
+        \x20       const ALPN: &'static str = {:?};\n\
+        \x20       const SERVICE_ID: u32 = 0x{:08x};\n\
+        \x20   }}\n\n",
+        service.proto_name, fqn, alpn, service_id
+    ));
+
+    // -- Method markers --
+    for method in &service.methods {
+        let method_name = &method.proto_name;
+        let owned = build_method_schema(&fqn, method, index);
+        let method_id = owned.method_id();
+        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
+        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
+        out.push_str(&format!("    pub struct {method_name};\n\n"));
+        out.push_str(&format!(
+            "    impl MethodMarker for {method_name} {{\n\
+            \x20       type Service = {service};\n\
+            \x20       type Request = {request_ty};\n\
+            \x20       type Response = {response_ty};\n\
+            \x20       const NAME: &'static str = {name:?};\n\
+            \x20       const METHOD_ID: u32 = 0x{id:08x};\n\
+            \x20       const REQUEST_STREAMING: bool = {req_stream};\n\
+            \x20       const RESPONSE_STREAMING: bool = {resp_stream};\n\
+            \x20   }}\n\n",
+            service = service.proto_name,
+            request_ty = request_ty,
+            response_ty = response_ty,
+            name = method_name,
+            id = method_id,
+            req_stream = method.request_streaming,
+            resp_stream = method.response_streaming,
+        ));
+    }
+
+    // -- Client trait --
+    let client_trait = format!("{}Client", service.proto_name);
+    out.push_str(&format!(
+        "    /// Typed client trait — one method per RPC. Wraps the\n\
+        \x20   /// underlying `StreamTransport` with prost encode/decode.\n\
+        \x20   ///\n\
+        \x20   /// TODO(hellas-wire v2): the method bodies currently `unimplemented!()`\n\
+        \x20   /// — the consumer migration phase fills them in.\n\
+        \x20   pub trait {client_trait}<T: ::hellas_wire::StreamTransport> {{\n",
+        client_trait = client_trait,
+    ));
+    for method in &service.methods {
+        let fn_name = to_snake_case(&method.proto_name);
+        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
+        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
+        let (sig_req, sig_resp) = client_signature(method, &request_ty, &response_ty);
+        out.push_str(&format!(
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::TransportError>> + Send;\n",
+        ));
+    }
+    out.push_str("    }\n\n");
+
+    // -- Server trait --
+    let server_trait = format!("{}Handler", service.proto_name);
+    out.push_str(&format!(
+        "    /// Server-side handler trait. Concrete servers implement\n\
+        \x20   /// this; the generated `{server}Server` dispatcher routes inbound\n\
+        \x20   /// frames to the matching handler.\n\
+        \x20   pub trait {server_trait}: Send + Sync + 'static {{\n",
+        server = service.proto_name,
+        server_trait = server_trait,
+    ));
+    for method in &service.methods {
+        let fn_name = to_snake_case(&method.proto_name);
+        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
+        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
+        let (sig_req, sig_resp) = server_signature(method, &request_ty, &response_ty);
+        out.push_str(&format!(
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::TransportError>> + Send;\n",
+        ));
+    }
+    out.push_str("    }\n\n");
+
+    // -- Server dispatcher (stub) --
+    out.push_str(&format!(
+        "    /// Wraps a `{server_trait}` and routes inbound streams to it.\n\
+        \x20   ///\n\
+        \x20   /// TODO(hellas-wire v2): dispatch is currently a stub; the\n\
+        \x20   /// consumer migration phase fills in the decode → handler →\n\
+        \x20   /// encode → trailer pipeline.\n\
+        \x20   pub struct {service}Server<H>(pub H);\n\n\
+        \x20   impl<T, H> ::hellas_wire::Dispatcher<T> for {service}Server<H>\n\
+        \x20   where\n\
+        \x20       T: ::hellas_wire::StreamTransport + Send + Sync,\n\
+        \x20       H: {server_trait},\n\
+        \x20   {{\n\
+        \x20       type Error = ::hellas_wire::TransportError;\n\n\
+        \x20       async fn dispatch(\n\
+        \x20           &self,\n\
+        \x20           inbound: ::hellas_wire::Inbound<T::Stream>,\n\
+        \x20       ) -> ::core::result::Result<(), Self::Error> {{\n\
+        \x20           let _ = (&self.0, inbound);\n\
+        \x20           unimplemented!(\"{service}Server::dispatch — wire v2 pipeline pending\");\n\
+        \x20       }}\n\
+        \x20   }}\n\n",
+        service = service.proto_name,
+        server_trait = server_trait,
+    ));
+
+    out.push_str("}\n\n");
+}
+
+fn build_method_schema(
+    service_fqn: &str,
+    method: &RpcMethod,
+    index: &SchemaIndex,
+) -> OwnedMethodSchema {
+    let request_msg = index.message_schema(&method.request_proto_type);
+    let response_msg = index.message_schema(&method.response_proto_type);
+    OwnedMethodSchema {
+        fqn: format!("{service_fqn}.{}", method.proto_name),
+        request: OwnedTypeSchema::Message(request_msg),
+        response: OwnedTypeSchema::Message(response_msg),
+        request_streaming: method.request_streaming,
+        response_streaming: method.response_streaming,
+    }
+}
+
+fn compute_service_id(fqn: &str, service: &RpcService, index: &SchemaIndex) -> u32 {
+    let methods: Vec<OwnedMethodSchema> = service
+        .methods
+        .iter()
+        .map(|m| build_method_schema(fqn, m, index))
+        .collect();
+
+    // Encode the ServiceSchema canonical form directly to a blake3
+    // hasher, mirroring `hellas_wire::schema::ServiceSchema::encode_to`.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(hellas_wire::schema::SERVICE_DOMAIN);
+    encode_str(fqn, &mut hasher);
+    let len = u32::try_from(methods.len()).expect("methods fit u32");
+    hasher.update(&len.to_be_bytes());
+    for m in &methods {
+        encode_str(&m.fqn, &mut hasher);
+        encode_owned_type(&m.request, &mut hasher);
+        encode_owned_type(&m.response, &mut hasher);
+        hasher.update(&[u8::from(m.request_streaming)]);
+        hasher.update(&[u8::from(m.response_streaming)]);
+    }
+    let d = *hasher.finalize().as_bytes();
+    u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+}
+
+fn client_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, String) {
+    let req_sig = if method.request_streaming {
+        format!("impl ::futures_core::Stream<Item = {req}> + Send + Unpin")
+    } else {
+        req.to_string()
+    };
+    let resp_sig = if method.response_streaming {
+        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::TransportError>> + Send>>")
+    } else {
+        resp.to_string()
+    };
+    (req_sig, resp_sig)
+}
+
+fn server_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, String) {
+    let req_sig = if method.request_streaming {
+        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = {req}> + Send>>")
+    } else {
+        req.to_string()
+    };
+    let resp_sig = if method.response_streaming {
+        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::TransportError>> + Send>>")
+    } else {
+        resp.to_string()
+    };
+    (req_sig, resp_sig)
+}
+
+fn service_module_ident(proto_name: &str) -> String {
+    to_snake_case(proto_name)
+}
+
+fn feature_for_package(package: &str) -> &'static str {
+    match package {
+        "hellas.v1" => "execute",
+        "hellas.courtesy.v1" => "courtesy",
+        "hellas.opaque.v1" => "opaque",
+        "hellas.swarm.v1" => "swarm",
+        "hellas.symbolic.v1" => "symbolic",
+        _ => panic!("no rpc-crate feature defined for protobuf package {package}"),
+    }
+}
+
+fn to_snake_case(input: &str) -> String {
+    let mut output = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in input.chars() {
+        if ch.is_ascii_uppercase() {
+            if prev_lower_or_digit {
+                output.push('_');
+            }
+            output.push(ch.to_ascii_lowercase());
+            prev_lower_or_digit = false;
         } else {
-            quote! { impl tonic::IntoRequest<#request_ty> }
+            output.push(ch);
+            prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
         }
     }
+    output
+}
 
-    fn call_type_for(method: &RpcMethod, method_counts: &HashMap<String, usize>) -> TokenStream {
-        let prefix = format_ident!("{}", call_prefix(method));
-        let marker_ident = format_ident!("{}", method_ident(method, method_counts));
-        quote! { crate::call::#prefix<crate::service::methods::#marker_ident> }
+/// Translate a fully-qualified proto type (e.g. `.hellas.swarm.v1.GetNodeInfoResponse`)
+/// into an absolute Rust path under `crate::pb::hellas::...`. Prost's
+/// `input_type` field is *relative* to the per-package module it generated,
+/// so it isn't usable from the centralized `pb::services` module without
+/// rewriting.
+///
+/// Nested message types (`.pkg.Parent.Child`) come through as Parent.child
+/// in proto naming — translated as `parent::Child` in Rust by prost's own
+/// scheme. We don't currently have nested message types in any hellas
+/// .proto, so a flat translation is enough; if that ever changes, extend
+/// the lowercase rule below.
+fn proto_fqn_to_rust_path(proto_fqn: &str) -> String {
+    // Strip leading dot.
+    let stripped = proto_fqn.strip_prefix('.').unwrap_or(proto_fqn);
+    // Split into segments. The last segment is the type name (PascalCase);
+    // every preceding segment is a module (snake_case in the .proto, which
+    // already lowercase).
+    let mut segments: Vec<&str> = stripped.split('.').collect();
+    let type_name = segments
+        .pop()
+        .expect("proto fqn has at least one segment");
+    let mut path = String::from("crate::pb");
+    for seg in segments {
+        path.push_str("::");
+        path.push_str(seg);
     }
-
-    fn call_prefix(method: &RpcMethod) -> &'static str {
-        match (method.request_stream, method.response_stream) {
-            (false, false) => "UnaryCall",
-            (false, true) => "ServerStreamingCall",
-            (true, false) => "ClientStreamingCall",
-            (true, true) => "BidiStreamingCall",
-        }
-    }
-
-    fn format_tokens(tokens: TokenStream) -> String {
-        let file: syn::File = syn::parse2(tokens.clone()).unwrap_or_else(|err| {
-            panic!(
-                "generated tokens do not parse as a Rust file: {err}\n\n--- tokens ---\n{}\n",
-                tokens.to_token_stream()
-            )
-        });
-        prettyplease::unparse(&file)
-    }
-
-    fn prepend_generated_header(body: String) -> String {
-        format!(
-            "// @generated by `cargo build -p hellas-rpc --features compile`. \
-             Do not edit by hand.\n\n{body}"
-        )
-    }
-
-    fn method_counts(services: &[RpcService]) -> HashMap<String, usize> {
-        let mut counts = HashMap::new();
-        for service in services {
-            for method in &service.methods {
-                *counts.entry(method.name.clone()).or_insert(0) += 1;
-            }
-        }
-        counts
-    }
-
-    fn method_ident(method: &RpcMethod, method_counts: &HashMap<String, usize>) -> String {
-        if method_counts.get(&method.name).copied().unwrap_or(0) > 1 {
-            format!("{}{}", method.service, method.name)
-        } else {
-            method.name.clone()
-        }
-    }
-
-    /// Maps each hellas protobuf package to the Rust module path inside
-    /// `hellas-pb` that owns its generated message types. `prost-build`'s
-    /// `extern_path` consumes these so emitted method markers point straight
-    /// at the pre-existing `hellas_pb::*` types instead of being re-generated.
-    fn pb_module_table() -> &'static [(&'static str, &'static str)] {
-        &[
-            ("hellas.v1", "::hellas_pb::hellas"),
-            ("hellas.swarm.v1", "::hellas_pb::swarm"),
-            ("hellas.courtesy.v1", "::hellas_pb::courtesy"),
-            ("hellas.opaque.v1", "::hellas_pb::opaque"),
-            ("hellas.symbolic.v1", "::hellas_pb::symbolic"),
-        ]
-    }
-
-    fn to_snake_case(input: &str) -> String {
-        let mut output = String::new();
-        let mut prev_lower_or_digit = false;
-        for ch in input.chars() {
-            if ch.is_ascii_uppercase() {
-                if prev_lower_or_digit {
-                    output.push('_');
-                }
-                output.push(ch.to_ascii_lowercase());
-                prev_lower_or_digit = false;
-            } else {
-                output.push(ch);
-                prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-            }
-        }
-        output
-    }
+    path.push_str("::");
+    path.push_str(type_name);
+    path
 }

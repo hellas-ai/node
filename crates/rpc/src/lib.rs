@@ -17,28 +17,17 @@ pub mod policy;
 
 pub mod provenance;
 
-/// Protobuf-generated message types. Doc-hidden; consumers use the
-/// re-exports from per-service modules (`client::courtesy`,
-/// `client::swarm`, etc.).
+/// Protobuf-generated message types plus per-service typed client traits,
+/// method markers, and server dispatcher stubs. The bare `pb` module is
+/// doc-hidden; downstream consumers should reach for the per-service
+/// re-exports under `pb::{courtesy, swarm, execute, opaque, symbolic}` or
+/// the per-service marker/trait modules under `pb::services::*`.
 #[doc(hidden)]
 pub mod pb;
 
-/// Generated per-service typed clients and dispatchers.
-///
-/// Each service has a marker type, method markers, and a typed client
-/// trait + server dispatcher. Generic over any `T: StreamTransport`
-/// from `hellas_wire`.
-pub mod client {
-    include!(concat!(env!("OUT_DIR"), "/clients.rs"));
-}
-
-pub mod server {
-    include!(concat!(env!("OUT_DIR"), "/servers.rs"));
-}
-
-pub mod service {
-    include!(concat!(env!("OUT_DIR"), "/service_markers.rs"));
-}
+/// Convenience re-export — same as `pb::services`, surfaced at the crate
+/// root because that's where downstream code expects service markers.
+pub use crate::pb::services;
 
 #[cfg(feature = "node")]
 pub use error::ExecutorError;

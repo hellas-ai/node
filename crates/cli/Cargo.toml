@@ -63,10 +63,7 @@ hellas-pb = { workspace = true, features = [
 ] }
 hellas-rpc = { workspace = true, default-features = false, features = [
   "node",
-  "compression",
   "discovery",
-  "iroh-client",
-  "iroh-server",
 ] }
 iroh-metrics = { version = "0.38", default-features = false, features = [
   "metrics",

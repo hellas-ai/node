@@ -33,8 +33,8 @@ fn default_service_aliases() -> Vec<ServiceAlias> {
     // directory's view of "what services exist" stays in sync with codegen.
     // Each service contributes two aliases: one keyed by ALPN and one keyed
     // by FQN, both pointing at the FQN as the canonical service name.
-    let mut aliases = Vec::with_capacity(crate::service::KNOWN_SERVICES.len() * 2);
-    for entry in crate::service::KNOWN_SERVICES {
+    let mut aliases = Vec::with_capacity(crate::services::KNOWN_SERVICES.len() * 2);
+    for entry in crate::services::KNOWN_SERVICES {
         aliases.push(ServiceAlias::new(entry.alpn, entry.name));
         aliases.push(ServiceAlias::new(entry.name, entry.name));
     }
@@ -421,19 +421,18 @@ fn bounded_penalty(count: u64, weight: i64) -> i64 {
 #[cfg(all(test, feature = "swarm", feature = "execute"))]
 mod tests {
     use super::*;
-    use crate::peers::IrohServiceSpec;
-    use crate::service::{ExecuteService, NodeService};
+    use crate::services::execute::Execute as ExecuteService;
+    use crate::services::node::Node as NodeService;
+    use hellas_wire::ServiceMarker;
 
     const GET_NODE_INFO: RequestKind =
-        RequestKind::for_method::<crate::service::methods::GetNodeInfo>();
+        RequestKind::for_method::<crate::services::node::GetNodeInfo>();
     const GET_KNOWN_PEERS: RequestKind =
-        RequestKind::for_method::<crate::service::methods::GetKnownPeers>();
+        RequestKind::for_method::<crate::services::node::GetKnownPeers>();
 
-    // Test-local aliases for the well-known ALPNs. Kept here so the tests
-    // don't depend on hand-written constants in this module — the actual
-    // service catalogue is the build-script-generated `KNOWN_SERVICES`.
-    const NODE_SERVICE_ALPN: &str = <NodeService as IrohServiceSpec>::ALPN;
-    const EXECUTE_SERVICE_ALPN: &str = <ExecuteService as IrohServiceSpec>::ALPN;
+    // Test-local aliases for the well-known ALPNs.
+    const NODE_SERVICE_ALPN: &str = <NodeService as ServiceMarker>::ALPN;
+    const EXECUTE_SERVICE_ALPN: &str = <ExecuteService as ServiceMarker>::ALPN;
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])

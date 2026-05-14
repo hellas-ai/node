@@ -2,9 +2,9 @@
 
 Generated protobuf bindings for Hellas.
 
-The source `.proto` files live under `../../proto/hellas`. Generated Rust files
-are checked in under `src/` so normal builds do not need `protoc`, `buf`, or the
-protobuf compiler toolchain.
+By convention, the source `.proto` files live in the repo root, 
+under `proto/hellas`.
+Generated Rust files are checked in under `src/` so normal builds do not need `protoc`, `buf`, or the protobuf compiler toolchain.
 
 ## Features
 

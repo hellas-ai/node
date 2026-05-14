@@ -1,115 +1,89 @@
-//! Generated protobuf bindings for the Hellas protocol.
+//! Protobuf bindings for the Hellas protocol.
 //!
-//! The source `.proto` files live under `proto/hellas` at the workspace root.
+//! Per-package message types are generated into `OUT_DIR` by the build
+//! script (`prost-build` driven by `protox`). Each `.proto` package gets a
+//! Rust module here with the matching nesting (`hellas::v1`,
+//! `hellas::courtesy::v1`, …) so prost's `super::super::v1::Ticket`-style
+//! cross-package references resolve.
+//!
+//! Service/method markers, typed client traits, and the server dispatcher
+//! stubs live in [`services`].
 
-mod generated {
-    pub mod hellas {
-        #[cfg(feature = "courtesy")]
-        #[allow(dead_code)]
-        pub mod courtesy {
-            pub mod v1 {
-                include!("hellas.courtesy.v1.rs");
-            }
-        }
+#[doc(hidden)]
+pub mod hellas {
+    #[cfg(feature = "execute")]
+    #[allow(dead_code)]
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/hellas.v1.rs"));
+    }
 
-        #[cfg(feature = "hellas")]
-        #[allow(dead_code)]
+    #[cfg(feature = "courtesy")]
+    #[allow(dead_code)]
+    pub mod courtesy {
         pub mod v1 {
-            include!("hellas.v1.rs");
+            include!(concat!(env!("OUT_DIR"), "/hellas.courtesy.v1.rs"));
         }
+    }
 
-        #[cfg(feature = "opaque")]
-        #[allow(dead_code)]
-        pub mod opaque {
-            pub mod v1 {
-                include!("hellas.opaque.v1.rs");
-            }
+    #[cfg(feature = "opaque")]
+    #[allow(dead_code)]
+    pub mod opaque {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.opaque.v1.rs"));
         }
+    }
 
-        #[cfg(feature = "swarm")]
-        #[allow(dead_code)]
-        pub mod swarm {
-            pub mod v1 {
-                include!("hellas.swarm.v1.rs");
-            }
+    #[cfg(feature = "swarm")]
+    #[allow(dead_code)]
+    pub mod swarm {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.swarm.v1.rs"));
         }
+    }
 
-        #[cfg(feature = "symbolic")]
-        #[allow(dead_code)]
-        pub mod symbolic {
-            pub mod v1 {
-                include!("hellas.symbolic.v1.rs");
-            }
+    #[cfg(feature = "symbolic")]
+    #[allow(dead_code)]
+    pub mod symbolic {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.symbolic.v1.rs"));
         }
     }
 }
 
-#[allow(unused_macros)]
-macro_rules! service_exports {
-    ($($path:ident)::+, $client:ident, $server:ident) => {
-        #[cfg(feature = "client")]
-        pub use $($path)::+::$client;
-        #[cfg(feature = "server")]
-        pub use $($path)::+::$server;
-    };
+/// Re-exports of the Hellas core execution types (`hellas.v1`).
+#[cfg(feature = "execute")]
+pub mod execute {
+    pub use crate::pb::hellas::v1::*;
 }
 
-#[cfg(feature = "hellas")]
-pub mod hellas {
-    pub use crate::generated::hellas::v1::{
-        FinishStatus, ReceiptEnvelope, RunTicketRequest, Ticket, WorkChunk, WorkEvent, WorkFailed,
-        WorkFinished, work_event,
-    };
-    service_exports!(crate::generated::hellas::v1, execute_client, execute_server);
-}
-
+/// Re-exports of `hellas.symbolic.v1`.
 #[cfg(feature = "symbolic")]
 pub mod symbolic {
-    pub use crate::generated::hellas::symbolic::v1::SymbolicRequest;
-    service_exports!(
-        crate::generated::hellas::symbolic::v1,
-        symbolic_client,
-        symbolic_server
-    );
+    pub use crate::pb::hellas::symbolic::v1::*;
 }
 
+/// Re-exports of `hellas.opaque.v1`.
 #[cfg(feature = "opaque")]
 pub mod opaque {
-    pub use crate::generated::hellas::opaque::v1::OpaqueRequest;
-    service_exports!(
-        crate::generated::hellas::opaque::v1,
-        opaque_client,
-        opaque_server
-    );
+    pub use crate::pb::hellas::opaque::v1::*;
 }
 
+/// Re-exports of `hellas.courtesy.v1`.
 #[cfg(feature = "courtesy")]
 pub mod courtesy {
-    pub use crate::generated::hellas::courtesy::v1::{
-        ChatMessage, DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest,
-        GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest,
-        GetStatsResponse, ListModelsRequest, ListModelsResponse, ModelInfo, ModelStatus,
-        ModelTokenStats, PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest,
-        QuoteChatPromptResponse, QuotePreparedTextRequest, QuotePreparedTextResponse,
-        QuotePromptRequest, QuotePromptResponse, SymbolicArtifactStart, SymbolicGenesisStart,
-        SymbolicStart, TokenStats, symbolic_start,
-    };
-    service_exports!(
-        crate::generated::hellas::courtesy::v1,
-        courtesy_client,
-        courtesy_server
-    );
+    pub use crate::pb::hellas::courtesy::v1::*;
 }
 
+/// Re-exports of `hellas.swarm.v1`.
 #[cfg(feature = "swarm")]
 pub mod swarm {
-    pub use crate::generated::hellas::swarm::v1::{
-        GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
-        Presence,
-    };
-    service_exports!(
-        crate::generated::hellas::swarm::v1,
-        node_client,
-        node_server
-    );
+    pub use crate::pb::hellas::swarm::v1::*;
+}
+
+/// Service / method markers, typed client traits, and server dispatcher
+/// stubs. Emitted by `build.rs`. Each block is `#[cfg(feature = "<pkg>")]`-
+/// gated so unused services don't compile.
+#[allow(unused_imports, dead_code, clippy::all)]
+pub mod services {
+    include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));
 }

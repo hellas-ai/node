@@ -464,7 +464,7 @@ pub(super) fn duration_ms(duration: Duration) -> f64 {
 #[cfg(all(test, feature = "swarm"))]
 mod tests {
     use super::*;
-    use crate::service::NodeService;
+    use crate::services::node::Node;
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
@@ -490,7 +490,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RequestKind::for_method::<crate::services::node::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -506,7 +506,7 @@ mod tests {
         let registry = manager.snapshot().expect("registry should be readable");
         let entry = registry.get(id).expect("peer should exist");
         assert_eq!(entry.transport_security, TransportSecurity::Authenticated);
-        assert!(entry.has_service_key::<NodeService>());
+        assert!(entry.has_service_key::<Node>());
         assert_eq!(entry.in_flight, 0);
         assert_eq!(registry.total_in_flight(), 0);
     }
@@ -519,7 +519,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RequestKind::for_method::<crate::services::node::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -528,7 +528,7 @@ mod tests {
         let registry = manager.snapshot().expect("registry should be readable");
         let entry = registry.get(id).expect("peer should exist");
         assert_eq!(entry.transport_security, TransportSecurity::Untrusted);
-        assert!(!entry.has_service_key::<NodeService>());
+        assert!(!entry.has_service_key::<Node>());
         assert_eq!(entry.in_flight, 0);
         assert_eq!(entry.error_count, 1);
     }
@@ -541,7 +541,7 @@ mod tests {
         let permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RequestKind::for_method::<crate::services::node::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -558,10 +558,10 @@ mod tests {
     fn service_session_ties_method_to_service() {
         let manager = PeerManager::with_config(config());
         let id = peer(4);
-        let node = manager.peer(id).service::<NodeService>();
+        let node = manager.peer(id).service::<Node>();
 
         let mut permit = node
-            .acquire_method::<crate::service::methods::GetNodeInfo>(
+            .acquire_method::<crate::services::node::GetNodeInfo>(
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -571,7 +571,7 @@ mod tests {
             .state()
             .expect("registry should be readable")
             .expect("node service should be recorded");
-        assert_eq!(service.service, <NodeService as RpcService>::NAME);
+        assert_eq!(service.service, <Node as RpcService>::NAME);
         assert_eq!(service.success_count, 1);
     }
 
@@ -634,7 +634,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RequestKind::for_method::<crate::services::node::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -679,7 +679,7 @@ mod tests {
             .try_acquire(
                 0,
                 id,
-                RequestKind::for_method::<crate::service::methods::GetNodeInfo>(),
+                RequestKind::for_method::<crate::services::node::GetNodeInfo>(),
             )
             .expect("permit should be admitted");
         // Dropping without release should fire the debug tripwire.

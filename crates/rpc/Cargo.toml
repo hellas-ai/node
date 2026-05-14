@@ -11,64 +11,41 @@ documentation.workspace = true
 default = []
 
 # === Protocol modules ======================================================
-# Pick the protocols you want. Each pulls only its own hellas-pb feature, so
-# downstream binary size scales with the protocols you actually use.
-swarm    = ["hellas-pb/swarm"]
-courtesy = ["hellas-pb/courtesy"]
-execute  = ["hellas-pb/hellas"]   # `hellas.v1.Execute` service. Internal pb feature is named `hellas` for historical reasons.
-symbolic = ["hellas-pb/symbolic"]
-opaque   = ["hellas-pb/opaque"]
+# Each feature gates the codegen for one proto package. The codegen runs
+# unconditionally (no `compile` feature anymore), but generated items are
+# `#[cfg(feature = ...)]`-gated by package, so downstream binary size scales
+# with the protocols you actually use.
+# `execute` is the foundation — symbolic, opaque, and courtesy all reference
+# `hellas.v1.Ticket` and related types.
+execute  = []
+symbolic = ["execute"]
+opaque   = ["execute"]
+# Courtesy proto imports hellas.v1 (Ticket) and hellas.symbolic.v1
+# (SymbolicRequest), so the feature must pull both forward.
+courtesy = ["execute", "symbolic"]
+swarm    = []
 all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
 
-# === Transports ============================================================
-# Bare `iroh` brings the dep with no sub-features — useful when you only need
-# the `PeerId: From<EndpointId>` conversion. For real outbound/inbound RPC
-# you also enable `iroh-client` / `iroh-server`, which switch on the matching
-# sub-feature in `tonic-iroh-transport` and (for `iroh-client`) bring in the
-# typed call types' prost codec plus `hellas-pb`'s tonic-client stubs.
-iroh        = ["dep:tonic-iroh-transport"]
-iroh-client = [
-  "iroh",
-  "hellas-pb/client",
-  "dep:tonic-prost",
-  "tonic-iroh-transport/client",
-]
-iroh-server = ["iroh", "tonic-iroh-transport/server"]
-# websocket, uart, etc. — added when the transport adapters land.
-
-# === Server role ===========================================================
-# Tonic's server runtime + hellas-pb's per-service server stubs. Orthogonal
-# to protocol selection — combine with any subset of the protocol features.
-server = ["tonic/server", "hellas-pb/server"]
-
 # === Other knobs ===========================================================
-compression = ["tonic/gzip", "tonic/zstd"]
-# Opt-in: re-run codegen at build time. Mirrors `hellas-pb`'s policy — the
-# generated `service_markers.rs` / `client_traits.rs` are checked into
-# `src/generated/`, so downstream builds never need protoc. Enable this
-# feature in the devshell when changing proto files; commit the regenerated
-# files alongside the proto edit.
-compile = [
-  "dep:prost-build",
-  "dep:prettyplease",
-  "dep:proc-macro2",
-  "dep:quote",
-  "dep:syn",
-]
+# Server-side dispatcher stubs.
+server = []
 
-# Discovery (mDNS + DHT) is iroh-only today; keeps `iroh` as its transport
-# floor without pulling any protocol features.
-discovery = [
-  "iroh",
-  "dep:futures",
-  "dep:mainline",
-  "tonic-iroh-transport/discovery-mdns",
-  "tonic-iroh-transport/discovery-dht",
-]
+# Transport-layer compression knob. Currently a no-op — kept so consumers
+# can opt in for forward-compat. The wire layer will gain native compression
+# in a later milestone.
+compression = []
 
-# Binary-side bundle: server + every protocol + the executor / model deps a
-# `hellas-cli` / `hellas-executor` build needs. Not a "fat alias" — this is
-# the curated set of deps for the node binary itself.
+# Iroh transport binding (placeholder — actual wiring lives in `hellas-wire`
+# and consumer crates). Currently a no-op flag so downstream crates can
+# select it without breaking workspace resolution.
+iroh = []
+iroh-client = ["iroh"]
+iroh-server = ["iroh"]
+
+# Discovery (mDNS + DHT) — temporarily kept until peers/* migration lands.
+discovery = ["dep:futures", "dep:mainline"]
+
+# Binary-side bundle for the node binary (executor / model deps).
 node = [
   "server",
   "all-protocols",
@@ -88,6 +65,7 @@ tokenizers = { version = "0.21", features = [
 ], optional = true }
 
 [dependencies]
+bytes = "1"
 catgrad = { workspace = true, default-features = false, features = [
   "serde",
 ], optional = true }
@@ -95,7 +73,7 @@ catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
-hellas-pb.workspace = true
+hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
   "ureq",
 ], optional = true }
@@ -105,15 +83,12 @@ pin-project = "1"
 mainline = { version = "6", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-prost = { version = "0.14", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 thiserror = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = [
   "progressbar",
   "fancy-regex",
 ], optional = true }
-tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
-tonic-prost = { version = "0.14", default-features = false, optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 # `web-time` shims `std::time::Instant` / `SystemTime` so the peer registry's
@@ -122,11 +97,11 @@ tower-service = "0.3"
 web-time = "1"
 
 [build-dependencies]
-prettyplease = { version = "0.2", optional = true }
-proc-macro2 = { version = "1", optional = true }
-prost-build = { version = "0.14", optional = true }
-quote = { version = "1", optional = true }
-syn = { version = "2", features = ["full", "parsing"], optional = true }
+blake3 = { workspace = true }
+hellas-wire = { workspace = true, default-features = false }
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.9"
 
 [dev-dependencies]
 tokio.workspace = true
