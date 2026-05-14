@@ -318,6 +318,16 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
     clock: C,
     config: MuxConfig,
 ) -> Result<Multiplexer<N, C>, CfDoError> {
+    // Compile-time bound: pending_write must fit in the attachment
+    // budget. We cap at 16 KiB per the plan; the snapshot itself is
+    // bounded by N * sizeof(slot record) + this.
+    const PENDING_WRITE_MAX: usize = 16 * 1024;
+    // Free-mask word count must match what the in-memory representation
+    // would produce for this `N`. Caller-supplied N drives the
+    // expected word count; a mismatch means the snapshot was taken with
+    // a different mux size and is unsafe to restore.
+    let expected_words = (N + 63) / 64;
+
     let mut cur = Cursor::new(bytes);
 
     let magic = cur.take_u8()?;
@@ -329,23 +339,82 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
 
     // Reconstruct mux with default state, then overwrite.
     let mut mux = Multiplexer::<N, C>::new(role, clock, config);
+    let mux_config = *mux.config();
 
     let n_words = cur.take_u16()? as usize;
+    if n_words != expected_words {
+        return Err(CfDoError::SnapshotCorrupt("free_mask word count mismatch"));
+    }
     let mut words = Vec::with_capacity(n_words);
     for _ in 0..n_words {
         words.push(cur.take_u64()?);
     }
+    // The free_mask must only have bits set for slots of our parity.
+    // A poisoned snapshot that marks peer-parity slots "free" would
+    // let our allocator hand out slots in the peer's domain.
+    let peer_parity_mask: u64 = if role.parity() == 0 { 0xAAAA_AAAA_AAAA_AAAA } else { 0x5555_5555_5555_5555 };
+    for (word_idx, word) in words.iter().enumerate() {
+        if word & peer_parity_mask != 0 {
+            // Allow leniency on the LAST word: bits beyond N are masked off below.
+            let tail_bits_in_word = (word_idx + 1) * 64;
+            if tail_bits_in_word <= N || (word & peer_parity_mask) & ((1u64 << (N - word_idx * 64)) - 1) != 0 {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "free_mask sets a bit owned by peer parity",
+                ));
+            }
+        }
+    }
     mux.set_free_mask_words(&words);
 
     let (count, _) = cur.take_varint()?;
+    if count > N as u64 {
+        return Err(CfDoError::SnapshotCorrupt("occupied count exceeds N"));
+    }
+
+    // Track which slot indices we've seen so we can detect duplicates
+    // and cross-check against the free_mask.
+    let mut seen_slots = std::collections::HashSet::with_capacity(count as usize);
+
     for _ in 0..count {
         let idx = cur.take_u16()?;
+        if (idx as usize) >= N {
+            return Err(CfDoError::SnapshotCorrupt("slot idx out of range"));
+        }
+        if !seen_slots.insert(idx) {
+            return Err(CfDoError::SnapshotCorrupt("duplicate slot idx"));
+        }
+        // An occupied slot must NOT also be in the free_mask. If it is,
+        // someone fabricated a snapshot to hand the same slot out
+        // twice — first as "free" (so we'd allocate it) and second as
+        // "open" (so frames arriving on it dispatch to the planted
+        // state). We reject the snapshot rather than try to repair it.
+        let word = words[(idx / 64) as usize];
+        let bit = 1u64 << (idx % 64);
+        if word & bit != 0 {
+            return Err(CfDoError::SnapshotCorrupt(
+                "slot listed as occupied is also in free_mask",
+            ));
+        }
+
         let generation = cur.take_u16()?;
         let state = state_from_tag(cur.take_u8()?)?;
         let method_id = cur.take_u32()?;
         let peer_recv_credit = cur.take_u32()?;
         let local_recv_credit = cur.take_u32()?;
         let local_credit_high_water = cur.take_u32()?;
+        if local_recv_credit > local_credit_high_water {
+            return Err(CfDoError::SnapshotCorrupt(
+                "local_recv_credit > high_water",
+            ));
+        }
+        // Sanity: peer_recv_credit shouldn't exceed config's initial
+        // credit (the peer wouldn't have advertised more than they
+        // were ever willing to receive).
+        if peer_recv_credit > mux_config.initial_credit {
+            return Err(CfDoError::SnapshotCorrupt(
+                "peer_recv_credit > initial",
+            ));
+        }
         let opened_age_ns = cur.take_u64()?;
 
         let deadline_flag = cur.take_u8()?;
@@ -380,10 +449,25 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
         0 => mux.set_pending_write(None),
         1 => {
             let (len, _) = cur.take_varint()?;
-            let bytes = cur.take_bytes(len as usize)?;
+            let len = len as usize;
+            if len > PENDING_WRITE_MAX {
+                return Err(CfDoError::SnapshotCorrupt(
+                    "pending_write exceeds budget",
+                ));
+            }
+            let bytes = cur.take_bytes(len)?;
             mux.set_pending_write(Some(Bytes::copy_from_slice(bytes)));
         }
         _ => return Err(CfDoError::SnapshotCorrupt("bad has_pending flag")),
+    }
+
+    // Trailing-bytes check: the snapshot must be exactly the right
+    // length. Extra bytes mean someone appended a payload we don't
+    // know how to parse — reject.
+    if cur.pos != bytes.len() {
+        return Err(CfDoError::SnapshotCorrupt(
+            "trailing bytes after snapshot",
+        ));
     }
 
     Ok(mux)
@@ -499,5 +583,324 @@ mod tests {
             restored.pending_write_ref().is_some(),
             "pending_write should survive round-trip"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Adversarial / failure-mode tests for hibernation.
+    //
+    // The DO's attachment is peer-controllable in adversarial models
+    // (a compromised storage tier, a tampered re-serialize, a stale
+    // attachment from a different code version). Every code path that
+    // restores trusted state from the attachment must reject obvious
+    // tampering with `SnapshotCorrupt` rather than mis-attribute slots,
+    // hand out the same slot twice, or replay arbitrary bytes.
+    //
+    // These tests cover:
+    //   - drop-then-fresh-start (no snapshot path)
+    //   - worker dies mid-callback (partial write of attachment)
+    //   - magic-byte mismatch (version upgrade or bit flip)
+    //   - truncation at every byte offset
+    //   - inflated occupancy count
+    //   - parity violation (client claims to own odd slot)
+    //   - duplicate slot index
+    //   - free-mask vs occupied list contradiction
+    //   - credit > high_water
+    //   - pending_write claims absurd length
+    //   - trailing bytes appended past the snapshot
+    // ----------------------------------------------------------------
+
+    fn client_with_open_slot() -> (Multiplexer<32, DefaultClock>, Vec<u8>) {
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        mux.open(0xCAFEBABE, Metadata::new()).unwrap();
+        let bytes = serialize_mux(&mux);
+        (mux, bytes)
+    }
+
+    #[test]
+    fn drop_and_fresh_start_is_a_fresh_mux() {
+        // No snapshot path: caller never calls deserialize_mux, just
+        // constructs a new Multiplexer. This is the cache-eviction /
+        // version-upgrade / first-boot path; must work as if nothing
+        // ever existed.
+        let fresh: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        assert_eq!(fresh.role(), Role::Client);
+        assert!(fresh.pending_write_ref().is_none());
+        // No slots are occupied yet.
+        assert_eq!(fresh.iter_occupied_slots().count(), 0);
+    }
+
+    #[test]
+    fn worker_dies_mid_callback_partial_attachment() {
+        // Worker died after `mux.recv` but BEFORE
+        // `serialize_attachment` finished writing. The next callback
+        // sees a truncated attachment. Every prefix must reject.
+        let (_, full) = client_with_open_slot();
+        for prefix_len in 0..full.len() {
+            let truncated = &full[..prefix_len];
+            let res = deserialize_mux::<32, _>(
+                truncated,
+                DefaultClock,
+                MuxConfig::default(),
+            );
+            // Any prefix should hit SnapshotTooShort, SnapshotCorrupt,
+            // or one of the named tag errors. None should succeed.
+            assert!(
+                res.is_err(),
+                "truncation at byte {prefix_len} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn bit_flipped_magic_byte_rejected() {
+        let (_, mut bytes) = client_with_open_slot();
+        bytes[0] = bytes[0].wrapping_add(1);
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("bad magic must reject");
+        assert!(matches!(err, CfDoError::SnapshotCorrupt("bad magic")));
+    }
+
+    #[test]
+    fn future_magic_byte_rejected_with_named_error() {
+        // Version-upgrade scenario: a future DO writes a snapshot with
+        // a newer magic byte. The current code must NOT silently parse
+        // it as the legacy format.
+        let (_, mut bytes) = client_with_open_slot();
+        bytes[0] = 0xA2;
+        assert!(matches!(
+            deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default()),
+            Err(CfDoError::SnapshotCorrupt("bad magic"))
+        ));
+    }
+
+    #[test]
+    fn inflated_occupancy_count_rejected() {
+        // The count varint is one byte at position
+        //   1 (magic) + 1 (role) + 2 (n_words) + n_words*8 (words) = ...
+        // For N=32: n_words = 1, so count is at offset 1+1+2+8 = 12.
+        // We rewrite the count to claim 33 slots (> N).
+        let (_, mut bytes) = client_with_open_slot();
+        // Find the count varint position by re-encoding our way there.
+        let count_offset = 1 + 1 + 2 + 8;
+        bytes[count_offset] = 33; // single-byte varint
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("count > N must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("occupied count exceeds N")
+        ));
+    }
+
+    #[test]
+    fn duplicate_slot_index_rejected() {
+        // Open two slots, then craft a snapshot that lists slot 0
+        // twice (instead of slot 0 and slot 2).
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        mux.open(0x1, Metadata::new()).unwrap();
+        mux.open(0x2, Metadata::new()).unwrap();
+        let mut bytes = serialize_mux(&mux);
+        // Slot record stride: 2 (idx) + 2 (gen) + 1 (state) + 4 (mid)
+        //                   + 4 (peer_credit) + 4 (local_credit)
+        //                   + 4 (high_water) + 8 (opened_age)
+        //                   + 1 (deadline_flag) [+8 if Some]
+        //                   = 30 bytes, deadline=None case.
+        // First slot record starts at:
+        //   1 (magic) + 1 (role) + 2 (n_words) + 8 (one u64 word) + 1 (count varint)
+        //   = 13
+        let first_record_start = 13;
+        let second_record_start = first_record_start + 30; // each record is 30 bytes (no deadline)
+        // Overwrite the idx of the second record with the idx of the first (0).
+        bytes[second_record_start..second_record_start + 2].copy_from_slice(&0u16.to_le_bytes());
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("duplicate slot idx must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("duplicate slot idx")
+        ));
+    }
+
+    #[test]
+    fn slot_in_both_free_mask_and_occupied_list_rejected() {
+        // Client owns slot 0 (parity even). Open it, then poison the
+        // free_mask to ALSO claim slot 0 is free. A restored mux that
+        // accepted both would happily hand slot 0 to a new caller
+        // while the existing slot record is also live — same slot
+        // dispatched twice.
+        let (_, mut bytes) = client_with_open_slot();
+        // free_mask occupies offset 1+1+2 .. 1+1+2+8 = 4..12. Set bit 0
+        // (lowest of word 0) → slot 0 marked free.
+        bytes[4] |= 1;
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("slot occupied AND in free_mask must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("slot listed as occupied is also in free_mask")
+        ));
+    }
+
+    #[test]
+    fn peer_parity_in_our_free_mask_rejected() {
+        // Client role: we own even indices. A poisoned free_mask
+        // claiming an odd slot (1) is free would let our `open()`
+        // hand out a peer-domain slot.
+        let mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let mut bytes = serialize_mux(&mux);
+        // Mark slot 1 (odd, peer-owned) as free.
+        bytes[4] |= 0b10;
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("peer-parity slot in our free_mask must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("free_mask sets a bit owned by peer parity")
+        ));
+    }
+
+    #[test]
+    fn credit_exceeds_high_water_rejected() {
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        mux.open(0x1, Metadata::new()).unwrap();
+        let mut bytes = serialize_mux(&mux);
+        // local_recv_credit field is at offset:
+        //   13 (free_mask + count) + 2 (idx) + 2 (gen) + 1 (state)
+        //   + 4 (mid) + 4 (peer_credit) = 26
+        let local_credit_offset = 13 + 2 + 2 + 1 + 4 + 4;
+        // Overwrite local_recv_credit with 0xFFFF_FFFF.
+        bytes[local_credit_offset..local_credit_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("local_recv_credit > high_water must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("local_recv_credit > high_water")
+                | CfDoError::SnapshotCorrupt("peer_recv_credit > initial")
+        ));
+    }
+
+    #[test]
+    fn pending_write_oversized_rejected() {
+        // Construct a snapshot with has_pending=1 and a 1 MiB pending
+        // frame. The 16 KiB budget should reject.
+        let mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let mut bytes = serialize_mux(&mux);
+        // Replace the has_pending=0 trailer with has_pending=1 + 1 MiB.
+        // The has_pending byte is the LAST byte before any pending data.
+        // Find and overwrite.
+        assert_eq!(*bytes.last().unwrap(), 0); // pending=None
+        let last = bytes.len() - 1;
+        bytes[last] = 1;
+        let mut len_varint = Vec::new();
+        write_varint(1 * 1024 * 1024, &mut len_varint);
+        bytes.extend(len_varint);
+        // We don't even need the trailing bytes — the check fires on length.
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("oversized pending_write must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("pending_write exceeds budget")
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_appended_rejected() {
+        let (_, mut bytes) = client_with_open_slot();
+        bytes.extend_from_slice(b"\xde\xad\xbe\xef");
+        let err = deserialize_mux::<32, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("trailing bytes must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("trailing bytes after snapshot")
+        ));
+    }
+
+    #[test]
+    fn n_word_count_mismatch_rejected() {
+        // Snapshot was taken with N=64 (n_words=1, same as N=32). But
+        // if N=128 it'd be n_words=2. Test that the deserializer with
+        // a different N rejects mismatched counts.
+        // We serialize for N=32 (n_words=1) and try to deserialize
+        // into N=128 (expected n_words=2).
+        let mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        let bytes = serialize_mux(&mux);
+        let err = deserialize_mux::<128, _>(&bytes, DefaultClock, MuxConfig::default())
+            .err().expect("mismatched N must reject");
+        assert!(matches!(
+            err,
+            CfDoError::SnapshotCorrupt("free_mask word count mismatch")
+        ));
+    }
+
+    /// Property test: arbitrary byte strings must never cause panic,
+    /// silent state corruption, or OOM allocation. Either the bytes
+    /// happen to be a valid round-tripped snapshot (vanishingly
+    /// unlikely for random input), or `deserialize_mux` returns an
+    /// error.
+    #[test]
+    fn random_bytes_never_panic_or_oom() {
+        use proptest::prelude::*;
+        let mut runner = proptest::test_runner::TestRunner::default();
+        // 1000 random small byte buffers. Capping at 4 KiB keeps the
+        // test fast while still covering all the parser's
+        // narrow-path failure modes.
+        runner
+            .run(&proptest::collection::vec(any::<u8>(), 0..4096), |bytes| {
+                let res = deserialize_mux::<32, _>(
+                    &bytes,
+                    DefaultClock,
+                    MuxConfig::default(),
+                );
+                // Either err, or a valid restored mux. If valid, we
+                // re-serialize and round-trip again to catch any
+                // restore-then-reserialize divergence.
+                if let Ok(mux) = res {
+                    let again = serialize_mux(&mux);
+                    let _ = deserialize_mux::<32, _>(
+                        &again,
+                        DefaultClock,
+                        MuxConfig::default(),
+                    )
+                    .expect("re-deserialize of self-serialized snapshot");
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn generation_survives_round_trip() {
+        // Open + reset a slot N times so its generation rolls forward,
+        // then snapshot + restore. Generation must come back identical.
+        let mut mux: Multiplexer<32, _> =
+            Multiplexer::new(Role::Client, DefaultClock, MuxConfig::default());
+        for _ in 0..5 {
+            let s = mux.open(0x1, Metadata::new()).unwrap();
+            mux.reset(s, crate::WireCode::Cancelled);
+            // Drain so the slot returns to free.
+            while mux.next_outbound().is_some() {}
+        }
+        let s = mux.open(0x2, Metadata::new()).unwrap();
+        // Don't reset this one — leave it occupied for the snapshot.
+        let pre_gen = mux
+            .iter_occupied_slots()
+            .find(|(idx, _)| *idx == s)
+            .map(|(_, slot)| slot.generation)
+            .unwrap();
+        assert!(pre_gen > 0, "generation should have rolled forward");
+
+        let bytes = serialize_mux(&mux);
+        let restored: Multiplexer<32, _> =
+            deserialize_mux(&bytes, DefaultClock, MuxConfig::default()).unwrap();
+        let post_gen = restored
+            .iter_occupied_slots()
+            .find(|(idx, _)| *idx == s)
+            .map(|(_, slot)| slot.generation)
+            .unwrap();
+        assert_eq!(pre_gen, post_gen, "generation must round-trip");
     }
 }
