@@ -686,8 +686,17 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
         let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
         let (sig_req, sig_resp) = server_signature(method, &request_ty, &response_ty);
+        // For unary methods, allow the handler to return either the bare
+        // response type or `WithTrailer<R>` (which carries response-side
+        // metadata like provenance). For streaming methods, keep the
+        // stream-type return as-is.
+        let handler_resp = if !method.request_streaming && !method.response_streaming {
+            format!("impl Into<crate::call::WithTrailer<{sig_resp}>> + Send", sig_resp = sig_resp)
+        } else {
+            sig_resp.clone()
+        };
         out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::WireStatus>> + Send;\n",
+            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{handler_resp}, ::hellas_wire::WireStatus>> + Send;\n",
         ));
     }
     out.push_str("    }\n\n");
@@ -803,7 +812,7 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         let case_body = match (method.request_streaming, method.response_streaming) {
             (false, false) => format!(
                 "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
-                \x20                   crate::call::dispatch_unary::<T, {method_marker}, _, _>(inbound, |req| {{\n\
+                \x20                   crate::call::dispatch_unary::<T, {method_marker}, _, _, _>(inbound, |req| {{\n\
                 \x20                       let h = &self.0;\n\
                 \x20                       async move {{ h.{fn_name}(req).await }}\n\
                 \x20                   }}).await\n\

@@ -120,9 +120,37 @@ fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
     WireStatus::new(WireCode::Unavailable, err.to_string())
 }
 
+/// A successful unary response plus any trailer metadata the handler
+/// wants to emit (commitments, receipts, OTel span context, …).
+#[derive(Debug)]
+pub struct WithTrailer<R> {
+    pub response: R,
+    pub metadata: hellas_wire::Metadata,
+}
+
+impl<R> WithTrailer<R> {
+    pub fn new(response: R) -> Self {
+        Self {
+            response,
+            metadata: hellas_wire::Metadata::new(),
+        }
+    }
+
+    pub fn with_metadata(response: R, metadata: hellas_wire::Metadata) -> Self {
+        Self { response, metadata }
+    }
+}
+
+impl<R> From<R> for WithTrailer<R> {
+    fn from(response: R) -> Self {
+        Self::new(response)
+    }
+}
+
 /// Server-side helper: decode a single prost message off the recv stream,
-/// emit a single response, then close with an Ok trailer.
-pub async fn dispatch_unary<T, M, F, Fut>(
+/// emit a single response, then close with an Ok trailer (optionally
+/// carrying provenance/receipt metadata via `WithTrailer`).
+pub async fn dispatch_unary<T, M, F, Fut, RespOrTrailer>(
     inbound: hellas_wire::transport::Inbound<T::Stream>,
     handler: F,
 ) -> Result<(), TransportError>
@@ -132,7 +160,8 @@ where
     M::Request: Message + Default,
     M::Response: Message,
     F: FnOnce(M::Request) -> Fut + Send,
-    Fut: std::future::Future<Output = Result<M::Response, WireStatus>> + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
     let (mut send, recv) = WireStream::split(inbound.stream);
     let mut recv = Box::pin(recv);
@@ -145,7 +174,8 @@ where
         .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
     match handler(request).await {
-        Ok(response) => {
+        Ok(result) => {
+            let WithTrailer { response, metadata } = result.into();
             let mut buf = BytesMut::with_capacity(response.encoded_len());
             response
                 .encode(&mut buf)
@@ -153,7 +183,16 @@ where
             send.send_body(buf.freeze())
                 .await
                 .map_err(|e| TransportError::Io(format!("send: {e}")))?;
-            send.close_send(Some(Trailer::ok()))
+            let trailer = if metadata.is_empty() {
+                Trailer::ok()
+            } else {
+                Trailer {
+                    status: WireCode::Ok,
+                    message: smol_str::SmolStr::new_static(""),
+                    metadata,
+                }
+            };
+            send.close_send(Some(trailer))
                 .await
                 .map_err(|e| TransportError::Io(format!("close: {e}")))?;
         }

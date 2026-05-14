@@ -2625,6 +2625,7 @@ dependencies = [
  "protox",
  "serde",
  "serde_json",
+ "smol_str",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tokio",
