@@ -35,10 +35,10 @@ server = []
 # in a later milestone.
 compression = []
 
-# Iroh transport binding (placeholder — actual wiring lives in `hellas-wire`
-# and consumer crates). Currently a no-op flag so downstream crates can
-# select it without breaking workspace resolution.
-iroh = []
+# Iroh transport binding. Enables `From<iroh::EndpointId> for PeerId`
+# (peers/id.rs) so consumers can construct PeerIds from iroh's
+# EndpointId without a separate conversion helper.
+iroh = ["dep:iroh"]
 iroh-client = ["iroh"]
 iroh-server = ["iroh"]
 
@@ -74,6 +74,7 @@ chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+iroh = { workspace = true, optional = true }
 smol_str = "0.3"
 hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [

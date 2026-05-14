@@ -81,12 +81,31 @@ pub struct Multiplexer<const N: usize, C: Clock> {
     /// At most one outbound frame is "currently being shipped" to the
     /// wire. Application driver polls `next_outbound` to drain.
     pending_write: Option<Bytes>,
+    /// Slots whose local terminal frame has been emitted by
+    /// `next_outbound` but whose free has been deferred until the
+    /// caller has actually flushed the frame to the wire. We need
+    /// this because a transport that backpressures will call
+    /// `set_pending_write(Some(bytes))` to re-stash the terminal
+    /// frame; if we'd freed the slot eagerly, the snapshot would
+    /// contain a `pending_write` whose `(stream_id, generation)`
+    /// references a freed slot and restore would reject. Drained at
+    /// the top of `next_outbound` when `pending_write` is `None` —
+    /// at that point the caller has implicitly acked by asking for
+    /// the next frame.
+    pending_terminal_free: Vec<SlotIndex>,
     /// Round-robin pointer for scheduling outbound from slots.
     rr: u16,
     clock: C,
     config: MuxConfig,
 }
 
+// The mux is not `Sync`; the sans-io contract assumes exclusive
+// `&mut Multiplexer` access from a single driver (one CF DO
+// callback, one connection task, etc.). Sharing across concurrent
+// callbacks is undefined: stale `pending_terminal_free` reads, lost
+// pushes, and out-of-order `next_outbound` drains would all break
+// the snapshot invariants. Wrap in a `Mutex` if a transport ever
+// needs cross-task access.
 impl<const N: usize, C: Clock> Multiplexer<N, C> {
     pub fn new(role: Role, clock: C, config: MuxConfig) -> Self {
         let mut free_mask = vec![0u64; (N + 63) / 64];
@@ -103,6 +122,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             free_mask,
             role,
             pending_write: None,
+            pending_terminal_free: Vec::new(),
             rr: 0,
             clock,
             config,
@@ -155,6 +175,11 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
 
     /// Allocate a slot and queue an OPEN frame. Returns the slot index.
     pub fn open(&mut self, method_id: u32, headers: Metadata) -> Result<SlotIndex, MuxError> {
+        // Reclaim any slots whose local terminal frame has been
+        // emitted but not yet reaped. Without this, an `open()`
+        // call right after a `reset()`+`next_outbound()` cycle
+        // wouldn't see the just-closed slot as free.
+        self.drain_pending_terminal_free();
         let idx = self.lowest_free().ok_or(MuxError::AtCapacity)?;
         // Compute new generation from any prior occupant (we keep a
         // generation counter even when slot is Empty by carrying it forward
@@ -245,8 +270,9 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         };
         slot.local_terminal = true;
         slot.state = match slot.state {
-            SlotState::OpenLocal => SlotState::HalfClosedLocal,
-            SlotState::Open => SlotState::HalfClosedLocal,
+            SlotState::OpenLocal | SlotState::OpenRemote | SlotState::Open => {
+                SlotState::HalfClosedLocal
+            }
             SlotState::HalfClosedRemote => SlotState::Closed,
             other => other,
         };
@@ -304,7 +330,11 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             let Some(slot) = self.streams[idx].as_mut() else {
                 continue;
             };
-            if slot.is_closed() {
+            // Skip slots where the peer has already terminated sending:
+            // is_closed() (both directions terminal) OR peer_terminal
+            // alone (we're half-closed-remote — peer won't send more
+            // body, so additional credit is wasted bytes on the wire).
+            if slot.is_closed() || slot.peer_terminal {
                 continue;
             }
             // If a Credit frame is already queued for this slot, no-op.
@@ -338,6 +368,11 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         if let Some(pending) = self.pending_write.take() {
             return Some(pending);
         }
+        // Caller is asking for the next frame without re-stashing the
+        // previous one, so any terminal frame we emitted last call is
+        // now considered shipped. Free its slot before scanning so a
+        // newly-opened slot can reclaim the index.
+        self.drain_pending_terminal_free();
         let start = self.rr;
         for _ in 0..N {
             let idx = self.rr;
@@ -352,9 +387,22 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                     generation: slot.generation,
                 };
                 let was_terminal = matches!(frame, Frame::End(_) | Frame::Reset(_));
+                let queue_empty_after_pop = slot.send_queue.is_empty();
+                let both_terminal = slot.local_terminal && slot.peer_terminal;
                 let bytes = encode_keyed_frame(key, &frame);
-                if was_terminal {
-                    self.maybe_free_slot(idx);
+                // Queue idx for deferred free if EITHER:
+                //   (a) we just emitted a terminal frame — the
+                //       free-on-ship-ack contract applies.
+                //   (b) the slot is now both-terminal AND its
+                //       queue is empty AFTER this pop — the slot
+                //       has no more work to do; a non-terminal
+                //       frame (e.g. a Credit) just drained the
+                //       last buffered byte. Without this push the
+                //       slot would orphan: state=Closed, bit
+                //       clear, no path back to maybe_free_slot.
+                let needs_defer = was_terminal || (both_terminal && queue_empty_after_pop);
+                if needs_defer && !self.pending_terminal_free.contains(&idx) {
+                    self.pending_terminal_free.push(idx);
                 }
                 return Some(bytes);
             }
@@ -363,18 +411,73 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         None
     }
 
-    fn maybe_free_slot(&mut self, idx: SlotIndex) {
-        let Some(slot) = self.slot(idx) else { return };
-        if slot.peer_terminal && slot.local_terminal {
-            // Keep the generation counter by leaving the slot inhabited but
-            // mark it free for reuse and clear buffers.
-            if let Some(s) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut()) {
-                s.state = SlotState::Closed;
-                s.recv_buf.clear();
-                s.send_queue.clear();
+    /// Tidy up state that becomes inconsistent when a recv-side
+    /// terminal frees a slot that has lingering deferred-free or
+    /// pending-write references. Called after `maybe_free_slot`
+    /// fires inside the recv path. Three things to scrub:
+    ///   1. Stale entry in `pending_terminal_free` (the slot is
+    ///      already free, so the deferred drain would no-op but
+    ///      we should keep the list honest).
+    ///   2. `pending_write` keyed to this idx — its slot is gone,
+    ///      so the bytes would fail snapshot restoration
+    ///      validation. Drop them; the peer's terminal already
+    ///      tore down the stream on their side.
+    fn clean_up_after_remote_free(&mut self, idx: SlotIndex) {
+        self.pending_terminal_free.retain(|&i| i != idx);
+        if let Some(bytes) = &self.pending_write {
+            if bytes.len() >= 4 {
+                let stream_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+                if stream_id == idx {
+                    self.pending_write = None;
+                }
             }
-            self.mark_free(idx);
         }
+    }
+
+    /// Reap slots in the deferred terminal-free list. Called by
+    /// `next_outbound` (when `pending_write` is `None`, signaling
+    /// the caller has implicitly acked the previous emission) and
+    /// `open` (so a freshly-closed slot can be reallocated).
+    ///
+    /// Entries whose slot can't yet be freed — e.g. a `reset()`
+    /// queued a Reset frame after the terminal emit — are KEPT
+    /// in the list so the next round of draining (after the queued
+    /// frame ships) can finish the job.
+    fn drain_pending_terminal_free(&mut self) {
+        if self.pending_terminal_free.is_empty() {
+            return;
+        }
+        let drained: Vec<SlotIndex> = self.pending_terminal_free.drain(..).collect();
+        for idx in drained {
+            if !self.maybe_free_slot(idx) {
+                self.pending_terminal_free.push(idx);
+            }
+        }
+    }
+
+    /// Try to free a slot. Returns `true` if the slot was reclaimed.
+    ///
+    /// A slot may be freed iff (a) both sides have signalled terminal
+    /// AND (b) no outbound frames remain in the slot's send_queue —
+    /// the latter handles the case where `close_send` queued an End,
+    /// the End was emitted (deferred-free), and the app then called
+    /// `reset()` which queued a Reset. Clearing send_queue here would
+    /// silently drop that Reset; callers must keep the slot occupied
+    /// until the queued terminal is actually emitted.
+    fn maybe_free_slot(&mut self, idx: SlotIndex) -> bool {
+        let Some(slot) = self.slot(idx) else { return false };
+        if !(slot.peer_terminal && slot.local_terminal) {
+            return false;
+        }
+        if !slot.send_queue.is_empty() {
+            return false;
+        }
+        if let Some(s) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut()) {
+            s.state = SlotState::Closed;
+            s.recv_buf.clear();
+        }
+        self.mark_free(idx);
+        true
     }
 
     /// Feed an inbound keyed-frame's bytes. Validates, applies state
@@ -414,6 +517,15 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 StreamSlot::open_remote(open.method_id, now, self.config.initial_credit);
             slot.generation = keyed.key.generation;
             self.streams[idx as usize] = Some(slot);
+            // The fresh slot record overwrites a Closed predecessor.
+            // Any leftover references to the OLD slot — a deferred
+            // terminal-free entry or a `pending_write` keyed to the
+            // prior generation — would now point at a slot whose
+            // state machine has wound forward, breaking invariant
+            // I2 (term_free idx must be in HalfClosedLocal/Closed)
+            // and I4 (pending_write key must match an occupied
+            // slot). Scrub them.
+            self.clean_up_after_remote_free(idx);
             events.push(Event::NewIncomingStream {
                 slot: idx,
                 method_id: open.method_id,
@@ -471,8 +583,9 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 slot.peer_terminal = true;
                 slot.recv_trailer = Some(end.trailer.clone());
                 slot.state = match slot.state {
-                    SlotState::OpenRemote => SlotState::HalfClosedRemote,
-                    SlotState::Open => SlotState::HalfClosedRemote,
+                    SlotState::OpenRemote | SlotState::OpenLocal | SlotState::Open => {
+                        SlotState::HalfClosedRemote
+                    }
                     SlotState::HalfClosedLocal => SlotState::Closed,
                     other => other,
                 };
@@ -480,17 +593,25 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                     slot: idx,
                     trailer: end.trailer,
                 });
-                self.maybe_free_slot(idx);
+                if self.maybe_free_slot(idx) {
+                    self.clean_up_after_remote_free(idx);
+                }
             }
             Frame::Reset(r) => {
                 slot.peer_terminal = true;
                 slot.local_terminal = true;
                 slot.state = SlotState::Closed;
+                // Peer aborted — any frames we had queued for this
+                // stream are pointless. Drop them so the slot can be
+                // reclaimed immediately rather than waiting for a
+                // terminal emit that the peer doesn't care about.
+                slot.send_queue.clear();
                 events.push(Event::ResetStream {
                     slot: idx,
                     code: r.code,
                 });
                 self.maybe_free_slot(idx);
+                self.clean_up_after_remote_free(idx);
             }
             Frame::Credit(c) => {
                 slot.peer_recv_credit =
@@ -565,6 +686,22 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         self.pending_write = pending;
     }
 
+    /// Deferred terminal-free list. Slots here have emitted their
+    /// local terminal frame from `next_outbound` but haven't been
+    /// confirmed shipped by the transport — we keep them occupied
+    /// so a snapshot's `pending_write` can still resolve back to a
+    /// known slot on restore.
+    pub(crate) fn pending_terminal_free_slice(&self) -> &[SlotIndex] {
+        &self.pending_terminal_free
+    }
+
+    /// Re-populate the deferred terminal-free list during restore.
+    /// Caller (snapshot reader) is expected to have validated each
+    /// entry against the occupied slot table.
+    pub(crate) fn set_pending_terminal_free(&mut self, slots: Vec<SlotIndex>) {
+        self.pending_terminal_free = slots;
+    }
+
     /// Sample the mux's clock. Snapshot serializers use this to capture a
     /// single consistent `now` against which `opened_at`/`deadline` are
     /// converted to durations.
@@ -614,9 +751,11 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
 
     /// Construct a `StreamSlot` from a snapshot. The caller supplies the
     /// post-wake `opened_at` (so `Instant`s reconstitute relative to the
-    /// new clock). `recv_buf`, `recv_trailer`, and `send_queued` are reset:
-    /// the hibernation contract is that no per-frame buffered state
-    /// survives — only the slot's accounting fields.
+    /// new clock). `send_queue` starts empty here; the cf_do snapshot
+    /// reader re-pushes any persisted entries afterward. `recv_buf` and
+    /// `recv_trailer` always reset — inbound-side buffered state is not
+    /// part of the hibernation contract (peer will retransmit or surface
+    /// a transport-level failure).
     pub(crate) fn make_restored_slot(
         generation: u16,
         state: SlotState,
@@ -713,6 +852,50 @@ mod tests {
             Event::EndStream { slot: s, .. } => assert_eq!(*s, 0),
             _ => panic!("expected EndStream"),
         }
+    }
+
+    #[test]
+    fn reset_after_close_send_emit_still_ships_reset() {
+        // Regression: app calls close_send (queues End), the End is
+        // emitted by next_outbound (added to pending_terminal_free),
+        // then app calls reset() before peer's terminal arrives.
+        // `reset` queues a Reset and flips peer_terminal=true; this
+        // triggers `drain_pending_terminal_free` on the next
+        // next_outbound call. Under the previous eager-clear
+        // behavior, `maybe_free_slot` would clear send_queue and
+        // discard the still-queued Reset, leaving the peer never
+        // told the stream was cancelled.
+        let (mut client, mut server) = pair::<32>();
+        let s = client.open(0x1, Metadata::new()).unwrap();
+        drain(&mut client, &mut server);
+
+        // Client closes-send → emit End → slot enters
+        // pending_terminal_free (only local_terminal=true so far).
+        client.close_send(s, None).unwrap();
+        let end_bytes = client.next_outbound().expect("End");
+        let _ = server.recv(&end_bytes).unwrap();
+
+        // App changes its mind and resets. peer_terminal was false,
+        // so reset's both-terminal early-return doesn't fire; reset
+        // queues a Reset and sets both terminals.
+        client.reset(s, WireCode::Cancelled);
+        let reset_bytes = client
+            .next_outbound()
+            .expect("Reset must be emitted, not silently swallowed by maybe_free_slot");
+        // Decode and assert it's actually a Reset for our slot.
+        let decoded = crate::mux::decode_keyed_frame(&reset_bytes).unwrap();
+        assert_eq!(decoded.key.stream_id, s);
+        assert!(
+            matches!(decoded.frame, Frame::Reset(ResetFrame { code: WireCode::Cancelled })),
+            "emitted frame must be Reset/Cancelled, got {:?}",
+            decoded.frame
+        );
+
+        // After the Reset ships, the slot finally frees up so the
+        // next open() can reuse the index.
+        let _ = client.next_outbound(); // triggers drain
+        let new_idx = client.open(0x2, Metadata::new()).unwrap();
+        assert_eq!(new_idx, s, "slot should be reclaimable after both terminals shipped");
     }
 
     #[test]
