@@ -17,9 +17,9 @@
 mod support;
 
 use hellas_kernel::{
-    ApplyError, BlockHash, BlockHeight, CloseKind, CoinId, Context, Funding, Genesis,
-    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode,
-    Secp256k1Verifier, Sig, State, Terms, Tx,
+    ApplyError, BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Funding, Genesis,
+    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Seal,
+    SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig, State, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 use support::{FixedStore, party_one, payouts_two};
@@ -142,4 +142,28 @@ fn forged_signature_is_rejected_by_real_verifier() {
             reason: InvalidProofReason::BadSignature,
         }),
     );
+}
+
+#[test]
+fn production_secp256k1_verifier_rejects_dispute_seals() {
+    let (_, maker_pk) = keypair(1);
+    let (_, taker_pk) = keypair(2);
+    let parties = Parties::new(maker_pk, taker_pk);
+    let outputs = payouts(maker_pk, taker_pk);
+    let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
+    let edge = EdgeId::from_bytes([9; EdgeId::LENGTH]);
+    let hash = Tx::payload_hash(edge, CloseKind::Violation, terms.hash(), &outputs);
+    let seal = Seal::placeholder(terms.protocol(), CloseKind::Violation, hash);
+    let public = SealPublicInputs {
+        edge_id: edge,
+        protocol: terms.protocol(),
+        terms_hash: terms.hash(),
+        payouts: &outputs,
+    };
+
+    assert!(!Secp256k1Verifier::new().verify_seal(seal, &public));
+    assert_eq!(CloseKind::Mutual.tag(), 0);
+    assert_eq!(CloseKind::Timeout.tag(), 1);
+    assert_eq!(CloseKind::Violation.tag(), 2);
+    assert_eq!(seal.to_bytes(), *seal.as_bytes());
 }

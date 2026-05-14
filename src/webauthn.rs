@@ -467,6 +467,11 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MAX_WEBAUTHN_DATA_LENGTH, WebAuthnData};
+
+    const ZERO_CHALLENGE: [u8; 43] = *b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const GOOD_CLIENT_DATA: &[u8] =
+        br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
 
     #[test]
     fn challenge_base64url_matches_known_value() {
@@ -475,17 +480,177 @@ mod tests {
             base64url_32(hash.as_bytes()),
             *b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         );
+
+        let hash = PayloadHash::from_bytes([0xff; PayloadHash::LENGTH]);
+        assert_eq!(
+            base64url_32(hash.as_bytes()),
+            *b"__________________________________________8",
+        );
     }
 
     #[test]
     fn client_data_rejects_nested_challenge_injection() {
-        let expected = *b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let attack =
             br#"{"type":"webauthn.get","challenge":"bad","extra":{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
 
         assert_eq!(
-            validate_client_data_json(attack, &expected),
+            validate_client_data_json(attack, &ZERO_CHALLENGE),
             Err(WebAuthnError::InvalidChallenge),
         );
+    }
+
+    #[test]
+    fn client_data_accepts_ignored_json_values_and_whitespace() {
+        let input = br#" {
+            "other": [false, null, -12.5e+2, {"escaped":"a\u0041", "simple":"a\nb", "array":[]}],
+            "type": "webauthn.get",
+            "challenge": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "tail": true
+        } "#;
+
+        assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
+    }
+
+    #[test]
+    fn client_data_rejects_trailing_junk_and_missing_fields() {
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"} true"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::MissingClientDataField),
+        );
+        assert_eq!(
+            validate_client_data_json(br#"{"type":"webauthn.get"}"#, &ZERO_CHALLENGE),
+            Err(WebAuthnError::MissingClientDataField),
+        );
+    }
+
+    #[test]
+    fn client_data_rejects_duplicates_and_escaped_required_fields() {
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::DuplicateClientDataField),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::DuplicateClientDataField),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn\u002eget","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataType),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"ty\u0070e":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::MissingClientDataField),
+        );
+    }
+
+    #[test]
+    fn client_data_rejects_malformed_ignored_values() {
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":truex}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":"\u12x4"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            validate_client_data_json(
+                b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"extra\":\"\n\"}",
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+    }
+
+    #[test]
+    fn message_hash_rejects_bad_authenticator_data_flags() {
+        let hash = PayloadHash::from_bytes([0; PayloadHash::LENGTH]);
+
+        assert_eq!(
+            webauthn_message_hash(&[0; MIN_AUTH_DATA_LEN + PayloadHash::LENGTH - 1], hash),
+            Err(WebAuthnError::DataTooShort),
+        );
+        let mut minimum_len_data = [0; MIN_AUTH_DATA_LEN + PayloadHash::LENGTH];
+        minimum_len_data[32] = UP;
+        assert_eq!(
+            webauthn_message_hash(&minimum_len_data, hash),
+            Err(WebAuthnError::InvalidClientDataJson),
+        );
+        assert_eq!(
+            message_hash_with_flags(0, GOOD_CLIENT_DATA),
+            Err(WebAuthnError::MissingUserPresence),
+        );
+        assert_eq!(
+            message_hash_with_flags(UP | AT, GOOD_CLIENT_DATA),
+            Err(WebAuthnError::AttestedCredentialDataUnsupported),
+        );
+        assert_eq!(
+            message_hash_with_flags(UV | ED, GOOD_CLIENT_DATA),
+            Err(WebAuthnError::ExtensionsUnsupported),
+        );
+        assert!(message_hash_with_flags(UP, GOOD_CLIENT_DATA).is_ok());
+    }
+
+    #[test]
+    fn p256_signature_low_s_boundary_is_not_high_s() {
+        let assertion = WebAuthnAssertion::new(
+            [1; PayloadHash::LENGTH],
+            P256_N_HALF,
+            [0; PayloadHash::LENGTH],
+            [0; PayloadHash::LENGTH],
+            empty_webauthn_data(),
+        );
+
+        assert_eq!(
+            verify_p256_signature(&assertion, &[0; PayloadHash::LENGTH]),
+            Err(WebAuthnError::InvalidPublicKey),
+        );
+    }
+
+    fn message_hash_with_flags(
+        flags: u8,
+        client_data: &[u8],
+    ) -> Result<[u8; PayloadHash::LENGTH], WebAuthnError> {
+        let mut data = [0; MAX_WEBAUTHN_DATA_LENGTH];
+        data[32] = flags;
+        let len = MIN_AUTH_DATA_LEN + client_data.len();
+        data[MIN_AUTH_DATA_LEN..len].copy_from_slice(client_data);
+
+        webauthn_message_hash(
+            &data[..len],
+            PayloadHash::from_bytes([0; PayloadHash::LENGTH]),
+        )
+    }
+
+    fn empty_webauthn_data() -> WebAuthnData {
+        crate::List::empty(0)
     }
 }

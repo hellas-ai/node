@@ -76,6 +76,7 @@ fn all_constructor_yields_full_list() {
     let list: List<u32, 3> = List::all([100, 200, 300]);
 
     assert_eq!(list.len(), 3);
+    assert!(!list.is_empty());
     assert_eq!(list.as_slice(), &[100, 200, 300]);
 }
 
