@@ -15,9 +15,7 @@ default = []
 # feature that cargo creates from the optional dep (no `dep:` prefix used).
 candle = [
   "hellas-executor/candle",
-  "hellas-pb/server",
   "hellas-rpc/server",
-  "tonic-iroh-transport/server",
 ]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
@@ -33,8 +31,6 @@ otel = [
   "dep:tracing-opentelemetry",
   "dep:reqwest",
   "dep:iroh-metrics",
-  "tonic-iroh-transport/otel",
-  "tonic-iroh-transport/metrics",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -53,18 +49,12 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
-hellas-pb = { workspace = true, features = [
-  "hellas",
-  "symbolic",
-  "opaque",
-  "courtesy",
-  "swarm",
-  "client",
-] }
 hellas-rpc = { workspace = true, default-features = false, features = [
   "node",
-  "discovery",
+  "all-protocols",
 ] }
+hellas-wire = { workspace = true, features = ["iroh"] }
+iroh = { version = "0.98", default-features = false }
 iroh-metrics = { version = "0.38", default-features = false, features = [
   "metrics",
 ], optional = true }
@@ -82,12 +72,6 @@ serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
 tokio-stream = { workspace = true }
-tonic = { workspace = true }
-tonic-iroh-transport = { workspace = true, default-features = false, features = [
-  "client",
-  "discovery-mdns",
-  "discovery-dht",
-] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }

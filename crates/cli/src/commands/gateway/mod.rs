@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tonic_iroh_transport::iroh::{EndpointId, SecretKey};
+use iroh::{EndpointId, SecretKey};
 
 use self::state::{GatewayState, HttpError};
 

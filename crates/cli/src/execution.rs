@@ -46,9 +46,9 @@ use hellas_core::{
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
-use hellas_pb::courtesy::QuotePreparedTextRequest;
-use hellas_pb::hellas::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, work_event};
-use hellas_pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
+use hellas_rpc::pb::execute::{self as pb, FinishStatus, RunTicketRequest, WorkEvent, work_event};
+use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{
     ExecuteDriver, ManagedRemoteDriver, QuotedPreparedTextResponse, QuotedResponse,
@@ -64,8 +64,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tonic_iroh_transport::iroh::address_lookup::DnsAddressLookup;
-use tonic_iroh_transport::iroh::{
+use iroh::address_lookup::DnsAddressLookup;
+use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::PortmapperConfig,
 };
 use tonic_iroh_transport::swarm::{DhtBackend, MdnsBackend, ServiceRegistry};
@@ -1172,7 +1172,7 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 // ---------------------------------------------------------------------------
 
 struct QuotedRemoteDriver {
-    quote: hellas_pb::hellas::Ticket,
+    quote: hellas_rpc::pb::execute::Ticket,
     provenance: ExecutionProvenance,
     /// Carries its own `PeerManager` + `peer_id`; the surrounding fields
     /// don't need to repeat them.
@@ -1243,8 +1243,8 @@ async fn bind_remote_endpoint(secret_key: Option<&SecretKey>) -> anyhow::Result<
 async fn bind_remote_endpoint_with_bindings(
     secret_key: Option<&SecretKey>,
 ) -> anyhow::Result<(Arc<Endpoint>, DiscoveryBindings)> {
-    use tonic_iroh_transport::iroh::address_lookup::PkarrPublisher;
-    use tonic_iroh_transport::iroh::endpoint::presets;
+    use iroh::address_lookup::PkarrPublisher;
+    use iroh::endpoint::presets;
 
     let mut builder = Endpoint::builder(presets::N0)
         .clear_address_lookup()

@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
-use tonic_iroh_transport::iroh::EndpointId;
+use iroh::EndpointId;
 
 /// End-to-end deadline applied at the consumer of `PreparedGeneration::stream`.
 /// Covers preparation (quote / discovery) AND the entire decode stream.
