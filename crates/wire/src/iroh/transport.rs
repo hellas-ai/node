@@ -6,7 +6,7 @@ use bytes::BytesMut;
 use iroh::endpoint::Connection;
 use tokio::sync::Mutex;
 
-use crate::frame::{decode_frame, read_varint, Frame, OpenFrame};
+use crate::frame::{decode_frame, read_varint_partial, Frame, FrameError, OpenFrame, MAX_FRAME_BYTES};
 use crate::metadata::Metadata;
 use crate::transport::{
     AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext,
@@ -81,7 +81,10 @@ impl StreamTransport for IrohTransport {
         // Read the OpenFrame off the wire to populate Inbound metadata.
         let mut read_buf = BytesMut::new();
         let (method_id, headers, consumed) = loop {
-            // Try to pop OpenFrame
+            // Try to pop OpenFrame. Fatal parse errors abort the
+            // accept — see try_peek_open's docs for the partition
+            // between recoverable (truncated) and fatal (oversized
+            // or malformed varint) cases.
             if !read_buf.is_empty() {
                 match try_peek_open(&read_buf) {
                     Ok(Some((mid, hdr, consumed))) => {
@@ -118,17 +121,26 @@ impl StreamTransport for IrohTransport {
     }
 }
 
-fn try_peek_open(
-    buf: &[u8],
-) -> Result<Option<(u32, Metadata, usize)>, crate::frame::FrameError> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let (len, consumed) = match read_varint(buf) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+/// Tri-state parse of the next length-prefixed frame as an OpenFrame.
+///
+/// - `Ok(Some(...))` — frame ready; caller advances `consumed` bytes.
+/// - `Ok(None)` — need more bytes; varint or body is truncated.
+/// - `Err(_)` — fatal: corrupt varint, oversized announced length, or
+///   the frame doesn't decode as Open. Caller must abort the stream
+///   rather than retry, because none of these are recoverable by
+///   buffering more bytes.
+fn try_peek_open(buf: &[u8]) -> Result<Option<(u32, Metadata, usize)>, FrameError> {
+    let (len, consumed) = match read_varint_partial(buf)? {
+        Some(v) => v,
+        None => return Ok(None),
     };
     let len = len as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(FrameError::OversizedFrame {
+            len,
+            cap: MAX_FRAME_BYTES,
+        });
+    }
     if buf.len() < consumed + len {
         return Ok(None);
     }
@@ -137,6 +149,6 @@ fn try_peek_open(
         Frame::Open(OpenFrame { method_id, headers }) => {
             Ok(Some((method_id, headers, consumed + len)))
         }
-        _ => Err(crate::frame::FrameError::UnknownKind(0)),
+        _ => Err(FrameError::UnknownKind(0)),
     }
 }
