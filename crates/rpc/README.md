@@ -1,266 +1,182 @@
 # hellas-rpc
 
-`hellas-rpc` owns Hellas node-level RPC plumbing: service identities,
-peer-state primitives, admission/accounting policy, peer exchange, provenance
-metadata helpers, and the client/server support code used by node consumers.
+The Hellas node RPC stack: service identities, codegen-emitted client/server
+traits, peer-state primitives, admission/accounting policy, response-trailer
+provenance helpers, and the call-side helpers used by node consumers.
 
-It does not own every transport. Today the main transport is tonic over iroh,
-but the peer model is intentionally transport independent.
+Transport-independent in spirit; the in-tree transport is iroh's QUIC
+substreams via [`hellas-wire`](../wire). The wire layer's protocol is unique
+to Hellas — there is no longer a tonic/h2 codepath in production. A h2/gRPC-
+compat transport is stubbed for future use; see "Open work".
 
-## Mental Model
+## Mental model
 
-The network is peer-to-peer. Avoid thinking of a peer as "client" or "server"
-in the domain model.
+The network is peer-to-peer. Avoid thinking of a peer as "client" or
+"server" in the domain model.
 
-The stable identities are:
+Stable identities:
 
-- `PeerId`: one remote actor.
-- `(PeerId, service)`: one remote capability/session scope.
-- `(PeerId, service, method)`: one RPC accounting/admission scope.
-- Transport links: implementation detail owned by the transport layer.
+- `PeerId` — one remote actor (32 bytes, today the iroh endpoint public key).
+- `(PeerId, service)` — one remote capability/session scope.
+- `(PeerId, service, method)` — one RPC accounting/admission scope.
+- Transport links — implementation detail owned by the transport layer.
 
 A peer can initiate requests to us and also serve requests from us. Both
 directions update the same peer record.
 
-## Peer Facts vs Service Sessions
+## Layers
 
-`PeerRegistry` stores global facts keyed by `PeerId`:
-
-- first/last seen time
-- transport security and derived auth level
-- trust flag
-- latency EMA
-- request/error/cancellation counters
-- discovered service facts
-
-Service facts are keyed inside the peer by service name. This means a peer can
-be a node provider, executor, courtesy provider, custom downstream service, or
-any combination of those.
-
-It is fine for transports to maintain one stateful session per `(peer, service)`.
-It is also fine for a transport to temporarily have multiple physical links for
-the same `(peer, service)` during races, reconnects, or inbound/outbound overlap.
-Those links must converge into the same peer facts. They must not become
-separate logical peers.
-
-## Current Transport Boundary
-
-With tonic over iroh today, service ALPN selects the service at connection
-setup. That naturally makes the current iroh connection pool scoped like:
-
-```text
-(remote peer, service ALPN)
+```
+┌──────────────────────────────────────────────────────────────┐
+│ application: CLI commands, gateway, executor handlers       │
+├──────────────────────────────────────────────────────────────┤
+│ generated clients & dispatchers (per service)               │
+│   Courtesy / Execute / Symbolic / Opaque / Node             │
+│   each → ServiceMarker, MethodMarker, Client trait + impl,  │
+│           Handler trait, Server dispatcher.                 │
+├──────────────────────────────────────────────────────────────┤
+│ hellas_rpc::call helpers (transport-generic)                │
+│   unary, unary_with_trailer, server_streaming →             │
+│     `StreamingCall<R>` (Stream<Item = Result<R,WireStatus>> │
+│     + `#[must_use] finish() -> Result<Trailer,WireStatus>`) │
+│   dispatch_unary, dispatch_server_streaming                 │
+├──────────────────────────────────────────────────────────────┤
+│ hellas_wire::transport: StreamTransport, RecvHalf,          │
+│   SendHalf, Inbound, TransportContext, Trailer, WireStatus  │
+├──────────────────────────────────────────────────────────────┤
+│ transports                                                  │
+│   iroh::IrohTransport (QUIC bidi substreams) ← in prod      │
+│   ws::* (browser / native / CF Durable Object)              │
+│   h2::* (stub, gRPC-compat target)                          │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Inbound accepted iroh connections and outbound pooled iroh connections may both
-exist at the same time. That is allowed. `hellas-rpc` records observations about
-the remote peer and service; it does not try to own or deduplicate physical
-transport links.
+## Codegen
 
-If we later move to a single Hellas session ALPN with substreams, the logical
-model should stay the same:
+`build.rs` reads the `.proto` files via `protox`, runs `prost-build` for
+message types, and emits hand-rolled service code via `quote!` +
+`prettyplease`. Per service:
 
-```text
-PeerId -> service sessions -> RPCs
-```
+- `ServiceMarker` impl on a unit struct — carries `ALPN`, etc.
+- `MethodMarker` impl per method — carries `METHOD_ID` (a 32-bit
+  Blake3-derived id), `NAME`, and the request/response prost types.
+- `pub trait XClient` — transport-agnostic in the trait signature, with one
+  blanket `impl<T: StreamTransport> XClient for XClientImpl<T>` over the
+  generic implementation. Methods delegate to `crate::call::unary` /
+  `crate::call::server_streaming` parameterized by `MethodMarker`.
+- `pub trait XHandler` — server-side handler trait. One concrete impl per
+  application (`ExecutorHandle` in-tree for Courtesy/Execute/Symbolic/
+  Opaque; `NodeHandlerImpl` for Node).
+- `pub struct XServer<H>(pub H)` + `impl<T: StreamTransport, H: XHandler>
+  Dispatcher<T> for XServer<H>` — routes inbound substreams by
+  `method_id` and invokes the right handler method.
 
-Only the transport implementation changes.
+The generated tables `KNOWN_SERVICES`, `KNOWN_METHODS`, and
+`KNOWN_RATE_LIMITED_METHODS` are populated alongside the codegen and feed
+the peer directory's policy lookups.
 
-## Responsibilities
+## Call helpers
 
-`PeerRegistry` is the pure state machine.
+`crate::call` exposes the transport-generic helpers the codegen emits into.
+They are not part of the user-facing API; users call the generated `*Client`
+methods.
 
-- No async.
-- No clock.
-- No storage.
-- No transport handles.
-- Bounded by `PeerRegistryConfig`.
+- `unary<T,M>(transport, req, headers) -> Result<M::Response, WireStatus>`.
+- `unary_with_trailer<T,M>(...) -> Result<WithTrailer<M::Response>, _>` —
+  exposes the server's terminal trailer metadata to the caller (provenance
+  bytes, receipt envelopes, OTel span context, …). The unary protocol shape
+  is enforced: exactly one body chunk, then EOF, then a terminal trailer.
+  Extra bodies or missing trailers surface as `WireCode::Internal`.
+- `server_streaming<T,M>(...) -> Result<StreamingCall<M::Response>, _>` —
+  iteration + termination. `StreamingCall<R>` implements
+  `Stream<Item = Result<R, WireStatus>>` for body chunks only; the
+  `#[must_use]` `finish(self) -> Result<Trailer, WireStatus>` method
+  surfaces the terminal trailer (or non-Ok status as `Err`). Body and
+  trailer are sequenced by ownership: the protocol invariant "0+ bodies,
+  then exactly one terminal trailer" cannot be encoded in an invalid
+  order at this API surface.
+- `dispatch_unary<T,M,...>`, `dispatch_server_streaming<T,M,...>` —
+  server-side counterparts; the generated `XServer<H>` dispatcher calls
+  these to drive the handler.
 
-Use it directly only when a target needs strict sans-io control.
+## Peers
 
-`PeerManager` is the normal application wrapper.
+Sans-io peer-state primitives. No transport, runtime, clock, or storage
+dependencies; callers pass timestamps in.
 
-- Owns shared registry state.
-- Supplies wall-clock timestamps.
-- Provides closure-based reads and snapshots.
-- Exposes `PeerSession` and `PeerServiceSession<S>` views over the shared state.
-- Provides RAII RPC guards so dropped requests release in-flight slots.
+- `PeerRegistry` (in-memory) holds global facts keyed by `PeerId`:
+  first/last seen, transport security + derived `AuthLevel`, trust flag,
+  RTT EMA (via `hellas_wire::latency::EwmaLatency`), request/error/
+  cancellation counters, per-service state.
+- `PeerManager` (`Arc<Mutex<PeerRegistry>>` + monotonic clock) is the
+  callable wrapper used by application code.
+- `PeerDirectory` adds disclosure policy (`min_disclosed_auth_level`,
+  ranking, `ranked_known_peers`) and an inbound-admission split:
+  `observe_inbound_request(peer, rtt, policy)` distinguishes
+  `InboundRequestPolicy::AccountOnly` (counters but no rate limit) from
+  `RateLimited` (per-peer token bucket via `TokenBucket`).
 
-Generated clients, hand-written clients, and transport adapters should generally
-talk to `PeerManager`, not directly to `PeerRegistry`.
+## Address model
 
-`IrohRpcPool<S>` is the optional iroh client helper (`iroh-client` feature).
+Hellas carries *identity* (`PeerId` → iroh `EndpointId`) as durable state.
+Direct addresses (SocketAddrs, relay URLs, custom routes) are *ephemeral
+dial hints* bundled into an iroh `EndpointAddr` at the call site and
+handed to `Endpoint::connect(addr, alpn)` once. They never enter
+`PeerManager` / `PeerDirectory`. `presets::N0` configures pkarr/DNS
+address lookup, so identity-only routing works when iroh can resolve the
+peer.
 
-- Owns a `tonic-iroh-transport::ConnectionPool` for one typed service.
-- Acquires a typed method permit before dialing.
-- Records connection failures as connect errors automatically.
-- Returns the tonic channel plus `RpcPermitGuard` on success, so the caller can
-  finish the guard when the unary call or stream actually ends.
+The CLI's `ExecutionRuntime::remote(secret_key, seed_targets)` builds the
+endpoint + `ServiceRegistry`; `RemoteNodeTarget::addr: EndpointAddr` is
+the dial-time bundle. `Pool::transport(impl Into<EndpointAddr>)` is the
+final dial boundary.
 
-Generated `Iroh*Client` wrappers are also available under
-`hellas_rpc::iroh_client` with the same feature.
+## Provenance trailers
 
-- Generated from `proto/hellas/**/*.proto` by `crates/rpc/build.rs`.
-- Keep tonic/prost request and response types.
-- Use generated `MethodKey` markers internally; call sites do not pass method
-  strings.
-- Unary methods finish their permit before returning.
-- Streaming methods return `ManagedStreaming<T>`, which releases the permit on
-  stream end, stream error, explicit `finish_ok` / `finish_err`, or drop.
+Server handlers emit signed execution provenance (commitment digest, etc.)
+in the response `Trailer::metadata`. `crate::provenance` provides
+`read_provenance_metadata` and `write_provenance_metadata` helpers; the
+codegen-emitted handler return type is `WithTrailer<R>` so handlers can
+attach metadata without a separate ack channel. Missing provenance is a
+hard failure at the call site (no zero-digest fallback).
 
-Use `IrohRpcPool<S>` directly when building a higher-level driver that needs
-raw tonic channels. Use the generated `Iroh*Client` wrappers for simple RPC
-calls.
+## Open work
 
-`PeerDirectory` is server-side peer exchange policy.
+- **h2 / gRPC-compat transport** (task #14) — `hellas_wire::h2` is a stub.
+  Lands a `StreamTransport` impl over `h2` so external gRPC clients can
+  reach Hellas services.
+- **`AdmittingDispatcher` middleware** — the `PeerDirectory` policy hooks
+  are in place, but no code calls them from the serve path yet. See
+  `cli/commands/serve/node.rs` for the audit notes; the implementation
+  sketch is in `~/.claude/plans/recursive-mixing-neumann.md` §Phase F.
+- **ESP32 follow-ups** — `get_known_peers` returns an empty list on
+  device; the wire dispatcher doesn't surface peer identity to handlers.
+  See `HELLAS_WIRE_CUTOVER_FINDINGS.md` §§8–9.
+- **Generation-rollover defense** — `u16` generation counter wraps to 0
+  after `u16::MAX` slot reuses. Defense-in-depth only; gen=0 doesn't
+  appear on the wire from a legit peer, so the wrap isn't exploitable.
 
-- Tracks inbound request accounting.
-- Applies peer and global rate limits for peer disclosure.
-- Filters by service.
-- Ranks peers.
-- Computes disclosure limits.
+## Where the docs are
 
-Use it for APIs like `GetKnownPeers`.
+- This README — orientation.
+- `~/src/explorer/HELLAS_WIRE_CUTOVER_FINDINGS.md` — chronology of the
+  cutover (21 findings, mostly resolved).
+- `~/.claude/projects/-home-grw-src-explorer/memory/hellas_rpc_*.md` —
+  recurring-context notes for assistants.
+- Inline comments at the WHY-non-obvious points.
 
-## Type-Safe Methods
+## Feature gates
 
-Do not pass RPC method names as ad-hoc strings in application code. The shared
-plumbing accepts raw `RequestKind` values for extensibility, but typed clients
-should use method marker types:
+The crate has more knobs than it needs; legacy features are still in
+`Cargo.toml`. The important ones today:
 
-```rust
-pub struct ListModels;
+- `iroh` / `iroh-client` / `iroh-server` — enable the iroh transport
+  binding and its codegen.
+- `discovery` — peer-exchange + mDNS + DHT (today partial — see
+  `HELLAS_WIRE_CUTOVER_FINDINGS.md` §14).
+- Per-service (`execute`, `symbolic`, `opaque`, `courtesy`, `swarm`,
+  `all-protocols`) — gate the codegen for one proto package each.
+- `node` — binary-side bundle pulling in catgrad/chatgrad/tokenizers.
 
-impl MethodKey for ListModels {
-    type Service = CourtesyService;
-    const NAME: &'static str = "ListModels";
-}
-```
-
-Built-in Hellas service and method markers are generated from
-`proto/hellas/**/*.proto` by `crates/rpc/build.rs` and live under
-`hellas_rpc::service` and `hellas_rpc::service::methods`. Duplicate RPC names are
-disambiguated with their service name, e.g. `SymbolicCreateTicket` and
-`OpaqueCreateTicket`.
-
-Downstream RPC codegen should emit the same shape for custom `.proto` files:
-one service marker implementing `ServiceKey`, plus one marker per RPC method
-implementing `MethodKey`.
-
-For iroh transports, downstream codegen can mirror the built-in generated
-clients: call `IrohRpcPool::<S>::channel::<M>` before constructing the tonic
-client, then use `hellas_rpc::iroh_client::finish_unary` or
-`finish_streaming` to release the permit around the RPC result.
-
-## Calling Patterns
-
-Discovery and transport adapters record capabilities before application code
-needs them:
-
-```rust
-manager
-    .peer(peer)
-    .observe_discovered(
-        DiscoverySource::PeerExchange,
-        TransportSecurity::Untrusted,
-    )?;
-
-manager
-    .peer(peer)
-    .service::<CourtesyService>()
-    .observe_discovered(
-        DiscoverySource::Transport("discovery"),
-        TransportSecurity::Untrusted,
-    )?;
-```
-
-Outbound RPCs acquire admission before I/O and finish exactly once:
-
-```rust
-let courtesy = manager.peer(peer).service::<CourtesyService>();
-let mut permit = courtesy.acquire_method::<methods::ListModels>(
-    1.0,
-    RpcObservation::authenticated_transport("iroh"),
-)?;
-
-match client.list_models(request).await {
-    Ok(response) => {
-        permit.finish_ok();
-        Ok(response)
-    }
-    Err(err) => {
-        permit.finish_err(err.to_string());
-        Err(err)
-    }
-}
-```
-
-Connection establishment failures use `finish_connect_err`. That records the
-failure without claiming the remote service was authenticated or usable.
-
-Inbound RPCs are accounting signals, not capability proof. A browser can call
-`GetKnownPeers`; that does not mean it provides the node service.
-
-```rust
-directory.observe_inbound_request(
-    requester,
-    observed_rtt_ms,
-    InboundRequestPolicy::rate_limited_method::<methods::GetKnownPeers>(4.0, 1.0),
-)?;
-```
-
-## Rules
-
-- Peer identity is global. Never create separate logical peers for inbound vs
-  outbound traffic.
-- Service capability is per `(peer, service)`.
-- Request accounting is per `(peer, service, method)`.
-- Inbound requests do not imply the requester serves that service.
-- Discovery, successful outbound RPCs, and explicit signed handshakes may imply
-  service capability.
-- Transport security observations should only get stronger unless a future
-  policy explicitly models downgrade/revocation.
-- Physical transport links are not the source of truth. They feed observations
-  into peer state.
-
-## Persistence
-
-The registry is intentionally in-memory. Persistence belongs at the embedding
-layer because targets have different storage:
-
-- native binaries may use sqlite, rocksdb, or flat files;
-- browsers may use IndexedDB or local storage;
-- ESP32-class targets may use NVS/flash with small fixed-size records.
-
-Persist durable facts such as peer id, trust, labels, last known services, and
-last successful contact. Do not persist in-flight counts or live permit state.
-Rate-limit buckets may be persisted only if a target needs restart-resistant
-abuse protection.
-
-## Extensibility
-
-Downstream crates can define their own `.proto` services and implement
-`ServiceKey` for their service marker. They get the same peer/session/admission
-model:
-
-```rust
-pub struct MyService;
-
-impl ServiceKey for MyService {
-    const NAME: &'static str = "example.my.v1.MyService";
-}
-```
-
-The shared primitives do not require Hellas-owned services. Custom services are
-just additional `(peer, service)` capabilities.
-
-## What This Crate Does Not Promise
-
-`hellas-rpc` does not guarantee one physical connection per peer. That belongs
-to the transport layer.
-
-`hellas-rpc` does not require every transport to expose the same session shape.
-Iroh may use service ALPN sessions; WebSocket or UART transports may use a muxed
-pipe; a future wire layer may use one peer session with service substreams. All
-of those map into the same peer model as long as observations flow through
-`PeerManager` / `PeerDirectory`.
+`server` enables the dispatcher emission. Default-features is intentionally
+empty so downstream binaries opt in only what they ship.
