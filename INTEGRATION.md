@@ -15,7 +15,7 @@ The kernel needs three host-supplied things:
 - one verifier value implementing both `SigVerifier` and `SealVerifier`.
 
 The kernel owns transition validity. The host owns persistence, block
-ordering, transaction admission, and protocol-specific proof lookup.
+ordering, transaction intake, and protocol-specific proof lookup.
 
 ```rust
 state.apply_block(&verifier, &block)?;
@@ -121,7 +121,7 @@ The bundled kernel verifier treats `WebAuthn` as a portable transaction-signing
 envelope. It checks the signature, user-presence/user-verification flags, key
 binding, and challenge binding. It does not enforce application origin or
 `rpIdHash` policy. If a host wants origin-scoped wallet policy, it should apply
-that policy before constructing or admitting `OpenAuth::WebAuthn`.
+that policy before constructing or accepting `OpenAuth::WebAuthn`.
 
 The mixed example demonstrates maker native auth and taker passkey auth:
 
@@ -195,6 +195,6 @@ Before submitting kernel transactions from a host:
 - use `Tx::payload_hash(edge, kind, terms_hash, &outputs)` for mutual close
   signatures or seal public-input construction;
 - wire a production verifier that matches the key types and proof modes the
-  host admits;
+  host accepts;
 - buffer events from `apply_iter` until it returns `Ok`, because event callbacks
   fire before the staged batch commits.

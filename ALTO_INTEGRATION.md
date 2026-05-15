@@ -11,6 +11,10 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 `State::apply_iter` added, deliberate omissions documented in
 `Context`. This document is the Phase 1 work plan.
 
+The general kernel integration contract is in `INTEGRATION.md`. Alto should
+follow that contract directly: one kernel `Key` per party, with `OpenAuth`
+acting only as the witness format for that same key.
+
 ## Surface comparison
 
 | Concern                | Alto today                                              | Hellas-kernel                                  |
@@ -18,6 +22,7 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
 | Tx enum                | `Transaction { Transfer, MergeCoin }`                    | `Tx { Open, Close }`                           |
 | Object                 | `Coin { owner: Address, value: u64 }`                    | `Coin` (same shape) + `Edge`                   |
 | Object id              | `ObjectId = Sha256 Digest`                               | `CoinId`, `EdgeId`                             |
+| Party key              | `Address` / public key                                   | one `Key` for coin ownership, terms party, open auth, payout owner |
 | Sig type               | `WebAuthnSignature { sig, auth_data, client_data }`      | `Sig = [u8; 64]` for native close/open auth; `OpenAuth::WebAuthn` for passkey opens |
 | STF                    | `execute_all` / `execute_proposal` (inline, async)       | `State::apply*` (sync, trait-bounded)          |
 | Store                  | `UtxoDb<E>` (commonware MMR, async, `Batch::Unmerkleized`) | `Store + Batch` traits (sync)                  |
@@ -43,6 +48,7 @@ Phase 0 (kernel-side prep) is done: `Access` subsystem removed,
   by the kernel's canonical open hash (`Tx::open_hash`) for channel
   opens. Alto may still build browser request options, but the
   submitted assertion is carried into the kernel as `OpenAuth::WebAuthn`.
+  There is no separate open-auth key namespace.
 - `chain/src/execution/kernel.rs::ExecutionError` — replaced by
   `hellas_kernel::ApplyError` / `BatchError`. Drop the
   `is_transient_for_mempool` / `is_fatal_storage` classifier and re-add
@@ -62,6 +68,11 @@ Where `UserVerifier` is a unit struct (or carries any policy state
 alto needs — e.g. a precomputed-sig cache). The kernel takes one value
 that impls *both* traits; we impl them on the same struct so callers
 pass `&UserVerifier`.
+
+The `key: Key` passed to both verifier methods is the same party key used by
+`Coin.owner`, `Terms.parties()`, and close payout owners. `OpenAuth` only says
+how that party proves consent for this open: native signature or `WebAuthn`
+assertion.
 
 ```rust
 // chain/src/execution/verifier.rs (new file, ~35 lines)
@@ -109,8 +120,9 @@ match) live inside the kernel and need no verifier — the `UserVerifier`
 above carries no Timeout logic.
 
 **Important boundary decision: WebAuthn open authorization lives in the
-kernel.** Alto's mempool / proposer should not unwrap WebAuthn into a
-bare ECDSA `Sig`. For an open, it constructs:
+kernel.** Alto's mempool / proposer should not unwrap WebAuthn into a bare
+ECDSA `Sig`, and should not translate it into a second "open key". For an
+open, it constructs:
 
 - `OpenAuth::Native(Sig)` for a native party signature, or
 - `OpenAuth::WebAuthn(WebAuthnAssertion)` for a passkey assertion.
@@ -127,6 +139,17 @@ The kernel verifier checks the WebAuthn assertion directly:
 Following Tempo's consensus shape, the kernel does not enforce
 `origin` or `rpIdHash`. Those bytes remain inside the signed WebAuthn
 message, but they are not policy inputs for kernel validity.
+
+If Alto wants browser-origin or wallet-domain policy, it enforces that before
+constructing or accepting `OpenAuth::WebAuthn`. The kernel only enforces the
+portable transaction-signing envelope: key binding, challenge binding,
+authenticator flags, and signature validity.
+
+Passkey-backed parties can authorize opens and receive payouts under the same
+kernel `Key`. They are not automatically raw cooperative-close signers. A
+passkey party closes through timeout, a protocol-specific seal, or a future
+close-signature envelope/verifier that explicitly accepts the desired P-256 or
+passkey close shape.
 
 ### 2. `impl hellas_kernel::Store for UtxoDb<E>` (and a `Batch` adapter)
 
@@ -254,7 +277,8 @@ The mempool's job changes:
 - Accepts `Tx` instead of `Transaction`.
 - Build kernel `Tx::open_with_auth(...)` values. WebAuthn assertions
   are not unwrapped; the kernel verifies their challenge binding and
-  P-256 signature during apply.
+  P-256 signature during apply. The party key remains the coin owner /
+  terms party key.
 - Drops the `is_transient_for_mempool` classification — kernel's
   `ApplyError::MissingCoin` is the moral equivalent; the mempool
   can pattern-match on `ApplyError` variants to decide retain-vs-drop.
@@ -339,7 +363,7 @@ replaced by trait impls and kernel calls.
 ## Out of scope for Phase 1
 
 - Real fee model (Fees::ZERO suffices).
-- Dispute seals: admitting `Proof::Violation` requires a
+- Dispute seals: accepting `Proof::Violation` requires a
   protocol-specific `SealVerifier` impl; v1 leaves `UserVerifier`'s
   `verify_seal` returning `false`.
 - Adding `BlockTime` / timestamp to `Context`.

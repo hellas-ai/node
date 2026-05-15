@@ -209,7 +209,7 @@ The protocol should eventually have focused or integrated models for:
 | Area | Model role |
 | --- | --- |
 | L1 object lifecycle | coin/edge reachability, canonical ids, close payouts |
-| Open authorization | native/WebAuthn authorization reduces to party consent |
+| Open authorization | native/WebAuthn witnesses prove consent from the same party key |
 | Fees and close reserve | open-time close budget, reserve surplus, fee raises |
 | Active lifetime | permanent slot fee, rent budget, bond, expiry, collection |
 | Terms | value domains, timeout outputs, reserve surplus policy |
