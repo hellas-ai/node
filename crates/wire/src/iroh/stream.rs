@@ -12,7 +12,8 @@ use futures_core::Stream as FuturesStream;
 use iroh::endpoint::{RecvStream, SendStream};
 
 use crate::frame::{
-    decode_frame, encode_frame, read_varint, write_varint, EndFrame, Frame, OpenFrame,
+    decode_frame, encode_frame, read_varint_partial, write_varint, EndFrame, Frame, FrameError,
+    OpenFrame, MAX_FRAME_BYTES,
 };
 use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
@@ -215,6 +216,21 @@ impl FuturesStream for IrohRecvHalf {
                 },
                 Ok(None) => { /* fall through to read more bytes */ }
                 Err(e) => {
+                    // Fatal parse error (malformed varint, oversized
+                    // length, decode failure). The wire is poisoned;
+                    // stop reading, signal end, and stash a synthetic
+                    // trailer so trailer-aware consumers see the
+                    // protocol failure rather than a silent close.
+                    this.done = true;
+                    if let Some(mut r) = this.recv.take() {
+                        let _ = r.stop(STREAM_ERROR_CODE.into());
+                    }
+                    if this.trailer.is_none() {
+                        this.trailer = Some(Trailer::from_status(
+                            WireCode::Internal,
+                            "frame decode error",
+                        ));
+                    }
                     return Poll::Ready(Some(Err(std::io::Error::other(format!(
                         "frame decode: {e}"
                     )))));
@@ -274,19 +290,74 @@ impl crate::transport::RecvHalf for IrohRecvHalf {
     }
 }
 
-fn try_pop_frame(buf: &mut BytesMut) -> Result<Option<Frame>, crate::frame::FrameError> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let (len, consumed) = match read_varint(&buf) {
-        Ok(v) => v,
-        Err(_) => return Ok(None), // not enough bytes yet for the length
+/// Tri-state parse of the next length-prefixed frame.
+///
+/// - `Ok(Some(frame))` — decoded; the bytes have been split off `buf`.
+/// - `Ok(None)` — need more bytes; varint or body is truncated.
+/// - `Err(_)` — fatal: corrupt varint or oversized announced length.
+///   Caller must abort the stream; buffering more bytes cannot recover.
+fn try_pop_frame(buf: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
+    let (len, consumed) = match read_varint_partial(buf)? {
+        Some(v) => v,
+        None => return Ok(None),
     };
     let len = len as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(FrameError::OversizedFrame {
+            len,
+            cap: MAX_FRAME_BYTES,
+        });
+    }
     if buf.len() < consumed + len {
         return Ok(None);
     }
     let frame_bytes = buf.split_to(consumed + len);
     let frame = decode_frame(&frame_bytes[consumed..])?;
     Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_varint_is_fatal_not_buffer_growth() {
+        // Old behaviour: every varint error collapsed to Ok(None), so
+        // the recv loop kept extending the read buffer waiting for
+        // more bytes — a peer could send 0xFF repeatedly and OOM us.
+        // New behaviour: 10 continuation bytes is fatal.
+        let mut buf = BytesMut::from(&[0xFFu8; 10][..]);
+        let err = try_pop_frame(&mut buf).unwrap_err();
+        assert!(matches!(err, FrameError::BadVarint));
+        // Buffer is NOT consumed on fatal error — the caller decides
+        // to abort, no point in advancing.
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn oversized_announced_length_is_fatal_before_buffering() {
+        // A peer announces u64::MAX as the frame length. We must reject
+        // BEFORE attempting to wait for that many bytes.
+        let mut buf = BytesMut::new();
+        write_varint(u64::MAX, &mut buf);
+        let err = try_pop_frame(&mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            FrameError::OversizedFrame { len: _, cap: _ }
+        ));
+    }
+
+    #[test]
+    fn truncated_varint_is_recoverable() {
+        // A varint can legitimately straddle a TCP/QUIC read boundary.
+        // ≤ 9 continuation bytes is "need more bytes", not fatal.
+        for n in 1usize..=9 {
+            let buf_data = vec![0xFFu8; n];
+            let mut buf = BytesMut::from(&buf_data[..]);
+            let out = try_pop_frame(&mut buf).unwrap();
+            assert!(out.is_none(), "n={n} should be recoverable");
+            // Buffer is preserved across the partial read.
+            assert_eq!(buf.len(), n);
+        }
+    }
 }
