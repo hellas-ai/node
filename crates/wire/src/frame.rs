@@ -96,6 +96,8 @@ pub enum FrameError {
     BadValueUtf8,
     #[error("varint too long")]
     BadVarint,
+    #[error("frame length {len} exceeds wire cap {cap}")]
+    OversizedFrame { len: usize, cap: usize },
 }
 
 // -- Wire codec --------------------------------------------------------------
@@ -342,17 +344,52 @@ pub(crate) fn write_varint(mut v: u64, out: &mut bytes::BytesMut) {
 }
 
 pub(crate) fn read_varint(buf: &[u8]) -> Result<(u64, usize), FrameError> {
+    // "Must be complete" wrapper used by inner-frame decoders where the
+    // full frame bytes are already buffered. A truncated varint here is
+    // indistinguishable from corruption.
+    match read_varint_partial(buf)? {
+        Some(v) => Ok(v),
+        None => Err(FrameError::BadVarint),
+    }
+}
+
+/// Decode a varint while distinguishing a truncated buffer (recoverable —
+/// more bytes may arrive) from a malformed varint (fatal — peer is
+/// sending garbage).
+///
+/// Returns:
+/// - `Ok(Some((value, consumed)))` — complete varint decoded
+/// - `Ok(None)` — buffer ends mid-varint (≤ 9 continuation bytes seen)
+/// - `Err(BadVarint)` — 10 continuation bytes seen, malformed
+pub(crate) fn read_varint_partial(
+    buf: &[u8],
+) -> Result<Option<(u64, usize)>, FrameError> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, byte) in buf.iter().take(10).enumerate() {
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
-            return Ok((result, i + 1));
+            return Ok(Some((result, i + 1)));
         }
         shift += 7;
     }
-    Err(FrameError::BadVarint)
+    if buf.len() < 10 {
+        Ok(None)
+    } else {
+        Err(FrameError::BadVarint)
+    }
 }
+
+/// Wire-level upper bound on a single encoded frame, including its
+/// kind byte and body. Enforced by stream parsers BEFORE allocating
+/// buffer space; defends against a peer announcing `u64::MAX` as a
+/// frame length and tarpitting our read loop into unbounded buffer
+/// growth.
+///
+/// This is intentionally NOT coupled to `MuxConfig::body_frame_max`.
+/// The mux's body-frame cap is a flow-control knob; this cap is the
+/// parser's escape hatch. They differ in concern and lifecycle.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -366,6 +403,54 @@ mod tests {
             let (decoded, _) = read_varint(&buf).unwrap();
             assert_eq!(v, decoded);
         }
+    }
+
+    #[test]
+    fn varint_partial_distinguishes_truncated_from_malformed() {
+        // Empty buffer is truncated, not malformed.
+        assert_eq!(read_varint_partial(&[]).unwrap(), None);
+        // 1..=9 continuation bytes is truncated; we don't know the next
+        // byte yet.
+        for n in 1usize..=9 {
+            let buf = vec![0xFFu8; n];
+            assert_eq!(
+                read_varint_partial(&buf).unwrap(),
+                None,
+                "truncated at {n} should be Ok(None), got something else"
+            );
+        }
+        // 10 continuation bytes — there is no legal u64 varint with
+        // 10 continuation bytes, so this is fatal.
+        let mut buf = vec![0xFFu8; 10];
+        assert!(matches!(
+            read_varint_partial(&buf),
+            Err(FrameError::BadVarint)
+        ));
+        // 10 bytes where the 10th has the stop bit: valid u64 varint
+        // (encodes u64::MAX with the standard LEB128 layout).
+        buf[9] = 0x01;
+        let (val, consumed) = read_varint_partial(&buf).unwrap().unwrap();
+        assert_eq!(consumed, 10);
+        assert_eq!(val, u64::MAX);
+    }
+
+    #[test]
+    fn varint_blocking_wrapper_rejects_truncation_as_badvarint() {
+        // The `must-be-complete` wrapper collapses Ok(None) to BadVarint.
+        // Anything that wasn't a complete varint is a hard error here.
+        assert!(matches!(read_varint(&[]), Err(FrameError::BadVarint)));
+        assert!(matches!(
+            read_varint(&[0xFF]),
+            Err(FrameError::BadVarint)
+        ));
+    }
+
+    #[test]
+    fn max_frame_bytes_is_a_real_cap() {
+        // Documented expectation rather than a runtime check — pin the
+        // constant so a change forces a deliberate audit.
+        assert!(MAX_FRAME_BYTES >= 1 << 20);
+        assert!(MAX_FRAME_BYTES <= 16 * 1024 * 1024);
     }
 
     #[test]
