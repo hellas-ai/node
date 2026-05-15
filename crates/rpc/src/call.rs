@@ -233,13 +233,9 @@ where
                 .map_err(|e| TransportError::Io(format!("close: {e}")))?;
         }
         Err(status) => {
-            send.close_send(Some(Trailer {
-                status: status.code,
-                message: status.message,
-                metadata: status.metadata,
-            }))
-            .await
-            .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+            send.close_send(Some(status.into()))
+                .await
+                .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
         }
     }
     Ok(())
@@ -274,13 +270,9 @@ where
     let mut stream = match handler(request).await {
         Ok(s) => s,
         Err(status) => {
-            send.close_send(Some(Trailer {
-                status: status.code,
-                message: status.message,
-                metadata: status.metadata,
-            }))
-            .await
-            .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+            send.close_send(Some(status.into()))
+                .await
+                .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
             return Ok(());
         }
     };

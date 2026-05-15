@@ -126,3 +126,13 @@ impl Trailer {
         }
     }
 }
+
+impl From<crate::status::WireStatus> for Trailer {
+    fn from(s: crate::status::WireStatus) -> Self {
+        Self {
+            status: s.code,
+            message: s.message,
+            metadata: s.metadata,
+        }
+    }
+}

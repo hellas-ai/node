@@ -1,6 +1,6 @@
 //! Per-connection RTT estimator. Default EWMA.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EwmaLatency {
     /// Smoothing factor in `(0, 1]`. `1.0` = latest sample only.
     pub alpha: f64,
