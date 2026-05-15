@@ -29,6 +29,8 @@
 //! documented on [`Sig::placeholder`] and [`Seal::placeholder`]; production
 //! verifiers wire real cryptography. Optional feature-gated helpers provide
 //! concrete native/`WebAuthn` verification without changing the apply path.
+//! `OpenAuth` is only a witness format: it proves consent from the same
+//! party key used for coin ownership, terms, and payouts.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!

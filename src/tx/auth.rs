@@ -4,7 +4,8 @@
 //! cooperative closes are settlement-key signatures over a close payload hash.
 //! Opens need a wider envelope: a party may authorize an edge with the same
 //! native signature shape, or with a `WebAuthn` assertion whose challenge binds
-//! to the canonical open hash.
+//! to the canonical open hash. Both variants prove consent from the same
+//! kernel party key used for funding ownership, terms, and payouts.
 
 use crate::{
     consts::MAX_WEBAUTHN_DATA_LENGTH,
@@ -81,7 +82,10 @@ impl WebAuthnAssertion {
     }
 }
 
-/// Party authorization for an edge open.
+/// Party-key authorization for an edge open.
+///
+/// This is a witness envelope, not a separate identity. The verifier checks
+/// each variant against the maker/taker key committed in [`crate::Terms`].
 #[allow(
     clippy::large_enum_variant,
     reason = "Open auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"

@@ -44,20 +44,21 @@ use crate::tx::{OpenAuth, Payout, Seal};
 ///
 /// [`Proof::Mutual`]: crate::Proof::Mutual
 pub trait SigVerifier {
-    /// Returns true when `sig` is a valid witness from `key` over `hash`.
+    /// Returns true when `sig` is a valid witness from `party_key` over
+    /// `hash`.
     #[must_use]
-    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool;
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool;
 
-    /// Returns true when `auth` is a valid open authorization from `key`
-    /// over `hash`.
+    /// Returns true when `auth` is a valid open authorization from
+    /// `party_key` over `hash`.
     ///
     /// Native open authorizations reuse [`Self::verify_sig`]. `WebAuthn` is
     /// rejected by default so existing native-only verifiers do not
     /// accidentally start accepting a new signature scheme.
     #[must_use]
-    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
             OpenAuth::WebAuthn(_) => false,
         }
     }

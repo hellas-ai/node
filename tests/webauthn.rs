@@ -32,15 +32,15 @@ const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 struct MixedVerifier;
 
 impl SigVerifier for MixedVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
-        sig == Sig::placeholder(key, hash)
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool {
+        sig == Sig::placeholder(party_key, hash)
     }
 
-    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
             OpenAuth::WebAuthn(assertion) => {
-                verify_webauthn_assertion(assertion, key, hash).is_ok()
+                verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
         }
     }
@@ -178,6 +178,42 @@ fn webauthn_open_rejects_wrong_challenge() {
         ],
     );
 
+    assert_eq!(
+        state.apply(CONTEXT, &MixedVerifier, &open),
+        Err(ApplyError::InvalidOpen {
+            output: edge,
+            reason: InvalidOpenReason::BadSignature,
+        }),
+    );
+}
+
+#[test]
+fn webauthn_open_rejects_assertion_from_wrong_party_key() {
+    let maker_sk = keypair(1);
+    let wrong_sk = keypair(9);
+    let maker_key = p256_key_from_signing_key(&maker_sk);
+    let funding = funding();
+    let terms = make_terms(maker_key, 1);
+    let hash = Tx::open_hash(&funding, &terms);
+    let (maker_assertion, assertion_key) =
+        sign_webauthn(&wrong_sk, hash, "https://wallet.example.invalid");
+    let taker_sig = Sig::placeholder(TAKER, hash);
+    let edge = Tx::edge_id_of(&funding, &terms);
+    let open = Tx::open_with_auth(
+        funding,
+        terms,
+        OpenAuth::webauthn(maker_assertion),
+        OpenAuth::native(taker_sig),
+    );
+    let mut state = state(
+        FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
+        [
+            Genesis::coin(MAKER_COIN, maker_key, 10),
+            Genesis::coin(TAKER_COIN, TAKER, 5),
+        ],
+    );
+
+    assert_ne!(assertion_key, maker_key);
     assert_eq!(
         state.apply(CONTEXT, &MixedVerifier, &open),
         Err(ApplyError::InvalidOpen {

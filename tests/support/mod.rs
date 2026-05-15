@@ -28,8 +28,8 @@ pub(crate) struct FakeVerifier;
 pub(crate) const FAKE_VERIFIER: FakeVerifier = FakeVerifier;
 
 impl SigVerifier for FakeVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::PayloadHash) -> bool {
-        sig == Sig::placeholder(key, hash)
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: hellas_kernel::PayloadHash) -> bool {
+        sig == Sig::placeholder(party_key, hash)
     }
 }
 
@@ -54,7 +54,7 @@ pub(crate) struct RejectVerifier;
 pub(crate) const REJECT_VERIFIER: RejectVerifier = RejectVerifier;
 
 impl SigVerifier for RejectVerifier {
-    fn verify_sig(&self, _sig: Sig, _key: Key, _hash: hellas_kernel::PayloadHash) -> bool {
+    fn verify_sig(&self, _sig: Sig, _party_key: Key, _hash: hellas_kernel::PayloadHash) -> bool {
         false
     }
 }
