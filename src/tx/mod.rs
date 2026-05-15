@@ -85,8 +85,12 @@ impl Tx {
         }
     }
 
-    /// Creates an open transaction from concrete terms and typed party
-    /// authorizations.
+    /// Creates an open transaction from concrete terms and typed party-key
+    /// authorization witnesses.
+    ///
+    /// `maker_auth` and `taker_auth` are checked against the maker/taker keys
+    /// committed by `terms.parties()`, even when that party contributes no
+    /// funding input.
     #[must_use]
     pub const fn open_with_auth(
         funding: Funding,

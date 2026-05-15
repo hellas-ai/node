@@ -533,22 +533,24 @@ fn open_rejects_funding_owned_by_other_keys() {
     // first regardless.
     let attack = open_tx_with(funding, eve_terms(), EVE, EVE);
     let mut state = funded_state_for(&attack);
+    let output = open_edge_id(&attack);
+    let store = *state.store();
 
-    let result = state.apply(CONTEXT, &FAKE_VERIFIER, &attack);
-
-    assert!(
-        matches!(result, Err(ApplyError::InvalidOpen { .. })),
-        "kernel must reject opens that consume coins not owned by the \
-         claimed party; got {result:?}",
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &attack),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::FundingUnauthorized,
+        }),
     );
+    assert_eq!(*state.store(), store);
 }
 
 #[test]
-fn open_rejects_maker_coin_owned_by_someone_other_than_maker_party() {
+fn open_rejects_terms_party_that_does_not_own_funding() {
     // The taker is honest (TAKER owns TAKER_COIN), but the "maker"
-    // slot is filled with a coin Eve doesn't own. The kernel must
-    // reject; otherwise Eve can launder Maker's coin through a
-    // self-dealing edge whose timeout payouts target her.
+    // party in the terms is Eve. Even if Eve signs the open as the
+    // named maker, she cannot move Maker's coin into those terms.
     let funding = funding(MAKER_COIN, TAKER_COIN);
     let mixed_terms = Terms::basic(
         PROTOCOL,
@@ -558,12 +560,72 @@ fn open_rejects_maker_coin_owned_by_someone_other_than_maker_party() {
     );
     let attack = open_tx_with(funding, mixed_terms, EVE, TAKER);
     let mut state = funded_state_for(&attack);
+    let output = open_edge_id(&attack);
+    let store = *state.store();
 
-    let result = state.apply(CONTEXT, &FAKE_VERIFIER, &attack);
-
-    assert!(
-        matches!(result, Err(ApplyError::InvalidOpen { .. })),
-        "kernel must reject opens where a party's funding coins are not \
-         owned by that party's key; got {result:?}",
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &attack),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::FundingUnauthorized,
+        }),
     );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn open_rejects_wrong_maker_auth_even_when_taker_funds_everything() {
+    let funding = Funding::new(empty_party(), party1(TAKER_COIN));
+    let terms = terms_paying(0, 5);
+    let open = open_tx_with(funding, terms, EVE, TAKER);
+    let mut state = funded_state_for(&open);
+    let output = open_edge_id(&open);
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::BadSignature,
+        }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn open_rejects_wrong_taker_auth_even_when_maker_funds_everything() {
+    let funding = Funding::new(party1(MAKER_COIN), empty_party());
+    let terms = terms_paying(10, 0);
+    let open = open_tx_with(funding, terms, MAKER, EVE);
+    let mut state = funded_state_for(&open);
+    let output = open_edge_id(&open);
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::BadSignature,
+        }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn open_rejects_empty_funding_without_both_party_auth() {
+    let funding = Funding::new(empty_party(), empty_party());
+    let terms = terms_with(&no_payouts());
+    let open = open_tx_with(funding, terms, MAKER, EVE);
+    let mut state = funded_state_for(&open);
+    let output = open_edge_id(&open);
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::BadSignature,
+        }),
+    );
+    assert_eq!(*state.store(), store);
 }

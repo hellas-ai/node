@@ -52,8 +52,8 @@ impl Default for Secp256k1Verifier {
 }
 
 impl SigVerifier for Secp256k1Verifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
-        let Ok(pk) = PublicKey::from_slice(key.as_bytes()) else {
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool {
+        let Ok(pk) = PublicKey::from_slice(party_key.as_bytes()) else {
             return false;
         };
         let Ok(signature) = Signature::from_compact(sig.as_bytes()) else {
@@ -63,12 +63,12 @@ impl SigVerifier for Secp256k1Verifier {
         self.secp.verify_ecdsa(message, &signature, &pk).is_ok()
     }
 
-    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
             #[cfg(feature = "webauthn")]
             OpenAuth::WebAuthn(assertion) => {
-                crate::webauthn::verify_webauthn_assertion(assertion, key, hash).is_ok()
+                crate::webauthn::verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
             #[cfg(not(feature = "webauthn"))]
             OpenAuth::WebAuthn(_) => false,
