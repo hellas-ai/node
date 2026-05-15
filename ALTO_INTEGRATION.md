@@ -69,10 +69,10 @@ alto needs — e.g. a precomputed-sig cache). The kernel takes one value
 that impls *both* traits; we impl them on the same struct so callers
 pass `&UserVerifier`.
 
-The `key: Key` passed to both verifier methods is the same party key used by
-`Coin.owner`, `Terms.parties()`, and close payout owners. `OpenAuth` only says
-how that party proves consent for this open: native signature or `WebAuthn`
-assertion.
+The `party_key: Key` passed to both verifier methods is the same party key
+used by `Coin.owner`, `Terms.parties()`, and close payout owners. `OpenAuth`
+only says how that party proves consent for this open: native signature or
+`WebAuthn` assertion.
 
 ```rust
 // chain/src/execution/verifier.rs (new file, ~35 lines)
@@ -86,8 +86,8 @@ use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 pub struct UserVerifier;
 
 impl SigVerifier for UserVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
-        let Ok(vk) = VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool {
+        let Ok(vk) = VerifyingKey::from_sec1_bytes(party_key.as_bytes()) else {
             return false;
         };
         let Ok(sig) = Signature::from_slice(sig.as_bytes()) else {
@@ -96,11 +96,11 @@ impl SigVerifier for UserVerifier {
         vk.verify(hash.as_bytes(), &sig).is_ok()
     }
 
-    fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool {
+    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, key, hash),
+            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
             OpenAuth::WebAuthn(assertion) => {
-                verify_webauthn_assertion(assertion, key, hash).is_ok()
+                verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
         }
     }

@@ -193,7 +193,8 @@ kernel/crypto seam, each scoped to exactly one kind of verification:
 
 ```rust
 trait SigVerifier {
-    fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool;
+    fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool;
+    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool;
 }
 
 struct SealPublicInputs<'a> {

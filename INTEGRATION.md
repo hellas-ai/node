@@ -160,16 +160,18 @@ passkey parties is required, extend the close witness/verifier story directly.
 
 ## Verifier Responsibilities
 
-`SigVerifier` decides party signatures and open authorizations:
+`SigVerifier` decides party signatures and open authorizations. The
+`party_key` parameter is the same key space used by `Coin.owner`,
+`Terms.parties()`, and payout owners:
 
 ```rust
-fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool;
-fn verify_open_auth(&self, auth: &OpenAuth, key: Key, hash: PayloadHash) -> bool;
+fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool;
+fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool;
 ```
 
 The default `verify_open_auth` accepts only `OpenAuth::Native`. Verifiers that
 want passkey opens must override it and call
-`verify_webauthn_assertion(assertion, key, hash)`.
+`verify_webauthn_assertion(assertion, party_key, hash)`.
 
 `SealVerifier` decides protocol-specific violation proofs. The kernel passes
 bounded public inputs:
