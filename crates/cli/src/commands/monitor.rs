@@ -19,7 +19,7 @@ use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInf
 use hellas_rpc::peers::{
     DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity,
 };
-use hellas_rpc::services::node::{Node, NodeClient, NodeClientImpl};
+use hellas_rpc::services::node::{Node, NodeClientImpl};
 use hellas_wire::iroh::pool::PoolOptions;
 use hellas_wire::iroh::swarm::{
     DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,

@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use hellas_core::Digest;
 use hellas_rpc::pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
-use hellas_rpc::services::courtesy::{Courtesy, CourtesyClient, CourtesyClientImpl};
+use hellas_rpc::services::courtesy::{Courtesy, CourtesyClientImpl};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::ServiceMarker;
 use iroh::endpoint::presets;

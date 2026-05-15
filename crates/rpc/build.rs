@@ -649,28 +649,6 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         ));
     }
 
-    // -- Client trait --
-    let client_trait = format!("{}Client", service.proto_name);
-    out.push_str(&format!(
-        "    /// Typed client trait — one method per RPC. Wraps the\n\
-        \x20   /// underlying `StreamTransport` with prost encode/decode.\n\
-        \x20   ///\n\
-        \x20   /// TODO(hellas-wire v2): the method bodies currently `unimplemented!()`\n\
-        \x20   /// — the consumer migration phase fills them in.\n\
-        \x20   pub trait {client_trait}<T: ::hellas_wire::StreamTransport> {{\n",
-        client_trait = client_trait,
-    ));
-    for method in &service.methods {
-        let fn_name = to_snake_case(&method.proto_name);
-        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
-        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
-        let (sig_req, sig_resp) = client_signature(method, &request_ty, &response_ty);
-        out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{sig_resp}, ::hellas_wire::WireStatus>> + Send;\n",
-        ));
-    }
-    out.push_str("    }\n\n");
-
     // -- Server trait --
     let server_trait = format!("{}Handler", service.proto_name);
     out.push_str(&format!(
@@ -701,7 +679,12 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
     }
     out.push_str("    }\n\n");
 
-    // -- Generic Client impl over any StreamTransport, using rpc::call helpers --
+    // -- Generic Client over any StreamTransport, using rpc::call helpers --
+    //
+    // Methods are inherent on `XClientImpl<T>`. There's no `XClient` trait:
+    // every consumer constructs `XClientImpl::new(t)` and calls methods
+    // directly; nothing in the workspace is generic over an `XClient`
+    // bound or uses `dyn XClient`, so the trait was pure indirection.
     let client_impl_name = format!("{}ClientImpl", service.proto_name);
     out.push_str(&format!(
         "    /// Generic client over any `StreamTransport`. Wraps a transport\n\
@@ -711,22 +694,15 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         \x20   pub struct {client_impl_name}<T> {{\n\
         \x20       transport: T,\n\
         \x20   }}\n\n\
-        \x20   impl<T> {client_impl_name}<T> {{\n\
-        \x20       pub fn new(transport: T) -> Self {{\n\
-        \x20           Self {{ transport }}\n\
-        \x20       }}\n\
-        \x20   }}\n\n",
-        client_impl_name = client_impl_name,
-    ));
-    // Client trait impl bodies that delegate to the call helpers.
-    out.push_str(&format!(
-        "    impl<T> {client_trait}<T> for {client_impl_name}<T>\n\
+        \x20   impl<T> {client_impl_name}<T>\n\
         \x20   where\n\
         \x20       T: ::hellas_wire::StreamTransport + Sync,\n\
         \x20       T::Error: ::std::error::Error + Send + Sync + 'static,\n\
         \x20       T::Stream: 'static,\n\
-        \x20   {{\n",
-        client_trait = client_trait,
+        \x20   {{\n\
+        \x20       pub fn new(transport: T) -> Self {{\n\
+        \x20           Self {{ transport }}\n\
+        \x20       }}\n\n",
         client_impl_name = client_impl_name,
     ));
     for method in &service.methods {
@@ -778,7 +754,7 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
             (sig_resp.clone(), body)
         };
         out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{real_sig_resp}, ::hellas_wire::WireStatus>> + Send {{\n\
+            "        pub fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{real_sig_resp}, ::hellas_wire::WireStatus>> + Send {{\n\
             {body}\n\
             \x20       }}\n",
         ));
