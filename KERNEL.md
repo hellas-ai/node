@@ -8,6 +8,9 @@ The high-level economic security goal is documented in
 `PROTOCOL_SECURITY_MODEL.md`. This document focuses on the implementation and
 formal-model boundary that supports that goal.
 
+The caller-facing integration contract is documented in `INTEGRATION.md`:
+storage, context, verifier wiring, and the one-party-key authorization model.
+
 The modeling method is documented in `FORMAL_MODELING_STRATEGY.md`: keep a
 family of small models over a shared algebra, promote focused obligations into
 integrated models, and avoid locking the protocol into mechanisms before the
