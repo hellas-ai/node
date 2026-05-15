@@ -51,16 +51,15 @@ use hellas_rpc::pb::execute::{
 };
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::model::ModelAssets;
-use hellas_rpc::peers::PeerManager;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClient, ExecuteClientImpl};
 use hellas_rpc::services::opaque::Opaque;
-use hellas_wire::WireStatus;
+use hellas_wire::{ServiceMarker, WireStatus};
 use hellas_wire::iroh::swarm::ServiceRegistry;
-use hellas_wire::iroh::{IrohTransport, PoolError};
+use hellas_wire::iroh::IrohTransport;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -83,6 +82,9 @@ pub enum ExecutionRoute {
 }
 
 impl ExecutionRoute {
+    /// Build a remote route from CLI inputs: a peer id and optional
+    /// direct-address hints. Hints become an `EndpointAddr` bundle
+    /// consumed at dial time; they are not stored in peer state.
     pub fn remote(
         node_id: Option<EndpointId>,
         node_addrs: Vec<SocketAddr>,
@@ -90,27 +92,40 @@ impl ExecutionRoute {
     ) -> Self {
         match node_id {
             Some(node_id) => Self::RemoteDirect(RemoteNodeTarget {
-                node_id,
-                node_addrs,
+                addr: EndpointAddr::from_parts(
+                    node_id,
+                    node_addrs.into_iter().map(TransportAddr::Ip),
+                ),
             }),
             None => Self::RemoteDiscovery { retries },
         }
     }
 }
 
+/// A remote dial target: the canonical iroh identity plus optional
+/// dial-time hints (direct sockaddrs, relay URLs, custom routes).
+/// `EndpointAddr` is iroh's address-bundle type; an empty hints set
+/// works because `presets::N0` configures pkarr/DNS address lookup.
+///
+/// Hints are *ephemeral*: they are passed to `Endpoint::connect`
+/// once, then discarded. They never enter `PeerManager` /
+/// `PeerDirectory`, which key on identity (`EndpointId`) only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteNodeTarget {
-    pub node_id: EndpointId,
-    pub node_addrs: Vec<SocketAddr>,
+    pub addr: EndpointAddr,
 }
 
 impl RemoteNodeTarget {
-    #[allow(dead_code)] // used once the registry supports static-addr feeds
-    fn endpoint_addr(&self) -> EndpointAddr {
-        EndpointAddr::from_parts(
-            self.node_id,
-            self.node_addrs.iter().copied().map(TransportAddr::Ip),
-        )
+    pub fn node_id(&self) -> EndpointId {
+        self.addr.id
+    }
+}
+
+impl From<EndpointId> for RemoteNodeTarget {
+    fn from(node_id: EndpointId) -> Self {
+        Self {
+            addr: EndpointAddr::from(node_id),
+        }
     }
 }
 
@@ -123,24 +138,27 @@ pub enum ExecutionStrategy {
     },
 }
 
+/// All state needed to dial remote peers: the bound iroh `Endpoint`
+/// (held so its lifetime is tied to the runtime) plus the
+/// `ServiceRegistry` of pooled per-ALPN connections built atop it.
+///
+/// Constructed lazily by [`ExecutionRuntime::remote`] — no half-built
+/// "secret key but no endpoint" state.
+#[derive(Clone)]
+pub struct RemoteRpc {
+    #[allow(dead_code)] // held alive so the registry's pools stay valid
+    endpoint: iroh::Endpoint,
+    registry: ServiceRegistry,
+}
+
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
     #[cfg(feature = "hellas-executor")]
     local_executor: Option<ExecutorHandle>,
-    /// Optional secret key for the iroh client endpoint. Held so callers can
-    /// thread an identity through `with_secret_key` even if no registry is
-    /// supplied; used by external code that constructs its own registry.
-    #[allow(dead_code)]
-    secret_key: Option<SecretKey>,
-    /// Registry-backed connection pools per service ALPN. `None` means no
-    /// remote dial path is configured; `RemoteDirect` quotes/streams will
-    /// surface a clear error in that case.
-    registry: Option<ServiceRegistry>,
-    /// Carried for parity with the pre-cutover runtime; no longer load-
-    /// bearing on the local hot path now that the executor's handle
-    /// implements the service handler traits directly.
-    #[allow(dead_code)]
-    peer_registry: PeerManager,
+    /// `Some` iff remote dialing is configured. `None` means a local-
+    /// only runtime; any `*Direct::*` path on such a runtime returns
+    /// a clear "remote dispatch on a local-only runtime" error.
+    remote: Option<RemoteRpc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,27 +275,51 @@ pub enum OpaqueOutcome {
 // ---------------------------------------------------------------------------
 
 impl ExecutionRuntime {
+    /// Local-only runtime: dispatches all calls in-process via the
+    /// executor handle. `*Direct` / `*Discovery` routes are not
+    /// reachable on this runtime — use [`Self::remote`] for those.
     #[cfg(feature = "hellas-executor")]
-    pub fn with_local_executor(local_executor: ExecutorHandle) -> Self {
+    pub fn local(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
-            secret_key: None,
-            registry: None,
-            peer_registry: PeerManager::default(),
+            remote: None,
         }
     }
 
-    pub fn with_secret_key(mut self, secret_key: SecretKey) -> Self {
-        self.secret_key = Some(secret_key);
-        self
+    /// Remote-capable runtime: binds an iroh `Endpoint` keyed on
+    /// `secret_key`, builds a `ServiceRegistry`, and registers no
+    /// discovery backends by default. `seed_targets` are dial hints
+    /// consumed at `Endpoint::connect` time per call site; they do
+    /// not become durable peer state.
+    pub async fn remote(
+        secret_key: SecretKey,
+        seed_targets: Vec<EndpointAddr>,
+    ) -> anyhow::Result<Self> {
+        Self::default().with_remote(secret_key, seed_targets).await
     }
 
-    /// Attach a `ServiceRegistry` (which owns pooled iroh connections per
-    /// service ALPN). Required for `RemoteDirect` routes; `Local` works
-    /// without one.
-    pub fn with_registry(mut self, registry: ServiceRegistry) -> Self {
-        self.registry = Some(registry);
-        self
+    /// Add remote-capability to an existing runtime (typically one
+    /// built via [`Self::local`] when verify-against-local is active).
+    /// Builds the iroh `Endpoint` and `ServiceRegistry`; `seed_targets`
+    /// remain ephemeral dial hints (see [`RemoteNodeTarget`]).
+    pub async fn with_remote(
+        mut self,
+        secret_key: SecretKey,
+        _seed_targets: Vec<EndpointAddr>,
+    ) -> anyhow::Result<Self> {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret_key)
+            .bind()
+            .await
+            .context("failed to bind iroh endpoint for ExecutionRuntime")?;
+        let registry = ServiceRegistry::new(&endpoint);
+        // Static dial hints belong at `Endpoint::connect` time (carried
+        // in `RemoteNodeTarget::addr`), not in discovery state. If a
+        // future use case wants gossip about these peers, add a
+        // `StaticBackend` here — the routing-level hints work without it.
+        let _ = _seed_targets;
+        self.remote = Some(RemoteRpc { endpoint, registry });
+        Ok(self)
     }
 
     #[cfg(feature = "hellas-executor")]
@@ -294,7 +336,7 @@ impl ExecutionRuntime {
             producer_key,
         )
         .context("failed to initialize local execution backend")?;
-        Ok(Self::with_local_executor(local_executor))
+        Ok(Self::local(local_executor))
     }
 
     #[cfg(feature = "hellas-executor")]
@@ -304,12 +346,27 @@ impl ExecutionRuntime {
             .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
     }
 
-    fn require_registry(&self) -> Result<&ServiceRegistry, anyhow::Error> {
-        self.registry
-            .as_ref()
-            .ok_or_else(|| anyhow!(
-                "remote execution requested but no iroh ServiceRegistry is configured on the runtime"
-            ))
+    /// Get a typed `IrohTransport` for one service, dialing the
+    /// supplied target. Every `*Direct::*` path in this file goes
+    /// through here so address+pool plumbing is in one place.
+    async fn remote_transport<S: ServiceMarker>(
+        &self,
+        target: &RemoteNodeTarget,
+    ) -> anyhow::Result<IrohTransport> {
+        let r = self.remote.as_ref().ok_or_else(|| {
+            anyhow!("remote dispatch on a local-only runtime — construct via ExecutionRuntime::remote(...)")
+        })?;
+        r.registry
+            .pool::<S>()
+            .transport(target.addr.clone())
+            .await
+            .map_err(|err| {
+                anyhow!(err).context(format!(
+                    "failed to dial {} on {}",
+                    S::ALPN,
+                    target.node_id()
+                ))
+            })
     }
 }
 
@@ -591,15 +648,9 @@ impl PreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let registry = runtime.require_registry()?;
-                let pool = registry.pool::<Courtesy>();
-                let transport = pool
-                    .transport(target.node_id)
-                    .await
-                    .map_err(|err: PoolError| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Courtesy on {}", target.node_id))
-                    })?;
+                let transport = runtime
+                    .remote_transport::<Courtesy>(target)
+                    .await?;
                 // Use unary_with_trailer to receive both the response and
                 // the server's End-frame metadata (provenance headers).
                 let with_trailer = hellas_rpc::call::unary_with_trailer::<
@@ -610,32 +661,26 @@ impl PreparedRoute {
                     .map_err(|status| {
                         anyhow!(status).context(format!(
                             "node {} declined quote_prepared_text",
-                            target.node_id
+                            target.node_id()
                         ))
                     })?;
                 let ticket = with_trailer.response.ticket.ok_or_else(|| {
-                    anyhow!("quote_prepared_text response from {} missing ticket", target.node_id)
+                    anyhow!(
+                        "quote_prepared_text response from {} missing ticket",
+                        target.node_id()
+                    )
                 })?;
-                // Pull provenance from the trailer. Missing/malformed
-                // provenance is a hard failure: a zero digest silently
-                // masquerades as a real commitment and hides trailer-
-                // propagation bugs from this layer to the caller.
                 let provenance =
                     hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
                         .map_err(|e| {
                             anyhow!(e).context(format!(
                                 "node {} response missing provenance metadata",
-                                target.node_id
+                                target.node_id()
                             ))
                         })?;
 
                 // Open a fresh Execute-ALPN transport for the run step.
-                let execute_pool = registry.pool::<Execute>();
-                let execute_transport =
-                    execute_pool.transport(target.node_id).await.map_err(|err| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Execute on {}", target.node_id))
-                    })?;
+                let execute_transport = runtime.remote_transport::<Execute>(target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
                     request_commitment: ticket.request_commitment,
@@ -643,17 +688,15 @@ impl PreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
-                let registry = runtime.require_registry()?;
+                let remote = runtime.remote.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "remote dispatch on a local-only runtime — \
+                         construct via ExecutionRuntime::remote(...)"
+                    )
+                })?;
                 let (target, request_commitment, provenance) =
-                    discover_and_quote(registry, quote_req, *retries).await?;
-                let execute_pool = registry.pool::<Execute>();
-                let execute_transport = execute_pool
-                    .transport(target.node_id)
-                    .await
-                    .map_err(|err: PoolError| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Execute on {}", target.node_id))
-                    })?;
+                    discover_and_quote(&remote.registry, quote_req, *retries).await?;
+                let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
                     request_commitment,
@@ -720,33 +763,19 @@ impl OpaquePreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let registry = runtime.require_registry()?;
-                let opaque_pool = registry.pool::<Opaque>();
-                let opaque_transport = opaque_pool.transport(target.node_id).await.map_err(
-                    |err: PoolError| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Opaque on {}", target.node_id))
-                    },
-                )?;
+                let opaque_transport = runtime.remote_transport::<Opaque>(target).await?;
                 let client = hellas_rpc::services::opaque::OpaqueClientImpl::new(opaque_transport);
                 use hellas_rpc::services::opaque::OpaqueClient;
-                let ticket =
-                    client
-                        .create_ticket(request.clone())
-                        .await
-                        .map_err(|status| {
-                            anyhow!(status).context(format!(
-                                "node {} declined opaque create_ticket",
-                                target.node_id
-                            ))
-                        })?;
-                let execute_pool = registry.pool::<Execute>();
-                let execute_transport = execute_pool.transport(target.node_id).await.map_err(
-                    |err| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Execute on {}", target.node_id))
-                    },
-                )?;
+                let ticket = client
+                    .create_ticket(request.clone())
+                    .await
+                    .map_err(|status| {
+                        anyhow!(status).context(format!(
+                            "node {} declined opaque create_ticket",
+                            target.node_id()
+                        ))
+                    })?;
+                let execute_transport = runtime.remote_transport::<Execute>(target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
                     request: request.clone(),
@@ -754,17 +783,15 @@ impl OpaquePreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
-                let registry = runtime.require_registry()?;
+                let remote = runtime.remote.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "remote dispatch on a local-only runtime — \
+                         construct via ExecutionRuntime::remote(...)"
+                    )
+                })?;
                 let (target, request_commitment) =
-                    discover_and_opaque_quote(registry, request, *retries).await?;
-                let execute_pool = registry.pool::<Execute>();
-                let execute_transport = execute_pool
-                    .transport(target.node_id)
-                    .await
-                    .map_err(|err: PoolError| {
-                        anyhow!(err)
-                            .context(format!("failed to dial Execute on {}", target.node_id))
-                    })?;
+                    discover_and_opaque_quote(&remote.registry, request, *retries).await?;
+                let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
                     request: request.clone(),
@@ -877,10 +904,7 @@ async fn discover_and_quote(
                 }
             };
 
-        let target = RemoteNodeTarget {
-            node_id: peer_id,
-            node_addrs: Vec::new(),
-        };
+        let target = RemoteNodeTarget::from(peer_id);
         return Ok((target, ticket.request_commitment, provenance));
     }
 
@@ -929,11 +953,7 @@ async fn discover_and_opaque_quote(
         let client = OpaqueClientImpl::new(transport);
         match client.create_ticket(request.clone()).await {
             Ok(ticket) => {
-                let target = RemoteNodeTarget {
-                    node_id: peer_id,
-                    node_addrs: Vec::new(),
-                };
-                return Ok((target, ticket.request_commitment));
+                return Ok((RemoteNodeTarget::from(peer_id), ticket.request_commitment));
             }
             Err(status) => {
                 last_error = Some(

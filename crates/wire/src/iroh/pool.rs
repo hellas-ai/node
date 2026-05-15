@@ -214,12 +214,20 @@ impl Pool {
     ///
     /// Returns [`PoolError`] if the pool is shut down, the dial times
     /// out, the connection limit is reached, or iroh refuses the dial.
-    pub async fn connection(&self, peer_id: EndpointId) -> Result<Connection, PoolError> {
+    pub async fn connection(
+        &self,
+        target: impl Into<iroh::EndpointAddr>,
+    ) -> Result<Connection, PoolError> {
+        let target: iroh::EndpointAddr = target.into();
+        let peer_id = target.id;
         if self.inner.closed.is_set() {
             return Err(PoolError::Shutdown);
         }
 
-        // Fast path: liveness-checked cache hit.
+        // Fast path: liveness-checked cache hit. Cache is keyed on
+        // EndpointId because that's the stable identity — any hints
+        // in the EndpointAddr are dial-time only and don't affect
+        // whether a live connection can be reused.
         if let Some(conn) = self.inner.cached_live(peer_id) {
             return Ok(conn);
         }
@@ -227,10 +235,12 @@ impl Pool {
         // Slow path: dial a fresh one. We don't lock the cache across the
         // dial — concurrent racers might each open a connection; the
         // loser's connection is dropped immediately when we re-insert.
+        // Pass the full EndpointAddr to iroh::Endpoint::connect so any
+        // CLI-supplied direct addresses become dial hints.
         let connect = self
             .inner
             .endpoint
-            .connect(peer_id, self.inner.alpn.as_slice());
+            .connect(target, self.inner.alpn.as_slice());
         let conn = n0_future::time::timeout(self.inner.options.connect_timeout, connect)
             .await
             .map_err(|_| PoolError::Timeout)?
@@ -292,8 +302,11 @@ impl Pool {
     /// # Errors
     ///
     /// Forwards [`PoolError`] from [`Pool::connection`].
-    pub async fn transport(&self, peer_id: EndpointId) -> Result<IrohTransport, PoolError> {
-        let conn = self.connection(peer_id).await?;
+    pub async fn transport(
+        &self,
+        target: impl Into<iroh::EndpointAddr>,
+    ) -> Result<IrohTransport, PoolError> {
+        let conn = self.connection(target).await?;
         Ok(IrohTransport::new(conn))
     }
 

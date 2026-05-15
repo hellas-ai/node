@@ -102,12 +102,13 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                 options.dtype.clone(),
                 producer_key,
             )?
-            .with_secret_key(secret_key.clone())
+            .with_remote(secret_key.clone(), Vec::new())
+            .await?
         } else {
-            ExecutionRuntime::default().with_secret_key(secret_key.clone())
+            ExecutionRuntime::remote(secret_key.clone(), Vec::new()).await?
         };
         #[cfg(not(feature = "hellas-executor"))]
-        let runtime = ExecutionRuntime::default().with_secret_key(secret_key.clone());
+        let runtime = ExecutionRuntime::remote(secret_key.clone(), Vec::new()).await?;
 
         #[cfg(feature = "hellas-executor")]
         let strategy = if options.verify_local {
