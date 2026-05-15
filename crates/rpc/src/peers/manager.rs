@@ -122,6 +122,24 @@ impl PeerManager {
         self.observe_discovered_service_name(peer, source, S::NAME, transport_security)
     }
 
+    /// Record that a peer just made an inbound request. Bumps the
+    /// per-peer `total_requests` + `last_seen_ms` + RTT EMA; ensures
+    /// the peer exists in the registry. No rate-limit policy lives
+    /// here — callers that need to *reject* abusive peers wrap their
+    /// dispatch in middleware that consults their own bucket. (The
+    /// Phase F `AdmittingDispatcher` was deferred; see the audit
+    /// comment in `cli/commands/serve/node.rs`. The esp32's inbound
+    /// path calls this method directly because the wire layer
+    /// doesn't surface peer identity into handlers yet.)
+    pub fn observe_inbound_request(
+        &self,
+        peer: PeerId,
+        rtt_ms: Option<f64>,
+    ) -> Result<PeerChange, PeerManagerError> {
+        let now = self.now_ms();
+        Ok(self.lock()?.observe_inbound_request(now, peer, rtt_ms)?)
+    }
+
     pub fn forget_peer(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
         self.apply(peer, PeerEvent::Forgotten)
     }
