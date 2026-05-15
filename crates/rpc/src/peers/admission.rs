@@ -14,13 +14,6 @@ impl RequestKind {
         Self { service, method }
     }
 
-    pub const fn for_service<S: RpcService>(method: &'static str) -> Self {
-        Self {
-            service: S::NAME,
-            method,
-        }
-    }
-
     pub const fn for_method<M: RpcMethod>() -> Self {
         Self {
             service: <M::Service as RpcService>::NAME,
@@ -47,16 +40,14 @@ impl RequestKind {
 pub struct Permit {
     peer: PeerId,
     kind: RequestKind,
-    started_at_ms: u64,
     armed: bool,
 }
 
 impl Permit {
-    pub(super) const fn new(peer: PeerId, kind: RequestKind, started_at_ms: u64) -> Self {
+    pub(super) const fn new(peer: PeerId, kind: RequestKind) -> Self {
         Self {
             peer,
             kind,
-            started_at_ms,
             armed: true,
         }
     }
@@ -67,10 +58,6 @@ impl Permit {
 
     pub const fn kind(&self) -> RequestKind {
         self.kind
-    }
-
-    pub const fn started_at_ms(&self) -> u64 {
-        self.started_at_ms
     }
 
     /// Internal disarm called by `PeerRegistry::release` before dropping the
