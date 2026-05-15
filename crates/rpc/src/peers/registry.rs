@@ -447,10 +447,45 @@ impl PeerRegistry {
         self.get(peer).and_then(PeerEntry::latency_ms)
     }
 
-    /// Record an inbound request from a peer without inferring that the peer
-    /// provides the requested service.
-    ///
-    /// Pure stats — ensures the peer is tracked, bumps `total_requests`,
+    /// Record an inbound request from a peer. Ensures the peer is
+    /// tracked, bumps `total_requests` + `last_seen_ms`, and records
+    /// any observed RTT into the EMA. No rate-limit decision is made
+    /// here; admission-policy logic lives at the caller's middleware
+    /// layer when it exists (today: only esp32 calls this directly,
+    /// at connection-establishment time, before per-method dispatch).
+    pub fn observe_inbound_request(
+        &mut self,
+        now_ms: u64,
+        peer: PeerId,
+        rtt_ms: Option<f64>,
+    ) -> Result<PeerChange, AcquireDenied> {
+        let (inserted, evicted) =
+            self.ensure_peer(now_ms, peer)
+                .map_err(|_| AcquireDenied::PeerLimit {
+                    peer,
+                    max_peers: self.config.max_peers,
+                })?;
+        let Some(entry) = self.peers.get_mut(&peer) else {
+            return Err(AcquireDenied::PeerLimit {
+                peer,
+                max_peers: self.config.max_peers,
+            });
+        };
+        entry.last_seen_ms = now_ms;
+        entry.total_requests = entry.total_requests.saturating_add(1);
+        if let Some(rtt_ms) = rtt_ms {
+            entry.rtt.record(rtt_ms);
+        }
+        Ok(PeerChange {
+            peer,
+            inserted,
+            updated: !inserted,
+            removed: false,
+            evicted,
+            dropped: false,
+        })
+    }
+
     pub fn observe_discovered_service(
         &mut self,
         now_ms: u64,
