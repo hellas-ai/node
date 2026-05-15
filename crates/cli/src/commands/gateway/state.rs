@@ -80,12 +80,12 @@ pub(super) struct HttpError {
 }
 
 impl GatewayState {
-    pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+    pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
             let producer_key =
                 crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
-            ExecutionRuntime::with_local_executor(
+            ExecutionRuntime::local(
                 Executor::spawn_with_producer_key(
                     DownloadPolicy::Eager,
                     ExecutePolicy::Eager,
@@ -95,12 +95,13 @@ impl GatewayState {
                 )
                 .context("failed to initialize local execution backend")?,
             )
-            .with_secret_key(options.secret_key.clone())
+            .with_remote(options.secret_key.clone(), Vec::new())
+            .await?
         } else {
-            ExecutionRuntime::default().with_secret_key(options.secret_key.clone())
+            ExecutionRuntime::remote(options.secret_key.clone(), Vec::new()).await?
         };
         #[cfg(not(feature = "hellas-executor"))]
-        let runtime = ExecutionRuntime::default().with_secret_key(options.secret_key.clone());
+        let runtime = ExecutionRuntime::remote(options.secret_key.clone(), Vec::new()).await?;
 
         Ok(Self {
             node_id: options.node_id,
@@ -149,10 +150,7 @@ impl GatewayState {
         if let Some(node_id) = self.verify_node_id {
             return ExecutionStrategy::Verify {
                 primary,
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
-                    node_id,
-                    node_addrs: Vec::new(),
-                }),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(node_id)),
             };
         }
 
@@ -588,10 +586,7 @@ mod tests {
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
-                    node_id: endpoint(1),
-                    node_addrs: Vec::new(),
-                }),
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(1))),
                 shadow: ExecutionRoute::Local,
             }
         );
@@ -604,14 +599,8 @@ mod tests {
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
-                    node_id: endpoint(1),
-                    node_addrs: Vec::new(),
-                }),
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget {
-                    node_id: endpoint(2),
-                    node_addrs: Vec::new(),
-                }),
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(1))),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(2))),
             }
         );
     }
