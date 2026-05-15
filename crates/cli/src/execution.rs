@@ -616,14 +616,18 @@ impl PreparedRoute {
                 let ticket = with_trailer.response.ticket.ok_or_else(|| {
                     anyhow!("quote_prepared_text response from {} missing ticket", target.node_id)
                 })?;
-                // Pull provenance from the trailer; fall back to a zero
-                // digest if the transport didn't surface trailer metadata.
-                let provenance = hellas_rpc::provenance::read_provenance_metadata(
-                    &with_trailer.metadata,
-                )
-                .unwrap_or(ExecutionProvenance {
-                    commitment_id: [0; 32],
-                });
+                // Pull provenance from the trailer. Missing/malformed
+                // provenance is a hard failure: a zero digest silently
+                // masquerades as a real commitment and hides trailer-
+                // propagation bugs from this layer to the caller.
+                let provenance =
+                    hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
+                        .map_err(|e| {
+                            anyhow!(e).context(format!(
+                                "node {} response missing provenance metadata",
+                                target.node_id
+                            ))
+                        })?;
 
                 // Open a fresh Execute-ALPN transport for the run step.
                 let execute_pool = registry.pool::<Execute>();
@@ -859,10 +863,19 @@ async fn discover_and_quote(
             continue;
         };
 
-        let provenance = hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
-            .unwrap_or(ExecutionProvenance {
-                commitment_id: [0; 32],
-            });
+        let provenance =
+            match hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_error = Some(anyhow!(e).context(format!(
+                        "peer {peer_id} response missing provenance metadata"
+                    )));
+                    if attempts >= max_attempts {
+                        break;
+                    }
+                    continue;
+                }
+            };
 
         let target = RemoteNodeTarget {
             node_id: peer_id,
