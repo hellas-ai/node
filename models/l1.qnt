@@ -30,11 +30,11 @@ module l1 {
   var liveEdges: Set[Edge]
   var height: int
 
-  // Per-edge open authorization. For every edge that goes live, the
-  // open action records the (asMaker, asTaker) parties the submitter
-  // claimed when calling `openEdge`. The `fundingAuthorized` invariant
-  // checks these against `coinOwner(makerInput(e))` / `coinOwner(takerInput(e))`
-  // — i.e. that the claimed parties actually own the consumed coins.
+  // Per-edge open authorization. For every edge that goes live, the open
+  // action records the (asMaker, asTaker) party keys the submitter claimed
+  // when calling `openEdge`. The `fundingAuthorized` invariant checks these
+  // against `coinOwner(makerInput(e))` / `coinOwner(takerInput(e))` - i.e. the
+  // same party keys that own the consumed coins authorized the open.
   // Dead-edge entries are meaningless; the invariant only ranges over
   // `liveEdges`.
   var openAuth: Edge -> OpenAuth
@@ -236,12 +236,11 @@ module l1 {
   val heightAtLeastGenesis = inv::heightAtLeastGenesis(height)
 
   // Every live edge's (asMaker, asTaker) authorization must match the
-  // canonical owners of the coins that funded it. A correct kernel
-  // enforces this on open; reaching a state where it fails means an
-  // unauthorized open went through. The Rust kernel enforces this through
-  // owner-match plus typed open authorization (`OpenAuth::Native` or
-  // `OpenAuth::WebAuthn`), both abstracted here as "the named party
-  // authorized this edge".
+  // canonical party keys that funded it. A correct kernel enforces this on
+  // open; reaching a state where it fails means an unauthorized open went
+  // through. The Rust kernel enforces this through owner-match plus typed
+  // open authorization (`OpenAuth::Native` or `OpenAuth::WebAuthn`), both
+  // abstracted here as the same party key authorizing this edge.
   val fundingAuthorized = inv::fundingAuthorized(liveEdges, openAuth)
 
   // ---------------------------------------------------------------------
