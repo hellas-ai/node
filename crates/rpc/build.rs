@@ -753,7 +753,7 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
         let (real_sig_resp, body) = if method.response_streaming && !method.request_streaming {
             (
                 format!(
-                    "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>",
+                    "crate::call::StreamingCall<{resp}>",
                     resp = response_ty
                 ),
                 format!(
@@ -765,10 +765,11 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
                 ),
             )
         } else if method.response_streaming {
-            // client-stream/bidi: keep the streaming response signature but stub the body.
+            // client-stream/bidi: keep the same response type as pure server-streaming
+            // (`StreamingCall<R>`) but stub the body until the wire-v2 helpers land.
             (
                 format!(
-                    "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>",
+                    "crate::call::StreamingCall<{resp}>",
                     resp = response_ty
                 ),
                 "            async move { let _ = request; unimplemented!(\"client/bidi streaming pending\") }".to_string(),
@@ -905,7 +906,7 @@ fn client_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, Strin
         req.to_string()
     };
     let resp_sig = if method.response_streaming {
-        format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>")
+        format!("crate::call::StreamingCall<{resp}>")
     } else {
         resp.to_string()
     };

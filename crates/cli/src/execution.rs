@@ -1054,8 +1054,14 @@ fn remote_execute_stream(
                 break;
             }
         }
+        // Stream EOF: surface the terminal trailer. A non-Ok trailer
+        // (handler aborted mid-stream, transport-level abort, etc.)
+        // becomes the call's Err — much more informative than the old
+        // "ended without terminal outcome" catch-all.
+        wire.finish()
+            .map_err(|status| anyhow!(status).context("remote execute stream trailer"))?;
         if !got_terminal {
-            Err(anyhow!("remote execute stream ended without terminal outcome"))?;
+            Err(anyhow!("remote execute stream ended Ok but emitted no Done event"))?;
         }
         drop(client);
     }
@@ -1090,9 +1096,13 @@ fn remote_execute_opaque_stream(
                 break;
             }
         }
+        wire.finish()
+            .map_err(|status| {
+                anyhow!(status).context("remote opaque execute stream trailer")
+            })?;
         if !got_terminal {
             Err(anyhow!(
-                "remote opaque execute stream ended without terminal outcome"
+                "remote opaque execute stream ended Ok but emitted no Done event"
             ))?;
         }
         drop(client);
