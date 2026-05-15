@@ -12,6 +12,7 @@ use iroh::SecretKey;
 use tracing::warn;
 
 mod node;
+mod node_handler;
 
 pub async fn run(
     port: Option<u16>,
