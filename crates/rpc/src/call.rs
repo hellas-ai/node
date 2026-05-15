@@ -5,9 +5,11 @@
 //! below, parameterised by a `MethodMarker` so prost type info is at the
 //! type level — no string method names at call sites.
 
+use std::marker::PhantomData;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use prost::Message;
 
@@ -17,10 +19,6 @@ use hellas_wire::transport::{
     MethodMarker, RecvHalf, SendHalf, Stream as WireStream, StreamTransport,
 };
 use hellas_wire::TransportError;
-
-/// Pin-boxed receive stream for server-streaming responses.
-pub type ResponseStream<R> =
-    Pin<Box<dyn futures_core::Stream<Item = Result<R, WireStatus>> + Send>>;
 
 /// Unary call: send one request, receive one response.
 pub async fn unary<T, M>(
@@ -75,51 +73,74 @@ where
         .await
         .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
 
-    let chunk_opt = match recv.next().await {
-        Some(Ok(b)) => Some(b),
+    // Unary protocol shape: exactly one body chunk, then EOF, then a
+    // terminal trailer. Anything else is a server-side bug and must
+    // surface as Internal rather than be silently swallowed.
+    let chunk = match recv.next().await {
+        Some(Ok(b)) => b,
         Some(Err(e)) => return Err(WireStatus::internal(format!("recv: {e}"))),
-        None => None,
-    };
-    // Drain to terminal so the trailer is populated.
-    while recv.next().await.is_some() {}
-    // If the server emitted an error trailer, surface it as the call
-    // result — don't conflate "no body" with "Internal".
-    if let Some(trailer) = recv.trailer() {
-        if trailer.status != WireCode::Ok {
-            return Err(WireStatus {
-                code: trailer.status,
-                message: trailer.message.clone(),
-                details: bytes::Bytes::new(),
-                metadata: trailer.metadata.clone(),
+        None => {
+            // No body — must be a terminal-trailer-only error response.
+            // Drain to populate the trailer and surface it.
+            while recv.next().await.is_some() {}
+            return Err(match recv.trailer() {
+                Some(t) if t.status != WireCode::Ok => trailer_to_status(t),
+                Some(_) => WireStatus::internal("unary handler returned no body but Ok trailer"),
+                None => WireStatus::internal("unary handler returned no body and no trailer"),
             });
         }
+    };
+    // We got the body; next() must be None next. An extra body is a
+    // handler-protocol bug, not noise to swallow.
+    match recv.next().await {
+        None => {}
+        Some(Ok(_)) => {
+            return Err(WireStatus::internal(
+                "unary handler emitted more than one body",
+            ));
+        }
+        Some(Err(e)) => return Err(WireStatus::internal(format!("recv after body: {e}"))),
     }
-    let chunk = chunk_opt.ok_or_else(|| {
-        WireStatus::new(
-            WireCode::Internal,
-            "empty unary response with Ok trailer",
-        )
-    })?;
+    let trailer = recv
+        .trailer()
+        .ok_or_else(|| WireStatus::internal("unary call ended without terminal trailer"))?;
+    if trailer.status != WireCode::Ok {
+        return Err(trailer_to_status(trailer));
+    }
     let response = M::Response::decode(&chunk[..])
         .map_err(|e| WireStatus::internal(format!("prost decode: {e}")))?;
-    let metadata = recv.trailer().map(|t| t.metadata.clone()).unwrap_or_default();
-    Ok(WithTrailer::with_metadata(response, metadata))
+    Ok(WithTrailer::with_metadata(response, trailer.metadata.clone()))
 }
 
-/// Server-streaming call: send one request, receive a stream of responses.
+fn trailer_to_status(t: &Trailer) -> WireStatus {
+    WireStatus {
+        code: t.status,
+        message: t.message.clone(),
+        details: Bytes::new(),
+        metadata: t.metadata.clone(),
+    }
+}
+
+/// Server-streaming call: send one request, receive a stream of responses
+/// + a terminal trailer.
+///
+/// Returns a [`StreamingCall`]: the consumer iterates body chunks via the
+/// `Stream` impl and MUST call [`StreamingCall::finish`] after the stream
+/// EOFs to surface the terminal trailer (or error).
 pub async fn server_streaming<T, M>(
     transport: &T,
     request: M::Request,
     headers: Metadata,
-) -> Result<ResponseStream<M::Response>, WireStatus>
+) -> Result<StreamingCall<M::Response>, WireStatus>
 where
     T: StreamTransport + Sync,
     M: MethodMarker,
     M::Request: Message,
     M::Response: Message + Default + Send + 'static,
     T::Stream: 'static,
-    <T::Stream as WireStream>::RecvHalf: 'static,
+    <T::Stream as WireStream>::RecvHalf: Unpin + 'static,
     <T::Stream as WireStream>::SendHalf: 'static,
+    <<T::Stream as WireStream>::RecvHalf as RecvHalf>::Error: std::error::Error + Send + Sync + 'static,
     T::Error: std::error::Error + Send + Sync + 'static,
 {
     let stream = transport
@@ -127,7 +148,6 @@ where
         .await
         .map_err(transport_to_status)?;
     let (mut send, recv) = WireStream::split(stream);
-    let recv = Box::pin(recv);
 
     let mut buf = BytesMut::with_capacity(request.encoded_len());
     request
@@ -140,20 +160,133 @@ where
         .await
         .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
 
-    // The send-half is dropped here; the recv-half drives response decoding.
-    let decoded =
-        recv.map(|chunk| -> Result<M::Response, WireStatus> {
-            let bytes = chunk.map_err(|e| {
-                WireStatus::internal(format!("recv: {e}"))
-            })?;
-            M::Response::decode(&bytes[..])
-                .map_err(|e| WireStatus::internal(format!("prost decode: {e}")))
-        });
-    Ok(Box::pin(decoded))
+    Ok(StreamingCall::new(recv))
 }
 
 fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
     WireStatus::new(WireCode::Unavailable, err.to_string())
+}
+
+// -- Streaming response surface ---------------------------------------------
+
+/// A streaming-response call: yields decoded body chunks via its
+/// `Stream` impl, then surfaces the terminal trailer via [`finish`].
+///
+/// Owns the recv-half directly (type-erased through a private trait
+/// so consumers don't need to thread the transport type all the way
+/// through). The protocol invariant *"0+ bodies, then exactly one
+/// terminal trailer"* maps to the API surface as *"0+ next() calls,
+/// then exactly one finish() call"* — sequenced by ownership, no
+/// invalid states representable.
+///
+/// [`finish`]: StreamingCall::finish
+#[must_use = "streaming calls carry a terminal trailer; ignoring it discards the server-side status"]
+pub struct StreamingCall<R> {
+    inner: Pin<Box<dyn ErasedRecv + Send>>,
+    eof: bool,
+    _r: PhantomData<R>,
+}
+
+// The `Pin<Box<...>>` field is already heap-pinned; the outer struct
+// only carries a `bool` and `PhantomData`, so it is safe to move the
+// outer struct around.
+impl<R> Unpin for StreamingCall<R> {}
+
+/// Object-safe view onto a recv-half. Adapts the transport-specific
+/// `RecvHalf::Error` to a `WireStatus` and exposes the trailer as an
+/// owned `Trailer` so `finish` can move out.
+trait ErasedRecv {
+    fn poll_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>)
+        -> Poll<Option<Result<Bytes, WireStatus>>>;
+    fn take_trailer(&self) -> Option<Trailer>;
+}
+
+struct RecvAdapter<R: RecvHalf + Unpin> {
+    recv: R,
+}
+
+impl<R: RecvHalf + Unpin> ErasedRecv for RecvAdapter<R>
+where
+    R::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn poll_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, WireStatus>>> {
+        match Pin::new(&mut self.recv).poll_next(cx) {
+            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(WireStatus::internal(format!("recv: {e}")))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+    fn take_trailer(&self) -> Option<Trailer> {
+        self.recv.trailer().cloned()
+    }
+}
+
+impl<R> StreamingCall<R> {
+    fn new<H>(recv: H) -> Self
+    where
+        H: RecvHalf + Unpin + Send + 'static,
+        H::Error: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            inner: Box::pin(RecvAdapter { recv }),
+            eof: false,
+            _r: PhantomData,
+        }
+    }
+
+    /// Consume the call and return the terminal trailer.
+    ///
+    /// Must be called after the `Stream` impl returns `None`. Returns
+    /// the trailer if its `status == Ok`; otherwise returns the
+    /// trailer reified as a `WireStatus` error. A missing trailer is
+    /// treated as `Internal` — the server emitted an EOF with no
+    /// terminal frame, which is itself a protocol bug.
+    pub fn finish(self) -> Result<Trailer, WireStatus> {
+        assert!(
+            self.eof,
+            "StreamingCall::finish() called before the Stream returned None"
+        );
+        match self.inner.take_trailer() {
+            Some(t) if t.status == WireCode::Ok => Ok(t),
+            Some(t) => Err(trailer_to_status(&t)),
+            None => Err(WireStatus::internal(
+                "stream ended without terminal trailer",
+            )),
+        }
+    }
+}
+
+impl<R: Message + Default> futures_core::Stream for StreamingCall<R> {
+    type Item = Result<R, WireStatus>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if self.eof {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_chunk(cx) {
+            Poll::Ready(Some(Ok(bytes))) => match R::decode(&bytes[..]) {
+                Ok(msg) => Poll::Ready(Some(Ok(msg))),
+                Err(e) => Poll::Ready(Some(Err(WireStatus::internal(format!(
+                    "prost decode: {e}"
+                ))))),
+            },
+            Poll::Ready(Some(Err(s))) => Poll::Ready(Some(Err(s))),
+            Poll::Ready(None) => {
+                self.eof = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// A successful unary response plus any trailer metadata the handler
@@ -305,4 +438,152 @@ where
         .await
         .map_err(|e| TransportError::Io(format!("close: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod streaming_call_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Synthetic recv that mimics the wire-layer ErasedRecv: pre-loaded
+    /// body chunks + a final trailer. Used to drive `StreamingCall<R>`
+    /// without spinning up a transport.
+    struct MockRecv {
+        chunks: VecDeque<Result<Bytes, WireStatus>>,
+        trailer: Option<Trailer>,
+    }
+
+    impl ErasedRecv for MockRecv {
+        fn poll_chunk(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, WireStatus>>> {
+            Poll::Ready(self.chunks.pop_front())
+        }
+        fn take_trailer(&self) -> Option<Trailer> {
+            self.trailer.clone()
+        }
+    }
+
+    fn streaming_call_from_mock<R>(
+        chunks: Vec<Result<Bytes, WireStatus>>,
+        trailer: Option<Trailer>,
+    ) -> StreamingCall<R> {
+        StreamingCall {
+            inner: Box::pin(MockRecv {
+                chunks: chunks.into(),
+                trailer,
+            }),
+            eof: false,
+            _r: PhantomData,
+        }
+    }
+
+    fn ok_trailer() -> Trailer {
+        Trailer::ok()
+    }
+
+    fn err_trailer(code: WireCode, msg: &str) -> Trailer {
+        Trailer::from_status(code, msg)
+    }
+
+    /// Encode a `u32` as a single prost-wire body chunk so a stream of
+    /// uint32 messages decodes cleanly. (prost-encoded `Default::default()`
+    /// for any all-zero scalar message is `b""`, so a real message type
+    /// would also work; uint32 keeps the test self-contained.)
+    fn body(v: u32) -> Bytes {
+        let mut b = bytes::BytesMut::new();
+        // proto wire format for `message Foo { uint32 x = 1; }`: tag 0x08 + varint(v).
+        // We'll just encode the bare uint32 value into a single-field message
+        // shape by using prost's `encode_to_vec` on a u32 in a wrapper.
+        // For brevity, define a tiny wrapper inline:
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct U32Msg {
+            #[prost(uint32, tag = "1")]
+            x: u32,
+        }
+        let m = U32Msg { x: v };
+        prost::Message::encode(&m, &mut b).unwrap();
+        b.freeze()
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct U32Msg {
+        #[prost(uint32, tag = "1")]
+        x: u32,
+    }
+
+    #[tokio::test]
+    async fn streaming_call_yields_body_then_finishes_ok() {
+        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
+            vec![Ok(body(7)), Ok(body(13))],
+            Some(ok_trailer()),
+        );
+        let a = call.next().await.unwrap().expect("first chunk");
+        assert_eq!(a.x, 7);
+        let b = call.next().await.unwrap().expect("second chunk");
+        assert_eq!(b.x, 13);
+        assert!(call.next().await.is_none(), "eof after 2 chunks");
+        let trailer = call.finish().expect("Ok trailer must surface as Ok");
+        assert_eq!(trailer.status, WireCode::Ok);
+    }
+
+    #[tokio::test]
+    async fn streaming_call_surfaces_non_ok_trailer_via_finish() {
+        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
+            vec![Ok(body(1))],
+            Some(err_trailer(WireCode::Cancelled, "abort")),
+        );
+        let _ = call.next().await.unwrap().expect("first chunk");
+        assert!(call.next().await.is_none(), "eof after 1 chunk");
+        let err = call.finish().expect_err("non-Ok trailer must surface as Err");
+        assert_eq!(err.code, WireCode::Cancelled);
+        assert_eq!(err.message.as_str(), "abort");
+    }
+
+    #[tokio::test]
+    async fn streaming_call_missing_trailer_is_internal() {
+        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
+            vec![Ok(body(1))],
+            None,
+        );
+        let _ = call.next().await;
+        let _ = call.next().await;
+        let err = call.finish().expect_err("missing trailer must surface as Err");
+        assert_eq!(err.code, WireCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn streaming_call_per_item_error_is_not_swallowed() {
+        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
+            vec![
+                Ok(body(1)),
+                Err(WireStatus::new(WireCode::DataLoss, "mid-flow")),
+            ],
+            Some(ok_trailer()),
+        );
+        let a = call.next().await.unwrap().expect("first chunk");
+        assert_eq!(a.x, 1);
+        let err = call.next().await.unwrap().expect_err("mid-flow err surfaces");
+        assert_eq!(err.code, WireCode::DataLoss);
+        // After a per-item error, the consumer still owns the call.
+        // EOF semantics depend on the underlying recv; for MockRecv,
+        // the next pop returns None.
+        assert!(call.next().await.is_none());
+        // Trailer was Ok on the mock — finish returns Ok. Real
+        // transports wouldn't emit Ok-trailer after a mid-stream error,
+        // but the API surface separates the two layers cleanly.
+        assert!(call.finish().is_ok());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "before the Stream returned None")]
+    async fn streaming_call_finish_before_eof_panics() {
+        let call: StreamingCall<U32Msg> = streaming_call_from_mock(
+            vec![Ok(body(1))],
+            Some(ok_trailer()),
+        );
+        // Skip iteration: finish() requires EOF, must panic.
+        let _ = call.finish();
+    }
 }
