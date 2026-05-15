@@ -19,17 +19,20 @@ use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, Executor, ExecuteServer, ExecutorMetrics,
     OpaqueServer, SymbolicServer,
 };
+use hellas_rpc::peers::{PeerDirectory, PeerId};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::Execute;
+use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::opaque::Opaque;
 use hellas_rpc::services::symbolic::Symbolic;
-// hellas_rpc::services::node::Node — server impl pending (CUTOVER_FINDINGS).
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use iroh::{endpoint::Connection, endpoint::presets, Endpoint, EndpointId, SecretKey};
 use tokio::task::JoinHandle;
 use tracing::warn;
+
+use super::node_handler::NodeHandlerImpl;
 
 pub(super) struct NodeHandle {
     node_id: EndpointId,
@@ -84,11 +87,10 @@ pub(super) async fn spawn_node(
     )
     .await
     .context("failed to spawn executor")?;
-    // Currently unused: preload_weights, build, graffiti. The pre-cutover
-    // node bootstrap wired these into discovery / status. Re-wire them
-    // once `hellas_wire::iroh::swarm::ServiceRegistry` publishes node
-    // metadata.
-    let _ = (preload_weights, build, graffiti);
+    // `preload_weights` was consumed by the pre-cutover model preloader.
+    // Re-wire it once that path is back. `build` and `graffiti` are now
+    // surfaced via the Node service's GetNodeInfoResponse below.
+    let _ = preload_weights;
 
     // -- Bind iroh Endpoint with one ALPN per service we serve.
     let alpns: Vec<Vec<u8>> = vec![
@@ -96,6 +98,7 @@ pub(super) async fn spawn_node(
         <Symbolic as ServiceMarker>::ALPN.as_bytes().to_vec(),
         <Opaque as ServiceMarker>::ALPN.as_bytes().to_vec(),
         <Courtesy as ServiceMarker>::ALPN.as_bytes().to_vec(),
+        <Node as ServiceMarker>::ALPN.as_bytes().to_vec(),
     ];
 
     let mut builder = Endpoint::builder(presets::N0)
@@ -111,6 +114,19 @@ pub(super) async fn spawn_node(
         .await
         .context("failed to bind iroh endpoint")?;
     let node_id = endpoint.id();
+
+    // -- Construct a shared peer directory for the Node service. Future
+    //    work (Phase F) will route inbound dispatch through an
+    //    `AdmittingDispatcher` that drives this directory's rate-limit
+    //    + admission checks; today it only feeds `get_known_peers`.
+    let local_peer = PeerId::from_bytes(*node_id.as_bytes());
+    let directory = Arc::new(PeerDirectory::new(local_peer));
+
+    // -- Build the Node handler with the operator-supplied build hash
+    //    and graffiti so introspection (`hellas rpc`) returns real data.
+    //    `NodeHandlerImpl: Clone` (its fields are Arc/Copy), so we
+    //    clone per-connection rather than wrap in Arc<dyn>.
+    let node_handler = NodeHandlerImpl::new(node_id, build, graffiti, directory.clone());
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
@@ -130,6 +146,7 @@ pub(super) async fn spawn_node(
                 }
             };
             let handle_for_conn = accept_handle.clone();
+            let node_handler_for_conn = node_handler.clone();
             tokio::spawn(async move {
                 let conn = match accepting.await {
                     Ok(c) => c,
@@ -139,7 +156,9 @@ pub(super) async fn spawn_node(
                     }
                 };
                 let alpn = conn.alpn().to_vec();
-                if let Err(e) = serve_connection(alpn, conn, handle_for_conn).await {
+                if let Err(e) =
+                    serve_connection(alpn, conn, handle_for_conn, node_handler_for_conn).await
+                {
                     warn!("serve_connection error: {e}");
                 }
             });
@@ -160,6 +179,7 @@ async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
     handle: hellas_executor::ExecutorHandle,
+    node_handler: NodeHandlerImpl,
 ) -> anyhow::Result<()> {
     let transport = IrohTransport::new(conn);
 
@@ -174,6 +194,9 @@ async fn serve_connection(
         serve_loop(&transport, &server).await
     } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
         let server = CourtesyServer(handle);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
+        let server = NodeServer(node_handler);
         serve_loop(&transport, &server).await
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
