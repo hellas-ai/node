@@ -445,9 +445,13 @@ mod streaming_call_tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// Synthetic recv that mimics the wire-layer ErasedRecv: pre-loaded
-    /// body chunks + a final trailer. Used to drive `StreamingCall<R>`
-    /// without spinning up a transport.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct U32Msg {
+        #[prost(uint32, tag = "1")]
+        x: u32,
+    }
+
+    /// Synthetic recv: pre-loaded chunks + optional trailer.
     struct MockRecv {
         chunks: VecDeque<Result<Bytes, WireStatus>>,
         trailer: Option<Trailer>,
@@ -465,125 +469,69 @@ mod streaming_call_tests {
         }
     }
 
-    fn streaming_call_from_mock<R>(
+    fn call(
         chunks: Vec<Result<Bytes, WireStatus>>,
         trailer: Option<Trailer>,
-    ) -> StreamingCall<R> {
+    ) -> StreamingCall<U32Msg> {
         StreamingCall {
-            inner: Box::pin(MockRecv {
-                chunks: chunks.into(),
-                trailer,
-            }),
+            inner: Box::pin(MockRecv { chunks: chunks.into(), trailer }),
             eof: false,
             _r: PhantomData,
         }
     }
 
-    fn ok_trailer() -> Trailer {
-        Trailer::ok()
-    }
-
-    fn err_trailer(code: WireCode, msg: &str) -> Trailer {
-        Trailer::from_status(code, msg)
-    }
-
-    /// Encode a `u32` as a single prost-wire body chunk so a stream of
-    /// uint32 messages decodes cleanly. (prost-encoded `Default::default()`
-    /// for any all-zero scalar message is `b""`, so a real message type
-    /// would also work; uint32 keeps the test self-contained.)
     fn body(v: u32) -> Bytes {
         let mut b = bytes::BytesMut::new();
-        // proto wire format for `message Foo { uint32 x = 1; }`: tag 0x08 + varint(v).
-        // We'll just encode the bare uint32 value into a single-field message
-        // shape by using prost's `encode_to_vec` on a u32 in a wrapper.
-        // For brevity, define a tiny wrapper inline:
-        #[derive(Clone, PartialEq, ::prost::Message)]
-        struct U32Msg {
-            #[prost(uint32, tag = "1")]
-            x: u32,
-        }
-        let m = U32Msg { x: v };
-        prost::Message::encode(&m, &mut b).unwrap();
+        prost::Message::encode(&U32Msg { x: v }, &mut b).unwrap();
         b.freeze()
     }
 
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    struct U32Msg {
-        #[prost(uint32, tag = "1")]
-        x: u32,
+    #[tokio::test]
+    async fn happy_path_then_ok_trailer() {
+        let mut c = call(vec![Ok(body(7)), Ok(body(13))], Some(Trailer::ok()));
+        assert_eq!(c.next().await.unwrap().unwrap().x, 7);
+        assert_eq!(c.next().await.unwrap().unwrap().x, 13);
+        assert!(c.next().await.is_none());
+        assert_eq!(c.finish().unwrap().status, WireCode::Ok);
     }
 
     #[tokio::test]
-    async fn streaming_call_yields_body_then_finishes_ok() {
-        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
-            vec![Ok(body(7)), Ok(body(13))],
-            Some(ok_trailer()),
-        );
-        let a = call.next().await.unwrap().expect("first chunk");
-        assert_eq!(a.x, 7);
-        let b = call.next().await.unwrap().expect("second chunk");
-        assert_eq!(b.x, 13);
-        assert!(call.next().await.is_none(), "eof after 2 chunks");
-        let trailer = call.finish().expect("Ok trailer must surface as Ok");
-        assert_eq!(trailer.status, WireCode::Ok);
-    }
-
-    #[tokio::test]
-    async fn streaming_call_surfaces_non_ok_trailer_via_finish() {
-        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
+    async fn non_ok_trailer_surfaces_via_finish() {
+        let mut c = call(
             vec![Ok(body(1))],
-            Some(err_trailer(WireCode::Cancelled, "abort")),
+            Some(Trailer::from_status(WireCode::Cancelled, "abort")),
         );
-        let _ = call.next().await.unwrap().expect("first chunk");
-        assert!(call.next().await.is_none(), "eof after 1 chunk");
-        let err = call.finish().expect_err("non-Ok trailer must surface as Err");
+        let _ = c.next().await;
+        let _ = c.next().await; // drain to EOF
+        let err = c.finish().unwrap_err();
         assert_eq!(err.code, WireCode::Cancelled);
         assert_eq!(err.message.as_str(), "abort");
     }
 
     #[tokio::test]
-    async fn streaming_call_missing_trailer_is_internal() {
-        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
-            vec![Ok(body(1))],
-            None,
-        );
-        let _ = call.next().await;
-        let _ = call.next().await;
-        let err = call.finish().expect_err("missing trailer must surface as Err");
-        assert_eq!(err.code, WireCode::Internal);
+    async fn missing_trailer_is_internal() {
+        let mut c = call(vec![Ok(body(1))], None);
+        let _ = c.next().await;
+        let _ = c.next().await;
+        assert_eq!(c.finish().unwrap_err().code, WireCode::Internal);
     }
 
     #[tokio::test]
-    async fn streaming_call_per_item_error_is_not_swallowed() {
-        let mut call: StreamingCall<U32Msg> = streaming_call_from_mock(
-            vec![
-                Ok(body(1)),
-                Err(WireStatus::new(WireCode::DataLoss, "mid-flow")),
-            ],
-            Some(ok_trailer()),
+    async fn per_item_error_propagates() {
+        let mut c = call(
+            vec![Ok(body(1)), Err(WireStatus::new(WireCode::DataLoss, "mid"))],
+            Some(Trailer::ok()),
         );
-        let a = call.next().await.unwrap().expect("first chunk");
-        assert_eq!(a.x, 1);
-        let err = call.next().await.unwrap().expect_err("mid-flow err surfaces");
-        assert_eq!(err.code, WireCode::DataLoss);
-        // After a per-item error, the consumer still owns the call.
-        // EOF semantics depend on the underlying recv; for MockRecv,
-        // the next pop returns None.
-        assert!(call.next().await.is_none());
-        // Trailer was Ok on the mock — finish returns Ok. Real
-        // transports wouldn't emit Ok-trailer after a mid-stream error,
-        // but the API surface separates the two layers cleanly.
-        assert!(call.finish().is_ok());
+        assert_eq!(c.next().await.unwrap().unwrap().x, 1);
+        assert_eq!(
+            c.next().await.unwrap().unwrap_err().code,
+            WireCode::DataLoss,
+        );
     }
 
     #[tokio::test]
     #[should_panic(expected = "before the Stream returned None")]
-    async fn streaming_call_finish_before_eof_panics() {
-        let call: StreamingCall<U32Msg> = streaming_call_from_mock(
-            vec![Ok(body(1))],
-            Some(ok_trailer()),
-        );
-        // Skip iteration: finish() requires EOF, must panic.
-        let _ = call.finish();
+    async fn finish_before_eof_panics() {
+        let _ = call(vec![Ok(body(1))], Some(Trailer::ok())).finish();
     }
 }
