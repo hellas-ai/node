@@ -47,13 +47,6 @@ impl PeerManager {
         }
     }
 
-    pub fn from_registry(registry: PeerRegistry) -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(registry)),
-            base: Instant::now(),
-        }
-    }
-
     /// Milliseconds since this manager was constructed.
     ///
     /// Monotonic: never goes backward, never jumps forward across NTP / DST /
