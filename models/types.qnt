@@ -47,9 +47,10 @@ module types {
     | Adversary
 
   // Open authorization reduced to the security property the kernel needs:
-  // the named maker/taker parties authorized the open. The concrete envelope
-  // may be native or WebAuthn; at this abstraction level only the resulting
-  // party identity matters.
+  // the same maker/taker party keys that own the funding lineage and appear
+  // in the terms authorized the open. Native and WebAuthn are witness
+  // encodings for that same party identity, not separate authorization
+  // namespaces.
   type OpenAuth = { maker: Party, taker: Party }
 
   // Canonical coin ownership. Every concrete coin in the closed universe
@@ -160,12 +161,13 @@ module types {
       | Edge2 => TakerOut2
     }
 
-  // Sentinel value for edge slots that are not live. The value is not treated
-  // as an authorization; invariants only inspect open auth for live edges.
+  // Sentinel value for edge slots that are not live. `Adversary` is never a
+  // valid economic party key here; invariants only inspect open auth for live
+  // edges, so this cannot be mistaken for a real authorization.
   pure val NoOpenAuth = { maker: Adversary, taker: Adversary }
 
-  // The only authorization acceptable for an edge is the pair of owners of
-  // the funding coins that edge consumes.
+  // The only authorization acceptable for this two-sided funding model is the
+  // pair of party keys that owns the coins consumed by the edge.
   pure def canonicalOpenAuth(e: Edge): OpenAuth =
     { maker: coinOwner(makerInput(e)), taker: coinOwner(takerInput(e)) }
 
