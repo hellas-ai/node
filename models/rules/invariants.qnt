@@ -139,9 +139,9 @@ module invariants {
       liveCoins.contains(makerOutput(e)) == liveCoins.contains(takerOutput(e)))
 
   // Every live edge's recorded open authorization must match the canonical
-  // owners of the funding coins that edge consumed. This abstracts over the
-  // concrete auth envelope: native and WebAuthn both reduce to the same party
-  // authorization fact.
+  // party keys for the funding lineage consumed by that edge. This abstracts
+  // over native/WebAuthn witness encoding without introducing a second
+  // authorization identity.
   pure def fundingAuthorized(
     liveEdges: Set[Edge],
     openAuth: Edge -> OpenAuth,

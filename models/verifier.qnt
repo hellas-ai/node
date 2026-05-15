@@ -4,9 +4,10 @@
 //
 // Mirrors src/verifier.rs at the abstract close-proof level. The Rust
 // verifier trait also covers typed open authorization; the L1 model
-// represents that separately as `openAuth` in l1.qnt because the concrete
-// signature envelope (native vs WebAuthn) is irrelevant to the state
-// invariants once it establishes "this party authorized the open".
+// represents that separately as `openAuth` in l1.qnt because native vs
+// WebAuthn changes only the witness encoding. The invariant cares that the
+// same party key used for funds/terms authorized the open, with no separate
+// open-auth key namespace.
 // Two narrow verifier interfaces draw the kernel/crypto seam:
 //
 //   sigOk(...)  ↔ SigVerifier::verify_sig

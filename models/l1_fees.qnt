@@ -36,6 +36,11 @@ module l1_fees {
     | EmptyFunding
     | SelfFunding
 
+  // Parties named by the channel terms and open authorization. Native and
+  // WebAuthn are concrete witness encodings for these same party keys; the
+  // fee model does not introduce an extra open-auth key namespace. One-sided
+  // and empty funding can still require both parties to consent, while a
+  // self-edge intentionally names the same party key twice.
   type OpenParties = { maker: Party, taker: Party }
 
   type CloseOutcome =
@@ -141,6 +146,19 @@ module l1_fees {
       | SelfFunding => { maker: Maker, taker: Maker }
     }
 
+  pure def fundingInputsOwnedByOpenParties(
+    shape: FundingShape,
+    parties: OpenParties,
+  ): bool =
+    makerInputs(shape).forall(id => coinOwner(id) == parties.maker)
+      and takerInputs(shape).forall(id => coinOwner(id) == parties.taker)
+
+  pure def openAuthorizationOk(shape: FundingShape, parties: OpenParties): bool =
+    parties == openPartiesFor(shape)
+      and parties.maker != Adversary
+      and parties.taker != Adversary
+      and fundingInputsOwnedByOpenParties(shape, parties)
+
   pure def fundingTotalFor(shape: FundingShape): int =
     match shape {
       | FullFunding => MakerValue + TakerValue
@@ -237,10 +255,6 @@ module l1_fees {
       0,
     )
 
-  pure def fundingOwnershipOk(shape: FundingShape): bool =
-    makerInputs(shape).forall(id => coinOwner(id) == openPartiesFor(shape).maker)
-      and takerInputs(shape).forall(id => coinOwner(id) == openPartiesFor(shape).taker)
-
   pure def violationEnabled(shape: FundingShape): bool =
     shape != EmptyFunding
       and openPartiesFor(shape).maker != openPartiesFor(shape).taker
@@ -314,7 +328,7 @@ module l1_fees {
       and reserves.get(Channel) == 0
       and closeFees.get(Channel) == 0
       and height < TimeoutHeight
-      and fundingOwnershipOk(shape)
+      and openAuthorizationOk(shape, openPartiesFor(shape))
       and fundingInputs(shape).forall(id => liveCoins.contains(id))
       and fundingValue(shape) == fundingTotalFor(shape)
       and fundingValue(shape) >= openDebitFor(shape)
@@ -660,12 +674,12 @@ module l1_fees {
       and fundingTotalFor(EmptyFunding) == 0
       and openPartiesFor(SelfFunding).maker == openPartiesFor(SelfFunding).taker
       and openPartiesFor(FullFunding).maker != openPartiesFor(FullFunding).taker
-      and canOpen(EmptyFunding) implies fundingValue(EmptyFunding) == 0
+      and (canOpen(EmptyFunding) implies fundingValue(EmptyFunding) == 0)
+      and AllFundingShapes.forall(shape => openAuthorizationOk(shape, openPartiesFor(shape)))
 
   val fundingAuthorized =
     liveEdges.forall(id =>
-      edgeParties.get(id) == openPartiesFor(edgeShape.get(id))
-        and fundingOwnershipOk(edgeShape.get(id)))
+      openAuthorizationOk(edgeShape.get(id), edgeParties.get(id)))
 
   val expiredLiveHasTimeoutPath =
     not(liveEdges.contains(Channel)) or height < TimeoutHeight or canClose(Timeout)
