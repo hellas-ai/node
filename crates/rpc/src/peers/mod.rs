@@ -30,9 +30,7 @@ mod registry;
 mod security;
 
 pub use admission::AcquireDenied;
-pub use directory::{
-    InboundAdmission, InboundRequestPolicy, PeerDirectory, PeerDirectoryConfig,
-};
+pub use directory::{PeerDirectory, PeerDirectoryConfig};
 pub use id::PeerId;
 pub use manager::{
     PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation,

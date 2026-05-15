@@ -125,7 +125,6 @@ pub enum PeerEvent {
         label: String,
     },
     InvalidRequest,
-    RateLimited,
     Forgotten,
 }
 
@@ -452,81 +451,6 @@ impl PeerRegistry {
     /// provides the requested service.
     ///
     /// Pure stats — ensures the peer is tracked, bumps `total_requests`,
-    /// updates the RTT EMA. Does *not* touch the per-peer rate-limit
-    /// bucket; callers that actually reject on rate-limit must consult
-    /// [`Self::try_admit_inbound`] explicitly. Splitting stats from the
-    /// bucket spend means `account_only` methods can't drain admission for
-    /// `rate_limited` disclosure-style methods like `Node/GetKnownPeers`.
-    pub fn observe_inbound_request(
-        &mut self,
-        now_ms: u64,
-        peer: PeerId,
-        rtt_ms: Option<f64>,
-    ) -> Result<PeerChange, AcquireDenied> {
-        let (inserted, evicted) =
-            self.ensure_peer(now_ms, peer)
-                .map_err(|_| AcquireDenied::PeerLimit {
-                    peer,
-                    max_peers: self.config.max_peers,
-                })?;
-
-        let Some(entry) = self.peers.get_mut(&peer) else {
-            return Err(AcquireDenied::PeerLimit {
-                peer,
-                max_peers: self.config.max_peers,
-            });
-        };
-
-        entry.last_seen_ms = now_ms;
-        entry.total_requests = entry.total_requests.saturating_add(1);
-        if let Some(rtt_ms) = rtt_ms {
-            entry.rtt.record(rtt_ms);
-        }
-
-        Ok(PeerChange {
-            peer,
-            inserted,
-            updated: !inserted,
-            removed: false,
-            evicted,
-            dropped: false,
-        })
-    }
-
-    /// Spend one token from the per-peer rate-limit bucket. The directory
-    /// invokes this only for methods marked `rate_limited` — `account_only`
-    /// methods stay out of the bucket so they can't drain admission for
-    /// disclosure-style methods (`GetKnownPeers`, etc.). Returns `Err` with
-    /// retry-after when the bucket is empty.
-    pub fn try_admit_inbound(
-        &mut self,
-        now_ms: u64,
-        peer: PeerId,
-    ) -> Result<(), AcquireDenied> {
-        let Some(entry) = self.peers.get_mut(&peer) else {
-            return Err(AcquireDenied::PeerLimit {
-                peer,
-                max_peers: self.config.max_peers,
-            });
-        };
-        if let Err(retry_after_ms) = entry.bucket.try_take(
-            now_ms,
-            self.config.bucket_capacity,
-            self.config.bucket_refill_per_sec,
-        ) {
-            entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
-            return Err(AcquireDenied::RateLimited {
-                peer,
-                retry_after_ms,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn observe_invalid_request(&mut self, now_ms: u64, peer: PeerId) -> PeerChange {
-        self.apply(now_ms, peer, PeerEvent::InvalidRequest)
-    }
-
     pub fn observe_discovered_service(
         &mut self,
         now_ms: u64,
@@ -669,9 +593,6 @@ impl PeerRegistry {
             }
             PeerEvent::InvalidRequest => {
                 entry.invalid_request_count = entry.invalid_request_count.saturating_add(1);
-            }
-            PeerEvent::RateLimited => {
-                entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             }
             PeerEvent::Forgotten => unreachable!("forgotten events are handled before insert"),
         }
@@ -1108,34 +1029,6 @@ mod tests {
             bucket_refill_per_sec: 1.0,
             ..config()
         });
-    }
-
-    #[test]
-    fn inbound_requests_do_not_imply_service_capability() {
-        let mut registry = PeerRegistry::with_config(config());
-        let id = peer(9);
-
-        registry
-            .observe_inbound_request(10, id, Some(25.0))
-            .expect("inbound request should be recorded");
-
-        let entry = registry.get(id).expect("peer should exist");
-        assert_eq!(entry.total_requests, 1);
-        assert_eq!(entry.success_count, 0);
-        assert_eq!(entry.latency_ms(), Some(25.0));
-        assert!(!entry.has_service(NODE));
-    }
-
-    #[test]
-    fn tracks_invalid_requests() {
-        let mut registry = PeerRegistry::with_config(config());
-        let id = peer(10);
-
-        registry.observe_invalid_request(10, id);
-        registry.observe_invalid_request(20, id);
-
-        let entry = registry.get(id).expect("peer should exist");
-        assert_eq!(entry.invalid_request_count, 2);
     }
 
     #[test]
