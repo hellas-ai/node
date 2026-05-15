@@ -55,7 +55,7 @@ use hellas_rpc::model::ModelAssets;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::Courtesy;
-use hellas_rpc::services::execute::{Execute, ExecuteClient, ExecuteClientImpl};
+use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::opaque::Opaque;
 use hellas_wire::{ServiceMarker, WireStatus};
 use hellas_wire::iroh::swarm::ServiceRegistry;
@@ -765,7 +765,6 @@ impl OpaquePreparedRoute {
             ExecutionRoute::RemoteDirect(target) => {
                 let opaque_transport = runtime.remote_transport::<Opaque>(target).await?;
                 let client = hellas_rpc::services::opaque::OpaqueClientImpl::new(opaque_transport);
-                use hellas_rpc::services::opaque::OpaqueClient;
                 let ticket = client
                     .create_ticket(request.clone())
                     .await
@@ -919,7 +918,7 @@ async fn discover_and_opaque_quote(
     request: &PbOpaqueRequest,
     retries: usize,
 ) -> anyhow::Result<(RemoteNodeTarget, Vec<u8>)> {
-    use hellas_rpc::services::opaque::{OpaqueClient, OpaqueClientImpl};
+    use hellas_rpc::services::opaque::OpaqueClientImpl;
     let mut stream = Box::pin(registry.discover::<Opaque>());
     let pool = registry.pool::<Opaque>();
     let mut last_error: Option<anyhow::Error> = None;

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use hellas_rpc::pb::swarm::GetNodeInfoRequest;
-use hellas_rpc::services::node::{NodeClient, NodeClientImpl};
+use hellas_rpc::services::node::NodeClientImpl;
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::ServiceMarker;
 use iroh::endpoint::presets;
