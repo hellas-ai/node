@@ -12,6 +12,7 @@ pub mod model;
 
 pub mod call;
 pub mod peers;
+pub mod serve;
 pub mod spec;
 pub use spec::ModelSpec;
 

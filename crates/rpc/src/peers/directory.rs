@@ -152,6 +152,14 @@ impl PeerDirectory {
         }
     }
 
+    /// Cheap (`Arc<Mutex<_>>`) clone of the underlying `PeerManager`,
+    /// for callers — chiefly `AccountingDispatcher` — that need to
+    /// write inbound observations into the same registry this
+    /// directory will later rank from.
+    pub fn manager(&self) -> PeerManager {
+        self.manager.clone()
+    }
+
     pub fn ranked_known_peers(
         &self,
         requester: PeerId,
