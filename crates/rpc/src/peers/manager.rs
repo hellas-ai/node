@@ -8,8 +8,8 @@ use thiserror::Error;
 
 use super::admission::{Outcome, Permit, RequestKind};
 use super::{
-    AcquireDenied, DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerId, PeerRegistry,
-    PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, ServiceState, TransportSecurity,
+    AcquireDenied, DiscoverySource, PeerChange, PeerEvent, PeerId, PeerRegistry,
+    PeerRegistryConfig, RpcMethod, RpcService, ServiceObservation, TransportSecurity,
 };
 
 /// Shared peer-state owner for application code.
@@ -165,14 +165,6 @@ impl PeerManager {
         )
     }
 
-    pub fn set_peer_trusted(
-        &self,
-        peer: PeerId,
-        trusted: bool,
-    ) -> Result<PeerChange, PeerManagerError> {
-        self.apply(peer, PeerEvent::TrustSet { trusted })
-    }
-
     pub fn acquire_rpc(
         &self,
         peer: PeerId,
@@ -248,28 +240,12 @@ impl PeerSession {
         self.manager.set_peer_label(self.peer, label)
     }
 
-    pub fn set_trusted(&self, trusted: bool) -> Result<PeerChange, PeerManagerError> {
-        self.manager.set_peer_trusted(self.peer, trusted)
-    }
-
     pub fn service<S: RpcService>(&self) -> PeerServiceSession<S> {
         PeerServiceSession {
             manager: self.manager.clone(),
             peer: self.peer,
             _service: PhantomData,
         }
-    }
-
-    pub fn with_entry<R>(
-        &self,
-        read: impl FnOnce(Option<&PeerEntry>) -> R,
-    ) -> Result<R, PeerManagerError> {
-        self.manager
-            .with_registry(|registry| read(registry.get(self.peer)))
-    }
-
-    pub fn entry_snapshot(&self) -> Result<Option<PeerEntry>, PeerManagerError> {
-        self.with_entry(|entry| entry.cloned())
     }
 }
 
@@ -290,10 +266,6 @@ impl<S: RpcService> PeerServiceSession<S> {
         self.peer
     }
 
-    pub const fn service_name(&self) -> &'static str {
-        S::NAME
-    }
-
     pub fn observe_discovered(
         &self,
         source: DiscoverySource,
@@ -301,23 +273,6 @@ impl<S: RpcService> PeerServiceSession<S> {
     ) -> Result<ServiceObservation, PeerManagerError> {
         self.manager
             .observe_discovered_service::<S>(self.peer, source, transport_security)
-    }
-
-    pub fn acquire_method<M: RpcMethod<Service = S>>(
-        &self,
-        observation: RpcObservation,
-    ) -> Result<RpcPermitGuard, PeerManagerError> {
-        self.manager
-            .acquire_rpc(self.peer, RequestKind::for_method::<M>(), observation)
-    }
-
-    pub fn state(&self) -> Result<Option<ServiceState>, PeerManagerError> {
-        self.manager.with_registry(|registry| {
-            registry
-                .get(self.peer)
-                .and_then(|entry| entry.service::<S>())
-                .cloned()
-        })
     }
 }
 
@@ -547,72 +502,6 @@ mod tests {
         assert_eq!(registry.total_in_flight(), 0);
     }
 
-    #[test]
-    fn service_session_ties_method_to_service() {
-        let manager = PeerManager::with_config(config());
-        let id = peer(4);
-        let node = manager.peer(id).service::<Node>();
-
-        let mut permit = node
-            .acquire_method::<crate::services::node::GetNodeInfo>(
-                RpcObservation::authenticated_transport("iroh"),
-            )
-            .expect("request should be admitted");
-        permit.finish_ok();
-
-        let service = node
-            .state()
-            .expect("registry should be readable")
-            .expect("node service should be recorded");
-        assert_eq!(service.service, <Node as RpcService>::NAME);
-        assert_eq!(service.success_count, 1);
-    }
-
-    #[test]
-    fn peer_session_records_discovery_without_service() {
-        let manager = PeerManager::with_config(config());
-        let id = peer(5);
-
-        let change = manager
-            .peer(id)
-            .observe_discovered(DiscoverySource::PeerExchange, TransportSecurity::Untrusted)
-            .expect("peer should be recorded");
-        assert!(change.inserted);
-
-        let entry = manager
-            .peer(id)
-            .entry_snapshot()
-            .expect("registry should be readable")
-            .expect("peer should exist");
-        assert!(entry.services.is_empty());
-    }
-
-    #[test]
-    fn peer_session_records_label_trust_and_forget() {
-        let manager = PeerManager::with_config(config());
-        let id = peer(6);
-        let peer = manager.peer(id);
-
-        peer.observe_discovered(DiscoverySource::Manual, TransportSecurity::Untrusted)
-            .expect("peer should be recorded");
-        peer.set_label("local gpu")
-            .expect("label should be recorded");
-        peer.set_trusted(true).expect("trust should be recorded");
-
-        let entry = peer
-            .entry_snapshot()
-            .expect("registry should be readable")
-            .expect("peer should exist");
-        assert_eq!(entry.label.as_deref(), Some("local gpu"));
-        assert!(entry.trusted);
-
-        peer.forget().expect("peer should be forgotten");
-        assert!(
-            peer.entry_snapshot()
-                .expect("registry should be readable")
-                .is_none()
-        );
-    }
 
     #[test]
     fn finish_ok_after_forget_preserves_tombstone_and_purges_entry() {
