@@ -58,7 +58,7 @@ pub struct GatewayOptions {
 }
 
 pub async fn run(options: GatewayOptions) -> CliResult<()> {
-    let state = Arc::new(GatewayState::from_options(&options)?);
+    let state = Arc::new(GatewayState::from_options(&options).await?);
 
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
