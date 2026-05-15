@@ -124,9 +124,6 @@ pub enum PeerEvent {
     LabelSet {
         label: String,
     },
-    TrustSet {
-        trusted: bool,
-    },
     InvalidRequest,
     RateLimited,
     Forgotten,
@@ -245,7 +242,6 @@ pub struct PeerEntry {
     pub last_source: Option<DiscoverySource>,
     pub transport_security: TransportSecurity,
     pub auth_level: AuthLevel,
-    pub trusted: bool,
     pub label: Option<String>,
     pub services: HashMap<&'static str, ServiceState>,
     pub rtt: EwmaLatency,
@@ -275,7 +271,6 @@ impl PeerEntry {
             last_source: None,
             transport_security: TransportSecurity::Untrusted,
             auth_level: AuthLevel::Untrusted,
-            trusted: false,
             label: None,
             services: HashMap::new(),
             rtt: EwmaLatency { alpha: rtt_alpha, est_ms: None },
@@ -312,14 +307,9 @@ impl PeerEntry {
         self.rtt.get()
     }
 
-    fn update_auth_level(&mut self) {
-        self.auth_level =
-            AuthLevel::from_transport_and_trust(self.transport_security, self.trusted);
-    }
-
     fn observe_transport(&mut self, transport_security: TransportSecurity) {
         self.transport_security = self.transport_security.strongest(transport_security);
-        self.update_auth_level();
+        self.auth_level = AuthLevel::from_transport(self.transport_security);
     }
 
     /// Record a service observation. When the per-peer service cap is hit,
@@ -364,13 +354,12 @@ impl PeerEntry {
         evicted
     }
 
-    /// Order: trust < transport security < #services < successes < last_seen
+    /// Order: transport security < #services < successes < last_seen
     /// < PeerId. The trailing `PeerId` is a stable tie-breaker so eviction
     /// stays deterministic even when every other key matches — HashMap
     /// iteration order is randomized and would otherwise leak into output.
-    fn eviction_key(&self) -> (u8, u8, usize, u64, u64, PeerId) {
+    fn eviction_key(&self) -> (u8, usize, u64, u64, PeerId) {
         (
-            u8::from(self.trusted),
             self.transport_security.strength(),
             self.services.len(),
             self.success_count,
@@ -453,14 +442,6 @@ impl PeerRegistry {
 
     pub fn iter(&self) -> impl Iterator<Item = &PeerEntry> {
         self.peers.values().filter(|e| !e.tombstoned)
-    }
-
-    pub fn with_service(&self, service: &'static str) -> impl Iterator<Item = &PeerEntry> {
-        self.iter().filter(move |peer| peer.has_service(service))
-    }
-
-    pub fn with_service_key<S: RpcService>(&self) -> impl Iterator<Item = &PeerEntry> {
-        self.with_service(S::NAME)
     }
 
     pub fn latency(&self, peer: PeerId) -> Option<f64> {
@@ -686,10 +667,6 @@ impl PeerRegistry {
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));
             }
-            PeerEvent::TrustSet { trusted } => {
-                entry.trusted = trusted;
-                entry.update_auth_level();
-            }
             PeerEvent::InvalidRequest => {
                 entry.invalid_request_count = entry.invalid_request_count.saturating_add(1);
             }
@@ -758,7 +735,7 @@ impl PeerRegistry {
         entry.last_seen_ms = now_ms;
         self.total_in_flight += 1;
 
-        Ok(Permit::new(peer, kind, now_ms))
+        Ok(Permit::new(peer, kind))
     }
 
     pub fn release(&mut self, now_ms: u64, mut permit: Permit, outcome: Outcome) -> PeerChange {
@@ -965,7 +942,10 @@ mod tests {
 
         let entry = registry.get(id).expect("peer should exist");
         assert!(entry.has_service(NODE));
-        assert_eq!(registry.with_service_key::<Node>().count(), 1);
+        assert_eq!(
+            registry.iter().filter(|p| p.has_service(NODE)).count(),
+            1
+        );
     }
 
     #[test]
@@ -1160,18 +1140,10 @@ mod tests {
 
     #[test]
     fn auth_level_ordering_matches_authority() {
-        // `allows_at_least` encodes the authority lattice explicitly so
-        // adding/reordering variants in security.rs can't silently flip
-        // filter semantics. Spot-check the strict chain and the reflexive
-        // case at every step.
         assert!(AuthLevel::Authenticated.allows_at_least(AuthLevel::Local));
-        assert!(AuthLevel::Local.allows_at_least(AuthLevel::Trusted));
-        assert!(AuthLevel::Trusted.allows_at_least(AuthLevel::Untrusted));
-
+        assert!(AuthLevel::Local.allows_at_least(AuthLevel::Untrusted));
         assert!(!AuthLevel::Local.allows_at_least(AuthLevel::Authenticated));
-        assert!(!AuthLevel::Trusted.allows_at_least(AuthLevel::Local));
-        assert!(!AuthLevel::Untrusted.allows_at_least(AuthLevel::Trusted));
-
+        assert!(!AuthLevel::Untrusted.allows_at_least(AuthLevel::Local));
         assert!(AuthLevel::Authenticated.allows_at_least(AuthLevel::Authenticated));
         assert!(AuthLevel::Untrusted.allows_at_least(AuthLevel::Untrusted));
     }

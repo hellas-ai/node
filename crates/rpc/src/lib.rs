@@ -42,10 +42,6 @@ pub use model::ModelAssetsError;
 #[cfg(feature = "node")]
 pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
-/// Body-frame size cap for the wire layer's per-call payloads. Matches
-/// the historical gRPC message limit so legacy paths see no regression.
-pub const MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
-
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
