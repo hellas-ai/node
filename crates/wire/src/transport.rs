@@ -8,16 +8,41 @@ use std::future::Future;
 
 use bytes::Bytes;
 use futures_core::Stream as FuturesStream;
-use smol_str::SmolStr;
 
 use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
 
-/// Peer identity. Transports that have a real identity (iroh QUIC cert,
-/// mTLS subject, …) populate this. Transports that don't (browser WS,
-/// CF DO inbound) leave it `None`.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PeerIdentity(pub SmolStr);
+/// Peer identity as the canonical 32-byte form. Transports that have a
+/// real identity (iroh `EndpointId`, mTLS-bound 32-byte key, handshake-
+/// agreed cookie) populate this. Transports that don't (browser WS,
+/// CF DO inbound before challenge) leave it `None`.
+///
+/// Byte-shaped, not string-shaped, so consumers — the
+/// `AccountingDispatcher` in particular — can construct a
+/// `hellas_rpc::peers::PeerId` directly without a hex round-trip.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PeerIdentity(pub [u8; 32]);
+
+impl std::fmt::Display for PeerIdentity {
+    /// Short hex (8 chars … 8 chars), matching `hellas_rpc::peers::PeerId`'s
+    /// log format. Use `{:#}` for the full 64-char form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            for b in &self.0 {
+                write!(f, "{b:02x}")?;
+            }
+            return Ok(());
+        }
+        for b in &self.0[..4] {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, "…")?;
+        for b in &self.0[28..] {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// What kind of authentication the transport itself vouches for. Apps
 /// layer their own auth on top via metadata.

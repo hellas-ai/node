@@ -19,8 +19,9 @@ use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, Executor, ExecuteServer, ExecutorMetrics,
     OpaqueServer, SymbolicServer,
 };
-use hellas_rpc::peers::{PeerDirectory, PeerId};
+use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::Execute;
 use hellas_rpc::services::node::{Node, NodeServer};
@@ -160,6 +161,7 @@ pub(super) async fn spawn_node(
             };
             let handle_for_conn = accept_handle.clone();
             let node_handler_for_conn = node_handler.clone();
+            let manager_for_conn = directory.manager();
             tokio::spawn(async move {
                 let conn = match accepting.await {
                     Ok(c) => c,
@@ -169,8 +171,14 @@ pub(super) async fn spawn_node(
                     }
                 };
                 let alpn = conn.alpn().to_vec();
-                if let Err(e) =
-                    serve_connection(alpn, conn, handle_for_conn, node_handler_for_conn).await
+                if let Err(e) = serve_connection(
+                    alpn,
+                    conn,
+                    handle_for_conn,
+                    node_handler_for_conn,
+                    manager_for_conn,
+                )
+                .await
                 {
                     warn!("serve_connection error: {e}");
                 }
@@ -193,23 +201,30 @@ async fn serve_connection(
     conn: Connection,
     handle: hellas_executor::ExecutorHandle,
     node_handler: NodeHandlerImpl,
+    manager: PeerManager,
 ) -> anyhow::Result<()> {
     let transport = IrohTransport::new(conn);
 
+    // Every generated `XServer` is wrapped in `AccountingDispatcher`
+    // so per-peer counters (`total_requests`, `last_seen_ms`, RTT
+    // EMA) are populated for every inbound. That's the producer side
+    // of the data that `PeerDirectory::ranked_known_peers` consumes
+    // when surfacing `Node/get_known_peers`; without this wrapper
+    // the directory the node hands out is always empty.
     if alpn == <Execute as ServiceMarker>::ALPN.as_bytes() {
-        let server = ExecuteServer(handle);
+        let server = AccountingDispatcher::new(ExecuteServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Symbolic as ServiceMarker>::ALPN.as_bytes() {
-        let server = SymbolicServer(handle);
+        let server = AccountingDispatcher::new(SymbolicServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Opaque as ServiceMarker>::ALPN.as_bytes() {
-        let server = OpaqueServer(handle);
+        let server = AccountingDispatcher::new(OpaqueServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
-        let server = CourtesyServer(handle);
+        let server = AccountingDispatcher::new(CourtesyServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
-        let server = NodeServer(node_handler);
+        let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
         serve_loop(&transport, &server).await
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));

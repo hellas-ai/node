@@ -32,9 +32,7 @@ impl IrohTransport {
     }
 
     fn peer_identity(&self) -> Option<PeerIdentity> {
-        Some(PeerIdentity(
-            self.connection.remote_id().to_string().into(),
-        ))
+        Some(PeerIdentity(*self.connection.remote_id().as_bytes()))
     }
 }
 
