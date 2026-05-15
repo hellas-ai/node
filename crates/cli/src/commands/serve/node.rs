@@ -115,10 +115,23 @@ pub(super) async fn spawn_node(
         .context("failed to bind iroh endpoint")?;
     let node_id = endpoint.id();
 
-    // -- Construct a shared peer directory for the Node service. Future
-    //    work (Phase F) will route inbound dispatch through an
-    //    `AdmittingDispatcher` that drives this directory's rate-limit
-    //    + admission checks; today it only feeds `get_known_peers`.
+    // -- Construct a shared peer directory.
+    //
+    // CUTOVER_FINDINGS #6 (admission middleware) audit: the directory's
+    // `observe_inbound_request(peer, rtt, policy)` shape is correct
+    // (account-only vs rate-limited split, AuthLevel disclosure gate,
+    // tested in `peers::directory::tests`), `Inbound::context.peer` IS
+    // populated by IrohTransport (via `connection.remote_id()`), and
+    // the directory is reachable from the dispatch path. What's
+    // missing is the wrapper that calls it.
+    //
+    // Deferred until a concrete abuse scenario warrants it: an
+    // `AdmittingDispatcher<S>` that, before forwarding to the
+    // generated dispatcher, looks up `policy_for(inbound.method_id)`
+    // via `KNOWN_RATE_LIMITED_METHODS` and calls
+    // `directory.observe_inbound_request(...)`. The plan in
+    // `/home/grw/.claude/plans/recursive-mixing-neumann.md` Phase F
+    // is the implementation sketch when needed.
     let local_peer = PeerId::from_bytes(*node_id.as_bytes());
     let directory = Arc::new(PeerDirectory::new(local_peer));
 
