@@ -109,6 +109,8 @@ let
     cargo-audit
     cargo-outdated
     cargo-sort
+    cargo-machete
+    cargo-udeps
     skopeo
     pi-coding-agent
     piShim
