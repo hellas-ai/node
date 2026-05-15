@@ -187,6 +187,97 @@ fn webauthn_open_rejects_wrong_challenge() {
     );
 }
 
+#[cfg(feature = "secp256k1")]
+#[test]
+fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
+    use hellas_kernel::{CloseKind, InvalidProofReason, Proof, Secp256k1Verifier};
+    use secp256k1::{Message, Secp256k1, SecretKey};
+
+    fn secp_keypair(seed: u8) -> (SecretKey, Key) {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_byte_array([seed; 32]).expect("non-zero seed");
+        let public = secret.public_key(&secp);
+        (secret, Key::from_bytes(public.serialize()))
+    }
+
+    fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
+        let secp = Secp256k1::new();
+        let message = Message::from_digest(hash.to_bytes());
+        let signature = secp.sign_ecdsa(message, secret);
+        Sig::from_bytes(signature.serialize_compact())
+    }
+
+    fn p256_raw_sig(signing_key: &SigningKey, hash: PayloadHash) -> Sig {
+        let signature: P256Signature = signing_key
+            .sign_prehash(hash.as_bytes())
+            .expect("P-256 prehash signing succeeds");
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let bytes = signature.to_bytes();
+        let mut out = [0_u8; Sig::LENGTH];
+        out.copy_from_slice(&bytes);
+        Sig::from_bytes(out)
+    }
+
+    let (maker_sk, maker_key) = secp_keypair(3);
+    let taker_sk = keypair(4);
+    let taker_key = p256_key_from_signing_key(&taker_sk);
+    let funding = funding();
+    let outputs = payouts_two(maker_key, 7, taker_key, 8);
+    let terms = Terms::basic(
+        ProtocolCode::new(1),
+        Parties::new(maker_key, taker_key),
+        TIMEOUT,
+        outputs.clone(),
+    );
+    let terms_hash = terms.hash();
+    let open_hash = Tx::open_hash(&funding, &terms);
+    let (taker_assertion, assertion_key) =
+        sign_webauthn(&taker_sk, open_hash, "https://wallet.example.invalid");
+    let edge = Tx::edge_id_of(&funding, &terms);
+    let open = Tx::open_with_auth(
+        funding,
+        terms,
+        OpenAuth::native(secp_sign(&maker_sk, open_hash)),
+        OpenAuth::webauthn(taker_assertion),
+    );
+    let mut state = state(
+        FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
+        [
+            Genesis::coin(MAKER_COIN, maker_key, 10),
+            Genesis::coin(TAKER_COIN, taker_key, 5),
+        ],
+    );
+    let verifier = Secp256k1Verifier::new();
+
+    assert_eq!(assertion_key, taker_key);
+    state
+        .apply(CONTEXT, &verifier, &open)
+        .expect("bundled verifier accepts native maker + WebAuthn taker open");
+    assert_eq!(
+        state.store().edge(edge).map(hellas_kernel::Edge::value),
+        Some(15),
+    );
+
+    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
+    let close = Tx::close(
+        edge,
+        Proof::mutual(
+            secp_sign(&maker_sk, close_hash),
+            p256_raw_sig(&taker_sk, close_hash),
+        ),
+        outputs,
+    );
+
+    assert_eq!(
+        state.apply(CONTEXT, &verifier, &close),
+        Err(ApplyError::InvalidProof {
+            input: edge,
+            reason: InvalidProofReason::BadSignature,
+        }),
+    );
+    assert!(state.store().edge(edge).is_some());
+}
+
 fn p256_key_from_signing_key(signing_key: &SigningKey) -> Key {
     let verifying_key = signing_key.verifying_key();
     let point = verifying_key.to_encoded_point(false);
