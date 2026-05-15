@@ -194,10 +194,6 @@ impl PeerDirectory {
         self.local_peer
     }
 
-    pub fn manager(&self) -> PeerManager {
-        self.manager.clone()
-    }
-
     pub fn max_service_filter_len(&self) -> usize {
         self.config.max_service_filter_len
     }
@@ -351,7 +347,7 @@ fn matches_service_filter(
         return !peer.services.is_empty();
     }
     service_for_filter(requested_service_filter, config).map_or_else(
-        || peer.has_service_name(requested_service_filter),
+        || peer.has_service(requested_service_filter),
         |service| peer.has_service(service),
     )
 }
@@ -385,7 +381,8 @@ fn recommendation_score(peer: &PeerEntry, now_ms: u64, config: &PeerDirectoryCon
     let recency_score = ((1.0 - (age_secs / stale_after_secs)).clamp(0.0, 1.0) * 1000.0) as i64;
 
     let latency_score = peer
-        .rtt_ema_ms
+        .rtt
+        .get()
         .map(latency_score)
         .unwrap_or(config.default_latency_score);
 

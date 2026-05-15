@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use hellas_wire::latency::EwmaLatency;
+
 use super::RpcService;
 use super::admission::{AcquireDenied, Outcome, Permit, RequestKind, TokenBucket};
 use super::id::PeerId;
@@ -46,21 +48,6 @@ impl Default for PeerRegistryConfig {
 }
 
 impl PeerRegistryConfig {
-    /// Conservative profile for low-memory devices.
-    pub const fn small(max_peers: usize) -> Self {
-        Self {
-            max_peers,
-            max_services_per_peer: 8,
-            max_in_flight_per_peer: 2,
-            max_in_flight_total: 8,
-            bucket_capacity: 8.0,
-            bucket_refill_per_sec: 1.0,
-            rtt_ema_alpha: DEFAULT_RTT_EMA_ALPHA,
-            max_label_len: 64,
-            max_error_len: 128,
-        }
-    }
-
     pub(super) fn normalized(mut self) -> Self {
         if !self.bucket_capacity.is_finite() || self.bucket_capacity < 0.0 {
             self.bucket_capacity = 0.0;
@@ -236,7 +223,7 @@ impl ServiceState {
         self.status = ServiceStatus::Healthy;
         self.last_seen_ms = now_ms;
         self.success_count = self.success_count.saturating_add(1);
-        self.last_rtt_ms = clean_rtt(rtt_ms);
+        self.last_rtt_ms = finite_nonneg(rtt_ms);
         self.last_error = None;
     }
 
@@ -244,7 +231,7 @@ impl ServiceState {
         self.status = ServiceStatus::Failed;
         self.last_seen_ms = now_ms;
         self.error_count = self.error_count.saturating_add(1);
-        self.last_rtt_ms = rtt_ms.and_then(clean_rtt);
+        self.last_rtt_ms = rtt_ms.and_then(finite_nonneg);
         self.last_error = Some(error);
     }
 }
@@ -261,7 +248,7 @@ pub struct PeerEntry {
     pub trusted: bool,
     pub label: Option<String>,
     pub services: HashMap<&'static str, ServiceState>,
-    pub rtt_ema_ms: Option<f64>,
+    pub rtt: EwmaLatency,
     pub success_count: u64,
     pub error_count: u64,
     pub cancelled_count: u64,
@@ -280,7 +267,7 @@ pub struct PeerEntry {
 }
 
 impl PeerEntry {
-    fn new(id: PeerId, now_ms: u64, bucket_capacity: f64) -> Self {
+    fn new(id: PeerId, now_ms: u64, bucket_capacity: f64, rtt_alpha: f64) -> Self {
         Self {
             id,
             first_seen_ms: now_ms,
@@ -291,7 +278,7 @@ impl PeerEntry {
             trusted: false,
             label: None,
             services: HashMap::new(),
-            rtt_ema_ms: None,
+            rtt: EwmaLatency { alpha: rtt_alpha, est_ms: None },
             success_count: 0,
             error_count: 0,
             cancelled_count: 0,
@@ -305,11 +292,7 @@ impl PeerEntry {
         }
     }
 
-    pub fn has_service(&self, service: &'static str) -> bool {
-        self.services.contains_key(service)
-    }
-
-    pub fn has_service_name(&self, service: &str) -> bool {
+    pub fn has_service(&self, service: &str) -> bool {
         self.services.contains_key(service)
     }
 
@@ -325,8 +308,8 @@ impl PeerEntry {
         self.service_state(S::NAME)
     }
 
-    pub const fn latency_ms(&self) -> Option<f64> {
-        self.rtt_ema_ms
+    pub fn latency_ms(&self) -> Option<f64> {
+        self.rtt.get()
     }
 
     fn update_auth_level(&mut self) {
@@ -379,17 +362,6 @@ impl PeerEntry {
             ServiceState::observed(service, now_ms, transport_security),
         );
         evicted
-    }
-
-    fn record_rtt(&mut self, rtt_ms: f64, alpha: f64) {
-        let Some(rtt_ms) = clean_rtt(rtt_ms) else {
-            return;
-        };
-
-        self.rtt_ema_ms = Some(match self.rtt_ema_ms {
-            Some(current) => current.mul_add(1.0 - alpha, rtt_ms * alpha),
-            None => rtt_ms,
-        });
     }
 
     /// Order: trust < transport security < #services < successes < last_seen
@@ -527,7 +499,7 @@ impl PeerRegistry {
         entry.last_seen_ms = now_ms;
         entry.total_requests = entry.total_requests.saturating_add(1);
         if let Some(rtt_ms) = rtt_ms {
-            entry.record_rtt(rtt_ms, self.config.rtt_ema_alpha);
+            entry.rtt.record(rtt_ms);
         }
 
         Ok(PeerChange {
@@ -709,7 +681,7 @@ impl PeerRegistry {
                 let _ = entry.observe_service(service, now_ms, transport_security, max_services);
             }
             PeerEvent::RttSample { rtt_ms } => {
-                entry.record_rtt(rtt_ms, self.config.rtt_ema_alpha);
+                entry.rtt.record(rtt_ms);
             }
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));
@@ -795,7 +767,6 @@ impl PeerRegistry {
 
         let peer = permit.peer();
         let max_services = self.config.max_services_per_peer;
-        let alpha = self.config.rtt_ema_alpha;
         let max_error_len = self.config.max_error_len;
 
         let Some(entry) = self.peers.get_mut(&peer) else {
@@ -808,7 +779,7 @@ impl PeerRegistry {
         match outcome {
             Outcome::Ok { rtt_ms } => {
                 entry.success_count = entry.success_count.saturating_add(1);
-                entry.record_rtt(rtt_ms, alpha);
+                entry.rtt.record(rtt_ms);
                 let _ = entry.observe_service(
                     permit.kind().service,
                     now_ms,
@@ -823,7 +794,7 @@ impl PeerRegistry {
             Outcome::Err { rtt_ms, error } => {
                 entry.error_count = entry.error_count.saturating_add(1);
                 if let Some(rtt_ms) = rtt_ms {
-                    entry.record_rtt(rtt_ms, alpha);
+                    entry.rtt.record(rtt_ms);
                 }
                 let error = truncate_string(error, max_error_len);
                 if let Some(service) = entry.services.get_mut(permit.kind().service) {
@@ -874,7 +845,12 @@ impl PeerRegistry {
 
         self.peers.insert(
             peer,
-            PeerEntry::new(peer, now_ms, self.config.bucket_capacity),
+            PeerEntry::new(
+                peer,
+                now_ms,
+                self.config.bucket_capacity,
+                self.config.rtt_ema_alpha,
+            ),
         );
         Ok((true, evicted))
     }
@@ -888,12 +864,8 @@ impl PeerRegistry {
     }
 }
 
-fn clean_rtt(rtt_ms: f64) -> Option<f64> {
-    if rtt_ms.is_finite() && rtt_ms >= 0.0 {
-        Some(rtt_ms)
-    } else {
-        None
-    }
+fn finite_nonneg(rtt_ms: f64) -> Option<f64> {
+    (rtt_ms.is_finite() && rtt_ms >= 0.0).then_some(rtt_ms)
 }
 
 fn truncate_string(mut value: String, max_len: usize) -> String {

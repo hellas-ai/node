@@ -29,7 +29,7 @@ mod manager;
 mod registry;
 mod security;
 
-pub use admission::{AcquireDenied, InboundPeerObservation, PeerExtractor};
+pub use admission::AcquireDenied;
 pub use directory::{
     InboundAdmission, InboundRequestPolicy, PeerDirectory, PeerDirectoryConfig,
 };

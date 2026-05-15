@@ -83,16 +83,4 @@ impl AuthLevel {
     pub const fn allows_at_least(self, threshold: Self) -> bool {
         self.rank() >= threshold.rank()
     }
-
-    pub const fn allows_authenticated_policy(self) -> bool {
-        matches!(self, Self::Authenticated)
-    }
-
-    pub const fn allows_local_policy(self) -> bool {
-        matches!(self, Self::Authenticated | Self::Local)
-    }
-
-    pub const fn allows_trusted_policy(self) -> bool {
-        matches!(self, Self::Authenticated | Self::Local | Self::Trusted)
-    }
 }

@@ -165,27 +165,6 @@ impl fmt::Display for AcquireDenied {
 
 impl std::error::Error for AcquireDenied {}
 
-/// What a [`PeerExtractor`] pulls off an inbound `http::Request` before any
-/// service logic runs. The peer id is authoritative for accounting; `rtt_ms`
-/// is best-effort transport telemetry (None when the transport has no fresh
-/// path RTT sample).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct InboundPeerObservation {
-    pub peer: PeerId,
-    pub rtt_ms: Option<f64>,
-}
-
-/// Transport-side adapter that maps an inbound `http::Request` to the peer
-/// identity that originated it.
-///
-/// The generated managed server wrappers call into this trait once per inbound
-/// request, before calling `PeerDirectory::observe_inbound_request`. One impl
-/// per transport (iroh, websocket, uds, …) lives behind the matching feature
-/// flag; the wrappers stay transport-agnostic.
-pub trait PeerExtractor: Send + Sync + 'static {
-    fn extract<B>(&self, request: &http::Request<B>) -> Option<InboundPeerObservation>;
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TokenBucket {
     tokens: f64,
