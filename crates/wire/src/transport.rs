@@ -105,7 +105,14 @@ pub trait SendHalf: Send {
 
 /// Recv half. Yields body chunks; trailer is available after the
 /// stream terminates.
-pub trait RecvHalf: FuturesStream<Item = Result<Bytes, <Self as RecvHalf>::Error>> + Send {
+///
+/// `Unpin` is required so consumers can hold a `&mut RecvHalf` and
+/// poll it without manual projection. In practice every impl in this
+/// workspace is structurally Unpin (no self-referential fields); the
+/// bound makes that explicit at the trait level.
+pub trait RecvHalf:
+    FuturesStream<Item = Result<Bytes, <Self as RecvHalf>::Error>> + Send + Unpin
+{
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Available after `next()` has returned `None`. Carries the
