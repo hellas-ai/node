@@ -3,10 +3,10 @@ extern crate tracing;
 
 use catgrad::prelude::Dtype;
 use clap::{Parser, Subcommand, ValueEnum};
+use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use iroh::EndpointId;
 
 mod commands;
 mod execution;
@@ -224,7 +224,10 @@ enum Commands {
         #[arg(long = "responses-backend", value_enum, default_value_t = GatewayResponsesBackend::Hellas)]
         responses_backend: GatewayResponsesBackend,
         /// Upstream endpoint used when --responses-backend=proxy.
-        #[arg(long = "responses-proxy-url", default_value = "https://api.openai.com/v1/responses")]
+        #[arg(
+            long = "responses-proxy-url",
+            default_value = "https://api.openai.com/v1/responses"
+        )]
         responses_proxy_url: String,
         /// Environment variable holding the bearer token for --responses-backend=proxy.
         #[arg(long = "responses-proxy-api-key-env", default_value = "OPENAI_API_KEY")]

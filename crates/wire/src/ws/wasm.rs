@@ -9,9 +9,7 @@ use futures::{SinkExt, StreamExt};
 use ws_stream_wasm::{WsMessage, WsMeta, WsStream};
 
 use crate::clock::DefaultClock;
-use crate::mux::{
-    MessagePipe, MuxConfig, MuxTransport, Role,
-};
+use crate::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
 
 /// Default const-N for browser-facing WS muxes.
 pub const WASM_MUX_N: usize = 64;

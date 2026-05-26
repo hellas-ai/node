@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use hellas_wire_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
-    ExecutionResult,
+    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, ExecutionResult,
 };
 
 mod generation;
@@ -51,7 +50,10 @@ impl ExecutionBackend for GatewayBackend {
                 .provenance
                 .as_ref()
                 .map(self::provenance::provenance_from_execution);
-            Ok(BackendStream::new(text_events(prepared), initial_provenance))
+            Ok(BackendStream::new(
+                text_events(prepared),
+                initial_provenance,
+            ))
         })
     }
 }

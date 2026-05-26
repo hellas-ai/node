@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    AuthLevel, PeerEntry, PeerId, PeerManager, PeerManagerError, PeerRegistryConfig,
-};
+use super::{AuthLevel, PeerEntry, PeerId, PeerManager, PeerManagerError, PeerRegistryConfig};
 
 const DEFAULT_MAX_TRACKED_PEERS: usize = 2048;
 const DEFAULT_MAX_KNOWN_PEERS_RESPONSE: usize = 64;
@@ -118,12 +116,7 @@ impl PeerDirectoryConfig {
 /// Shared peer directory for server-side peer exchange and recommendation.
 ///
 /// Wraps `PeerManager` with ranking/filtering policy for `get_known_peers`-
-/// style responses. Inbound-admission state (per-peer rate limits, global
-/// disclosure buckets) was previously hung off this type but is currently
-/// dead — Phase F of the cutover deferred admission middleware indefinitely
-/// (see `cli/commands/serve/node.rs` audit comment). If/when that work
-/// resumes, re-introduce the rate-limit + admission methods then; the
-/// scaffolding-without-callers form bloated the crate.
+/// style responses.
 #[derive(Clone, Debug)]
 pub struct PeerDirectory {
     local_peer: PeerId,
@@ -176,7 +169,10 @@ impl PeerDirectory {
                     if peer.id == self.local_peer || peer.id == requester {
                         return None;
                     }
-                    if !peer.auth_level.allows_at_least(config.min_disclosed_auth_level) {
+                    if !peer
+                        .auth_level
+                        .allows_at_least(config.min_disclosed_auth_level)
+                    {
                         return None;
                     }
                     let age_ms = now.saturating_sub(peer.last_seen_ms);
@@ -292,7 +288,10 @@ mod tests {
             .manager
             .peer(id)
             .service::<NodeService>()
-            .observe_discovered(DiscoverySource::Transport("test"), TransportSecurity::Untrusted)
+            .observe_discovered(
+                DiscoverySource::Transport("test"),
+                TransportSecurity::Untrusted,
+            )
             .expect("service should be recorded");
     }
 
@@ -330,4 +329,3 @@ mod tests {
         );
     }
 }
-

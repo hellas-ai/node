@@ -5,8 +5,14 @@
 //! inbound RPCs here.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
+use catgrad::prelude::Dtype;
+use catgrad_llm::{Detokenizer, LLMError};
 use futures_core::Stream;
+use futures_util::StreamExt;
+use hellas_rpc::call::WithTrailer;
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
     GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
@@ -17,21 +23,23 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
-use hellas_rpc::call::WithTrailer;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
 use hellas_rpc::services::execute::ExecuteHandler;
 use hellas_rpc::services::opaque::OpaqueHandler;
 use hellas_rpc::services::symbolic::SymbolicHandler;
-use hellas_rpc::ExecutorError;
-use hellas_wire::{Metadata, WireStatus};
+use hellas_rpc::{ExecutorError, decode_token_ids};
+use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::state::model_spec;
+
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
 
-type ExecuteStream =
-    Pin<Box<dyn Stream<Item = Result<WorkEvent, WireStatus>> + Send>>;
+type ExecuteStream = Pin<Box<dyn Stream<Item = Result<WorkEvent, WireStatus>> + Send>>;
+type DecodeTokensRequestStream =
+    Pin<Box<dyn Stream<Item = Result<DecodeTokensRequest, WireStatus>> + Send>>;
 type DecodeTokensStream =
     Pin<Box<dyn Stream<Item = Result<DecodeTokensResponse, WireStatus>> + Send>>;
 
@@ -146,13 +154,9 @@ fn with_provenance<R>(outcome: TicketOutcome<R>) -> WithTrailer<R> {
 // codegen wraps it via the call helpers for the wire layer.
 
 impl ExecuteHandler for ExecutorHandle {
-    async fn run_ticket(
-        &self,
-        request: RunTicketRequest,
-    ) -> Result<ExecuteStream, WireStatus> {
+    async fn run_ticket(&self, request: RunTicketRequest) -> Result<ExecuteStream, WireStatus> {
         let outcome = self.run_ticket_handle(request).await?;
-        let stream: ExecuteStream =
-            Box::pin(ReceiverStream::new(outcome.events));
+        let stream: ExecuteStream = Box::pin(ReceiverStream::new(outcome.events));
         // Provenance metadata loss: the new wire layer doesn't expose
         // per-response trailer plumbing through the codegen-emitted
         // server traits yet. Callers that need provenance read it
@@ -243,10 +247,7 @@ impl CourtesyHandler for ExecutorHandle {
         Ok(self.list_models_handle().await?)
     }
 
-    async fn get_stats(
-        &self,
-        _request: GetStatsRequest,
-    ) -> Result<GetStatsResponse, WireStatus> {
+    async fn get_stats(&self, _request: GetStatsRequest) -> Result<GetStatsResponse, WireStatus> {
         Ok(self.get_stats_handle().await?)
     }
 
@@ -257,17 +258,132 @@ impl CourtesyHandler for ExecutorHandle {
         Ok(self.get_model_stats_handle(request).await?)
     }
 
-    fn decode_tokens(
+    async fn decode_tokens(
         &self,
-        _request: Pin<Box<dyn Stream<Item = DecodeTokensRequest> + Send>>,
-    ) -> impl std::future::Future<Output = Result<DecodeTokensStream, WireStatus>> + Send
-    {
-        // The codegen does not yet emit a bidi-streaming dispatcher; this
-        // handler is unreachable until bidi streaming support is added.
-        async move {
-            Err(WireStatus::unimplemented(
-                "decode_tokens: bidi streaming pending wire-v2 helpers",
-            ))
+        request: DecodeTokensRequestStream,
+    ) -> Result<DecodeTokensStream, WireStatus> {
+        Ok(decode_tokens_stream(request, self.preferred_dtype))
+    }
+}
+
+fn decode_tokens_stream(
+    mut requests: DecodeTokensRequestStream,
+    dtype: Dtype,
+) -> DecodeTokensStream {
+    Box::pin(async_stream::try_stream! {
+        let mut decoder: Option<DecodeSession> = None;
+        while let Some(item) = requests.next().await {
+            let request = item?;
+            if decoder.is_none() {
+                let assets = load_decode_assets(
+                    request.huggingface_model_id.clone(),
+                    request.huggingface_revision.clone(),
+                    dtype,
+                )
+                .await?;
+                decoder = Some(DecodeSession::new(
+                    request.huggingface_model_id.clone(),
+                    request.huggingface_revision.clone(),
+                    assets,
+                ));
+            }
+
+            let session = decoder
+                .as_mut()
+                .expect("decode session is initialized before use");
+            session.validate_request_model(&request)?;
+            if request.token_bytes.is_empty() {
+                continue;
+            }
+            let text = session.push_bytes(&request.token_bytes)?;
+            if !text.is_empty() {
+                yield DecodeTokensResponse { text };
+            }
         }
+    })
+}
+
+async fn load_decode_assets(
+    model_id: String,
+    revision: String,
+    dtype: Dtype,
+) -> Result<Arc<ModelAssets>, WireStatus> {
+    if model_id.is_empty() {
+        return Err(WireStatus::new(
+            WireCode::InvalidArgument,
+            "huggingface_model_id is required on the first decode_tokens request",
+        ));
+    }
+    let spec = model_spec(&model_id, &revision);
+    let assets = tokio::task::spawn_blocking(move || ModelAssets::load(&spec, dtype))
+        .await
+        .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
+    Ok(Arc::new(assets))
+}
+
+struct DecodeSession {
+    model_id: String,
+    revision: String,
+    decoder: Detokenizer<'static>,
+}
+
+impl DecodeSession {
+    fn new(model_id: String, revision: String, assets: Arc<ModelAssets>) -> Self {
+        let stop_token_ids = assets.stop_token_ids().to_vec();
+        let decoder = Detokenizer::new(
+            move |token_ids| {
+                let token_ids: Vec<u32> = token_ids
+                    .iter()
+                    .map(|&token| {
+                        u32::try_from(token).map_err(|_| {
+                            LLMError::TokenizerError(format!(
+                                "negative token id {token} cannot be decoded"
+                            ))
+                        })
+                    })
+                    .collect::<catgrad_llm::Result<_>>()?;
+                assets
+                    .decode_tokens(&token_ids)
+                    .map_err(|err| LLMError::TokenizerError(err.to_string()))
+            },
+            &stop_token_ids,
+        );
+        Self {
+            model_id,
+            revision,
+            decoder,
+        }
+    }
+
+    fn validate_request_model(&self, request: &DecodeTokensRequest) -> Result<(), WireStatus> {
+        if request.huggingface_model_id.is_empty() && request.huggingface_revision.is_empty() {
+            return Ok(());
+        }
+        if request.huggingface_model_id == self.model_id
+            && request.huggingface_revision == self.revision
+        {
+            return Ok(());
+        }
+        Err(WireStatus::new(
+            WireCode::InvalidArgument,
+            "decode_tokens stream cannot switch tokenizer after the first request",
+        ))
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<String, WireStatus> {
+        let token_ids: Vec<i32> = decode_token_ids(bytes)?
+            .into_iter()
+            .map(|token| {
+                i32::try_from(token).map_err(|_| {
+                    WireStatus::new(
+                        WireCode::InvalidArgument,
+                        format!("token id {token} exceeds i32 range"),
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.decoder
+            .push_tokens(&token_ids)
+            .map_err(|err| WireStatus::internal(format!("failed to detokenize token batch: {err}")))
     }
 }

@@ -8,7 +8,7 @@ use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
 
 use super::slot::{Role, SlotIndex, SlotState, StreamSlot};
-use super::wire::{decode_keyed_frame, encode_keyed_frame, StreamKey};
+use super::wire::{StreamKey, decode_keyed_frame, encode_keyed_frame};
 
 #[derive(Clone, Copy, Debug)]
 pub struct MuxConfig {
@@ -196,10 +196,8 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         let mut slot = StreamSlot::open_local(method_id, now, self.config.initial_credit);
         slot.generation = next_gen;
         // Queue the OPEN frame for scheduler.
-        slot.send_queue.push_back(Frame::Open(OpenFrame {
-            method_id,
-            headers,
-        }));
+        slot.send_queue
+            .push_back(Frame::Open(OpenFrame { method_id, headers }));
         self.streams[idx as usize] = Some(slot);
         self.mark_used(idx);
         Ok(idx)
@@ -218,10 +216,8 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         let slot = self
             .slot_mut(idx)
             .ok_or(MuxError::Protocol("send on empty slot"))?;
-        if matches!(
-            slot.state,
-            SlotState::HalfClosedLocal | SlotState::Closed
-        ) || slot.local_terminal
+        if matches!(slot.state, SlotState::HalfClosedLocal | SlotState::Closed)
+            || slot.local_terminal
         {
             return Err(MuxError::SlotClosed(idx));
         }
@@ -232,10 +228,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         // at a time per slot. The caller waits for poll_ready. Control
         // frames the state machine emits internally (Credit/End/Reset)
         // can still slot in alongside.
-        let has_body_queued = slot
-            .send_queue
-            .iter()
-            .any(|f| matches!(f, Frame::Body(_)));
+        let has_body_queued = slot.send_queue.iter().any(|f| matches!(f, Frame::Body(_)));
         if has_body_queued {
             return Err(MuxError::Protocol("send while previous body still queued"));
         }
@@ -249,11 +242,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     }
 
     /// Close the send side. Optionally with a trailer.
-    pub fn close_send(
-        &mut self,
-        idx: SlotIndex,
-        trailer: Option<Trailer>,
-    ) -> Result<(), MuxError> {
+    pub fn close_send(&mut self, idx: SlotIndex, trailer: Option<Trailer>) -> Result<(), MuxError> {
         let slot = self
             .slot_mut(idx)
             .ok_or(MuxError::Protocol("close on empty slot"))?;
@@ -297,7 +286,8 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         // and drop everything behind it (they'd be irrelevant on the
         // closed stream anyway).
         slot.send_queue.clear();
-        slot.send_queue.push_front(Frame::Reset(ResetFrame { code }));
+        slot.send_queue
+            .push_front(Frame::Reset(ResetFrame { code }));
     }
 
     /// Pull buffered body chunks off the slot for the application.
@@ -377,8 +367,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         for _ in 0..N {
             let idx = self.rr;
             self.rr = (self.rr + 1) % (N as u16);
-            let Some(slot) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut())
-            else {
+            let Some(slot) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut()) else {
                 continue;
             };
             if let Some(frame) = slot.send_queue.pop_front() {
@@ -465,7 +454,9 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// silently drop that Reset; callers must keep the slot occupied
     /// until the queued terminal is actually emitted.
     fn maybe_free_slot(&mut self, idx: SlotIndex) -> bool {
-        let Some(slot) = self.slot(idx) else { return false };
+        let Some(slot) = self.slot(idx) else {
+            return false;
+        };
         if !(slot.peer_terminal && slot.local_terminal) {
             return false;
         }
@@ -496,9 +487,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         if let Frame::Open(open) = &keyed.frame {
             // Open from peer: must be peer-owned parity.
             if self.role.owns_slot(idx) {
-                return Err(MuxError::Protocol(
-                    "peer opened a slot owned by our parity",
-                ));
+                return Err(MuxError::Protocol("peer opened a slot owned by our parity"));
             }
             // Stale-generation check: if slot exists, compare gens.
             if let Some(existing) = self.slot(idx) {
@@ -513,8 +502,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 }
             }
             let now = self.clock.now();
-            let mut slot =
-                StreamSlot::open_remote(open.method_id, now, self.config.initial_credit);
+            let mut slot = StreamSlot::open_remote(open.method_id, now, self.config.initial_credit);
             slot.generation = keyed.key.generation;
             self.streams[idx as usize] = Some(slot);
             // The fresh slot record overwrites a Closed predecessor.
@@ -557,7 +545,8 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                     slot.local_terminal = true;
                     slot.state = SlotState::Closed;
                     slot.send_queue.clear();
-                    slot.send_queue.push_front(Frame::Reset(ResetFrame { code }));
+                    slot.send_queue
+                        .push_front(Frame::Reset(ResetFrame { code }));
                     events.push(Event::ResetStream { slot: idx, code });
                     return Ok(events);
                 }
@@ -574,10 +563,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 // drops below `local_credit_high_water /
                 // credit_refill_ratio`. The driver ships the Credit
                 // frame on the very next outbound flush.
-                events.push(Event::BodyChunk {
-                    slot: idx,
-                    payload,
-                });
+                events.push(Event::BodyChunk { slot: idx, payload });
             }
             Frame::End(end) => {
                 slot.peer_terminal = true;
@@ -614,8 +600,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 self.clean_up_after_remote_free(idx);
             }
             Frame::Credit(c) => {
-                slot.peer_recv_credit =
-                    slot.peer_recv_credit.saturating_add(c.additional_bytes);
+                slot.peer_recv_credit = slot.peer_recv_credit.saturating_add(c.additional_bytes);
                 events.push(Event::PeerCredit {
                     slot: idx,
                     additional_bytes: c.additional_bytes,
@@ -719,21 +704,22 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         // but is marked free in the bitmap. Those records are not
         // serialized — they'd round-trip back as the bogus "slot is
         // both in free_mask and listed as occupied" state.
-        self.streams
-            .iter()
-            .enumerate()
-            .filter_map(move |(i, s)| {
-                let s = s.as_ref()?;
-                let idx = i as SlotIndex;
-                let word = self.free_mask.get((idx / 64) as usize).copied().unwrap_or(0);
-                let bit = 1u64 << (idx % 64);
-                if word & bit != 0 {
-                    // In free_mask → not currently occupied.
-                    None
-                } else {
-                    Some((idx, s))
-                }
-            })
+        self.streams.iter().enumerate().filter_map(move |(i, s)| {
+            let s = s.as_ref()?;
+            let idx = i as SlotIndex;
+            let word = self
+                .free_mask
+                .get((idx / 64) as usize)
+                .copied()
+                .unwrap_or(0);
+            let bit = 1u64 << (idx % 64);
+            if word & bit != 0 {
+                // In free_mask → not currently occupied.
+                None
+            } else {
+                Some((idx, s))
+            }
+        })
     }
 
     /// Restore one occupied slot. Caller is expected to have already reset
@@ -775,9 +761,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             peer_recv_credit,
             local_recv_credit,
             local_credit_high_water,
-            send_queue: std::collections::VecDeque::with_capacity(
-                crate::mux::slot::SLOT_QUEUE_CAP,
-            ),
+            send_queue: std::collections::VecDeque::with_capacity(crate::mux::slot::SLOT_QUEUE_CAP),
             // HalfClosedLocal: we sent our terminal frame → local_terminal.
             // HalfClosedRemote: peer sent theirs → peer_terminal.
             // Closed: both. Open*/Open: neither.
@@ -824,9 +808,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::NewIncomingStream {
-                slot: s,
-                method_id,
-                ..
+                slot: s, method_id, ..
             } => {
                 assert_eq!(*s, 0);
                 assert_eq!(*method_id, 0xCAFEBABE);
@@ -886,7 +868,12 @@ mod tests {
         let decoded = crate::mux::decode_keyed_frame(&reset_bytes).unwrap();
         assert_eq!(decoded.key.stream_id, s);
         assert!(
-            matches!(decoded.frame, Frame::Reset(ResetFrame { code: WireCode::Cancelled })),
+            matches!(
+                decoded.frame,
+                Frame::Reset(ResetFrame {
+                    code: WireCode::Cancelled
+                })
+            ),
             "emitted frame must be Reset/Cancelled, got {:?}",
             decoded.frame
         );
@@ -895,7 +882,10 @@ mod tests {
         // next open() can reuse the index.
         let _ = client.next_outbound(); // triggers drain
         let new_idx = client.open(0x2, Metadata::new()).unwrap();
-        assert_eq!(new_idx, s, "slot should be reclaimable after both terminals shipped");
+        assert_eq!(
+            new_idx, s,
+            "slot should be reclaimable after both terminals shipped"
+        );
     }
 
     #[test]
@@ -917,10 +907,8 @@ mod tests {
             credit_refill_ratio: 2, // threshold = 50
             body_frame_max: 1024,
         };
-        let mut client: Multiplexer<32, _> =
-            Multiplexer::new(Role::Client, DefaultClock, cfg);
-        let mut server: Multiplexer<32, _> =
-            Multiplexer::new(Role::Server, DefaultClock, cfg);
+        let mut client: Multiplexer<32, _> = Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> = Multiplexer::new(Role::Server, DefaultClock, cfg);
         let s = client.open(0x1, Metadata::new()).unwrap();
         drain(&mut client, &mut server);
 
@@ -968,10 +956,8 @@ mod tests {
             credit_refill_ratio: 2,
             body_frame_max: 1024,
         };
-        let mut client: Multiplexer<32, _> =
-            Multiplexer::new(Role::Client, DefaultClock, cfg);
-        let mut server: Multiplexer<32, _> =
-            Multiplexer::new(Role::Server, DefaultClock, cfg);
+        let mut client: Multiplexer<32, _> = Multiplexer::new(Role::Client, DefaultClock, cfg);
+        let mut server: Multiplexer<32, _> = Multiplexer::new(Role::Server, DefaultClock, cfg);
         let s = client.open(0x1, Metadata::new()).unwrap();
         drain(&mut client, &mut server);
         // Saturate server's local credit (force it below threshold).

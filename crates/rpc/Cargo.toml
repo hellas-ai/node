@@ -17,17 +17,17 @@ default = []
 # with the protocols you actually use.
 # `execute` is the foundation — symbolic, opaque, and courtesy all reference
 # `hellas.v1.Ticket` and related types.
-execute  = []
+execute = []
 symbolic = ["execute"]
-opaque   = ["execute"]
+opaque = ["execute"]
 # Courtesy proto imports hellas.v1 (Ticket) and hellas.symbolic.v1
 # (SymbolicRequest), so the feature must pull both forward.
 courtesy = ["execute", "symbolic"]
-swarm    = []
+swarm = []
 all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
 
 # === Other knobs ===========================================================
-# Server-side dispatcher stubs.
+# Server-side dispatchers.
 server = []
 
 # Transport-layer compression knob. Currently a no-op — kept so consumers
@@ -42,55 +42,49 @@ iroh = ["dep:iroh"]
 iroh-client = ["iroh"]
 iroh-server = ["iroh"]
 
-# Discovery (mDNS + DHT) — temporarily kept until peers/* migration lands.
+# Discovery (mDNS + DHT).
 discovery = ["dep:futures", "dep:mainline"]
 
 # Binary-side bundle for the node binary (executor / model deps).
 node = [
-  "server",
-  "all-protocols",
-  "dep:catgrad",
-  "dep:catgrad-llm",
-  "dep:chatgrad",
-  "dep:serde",
-  "dep:serde_json",
-  "dep:tokenizers",
-  "dep:hf-hub",
+    "server",
+    "all-protocols",
+    "dep:catgrad",
+    "dep:catgrad-llm",
+    "dep:chatgrad",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:hf-hub",
 ]
-
-[target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
-tokenizers = { version = "0.21", features = [
-  "onig",
-  "esaxx_fast",
-], optional = true }
 
 [dependencies]
 bytes = "1"
 catgrad = { workspace = true, default-features = false, features = [
-  "serde",
+    "serde",
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
-iroh = { workspace = true, optional = true }
-smol_str = "0.3"
 hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
-  "ureq",
+    "ureq",
 ], optional = true }
 http = "1"
 http-body = "1"
-pin-project = "1"
+iroh = { workspace = true, optional = true }
 mainline = { version = "6", optional = true }
+pin-project = "1"
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-prost = { version = "0.14", default-features = false, features = ["derive"] }
+smol_str = "0.3"
 thiserror = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = [
-  "progressbar",
-  "fancy-regex",
+    "progressbar",
+    "fancy-regex",
 ], optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
@@ -98,6 +92,12 @@ tower-service = "0.3"
 # monotonic clock works under wasm (where stdlib's `Instant::now` panics with
 # "time not implemented on this platform"). Identical to std on native targets.
 web-time = "1"
+
+[target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
+tokenizers = { version = "0.21", features = [
+    "onig",
+    "esaxx_fast",
+], optional = true }
 
 [build-dependencies]
 blake3 = { workspace = true }

@@ -13,8 +13,8 @@
 //! `Node::get_known_peers` responses — without this middleware, that
 //! consumer is forever surfacing an empty directory.
 
-use hellas_wire::transport::{Inbound, StreamTransport};
 use hellas_wire::Dispatcher;
+use hellas_wire::transport::{Inbound, StreamTransport};
 
 use crate::peers::{PeerId, PeerManager};
 

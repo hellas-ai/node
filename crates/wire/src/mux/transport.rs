@@ -6,17 +6,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::clock::Clock;
 use crate::metadata::Metadata;
 use crate::status::WireCode;
-use crate::transport::{
-    AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext,
-};
+use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext};
 
 use super::slot::{Role, SlotIndex};
-use super::state::{Event, MuxConfig, MuxError, Multiplexer};
+use super::state::{Event, Multiplexer, MuxConfig, MuxError};
 use super::stream::MuxStream;
 
 /// Trait for the underlying message-oriented byte pipe (one WS message
@@ -104,9 +102,7 @@ impl MuxTransport {
         spawn: F,
     ) -> Self
     where
-        F: FnOnce(
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
-        ),
+        F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>),
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -134,11 +130,7 @@ impl StreamTransport for MuxTransport {
     type Stream = MuxStream;
     type Error = MuxTransportError;
 
-    async fn open(
-        &self,
-        method_id: u32,
-        headers: Metadata,
-    ) -> Result<Self::Stream, Self::Error> {
+    async fn open(&self, method_id: u32, headers: Metadata) -> Result<Self::Stream, Self::Error> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Open {
@@ -269,8 +261,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                         trailer_tx: Some(trailer_tx),
                     },
                 );
-                let stream =
-                    MuxStream::new(slot, self.cmd_tx_clone(), recv_rx, trailer_rx);
+                let stream = MuxStream::new(slot, self.cmd_tx_clone(), recv_rx, trailer_rx);
                 let inbound = Inbound {
                     method_id,
                     headers,
@@ -302,9 +293,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
             Event::ResetStream { slot, code } => {
                 if let Some(mut chans) = self.slot_to_chans.remove(&slot) {
                     if let Some(t) = chans.trailer_tx.take() {
-                        let _ = t.send(crate::metadata::Trailer::from_status(
-                            code, "reset",
-                        ));
+                        let _ = t.send(crate::metadata::Trailer::from_status(code, "reset"));
                     }
                 }
             }

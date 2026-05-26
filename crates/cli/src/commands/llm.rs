@@ -8,12 +8,12 @@ use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
+use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
 use std::sync::Arc;
-use iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,

@@ -59,12 +59,7 @@ pub type PeerFeed = Pin<Box<dyn Stream<Item = FeedResult<DiscoveredPeer>>>>;
 
 /// Build a finite feed from a static peer list.
 #[must_use]
-pub fn static_feed(
-    peers: Vec<EndpointId>,
-    priority: u8,
-    trust: u8,
-    scope: Scope,
-) -> PeerFeedSpec {
+pub fn static_feed(peers: Vec<EndpointId>, priority: u8, trust: u8, scope: Scope) -> PeerFeedSpec {
     let peer_trust = trust;
     let stream = futures::stream::iter(peers.into_iter().map(move |id| {
         Ok(DiscoveredPeer {
@@ -86,11 +81,7 @@ pub fn static_feed(
 /// the peer-exchange backend and any caller that wants to inject peers
 /// from outside the discovery system.
 #[must_use]
-pub fn channel_feed(
-    rx: broadcast::Receiver<EndpointId>,
-    priority: u8,
-    trust: u8,
-) -> PeerFeedSpec {
+pub fn channel_feed(rx: broadcast::Receiver<EndpointId>, priority: u8, trust: u8) -> PeerFeedSpec {
     let peer_trust = trust;
     let stream = BroadcastStream::new(rx)
         .filter_map(|msg| async move { msg.ok() })

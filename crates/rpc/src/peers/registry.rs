@@ -83,14 +83,11 @@ impl PeerRegistryConfig {
             ));
         }
         if self.max_in_flight_per_peer == 0 {
-            reasons.push(
-                "max_in_flight_per_peer is 0: no peer can ever be admitted.".into(),
-            );
+            reasons.push("max_in_flight_per_peer is 0: no peer can ever be admitted.".into());
         }
         if self.max_in_flight_total == 0 {
-            reasons.push(
-                "max_in_flight_total is 0: the registry can never admit a request.".into(),
-            );
+            reasons
+                .push("max_in_flight_total is 0: the registry can never admit a request.".into());
         }
         reasons
     }
@@ -272,7 +269,10 @@ impl PeerEntry {
             auth_level: AuthLevel::Untrusted,
             label: None,
             services: HashMap::new(),
-            rtt: EwmaLatency { alpha: rtt_alpha, est_ms: None },
+            rtt: EwmaLatency {
+                alpha: rtt_alpha,
+                est_ms: None,
+            },
             success_count: 0,
             error_count: 0,
             cancelled_count: 0,
@@ -544,12 +544,7 @@ impl PeerRegistry {
     /// completing after `forget_peer` still credits stats correctly but
     /// doesn't undo the operator's forget — otherwise the subsequent
     /// `release` would no longer purge the entry.
-    pub fn apply_completion(
-        &mut self,
-        now_ms: u64,
-        peer: PeerId,
-        event: PeerEvent,
-    ) -> PeerChange {
+    pub fn apply_completion(&mut self, now_ms: u64, peer: PeerId, event: PeerEvent) -> PeerChange {
         self.apply_inner(now_ms, peer, event, TombstoneAction::Preserve)
     }
 
@@ -898,10 +893,7 @@ mod tests {
 
         let entry = registry.get(id).expect("peer should exist");
         assert!(entry.has_service(NODE));
-        assert_eq!(
-            registry.iter().filter(|p| p.has_service(NODE)).count(),
-            1
-        );
+        assert_eq!(registry.iter().filter(|p| p.has_service(NODE)).count(), 1);
     }
 
     #[test]
@@ -1033,7 +1025,11 @@ mod tests {
             ..config()
         }
         .validate();
-        assert_eq!(reasons.len(), 1, "exactly one violation expected: {reasons:?}");
+        assert_eq!(
+            reasons.len(),
+            1,
+            "exactly one violation expected: {reasons:?}"
+        );
         assert!(
             reasons[0].contains("bucket_capacity"),
             "violation should mention the failing knob: {}",
@@ -1050,7 +1046,10 @@ mod tests {
             ..config()
         }
         .validate();
-        assert!(reasons.is_empty(), "capacity 0.0 must validate: {reasons:?}");
+        assert!(
+            reasons.is_empty(),
+            "capacity 0.0 must validate: {reasons:?}"
+        );
     }
 
     #[test]
@@ -1119,9 +1118,19 @@ mod tests {
         // Forget while in flight: hidden from queries, but still alive
         // internally so the release path doesn't double-count.
         let change = registry.apply(5, id, PeerEvent::Forgotten);
-        assert!(change.removed, "Forgotten reports removed even when deferred");
-        assert!(registry.get(id).is_none(), "tombstoned peer hidden from get");
-        assert_eq!(registry.iter().count(), 0, "tombstoned peer hidden from iter");
+        assert!(
+            change.removed,
+            "Forgotten reports removed even when deferred"
+        );
+        assert!(
+            registry.get(id).is_none(),
+            "tombstoned peer hidden from get"
+        );
+        assert_eq!(
+            registry.iter().count(),
+            0,
+            "tombstoned peer hidden from iter"
+        );
         assert_eq!(registry.total_in_flight(), 1);
 
         // Release the permit: now the entry is actually gone.

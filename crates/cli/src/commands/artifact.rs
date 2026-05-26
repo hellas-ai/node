@@ -4,13 +4,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Subcommand;
 use hellas_core::Digest;
 use hellas_rpc::pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::services::courtesy::{Courtesy, CourtesyClientImpl};
-use hellas_wire::iroh::IrohTransport;
 use hellas_wire::ServiceMarker;
+use hellas_wire::iroh::IrohTransport;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
@@ -109,15 +109,10 @@ async fn connect_courtesy(
         .bind()
         .await
         .context("failed to bind iroh endpoint")?;
-    let endpoint_addr = EndpointAddr::from_parts(
-        node_id,
-        node_addrs.into_iter().map(TransportAddr::Ip),
-    );
+    let endpoint_addr =
+        EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
     let connection = endpoint
-        .connect(
-            endpoint_addr,
-            <Courtesy as ServiceMarker>::ALPN.as_bytes(),
-        )
+        .connect(endpoint_addr, <Courtesy as ServiceMarker>::ALPN.as_bytes())
         .await
         .with_context(|| format!("failed to connect to {node_id}"))?;
     Ok(CourtesyClientImpl::new(IrohTransport::new(connection)))

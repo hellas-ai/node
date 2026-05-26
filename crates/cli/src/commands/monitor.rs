@@ -15,9 +15,7 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::StreamExt;
 use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
-use hellas_rpc::peers::{
-    DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity,
-};
+use hellas_rpc::peers::{DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity};
 use hellas_rpc::services::node::{Node, NodeClientImpl};
 use hellas_wire::iroh::pool::PoolOptions;
 use hellas_wire::iroh::swarm::{
@@ -273,11 +271,7 @@ async fn interrogate_peer(
     registry: ServiceRegistry,
     peer_id: EndpointId,
 ) -> anyhow::Result<PeerInterrogationOutcome> {
-    let transport = match timeout(
-        CONNECT_TIMEOUT,
-        registry.pool::<Node>().transport(peer_id),
-    )
-    .await
+    let transport = match timeout(CONNECT_TIMEOUT, registry.pool::<Node>().transport(peer_id)).await
     {
         Ok(Ok(t)) => t,
         Ok(Err(err)) => return Err(anyhow::anyhow!("failed to dial Node service: {err}")),

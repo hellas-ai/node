@@ -248,9 +248,9 @@ fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenanc
         .as_deref()
         .and_then(|value| decode_hex_32("call commitment", value))
     {
-        response
-            .extensions_mut()
-            .insert(ExecutionProvenance { commitment_id: call });
+        response.extensions_mut().insert(ExecutionProvenance {
+            commitment_id: call,
+        });
     }
     if let Some(receipt) = provenance.receipt.as_ref() {
         response

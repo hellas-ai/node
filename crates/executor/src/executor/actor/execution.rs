@@ -3,11 +3,11 @@ use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use hellas_core::{Digest, Opaque, SignedReceipt, canonical_dag_cbor};
 use hellas_core::{Symbolic, SymbolicOutput};
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::execute::{
     FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
     work_event,
 };
-use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::time::Instant;
 use tokio::sync::mpsc;

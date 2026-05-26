@@ -8,7 +8,7 @@ use ::iroh::EndpointId;
 use futures::stream::{SelectAll, Stream};
 
 use super::discovery::Peer;
-use super::peers::{scope_matches, FeedError, FeedResult, PeerFeed, PeerFeedSpec};
+use super::peers::{FeedError, FeedResult, PeerFeed, PeerFeedSpec, scope_matches};
 
 /// A tagged feed: wraps a `PeerFeed` to attach source metadata to each item.
 struct TaggedFeed {
@@ -106,7 +106,7 @@ mod tests {
     use ::iroh::{EndpointId, SecretKey};
     use futures::stream::StreamExt;
 
-    use super::super::peers::{static_feed, Scope};
+    use super::super::peers::{Scope, static_feed};
     use super::SwarmEngine;
 
     fn endpoint_id(byte: u8) -> EndpointId {

@@ -1,9 +1,9 @@
 use anyhow::Context;
 use hellas_core::ProducerSigningKey;
+use iroh::SecretKey;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use iroh::SecretKey;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";

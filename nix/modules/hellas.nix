@@ -165,6 +165,131 @@ rec {
       };
     };
 
+  gatewayOptions =
+    { lib }:
+    let
+      inherit (lib) mkEnableOption mkOption types;
+    in
+    {
+      enable = mkEnableOption "Hellas HTTP gateway";
+      host = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "Host interface for the HTTP gateway to bind.";
+      };
+      port = mkOption {
+        type = types.nullOr types.port;
+        default = 8080;
+        description = "HTTP gateway port. Null lets the CLI auto-select.";
+      };
+      nodeId = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Direct target node id. Null enables discovery unless local mode is selected.";
+      };
+      nodeAddrs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Direct UDP address hints for the target node.";
+      };
+      local = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Run the gateway against an in-process catgrad executor.";
+      };
+      verifyLocal = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Verify remote responses against an in-process catgrad executor.";
+      };
+      verifyNodeId = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Remote node id used as the verification shadow.";
+      };
+      queueSize = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum number of queued local executions.";
+      };
+      retries = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Maximum execution retries in discovery mode.";
+      };
+      defaultMaxTokens = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Fallback max output tokens when a request omits a limit.";
+      };
+      forceModel = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Model id that replaces the model named by incoming requests.";
+      };
+      metricsPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        description = "Optional Prometheus metrics port.";
+      };
+      dtype = mkOption {
+        type = types.nullOr (
+          types.enum [
+            "f32"
+            "f16"
+            "bf16"
+            "f8"
+          ]
+        );
+        default = null;
+        description = "Dtype used by local gateway execution and verification.";
+      };
+      responsesBackend = mkOption {
+        type = types.enum [
+          "hellas"
+          "proxy"
+        ];
+        default = "hellas";
+        description = "Backend used by the OpenAI Responses endpoint.";
+      };
+      responsesProxyUrl = mkOption {
+        type = types.str;
+        default = "https://api.openai.com/v1/responses";
+        description = "Upstream endpoint used when responsesBackend is proxy.";
+      };
+      responsesProxyApiKeyEnv = mkOption {
+        type = types.str;
+        default = "OPENAI_API_KEY";
+        description = "Environment variable containing the Responses proxy bearer token.";
+      };
+      identityPath = mkOption {
+        type = types.str;
+        default = "/var/lib/hellas-gateway/.hellas/identity";
+        description = "Node identity file used by the HTTP gateway.";
+      };
+      producerKeyPath = mkOption {
+        type = types.str;
+        default = "/var/lib/hellas-gateway/.hellas/signing-key.secp256k1";
+        description = "Producer signing key used by local gateway execution and verification.";
+      };
+      environmentFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/secrets/hellas-gateway.env";
+        description = "Optional systemd EnvironmentFile path for gateway-only settings.";
+      };
+      openFirewall = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Open the HTTP gateway port in the firewall.";
+      };
+      extraArgs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Extra arguments to pass to `hellas-cli gateway`.";
+      };
+    };
+
   # OTEL_EXPORTER_OTLP_* env vars derived from a resolved `otel` cfg.
   # Returns {} when no endpoint is set so callers can `//`-merge unconditionally.
   mkOtelEnv =
@@ -223,4 +348,53 @@ rec {
       model
     ]) serve.preloadWeights
     ++ serve.extraArgs;
+
+  mkGatewayArgs =
+    {
+      lib,
+      gateway,
+    }:
+    let
+      optArg =
+        flag: value:
+        lib.optionals (value != null) [
+          flag
+          (toString value)
+        ];
+    in
+    [
+      "--identity"
+      gateway.identityPath
+      "--producer-key-path"
+      gateway.producerKeyPath
+      "gateway"
+    ]
+    ++ [
+      "--host"
+      gateway.host
+    ]
+    ++ optArg "--port" gateway.port
+    ++ optArg "--node-id" gateway.nodeId
+    ++ lib.concatMap (addr: [
+      "--node-addr"
+      addr
+    ]) gateway.nodeAddrs
+    ++ lib.optionals gateway.local [ "--local" ]
+    ++ lib.optionals gateway.verifyLocal [ "--verify-local" ]
+    ++ optArg "--verify" gateway.verifyNodeId
+    ++ optArg "--queue-size" gateway.queueSize
+    ++ optArg "--retries" gateway.retries
+    ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
+    ++ optArg "--force-model" gateway.forceModel
+    ++ optArg "--metrics-port" gateway.metricsPort
+    ++ optArg "--dtype" gateway.dtype
+    ++ [
+      "--responses-backend"
+      gateway.responsesBackend
+      "--responses-proxy-url"
+      gateway.responsesProxyUrl
+      "--responses-proxy-api-key-env"
+      gateway.responsesProxyApiKeyEnv
+    ]
+    ++ gateway.extraArgs;
 }

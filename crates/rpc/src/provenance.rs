@@ -115,7 +115,10 @@ mod tests {
     fn encode_hex_renders_lowercase_hex() {
         let s = encode_hex(&[0xab; 32]);
         assert_eq!(s.len(), 64);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(s, "ab".repeat(32));
     }
 
@@ -143,7 +146,10 @@ mod tests {
     #[test]
     fn bad_length_reports_actual_length() {
         let mut md = Metadata::new();
-        md.insert(COMMITMENT_KEY, MetadataValue::Bytes(Bytes::from_static(&[0u8; 8])));
+        md.insert(
+            COMMITMENT_KEY,
+            MetadataValue::Bytes(Bytes::from_static(&[0u8; 8])),
+        );
         let err = read_provenance_metadata(&md).expect_err("too-short value must fail");
         assert_eq!(
             err,

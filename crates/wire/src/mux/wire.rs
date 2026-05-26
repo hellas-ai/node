@@ -3,7 +3,7 @@
 
 use bytes::{Bytes, BytesMut};
 
-use crate::frame::{decode_frame, encode_frame, Frame, FrameError};
+use crate::frame::{Frame, FrameError, decode_frame, encode_frame};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StreamKey {
@@ -13,7 +13,10 @@ pub struct StreamKey {
 
 impl StreamKey {
     pub const fn new(stream_id: u16, generation: u16) -> Self {
-        Self { stream_id, generation }
+        Self {
+            stream_id,
+            generation,
+        }
     }
 }
 
@@ -42,7 +45,10 @@ pub fn decode_keyed_frame(buf: &[u8]) -> Result<KeyedFrame, FrameError> {
     let generation = u16::from_be_bytes([buf[2], buf[3]]);
     let frame = decode_frame(&buf[4..])?;
     Ok(KeyedFrame {
-        key: StreamKey { stream_id, generation },
+        key: StreamKey {
+            stream_id,
+            generation,
+        },
         frame,
     })
 }
