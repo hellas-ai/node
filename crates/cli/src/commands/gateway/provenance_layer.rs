@@ -21,6 +21,9 @@ use tower::{Layer, Service};
 
 use crate::execution::ReceiptArtifact;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReceiptHeader(pub String);
+
 #[derive(Clone, Default)]
 pub(super) struct ProvenanceLayer;
 
@@ -75,6 +78,10 @@ fn apply_provenance_headers(response: &mut Response<Body>) {
         response
             .headers_mut()
             .insert(receipt_header(), receipt_header_value(receipt));
+    } else if let Some(receipt) = extensions.get::<ReceiptHeader>() {
+        response
+            .headers_mut()
+            .insert(receipt_header(), receipt_string_header_value(&receipt.0));
     }
 }
 
@@ -94,6 +101,10 @@ fn header_value(bytes: &[u8; 32]) -> HeaderValue {
 fn receipt_header_value(receipt: &ReceiptArtifact) -> HeaderValue {
     HeaderValue::from_str(&receipt.encoded())
         .expect("base64url receipt envelope is always a valid header value")
+}
+
+fn receipt_string_header_value(receipt: &str) -> HeaderValue {
+    HeaderValue::from_str(receipt).expect("receipt envelope is always a valid header value")
 }
 
 #[cfg(test)]
