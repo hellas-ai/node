@@ -137,10 +137,11 @@ OpenAI Responses.
 
 ## OpenAI Adaptors
 
-The crate currently includes OpenAI Responses and OpenAI Chat Completions.
-Responses exercises rich inputs, structured output, response state, and
-streaming fanout. Chat Completions keeps exact OpenAI message JSON in canonical
-input items so tool-call history and tool results survive projection without
+The crate currently includes OpenAI Responses, OpenAI Chat Completions, and
+Anthropic Messages. Responses exercises rich inputs, structured output,
+response state, and streaming fanout. Chat Completions and Anthropic Messages
+keep exact provider message JSON in canonical input items so tool-call history,
+tool results, and provider block formats survive projection without
 gateway-specific parsing.
 
 Adaptor tests should pin both wire compatibility and the

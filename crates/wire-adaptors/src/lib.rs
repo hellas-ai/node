@@ -1,6 +1,7 @@
 //! Transport-neutral adaptors for LLM wire formats.
 
 pub mod adaptor;
+pub mod anthropic;
 pub mod backend;
 pub mod error;
 pub mod execution;

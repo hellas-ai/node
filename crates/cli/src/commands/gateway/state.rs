@@ -325,13 +325,30 @@ impl GatewayState {
         .await
     }
 
-    pub(super) async fn prepare_anthropic(
+    pub(super) async fn prepare_anthropic_execution(
         &self,
-        req: &anthropic::MessageRequest,
+        req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let messages = Vec::<Message>::from(req);
-        let thinking = ThinkingPolicy::from(req.thinking);
-        let model = self.resolve_model(&req.model);
+        let max_tokens = req
+            .canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens);
+        let messages = wire_anthropic_messages(&req.canonical).map_err(|message| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        })?;
+        let thinking =
+            match thinking_policy_from_anthropic_reasoning(req.canonical.reasoning.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(message) => {
+                    return Err(HttpError {
+                        status: StatusCode::BAD_REQUEST,
+                        message,
+                    });
+                }
+            };
+        let model = self.resolve_model(&req.canonical.model.name);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to load local model assets for `{model}`: {err}"),
@@ -347,7 +364,7 @@ impl GatewayState {
             model,
             assets,
             prepared_prompt,
-            req.max_tokens,
+            max_tokens,
             Some(chat_turn),
             "Failed to prepare chat request",
         )
@@ -489,6 +506,73 @@ fn wire_message_to_openai(message: &WireMessage) -> Result<openai::ChatMessage, 
         .build())
 }
 
+fn wire_anthropic_messages(canonical: &CanonicalExecution) -> Result<Vec<Message>, String> {
+    match &canonical.input {
+        Input::Text(text) => Ok(vec![Message::anthropic(anthropic::AnthropicMessage::user(
+            text.clone(),
+        ))]),
+        Input::Messages(messages) => messages
+            .iter()
+            .map(wire_message_to_anthropic)
+            .map(|message| message.map(Message::anthropic))
+            .collect(),
+        Input::Items(items) => items
+            .iter()
+            .map(wire_item_to_anthropic)
+            .map(|message| message.map(Message::anthropic))
+            .collect(),
+    }
+}
+
+fn wire_item_to_anthropic(item: &InputItem) -> Result<anthropic::AnthropicMessage, String> {
+    match item {
+        InputItem::Message(message) => wire_message_to_anthropic(message),
+        InputItem::Raw(value) => {
+            serde_json::from_value::<anthropic::AnthropicMessage>(value.clone())
+                .map_err(|err| format!("unsupported raw Anthropic message: {err}"))
+        }
+        InputItem::ToolCall { .. } | InputItem::ToolResult { .. } => {
+            Err("Anthropic local templates do not support tool history input yet".to_string())
+        }
+    }
+}
+
+fn wire_message_to_anthropic(message: &WireMessage) -> Result<anthropic::AnthropicMessage, String> {
+    Ok(anthropic::AnthropicMessage {
+        role: message.role.clone(),
+        content: wire_anthropic_content(&message.content)?,
+    })
+}
+
+fn wire_anthropic_content(
+    content: &[WireContentPart],
+) -> Result<anthropic::MessageContent, String> {
+    match content {
+        [] => Ok(anthropic::MessageContent::Text(String::new())),
+        [WireContentPart::Text { text }] => Ok(anthropic::MessageContent::Text(text.clone())),
+        parts => parts
+            .iter()
+            .map(wire_anthropic_content_part)
+            .collect::<Result<Vec<_>, _>>()
+            .map(anthropic::MessageContent::Blocks),
+    }
+}
+
+fn wire_anthropic_content_part(part: &WireContentPart) -> Result<anthropic::ContentBlock, String> {
+    match part {
+        WireContentPart::Text { text } => Ok(anthropic::ContentBlock::Text { text: text.clone() }),
+        WireContentPart::Image { .. } => {
+            Err("image content is not supported by local Anthropic templates".to_string())
+        }
+        WireContentPart::File { .. } => {
+            Err("file content is not supported by local Anthropic templates".to_string())
+        }
+        WireContentPart::Json(_) => {
+            Err("JSON content parts are not supported by local Anthropic templates".to_string())
+        }
+    }
+}
+
 fn wire_message_content(
     content: &[WireContentPart],
 ) -> Result<Option<openai::MessageContent>, String> {
@@ -580,6 +664,32 @@ fn thinking_policy_from_wire_reasoning(
         _ => return Err(format!("unsupported reasoning effort `{value}`")),
     };
     Ok(ThinkingPolicy::from(Some(effort)))
+}
+
+fn thinking_policy_from_anthropic_reasoning(
+    reasoning: Option<&hellas_wire_adaptors::ReasoningOptions>,
+) -> Result<ThinkingPolicy, String> {
+    let Some(reasoning) = reasoning else {
+        return Ok(ThinkingPolicy::Default);
+    };
+    let object = reasoning
+        .value
+        .as_object()
+        .ok_or_else(|| "Anthropic thinking options must be an object".to_string())?;
+    let config = match object.get("type").and_then(JsonValue::as_str) {
+        Some("enabled") => {
+            let budget_tokens = object
+                .get("budget_tokens")
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| "Anthropic thinking requires `budget_tokens`".to_string())?;
+            anthropic::ThinkingConfig::Enabled { budget_tokens }
+        }
+        Some("disabled") => anthropic::ThinkingConfig::Disabled,
+        Some(other) => return Err(format!("unsupported Anthropic thinking type `{other}`")),
+        None => return Err("Anthropic thinking requires `type`".to_string()),
+    };
+    Ok(ThinkingPolicy::from(Some(config)))
 }
 
 /// Map a `ModelAssets::chat_turn` failure to an HTTP status. Bad
@@ -891,6 +1001,48 @@ mod wire_adaptor_tests {
         assert_eq!(tool_call["id"], "call_1");
         assert_eq!(tool_call["function"]["name"], "lookup");
         assert_eq!(tool_call["function"]["arguments"], "{\"query\":\"zurich\"}");
+    }
+
+    #[test]
+    fn raw_anthropic_messages_preserve_block_shape() {
+        let canonical = canonical(Input::Items(vec![
+            InputItem::Raw(json!({
+                "role": "system",
+                "content": [{"type": "text", "text": "Be brief"}]
+            })),
+            InputItem::Raw(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "Hi"}]
+            })),
+        ]));
+
+        let messages = wire_anthropic_messages(&canonical).unwrap();
+        assert_eq!(messages.len(), 2);
+        let Message::Anthropic(system) = &messages[0] else {
+            panic!("expected Anthropic system message");
+        };
+        assert_eq!(system.role, "system");
+        assert!(matches!(
+            system.content,
+            anthropic::MessageContent::Blocks(_)
+        ));
+    }
+
+    #[test]
+    fn anthropic_reasoning_maps_to_thinking_policy() {
+        let thinking = thinking_policy_from_anthropic_reasoning(Some(
+            &hellas_wire_adaptors::ReasoningOptions {
+                value: json!({"type": "enabled", "budget_tokens": 1024}),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            thinking,
+            ThinkingPolicy::from(Some(anthropic::ThinkingConfig::Enabled {
+                budget_tokens: 1024
+            }))
+        );
     }
 
     #[test]
