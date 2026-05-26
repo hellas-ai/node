@@ -16,6 +16,10 @@ const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
     "thinking",
 ];
 
+// Anthropic tool declarations stay in passthrough until there is a
+// provider-neutral tool schema for this surface. Tool-use history itself is
+// preserved in the message content blocks.
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnthropicMessagesAdaptor;
 
@@ -748,23 +752,9 @@ mod tests {
             .expect("request projects");
         assert_eq!(execution.canonical.model.name, "claude-3-5-sonnet");
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(32));
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("messages"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("system"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("thinking"))
+        assert_eq!(
+            execution.canonical.committed_fields,
+            field_set(["model", "messages", "max_tokens", "system", "thinking"])
         );
         let Input::Items(items) = execution.canonical.input else {
             panic!("expected raw input items");
@@ -805,6 +795,34 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn parse_project_render_keeps_passthrough_available() {
+        let request = sample_request();
+        let execution = adaptor().to_execution_request(&request).unwrap();
+        assert_eq!(execution.passthrough, request.passthrough);
+
+        let response = adaptor()
+            .render_response(
+                &request,
+                ExecutionResult {
+                    output: vec![OutputItem::Text {
+                        text: "done".to_string(),
+                        channel: TextChannel::Output,
+                    }],
+                    usage: None,
+                    stop_reason: StopReason::EndOfText,
+                    provenance: None,
+                },
+                RenderContext::new("msg-test", "unused", 0),
+            )
+            .unwrap();
+        let WireBody::Json(body) = response.body else {
+            panic!("expected json body");
+        };
+        assert_eq!(body["model"], request.model);
+        assert_eq!(body["content"][0]["text"], "done");
     }
 
     #[test]
@@ -950,5 +968,9 @@ mod tests {
         };
         assert_eq!(finish_json["delta"]["stop_reason"], "tool_use");
         assert_eq!(finish[1].name.as_deref(), Some("message_stop"));
+    }
+
+    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
+        fields.into_iter().map(FieldPath::from).collect()
     }
 }

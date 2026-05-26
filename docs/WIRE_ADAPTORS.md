@@ -116,8 +116,11 @@ The core events are:
 
 ## Backend Contract
 
-Backends consume `ExecutionRequest` and produce `ExecutionResult` or
-`OutputEvent`.
+Backends consume `BackendRequest` and produce `ExecutionResult` or
+`OutputEvent`. `BackendRequest` carries both the projected `ExecutionRequest`
+and the original `RawRequest`; raw-preserving backends can forward exact input
+bytes while Hellas backends can ignore the raw bytes and execute only the
+canonical projection.
 
 Expected backend families:
 

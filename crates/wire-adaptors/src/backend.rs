@@ -4,17 +4,29 @@ use std::pin::Pin;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{ExecutionRequest, ExecutionResult, OutputEvent};
+use crate::{ExecutionRequest, ExecutionResult, OutputEvent, RawRequest};
 
 pub type BackendResult<T> = Result<T, BackendError>;
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = BackendResult<T>> + Send + 'a>>;
 pub type OutputEventStream<'a> =
     Pin<Box<dyn Stream<Item = BackendResult<OutputEvent>> + Send + 'a>>;
 
-pub trait ExecutionBackend {
-    fn execute<'a>(&'a self, request: ExecutionRequest) -> BackendFuture<'a, ExecutionResult>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackendRequest {
+    pub execution: ExecutionRequest,
+    pub raw: RawRequest,
+}
 
-    fn stream<'a>(&'a self, request: ExecutionRequest) -> BackendFuture<'a, OutputEventStream<'a>>;
+impl BackendRequest {
+    pub fn new(execution: ExecutionRequest, raw: RawRequest) -> Self {
+        Self { execution, raw }
+    }
+}
+
+pub trait ExecutionBackend {
+    fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult>;
+
+    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, OutputEventStream<'a>>;
 }
 
 #[derive(Debug, Error)]

@@ -236,6 +236,8 @@ pub enum TextChannel {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallDelta {
+    /// Compatibility form for callers that cannot yet split tool calls into
+    /// explicit start, arguments, and end events.
     pub index: usize,
     pub id: Option<String>,
     pub name_delta: Option<String>,
@@ -285,7 +287,9 @@ pub struct Usage {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
+    /// Lowercase hex commitment string ready for provider wire JSON.
     pub call_commitment: Option<String>,
+    /// Lowercase hex receipt commitment string ready for provider wire JSON.
     pub receipt_commitment: Option<String>,
 }
 

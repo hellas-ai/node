@@ -361,11 +361,9 @@ mod tests {
         assert_eq!(execution.canonical.model.name, "gpt-3.5-turbo-instruct");
         assert_eq!(execution.canonical.input, Input::Text("Hello".to_string()));
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(16));
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("prompt"))
+        assert_eq!(
+            execution.canonical.committed_fields,
+            field_set(["model", "prompt", "max_tokens"])
         );
     }
 
@@ -409,6 +407,41 @@ mod tests {
         assert_eq!(body["usage"]["total_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn parse_project_render_keeps_passthrough_available() {
+        let request = adaptor()
+            .parse(raw(json!({
+                "model": "gpt-3.5-turbo-instruct",
+                "prompt": "Hello",
+                "stream": false,
+                "temperature": 0.7
+            })))
+            .unwrap();
+        let execution = adaptor().to_execution_request(&request).unwrap();
+        assert_eq!(execution.passthrough, request.passthrough);
+
+        let response = adaptor()
+            .render_response(
+                &request,
+                ExecutionResult {
+                    output: vec![OutputItem::Text {
+                        text: " world".to_string(),
+                        channel: TextChannel::Output,
+                    }],
+                    usage: None,
+                    stop_reason: StopReason::EndOfText,
+                    provenance: None,
+                },
+                RenderContext::new("cmpl-test", "unused", 123),
+            )
+            .unwrap();
+        let WireBody::Json(body) = response.body else {
+            panic!("expected json body");
+        };
+        assert_eq!(body["model"], request.model);
+        assert_eq!(body["choices"][0]["text"], " world");
     }
 
     #[test]
@@ -476,5 +509,9 @@ mod tests {
         assert_eq!(done_json["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(done_json["hellas"]["receipt"], "bb".repeat(32));
         assert!(matches!(finished[1].data, WireEventData::Text(ref text) if text == "[DONE]"));
+    }
+
+    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
+        fields.into_iter().map(FieldPath::from).collect()
     }
 }

@@ -64,7 +64,9 @@ pub struct ResponsesStreamState {
     created_at: i64,
     sequence_number: u64,
     text: String,
-    output_started: bool,
+    started: bool,
+    next_output_index: usize,
+    message_output_index: Option<usize>,
     usage: Option<Usage>,
     provenance: Option<crate::Provenance>,
     tool_calls: Vec<ResponseToolCallState>,
@@ -105,7 +107,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
             created_at: context.created_at,
             sequence_number: 0,
             text: String::new(),
-            output_started: false,
+            started: false,
+            next_output_index: 0,
+            message_output_index: None,
             usage: None,
             provenance: None,
             tool_calls: Vec::new(),
@@ -125,6 +129,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
             "completed",
             output_items_json(&context.message_id, &result.output)?,
             result.usage,
+            request_metadata(request),
             result.provenance.as_ref(),
         );
         Ok(WireResponse::json(200, body))
@@ -135,10 +140,10 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         request: &Self::ParsedRequest,
         state: &mut Self::StreamState,
     ) -> AdaptorResult<Vec<WireStreamEvent>> {
-        if state.output_started {
+        if state.started {
             return Ok(Vec::new());
         }
-        state.output_started = true;
+        state.started = true;
 
         let created = response_event(
             "response.created",
@@ -162,35 +167,8 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 None,
             ),
         );
-        let item = message_item_json(&state.message_id, "in_progress", Vec::new());
-        let output_item_added = response_event(
-            "response.output_item.added",
-            json!({
-                "type": "response.output_item.added",
-                "sequence_number": next_sequence(state),
-                "output_index": 0,
-                "item": item,
-            }),
-        );
-        let part = output_text_json("");
-        let content_part_added = response_event(
-            "response.content_part.added",
-            json!({
-                "type": "response.content_part.added",
-                "sequence_number": next_sequence(state),
-                "item_id": state.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": part,
-            }),
-        );
 
-        Ok(vec![
-            created,
-            in_progress,
-            output_item_added,
-            content_part_added,
-        ])
+        Ok(vec![created, in_progress])
     }
 
     fn render_stream_event(
@@ -205,18 +183,23 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 channel: TextChannel::Output,
                 ..
             } => {
+                let mut events = ensure_message_item_started(state);
+                let output_index = state
+                    .message_output_index
+                    .expect("message item is started before text deltas");
                 state.text.push_str(&delta);
-                Ok(vec![response_event(
+                events.push(response_event(
                     "response.output_text.delta",
                     json!({
                         "type": "response.output_text.delta",
                         "sequence_number": next_sequence(state),
                         "item_id": state.message_id,
-                        "output_index": 0,
+                        "output_index": output_index,
                         "content_index": 0,
                         "delta": delta,
                     }),
-                )])
+                ));
+                Ok(events)
             }
             OutputEvent::TextDelta {
                 delta,
@@ -258,42 +241,8 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 if let Some(usage) = usage {
                     state.usage = Some(usage);
                 }
-                let completed_text = output_text_json(&state.text);
-                let content_done = response_event(
-                    "response.output_text.done",
-                    json!({
-                        "type": "response.output_text.done",
-                        "sequence_number": next_sequence(state),
-                        "item_id": state.message_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "text": state.text,
-                    }),
-                );
-                let part_done = response_event(
-                    "response.content_part.done",
-                    json!({
-                        "type": "response.content_part.done",
-                        "sequence_number": next_sequence(state),
-                        "item_id": state.message_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": completed_text,
-                    }),
-                );
-                let item = message_item_json(&state.message_id, "completed", vec![completed_text]);
-                let mut output = Vec::with_capacity(state.tool_calls.len() + 1);
-                output.push(item.clone());
-                output.extend(state.tool_calls.iter().map(response_tool_call_item));
-                let item_done = response_event(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "sequence_number": next_sequence(state),
-                        "output_index": 0,
-                        "item": item.clone(),
-                    }),
-                );
+                let mut events = finish_message_item(state);
+                let output = completed_output_items(state);
                 let completed = response_event(
                     "response.completed",
                     json!({
@@ -306,11 +255,13 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                             "completed",
                             output,
                             state.usage,
+                            request_metadata(request),
                             state.provenance.as_ref(),
                         ),
                     }),
                 );
-                Ok(vec![content_done, part_done, item_done, completed])
+                events.push(completed);
+                Ok(events)
             }
         }
     }
@@ -712,7 +663,7 @@ fn render_tool_call_start(
             start.index
         )));
     }
-    let output_index = state.tool_calls.len() + usize::from(state.output_started);
+    let output_index = next_output_index(state);
     state.tool_calls.push(ResponseToolCallState {
         parser_index: start.index,
         output_index,
@@ -737,6 +688,101 @@ fn render_tool_call_start(
             },
         }),
     )])
+}
+
+fn ensure_message_item_started(state: &mut ResponsesStreamState) -> Vec<WireStreamEvent> {
+    if state.message_output_index.is_some() {
+        return Vec::new();
+    }
+    let output_index = next_output_index(state);
+    state.message_output_index = Some(output_index);
+    let item = message_item_json(&state.message_id, "in_progress", Vec::new());
+    let part = output_text_json("");
+    vec![
+        response_event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": next_sequence(state),
+                "output_index": output_index,
+                "item": item,
+            }),
+        ),
+        response_event(
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "sequence_number": next_sequence(state),
+                "item_id": state.message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": part,
+            }),
+        ),
+    ]
+}
+
+fn finish_message_item(state: &mut ResponsesStreamState) -> Vec<WireStreamEvent> {
+    let Some(output_index) = state.message_output_index else {
+        return Vec::new();
+    };
+    let completed_text = output_text_json(&state.text);
+    let item = message_item_json(&state.message_id, "completed", vec![completed_text.clone()]);
+    vec![
+        response_event(
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "sequence_number": next_sequence(state),
+                "item_id": state.message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": state.text,
+            }),
+        ),
+        response_event(
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "sequence_number": next_sequence(state),
+                "item_id": state.message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": completed_text,
+            }),
+        ),
+        response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": next_sequence(state),
+                "output_index": output_index,
+                "item": item,
+            }),
+        ),
+    ]
+}
+
+fn completed_output_items(state: &ResponsesStreamState) -> Vec<JsonValue> {
+    let mut items = Vec::with_capacity(state.tool_calls.len() + 1);
+    if let Some(output_index) = state.message_output_index {
+        items.push((
+            output_index,
+            message_item_json(
+                &state.message_id,
+                "completed",
+                vec![output_text_json(&state.text)],
+            ),
+        ));
+    }
+    items.extend(
+        state
+            .tool_calls
+            .iter()
+            .map(|call| (call.output_index, response_tool_call_item(call))),
+    );
+    items.sort_by_key(|(output_index, _)| *output_index);
+    items.into_iter().map(|(_, item)| item).collect()
 }
 
 fn render_tool_call_arguments_delta(
@@ -862,6 +908,7 @@ fn response_status_event(
             status,
             output,
             usage,
+            request_metadata(request),
             state.provenance.as_ref(),
         ),
     })
@@ -874,6 +921,7 @@ fn response_json(
     status: &str,
     output: Vec<JsonValue>,
     usage: Option<Usage>,
+    metadata: Option<&JsonValue>,
     provenance: Option<&crate::Provenance>,
 ) -> JsonValue {
     let mut object = json!({
@@ -887,10 +935,22 @@ fn response_json(
     if let Some(usage) = usage {
         object["usage"] = usage_json(usage);
     }
+    if let Some(metadata) = metadata {
+        object["metadata"] = metadata.clone();
+    }
     if let Some(provenance) = provenance.and_then(provenance_json) {
         object["hellas"] = provenance;
     }
     object
+}
+
+fn request_metadata(request: &ParsedResponseRequest) -> Option<&JsonValue> {
+    request
+        .passthrough
+        .fields()
+        .iter()
+        .find(|field| field.path == FieldPath::from("metadata"))
+        .map(|field| &field.value)
 }
 
 fn message_item_json(message_id: &str, status: &str, content: Vec<JsonValue>) -> JsonValue {
@@ -943,6 +1003,12 @@ fn response_event(name: &str, data: JsonValue) -> WireStreamEvent {
 fn next_sequence(state: &mut ResponsesStreamState) -> u64 {
     let current = state.sequence_number;
     state.sequence_number = state.sequence_number.saturating_add(1);
+    current
+}
+
+fn next_output_index(state: &mut ResponsesStreamState) -> usize {
+    let current = state.next_output_index;
+    state.next_output_index = state.next_output_index.saturating_add(1);
     current
 }
 
@@ -1069,6 +1135,10 @@ mod tests {
                 "max_output_tokens": 64,
                 "temperature": 0.2,
                 "top_p": 0.9,
+                "top_logprobs": 2,
+                "parallel_tool_calls": true,
+                "truncation": "auto",
+                "previous_response_id": "resp_prev",
                 "stream": true,
                 "metadata": {"request_id": "r1"},
                 "seed": 42
@@ -1112,35 +1182,24 @@ mod tests {
         let parsed = sample_request();
         let execution = adaptor().to_execution_request(&parsed).unwrap();
         assert_eq!(execution.canonical.model.name, "gpt-4.1-mini");
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("model"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("input"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("tools"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("text"))
-        );
-        assert!(
-            !execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("metadata"))
+        assert_eq!(
+            execution.canonical.committed_fields,
+            field_set([
+                "model",
+                "input",
+                "instructions",
+                "max_output_tokens",
+                "temperature",
+                "top_p",
+                "top_logprobs",
+                "parallel_tool_calls",
+                "truncation",
+                "tools",
+                "tool_choice",
+                "text",
+                "reasoning",
+                "previous_response_id",
+            ])
         );
         assert_eq!(execution.passthrough.fields().len(), 3);
     }
@@ -1155,8 +1214,34 @@ mod tests {
     }
 
     #[test]
+    fn projection_preserves_builtin_tool_specs_as_raw_canonical_tools() {
+        let tool = json!({
+            "type": "web_search_preview",
+            "user_location": {"type": "approximate", "city": "Zurich"}
+        });
+        let parsed = adaptor()
+            .parse(raw(json!({
+                "model": "m",
+                "input": "hello",
+                "tools": [tool.clone()]
+            })))
+            .unwrap();
+        let execution = adaptor().to_execution_request(&parsed).unwrap();
+
+        assert_eq!(execution.canonical.tools.len(), 1);
+        assert_eq!(execution.canonical.tools[0].name, "web_search_preview");
+        assert_eq!(
+            execution.canonical.tools[0].kind,
+            ToolKind::BuiltIn("web_search_preview".to_string())
+        );
+        assert_eq!(execution.canonical.tools[0].raw, tool);
+    }
+
+    #[test]
     fn render_non_streaming_text_response() {
         let parsed = sample_request();
+        let execution = adaptor().to_execution_request(&parsed).unwrap();
+        assert_eq!(execution.passthrough, parsed.passthrough);
         let response = adaptor()
             .render_response(
                 &parsed,
@@ -1187,8 +1272,38 @@ mod tests {
         };
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["metadata"]["request_id"], "r1");
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn render_non_streaming_tool_call_response() {
+        let parsed = sample_request();
+        let response = adaptor()
+            .render_response(
+                &parsed,
+                ExecutionResult {
+                    output: vec![OutputItem::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: json!({"query": "tea"}),
+                    }],
+                    usage: None,
+                    stop_reason: StopReason::ToolCall,
+                    provenance: None,
+                },
+                RenderContext::new("resp_1", "msg_1", 123),
+            )
+            .unwrap();
+
+        let body = match response.body {
+            crate::WireBody::Json(body) => body,
+            crate::WireBody::Bytes(_) => panic!("expected JSON response"),
+        };
+        assert_eq!(body["output"][0]["type"], "function_call");
+        assert_eq!(body["output"][0]["call_id"], "call_1");
+        assert_eq!(body["output"][0]["arguments"], "{\"query\":\"tea\"}");
     }
 
     #[test]
@@ -1340,35 +1455,30 @@ mod tests {
                 "response.created",
                 "response.in_progress",
                 "response.output_item.added",
-                "response.content_part.added",
-                "response.output_item.added",
                 "response.function_call_arguments.delta",
                 "response.function_call_arguments.done",
-                "response.output_item.done",
-                "response.output_text.done",
-                "response.content_part.done",
                 "response.output_item.done",
                 "response.completed",
             ]
         );
 
-        let tool_added = match &events[4].data {
+        let tool_added = match &events[2].data {
             WireEventData::Json(value) => value,
             _ => panic!("expected tool-call added event"),
         };
-        assert_eq!(tool_added["output_index"], 1);
+        assert_eq!(tool_added["output_index"], 0);
         assert_eq!(tool_added["item"]["id"], "call_1");
         assert_eq!(tool_added["item"]["name"], "lookup");
         assert_eq!(tool_added["item"]["arguments"], "");
 
-        let args_delta = match &events[5].data {
+        let args_delta = match &events[3].data {
             WireEventData::Json(value) => value,
             _ => panic!("expected tool-call arguments delta"),
         };
         assert_eq!(args_delta["item_id"], "call_1");
         assert_eq!(args_delta["delta"], "{\"query\":\"tea\"}");
 
-        let args_done = match &events[6].data {
+        let args_done = match &events[4].data {
             WireEventData::Json(value) => value,
             _ => panic!("expected tool-call arguments done"),
         };
@@ -1378,11 +1488,103 @@ mod tests {
             WireEventData::Json(value) => value,
             _ => panic!("expected completed event"),
         };
-        assert_eq!(completed["response"]["output"][1]["type"], "function_call");
-        assert_eq!(completed["response"]["output"][1]["call_id"], "call_1");
+        assert_eq!(completed["response"]["output"][0]["type"], "function_call");
+        assert_eq!(completed["response"]["output"][0]["call_id"], "call_1");
         assert_eq!(
-            completed["response"]["output"][1]["arguments"],
+            completed["response"]["output"][0]["arguments"],
             "{\"query\":\"tea\"}"
         );
+    }
+
+    #[test]
+    fn render_stream_tool_first_then_text_preserves_output_order() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallStart(crate::ToolCallStart {
+                        index: 0,
+                        id: Some("call_1".to_string()),
+                        name: "lookup".to_string(),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallEnd(crate::ToolCallEnd {
+                        index: 0,
+                        arguments: json!({"query": "tea"}),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::TextDelta {
+                        index: 0,
+                        delta: "after".to_string(),
+                        channel: TextChannel::Output,
+                    },
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Finished {
+                        stop_reason: StopReason::ToolCall,
+                        usage: None,
+                    },
+                )
+                .unwrap(),
+        );
+
+        let tool_added = match &events[2].data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected tool-call added event"),
+        };
+        assert_eq!(tool_added["output_index"], 0);
+        let text_added = events
+            .iter()
+            .find_map(|event| match &event.data {
+                WireEventData::Json(value)
+                    if event.name.as_deref() == Some("response.output_item.added")
+                        && value["item"]["type"] == "message" =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("text item should be added after tool call");
+        assert_eq!(text_added["output_index"], 1);
+
+        let completed = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected completed event"),
+        };
+        assert_eq!(completed["response"]["output"][0]["type"], "function_call");
+        assert_eq!(completed["response"]["output"][1]["type"], "message");
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["text"],
+            "after"
+        );
+    }
+
+    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
+        fields.into_iter().map(FieldPath::from).collect()
     }
 }

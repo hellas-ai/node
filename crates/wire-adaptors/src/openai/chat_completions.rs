@@ -903,6 +903,11 @@ mod tests {
                 "max_tokens": 32,
                 "reasoning_effort": "low",
                 "response_format": {"type": "json_object"},
+                "temperature": 0.3,
+                "top_p": 0.8,
+                "top_logprobs": 2,
+                "parallel_tool_calls": true,
+                "stop": ["END"],
                 "stream": true,
                 "stream_options": {"include_usage": true},
                 "metadata": {"trace": "abc"},
@@ -948,23 +953,22 @@ mod tests {
             execution.canonical.response_format,
             Some(ResponseFormat::JsonObject)
         ));
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("messages"))
-        );
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("tools"))
-        );
-        assert!(
-            !execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("stream"))
+        assert_eq!(
+            execution.canonical.committed_fields,
+            field_set([
+                "model",
+                "messages",
+                "max_tokens",
+                "temperature",
+                "top_p",
+                "top_logprobs",
+                "parallel_tool_calls",
+                "stop",
+                "tools",
+                "tool_choice",
+                "response_format",
+                "reasoning_effort",
+            ])
         );
         assert!(matches!(execution.canonical.input, Input::Items(_)));
     }
@@ -1022,6 +1026,34 @@ mod tests {
         assert_eq!(body["usage"]["prompt_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn parse_project_render_keeps_passthrough_available() {
+        let request = sample_request();
+        let execution = adaptor().to_execution_request(&request).unwrap();
+        assert_eq!(execution.passthrough, request.passthrough);
+
+        let response = adaptor()
+            .render_response(
+                &request,
+                ExecutionResult {
+                    output: vec![OutputItem::Text {
+                        text: "done".to_string(),
+                        channel: TextChannel::Output,
+                    }],
+                    usage: None,
+                    stop_reason: StopReason::EndOfText,
+                    provenance: None,
+                },
+                RenderContext::new("chatcmpl-test", "msg-test", 123),
+            )
+            .unwrap();
+        let crate::WireBody::Json(body) = response.body else {
+            panic!("expected json body");
+        };
+        assert_eq!(body["model"], request.model);
+        assert_eq!(body["choices"][0]["message"]["content"], "done");
     }
 
     #[test]
@@ -1147,5 +1179,9 @@ mod tests {
             finish.last().unwrap().data,
             WireEventData::Text("[DONE]".to_string())
         );
+    }
+
+    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
+        fields.into_iter().map(FieldPath::from).collect()
     }
 }
