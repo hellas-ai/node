@@ -22,10 +22,6 @@
 //! takes the first that returns a successful quote. The run step then opens
 //! an Execute service transport for the selected peer.
 
-// Some helpers are reachable only under specific feature combinations.
-// Keep the cfg noise localized to this module.
-#![allow(dead_code)]
-
 use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
 use base64::Engine;
@@ -144,8 +140,7 @@ pub enum ExecutionStrategy {
 /// "secret key but no endpoint" state.
 #[derive(Clone)]
 pub struct RemoteRpc {
-    #[allow(dead_code)] // held alive so the registry's pools stay valid
-    endpoint: iroh::Endpoint,
+    _endpoint: iroh::Endpoint,
     registry: ServiceRegistry,
 }
 
@@ -250,7 +245,6 @@ pub enum StopReason {
 
 #[derive(Debug, Clone)]
 pub enum OpaqueExecutionEvent {
-    Chunk { position: u64, bytes: Vec<u8> },
     Done(OpaqueOutcome),
 }
 
@@ -292,7 +286,10 @@ impl ExecutionRuntime {
             .await
             .context("failed to bind iroh endpoint for ExecutionRuntime")?;
         let registry = ServiceRegistry::new(&endpoint);
-        self.remote = Some(RemoteRpc { endpoint, registry });
+        self.remote = Some(RemoteRpc {
+            _endpoint: endpoint,
+            registry,
+        });
         Ok(self)
     }
 
@@ -605,9 +602,9 @@ impl PreparedRoute {
             ExecutionRoute::Local => {
                 let handle = runtime.require_local_executor()?;
                 handle
-                    .preload_weights(local_model_spec(quote_req))
+                    .load_model_metadata(local_model_spec(quote_req))
                     .await
-                    .context("failed to preload local weights")?;
+                    .context("failed to load local model metadata")?;
                 let outcome = handle
                     .quote_prepared_text(quote_req.clone())
                     .await
@@ -1003,10 +1000,8 @@ fn local_execute_opaque_stream(
             let wire = item.map_err(|status: WireStatus| {
                 anyhow!(status).context("local opaque execution stream failed")
             })?;
-            let event = convert_opaque_wire_event(wire, &core_request)?;
-            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
-            yield event;
-            if is_done {
+            if let Some(event) = convert_opaque_wire_event(wire, &core_request)? {
+                yield event;
                 got_terminal = true;
                 break;
             }
@@ -1074,18 +1069,17 @@ fn remote_execute_opaque_stream(
             })?;
         let mut got_terminal = false;
         while let Some(item) = wire.next().await {
-            let event = convert_opaque_wire_event(
+            let Some(event) = convert_opaque_wire_event(
                 item.map_err(|status: WireStatus| {
                     anyhow!(status).context("remote opaque execute stream failed")
                 })?,
                 &core_request,
-            )?;
-            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            )? else {
+                continue;
+            };
             yield event;
-            if is_done {
-                got_terminal = true;
-                break;
-            }
+            got_terminal = true;
+            break;
         }
         wire.finish()
             .map_err(|status| {
@@ -1124,21 +1118,20 @@ fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
 fn convert_opaque_wire_event(
     event: WorkEvent,
     request: &CoreOpaqueRequest,
-) -> anyhow::Result<OpaqueExecutionEvent> {
+) -> anyhow::Result<Option<OpaqueExecutionEvent>> {
     let Some(event) = event.kind else {
         bail!("wire event with no body");
     };
     match event {
-        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
-            position: chunk.position,
-            bytes: chunk.bytes,
-        }),
-        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
+        work_event::Kind::Chunk(_) => Ok(None),
+        work_event::Kind::Finished(finished) => Ok(Some(OpaqueExecutionEvent::Done(
             parse_opaque_finished(finished, request)?,
-        )),
-        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
-            error: failed.error,
-        })),
+        ))),
+        work_event::Kind::Failed(failed) => {
+            Ok(Some(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+                error: failed.error,
+            })))
+        }
     }
 }
 

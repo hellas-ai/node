@@ -30,11 +30,6 @@ all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
 # Server-side dispatchers.
 server = []
 
-# Transport-layer compression knob. Currently a no-op — kept so consumers
-# can opt in for forward-compat. The wire layer will gain native compression
-# in a later milestone.
-compression = []
-
 # Iroh transport binding. Enables `From<iroh::EndpointId> for PeerId`
 # (peers/id.rs) so consumers can construct PeerIds from iroh's
 # EndpointId without a separate conversion helper.

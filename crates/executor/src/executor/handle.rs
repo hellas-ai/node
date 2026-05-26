@@ -115,8 +115,8 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn preload_weights(&self, model: String) -> Result<(), ExecutorError> {
-        self.send(|reply| ExecutorMessage::Preload { model, reply })
+    pub async fn load_model_metadata(&self, model: String) -> Result<(), ExecutorError> {
+        self.send(|reply| ExecutorMessage::LoadModelMetadata { model, reply })
             .await
     }
 

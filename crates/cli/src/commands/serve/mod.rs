@@ -19,7 +19,7 @@ pub async fn run(
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
     queue_size: usize,
-    preload_weights: Vec<String>,
+    preload_models: Vec<String>,
     artifact_store_path: Option<PathBuf>,
     metrics_port: Option<u16>,
     graffiti: String,
@@ -27,7 +27,7 @@ pub async fn run(
     secret_key: SecretKey,
     producer_key: ProducerSigningKey,
 ) -> CliResult<()> {
-    let preload_weights = dedupe_preload_weights(preload_weights);
+    let preload_models = dedupe_preload_models(preload_models);
     let artifact_store_path = artifact_store_path
         .map(Ok)
         .unwrap_or_else(crate::identity::default_artifact_store_path)?;
@@ -48,7 +48,7 @@ pub async fn run(
         download_policy.clone(),
         execute_policy.clone(),
         queue_size,
-        preload_weights.clone(),
+        &preload_models,
         build,
         graffiti,
         dtype,
@@ -76,8 +76,8 @@ pub async fn run(
     print_qr(&add_url);
     eprintln!("Explorer:     {add_url}");
 
-    if !preload_weights.is_empty() {
-        info!("Preloaded weights: {}", preload_weights.join(", "));
+    if !preload_models.is_empty() {
+        info!("Loaded model metadata: {}", preload_models.join(", "));
     }
 
     if matches!(download_policy, DownloadPolicy::Skip)
@@ -146,7 +146,7 @@ fn print_qr(data: &str) {
     }
 }
 
-fn dedupe_preload_weights(mut models: Vec<String>) -> Vec<String> {
+fn dedupe_preload_models(mut models: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     models.retain(|model| {
         let trimmed = model.trim();
@@ -163,8 +163,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dedupe_preload_weights_preserves_first_occurrence() {
-        let models = dedupe_preload_weights(vec![
+    fn dedupe_preload_models_preserves_first_occurrence() {
+        let models = dedupe_preload_models(vec![
             "foo/bar".to_string(),
             "baz/qux".to_string(),
             "foo/bar".to_string(),
@@ -174,8 +174,8 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_preload_weights_trims_and_drops_empty_entries() {
-        let models = dedupe_preload_weights(vec![
+    fn dedupe_preload_models_trims_and_drops_empty_entries() {
+        let models = dedupe_preload_models(vec![
             " foo/bar ".to_string(),
             "".to_string(),
             "   ".to_string(),
