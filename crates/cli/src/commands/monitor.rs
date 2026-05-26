@@ -5,9 +5,8 @@
 //! `get_known_peers`, and prints the events as whitespace-separated
 //! `key=value` records that downstream pipelines can grep.
 //!
-//! Ports back the pre-cutover implementation on top of the new
-//! `hellas_wire::iroh::swarm::ServiceRegistry` + per-service `Pool`
-//! plumbing.
+//! Uses `hellas_wire::iroh::swarm::ServiceRegistry` plus per-service
+//! pools for peer discovery and interrogation.
 
 use std::collections::HashSet;
 use std::future;

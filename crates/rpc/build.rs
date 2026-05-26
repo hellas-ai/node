@@ -85,9 +85,7 @@ fn regenerate() {
 
     let mut config = prost_build::Config::new();
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
-    // for zero-copy) is currently disabled because every consumer has
-    // call sites that produce `Vec<u8>` and migrating them is a
-    // separate, mechanical pass. See CUTOVER_FINDINGS.
+    // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);
     config.service_generator(Box::new(generator));
 
@@ -567,9 +565,9 @@ fn render_generated(services: &[RpcService], index: &SchemaIndex) -> String {
     }
     out.push_str("];\n\n");
 
-    // Method ID table (string → u32). Used by inbound dispatch to
-    // translate legacy gRPC paths during the migration. Kept independently
-    // of the cfg-gated marker impls so callers always see the full table.
+    // Method ID table (string -> u32). Used by inbound dispatch when
+    // resolving method paths. Kept independently of the cfg-gated marker
+    // impls so callers always see the full table.
     out.push_str("/// All method IDs known at codegen time, keyed by `service_fqn/method_name`.\n");
     out.push_str("pub const KNOWN_METHOD_IDS: &[(&'static str, u32)] = &[\n");
     for service in services {

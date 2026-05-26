@@ -4,10 +4,9 @@
 //! and spawns a per-connection accept loop that routes each inbound
 //! stream to the right service's dispatcher (selected by ALPN).
 //!
-//! Discovery (DHT publish, mDNS, peer-exchange) is NOT yet wired —
-//! see CUTOVER_FINDINGS finding #5. Peers can reach this node only by
-//! direct address until `hellas_wire::iroh::swarm::ServiceRegistry`
-//! lands and we publish through it.
+//! Peers can reach this node by direct address. Registry publishing is
+//! owned by the service-discovery path and is not started from this
+//! bootstrap.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,9 +87,9 @@ pub(super) async fn spawn_node(
     )
     .await
     .context("failed to spawn executor")?;
-    // `preload_weights` was consumed by the pre-cutover model preloader.
-    // Re-wire it once that path is back. `build` and `graffiti` are now
-    // surfaced via the Node service's GetNodeInfoResponse below.
+    // `preload_weights` is accepted for CLI compatibility; model loading is
+    // demand-driven by the executor. `build` and `graffiti` are surfaced via
+    // the Node service's GetNodeInfoResponse below.
     let _ = preload_weights;
 
     // -- Bind iroh Endpoint with one ALPN per service we serve.
@@ -118,13 +117,8 @@ pub(super) async fn spawn_node(
 
     // -- Construct a shared peer directory.
     //
-    // CUTOVER_FINDINGS #6 (admission middleware) audit: the directory's
-    // `observe_inbound_request(peer, rtt, policy)` shape is correct
-    // (account-only vs rate-limited split, AuthLevel disclosure gate,
-    // tested in `peers::directory::tests`), `Inbound::context.peer` IS
-    // populated by IrohTransport (via `connection.remote_id()`), and
-    // the directory is reachable from the dispatch path. What's
-    // missing is the wrapper that calls it.
+    // The directory records inbound service observations and is shared
+    // across the dispatch path.
     //
     // Deferred until a concrete abuse scenario warrants it: an
     // `AdmittingDispatcher<S>` that, before forwarding to the
