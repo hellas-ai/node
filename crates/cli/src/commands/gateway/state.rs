@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
 use catgrad_llm::types::Message;
-use catgrad_llm::types::{ThinkingPolicy, anthropic, openai, plain};
+use catgrad_llm::types::{ThinkingPolicy, anthropic, openai};
 use futures::Stream;
 use futures::StreamExt;
 #[cfg(feature = "hellas-executor")]
@@ -371,18 +371,27 @@ impl GatewayState {
         .await
     }
 
-    pub(super) async fn prepare_plain(
+    pub(super) async fn prepare_plain_execution(
         &self,
-        req: &plain::CompletionRequest,
+        req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let prompt = req.prompt.clone();
-        let model = self.resolve_model(&req.model);
+        let max_tokens = req
+            .canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens);
+        let Input::Text(prompt) = &req.canonical.input else {
+            return Err(HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: "Plain completion execution requires text input".to_string(),
+            });
+        };
+        let model = self.resolve_model(&req.canonical.model.name);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to load local model assets for `{model}`: {err}"),
         })?;
-        let prepared_prompt = assets.prepare_plain(&prompt).map_err(|err| HttpError {
+        let prepared_prompt = assets.prepare_plain(prompt).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!(
                 "Failed to prepare completion prompt: {}",
