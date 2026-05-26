@@ -2580,6 +2580,7 @@ dependencies = [
  "hellas-executor",
  "hellas-rpc",
  "hellas-wire",
+ "hellas-wire-adaptors",
  "iroh",
  "iroh-mdns-address-lookup",
  "iroh-metrics",
@@ -2717,6 +2718,16 @@ dependencies = [
  "web-time",
  "worker",
  "ws_stream_wasm",
+]
+
+[[package]]
+name = "hellas-wire-adaptors"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

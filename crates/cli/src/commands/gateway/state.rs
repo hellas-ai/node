@@ -1,4 +1,5 @@
-use super::{GatewayOptions, json_error};
+use super::proxy::ResponsesProxy;
+use super::{GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
     PreparedExecution, RemoteNodeTarget,
@@ -20,6 +21,10 @@ use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_wire_adaptors::{
+    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input,
+    InputItem, Message as WireMessage,
+};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -47,6 +52,7 @@ pub(super) struct GatewayState {
     pub(super) inference_timeout: Duration,
     pub(super) dtype: Dtype,
     runtime: ExecutionRuntime,
+    pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -74,6 +80,7 @@ pub(super) enum GenerationEvent {
     Done(Outcome),
 }
 
+#[derive(Debug)]
 pub(super) struct HttpError {
     pub(super) status: StatusCode,
     pub(super) message: String,
@@ -81,6 +88,14 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+        let responses_proxy = match options.responses_backend {
+            ResponsesBackend::Hellas => None,
+            ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
+                &options.responses_proxy_url,
+                &options.responses_proxy_api_key_env,
+            )?)),
+        };
+
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
             let producer_key =
@@ -117,6 +132,7 @@ impl GatewayState {
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             dtype: options.dtype,
             runtime,
+            responses_proxy,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -321,6 +337,159 @@ impl GatewayState {
         )
         .await
     }
+
+    pub(super) async fn prepare_wire_execution(
+        &self,
+        req: &WireExecutionRequest,
+    ) -> Result<PreparedGeneration, HttpError> {
+        let max_tokens = req
+            .canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens);
+        let model = self.resolve_model(&req.canonical.model.name);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
+
+        let prepared_prompt = match &req.canonical.input {
+            Input::Text(prompt) => assets.prepare_plain(prompt).map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "Failed to prepare completion prompt: {}",
+                    format_error_causes(&err)
+                ),
+            })?,
+            Input::Messages(messages) => {
+                let messages = wire_messages_to_openai(messages)?;
+                let messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
+                let tools = wire_tools_to_raw(req);
+                assets
+                    .prepare_chat_with_options(
+                        &messages,
+                        (!tools.is_empty()).then_some(tools.as_slice()),
+                        req.canonical.reasoning.is_some(),
+                    )
+                    .map_err(|err| HttpError {
+                        status: StatusCode::BAD_REQUEST,
+                        message: format!("Failed to prepare chat request: {err}"),
+                    })?
+            }
+            Input::Items(items) => {
+                let messages = wire_items_to_openai_messages(items)?;
+                let messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
+                let tools = wire_tools_to_raw(req);
+                assets
+                    .prepare_chat_with_options(
+                        &messages,
+                        (!tools.is_empty()).then_some(tools.as_slice()),
+                        req.canonical.reasoning.is_some(),
+                    )
+                    .map_err(|err| HttpError {
+                        status: StatusCode::BAD_REQUEST,
+                        message: format!("Failed to prepare Responses input: {err}"),
+                    })?
+            }
+        };
+
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
+            max_tokens,
+            "Failed to prepare Responses input",
+        )
+        .await
+    }
+}
+
+fn wire_tools_to_raw(req: &WireExecutionRequest) -> Vec<serde_json::Value> {
+    req.canonical
+        .tools
+        .iter()
+        .map(|tool| tool.raw.clone())
+        .collect()
+}
+
+fn wire_messages_to_openai(
+    messages: &[WireMessage],
+) -> Result<Vec<openai::ChatMessage>, HttpError> {
+    messages
+        .iter()
+        .map(|message| {
+            let content = content_parts_to_text(&message.content)?;
+            Ok(openai::ChatMessage::builder()
+                .role(message.role.clone())
+                .content(Some(openai::MessageContent::Text(content)))
+                .name(message.name.clone())
+                .build())
+        })
+        .collect()
+}
+
+fn wire_items_to_openai_messages(
+    items: &[InputItem],
+) -> Result<Vec<openai::ChatMessage>, HttpError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            InputItem::Message(message) => {
+                out.extend(wire_messages_to_openai(std::slice::from_ref(message))?);
+            }
+            InputItem::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                out.push(
+                    openai::ChatMessage::builder()
+                        .role("assistant".to_string())
+                        .content(None)
+                        .tool_calls(Some(vec![serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
+                            }
+                        })]))
+                        .build(),
+                );
+            }
+            InputItem::ToolResult { call_id, output } => {
+                out.push(
+                    openai::ChatMessage::builder()
+                        .role("tool".to_string())
+                        .content(Some(openai::MessageContent::Text(content_parts_to_text(output)?)))
+                        .tool_call_id(Some(call_id.clone()))
+                        .build(),
+                );
+            }
+            InputItem::Raw(value) => {
+                out.push(openai::ChatMessage::user(value.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn content_parts_to_text(parts: &[WireContentPart]) -> Result<String, HttpError> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            WireContentPart::Text { text } => out.push_str(text),
+            WireContentPart::Json(value) => out.push_str(&value.to_string()),
+            WireContentPart::Image { .. } | WireContentPart::File { .. } => {
+                return Err(HttpError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "local Hellas backend does not support image or file Responses input"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl PreparedGeneration {
@@ -575,6 +744,7 @@ mod tests {
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             dtype: Dtype::F32,
             runtime: ExecutionRuntime::default(),
+            responses_proxy: None,
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),
         }

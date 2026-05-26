@@ -1,9 +1,13 @@
 mod anthropic;
+mod backend;
 mod hellas_ext;
 mod openai;
 mod plain;
 mod provenance_layer;
+mod proxy;
+mod responses;
 mod state;
+mod wire_adaptor;
 mod wrap;
 
 use crate::commands::CliResult;
@@ -50,6 +54,9 @@ pub struct GatewayOptions {
     pub force_model: Option<String>,
     pub metrics_port: Option<u16>,
     pub dtype: Dtype,
+    pub responses_backend: ResponsesBackend,
+    pub responses_proxy_url: String,
+    pub responses_proxy_api_key_env: String,
     #[cfg(feature = "hellas-executor")]
     pub producer_key_path: Option<PathBuf>,
     pub secret_key: SecretKey,
@@ -57,11 +64,18 @@ pub struct GatewayOptions {
     pub wrap_args: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponsesBackend {
+    Hellas,
+    Proxy,
+}
+
 pub async fn run(options: GatewayOptions) -> CliResult<()> {
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
+        .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())

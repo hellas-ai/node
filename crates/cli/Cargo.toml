@@ -29,7 +29,6 @@ otel = [
   "dep:opentelemetry_sdk",
   "dep:opentelemetry-otlp",
   "dep:tracing-opentelemetry",
-  "dep:reqwest",
   "dep:iroh-metrics",
 ]
 
@@ -58,6 +57,7 @@ hellas-wire = { workspace = true, features = [
   "discovery-dht",
   "discovery-mdns",
 ] }
+hellas-wire-adaptors.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.2"
 iroh-metrics = { version = "1.0.0-rc.0", default-features = false, features = [
@@ -71,7 +71,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 prometheus-client = "0.24"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.9"
-reqwest = { workspace = true, optional = true }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
