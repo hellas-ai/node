@@ -53,7 +53,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let mut parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
-        .expect("Anthropic surface always carries a ChatTurn")
+        .expect("Anthropic preparation attaches a ChatTurn")
         .make_parser();
     let mut mapper = AnthropicStreamMapper::new(|prefix: &str| next_id(prefix));
 
@@ -208,7 +208,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
     let parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
-        .expect("Anthropic surface always carries a ChatTurn")
+        .expect("Anthropic preparation attaches a ChatTurn")
         .make_parser();
     let mapper = AnthropicStreamMapper::new(|prefix: &str| next_id(prefix));
 

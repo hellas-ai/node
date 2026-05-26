@@ -1,6 +1,6 @@
 use super::hellas_ext::{HellasExt, WithHellas};
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
+use super::{next_id, now_unix, sse_data, sse_response};
 use crate::execution::{Outcome, StopReason as ExecStopReason};
 use async_stream::stream;
 use axum::Json;
@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad_llm::types::openai;
 use futures::StreamExt;
-use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
 use hellas_runtime::runtime::chat::wire::openai::{
     OpenAiFinishReason, OpenAiStreamFrame, OpenAiStreamMapper,
 };
@@ -18,22 +18,34 @@ use hellas_runtime::runtime::chat::wire::{PumpError, pump_finish, pump_text};
 use hellas_runtime::runtime::chat::{
     DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
 };
+use hellas_wire_adaptors::openai::chat_completions::{
+    OpenAiChatCompletionsAdaptor, ParsedChatCompletionRequest,
+};
+use hellas_wire_adaptors::{
+    AdaptorError, ExecutionResult, OutputItem, Provenance, RawRequest, RenderContext,
+    StopReason as WireStopReason, Usage, WireAdaptor, WireBody,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
-    let req = match parse_json_body::<openai::ChatCompletionRequest>(&body, "OpenAI") {
-        Ok(req) => req,
-        Err(err) => return err.into_response(),
+    let adaptor = OpenAiChatCompletionsAdaptor;
+    let raw = match RawRequest::from_slice(&body) {
+        Ok(raw) => raw,
+        Err(err) => return adaptor_error("OpenAI Chat Completions", err),
     };
-    let stream_response_flag = req.stream == Some(true);
-    let include_usage = req
-        .stream_options
-        .as_ref()
-        .and_then(|options| options.include_usage)
-        .unwrap_or(false);
-    let prepared = match state.prepare_openai(&req).await {
+    let parsed = match adaptor.parse(raw) {
+        Ok(parsed) => parsed,
+        Err(err) => return adaptor_error("OpenAI Chat Completions", err),
+    };
+    let execution = match adaptor.to_execution_request(&parsed) {
+        Ok(execution) => execution,
+        Err(err) => return adaptor_error("OpenAI Chat Completions", err),
+    };
+    let stream_response_flag = parsed.stream == Some(true);
+    let include_usage = parsed.include_usage();
+    let prepared = match state.prepare_openai_chat_execution(&execution).await {
         Ok(prepared) => prepared,
         Err(err) => return err.into_response(),
     };
@@ -41,14 +53,29 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     if stream_response_flag {
         return stream_response(prepared, include_usage);
     }
-    respond(prepared).await
+    respond(adaptor, parsed, prepared).await
+}
+
+fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
+    let status = match error {
+        AdaptorError::InvalidJson(_)
+        | AdaptorError::InvalidRequest { .. }
+        | AdaptorError::Unsupported { .. }
+        | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
+        AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    super::json_error(status, format!("{surface}: {error}"))
 }
 
 /// Non-streaming endpoint. Drives the same per-delta pipeline as the
 /// streaming endpoint; the only difference is the sink — frames are
 /// discarded, and the buffered assistant payload comes from
 /// `mapper.snapshot()` at the end.
-async fn respond(prepared: PreparedGeneration) -> Response {
+async fn respond(
+    adaptor: OpenAiChatCompletionsAdaptor,
+    mut parsed: ParsedChatCompletionRequest,
+    prepared: PreparedGeneration,
+) -> Response {
     let id = next_id("chatcmpl");
     let created = now_unix();
     let model = prepared.model.clone();
@@ -59,7 +86,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let mut parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
-        .expect("OpenAI surface always carries a ChatTurn")
+        .expect("OpenAI chat preparation attaches a ChatTurn")
         .make_parser();
     let mut mapper = OpenAiStreamMapper::new(|prefix: &str| next_id(prefix));
 
@@ -139,29 +166,51 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         Ok(s) => s,
         Err(failure) => return failure_to_json_response(failure),
     };
-    let response = OpenAiChatResponse {
-        id,
-        object: "chat.completion".to_string(),
-        created,
-        model,
-        choices: vec![OpenAiChatChoice {
-            index: 0,
-            message: snapshot.message,
-            finish_reason: Some(snapshot.finish_reason),
-        }],
-        usage: Some(openai::Usage::from_counts(
-            prompt_tokens,
-            u32::try_from(total_tokens).unwrap_or(u32::MAX),
-        )),
+    let finish_reason = snapshot.finish_reason;
+    let message = match serde_json::to_value(snapshot.message) {
+        Ok(message) => message,
+        Err(err) => {
+            error!(%err, "openai chat response serialization failed");
+            return super::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize chat response",
+            );
+        }
+    };
+    parsed.model = model;
+    let result = ExecutionResult {
+        output: vec![OutputItem::Raw(message)],
+        usage: Some(usage(prompt_tokens, total_tokens)),
+        stop_reason: wire_stop_reason_from_openai_finish(finish_reason),
+        provenance: provenance_from_parts(provenance.as_ref(), catnix_receipt.as_ref()),
+    };
+    let rendered = match adaptor.render_response(
+        &parsed,
+        result,
+        RenderContext::new(id, next_id("msg"), created),
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) => return adaptor_error("OpenAI Chat Completions", err),
+    };
+    let WireBody::Json(body) = rendered.body else {
+        error!("openai chat adaptor rendered a non-json response");
+        return super::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat adaptor rendered an invalid response body",
+        );
+    };
+    let status = match StatusCode::from_u16(rendered.status) {
+        Ok(status) => status,
+        Err(err) => {
+            error!(%err, "openai chat adaptor rendered an invalid status");
+            return super::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "chat adaptor rendered an invalid response status",
+            );
+        }
     };
 
-    let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, catnix_receipt.as_ref()),
-        None => HellasExt::receipt(catnix_receipt.as_ref()),
-    };
-    let body = WithHellas::new(response, hellas);
-
-    let mut response = Json(body).into_response();
+    let mut response = (status, Json(body)).into_response();
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
@@ -171,11 +220,51 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     response
 }
 
+fn usage(prompt_tokens: u32, output_tokens: u64) -> Usage {
+    let input_tokens = u64::from(prompt_tokens);
+    Usage {
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+        total_tokens: Some(input_tokens.saturating_add(output_tokens)),
+    }
+}
+
+fn provenance_from_parts(
+    provenance: Option<&ExecutionProvenance>,
+    receipt: Option<&CatnixReceiptCommitment>,
+) -> Option<Provenance> {
+    let mut out = provenance
+        .and_then(provenance_from_execution)
+        .unwrap_or_default();
+    if let Some(receipt) = receipt {
+        out.receipt_commitment = Some(encode_hex(&receipt.0));
+    }
+    (out.call_commitment.is_some() || out.receipt_commitment.is_some()).then_some(out)
+}
+
+fn provenance_from_execution(provenance: &ExecutionProvenance) -> Option<Provenance> {
+    provenance
+        .catnix_call_commitment
+        .as_ref()
+        .map(encode_hex)
+        .map(|call_commitment| Provenance {
+            call_commitment: Some(call_commitment),
+            receipt_commitment: None,
+        })
+}
+
+fn wire_stop_reason_from_openai_finish(reason: OpenAiFinishReason) -> WireStopReason {
+    match reason {
+        OpenAiFinishReason::Stop => WireStopReason::EndOfText,
+        OpenAiFinishReason::Length => WireStopReason::MaxOutputTokens,
+        OpenAiFinishReason::ToolCalls => WireStopReason::ToolCall,
+    }
+}
+
 /// Streaming endpoint. Per-event: feed parser → feed mapper → wrap
 /// frames in `ChatCompletionChunk` → SSE. On `Err(DecodeFailure)`,
-/// emit error frame and close immediately (no `[DONE]`); per the P6
-/// contract we do **not** call `mapper.finish()` after a `feed()`
-/// failure — terminal handling is fully synchronous with the error.
+/// emit error frame and close immediately (no `[DONE]`). A parser
+/// failure is terminal, so the mapper is not finished afterward.
 ///
 /// The actual stream-building lives in
 /// [`build_openai_sse_stream`] so the wire-output contract can be
@@ -192,7 +281,7 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
     let parser: Box<dyn IncrementalToolCallParser> = prepared
         .chat_turn
         .as_ref()
-        .expect("OpenAI surface always carries a ChatTurn")
+        .expect("OpenAI chat preparation attaches a ChatTurn")
         .make_parser();
     let mapper = OpenAiStreamMapper::new(|prefix: &str| next_id(prefix));
 
@@ -229,25 +318,6 @@ enum OpenAiSsePayload {
     /// Per the wire convention enforced by the regression tests
     /// below, MUST NOT follow any error frame.
     Done,
-}
-
-#[derive(Serialize)]
-struct OpenAiChatResponse {
-    id: String,
-    object: String,
-    created: i64,
-    model: String,
-    choices: Vec<OpenAiChatChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<openai::Usage>,
-}
-
-#[derive(Serialize)]
-struct OpenAiChatChoice {
-    index: u32,
-    message: openai::ChatMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    finish_reason: Option<OpenAiFinishReason>,
 }
 
 #[derive(Serialize)]

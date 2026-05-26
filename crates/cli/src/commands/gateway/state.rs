@@ -231,10 +231,9 @@ impl GatewayState {
     }
 
     /// Drive the executor quote step and assemble a `PreparedGeneration`
-    /// from already-prepared inputs. Surface-specific assembly
-    /// (`prepare_openai` / `prepare_anthropic` / `prepare_plain`)
-    /// produces the `PreparedPrompt` (and, for chat surfaces, the
-    /// `ChatTurn`) before calling here.
+    /// from already-prepared inputs. Surface-specific preparation
+    /// produces the `PreparedPrompt` and, for chat surfaces, the
+    /// `ChatTurn` before calling here.
     async fn finalize_generation(
         &self,
         model: String,
@@ -275,19 +274,35 @@ impl GatewayState {
         })
     }
 
-    pub(super) async fn prepare_openai(
+    pub(super) async fn prepare_openai_chat_execution(
         &self,
-        req: &openai::ChatCompletionRequest,
+        req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
-        let messages: Vec<Message> = req.messages.iter().cloned().map(Message::from).collect();
-        let thinking = ThinkingPolicy::from(req.reasoning_effort);
-        let tools_dir = ToolDirectory::from_openai_tools(req.tools.as_deref().unwrap_or(&[]))
-            .map_err(|err| HttpError {
+        let max_tokens = req
+            .canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens);
+        let messages = wire_messages(&req.canonical).map_err(|message| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        })?;
+        let thinking = thinking_policy_from_wire_reasoning(req.canonical.reasoning.as_ref())
+            .map_err(|message| HttpError {
                 status: StatusCode::BAD_REQUEST,
-                message: format!("Invalid tool definitions: {err}"),
+                message,
             })?;
-        let model = self.resolve_model(&req.model);
+        let tools = req
+            .canonical
+            .tools
+            .iter()
+            .map(|tool| tool.raw.clone())
+            .collect::<Vec<_>>();
+        let tools_dir = ToolDirectory::from_openai_tools(&tools).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Invalid tool definitions: {err}"),
+        })?;
+        let model = self.resolve_model(&req.canonical.model.name);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to load local model assets for `{model}`: {err}"),
@@ -461,7 +476,8 @@ fn wire_item_to_openai(item: &InputItem) -> Result<openai::ChatMessage, String> 
                 },
             })]))
             .build()),
-        InputItem::Raw(_) => Err("unsupported raw Responses input item".to_string()),
+        InputItem::Raw(value) => serde_json::from_value::<openai::ChatMessage>(value.clone())
+            .map_err(|err| format!("unsupported raw chat message: {err}")),
     }
 }
 
@@ -545,6 +561,25 @@ fn json_to_wire_string(value: &JsonValue) -> String {
         JsonValue::String(value) => value.clone(),
         _ => serde_json::to_string(value).expect("serializing JSON value cannot fail"),
     }
+}
+
+fn thinking_policy_from_wire_reasoning(
+    reasoning: Option<&hellas_wire_adaptors::ReasoningOptions>,
+) -> Result<ThinkingPolicy, String> {
+    let Some(reasoning) = reasoning else {
+        return Ok(ThinkingPolicy::Default);
+    };
+    let Some(value) = reasoning.value.as_str() else {
+        return Err("reasoning options must be a string for OpenAI chat execution".to_string());
+    };
+    let effort = match value {
+        "none" => openai::ReasoningEffort::None,
+        "low" => openai::ReasoningEffort::Low,
+        "medium" => openai::ReasoningEffort::Medium,
+        "high" => openai::ReasoningEffort::High,
+        _ => return Err(format!("unsupported reasoning effort `{value}`")),
+    };
+    Ok(ThinkingPolicy::from(Some(effort)))
 }
 
 /// Map a `ModelAssets::chat_turn` failure to an HTTP status. Bad
@@ -832,6 +867,30 @@ mod wire_adaptor_tests {
         assert_eq!(tool_call["id"], "call_1");
         assert_eq!(tool_call["function"]["name"], "lookup");
         assert_eq!(tool_call["function"]["arguments"], r#"{"query":"zurich"}"#);
+    }
+
+    #[test]
+    fn raw_chat_message_preserves_openai_tool_call_shape() {
+        let item = InputItem::Raw(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"zurich\"}"
+                }
+            }]
+        }));
+
+        let message = wire_item_to_openai(&item).unwrap();
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.content, None);
+        let tool_call = &message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call["id"], "call_1");
+        assert_eq!(tool_call["function"]["name"], "lookup");
+        assert_eq!(tool_call["function"]["arguments"], "{\"query\":\"zurich\"}");
     }
 
     #[test]

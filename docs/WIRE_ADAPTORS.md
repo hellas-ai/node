@@ -135,20 +135,13 @@ transport-specific implementations. HTTP proxy backends belong in crates that
 can depend on an HTTP client. The gateway currently implements that for
 OpenAI Responses.
 
-## OpenAI Responses First
+## OpenAI Adaptors
 
-The first concrete adaptor is OpenAI Responses because it exercises the full
-surface: rich inputs, tools, structured output, reasoning controls, response
-state, non-streaming rendering, and streaming fanout.
+The crate currently includes OpenAI Responses and OpenAI Chat Completions.
+Responses exercises rich inputs, structured output, response state, and
+streaming fanout. Chat Completions keeps exact OpenAI message JSON in canonical
+input items so tool-call history and tool results survive projection without
+gateway-specific parsing.
 
-Implementation order:
-
-1. lossless request parsing
-2. projection to `ExecutionRequest`
-3. non-streaming response rendering
-4. streaming event rendering
-5. gateway integration
-6. raw HTTP proxy backend
-
-Each step should add fixtures that pin both wire compatibility and the
-canonical-versus-passthrough split.
+Adaptor tests should pin both wire compatibility and the
+canonical-versus-passthrough split for representative requests.
