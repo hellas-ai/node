@@ -1,6 +1,5 @@
 mod anthropic;
 mod backend;
-mod hellas_ext;
 mod openai;
 mod plain;
 mod provenance_layer;
@@ -12,7 +11,6 @@ mod wrap;
 
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
-use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -31,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use iroh::{EndpointId, SecretKey};
 
-use self::state::{GatewayState, HttpError};
+use self::state::GatewayState;
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -193,16 +191,6 @@ async fn bind_gateway(host: &str, port: Option<u16>) -> CliResult<tokio::net::Tc
         }
         Err(err) => Err(err).with_context(|| format!("failed to bind gateway on {preferred}")),
     }
-}
-
-fn parse_json_body<T: serde::de::DeserializeOwned>(
-    body: &Bytes,
-    protocol: &str,
-) -> Result<T, HttpError> {
-    catgrad_llm::utils::from_json_slice::<T>(body).map_err(|err| HttpError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Invalid {protocol} request: {err}"),
-    })
 }
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
