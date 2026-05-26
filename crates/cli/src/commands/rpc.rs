@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use anyhow::Context;
 use hellas_rpc::pb::swarm::GetNodeInfoRequest;
 use hellas_rpc::services::node::NodeClientImpl;
-use hellas_wire::iroh::IrohTransport;
 use hellas_wire::ServiceMarker;
+use hellas_wire::iroh::IrohTransport;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
@@ -22,17 +22,15 @@ pub async fn run(
 ) -> CliResult<()> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![hellas_rpc::services::node::Node::ALPN
-            .as_bytes()
-            .to_vec()])
+        .alpns(vec![
+            hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+        ])
         .bind()
         .await
         .context("failed to bind iroh endpoint")?;
 
-    let endpoint_addr = EndpointAddr::from_parts(
-        node_id,
-        node_addrs.into_iter().map(TransportAddr::Ip),
-    );
+    let endpoint_addr =
+        EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
 
     let connection = endpoint
         .connect(

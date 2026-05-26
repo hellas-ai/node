@@ -29,7 +29,10 @@ pub struct ServiceSchema<'a> {
 pub enum TypeSchema<'a> {
     Primitive(PrimKind),
     Message(MessageSchema<'a>),
-    EnumRef { name: &'a str, variants: &'a [(&'a str, i32)] },
+    EnumRef {
+        name: &'a str,
+        variants: &'a [(&'a str, i32)],
+    },
     Repeated(&'a TypeSchema<'a>),
     Map(&'a TypeSchema<'a>, &'a TypeSchema<'a>),
     Optional(&'a TypeSchema<'a>),
@@ -113,8 +116,7 @@ impl<'a> Encode for TypeSchema<'a> {
             Self::EnumRef { name, variants } => {
                 writer.write(&[2]);
                 name.encode_to(writer);
-                let len =
-                    u32::try_from(variants.len()).expect("enum variant count fits u32");
+                let len = u32::try_from(variants.len()).expect("enum variant count fits u32");
                 writer.write(&len.to_be_bytes());
                 for (n, v) in *variants {
                     n.encode_to(writer);
@@ -175,10 +177,7 @@ impl<'a> Encode for MessageSchema<'a> {
 impl<'a> Encode for MethodSchema<'a> {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
-        self.fqn.encoded_size()
-            + self.request.encoded_size()
-            + self.response.encoded_size()
-            + 2
+        self.fqn.encoded_size() + self.request.encoded_size() + self.response.encoded_size() + 2
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
         self.fqn.encode_to(writer);
@@ -192,13 +191,7 @@ impl<'a> Encode for MethodSchema<'a> {
 impl<'a> Encode for ServiceSchema<'a> {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
-        self.fqn.encoded_size()
-            + 4
-            + self
-                .methods
-                .iter()
-                .map(|m| m.encoded_size())
-                .sum::<usize>()
+        self.fqn.encoded_size() + 4 + self.methods.iter().map(|m| m.encoded_size()).sum::<usize>()
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
         self.fqn.encode_to(writer);

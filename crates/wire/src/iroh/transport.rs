@@ -6,11 +6,11 @@ use bytes::BytesMut;
 use iroh::endpoint::Connection;
 use tokio::sync::Mutex;
 
-use crate::frame::{decode_frame, read_varint_partial, Frame, FrameError, OpenFrame, MAX_FRAME_BYTES};
-use crate::metadata::Metadata;
-use crate::transport::{
-    AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext,
+use crate::frame::{
+    Frame, FrameError, MAX_FRAME_BYTES, OpenFrame, decode_frame, read_varint_partial,
 };
+use crate::metadata::Metadata;
+use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext};
 
 use super::stream::IrohStream;
 
@@ -52,11 +52,7 @@ impl StreamTransport for IrohTransport {
     type Stream = IrohStream;
     type Error = IrohTransportError;
 
-    async fn open(
-        &self,
-        method_id: u32,
-        headers: Metadata,
-    ) -> Result<Self::Stream, Self::Error> {
+    async fn open(&self, method_id: u32, headers: Metadata) -> Result<Self::Stream, Self::Error> {
         let (send, recv) = self
             .connection
             .open_bi()

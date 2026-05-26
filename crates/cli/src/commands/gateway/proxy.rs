@@ -30,8 +30,12 @@ impl ResponsesProxy {
     }
 
     fn from_parts(endpoint: Url, bearer_token: Option<String>) -> Self {
+        Self::with_client(reqwest::Client::new(), endpoint, bearer_token)
+    }
+
+    fn with_client(client: reqwest::Client, endpoint: Url, bearer_token: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             endpoint,
             bearer_token,
         }
@@ -358,6 +362,21 @@ mod tests {
         BackendRequest::new(execution, raw)
     }
 
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .unwrap()
+    }
+
+    fn test_proxy(addr: std::net::SocketAddr, bearer_token: Option<String>) -> ResponsesProxy {
+        ResponsesProxy::with_client(
+            test_client(),
+            Url::parse(&format!("http://{addr}/v1/responses")).unwrap(),
+            bearer_token,
+        )
+    }
+
     #[tokio::test]
     async fn forwards_request_body_and_bearer_token() {
         let (tx, rx) = oneshot::channel();
@@ -373,10 +392,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let proxy = ResponsesProxy::from_parts(
-            Url::parse(&format!("http://{addr}/v1/responses")).unwrap(),
-            Some("test-key".to_string()),
-        );
+        let proxy = test_proxy(addr, Some("test-key".to_string()));
         let body = Bytes::from_static(br#"{"model":"m","input":"hello","seed":7}"#);
         let response = proxy
             .forward_request(backend_request(body.clone()))
@@ -410,10 +426,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let proxy = ResponsesProxy::from_parts(
-            Url::parse(&format!("http://{addr}/v1/responses")).unwrap(),
-            None,
-        );
+        let proxy = test_proxy(addr, None);
         let body = Bytes::from_static(br#"{"model":"public","input":"hello","seed":7}"#);
         let mut request = backend_request(body);
         request.execution.canonical.model.name = "upstream".to_string();
@@ -445,10 +458,7 @@ mod tests {
 
         let body =
             Bytes::from_static(br#"{"model":"m","input":"hello","metadata":{"trace":"abc"}}"#);
-        let proxy = ResponsesProxy::from_parts(
-            Url::parse(&format!("http://{addr}/v1/responses")).unwrap(),
-            Some("test-key".to_string()),
-        );
+        let proxy = test_proxy(addr, Some("test-key".to_string()));
 
         let result = proxy.execute(backend_request(body.clone())).await.unwrap();
 

@@ -8,26 +8,25 @@
 //! - This backend is intended for bootstrap only. Once an honest peer is
 //!   found, direct iroh communication becomes the trusted path.
 //!
-//! Ported from `tonic_iroh_transport::swarm::dht` for the wire v1 cutover.
-//! Crate layout collapsed from `dht/{mod,backend,publisher,resolver}.rs` +
-//! `record.rs` into a single file for tighter scoping.
+//! The bucket publisher, resolver, record validation, and tests live together
+//! because they share the same signed-advertisement invariants.
 
 use std::cmp::Reverse;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ::iroh::{Endpoint, EndpointId, SecretKey, Signature};
 use futures::stream::{Stream, StreamExt};
-use mainline::{errors::PutMutableError, Dht, MutableItem};
+use mainline::{Dht, MutableItem, errors::PutMutableError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, error, info, trace, warn};
 
-use super::discovery::{Discovery, DiscoveredPeer};
+use super::discovery::{DiscoveredPeer, Discovery};
 use super::peers::{FeedError, FeedResult, PeerFeedSpec, Scope};
 
 // ---------------------------------------------------------------------------
@@ -157,7 +156,7 @@ struct ServiceAd {
 /// A bounded, shared mutable bucket of signed service advertisements.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ServiceBucket {
-    /// Bucket format version for clean cutovers.
+    /// Bucket format version.
     version: u8,
     /// Signed ads currently held in this shard.
     ads: Vec<SignedServiceAd>,
@@ -786,9 +785,8 @@ impl DhtBackend {
     ///
     /// Returns an error if the DHT client fails to bind.
     pub fn new(endpoint: &Endpoint) -> std::io::Result<Self> {
-        let dht = Arc::new(
-            Dht::client().map_err(|e| std::io::Error::other(format!("DHT client: {e}")))?,
-        );
+        let dht =
+            Arc::new(Dht::client().map_err(|e| std::io::Error::other(format!("DHT client: {e}")))?);
         Ok(Self {
             endpoint: endpoint.clone(),
             dht,

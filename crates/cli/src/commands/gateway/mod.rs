@@ -18,6 +18,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use catgrad::prelude::Dtype;
 use futures::Stream;
+use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -27,7 +28,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use iroh::{EndpointId, SecretKey};
 
 use self::state::GatewayState;
 

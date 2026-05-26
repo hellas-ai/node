@@ -23,8 +23,8 @@ let
     ]
     ++ workspaceNativeBuildInputs;
 
-  # CI-gating checks. These surface as `apps.<sys>.check-<name>` and run in
-  # the GitHub Actions matrix.
+  # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
+  # external matrix runners.
   checks = {
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
@@ -102,8 +102,8 @@ let
       text = lib.concatMapStringsSep "\n" lib.getExe pkgList;
     };
 
-  # Extended (post-gate) builds run only on push. Each value is an attribute
-  # path under `packages.<system>` consumed by the GitHub Actions matrix as
+  # Extended builds. Each value is an attribute path under `packages.<system>`
+  # consumed by matrix runners as
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";

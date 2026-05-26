@@ -68,10 +68,7 @@ impl Metadata {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
-    pub fn get_all<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> impl Iterator<Item = &'a MetadataValue> + 'a {
+    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a MetadataValue> + 'a {
         self.entries
             .iter()
             .filter(move |(k, _)| k == key)

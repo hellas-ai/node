@@ -157,10 +157,7 @@ pub fn encode_frame(frame: &Frame, out: &mut bytes::BytesMut) {
 
 pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
     if buf.is_empty() {
-        return Err(FrameError::Short {
-            needed: 1,
-            got: 0,
-        });
+        return Err(FrameError::Short { needed: 1, got: 0 });
     }
     let kind = FrameKind::from_u8(buf[0]).ok_or(FrameError::UnknownKind(buf[0]))?;
     let body = &buf[1..];
@@ -179,13 +176,9 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
         FrameKind::Body => Ok(Frame::Body(Bytes::copy_from_slice(body))),
         FrameKind::End => {
             if body.is_empty() {
-                return Err(FrameError::Short {
-                    needed: 1,
-                    got: 0,
-                });
+                return Err(FrameError::Short { needed: 1, got: 0 });
             }
-            let status =
-                WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
+            let status = WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
             let (msg_len, msg_consumed) = read_varint(&body[1..])?;
             let msg_len = msg_len as usize;
             let msg_start = 1 + msg_consumed;
@@ -210,13 +203,9 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
         }
         FrameKind::Reset => {
             if body.is_empty() {
-                return Err(FrameError::Short {
-                    needed: 1,
-                    got: 0,
-                });
+                return Err(FrameError::Short { needed: 1, got: 0 });
             }
-            let code =
-                WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
+            let code = WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
             Ok(Frame::Reset(ResetFrame { code }))
         }
         FrameKind::Credit => {
@@ -226,8 +215,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
                     got: body.len(),
                 });
             }
-            let additional_bytes =
-                u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let additional_bytes = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
             Ok(Frame::Credit(CreditFrame { additional_bytes }))
         }
     }
@@ -361,9 +349,7 @@ pub(crate) fn read_varint(buf: &[u8]) -> Result<(u64, usize), FrameError> {
 /// - `Ok(Some((value, consumed)))` — complete varint decoded
 /// - `Ok(None)` — buffer ends mid-varint (≤ 9 continuation bytes seen)
 /// - `Err(BadVarint)` — 10 continuation bytes seen, malformed
-pub(crate) fn read_varint_partial(
-    buf: &[u8],
-) -> Result<Option<(u64, usize)>, FrameError> {
+pub(crate) fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>, FrameError> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, byte) in buf.iter().take(10).enumerate() {
@@ -439,18 +425,17 @@ mod tests {
         // The `must-be-complete` wrapper collapses Ok(None) to BadVarint.
         // Anything that wasn't a complete varint is a hard error here.
         assert!(matches!(read_varint(&[]), Err(FrameError::BadVarint)));
-        assert!(matches!(
-            read_varint(&[0xFF]),
-            Err(FrameError::BadVarint)
-        ));
+        assert!(matches!(read_varint(&[0xFF]), Err(FrameError::BadVarint)));
     }
 
     #[test]
     fn max_frame_bytes_is_a_real_cap() {
         // Documented expectation rather than a runtime check — pin the
         // constant so a change forces a deliberate audit.
-        assert!(MAX_FRAME_BYTES >= 1 << 20);
-        assert!(MAX_FRAME_BYTES <= 16 * 1024 * 1024);
+        const {
+            assert!(MAX_FRAME_BYTES >= 1 << 20);
+            assert!(MAX_FRAME_BYTES <= 16 * 1024 * 1024);
+        }
     }
 
     #[test]

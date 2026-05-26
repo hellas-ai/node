@@ -18,16 +18,16 @@ use hellas_rpc::model::ModelAssets;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire_adaptors::{
-    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input,
-    InputItem, Message as WireMessage,
+    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
+    Message as WireMessage,
 };
+use iroh::EndpointId;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
-use iroh::EndpointId;
 
 /// End-to-end deadline applied while consuming a prepared generation.
 /// Covers preparation (quote / discovery) AND the entire decode stream.
@@ -355,7 +355,9 @@ fn wire_items_to_openai_messages(
                 out.push(
                     openai::ChatMessage::builder()
                         .role("tool".to_string())
-                        .content(Some(openai::MessageContent::Text(content_parts_to_text(output)?)))
+                        .content(Some(openai::MessageContent::Text(content_parts_to_text(
+                            output,
+                        )?)))
                         .tool_call_id(Some(call_id.clone()))
                         .build(),
                 );

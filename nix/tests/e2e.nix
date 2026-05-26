@@ -32,6 +32,51 @@ let
     marker: proofPath:
     "Use the bash tool to run: echo ${marker} > ${proofPath}. Confirm in your reply once the file has been written.";
 
+  responsesMock = pkgs.writeText "responses-mock.py" ''
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            body = self.rfile.read(length)
+            assert self.path == "/v1/responses", self.path
+            assert self.headers.get("authorization") == "Bearer proxy-secret"
+            request = json.loads(body)
+            response = {
+                "id": "resp_mock",
+                "object": "response",
+                "created_at": 0,
+                "model": request["model"],
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_mock",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "proxied-ok",
+                    }],
+                }],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+            encoded = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *_args):
+            pass
+
+    HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
+  '';
+
   harnesses = {
     pi =
       {
@@ -500,5 +545,40 @@ in
         };
       }
     ];
+  };
+
+  gateway-proxy-responses = pkgs.testers.runNixOSTest {
+    name = "hellas-gateway-proxy-responses";
+    nodes.gateway = _: {
+      imports = [ hellasModule ];
+      config = lib.mkMerge [
+        (mkBaseNode package)
+        {
+          environment.systemPackages = [ pkgs.python3 ];
+          services.hellas = {
+            inherit package;
+            environment.OPENAI_API_KEY = "proxy-secret";
+            gateway = {
+              enable = true;
+              port = gatewayPort;
+              responsesBackend = "proxy";
+              responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
+              responsesProxyApiKeyEnv = "OPENAI_API_KEY";
+            };
+          };
+        }
+      ];
+    };
+    testScript = ''
+      start_all()
+
+      gateway.succeed("python3 ${responsesMock} >/tmp/responses_mock.log 2>&1 &")
+      gateway.wait_until_succeeds("curl -sS -o /dev/null -X POST -H 'content-type: application/json' -H 'authorization: Bearer proxy-secret' -d '{\"model\":\"probe\",\"input\":\"hi\"}' http://127.0.0.1:18080/v1/responses")
+      gateway.wait_for_unit("hellas-gateway.service")
+      gateway.wait_for_open_port(${toString gatewayPort})
+      response = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
+      print(response)
+      assert "proxied-ok" in response
+    '';
   };
 }

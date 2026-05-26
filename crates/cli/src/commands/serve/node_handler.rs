@@ -4,23 +4,19 @@
 //! view of known peers via `get_known_peers`. Backed by the
 //! `PeerDirectory` the server constructs at spawn time.
 //!
-//! NOTE: the request's identity (which peer asked?) is not currently
-//! threaded through the generated dispatcher trait — only the request
-//! body reaches the handler. Until Phase F lands an `AdmittingDispatcher`
-//! that enriches the request with `Inbound::context.peer`, peer-aware
-//! filtering in `get_known_peers` falls back to an anonymous requester
-//! (`PeerId::default()`) and `min_disclosed_auth_level` on the
-//! `PeerDirectoryConfig` is the gate.
+//! Request peer identity is enforced before handler dispatch. Handler methods
+//! receive only decoded request bodies, so `get_known_peers` applies the
+//! directory disclosure policy with an anonymous requester.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::swarm::{
     GetKnownPeersRequest, GetKnownPeersResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId};
 use hellas_rpc::services::node::NodeHandler;
-use hellas_rpc::call::WithTrailer;
 use hellas_wire::{WireCode, WireStatus};
 use iroh::EndpointId;
 
@@ -47,7 +43,11 @@ impl NodeHandlerImpl {
             started_at: Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
             build: Arc::from(build),
-            os: Arc::from(format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)),
+            os: Arc::from(format!(
+                "{}-{}",
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            )),
             graffiti: Arc::from(graffiti),
             directory,
         }
@@ -74,9 +74,8 @@ impl NodeHandler for NodeHandlerImpl {
         &self,
         request: GetKnownPeersRequest,
     ) -> Result<WithTrailer<GetKnownPeersResponse>, WireStatus> {
-        // Anonymous requester until Phase F threads peer identity through
-        // the dispatcher. `min_disclosed_auth_level` on the directory
-        // config remains the disclosure gate.
+        // Handler methods do not receive transport identity; the directory
+        // disclosure policy remains the gate for anonymous requesters.
         let requester = PeerId::default();
         const DISCLOSURE_LIMIT: usize = 64;
         let peers = self
@@ -84,10 +83,7 @@ impl NodeHandler for NodeHandlerImpl {
             .ranked_known_peers(requester, &request.service_alpn, DISCLOSURE_LIMIT)
             .map_err(|e| WireStatus::new(WireCode::Internal, format!("known peers: {e}")))?;
         Ok(WithTrailer::new(GetKnownPeersResponse {
-            peer_ids: peers
-                .into_iter()
-                .map(|id| id.as_bytes().to_vec())
-                .collect(),
+            peer_ids: peers.into_iter().map(|id| id.as_bytes().to_vec()).collect(),
         }))
     }
 }

@@ -6,8 +6,7 @@ provenance helpers, and the call-side helpers used by node consumers.
 
 Transport-independent in spirit; the in-tree transport is iroh's QUIC
 substreams via [`hellas-wire`](../wire). The wire layer's protocol is unique
-to Hellas — there is no longer a tonic/h2 codepath in production. A h2/gRPC-
-compat transport is stubbed for future use; see "Open work".
+to Hellas — there is no longer a tonic/h2 codepath in production.
 
 ## Mental model
 
@@ -36,10 +35,12 @@ directions update the same peer record.
 │           Handler trait, Server dispatcher.                 │
 ├──────────────────────────────────────────────────────────────┤
 │ hellas_rpc::call helpers (transport-generic)                │
-│   unary, unary_with_trailer, server_streaming →             │
+│   unary, unary_with_trailer, server_streaming,              │
+│   bidi_streaming →                                          │
 │     `StreamingCall<R>` (Stream<Item = Result<R,WireStatus>> │
 │     + `#[must_use] finish() -> Result<Trailer,WireStatus>`) │
-│   dispatch_unary, dispatch_server_streaming                 │
+│   dispatch_unary, dispatch_server_streaming,                │
+│   dispatch_bidi_streaming                                   │
 ├──────────────────────────────────────────────────────────────┤
 │ hellas_wire::transport: StreamTransport, RecvHalf,          │
 │   SendHalf, Inbound, TransportContext, Trailer, WireStatus  │
@@ -47,7 +48,7 @@ directions update the same peer record.
 │ transports                                                  │
 │   iroh::IrohTransport (QUIC bidi substreams) ← in prod      │
 │   ws::* (browser / native / CF Durable Object)              │
-│   h2::* (stub, gRPC-compat target)                          │
+│   h2::* (gRPC-compatible transport feature boundary)        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,9 +96,12 @@ methods.
   trailer are sequenced by ownership: the protocol invariant "0+ bodies,
   then exactly one terminal trailer" cannot be encoded in an invalid
   order at this API surface.
-- `dispatch_unary<T,M,...>`, `dispatch_server_streaming<T,M,...>` —
-  server-side counterparts; the generated `XServer<H>` dispatcher calls
-  these to drive the handler.
+- `bidi_streaming<T,M>(...) -> Result<BidiStreamingCall<M::Request, M::Response>, _>` —
+  request and response streams over one RPC. `split()` returns a
+  `StreamingSink<Q>` and `StreamingCall<R>` for concurrent send/receive.
+- `dispatch_unary<T,M,...>`, `dispatch_server_streaming<T,M,...>`,
+  `dispatch_bidi_streaming<T,M,...>` — server-side counterparts; the
+  generated `XServer<H>` dispatcher calls these to drive the handler.
 
 ## Peers
 
@@ -146,12 +150,9 @@ hard failure at the call site (no zero-digest fallback).
   Lands a `StreamTransport` impl over `h2` so external gRPC clients can
   reach Hellas services.
 - **`AdmittingDispatcher` middleware** — the `PeerDirectory` policy hooks
-  are in place, but no code calls them from the serve path yet. See
-  `cli/commands/serve/node.rs` for the audit notes; the implementation
-  sketch is in `~/.claude/plans/recursive-mixing-neumann.md` §Phase F.
+  are in place, but no code calls them from the serve path yet.
 - **ESP32 follow-ups** — `get_known_peers` returns an empty list on
   device; the wire dispatcher doesn't surface peer identity to handlers.
-  See `HELLAS_WIRE_CUTOVER_FINDINGS.md` §§8–9.
 - **Generation-rollover defense** — `u16` generation counter wraps to 0
   after `u16::MAX` slot reuses. Defense-in-depth only; gen=0 doesn't
   appear on the wire from a legit peer, so the wrap isn't exploitable.
@@ -159,21 +160,15 @@ hard failure at the call site (no zero-digest fallback).
 ## Where the docs are
 
 - This README — orientation.
-- `~/src/explorer/HELLAS_WIRE_CUTOVER_FINDINGS.md` — chronology of the
-  cutover (21 findings, mostly resolved).
-- `~/.claude/projects/-home-grw-src-explorer/memory/hellas_rpc_*.md` —
-  recurring-context notes for assistants.
-- Inline comments at the WHY-non-obvious points.
+- Inline comments at the non-obvious invariants.
 
 ## Feature gates
 
-The crate has more knobs than it needs; legacy features are still in
-`Cargo.toml`. The important ones today:
+The important crate features are:
 
 - `iroh` / `iroh-client` / `iroh-server` — enable the iroh transport
   binding and its codegen.
-- `discovery` — peer-exchange + mDNS + DHT (today partial — see
-  `HELLAS_WIRE_CUTOVER_FINDINGS.md` §14).
+- `discovery` — peer-exchange + mDNS + DHT.
 - Per-service (`execute`, `symbolic`, `opaque`, `courtesy`, `swarm`,
   `all-protocols`) — gate the codegen for one proto package each.
 - `node` — binary-side bundle pulling in catgrad/chatgrad/tokenizers.

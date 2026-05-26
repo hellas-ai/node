@@ -1,13 +1,11 @@
 //! Connection pool for reusing iroh connections per service ALPN.
 //!
-//! Compared to the legacy `tonic-iroh-transport` pool, this one:
-//!
 //! * Returns either a raw `iroh::endpoint::Connection` or a per-conn
 //!   `IrohTransport` — no tonic `Channel` / HTTP/2 layer involved.
 //! * Uses a simple cache + background sweeper instead of a per-conn
 //!   actor; iroh `Connection` is cheap to clone and is already an
 //!   `Arc`-backed handle.
-//! * Is keyed by `(EndpointId, ALPN)` like before, but exposes the ALPN
+//! * Is keyed by `(EndpointId, ALPN)`, but exposes the ALPN
 //!   via `ServiceMarker` rather than a tonic `NamedService`.
 //!
 //! # Example
@@ -259,10 +257,10 @@ impl Pool {
         // If a racer already inserted a live connection while we were
         // dialing, prefer the cached one and drop ours (the iroh
         // connection close will happen when `conn` is dropped).
-        if let Some(existing) = cache.get(&peer_id) {
-            if existing.connection.close_reason().is_none() {
-                return Ok(existing.connection.clone());
-            }
+        if let Some(existing) = cache.get(&peer_id)
+            && existing.connection.close_reason().is_none()
+        {
+            return Ok(existing.connection.clone());
         }
 
         // Enforce max_connections via simple eviction: remove the

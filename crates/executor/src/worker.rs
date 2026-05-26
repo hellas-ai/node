@@ -6,6 +6,7 @@ use hellas_core::SymbolicRequest;
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
+use hellas_wire::WireStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,6 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
-use hellas_wire::WireStatus;
 use tracing::warn;
 
 pub(crate) struct ExecuteWorker {

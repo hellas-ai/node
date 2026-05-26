@@ -33,8 +33,7 @@ pub use admission::AcquireDenied;
 pub use directory::{PeerDirectory, PeerDirectoryConfig};
 pub use id::PeerId;
 pub use manager::{
-    PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation,
-    RpcPermitGuard,
+    PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
 };
 pub use registry::{
     DiscoverySource, PeerChange, PeerEntry, PeerEvent, PeerRegistry, PeerRegistryConfig,

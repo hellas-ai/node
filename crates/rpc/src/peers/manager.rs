@@ -53,8 +53,7 @@ impl PeerManager {
     /// manual clock changes. All timestamps stored in `PeerEntry` and used
     /// for admission/EMA/eviction are produced by this method.
     pub fn now_ms(&self) -> u64 {
-        u64::try_from(Instant::now().duration_since(self.base).as_millis())
-            .unwrap_or(u64::MAX)
+        u64::try_from(Instant::now().duration_since(self.base).as_millis()).unwrap_or(u64::MAX)
     }
 
     pub fn snapshot(&self) -> Result<PeerRegistry, PeerManagerError> {
@@ -125,12 +124,10 @@ impl PeerManager {
     /// Record that a peer just made an inbound request. Bumps the
     /// per-peer `total_requests` + `last_seen_ms` + RTT EMA; ensures
     /// the peer exists in the registry. No rate-limit policy lives
-    /// here — callers that need to *reject* abusive peers wrap their
-    /// dispatch in middleware that consults their own bucket. (The
-    /// Phase F `AdmittingDispatcher` was deferred; see the audit
-    /// comment in `cli/commands/serve/node.rs`. The esp32's inbound
-    /// path calls this method directly because the wire layer
-    /// doesn't surface peer identity into handlers yet.)
+    /// here — callers that need to reject abusive peers wrap their
+    /// dispatch in middleware that consults their own bucket. Handler
+    /// methods receive decoded request bodies, so transport identity is
+    /// accounted before dispatch.
     pub fn observe_inbound_request(
         &self,
         peer: PeerId,
@@ -493,7 +490,6 @@ mod tests {
         assert_eq!(entry.in_flight, 0);
         assert_eq!(registry.total_in_flight(), 0);
     }
-
 
     #[test]
     fn finish_ok_after_forget_preserves_tombstone_and_purges_entry() {

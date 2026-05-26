@@ -11,8 +11,8 @@ use std::error::Error as StdError;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::clock::DefaultClock;
 use crate::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
@@ -111,10 +111,7 @@ pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
 /// `peer` is the optional transport-vouched identity (e.g. extracted
 /// from a TLS client cert or an upstream auth header); pass `None` if
 /// the transport itself has nothing to vouch for.
-pub fn accept_upgraded<S>(
-    ws: WebSocketStream<S>,
-    peer: Option<PeerIdentity>,
-) -> WsTransport
+pub fn accept_upgraded<S>(ws: WebSocketStream<S>, peer: Option<PeerIdentity>) -> WsTransport
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {

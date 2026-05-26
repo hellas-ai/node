@@ -1,16 +1,12 @@
 //! mDNS-based local network peer discovery backend.
 //!
-//! Ported from `tonic_iroh_transport::swarm::discovery::MdnsBackend` for the
-//! wire v1 cutover. iroh 1.0.0-rc.0 moved mDNS out of the core crate into the
-//! external `iroh-mdns-address-lookup` crate (the 0.98 API exposed it as
-//! `iroh::address_lookup::mdns::MdnsAddressLookup`); the public shape is
-//! otherwise the same — a builder yielding a clonable handle that exposes a
+//! Uses `iroh-mdns-address-lookup`, which exposes a clonable handle with a
 //! `subscribe()` stream of `DiscoveryEvent`s.
 //!
 //! ALPN scoping is honoured: discovered peers whose published user-data does
 //! NOT advertise our target ALPN are skipped. The encoding follows the
-//! tonic-iroh-transport scheme (postcard `Vec<Vec<u8>>` then base64url-no-pad)
-//! so existing nodes that publish service ALPNs stay interoperable.
+//! service-advertisement scheme (postcard `Vec<Vec<u8>>` then
+//! base64url-no-pad).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +16,7 @@ use futures::stream::{Stream, StreamExt};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tracing::{debug, trace};
 
-use super::discovery::{Discovery, DiscoveredPeer};
+use super::discovery::{DiscoveredPeer, Discovery};
 use super::peers::{FeedResult, PeerFeedSpec, Scope};
 
 // ---------------------------------------------------------------------------
@@ -60,12 +56,7 @@ fn classify_user_data_alpn(user_data: Option<&str>, alpn: &[u8]) -> UserDataAlpn
 // Feed builder.
 // ---------------------------------------------------------------------------
 
-fn mdns_feed(
-    mdns: Arc<MdnsAddressLookup>,
-    alpn: Vec<u8>,
-    priority: u8,
-    trust: u8,
-) -> PeerFeedSpec {
+fn mdns_feed(mdns: Arc<MdnsAddressLookup>, alpn: Vec<u8>, priority: u8, trust: u8) -> PeerFeedSpec {
     let scope_alpn = alpn.clone();
     let peer_trust = trust;
     let stream = async_stream::try_stream! {

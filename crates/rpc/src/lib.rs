@@ -22,7 +22,7 @@ pub mod policy;
 pub mod provenance;
 
 /// Protobuf-generated message types plus per-service typed client traits,
-/// method markers, and server dispatcher stubs. The bare `pb` module is
+/// method markers, and server dispatchers. The bare `pb` module is
 /// doc-hidden; downstream consumers should reach for the per-service
 /// re-exports under `pb::{courtesy, swarm, execute, opaque, symbolic}` or
 /// the per-service marker/trait modules under `pb::services::*`.
@@ -64,10 +64,7 @@ impl std::error::Error for TokenBytesError {}
 
 impl From<TokenBytesError> for hellas_wire::WireStatus {
     fn from(err: TokenBytesError) -> Self {
-        hellas_wire::WireStatus::new(
-            hellas_wire::WireCode::InvalidArgument,
-            err.to_string(),
-        )
+        hellas_wire::WireStatus::new(hellas_wire::WireCode::InvalidArgument, err.to_string())
     }
 }
 
@@ -93,7 +90,7 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>, TokenBytesError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_token_ids, encode_token_ids, TokenBytesError};
+    use super::{TokenBytesError, decode_token_ids, encode_token_ids};
 
     #[test]
     fn token_ids_round_trip_through_bytes() {

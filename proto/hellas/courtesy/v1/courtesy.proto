@@ -156,9 +156,10 @@ message ListModelsResponse {
   repeated ModelInfo models = 1;
 }
 
-// Convenience RPC: stateless token decoding.
-// Client streams raw token bytes, server decodes with the model's tokenizer
-// and streams back text chunks.
+// Convenience RPC: streaming token decoding for clients that do not carry a
+// local tokenizer. The first request selects the Hugging Face tokenizer; later
+// requests may omit the model fields and carry token bytes only. Responses are
+// incremental text deltas.
 message DecodeTokensRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;

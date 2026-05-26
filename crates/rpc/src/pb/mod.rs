@@ -6,8 +6,8 @@
 //! `hellas::courtesy::v1`, …) so prost's `super::super::v1::Ticket`-style
 //! cross-package references resolve.
 //!
-//! Service/method markers, typed client traits, and the server dispatcher
-//! stubs live in [`services`].
+//! Service/method markers, typed client traits, and the server dispatchers
+//! live in [`services`].
 
 #[doc(hidden)]
 pub mod hellas {
@@ -80,9 +80,9 @@ pub mod swarm {
     pub use crate::pb::hellas::swarm::v1::*;
 }
 
-/// Service / method markers, typed client traits, and server dispatcher
-/// stubs. Emitted by `build.rs`. Each block is `#[cfg(feature = "<pkg>")]`-
-/// gated so unused services don't compile.
+/// Service / method markers, typed client traits, and server dispatchers.
+/// Emitted by `build.rs`. Each block is `#[cfg(feature = "<pkg>")]`-gated
+/// so unused services don't compile.
 #[allow(unused_imports, dead_code, clippy::all)]
 pub mod services {
     include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));

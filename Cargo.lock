@@ -2630,6 +2630,7 @@ dependencies = [
  "catnix",
  "chatgrad",
  "futures-core",
+ "futures-util",
  "half",
  "hellas-core",
  "hellas-rpc",
@@ -2855,15 +2856,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
-]
-
-[[package]]
-name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac",
 ]
 
 [[package]]
@@ -3304,8 +3296,9 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b98e206e3d3f2642f5c08c413755fc0ac19b54ae1a656af88be03454ce3ed2e6"
 dependencies = [
- "aes-gcm",
  "backon",
  "blake3",
  "bytes",
@@ -3317,12 +3310,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "hickory-resolver",
- "hkdf",
- "hmac",
  "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "ipnet",
  "iroh-base",
  "iroh-dns",
@@ -3340,19 +3328,16 @@ dependencies = [
  "portable-atomic",
  "portmapper",
  "rand 0.10.1",
- "reqwest 0.12.28",
  "reqwest 0.13.1",
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
- "sha2 0.10.9",
  "smallvec",
  "strum",
  "time",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
@@ -3364,6 +3349,8 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2160a45265eba3bd290ce698f584c9b088bee47e518e9ec4460d5e5888ef660e"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -3424,6 +3411,8 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8b6d2946350d398c9d2d795bb99b04f22e8414c8a8ad9c5c3c0c5b7899af9a4"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -3433,7 +3422,6 @@ dependencies = [
  "n0-error 1.0.0-rc.0",
  "n0-future",
  "ndk-context",
- "portable-atomic",
  "rand 0.10.1",
  "reqwest 0.13.1",
  "rustls",
@@ -3507,6 +3495,8 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54f490405e42dd2ecf16be18a3587d2665401e94a498094f12322eaa6d5ebb2b"
 dependencies = [
  "blake3",
  "bytes",
@@ -3531,6 +3521,7 @@ dependencies = [
  "pin-project",
  "postcard",
  "rand 0.10.1",
+ "reqwest 0.13.1",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -5899,14 +5890,12 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.7",
 ]

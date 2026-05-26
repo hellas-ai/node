@@ -13,10 +13,7 @@ default = []
 # Backend variants: each pulls in the optional `hellas-executor` dep plus the
 # RPC/transport server bits. Source code gates on the implicit `hellas-executor`
 # feature that cargo creates from the optional dep (no `dep:` prefix used).
-candle = [
-  "hellas-executor/candle",
-  "hellas-rpc/server",
-]
+candle = ["hellas-executor/candle", "hellas-rpc/server"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
 
@@ -25,11 +22,11 @@ candle-metal = ["candle", "hellas-executor/candle-metal"]
 # `execution.rs` / `serve/node.rs` collapse to identity, and iroh's metrics
 # module is not built.
 otel = [
-  "dep:opentelemetry",
-  "dep:opentelemetry_sdk",
-  "dep:opentelemetry-otlp",
-  "dep:tracing-opentelemetry",
-  "dep:iroh-metrics",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:iroh-metrics",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -49,19 +46,19 @@ futures = "0.3"
 hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
-  "node",
-  "all-protocols",
+    "node",
+    "all-protocols",
 ] }
 hellas-wire = { workspace = true, features = [
-  "iroh",
-  "discovery-dht",
-  "discovery-mdns",
+    "iroh",
+    "discovery-dht",
+    "discovery-mdns",
 ] }
 hellas-wire-adaptors.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.2"
 iroh-metrics = { version = "1.0.0-rc.0", default-features = false, features = [
-  "metrics",
+    "metrics",
 ], optional = true }
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
