@@ -2536,6 +2536,7 @@ dependencies = [
  "hellas-executor",
  "hellas-rpc",
  "hellas-runtime",
+ "hellas-wire-adaptors",
  "libc",
  "minijinja",
  "minijinja-contrib",
@@ -2640,6 +2641,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers",
+]
+
+[[package]]
+name = "hellas-wire-adaptors"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -44,6 +44,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "compression",
     "discovery",
 ] }
+hellas-wire-adaptors.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
 tonic-iroh-transport = { workspace = true, default-features = false, features = [
     "client",

@@ -6,6 +6,7 @@ members = [
     "crates/executor",
     "crates/rpc",
     "crates/runtime",
+    "crates/wire-adaptors",
 ]
 
 # `crates/wire` is intentionally NOT a workspace member: its optional
@@ -36,6 +37,7 @@ catnix = { path = "crates/catnix", default-features = false }
 hellas-core = { path = "crates/core", default-features = false }
 hellas-runtime = { path = "crates/runtime", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
+hellas-wire-adaptors = { path = "crates/wire-adaptors", default-features = false }
 iroh = "0.98"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde_bytes = "0.11"

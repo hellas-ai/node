@@ -124,20 +124,13 @@ impl Executor {
             plan.invocation.stop_token_ids.clone(),
         );
         // Cold-start: anchor on the bound program's genesis receipt.
-        // Anchored execution (later phase) will read this from the
-        // request wire field instead.
         let initial_receipt_id = execution.genesis_receipt_id();
         let commitment_id = execution
             .build_text_execution(initial_receipt_id, &plan.invocation, &policy)?
             .id();
-        // AXES.md pass 3: build a catnix `Term` projection over the same
-        // runtime inputs and log its identity alongside `commitment_id`.
-        // The new commitment is NOT byte-equal to the old one — the
-        // canonical encodings differ and `parameters`/`tokenizer` use
-        // placeholder ValueIds. This is audit-parity logging only; the
-        // settlement path is still anchored on `commitment_id`.
-        // Non-fatal: a projection failure logs a warning but does not
-        // abort the quote.
+        // Build the catnix projection over the same runtime inputs.
+        // Projection failure is non-fatal: the quote still runs without
+        // catnix provenance.
         let catnix_request = crate::catnix_bridge::build_catgrad_text_request(
             program_id,
             &plan.weights_key,
@@ -153,7 +146,7 @@ impl Executor {
                     (Some(call), format!("{term_id}"), format!("{commitment}"))
                 }
                 Err(err) => {
-                    warn!(error = %err, "catnix audit projection failed (non-fatal)");
+                    warn!(error = %err, "catnix projection failed");
                     (
                         None,
                         "projection_failed".to_string(),

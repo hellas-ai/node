@@ -1,0 +1,48 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use futures_core::Stream;
+use thiserror::Error;
+
+use crate::{ExecutionRequest, ExecutionResult, OutputEvent};
+
+pub type BackendResult<T> = Result<T, BackendError>;
+pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = BackendResult<T>> + Send + 'a>>;
+pub type OutputEventStream<'a> =
+    Pin<Box<dyn Stream<Item = BackendResult<OutputEvent>> + Send + 'a>>;
+
+pub trait ExecutionBackend {
+    fn execute<'a>(&'a self, request: ExecutionRequest) -> BackendFuture<'a, ExecutionResult>;
+
+    fn stream<'a>(&'a self, request: ExecutionRequest) -> BackendFuture<'a, OutputEventStream<'a>>;
+}
+
+#[derive(Debug, Error)]
+pub enum BackendError {
+    #[error("backend rejected request: {message}")]
+    Rejected { message: String },
+    #[error("backend execution failed: {message}")]
+    Execution { message: String },
+    #[error("backend stream failed: {message}")]
+    Stream { message: String },
+}
+
+impl BackendError {
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected {
+            message: message.into(),
+        }
+    }
+
+    pub fn execution(message: impl Into<String>) -> Self {
+        Self::Execution {
+            message: message.into(),
+        }
+    }
+
+    pub fn stream(message: impl Into<String>) -> Self {
+        Self::Stream {
+            message: message.into(),
+        }
+    }
+}

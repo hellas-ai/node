@@ -4,7 +4,7 @@ use crate::encode_token_ids;
 use crate::pb::hellas::GetQuoteRequest;
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::types::{Message, ThinkingPolicy, openai};
+use catgrad_llm::types::{Message, ThinkingPolicy};
 use catgrad_llm::utils::get_model_chat_template;
 use hellas_runtime::LLMError;
 use hellas_runtime::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
@@ -109,25 +109,7 @@ impl ModelAssets {
         self.prepare_chat_with_options(messages, ThinkingPolicy::Default, None)
     }
 
-    pub fn prepare_openai_response(
-        &self,
-        request: &openai::responses::ResponseRequest,
-    ) -> Result<PreparedPrompt> {
-        let messages =
-            request
-                .to_messages()
-                .map_err(|source| ModelAssetsError::PreparePromptRequest {
-                    source: source.into(),
-                })?;
-        let tools = request
-            .tools
-            .as_ref()
-            .filter(|tools| !tools.is_empty())
-            .map(|tools| Value::Array(tools.clone()));
-        self.prepare_chat_with_options(&messages, ThinkingPolicy::Disabled, tools.as_ref())
-    }
-
-    fn prepare_chat_with_options(
+    pub fn prepare_chat_with_options(
         &self,
         messages: &[Message],
         thinking: ThinkingPolicy,

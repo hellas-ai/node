@@ -1,7 +1,7 @@
 use super::{GatewayOptions, json_error};
 use crate::execution::{
-    ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
-    PreparedExecution, RemoteNodeTarget, StopReason,
+    ExecutionEvent, ExecutionRequest as RuntimeExecutionRequest, ExecutionRoute, ExecutionRuntime,
+    ExecutionStrategy, Outcome, PreparedExecution, RemoteNodeTarget, StopReason,
 };
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
@@ -23,6 +23,11 @@ use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
 use hellas_runtime::cid::Cid;
 use hellas_runtime::runtime::TextReceipt;
 use hellas_runtime::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
+use hellas_wire_adaptors::{
+    CanonicalExecution, ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest,
+    Input, InputItem, Message as WireMessage,
+};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -64,12 +69,8 @@ pub(super) struct PreparedGeneration {
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) stop_token_ids: Vec<i32>,
-    /// Bound chat-turn for chat surfaces (OpenAI / Anthropic). `None`
-    /// for the plain completion endpoint, which has no chat template
-    /// and no tool contract — see the P6 implementation contract in
-    /// the project plan. Chat surfaces use `chat_turn.make_parser()`
-    /// to drive the wire-event mapping; plain surface streams text
-    /// passthrough.
+    /// Bound chat-turn for surfaces that parse tool calls from model output.
+    /// Plain text surfaces leave output decoding as text passthrough.
     pub(super) chat_turn: Option<ChatTurn>,
     pub(super) assets: Arc<ModelAssets>,
     pub(super) inference_timeout: Duration,
@@ -233,7 +234,7 @@ impl GatewayState {
     ) -> Result<PreparedGeneration, HttpError> {
         let prompt_tokens = prepared_prompt.input_ids.len() as u32;
         let stop_token_ids = prepared_prompt.stop_token_ids.clone();
-        let request = ExecutionRequest::new(
+        let request = RuntimeExecutionRequest::new(
             self.runtime.clone(),
             assets.clone(),
             prepared_prompt,
@@ -355,18 +356,27 @@ impl GatewayState {
         .await
     }
 
-    pub(super) async fn prepare_openai_response(
+    pub(super) async fn prepare_wire_execution(
         &self,
-        req: &openai::responses::ResponseRequest,
+        req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req.max_output_tokens.unwrap_or(self.default_max_tokens);
-        let model = self.resolve_model(&req.model);
+        let max_tokens = req
+            .canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens);
+        let model = self.resolve_model(&req.canonical.model.name);
+        let messages = wire_messages(&req.canonical).map_err(|message| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        })?;
+        let tools = wire_tools(&req.canonical);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to load local model assets for `{model}`: {err}"),
         })?;
         let prepared_prompt = assets
-            .prepare_openai_response(req)
+            .prepare_chat_with_options(&messages, ThinkingPolicy::Disabled, tools.as_ref())
             .map_err(|err| HttpError {
                 status: StatusCode::BAD_REQUEST,
                 message: format!(
@@ -383,6 +393,145 @@ impl GatewayState {
             "Failed to prepare Responses request",
         )
         .await
+    }
+}
+
+fn wire_messages(canonical: &CanonicalExecution) -> Result<Vec<Message>, String> {
+    let mut messages = Vec::new();
+    if let Some(instructions) = &canonical.instructions {
+        messages.push(Message::openai(openai::ChatMessage::system(
+            instructions.clone(),
+        )));
+    }
+
+    match &canonical.input {
+        Input::Text(text) => {
+            messages.push(Message::openai(openai::ChatMessage::user(text.clone())))
+        }
+        Input::Messages(input_messages) => {
+            for message in input_messages {
+                messages.push(Message::openai(wire_message_to_openai(message)?));
+            }
+        }
+        Input::Items(items) => {
+            for item in items {
+                messages.push(Message::openai(wire_item_to_openai(item)?));
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+fn wire_item_to_openai(item: &InputItem) -> Result<openai::ChatMessage, String> {
+    match item {
+        InputItem::Message(message) => wire_message_to_openai(message),
+        InputItem::ToolResult { call_id, output } => Ok(openai::ChatMessage::builder()
+            .role("tool".to_string())
+            .content(Some(openai::MessageContent::Text(wire_content_text(
+                output,
+            ))))
+            .tool_call_id(Some(call_id.clone()))
+            .build()),
+        InputItem::ToolCall {
+            id,
+            name,
+            arguments,
+        } => Ok(openai::ChatMessage::builder()
+            .role("assistant".to_string())
+            .content(None)
+            .tool_calls(Some(vec![json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json_to_wire_string(arguments),
+                },
+            })]))
+            .build()),
+        InputItem::Raw(_) => Err("unsupported raw Responses input item".to_string()),
+    }
+}
+
+fn wire_message_to_openai(message: &WireMessage) -> Result<openai::ChatMessage, String> {
+    Ok(openai::ChatMessage::builder()
+        .role(message.role.clone())
+        .content(wire_message_content(&message.content)?)
+        .name(message.name.clone())
+        .build())
+}
+
+fn wire_message_content(
+    content: &[WireContentPart],
+) -> Result<Option<openai::MessageContent>, String> {
+    match content {
+        [] => Ok(None),
+        [WireContentPart::Text { text }] => Ok(Some(openai::MessageContent::Text(text.clone()))),
+        parts => parts
+            .iter()
+            .map(wire_content_part)
+            .collect::<Result<Vec<_>, _>>()
+            .map(openai::MessageContent::Parts)
+            .map(Some),
+    }
+}
+
+fn wire_content_part(part: &WireContentPart) -> Result<openai::ContentPart, String> {
+    match part {
+        WireContentPart::Text { text } => Ok(openai::ContentPart::Text { text: text.clone() }),
+        WireContentPart::Image { uri: Some(uri), .. } => Ok(openai::ContentPart::ImageUrl {
+            image_url: openai::ImageUrl { url: uri.clone() },
+        }),
+        WireContentPart::Image { uri: None, .. } => {
+            Err("image content requires a URI for local execution".to_string())
+        }
+        WireContentPart::File { .. } => {
+            Err("file content is not supported by local chat templates".to_string())
+        }
+        WireContentPart::Json(_) => {
+            Err("JSON content parts are not supported by local chat templates".to_string())
+        }
+    }
+}
+
+fn wire_content_text(content: &[WireContentPart]) -> String {
+    content
+        .iter()
+        .map(|part| match part {
+            WireContentPart::Text { text } => text.clone(),
+            WireContentPart::Image { uri, .. } => uri.clone().unwrap_or_default(),
+            WireContentPart::File {
+                file_id,
+                filename,
+                data,
+            } => file_id
+                .as_ref()
+                .or(filename.as_ref())
+                .or(data.as_ref())
+                .cloned()
+                .unwrap_or_default(),
+            WireContentPart::Json(value) => json_to_wire_string(value),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn wire_tools(canonical: &CanonicalExecution) -> Option<JsonValue> {
+    (!canonical.tools.is_empty()).then(|| {
+        JsonValue::Array(
+            canonical
+                .tools
+                .iter()
+                .map(|tool| tool.raw.clone())
+                .collect(),
+        )
+    })
+}
+
+fn json_to_wire_string(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => value.clone(),
+        _ => serde_json::to_string(value).expect("serializing JSON value cannot fail"),
     }
 }
 
@@ -609,5 +758,82 @@ mod tests {
             state.execution_strategy(),
             ExecutionStrategy::Run(ExecutionRoute::Local)
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_adaptor_tests {
+    use super::*;
+    use hellas_wire_adaptors::{ModelRef, SamplingOptions, ToolChoice};
+    use serde_json::json;
+
+    fn canonical(input: Input) -> CanonicalExecution {
+        CanonicalExecution {
+            model: ModelRef::new("model"),
+            input,
+            instructions: None,
+            sampling: SamplingOptions::default(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            response_format: None,
+            reasoning: None,
+            previous_response_id: None,
+            committed_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn wire_messages_map_text_input_to_user_message() {
+        let mut canonical = canonical(Input::Text("hello".to_string()));
+        canonical.instructions = Some("be direct".to_string());
+
+        let messages = wire_messages(&canonical).unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let Message::OpenAI(system) = &messages[0] else {
+            panic!("expected OpenAI system message");
+        };
+        assert_eq!(system.role, "system");
+
+        let Message::OpenAI(user) = &messages[1] else {
+            panic!("expected OpenAI user message");
+        };
+        assert_eq!(user.role, "user");
+        assert_eq!(
+            user.content,
+            Some(openai::MessageContent::Text("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn wire_tool_call_maps_to_openai_assistant_tool_call() {
+        let item = InputItem::ToolCall {
+            id: "call_1".to_string(),
+            name: "lookup".to_string(),
+            arguments: json!({"query": "zurich"}),
+        };
+
+        let message = wire_item_to_openai(&item).unwrap();
+        assert_eq!(message.role, "assistant");
+        let tool_call = &message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call["id"], "call_1");
+        assert_eq!(tool_call["function"]["name"], "lookup");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"zurich"}"#);
+    }
+
+    #[test]
+    fn wire_message_rejects_file_content_for_local_template() {
+        let message = WireMessage {
+            role: "user".to_string(),
+            content: vec![WireContentPart::File {
+                file_id: Some("file_1".to_string()),
+                filename: None,
+                data: None,
+            }],
+            name: None,
+        };
+
+        let err = wire_message_to_openai(&message).unwrap_err();
+        assert!(err.contains("file content is not supported"));
     }
 }

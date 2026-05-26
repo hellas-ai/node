@@ -246,14 +246,9 @@ pub enum Termination {
         total_tokens: u64,
         stop_reason: StopReason,
         receipt_cid: Cid<TextReceipt>,
-        /// AXES.md pass 3 catnix receipt commitment (BLAKE3 of the
-        /// signed `Claim` body). `None` when the producer didn't
-        /// compute a catnix audit Receipt (no catnix Call on the
-        /// quote, or projection failed). Goes onto the wire via
-        /// `Completed.catnix_receipt_commitment`. Today the signing
-        /// key is ephemeral per executor process, so the commitment
-        /// is verifiable cryptographically but not stable across
-        /// restarts — see PROGRESS.md for the durable-key gap.
+        /// Catnix receipt commitment: BLAKE3 of the signed `Claim`
+        /// body. `None` when no catnix Call was captured for the quote
+        /// or result projection/signing failed.
         catnix_receipt_commitment: Option<[u8; 32]>,
     },
     Failed {

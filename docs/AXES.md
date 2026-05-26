@@ -366,7 +366,7 @@ producer)`. Evidence that's merely stapled to the envelope outside the
 signature can be added, removed, or swapped without invalidating the
 receipt.
 
-- **Detachable** (default for audit-only Provenance) — fine. The
+- **Detachable** (default for diagnostic Provenance) — fine. The
   protocol takes no settlement position on its presence.
 - **Committed** (required for settlement-relevant evidence) — the
   receipt body includes an `evidence_commitment: Option<Digest>`

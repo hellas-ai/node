@@ -52,8 +52,7 @@ pub(crate) struct ExecuteJob {
     /// Catnix projection captured from the corresponding quote. Used to
     /// build and sign the terminal catnix `Receipt`.
     pub catnix_call: Option<Call>,
-    /// Producer signing key (ephemeral today). Used to sign the catnix
-    /// `Receipt` for audit logging.
+    /// Producer signing key. Used to sign the catnix `Receipt`.
     pub producer_key: Arc<ProducerSigningKey>,
 }
 
@@ -93,8 +92,8 @@ fn worker_loop(
         let metrics = Arc::clone(&job.metrics);
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
-        // Capture state needed for the post-run catnix audit Receipt
-        // before `job` is moved into `run_job`.
+        // Capture state needed for the terminal catnix Receipt before
+        // `job` is moved into `run_job`.
         let catnix_call = job.catnix_call.clone();
         let producer_key = Arc::clone(&job.producer_key);
         let prompt_token_ids = job.invocation.input_ids.clone();
@@ -113,7 +112,7 @@ fn worker_loop(
             run_job(job, on_progress)
         })) {
             Ok(Ok(outcome)) => {
-                let catnix_receipt_commitment = build_catnix_audit_receipt(
+                let catnix_receipt_commitment = build_catnix_receipt_commitment(
                     &execution_id,
                     catnix_call.as_ref(),
                     &producer_key,
@@ -217,7 +216,7 @@ fn map_stop_reason(reason: RuntimeStopReason) -> CatnixStopReason {
 /// project it through CatgradText's `project_result`, and sign a
 /// `Receipt` with the executor's producer key. Any failure is logged and
 /// returned as `None` so the execution can still complete.
-fn build_catnix_audit_receipt(
+fn build_catnix_receipt_commitment(
     execution_id: &str,
     catnix_call: Option<&Call>,
     producer_key: &ProducerSigningKey,
@@ -225,7 +224,7 @@ fn build_catnix_audit_receipt(
     prompt_token_ids: &[u32],
 ) -> Option<[u8; 32]> {
     let Some(call) = catnix_call else {
-        debug!(%execution_id, "no catnix call captured at quote time; skipping audit receipt");
+        debug!(%execution_id, "no catnix call captured at quote time; skipping catnix receipt");
         return None;
     };
 
@@ -235,14 +234,11 @@ fn build_catnix_audit_receipt(
 
     // Absolute final decoder position: initial state + prompt prefill +
     // generated tokens. For a cold start initial_state is genesis (len 0),
-    // so position = prompt_tokens + outcome.total_tokens. Continuation
-    // runs would add the previous state's position; not yet wired.
+    // so position = prompt_tokens + outcome.total_tokens.
     let absolute_position = (prompt_token_ids.len() as u64).saturating_add(outcome.total_tokens);
 
     // The output state is the catnix TextState over the full cold-start
-    // token history: prompt prefill + generated tokens. Anchored
-    // continuations will need to prepend the prior state's token history
-    // when that path is wired.
+    // token history: prompt prefill + generated tokens.
     let state_value_id = text_state_value_id_for_tokens(
         prompt_token_ids
             .iter()
@@ -266,7 +262,7 @@ fn build_catnix_audit_receipt(
     let result = match CatgradText::project_result(&text_run_output, call) {
         Ok(r) => r,
         Err(err) => {
-            warn!(%execution_id, error = %err, "catnix project_result failed (audit, non-fatal)");
+            warn!(%execution_id, error = %err, "catnix project_result failed");
             return None;
         }
     };
@@ -274,7 +270,7 @@ fn build_catnix_audit_receipt(
     let receipt = match Receipt::sign_delivery(call, &result, EvidenceBinding::None, producer_key) {
         Ok(r) => r,
         Err(err) => {
-            warn!(%execution_id, error = %err, "catnix Receipt::sign_delivery failed (audit, non-fatal)");
+            warn!(%execution_id, error = %err, "catnix Receipt::sign_delivery failed");
             return None;
         }
     };
@@ -282,14 +278,12 @@ fn build_catnix_audit_receipt(
     // Receipt commitment = BLAKE3 of the canonical signed-Claim body.
     let receipt_commitment_digest = receipt.claim.signature_preimage();
 
-    // Surface the key audit invariants in structured logs.
     let call_commitment = receipt.claim.call_commitment.digest();
     let result_commitment = receipt.claim.result_commitment.digest();
     let producer_id = receipt.claim.producer.digest();
     let term_id_str = format!("{term_id}");
     info!(
         %execution_id,
-        audit_only = true,
         catnix_receipt_persisted = false,
         catnix_receipt_commitment_in_outcome = true,
         producer_key_ephemeral = true,
@@ -302,7 +296,7 @@ fn build_catnix_audit_receipt(
         catnix_total_generated = outcome.total_tokens,
         catnix_stop_reason = ?stop_reason,
         catnix_tokens_value_id = %tokens_value_id.digest(),
-        "catnix audit receipt signed and attached to terminal outcome"
+        "catnix receipt signed and attached to terminal outcome"
     );
 
     Some(*receipt_commitment_digest.as_bytes())
