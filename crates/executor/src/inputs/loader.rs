@@ -30,7 +30,8 @@ pub(crate) fn is_cached_locally(locator: &HuggingFaceLocator) -> bool {
 pub(crate) fn load_bundle(locator: &HuggingFaceLocator) -> Result<Loaded, ExecutorError> {
     let backend = create_backend()?;
     let (model_paths, config_path, _tokenizer_path, _tokenizer_config_path) =
-        get_model_files(&locator.model_id, &locator.revision)?;
+        get_model_files(&locator.model_id, &locator.revision)
+            .map_err(hellas_runtime::LLMError::from)?;
     let resolved_revision = extract_revision_from_snapshot_path(&config_path).ok_or_else(|| {
         ExecutorError::WeightsError(format!(
             "unexpected hf cache path (no snapshots/<sha>): {}",
@@ -39,7 +40,8 @@ pub(crate) fn load_bundle(locator: &HuggingFaceLocator) -> Result<Loaded, Execut
     })?;
 
     let (inputs, _parameter_types, _total_params) =
-        load_model_weights(model_paths, &backend, locator.dtype)?;
+        load_model_weights(model_paths, &backend, locator.dtype, None)
+            .map_err(hellas_runtime::LLMError::from)?;
     let bundle = Arc::new(Bundle { inputs });
 
     Ok(Loaded {

@@ -22,6 +22,7 @@ fn test_executor(rx: mpsc::UnboundedReceiver<ExecutorMessage>) -> Executor {
         execute_policy: ExecutePolicy::default(),
         metrics: std::sync::Arc::new(crate::metrics::ExecutorMetrics::default()),
         supported_dtypes: vec![catgrad::prelude::Dtype::F32],
+        producer_key: std::sync::Arc::new(hellas_core::ProducerSigningKey::generate()),
     }
 }
 

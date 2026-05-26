@@ -61,6 +61,10 @@ message Completed {
   StopReason stop_reason = 2;
   // Cid<TextReceipt> — exactly 32 bytes. Receivers reject other lengths.
   bytes receipt_cid = 3;
+  // catnix `Claim::receipt_commitment` — BLAKE3 of the signed Receipt's
+  // canonical Claim body. Exactly 32 bytes when present, empty when the
+  // producer did not compute a catnix Receipt.
+  bytes catnix_receipt_commitment = 4;
 }
 
 message Failed {

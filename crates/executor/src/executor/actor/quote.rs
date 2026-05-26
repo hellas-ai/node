@@ -1,7 +1,6 @@
 use crate::inputs::{EnsureDisposition, HuggingFaceLocator, Status, is_cached_locally};
 use crate::state::{QuotePlan, QuoteRecord};
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::TextPolicy;
 use catgrad_llm::types;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::ModelAssets;
@@ -11,6 +10,7 @@ use hellas_rpc::pb::hellas::{
 };
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::spec::ModelSpec;
+use hellas_runtime::runtime::TextPolicy;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ fn dtype_to_wire(dtype: Dtype) -> String {
         Dtype::F32 => "f32".to_string(),
         Dtype::F16 => "f16".to_string(),
         Dtype::BF16 => "bf16".to_string(),
+        Dtype::F8 => "f8".to_string(),
         Dtype::U32 => "u32".to_string(),
     }
 }
@@ -50,7 +51,7 @@ impl Executor {
             let dtype = Dtype::from_str(raw).map_err(|e| {
                 ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
             })?;
-            if matches!(dtype, Dtype::U32) {
+            if matches!(dtype, Dtype::F8 | Dtype::U32) {
                 return Err(ExecutorError::InvalidQuoteRequest(
                     "model dtype must be f32, f16, or bf16".to_string(),
                 ));
@@ -129,6 +130,37 @@ impl Executor {
         let commitment_id = execution
             .build_text_execution(initial_receipt_id, &plan.invocation, &policy)?
             .id();
+        // AXES.md pass 3: build a catnix `Term` projection over the same
+        // runtime inputs and log its identity alongside `commitment_id`.
+        // The new commitment is NOT byte-equal to the old one — the
+        // canonical encodings differ and `parameters`/`tokenizer` use
+        // placeholder ValueIds. This is audit-parity logging only; the
+        // settlement path is still anchored on `commitment_id`.
+        // Non-fatal: a projection failure logs a warning but does not
+        // abort the quote.
+        let catnix_request = crate::catnix_bridge::build_catgrad_text_request(
+            program_id,
+            &plan.weights_key,
+            initial_receipt_id,
+            &plan.invocation,
+            &policy,
+        );
+        let (catnix_call, catnix_term_id_str, catnix_call_commitment_str) =
+            match crate::catnix_bridge::project_call_for_request(&catnix_request) {
+                Ok(call) => {
+                    let term_id = catnix::Digest::from_canonical_bytes(call.payload.as_bytes());
+                    let commitment = call.commitment().digest();
+                    (Some(call), format!("{term_id}"), format!("{commitment}"))
+                }
+                Err(err) => {
+                    warn!(error = %err, "catnix audit projection failed (non-fatal)");
+                    (
+                        None,
+                        "projection_failed".to_string(),
+                        "projection_failed".to_string(),
+                    )
+                }
+            };
         let cache_start = Instant::now();
         let start = execution.execution_start(commitment_id, initial_receipt_id)?;
         let cache_lookup_ms = cache_start.elapsed().as_millis();
@@ -138,18 +170,27 @@ impl Executor {
         let prompt_tokens = plan.invocation.input_ids.len();
         let max_new_tokens = plan.invocation.max_new_tokens;
         let cached_output_tokens = start.cached.as_ref().map_or(0, |c| c.output_tokens.len());
+        // Capture the catnix commitment before `catnix_call` moves into
+        // QuoteRecord, so the provenance metadata below can carry it
+        // without re-projecting.
+        let catnix_call_commitment_bytes = catnix_call
+            .as_ref()
+            .map(|call| *call.commitment().digest().as_bytes());
         let quote_id = self.store.create_quote(QuoteRecord {
             invocation: plan.invocation,
             execution,
             start,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: model_id.clone(),
+            catnix_call,
         });
 
         info!(
             %quote_id,
             %program_id,
             %commitment_id,
+            catnix_term_id = %catnix_term_id_str,
+            catnix_call_commitment = %catnix_call_commitment_str,
             amount = STATIC_QUOTE_AMOUNT,
             model = model_id,
             requested_revision,
@@ -179,6 +220,7 @@ impl Executor {
             },
             provenance: ExecutionProvenance {
                 commitment_id: *commitment_id.as_bytes(),
+                catnix_call_commitment: catnix_call_commitment_bytes,
             },
         })
     }
@@ -308,4 +350,3 @@ fn load_assets(
     };
     ModelAssets::load(&spec, dtype)
 }
-

@@ -1,7 +1,7 @@
 use super::{Bundle, Error, HuggingFaceLocator};
 use crate::programs::ExecutionContext;
-use catgrad::cid::Cid;
-use catgrad::runtime::Program;
+use hellas_runtime::cid::Cid;
+use hellas_runtime::graph::Program;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -87,9 +87,12 @@ impl State {
     }
 
     pub(crate) fn mark_loading(&mut self, locator: &HuggingFaceLocator) -> Result<(), Error> {
-        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
-            locator: locator.clone(),
-        })?;
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or_else(|| Error::UnknownKey {
+                locator: locator.clone(),
+            })?;
         if let Status::Failed(error) = &entry.status {
             return Err(Error::Failed {
                 locator: locator.clone(),
@@ -140,9 +143,12 @@ impl State {
         generation: u64,
         program: Arc<ExecutionContext>,
     ) -> Result<CacheProgramOutcome, Error> {
-        let entry = self.entries.get_mut(locator).ok_or_else(|| Error::UnknownKey {
-            locator: locator.clone(),
-        })?;
+        let entry = self
+            .entries
+            .get_mut(locator)
+            .ok_or_else(|| Error::UnknownKey {
+                locator: locator.clone(),
+            })?;
         require_ready(locator, &entry.status)?;
         if entry.generation != generation {
             return Ok(CacheProgramOutcome::Stale);
@@ -159,7 +165,7 @@ mod tests {
     use catgrad::category::lang::{Term, TypedTerm};
     use catgrad::interpreter;
     use catgrad::path::Path;
-    use catgrad::runtime::{BoundProgram, Program};
+    use hellas_runtime::graph::{BoundProgram, Program};
 
     fn locator(index: u8) -> HuggingFaceLocator {
         HuggingFaceLocator::new(
@@ -175,7 +181,7 @@ mod tests {
     }
 
     fn dummy_spec() -> Program {
-        catgrad::runtime::ProgramSpec {
+        hellas_runtime::graph::ProgramSpec {
             typed_term: TypedTerm {
                 term: Term::empty(),
                 source_type: vec![],
@@ -194,7 +200,7 @@ mod tests {
         Arc::new(
             ExecutionContext::new(Arc::new(
                 BoundProgram::bind(&bundle.inputs, &backend, dummy_spec())
-                    .map_err(catgrad_llm::LLMError::from)
+                    .map_err(hellas_runtime::LLMError::from)
                     .unwrap(),
             ))
             .unwrap(),

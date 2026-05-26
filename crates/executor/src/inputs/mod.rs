@@ -1,5 +1,5 @@
-//! Loading and lifecycle for [`catgrad::runtime::Inputs`] — the
-//! pre-loaded tensor bundles supplied to [`catgrad::runtime::Inputs::bind`]
+//! Loading and lifecycle for [`hellas_runtime::graph::Inputs`] — the
+//! pre-loaded tensor bundles supplied to [`hellas_runtime::graph::Inputs::bind`]
 //! to produce a runnable bound program.
 //!
 //! This module owns:
@@ -15,7 +15,7 @@
 //!   against the same `Inputs` share an entry; the registry is what
 //!   [`crate::programs::Cache`] queries on every quote.
 //!
-//! [`Inputs`]: catgrad::runtime::Inputs
+//! [`Inputs`]: hellas_runtime::graph::Inputs
 
 mod bundle;
 mod loader;

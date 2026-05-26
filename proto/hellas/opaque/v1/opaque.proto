@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package hellas.opaque.v1;
+
+import "hellas/v1/hellas.proto";
+
+// Trust-based opaque work. The protocol commits to the exact bytes; it does
+// not interpret service/method/payload or provide a non-cooperative validity
+// path for them.
+
+service Opaque {
+  rpc CreateTicket(OpaqueRequest) returns (.hellas.v1.Ticket);
+}
+
+message OpaqueRequest {
+  string service = 1;
+  string method = 2;
+  bytes payload = 3; // exact UTF-8 JSON bytes
+}

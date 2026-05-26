@@ -21,7 +21,7 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
     let dtype = Dtype::from_str(s)?;
     match dtype {
         Dtype::F32 | Dtype::F16 | Dtype::BF16 => Ok(dtype),
-        Dtype::U32 => Err("model dtype must be f32, f16, or bf16".to_string()),
+        Dtype::F8 | Dtype::U32 => Err("model dtype must be f32, f16, or bf16".to_string()),
     }
 }
 
@@ -543,13 +543,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// On CPU-only builds the default is `f32`; on CUDA/Metal builds it is
-    /// `bf16`. See [`DEFAULT_DTYPE_STR`]. Used for `serve` / `gateway`,
-    /// which still take a single dtype.
-    fn expected_default_dtype() -> Dtype {
-        parse_model_dtype(DEFAULT_DTYPE_STR).unwrap()
-    }
-
     #[test]
     fn llm_dtype_omitted_yields_empty_vec_for_runtime_resolution() {
         // Clap parses no `--dtype` as an empty `Vec<Dtype>`; main resolves
@@ -666,7 +659,7 @@ mod tests {
         let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
         match cli.command {
             Commands::Serve { dtype, .. } => {
-                assert_eq!(dtype, vec![expected_default_dtype()]);
+                assert_eq!(dtype, vec![parse_model_dtype(DEFAULT_DTYPE_STR).unwrap()]);
             }
             _ => panic!("expected serve command"),
         }

@@ -6,8 +6,8 @@ use catgrad::interpreter;
 /// via `Arc` avoids ever cloning the multi-GB tensor interior.
 ///
 /// Per-tensor CIDs are derived at bind time inside
-/// [`catgrad::runtime::BoundProgram::bind`] and cached on the resulting
-/// [`catgrad::runtime::BoundProgram`] — the bundle itself is CID-free.
+/// [`hellas_runtime::graph::BoundProgram::bind`] and cached on the resulting
+/// [`hellas_runtime::graph::BoundProgram`] — the bundle itself is CID-free.
 #[derive(Clone)]
 pub(crate) struct Bundle {
     pub inputs: interpreter::Parameters<ExecBackend>,

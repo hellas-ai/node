@@ -9,14 +9,17 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
-use catgrad_llm::runtime::chat::wire::anthropic::{AnthropicStreamFrame, AnthropicStreamMapper};
-use catgrad_llm::runtime::chat::wire::{PumpError, pump_finish, pump_text};
-use catgrad_llm::runtime::chat::{
-    DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
-};
 use catgrad_llm::types::anthropic;
 use futures::StreamExt;
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_runtime::runtime::chat::wire::anthropic::{
+    AnthropicStopReason, AnthropicStreamFrame, AnthropicStreamMapper,
+};
+use hellas_runtime::runtime::chat::wire::{PumpError, pump_finish, pump_text};
+use hellas_runtime::runtime::chat::{
+    DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
+};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -44,7 +47,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let id = next_id("msg");
     let model = prepared.model.clone();
     let prompt_tokens = prepared.prompt_tokens;
-    let provenance = prepared.provenance.clone();
+    let mut provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
     let mut parser: Box<dyn IncrementalToolCallParser> = prepared
@@ -59,10 +62,11 @@ async fn respond(prepared: PreparedGeneration) -> Response {
 
     let outcome = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                provenance = Some(prov);
+            }
             Ok(Some(Ok(GenerationEvent::Delta(d)))) => {
-                if let Err(PumpError { failure, .. }) =
-                    pump_text(&mut *parser, &mut mapper, &d)
-                {
+                if let Err(PumpError { failure, .. }) = pump_text(&mut *parser, &mut mapper, &d) {
                     // Non-streaming: cleanup frames are wire-bracketing
                     // and irrelevant when no wire stream exists. Discard.
                     return failure_to_json_response(failure);
@@ -89,20 +93,27 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, exec_stop, receipt_cid) = match outcome {
+    let (total_tokens, exec_stop, _receipt_cid, catnix_receipt) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
             receipt_cid,
+            catnix_receipt_commitment,
         } => {
             info!(
                 %receipt_cid,
                 ?provenance,
                 total_tokens,
                 ?stop_reason,
+                ?catnix_receipt_commitment,
                 "anthropic message completion ready"
             );
-            (total_tokens, stop_reason, receipt_cid)
+            (
+                total_tokens,
+                stop_reason,
+                receipt_cid,
+                catnix_receipt_commitment,
+            )
         }
         Outcome::Failed { position, error } => {
             warn!(position, %error, "anthropic message request failed");
@@ -114,9 +125,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     };
 
     let parser_stop = map_to_parser_stop(exec_stop);
-    if let Err(PumpError { failure, .. }) =
-        pump_finish(&mut *parser, &mut mapper, parser_stop)
-    {
+    if let Err(PumpError { failure, .. }) = pump_finish(&mut *parser, &mut mapper, parser_stop) {
         return failure_to_json_response(failure);
     }
 
@@ -124,22 +133,22 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         Ok(s) => s,
         Err(failure) => return failure_to_json_response(failure),
     };
-    let response = anthropic::MessageResponse::builder()
-        .id(id)
-        .message_type(Some("message".to_string()))
-        .role("assistant".to_string())
-        .content(snapshot.blocks)
-        .model(model)
-        .stop_reason(Some(snapshot.stop_reason))
-        .usage(anthropic::AnthropicUsage::new(
+    let response = AnthropicMessageResponse {
+        id,
+        message_type: Some("message".to_string()),
+        role: "assistant".to_string(),
+        content: snapshot.blocks,
+        model,
+        stop_reason: Some(snapshot.stop_reason),
+        usage: anthropic::AnthropicUsage::new(
             prompt_tokens,
             u32::try_from(total_tokens).unwrap_or(u32::MAX),
-        ))
-        .build();
+        ),
+    };
 
     let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt_cid),
-        None => HellasExt::receipt(&receipt_cid),
+        Some(prov) => HellasExt::both(prov, catnix_receipt.as_ref()),
+        None => HellasExt::receipt(catnix_receipt.as_ref()),
     };
     let body = WithHellas::new(response, hellas);
 
@@ -147,7 +156,9 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
-    response.extensions_mut().insert(receipt_cid);
+    if let Some(catnix) = catnix_receipt {
+        response.extensions_mut().insert(catnix);
+    }
     response
 }
 
@@ -160,6 +171,19 @@ async fn respond(prepared: PreparedGeneration) -> Response {
 struct AnthropicSsePayload {
     name: &'static str,
     json: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessageResponse {
+    id: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    message_type: Option<String>,
+    role: String,
+    content: Vec<serde_json::Value>,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<AnthropicStopReason>,
+    usage: anthropic::AnthropicUsage,
 }
 
 impl AnthropicSsePayload {
@@ -200,8 +224,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
         stream_provenance,
         upstream,
     );
-    let events = payloads
-        .map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
+    let events = payloads.map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
     let mut response = sse_response(events);
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
@@ -227,10 +250,10 @@ where
     S: futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static,
 {
     stream! {
-        // Stamp hellas.commitment_id INSIDE message_start.message
+        // Stamp hellas.commitment INSIDE message_start.message
         // (on the MessageResponse), so the field path is identical
-        // between streaming (`message_start.message.hellas.commitment_id`)
-        // and non-streaming (`hellas.commitment_id` on MessageResponse).
+        // between streaming (`message_start.message.hellas.commitment`)
+        // and non-streaming (`hellas.commitment` on MessageResponse).
         // Browser EventSource consumers can't read response headers,
         // so this in-band placement is the canonical commitment carrier.
         let message = anthropic::MessageResponse::builder()
@@ -241,7 +264,8 @@ where
             .model(model)
             .usage(anthropic::AnthropicUsage::new(prompt_tokens, 0))
             .build();
-        let message_hellas = match provenance.as_ref() {
+        let mut stream_provenance = provenance;
+        let message_hellas = match stream_provenance.as_ref() {
             Some(prov) => HellasExt::commitment(prov),
             None => HellasExt::default(),
         };
@@ -265,9 +289,14 @@ where
         let mut transport_error: Option<String> = None;
         let mut timed_out = false;
         let mut protocol_failure: Option<PumpError<AnthropicStreamFrame>> = None;
+        let mut commitment_pending = false;
 
         'outer: loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                    stream_provenance = Some(prov);
+                    commitment_pending = true;
+                }
                 Ok(Some(Ok(GenerationEvent::Delta(text)))) => {
                     match pump_text(&mut *parser, &mut mapper, &text) {
                         Ok(frames) => {
@@ -368,10 +397,11 @@ where
                 stop_reason,
                 total_tokens,
                 receipt_cid,
+                catnix_receipt_commitment,
             } => {
                 info!(
                     %receipt_cid,
-                    provenance = ?provenance,
+                    provenance = ?stream_provenance,
                     total_tokens,
                     ?stop_reason,
                     "anthropic message completion ready"
@@ -409,11 +439,19 @@ where
                 }
 
                 // message_stop is the SEMANTIC TERMINAL event.
-                // Wrapping it with hellas.receipt_id makes "receipt
+                // Wrapping it with hellas.receipt makes "receipt
                 // is on the terminal event" a testable invariant.
+                let hellas = if commitment_pending {
+                    match stream_provenance.as_ref() {
+                        Some(prov) => HellasExt::both(prov, catnix_receipt_commitment.as_ref()),
+                        None => HellasExt::receipt(catnix_receipt_commitment.as_ref()),
+                    }
+                } else {
+                    HellasExt::receipt(catnix_receipt_commitment.as_ref())
+                };
                 let stop_event = WithHellas::new(
                     anthropic::MessageStreamEvent::MessageStop,
-                    HellasExt::receipt(&receipt_cid),
+                    hellas,
                 );
                 yield AnthropicSsePayload {
                     name: "message_stop",
@@ -448,36 +486,40 @@ fn frame_to_payload(
     prompt_tokens: u32,
     output_tokens: u32,
 ) -> Option<AnthropicSsePayload> {
-    let (name, ev) = match frame {
+    let (name, json) = match frame {
         AnthropicStreamFrame::BlockStart { index, block } => (
             "content_block_start",
-            anthropic::MessageStreamEvent::ContentBlockStart {
-                index,
-                content_block: block,
-            },
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block,
+            }),
         ),
         AnthropicStreamFrame::BlockDelta { index, delta } => (
             "content_block_delta",
-            anthropic::MessageStreamEvent::ContentBlockDelta { index, delta },
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": delta,
+            }),
         ),
         AnthropicStreamFrame::BlockStop { index } => (
             "content_block_stop",
-            anthropic::MessageStreamEvent::ContentBlockStop { index },
+            json!({
+                "type": "content_block_stop",
+                "index": index,
+            }),
         ),
         AnthropicStreamFrame::Stop(stop_reason) => (
             "message_delta",
-            anthropic::MessageStreamEvent::MessageDelta {
-                delta: anthropic::StreamMessageDelta {
-                    stop_reason: Some(stop_reason),
-                },
-                usage: anthropic::AnthropicUsage::new(prompt_tokens, output_tokens),
-            },
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop_reason },
+                "usage": anthropic::AnthropicUsage::new(prompt_tokens, output_tokens),
+            }),
         ),
     };
-    Some(AnthropicSsePayload {
-        name,
-        json: serde_json::to_value(ev).unwrap(),
-    })
+    Some(AnthropicSsePayload { name, json })
 }
 
 fn error_type_for(failure: &DecodeFailure) -> &'static str {
@@ -512,22 +554,23 @@ mod streaming_tests {
     //! Drives `build_anthropic_sse_stream` with synthetic upstream
     //! streams and asserts the contract:
     //! - first event is `message_start` and its `.message` carries
-    //!   `hellas.commitment_id` (parity with non-streaming
+    //!   `hellas.commitment` (parity with non-streaming
     //!   `MessageResponse`);
     //! - on `Outcome::Completed`, `message_stop` is the SEMANTIC
-    //!   TERMINAL event and carries `hellas.receipt_id`;
+    //!   TERMINAL event and carries `hellas.receipt`;
     //! - error paths (transport / timeout / `Outcome::Failed`) emit
-    //!   NO `hellas.receipt_id` and the `error` event is the closer
+    //!   NO `hellas.receipt` and the `error` event is the closer
     //!   (no `message_stop` follows it).
     //! - `message_delta` does NOT carry the receipt — that lives on
     //!   `message_stop`.
 
     use super::*;
     use crate::execution::{Outcome, StopReason as ExecStopReason};
-    use catgrad::cid::Cid;
-    use catgrad_llm::runtime::TextReceipt;
-    use catgrad_llm::runtime::chat::PassthroughParser;
     use futures::StreamExt;
+    use hellas_rpc::provenance::CatnixReceiptCommitment;
+    use hellas_runtime::cid::Cid;
+    use hellas_runtime::runtime::TextReceipt;
+    use hellas_runtime::runtime::chat::PassthroughParser;
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -550,11 +593,16 @@ mod streaming_tests {
     fn test_provenance() -> ExecutionProvenance {
         ExecutionProvenance {
             commitment_id: [0xab; 32],
+            catnix_call_commitment: Some([0xef; 32]),
         }
     }
 
     fn test_receipt() -> Cid<TextReceipt> {
         Cid::<TextReceipt>::from_bytes([0xcd; 32])
+    }
+
+    fn test_catnix_receipt() -> CatnixReceiptCommitment {
+        CatnixReceiptCommitment([0x77; 32])
     }
 
     fn happy_upstream(
@@ -566,6 +614,7 @@ mod streaming_tests {
                 total_tokens: 1,
                 stop_reason: ExecStopReason::EndOfSequence,
                 receipt_cid,
+                catnix_receipt_commitment: Some(test_catnix_receipt()),
             })),
         ])
     }
@@ -573,7 +622,7 @@ mod streaming_tests {
     fn receipt_of(p: &AnthropicSsePayload) -> Option<&str> {
         p.json
             .get("hellas")
-            .and_then(|h| h.get("receipt_id"))
+            .and_then(|h| h.get("receipt"))
             .and_then(|v| v.as_str())
     }
 
@@ -584,8 +633,21 @@ mod streaming_tests {
         p.json
             .get("message")
             .and_then(|m| m.get("hellas"))
-            .and_then(|h| h.get("commitment_id"))
+            .and_then(|h| h.get("commitment"))
             .and_then(|v| v.as_str())
+    }
+
+    fn assert_no_removed_hellas_fields(value: &serde_json::Value) {
+        if let Some(hellas) = value.get("hellas") {
+            assert!(
+                hellas.get("commitment_id").is_none(),
+                "removed hellas.commitment_id leaked: {value:?}"
+            );
+            assert!(
+                hellas.get("receipt_id").is_none(),
+                "removed hellas.receipt_id leaked: {value:?}"
+            );
+        }
     }
 
     /// Happy path: message_start.message carries commitment;
@@ -613,12 +675,14 @@ mod streaming_tests {
         assert_eq!(first.name, "message_start");
         assert_eq!(
             commitment_in_message_start(first),
-            Some("ab".repeat(32).as_str())
+            Some("ef".repeat(32).as_str())
         );
+        assert_no_removed_hellas_fields(first.json.get("message").unwrap());
 
         let last = payloads.last().expect("non-empty");
         assert_eq!(last.name, "message_stop", "message_stop must be terminal");
-        assert_eq!(receipt_of(last), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(last), Some("77".repeat(32).as_str()));
+        assert_no_removed_hellas_fields(&last.json);
 
         // Receipt appears EXACTLY once and only on message_stop.
         let receipt_carriers: Vec<&'static str> = payloads
@@ -629,13 +693,15 @@ mod streaming_tests {
         assert_eq!(receipt_carriers, vec!["message_stop"]);
 
         // message_delta exists in the stream but doesn't carry receipt.
-        let deltas: Vec<&AnthropicSsePayload> =
-            payloads.iter().filter(|p| p.name == "message_delta").collect();
+        let deltas: Vec<&AnthropicSsePayload> = payloads
+            .iter()
+            .filter(|p| p.name == "message_delta")
+            .collect();
         assert!(!deltas.is_empty(), "expected at least one message_delta");
         for d in deltas {
             assert!(
                 receipt_of(d).is_none(),
-                "message_delta must not carry hellas.receipt_id: {d:?}"
+                "message_delta must not carry hellas.receipt: {d:?}"
             );
         }
     }
@@ -678,7 +744,7 @@ mod streaming_tests {
         let (id, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
         let upstream = futures::stream::iter(vec![
-            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>,
+            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>
         ]);
 
         let payloads: Vec<AnthropicSsePayload> = build_anthropic_sse_stream(
@@ -702,7 +768,7 @@ mod streaming_tests {
         );
         assert!(
             payloads.iter().all(|p| receipt_of(p).is_none()),
-            "transport error must not leak hellas.receipt_id: {payloads:#?}"
+            "transport error must not leak hellas.receipt: {payloads:#?}"
         );
     }
 
@@ -739,13 +805,10 @@ mod streaming_tests {
     async fn outcome_failed_emits_error_no_message_stop_no_receipt() {
         let (id, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(
-            Outcome::Failed {
-                position: 0,
-                error: "executor exploded".to_string(),
-            },
-        ))
-            as anyhow::Result<GenerationEvent>]);
+        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(Outcome::Failed {
+            position: 0,
+            error: "executor exploded".to_string(),
+        })) as anyhow::Result<GenerationEvent>]);
 
         let payloads: Vec<AnthropicSsePayload> = build_anthropic_sse_stream(
             id,

@@ -3,6 +3,7 @@ mod hellas_ext;
 mod openai;
 mod plain;
 mod provenance_layer;
+mod responses;
 mod state;
 mod wrap;
 
@@ -58,6 +59,7 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
+        .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())

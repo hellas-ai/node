@@ -1,8 +1,16 @@
+use crate::catnix_bridge::text_state_value_id_for_tokens;
 use crate::executor::ExecutorMessage;
 use crate::metrics::ExecutorMetrics;
 use crate::programs::{ExecutionContext, ExecutionStart};
 use crate::runner;
-use crate::state::{Invocation, Termination};
+use crate::state::{Invocation, StopReason as RuntimeStopReason, Termination};
+use catnix::{
+    Canonical, Digest as CatnixDigest, StopReason as CatnixStopReason, TermId, TextRunOutput,
+    TokenIds,
+};
+use hellas_core::ProducerSigningKey;
+use hellas_core::adaptors::catgrad_text::CatgradText;
+use hellas_core::protocol::{Call, EvidenceBinding, ProjectResult, Receipt};
 use hellas_rpc::pb::hellas::{
     Chunk as PbChunk, ExecuteStreamEvent, execute_stream_event::Event as PbEvent,
 };
@@ -41,6 +49,12 @@ pub(crate) struct ExecuteJob {
     /// with the streaming-RPC consumer; dropping it is the cancel signal.
     pub sender: tokio_mpsc::Sender<Result<ExecuteStreamEvent, Status>>,
     pub metrics: Arc<ExecutorMetrics>,
+    /// Catnix projection captured from the corresponding quote. Used to
+    /// build and sign the terminal catnix `Receipt`.
+    pub catnix_call: Option<Call>,
+    /// Producer signing key (ephemeral today). Used to sign the catnix
+    /// `Receipt` for audit logging.
+    pub producer_key: Arc<ProducerSigningKey>,
 }
 
 impl ExecuteWorker {
@@ -79,6 +93,11 @@ fn worker_loop(
         let metrics = Arc::clone(&job.metrics);
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
+        // Capture state needed for the post-run catnix audit Receipt
+        // before `job` is moved into `run_job`.
+        let catnix_call = job.catnix_call.clone();
+        let producer_key = Arc::clone(&job.producer_key);
+        let prompt_token_ids = job.invocation.input_ids.clone();
 
         // Track the last reported position so a Failed termination can
         // honestly report tokens emitted before the error.
@@ -93,11 +112,21 @@ fn worker_loop(
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(job, on_progress)
         })) {
-            Ok(Ok(outcome)) => Termination::Completed {
-                total_tokens: outcome.total_tokens,
-                stop_reason: outcome.stop_reason,
-                receipt_cid: outcome.receipt_cid,
-            },
+            Ok(Ok(outcome)) => {
+                let catnix_receipt_commitment = build_catnix_audit_receipt(
+                    &execution_id,
+                    catnix_call.as_ref(),
+                    &producer_key,
+                    &outcome,
+                    &prompt_token_ids,
+                );
+                Termination::Completed {
+                    total_tokens: outcome.total_tokens,
+                    stop_reason: outcome.stop_reason,
+                    receipt_cid: outcome.receipt_cid,
+                    catnix_receipt_commitment,
+                }
+            }
             Ok(Err(err)) => {
                 let msg = format!("{err:#}");
                 warn!("execute worker job {execution_id} failed: {msg}");
@@ -170,6 +199,136 @@ fn run_job(
         &cancel,
         on_progress,
     )
+}
+
+/// Map the runtime's `StopReason` enum onto catnix's `StopReason`
+/// newtype. Byte values intentionally align with the wire
+/// `hellas.v1.FinishStatus` proto enum so any future swap goes through
+/// here, not at the wire boundary.
+fn map_stop_reason(reason: RuntimeStopReason) -> CatnixStopReason {
+    match reason {
+        RuntimeStopReason::EndOfSequence => CatnixStopReason::END_OF_SEQUENCE,
+        RuntimeStopReason::MaxNewTokens => CatnixStopReason::MAX_OUTPUT,
+        RuntimeStopReason::Cancelled => CatnixStopReason::CANCELLED,
+    }
+}
+
+/// Build a catnix `TextRunOutput` from the runtime's decode outcome,
+/// project it through CatgradText's `project_result`, and sign a
+/// `Receipt` with the executor's producer key. Any failure is logged and
+/// returned as `None` so the execution can still complete.
+fn build_catnix_audit_receipt(
+    execution_id: &str,
+    catnix_call: Option<&Call>,
+    producer_key: &ProducerSigningKey,
+    outcome: &runner::DecodeOutcome,
+    prompt_token_ids: &[u32],
+) -> Option<[u8; 32]> {
+    let Some(call) = catnix_call else {
+        debug!(%execution_id, "no catnix call captured at quote time; skipping audit receipt");
+        return None;
+    };
+
+    // For CatgradText, the Call's payload bytes ARE a Term's canonical
+    // bytes, so its TermId is the BLAKE3 of those bytes.
+    let term_id = TermId::from_digest(CatnixDigest::from_canonical_bytes(call.payload.as_bytes()));
+
+    // Absolute final decoder position: initial state + prompt prefill +
+    // generated tokens. For a cold start initial_state is genesis (len 0),
+    // so position = prompt_tokens + outcome.total_tokens. Continuation
+    // runs would add the previous state's position; not yet wired.
+    let absolute_position = (prompt_token_ids.len() as u64).saturating_add(outcome.total_tokens);
+
+    // The output state is the catnix TextState over the full cold-start
+    // token history: prompt prefill + generated tokens. Anchored
+    // continuations will need to prepend the prior state's token history
+    // when that path is wired.
+    let state_value_id = text_state_value_id_for_tokens(
+        prompt_token_ids
+            .iter()
+            .copied()
+            .chain(outcome.output_tokens.iter().copied()),
+    );
+
+    let tokens_value = TokenIds::from_u32s(outcome.output_tokens.iter().copied());
+    let tokens_value_id = tokens_value.value_id();
+
+    let stop_reason = map_stop_reason(outcome.stop_reason);
+
+    let text_run_output = TextRunOutput::new(
+        term_id,
+        absolute_position,
+        state_value_id,
+        tokens_value_id,
+        stop_reason,
+    );
+
+    let result = match CatgradText::project_result(&text_run_output, call) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(%execution_id, error = %err, "catnix project_result failed (audit, non-fatal)");
+            return None;
+        }
+    };
+
+    let receipt = match Receipt::sign_delivery(call, &result, EvidenceBinding::None, producer_key) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(%execution_id, error = %err, "catnix Receipt::sign_delivery failed (audit, non-fatal)");
+            return None;
+        }
+    };
+
+    // Receipt commitment = BLAKE3 of the canonical signed-Claim body.
+    let receipt_commitment_digest = receipt.claim.signature_preimage();
+
+    // Surface the key audit invariants in structured logs.
+    let call_commitment = receipt.claim.call_commitment.digest();
+    let result_commitment = receipt.claim.result_commitment.digest();
+    let producer_id = receipt.claim.producer.digest();
+    let term_id_str = format!("{term_id}");
+    info!(
+        %execution_id,
+        audit_only = true,
+        catnix_receipt_persisted = false,
+        catnix_receipt_commitment_in_outcome = true,
+        producer_key_ephemeral = true,
+        producer_id = %producer_id,
+        catnix_term_id = %term_id_str,
+        catnix_call_commitment = %call_commitment,
+        catnix_result_commitment = %result_commitment,
+        catnix_receipt_commitment = %receipt_commitment_digest,
+        catnix_position = absolute_position,
+        catnix_total_generated = outcome.total_tokens,
+        catnix_stop_reason = ?stop_reason,
+        catnix_tokens_value_id = %tokens_value_id.digest(),
+        "catnix audit receipt signed and attached to terminal outcome"
+    );
+
+    Some(*receipt_commitment_digest.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_stop_reason;
+    use crate::state::StopReason as RuntimeStopReason;
+    use catnix::StopReason as CatnixStopReason;
+
+    #[test]
+    fn stop_reason_mapping_covers_all_runtime_variants() {
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::EndOfSequence),
+            CatnixStopReason::END_OF_SEQUENCE,
+        );
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::MaxNewTokens),
+            CatnixStopReason::MAX_OUTPUT,
+        );
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::Cancelled),
+            CatnixStopReason::CANCELLED,
+        );
+    }
 }
 
 /// Build the per-chunk callback the runner invokes. It pushes a `Chunk`

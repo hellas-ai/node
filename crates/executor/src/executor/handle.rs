@@ -61,10 +61,7 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn execute(
-        &self,
-        request: ExecuteRequest,
-    ) -> Result<ExecuteOutcome, ExecutorError> {
+    pub async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ExecutorError> {
         self.send(|reply| ExecutorMessage::Execute { request, reply })
             .await
     }
@@ -145,9 +142,8 @@ impl Execute for ExecutorHandle {
         request: Request<ExecuteRequest>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         let outcome = self.execute(request.into_inner()).await?;
-        let mut response = Response::new(
-            Box::pin(ReceiverStream::new(outcome.events)) as Self::ExecuteStream,
-        );
+        let mut response =
+            Response::new(Box::pin(ReceiverStream::new(outcome.events)) as Self::ExecuteStream);
         write_provenance_metadata(response.metadata_mut(), &outcome.provenance);
         Ok(response)
     }

@@ -24,6 +24,7 @@ compile = ["dep:tonic-prost-build"]
 node = [
     "dep:catgrad",
     "dep:catgrad-llm",
+    "dep:hellas-runtime",
     "dep:serde",
     "dep:serde_json",
     "dep:tokenizers",
@@ -41,13 +42,14 @@ thiserror = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
+hellas-runtime = { workspace = true, features = ["dag-cbor"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
-tokenizers = { version = "0.21", features = ["onig", "esaxx_fast"], optional = true }
+tokenizers = { version = "0.22.2", features = ["onig", "esaxx_fast"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }

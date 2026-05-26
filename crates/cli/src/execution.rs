@@ -31,25 +31,25 @@
 use anyhow::Error as AnyhowError;
 use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
-use catgrad::cid::Cid;
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::runtime::TextReceipt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
 use hellas_rpc::discovery::DiscoveryBindings;
 use hellas_rpc::driver::{ExecuteDriver, QuotedResponse, RemoteExecuteDriver};
-use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::hellas::{
     self as pb, ExecuteRequest, ExecuteStreamEvent, GetQuoteRequest, execute_stream_event,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
 use hellas_rpc::service::ExecuteService;
+use hellas_runtime::cid::Cid;
+use hellas_runtime::runtime::TextReceipt;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -144,6 +144,11 @@ pub struct ExecutionRuntime {
 /// more `Chunk` events, terminated by exactly one `Done`.
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
+    /// Provenance became known after streaming started. This currently
+    /// happens for discovery-routed remote execution, where quote
+    /// selection is deferred until the first provider successfully
+    /// starts returning a terminal stream.
+    Provenance(ExecutionProvenance),
     Chunk {
         /// Cumulative tokens emitted *after* this chunk.
         position: u64,
@@ -160,6 +165,9 @@ pub enum Outcome {
         total_tokens: u64,
         stop_reason: StopReason,
         receipt_cid: Cid<TextReceipt>,
+        /// Catnix receipt commitment from the producer's signed
+        /// `Claim`. `None` when the producer did not compute one.
+        catnix_receipt_commitment: Option<CatnixReceiptCommitment>,
     },
     Failed {
         /// Tokens emitted before the failure (for honest usage reporting).
@@ -341,6 +349,9 @@ impl PreparedExecution {
                 tokio::pin!(primary);
                 while let Some(event) = primary.next().await {
                     match event? {
+                        ExecutionEvent::Provenance(provenance) => {
+                            yield ExecutionEvent::Provenance(provenance);
+                        }
                         ExecutionEvent::Chunk { position, tokens } => {
                             yield ExecutionEvent::Chunk { position, tokens };
                         }
@@ -451,8 +462,9 @@ impl PreparedRoute {
     /// happened (Local, RemoteDirect) so the gateway can attach
     /// `x-hellas-*` response headers before any stream events flow.
     /// `None` for `RemoteDiscovery`, where the quote is deferred until
-    /// the first peer responds during streaming; in that case the gateway
-    /// falls back to in-band SSE events for the same provenance.
+    /// the first peer responds during streaming; in that case the stream
+    /// emits an in-band [`ExecutionEvent::Provenance`] before the first
+    /// chunk or terminal outcome from the selected peer.
     fn provenance(&self) -> Option<&ExecutionProvenance> {
         match self {
             #[cfg(feature = "hellas-executor")]
@@ -544,7 +556,9 @@ fn discovery_stream(
         for attempt in 1..=max_attempts {
             let remote = prepare_discovered_remote(&quote_req, secret_key.as_ref(), &tried).await?;
             let peer_id = remote.peer_id;
+            let provenance = remote.provenance.clone();
             let mut committed = false;
+            let mut provenance_emitted = false;
             let mut transport_err: Option<anyhow::Error> = None;
             let mut got_terminal = false;
             {
@@ -552,11 +566,23 @@ fn discovery_stream(
                 tokio::pin!(inner);
                 while let Some(event) = inner.next().await {
                     match event {
+                        Ok(ExecutionEvent::Provenance(provenance)) => {
+                            yield ExecutionEvent::Provenance(provenance);
+                            provenance_emitted = true;
+                        }
                         Ok(ExecutionEvent::Chunk { position, tokens }) => {
+                            if !provenance_emitted {
+                                yield ExecutionEvent::Provenance(provenance.clone());
+                                provenance_emitted = true;
+                            }
                             committed = true;
                             yield ExecutionEvent::Chunk { position, tokens };
                         }
                         Ok(ExecutionEvent::Done(outcome)) => {
+                            if !provenance_emitted {
+                                yield ExecutionEvent::Provenance(provenance.clone());
+                                provenance_emitted = true;
+                            }
                             got_terminal = true;
                             yield ExecutionEvent::Done(outcome);
                         }
@@ -702,10 +728,27 @@ fn parse_outcome(outcome: Option<pb::Outcome>) -> anyhow::Result<Outcome> {
         pb::outcome::Kind::Completed(c) => {
             let receipt_cid = receipt_cid_from_bytes(&c.receipt_cid)?;
             let stop_reason = stop_reason_from_pb(c.stop_reason)?;
+            // Empty means the producer did not compute a catnix receipt.
+            // Non-empty values must be exactly 32 bytes.
+            let catnix_receipt_commitment =
+                if c.catnix_receipt_commitment.is_empty() {
+                    None
+                } else {
+                    let arr: [u8; 32] = c.catnix_receipt_commitment.as_slice().try_into().map_err(
+                        |_| {
+                            anyhow!(
+                                "catnix_receipt_commitment wire length {} bytes (expected 0 or 32)",
+                                c.catnix_receipt_commitment.len()
+                            )
+                        },
+                    )?;
+                    Some(CatnixReceiptCommitment(arr))
+                };
             Ok(Outcome::Completed {
                 total_tokens: c.total_tokens,
                 stop_reason,
                 receipt_cid,
+                catnix_receipt_commitment,
             })
         }
         pb::outcome::Kind::Failed(f) => Ok(Outcome::Failed {
@@ -766,8 +809,10 @@ where
         .get_quote(quote_req.clone())
         .await
         .with_context(context)?;
-    tracing::Span::current()
-        .record("quote_id", tracing::field::display(&quoted.response.quote_id));
+    tracing::Span::current().record(
+        "quote_id",
+        tracing::field::display(&quoted.response.quote_id),
+    );
     Ok(quoted)
 }
 

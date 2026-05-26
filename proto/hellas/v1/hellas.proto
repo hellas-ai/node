@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package hellas.v1;
+
+// Core Hellas work protocol. This file owns the generic ticket and execution
+// surface plus transport-neutral event/receipt shapes. Scheme-specific ticket
+// creation lives in symbolic.proto / opaque.proto; non-core helper APIs live in
+// courtesy.proto; p2p/node discovery lives in swarm.proto.
+
+service Execute {
+  rpc RunTicket(RunTicketRequest) returns (stream WorkEvent);
+}
+
+message Ticket {
+  bytes request_commitment = 1; // exactly 32 bytes
+  uint64 amount = 2;
+  uint64 ttl_ms = 3;
+}
+
+message RunTicketRequest {
+  bytes request_commitment = 1; // exactly 32 bytes
+}
+
+// Wire protocol: zero or more WorkChunk events, terminated by exactly one
+// WorkFinished or WorkFailed, after which the stream ends. Streaming chunks
+// are transport-only; the terminal output is the object committed to by the
+// receipt.
+message WorkEvent {
+  oneof kind {
+    WorkChunk chunk = 1;
+    WorkFinished finished = 2;
+    WorkFailed failed = 3;
+  }
+}
+
+message WorkChunk {
+  // Cumulative position AFTER this chunk.
+  uint64 position = 1;
+  bytes bytes = 2;
+}
+
+message WorkFinished {
+  // Complete output object. Symbolic text uses little-endian u32 token IDs.
+  // Opaque uses exact UTF-8 JSON bytes.
+  bytes output = 1;
+  ReceiptEnvelope receipt = 2;
+  FinishStatus status = 3;
+  uint64 total_units = 4;
+}
+
+message WorkFailed {
+  // Units emitted before failure (tokens for symbolic text, bytes for opaque).
+  uint64 position = 1;
+  string error = 2;
+}
+
+enum FinishStatus {
+  FINISH_STATUS_UNSPECIFIED = 0;
+  FINISH_STATUS_END_OF_SEQUENCE = 1;
+  FINISH_STATUS_MAX_OUTPUT = 2;
+  FINISH_STATUS_CANCELLED = 3;
+}
+
+// Canonical hellas-core SignedReceipt encoded as strict dag-cbor.
+message ReceiptEnvelope {
+  bytes dag_cbor = 1;
+}

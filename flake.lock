@@ -8,11 +8,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1777045359,
-        "narHash": "sha256-LWSm9EjAb6usIkBf7x38MNGaCx0GYWEKxst3EoGfvCY=",
+        "lastModified": 1778772222,
+        "narHash": "sha256-ElANJUOd+NSBiulsl+rC9ouZK3H6yyrqdH8X4mzVfFw=",
         "owner": "hellas-ai",
         "repo": "catgrad",
-        "rev": "d66374ba63aad25bb5c257b7fd5787380fd5a56b",
+        "rev": "faf053fa78c343cad3e1966259fd54be9de074cf",
         "type": "github"
       },
       "original": {

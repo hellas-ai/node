@@ -1,0 +1,31 @@
+[package]
+name = "hellas-runtime"
+description = "Hellas-local catgrad runtime, commitments, and chat decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = ["dag-cbor", "serde"]
+serde = ["dep:serde"]
+dag-cbor = ["serde"]
+ndarray-backend = []
+
+[dependencies]
+catgrad = { workspace = true, default-features = false, features = ["serde"] }
+catgrad-llm = { workspace = true, default-features = false }
+catgrad-llm-models = { workspace = true }
+blake3 = "1"
+half = "2"
+jsonschema = "0.36"
+minijinja = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_ipld_dagcbor = "0.6.4"
+serde_json = "1"
+thiserror = "2"
+tokenizers = "0.22.2"
+
+[dev-dependencies]
+proptest = "1"

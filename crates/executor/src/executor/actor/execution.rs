@@ -26,8 +26,13 @@ impl Executor {
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         self.store.prune_expired_quotes(Instant::now());
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
+        let catnix_call_commitment = quote
+            .catnix_call
+            .as_ref()
+            .map(|call| *call.commitment().digest().as_bytes());
         let provenance = ExecutionProvenance {
             commitment_id: *quote.start.commitment_id.as_bytes(),
+            catnix_call_commitment,
         };
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;
@@ -51,6 +56,8 @@ impl Executor {
             cancel: CancellationToken::new(),
             sender,
             metrics: Arc::clone(&self.metrics),
+            catnix_call: quote.catnix_call.clone(),
+            producer_key: Arc::clone(&self.producer_key),
         };
 
         let queued = match self.try_start_execution(job) {

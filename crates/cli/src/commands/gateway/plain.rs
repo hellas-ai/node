@@ -1,5 +1,5 @@
 use super::hellas_ext::{HellasExt, WithHellas};
-use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
+use super::state::{GatewayState, GenerationEvent, PreparedGeneration, TextGenerationError};
 use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
 use crate::execution::{Outcome, StopReason};
 use async_stream::stream;
@@ -7,10 +7,11 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use catgrad::cid::Cid;
-use catgrad_llm::runtime::TextReceipt;
 use catgrad_llm::types::{openai, plain};
 use futures::StreamExt;
+use hellas_rpc::provenance::CatnixReceiptCommitment;
+use hellas_runtime::cid::Cid;
+use hellas_runtime::runtime::TextReceipt;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -38,21 +39,29 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
     let provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
-    let stream_provenance = provenance.clone();
+    let mut stream_provenance = provenance.clone();
     let mut response = sse_response(stream! {
         let inner = prepared.stream();
         tokio::pin!(inner);
 
-        let mut completed: Option<(openai::FinishReason, Cid<TextReceipt>)> = None;
+        let mut completed: Option<(
+            openai::FinishReason,
+            Cid<TextReceipt>,
+            Option<CatnixReceiptCommitment>,
+        )> = None;
         let mut error_message: Option<String> = None;
         // Track whether the commitment has been stamped on a chunk
         // yet. The first per-delta chunk carries it; if the stream
         // terminates with zero deltas, the terminal chunk carries
-        // both commitment_id and receipt_id.
+        // both catnix commitment and catnix receipt.
         let mut commitment_pending = stream_provenance.is_some();
 
         loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                    stream_provenance = Some(prov);
+                    commitment_pending = true;
+                }
                 Ok(Some(Ok(GenerationEvent::Delta(text)))) => {
                     let chunk = plain::CompletionChunk::builder()
                         .id(id.clone())
@@ -81,6 +90,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                     stop_reason,
                     total_tokens,
                     receipt_cid,
+                    catnix_receipt_commitment,
                 })))) => {
                     info!(
                         %receipt_cid,
@@ -89,7 +99,11 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                         ?stop_reason,
                         "completion request ready"
                     );
-                    completed = Some((map_finish_reason(stop_reason), receipt_cid));
+                    completed = Some((
+                        map_finish_reason(stop_reason),
+                        receipt_cid,
+                        catnix_receipt_commitment,
+                    ));
                     break;
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
@@ -133,7 +147,7 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
                 }
             }
             yield Ok(sse_data(&error_value));
-        } else if let Some((reason, receipt_cid)) = completed {
+        } else if let Some((reason, _receipt_cid, catnix_receipt)) = completed {
             let final_chunk = plain::CompletionChunk::builder()
                 .id(id.clone())
                 .object("text_completion".to_string())
@@ -151,11 +165,11 @@ fn stream_response(prepared: PreparedGeneration) -> Response {
             // it ALSO carries the commitment.
             let hellas = if commitment_pending {
                 match stream_provenance.as_ref() {
-                    Some(prov) => HellasExt::both(prov, &receipt_cid),
-                    None => HellasExt::receipt(&receipt_cid),
+                    Some(prov) => HellasExt::both(prov, catnix_receipt.as_ref()),
+                    None => HellasExt::receipt(catnix_receipt.as_ref()),
                 }
             } else {
-                HellasExt::receipt(&receipt_cid)
+                HellasExt::receipt(catnix_receipt.as_ref())
             };
             yield Ok(sse_data(&WithHellas::new(final_chunk, hellas)));
         }
@@ -173,50 +187,27 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let created = now_unix();
     let model = prepared.model.clone();
     let prompt_tokens = prepared.prompt_tokens;
-    let provenance = prepared.provenance.clone();
-    let deadline = prepared.deadline();
+    let initial_provenance = prepared.provenance.clone();
 
-    let stream = prepared.stream();
-    tokio::pin!(stream);
-    let mut text = String::new();
-    let outcome = loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(GenerationEvent::Delta(d)))) => text.push_str(&d),
-            Ok(Some(Ok(GenerationEvent::Done(o)))) => break Ok(o),
-            Ok(Some(Err(err))) => break Err(format!("Inference error: {err:#}")),
-            Ok(None) => break Err("execution stream ended without terminal outcome".to_string()),
-            Err(_) => {
-                break Err(format!(
-                    "inference timed out after {}s",
-                    super::timeout_secs_until(deadline)
-                ));
-            }
-        }
-    };
-
-    let (completion_tokens, finish_reason, receipt_cid) = match outcome {
-        Ok(Outcome::Completed {
-            total_tokens,
-            stop_reason,
-            receipt_cid,
-        }) => {
+    let completed = match prepared.collect_text().await {
+        Ok(completed) => {
             info!(
-                %receipt_cid,
-                ?provenance,
-                total_tokens,
-                ?stop_reason,
+                %completed.receipt_cid,
+                provenance = ?completed.provenance,
+                total_tokens = completed.total_tokens,
+                stop_reason = ?completed.stop_reason,
                 "completion request ready"
             );
-            (total_tokens, map_finish_reason(stop_reason), receipt_cid)
+            completed
         }
-        Ok(Outcome::Failed { position, error }) => {
+        Err(TextGenerationError::Failed { position, error }) => {
             warn!(position, %error, "completion request failed");
             return super::json_error(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Inference error: {error}"),
             );
         }
-        Err(message) => {
+        Err(TextGenerationError::Stream(message)) => {
             error!(%message, "completion request failed");
             return super::json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, message);
         }
@@ -230,27 +221,32 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         .choices(vec![
             plain::CompletionChoice::builder()
                 .index(0)
-                .text(text)
-                .finish_reason(Some(finish_reason))
+                .text(completed.text)
+                .finish_reason(Some(map_finish_reason(completed.stop_reason)))
                 .build(),
         ])
         .usage(Some(openai::Usage::from_counts(
             prompt_tokens,
-            u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            u32::try_from(completed.total_tokens).unwrap_or(u32::MAX),
         )))
         .build();
 
+    let provenance = completed.provenance.clone();
     let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt_cid),
-        None => HellasExt::receipt(&receipt_cid),
+        Some(prov) => HellasExt::both(prov, completed.catnix_receipt_commitment.as_ref()),
+        None => HellasExt::receipt(completed.catnix_receipt_commitment.as_ref()),
     };
     let body = WithHellas::new(response, hellas);
 
     let mut response = Json(body).into_response();
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
+    } else if let Some(prov) = initial_provenance {
+        response.extensions_mut().insert(prov);
     }
-    response.extensions_mut().insert(receipt_cid);
+    if let Some(catnix) = completed.catnix_receipt_commitment {
+        response.extensions_mut().insert(catnix);
+    }
     response
 }
 

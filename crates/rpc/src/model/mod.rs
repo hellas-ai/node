@@ -4,8 +4,8 @@ mod hf;
 
 use std::path::PathBuf;
 
-use catgrad_llm::LLMError;
-use catgrad_llm::runtime::chat::ChatTurnConfigError;
+use hellas_runtime::LLMError;
+use hellas_runtime::runtime::chat::ChatTurnConfigError;
 use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;

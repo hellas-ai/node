@@ -10,6 +10,7 @@ use crate::programs;
 use crate::state::ExecutorState;
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
+use hellas_core::ProducerSigningKey;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
@@ -34,6 +35,9 @@ pub struct Executor {
     /// don't carry a wire dtype). Other entries are also accepted for any
     /// `GetQuoteRequest` whose program bytes name them.
     pub(super) supported_dtypes: Vec<Dtype>,
+    /// Producer signing key used to sign catnix `Receipt`s. Generated at
+    /// executor startup and not persistent across restarts.
+    pub(super) producer_key: Arc<ProducerSigningKey>,
 }
 
 impl Executor {
@@ -65,6 +69,7 @@ impl Executor {
         );
         let (tx, rx) = mpsc::unbounded_channel();
         backend::create_backend()?;
+        let producer_key = Arc::new(ProducerSigningKey::generate());
         let executor = Self {
             rx,
             store: ExecutorState::new(),
@@ -75,6 +80,7 @@ impl Executor {
             execute_policy,
             metrics,
             supported_dtypes,
+            producer_key,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle { tx })

@@ -1,11 +1,13 @@
 use crate::backend::ExecBackend;
-use crate::state::Invocation;
+use crate::state::{Invocation, StopReason};
 use catgrad::category::core::Shape;
-use catgrad::cid::Cid;
 use catgrad::interpreter;
-use catgrad::runtime::{BoundProgram, Program};
-use catgrad_llm::runtime::{BoundProgramText, TextExecution, TextPolicy, TextReceipt, TextState};
 use hellas_rpc::ExecutorError;
+use hellas_runtime::cid::Cid;
+use hellas_runtime::graph::{BoundProgram, Program};
+use hellas_runtime::runtime::{
+    BoundProgramText, TextExecution, TextPolicy, TextReceipt, TextState,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +52,9 @@ pub(crate) struct CachedContinuation {
     /// the same receipt: it identifies the same outputs and the same
     /// post-state by content.
     pub receipt_id: Cid<TextReceipt>,
+    /// Terminal reason from the original real decode. Exact replays must
+    /// report the same reason, especially for max-token completions.
+    pub stop_reason: StopReason,
 }
 
 /// Pre-computed cache lookup result for a single quote, threaded into
@@ -75,6 +80,7 @@ pub(crate) struct ExecutionStart {
 struct ContinuationEntry {
     output_tokens: Arc<[u32]>,
     receipt_id: Cid<TextReceipt>,
+    stop_reason: StopReason,
     bytes: usize,
     last_touch: u64,
 }
@@ -197,6 +203,7 @@ impl ExecutionContext {
         commitment_id: Cid<TextExecution>,
         output_tokens: Vec<u32>,
         receipt_id: Cid<TextReceipt>,
+        stop_reason: StopReason,
     ) {
         self.execution_cache
             .lock()
@@ -206,6 +213,7 @@ impl ExecutionContext {
                 commitment_id,
                 Arc::<[u32]>::from(output_tokens),
                 receipt_id,
+                stop_reason,
             );
     }
 
@@ -243,6 +251,7 @@ impl ExecutionCache {
             CachedContinuation {
                 output_tokens: entry.output_tokens.clone(),
                 receipt_id: entry.receipt_id,
+                stop_reason: entry.stop_reason,
             }
         })
     }
@@ -257,6 +266,7 @@ impl ExecutionCache {
         commitment_id: Cid<TextExecution>,
         output_tokens: Arc<[u32]>,
         receipt_id: Cid<TextReceipt>,
+        stop_reason: StopReason,
     ) {
         let continuation_bytes = output_tokens
             .len()
@@ -282,6 +292,7 @@ impl ExecutionCache {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             entry.output_tokens = output_tokens;
             entry.receipt_id = receipt_id;
+            entry.stop_reason = stop_reason;
             entry.bytes = continuation_bytes;
             entry.last_touch = touch;
             self.total_bytes = self.total_bytes.saturating_add(continuation_bytes);
@@ -302,6 +313,7 @@ impl ExecutionCache {
             ContinuationEntry {
                 output_tokens,
                 receipt_id,
+                stop_reason,
                 bytes: continuation_bytes,
                 last_touch: touch,
             },
@@ -325,8 +337,8 @@ impl ExecutionCache {
         state: Arc<TextState<ExecBackend>>,
     ) {
         if self.receipts.contains_key(&receipt_id) {
-            // Same content, already present; refresh nothing here (no LRU
-            // eviction policy on receipts yet — TODO follow-up).
+            // Same content, already present; receipt cache entries are
+            // not refreshed on duplicate insert.
             return;
         }
         self.receipts.insert(receipt_id, state);
@@ -372,7 +384,7 @@ impl ExecutionCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cid, ExecutionCache, Program, TextExecution, TextReceipt};
+    use super::{Cid, ExecutionCache, Program, StopReason, TextExecution, TextReceipt};
     use std::sync::Arc;
 
     #[test]
@@ -387,6 +399,7 @@ mod tests {
             commitment_id,
             expected.clone(),
             receipt_id,
+            StopReason::MaxNewTokens,
         );
 
         let continuation = cache
@@ -394,6 +407,7 @@ mod tests {
             .expect("continuation should exist");
         assert_eq!(continuation.output_tokens, expected);
         assert_eq!(continuation.receipt_id, receipt_id);
+        assert_eq!(continuation.stop_reason, StopReason::MaxNewTokens);
     }
 
     #[test]
@@ -404,6 +418,7 @@ mod tests {
             Cid::<TextExecution>::from_bytes([1; 32]),
             Arc::<[u32]>::from(vec![1_u32, 2, 3]),
             Cid::<TextReceipt>::from_bytes([2; 32]),
+            StopReason::EndOfSequence,
         );
         assert!(
             cache

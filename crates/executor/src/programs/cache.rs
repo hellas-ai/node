@@ -3,10 +3,10 @@ use crate::inputs::{
     self, Bundle, EnsureDisposition, HuggingFaceLocator, Loaded, Status, is_cached_locally,
     load_bundle,
 };
-use catgrad::cid::Cid;
-use catgrad::runtime::Program;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::policy::DownloadPolicy;
+use hellas_runtime::cid::Cid;
+use hellas_runtime::graph::Program;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -223,10 +223,7 @@ impl Cache {
             let lookup_start = Instant::now();
             let next_step = {
                 let mut state = self.inner.state.lock().await;
-                let lookup = state
-                    .inputs
-                    .lookup_program(locator, program_id)
-?;
+                let lookup = state.inputs.lookup_program(locator, program_id)?;
                 if let Some(cached) = lookup.program {
                     BoundProgramStep::Ready(cached)
                 } else {
@@ -282,11 +279,9 @@ impl Cache {
                     let cache_start = Instant::now();
                     let cache_result = {
                         let mut state = self.inner.state.lock().await;
-                        let result = state.inputs.cache_program(
-                            locator,
-                            generation,
-                            bound_program,
-                        );
+                        let result = state
+                            .inputs
+                            .cache_program(locator, generation, bound_program);
                         Self::finish_build(&mut state.program_builds, &build_key);
                         result?
                     };
@@ -358,8 +353,9 @@ impl Cache {
         program: &Program,
     ) -> Result<Arc<ExecutionContext>, ExecutorError> {
         let backend = crate::backend::create_backend()?;
-        let bound = catgrad::runtime::BoundProgram::bind(&bundle.inputs, &backend, program.clone())
-            .map_err(catgrad_llm::LLMError::from)?;
+        let bound =
+            hellas_runtime::graph::BoundProgram::bind(&bundle.inputs, &backend, program.clone())
+                .map_err(hellas_runtime::LLMError::from)?;
         Ok(Arc::new(ExecutionContext::new(Arc::new(bound))?))
     }
 

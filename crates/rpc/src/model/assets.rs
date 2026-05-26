@@ -3,10 +3,14 @@ use std::sync::Arc;
 use crate::encode_token_ids;
 use crate::pb::hellas::GetQuoteRequest;
 use catgrad::prelude::Dtype;
-use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
-use catgrad_llm::types::Message;
-use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
-use catgrad_llm::{LLMError, PreparedPrompt};
+use catgrad_llm::PreparedPrompt;
+use catgrad_llm::types::{Message, ThinkingPolicy, openai};
+use catgrad_llm::utils::get_model_chat_template;
+use hellas_runtime::LLMError;
+use hellas_runtime::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
+use hellas_runtime::utils::{
+    get_model, get_model_architecture, prepared_prompt_from_messages_with_tools,
+};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -102,25 +106,56 @@ impl ModelAssets {
     }
 
     pub fn prepare_chat(&self, messages: &[Message]) -> Result<PreparedPrompt> {
-        let template = self
-            .chat_template
-            .as_deref()
-            .ok_or_else(|| ModelAssetsError::PreparePromptRequest {
+        self.prepare_chat_with_options(messages, ThinkingPolicy::Default, None)
+    }
+
+    pub fn prepare_openai_response(
+        &self,
+        request: &openai::responses::ResponseRequest,
+    ) -> Result<PreparedPrompt> {
+        let messages =
+            request
+                .to_messages()
+                .map_err(|source| ModelAssetsError::PreparePromptRequest {
+                    source: source.into(),
+                })?;
+        let tools = request
+            .tools
+            .as_ref()
+            .filter(|tools| !tools.is_empty())
+            .map(|tools| Value::Array(tools.clone()));
+        self.prepare_chat_with_options(&messages, ThinkingPolicy::Disabled, tools.as_ref())
+    }
+
+    fn prepare_chat_with_options(
+        &self,
+        messages: &[Message],
+        thinking: ThinkingPolicy,
+        tools: Option<&Value>,
+    ) -> Result<PreparedPrompt> {
+        let template = self.chat_template.as_deref().ok_or_else(|| {
+            ModelAssetsError::PreparePromptRequest {
                 source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
-            })?;
-        PreparedPrompt::from_messages(
-            &self.tokenizer,
+            }
+        })?;
+        prepared_prompt_from_messages_with_tools(
+            self.tokenizer.as_ref(),
             template,
-            &self.tokenizer_config,
+            self.tokenizer_config.as_ref(),
             messages,
             &self.stop_token_ids,
+            thinking,
+            tools,
         )
         .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 
     pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
-        PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
-            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+        PreparedPrompt::from_prompt(self.tokenizer.as_ref(), prompt, &self.stop_token_ids).map_err(
+            |source| ModelAssetsError::PreparePromptRequest {
+                source: source.into(),
+            },
+        )
     }
 
     pub fn decode_tokens(&self, token_ids: &[u32]) -> Result<String> {
@@ -133,8 +168,7 @@ impl ModelAssets {
     ///
     /// The caller supplies an already-built [`ToolDirectory`] (or
     /// `None` for no tools) — wire-shape conversion happens at the
-    /// gateway edge via `ToolDirectory::from_openai_tools` /
-    /// `ToolDirectory::from_anthropic_tools`. This keeps `ModelAssets`
+    /// gateway edge via `ToolDirectory::from_openai_tools`. This keeps `ModelAssets`
     /// independent of any one wire surface.
     ///
     /// Errors:

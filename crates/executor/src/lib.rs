@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate tracing;
 
+pub mod artifacts;
 mod backend;
+pub mod catnix_bridge;
 mod executor;
 mod inputs;
 mod metrics;

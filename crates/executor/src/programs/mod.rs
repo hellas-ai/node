@@ -1,10 +1,10 @@
 //! Bound-program cache + admission state machine, and the per-bound-program
-//! [`ExecutionContext`] that wraps a [`catgrad::runtime::BoundProgram`]
+//! [`ExecutionContext`] that wraps a [`hellas_runtime::graph::BoundProgram`]
 //! together with its run-time caches.
 //!
 //! [`Cache`] is the executor's two-level cache + admission machinery: load
 //! [`crate::inputs::Bundle`] (slow, single-flight, queued via the load
-//! queue) → bind a [`catgrad::runtime::Program`] against those inputs (fast
+//! queue) → bind a [`hellas_runtime::graph::Program`] against those inputs (fast
 //! CPU work, single-flight, cached). Every cache lookup produces an
 //! [`ExecutionContext`] ready to drive a quote and stream tokens.
 //!
@@ -17,7 +17,7 @@
 //! cache returns the previously-streamed output tokens without touching
 //! the model.
 //!
-//! [`Cid<TextExecution>`]: catgrad::cid::Cid
+//! [`Cid<TextExecution>`]: hellas_runtime::cid::Cid
 
 mod cache;
 mod context;

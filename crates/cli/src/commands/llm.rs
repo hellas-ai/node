@@ -144,6 +144,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             let mut completed = false;
             while let Some(event) = stream.next().await {
                 match event? {
+                    ExecutionEvent::Provenance(_) => {}
                     ExecutionEvent::Chunk { tokens, .. } => {
                         let delta = decoder.push_bytes(&tokens)?;
                         if !delta.is_empty() {

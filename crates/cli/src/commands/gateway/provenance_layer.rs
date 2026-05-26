@@ -1,6 +1,5 @@
-//! Tower middleware that lifts `ExecutionProvenance` (and an optional
-//! terminal `Cid<TextReceipt>`) from response extensions into the
-//! `x-hellas-*` HTTP response headers.
+//! Tower middleware that lifts catnix provenance from response
+//! extensions into the `x-hellas-*` HTTP response headers.
 //!
 //! Handlers stay free of header-attachment boilerplate: they insert the
 //! typed values into `response.extensions_mut()` and this layer renders
@@ -11,11 +10,10 @@
 
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
-use catgrad::cid::Cid;
-use catgrad_llm::runtime::TextReceipt;
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{
-    COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_HEADER, encode_hex,
+    CATNIX_COMMITMENT_HEADER, CATNIX_RECEIPT_HEADER, CatnixReceiptCommitment, ExecutionProvenance,
+    encode_hex,
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -66,23 +64,25 @@ where
 fn apply_provenance_headers(response: &mut Response<Body>) {
     let extensions = response.extensions().clone();
     if let Some(prov) = extensions.get::<ExecutionProvenance>() {
-        response
-            .headers_mut()
-            .insert(commitment_header(), header_value(&prov.commitment_id));
+        if let Some(catnix) = &prov.catnix_call_commitment {
+            response
+                .headers_mut()
+                .insert(catnix_commitment_header(), header_value(catnix));
+        }
     }
-    if let Some(receipt) = extensions.get::<Cid<TextReceipt>>() {
+    if let Some(catnix_receipt) = extensions.get::<CatnixReceiptCommitment>() {
         response
             .headers_mut()
-            .insert(receipt_header(), header_value(receipt.as_bytes()));
+            .insert(catnix_receipt_header(), header_value(&catnix_receipt.0));
     }
 }
 
-fn commitment_header() -> HeaderName {
-    HeaderName::from_static(COMMITMENT_HEADER)
+fn catnix_commitment_header() -> HeaderName {
+    HeaderName::from_static(CATNIX_COMMITMENT_HEADER)
 }
 
-fn receipt_header() -> HeaderName {
-    HeaderName::from_static(RECEIPT_HEADER)
+fn catnix_receipt_header() -> HeaderName {
+    HeaderName::from_static(CATNIX_RECEIPT_HEADER)
 }
 
 fn header_value(bytes: &[u8; 32]) -> HeaderValue {
@@ -94,10 +94,14 @@ fn header_value(bytes: &[u8; 32]) -> HeaderValue {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use hellas_rpc::provenance::{COMMITMENT_HEADER, RECEIPT_HEADER};
+    use hellas_runtime::cid::Cid;
+    use hellas_runtime::runtime::TextReceipt;
 
     fn build_response_with_extensions(
         prov: Option<ExecutionProvenance>,
         receipt: Option<Cid<TextReceipt>>,
+        catnix_receipt: Option<CatnixReceiptCommitment>,
     ) -> Response<Body> {
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -109,48 +113,44 @@ mod tests {
         if let Some(receipt) = receipt {
             response.extensions_mut().insert(receipt);
         }
+        if let Some(catnix_receipt) = catnix_receipt {
+            response.extensions_mut().insert(catnix_receipt);
+        }
         response
     }
 
     #[test]
-    fn applies_both_headers_when_present() {
+    fn ignores_runtime_receipt_extensions() {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
+            catnix_call_commitment: None,
         };
         let receipt = Cid::<TextReceipt>::from_bytes([0xef; 32]);
-        let mut response = build_response_with_extensions(Some(prov.clone()), Some(receipt));
+        let mut response = build_response_with_extensions(Some(prov), Some(receipt), None);
         apply_provenance_headers(&mut response);
-        assert_eq!(
-            response
-                .headers()
-                .get(COMMITMENT_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some("ab".repeat(32).as_str())
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(RECEIPT_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some("ef".repeat(32).as_str())
-        );
+        assert!(!response.headers().contains_key(COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
     #[test]
-    fn skips_receipt_header_when_absent() {
+    fn skips_headers_when_catnix_commitment_absent() {
         let prov = ExecutionProvenance {
             commitment_id: [1; 32],
+            catnix_call_commitment: None,
         };
-        let mut response = build_response_with_extensions(Some(prov), None);
+        let mut response = build_response_with_extensions(Some(prov), None, None);
         apply_provenance_headers(&mut response);
-        assert!(response.headers().contains_key(COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(CATNIX_COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(COMMITMENT_HEADER));
         assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
     #[test]
     fn no_extensions_yields_no_headers() {
-        let mut response = build_response_with_extensions(None, None);
+        let mut response = build_response_with_extensions(None, None, None);
         apply_provenance_headers(&mut response);
+        assert!(!response.headers().contains_key(CATNIX_COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(CATNIX_RECEIPT_HEADER));
         assert!(!response.headers().contains_key(COMMITMENT_HEADER));
         assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
@@ -158,6 +158,62 @@ mod tests {
     /// End-to-end: dispatch a request through an axum `Router` wrapped with
     /// `ProvenanceLayer` and confirm the layer lifts the handler-set
     /// extensions into the outgoing response headers.
+    #[test]
+    fn applies_catnix_header_when_present() {
+        let prov = ExecutionProvenance {
+            commitment_id: [0xab; 32],
+            catnix_call_commitment: Some([0xcd; 32]),
+        };
+        let mut response = build_response_with_extensions(Some(prov), None, None);
+        apply_provenance_headers(&mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get(CATNIX_COMMITMENT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cd".repeat(32).as_str())
+        );
+        assert!(!response.headers().contains_key(COMMITMENT_HEADER));
+    }
+
+    #[test]
+    fn skips_catnix_header_when_absent() {
+        let prov = ExecutionProvenance {
+            commitment_id: [1; 32],
+            catnix_call_commitment: None,
+        };
+        let mut response = build_response_with_extensions(Some(prov), None, None);
+        apply_provenance_headers(&mut response);
+        assert!(!response.headers().contains_key(CATNIX_COMMITMENT_HEADER));
+    }
+
+    /// Terminal catnix receipt commitment surfaces as `x-hellas-receipt`
+    /// when the handler attaches a `CatnixReceiptCommitment` extension.
+    #[test]
+    fn applies_catnix_receipt_header_when_present() {
+        let receipt = Cid::<TextReceipt>::from_bytes([0xef; 32]);
+        let catnix = CatnixReceiptCommitment([0x77; 32]);
+        let mut response = build_response_with_extensions(None, Some(receipt), Some(catnix));
+        apply_provenance_headers(&mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get(CATNIX_RECEIPT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("77".repeat(32).as_str())
+        );
+        assert!(!response.headers().contains_key(RECEIPT_HEADER));
+    }
+
+    #[test]
+    fn skips_catnix_receipt_header_when_absent() {
+        let receipt = Cid::<TextReceipt>::from_bytes([0xef; 32]);
+        let mut response = build_response_with_extensions(None, Some(receipt), None);
+        apply_provenance_headers(&mut response);
+        assert!(!response.headers().contains_key(RECEIPT_HEADER));
+        assert!(!response.headers().contains_key(CATNIX_RECEIPT_HEADER));
+    }
+
     #[tokio::test]
     async fn router_layer_lifts_extensions_to_headers() {
         use axum::Router;
@@ -168,11 +224,14 @@ mod tests {
         async fn handler() -> Response<Body> {
             let prov = ExecutionProvenance {
                 commitment_id: [0x12; 32],
+                catnix_call_commitment: Some([0xab; 32]),
             };
             let receipt = Cid::<TextReceipt>::from_bytes([0x56; 32]);
+            let catnix_receipt = CatnixReceiptCommitment([0x78; 32]);
             let mut response = Response::new(Body::empty());
             response.extensions_mut().insert(prov);
             response.extensions_mut().insert(receipt);
+            response.extensions_mut().insert(catnix_receipt);
             response
         }
 
@@ -180,18 +239,17 @@ mod tests {
             .route("/", get(handler))
             .layer(ProvenanceLayer);
 
-        let request = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(
-            response.headers().get(COMMITMENT_HEADER).unwrap(),
-            &"12".repeat(32)
+            response.headers().get(CATNIX_COMMITMENT_HEADER).unwrap(),
+            &"ab".repeat(32)
         );
         assert_eq!(
-            response.headers().get(RECEIPT_HEADER).unwrap(),
-            &"56".repeat(32)
+            response.headers().get(CATNIX_RECEIPT_HEADER).unwrap(),
+            &"78".repeat(32)
         );
+        assert!(!response.headers().contains_key(COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 }

@@ -142,6 +142,11 @@ pub struct Completed {
     /// Cid<TextReceipt> — exactly 32 bytes. Receivers reject other lengths.
     #[prost(bytes = "vec", tag = "3")]
     pub receipt_cid: ::prost::alloc::vec::Vec<u8>,
+    /// catnix `Claim::receipt_commitment` — BLAKE3 of the signed Receipt's
+    /// canonical Claim body. Exactly 32 bytes when present, empty when the
+    /// producer did not compute a catnix Receipt.
+    #[prost(bytes = "vec", tag = "4")]
+    pub catnix_receipt_commitment: ::prost::alloc::vec::Vec<u8>,
 }
 impl ::prost::Name for Completed {
     const NAME: &'static str = "Completed";

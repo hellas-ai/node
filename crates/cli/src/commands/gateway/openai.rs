@@ -8,14 +8,17 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use catgrad_llm::runtime::chat::wire::openai::{OpenAiStreamFrame, OpenAiStreamMapper};
-use catgrad_llm::runtime::chat::wire::{PumpError, pump_finish, pump_text};
-use catgrad_llm::runtime::chat::{
-    DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
-};
 use catgrad_llm::types::openai;
 use futures::StreamExt;
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_runtime::runtime::chat::wire::openai::{
+    OpenAiFinishReason, OpenAiStreamFrame, OpenAiStreamMapper,
+};
+use hellas_runtime::runtime::chat::wire::{PumpError, pump_finish, pump_text};
+use hellas_runtime::runtime::chat::{
+    DecodeFailure, IncrementalToolCallParser, StopReason as ParserStopReason,
+};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -50,7 +53,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     let created = now_unix();
     let model = prepared.model.clone();
     let prompt_tokens = prepared.prompt_tokens;
-    let provenance = prepared.provenance.clone();
+    let mut provenance = prepared.provenance.clone();
     let deadline = prepared.deadline();
 
     let mut parser: Box<dyn IncrementalToolCallParser> = prepared
@@ -65,10 +68,11 @@ async fn respond(prepared: PreparedGeneration) -> Response {
 
     let outcome = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                provenance = Some(prov);
+            }
             Ok(Some(Ok(GenerationEvent::Delta(d)))) => {
-                if let Err(PumpError { failure, .. }) =
-                    pump_text(&mut *parser, &mut mapper, &d)
-                {
+                if let Err(PumpError { failure, .. }) = pump_text(&mut *parser, &mut mapper, &d) {
                     // Non-streaming: cleanup frames are wire-bracketing
                     // and irrelevant when no wire stream exists. Discard.
                     return failure_to_json_response(failure);
@@ -95,20 +99,27 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         }
     };
 
-    let (total_tokens, stop_reason, receipt_cid) = match outcome {
+    let (total_tokens, stop_reason, _receipt_cid, catnix_receipt) = match outcome {
         Outcome::Completed {
             total_tokens,
             stop_reason,
             receipt_cid,
+            catnix_receipt_commitment,
         } => {
             info!(
                 %receipt_cid,
                 ?provenance,
                 total_tokens,
                 ?stop_reason,
+                ?catnix_receipt_commitment,
                 "openai chat completion ready"
             );
-            (total_tokens, stop_reason, receipt_cid)
+            (
+                total_tokens,
+                stop_reason,
+                receipt_cid,
+                catnix_receipt_commitment,
+            )
         }
         Outcome::Failed { position, error } => {
             warn!(position, %error, "openai chat request failed");
@@ -120,9 +131,7 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     };
 
     let parser_stop = map_to_parser_stop(stop_reason);
-    if let Err(PumpError { failure, .. }) =
-        pump_finish(&mut *parser, &mut mapper, parser_stop)
-    {
+    if let Err(PumpError { failure, .. }) = pump_finish(&mut *parser, &mut mapper, parser_stop) {
         return failure_to_json_response(failure);
     }
 
@@ -130,27 +139,25 @@ async fn respond(prepared: PreparedGeneration) -> Response {
         Ok(s) => s,
         Err(failure) => return failure_to_json_response(failure),
     };
-    let response = openai::ChatCompletionResponse::builder()
-        .id(id)
-        .object("chat.completion".to_string())
-        .created(created)
-        .model(model)
-        .choices(vec![
-            openai::ChatChoice::builder()
-                .index(0)
-                .message(snapshot.message)
-                .finish_reason(Some(snapshot.finish_reason))
-                .build(),
-        ])
-        .usage(Some(openai::Usage::from_counts(
+    let response = OpenAiChatResponse {
+        id,
+        object: "chat.completion".to_string(),
+        created,
+        model,
+        choices: vec![OpenAiChatChoice {
+            index: 0,
+            message: snapshot.message,
+            finish_reason: Some(snapshot.finish_reason),
+        }],
+        usage: Some(openai::Usage::from_counts(
             prompt_tokens,
             u32::try_from(total_tokens).unwrap_or(u32::MAX),
-        )))
-        .build();
+        )),
+    };
 
     let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt_cid),
-        None => HellasExt::receipt(&receipt_cid),
+        Some(prov) => HellasExt::both(prov, catnix_receipt.as_ref()),
+        None => HellasExt::receipt(catnix_receipt.as_ref()),
     };
     let body = WithHellas::new(response, hellas);
 
@@ -158,7 +165,9 @@ async fn respond(prepared: PreparedGeneration) -> Response {
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
     }
-    response.extensions_mut().insert(receipt_cid);
+    if let Some(catnix) = catnix_receipt {
+        response.extensions_mut().insert(catnix);
+    }
     response
 }
 
@@ -201,9 +210,7 @@ fn stream_response(prepared: PreparedGeneration, include_usage: bool) -> Respons
         stream_provenance,
         upstream,
     );
-    let events = payloads.map(|payload| {
-        Ok::<_, std::convert::Infallible>(payload.into_event())
-    });
+    let events = payloads.map(|payload| Ok::<_, std::convert::Infallible>(payload.into_event()));
     let mut response = sse_response(events);
     if let Some(prov) = provenance {
         response.extensions_mut().insert(prov);
@@ -222,6 +229,44 @@ enum OpenAiSsePayload {
     /// Per the wire convention enforced by the regression tests
     /// below, MUST NOT follow any error frame.
     Done,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatResponse {
+    id: String,
+    object: String,
+    created: i64,
+    model: String,
+    choices: Vec<OpenAiChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<openai::Usage>,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatChoice {
+    index: u32,
+    message: openai::ChatMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<OpenAiFinishReason>,
+}
+
+#[derive(Serialize)]
+struct OpenAiChunk {
+    id: String,
+    object: String,
+    created: i64,
+    model: String,
+    choices: Vec<OpenAiChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<openai::Usage>,
+}
+
+#[derive(Serialize)]
+struct OpenAiChunkChoice {
+    index: u32,
+    delta: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<OpenAiFinishReason>,
 }
 
 impl OpenAiSsePayload {
@@ -253,7 +298,7 @@ where
     S: futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send + 'static,
 {
     stream! {
-        // Start frame: role:assistant chunk carrying hellas.commitment_id
+        // Start frame: role:assistant chunk carrying hellas.commitment
         // when provenance is available. Browser EventSource and many
         // WASM HTTP wrappers swallow response headers, so the in-band
         // JSON extension is the canonical commitment carrier here.
@@ -262,14 +307,12 @@ where
             created,
             &model,
             OpenAiStreamFrame {
-                delta: openai::ChatDelta {
-                    role: Some("assistant".to_string()),
-                    ..Default::default()
-                },
+                delta: json!({ "role": "assistant" }),
                 finish_reason: None,
             },
         );
-        let start_hellas = match provenance.as_ref() {
+        let mut stream_provenance = provenance;
+        let start_hellas = match stream_provenance.as_ref() {
             Some(prov) => HellasExt::commitment(prov),
             None => HellasExt::default(),
         };
@@ -284,9 +327,14 @@ where
         let mut transport_error: Option<String> = None;
         let mut timed_out = false;
         let mut protocol_failure: Option<PumpError<OpenAiStreamFrame>> = None;
+        let mut commitment_pending = false;
 
         'outer: loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                    stream_provenance = Some(prov);
+                    commitment_pending = true;
+                }
                 Ok(Some(Ok(GenerationEvent::Delta(text)))) => {
                     match pump_text(&mut *parser, &mut mapper, &text) {
                         Ok(frames) => {
@@ -381,10 +429,11 @@ where
                 stop_reason,
                 total_tokens,
                 receipt_cid,
+                catnix_receipt_commitment,
             } => {
                 info!(
                     %receipt_cid,
-                    provenance = ?provenance,
+                    provenance = ?stream_provenance,
                     total_tokens,
                     ?stop_reason,
                     "openai chat completion ready"
@@ -408,32 +457,26 @@ where
                     }
                 };
 
-                // Build all post-pump chunks (mapper finish output +
-                // optional usage chunk) into one ordered vec so we can
-                // tag the LAST one with hellas.receipt_id. Per the
-                // approved plan: receipt rides the SEMANTIC TERMINAL
-                // event — the last `data:` chunk before `[DONE]`. With
-                // include_usage that's the usage chunk; otherwise the
-                // finish-reason chunk.
-                let mut tail_chunks: Vec<openai::ChatCompletionChunk> = finish_frames
+                // Build all post-pump chunks (mapper finish output plus
+                // optional usage chunk) in order so the last data frame
+                // carries `hellas.receipt`.
+                let mut tail_chunks: Vec<OpenAiChunk> = finish_frames
                     .into_iter()
                     .map(|frame| wrap_chunk(&id, created, &model, frame))
                     .collect();
 
                 if include_usage {
-                    tail_chunks.push(
-                        openai::ChatCompletionChunk::builder()
-                            .id(id.clone())
-                            .object("chat.completion.chunk".to_string())
-                            .created(created)
-                            .model(model.clone())
-                            .choices(vec![])
-                            .usage(Some(openai::Usage::from_counts(
-                                prompt_tokens,
-                                u32::try_from(total_tokens).unwrap_or(u32::MAX),
-                            )))
-                            .build(),
-                    );
+                    tail_chunks.push(OpenAiChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![],
+                        usage: Some(openai::Usage::from_counts(
+                            prompt_tokens,
+                            u32::try_from(total_tokens).unwrap_or(u32::MAX),
+                        )),
+                    });
                 }
 
                 // Mapper-contract assertion: a successful Completed
@@ -452,8 +495,8 @@ where
                         created,
                         &model,
                         OpenAiStreamFrame {
-                            delta: openai::ChatDelta::default(),
-                            finish_reason: Some(openai::FinishReason::Stop),
+                            delta: json!({}),
+                            finish_reason: Some(OpenAiFinishReason::Stop),
                         },
                     ));
                 }
@@ -461,7 +504,17 @@ where
                 let last_idx = tail_chunks.len() - 1;
                 for (idx, chunk) in tail_chunks.into_iter().enumerate() {
                     if idx == last_idx {
-                        let wrapped = WithHellas::new(chunk, HellasExt::receipt(&receipt_cid));
+                        let hellas = if commitment_pending {
+                            match stream_provenance.as_ref() {
+                                Some(prov) => {
+                                    HellasExt::both(prov, catnix_receipt_commitment.as_ref())
+                                }
+                                None => HellasExt::receipt(catnix_receipt_commitment.as_ref()),
+                            }
+                        } else {
+                            HellasExt::receipt(catnix_receipt_commitment.as_ref())
+                        };
+                        let wrapped = WithHellas::new(chunk, hellas);
                         yield OpenAiSsePayload::Json(serde_json::to_value(wrapped).unwrap());
                     } else {
                         yield OpenAiSsePayload::Json(serde_json::to_value(chunk).unwrap());
@@ -474,25 +527,19 @@ where
     }
 }
 
-fn wrap_chunk(
-    id: &str,
-    created: i64,
-    model: &str,
-    frame: OpenAiStreamFrame,
-) -> openai::ChatCompletionChunk {
-    openai::ChatCompletionChunk::builder()
-        .id(id.to_string())
-        .object("chat.completion.chunk".to_string())
-        .created(created)
-        .model(model.to_string())
-        .choices(vec![
-            openai::ChatStreamChoice::builder()
-                .index(0)
-                .delta(frame.delta)
-                .finish_reason(frame.finish_reason)
-                .build(),
-        ])
-        .build()
+fn wrap_chunk(id: &str, created: i64, model: &str, frame: OpenAiStreamFrame) -> OpenAiChunk {
+    OpenAiChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![OpenAiChunkChoice {
+            index: 0,
+            delta: frame.delta,
+            finish_reason: frame.finish_reason,
+        }],
+        usage: None,
+    }
 }
 
 fn error_frame(failure: &DecodeFailure) -> serde_json::Value {
@@ -544,21 +591,22 @@ mod streaming_done_tests {
     //! clients the response was a successful empty completion.
     //!
     //! Positive-path coverage asserts:
-    //! - first chunk carries `hellas.commitment_id` when provenance is
+    //! - first chunk carries `hellas.commitment` when provenance is
     //!   provided, and no `hellas` field otherwise;
     //! - the SEMANTIC TERMINAL chunk (last `data:` before `[DONE]`)
-    //!   carries `hellas.receipt_id`. With `include_usage=true` that's
+    //!   carries `hellas.receipt`. With `include_usage=true` that's
     //!   the trailing usage chunk; without, the finish-reason chunk;
-    //! - error paths NEVER emit `hellas.receipt_id`;
+    //! - error paths NEVER emit `hellas.receipt`;
     //! - no separate `event: hellas-*` SSE events appear (the
     //!   `OpenAiSsePayload` enum no longer has variants for them).
 
     use super::*;
     use crate::execution::{Outcome, StopReason as ExecStopReason};
-    use catgrad::cid::Cid;
-    use catgrad_llm::runtime::TextReceipt;
-    use catgrad_llm::runtime::chat::PassthroughParser;
     use futures::StreamExt;
+    use hellas_rpc::provenance::CatnixReceiptCommitment;
+    use hellas_runtime::cid::Cid;
+    use hellas_runtime::runtime::TextReceipt;
+    use hellas_runtime::runtime::chat::PassthroughParser;
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -583,6 +631,7 @@ mod streaming_done_tests {
     fn test_provenance() -> ExecutionProvenance {
         ExecutionProvenance {
             commitment_id: [0xab; 32],
+            catnix_call_commitment: Some([0xef; 32]),
         }
     }
 
@@ -590,8 +639,12 @@ mod streaming_done_tests {
         Cid::<TextReceipt>::from_bytes([0xcd; 32])
     }
 
+    fn test_catnix_receipt() -> CatnixReceiptCommitment {
+        CatnixReceiptCommitment([0x77; 32])
+    }
+
     /// Successful upstream: one delta then `Outcome::Completed`. The
-    /// receipt CID lands inside the terminal frame via the gateway's
+    /// catnix receipt lands inside the terminal frame via the gateway's
     /// `Outcome::Completed` arm.
     fn happy_upstream(
         receipt_cid: Cid<TextReceipt>,
@@ -602,6 +655,7 @@ mod streaming_done_tests {
                 total_tokens: 1,
                 stop_reason: ExecStopReason::EndOfSequence,
                 receipt_cid,
+                catnix_receipt_commitment: Some(test_catnix_receipt()),
             })),
         ])
     }
@@ -636,20 +690,33 @@ mod streaming_done_tests {
         }
     }
 
-    /// `chunk.hellas.commitment_id` if present.
+    /// `chunk.hellas.commitment` if present.
     fn commitment_of(p: &OpenAiSsePayload) -> Option<&str> {
         as_json(p)
             .get("hellas")
-            .and_then(|h| h.get("commitment_id"))
+            .and_then(|h| h.get("commitment"))
             .and_then(|v| v.as_str())
     }
 
-    /// `chunk.hellas.receipt_id` if present.
+    /// `chunk.hellas.receipt` if present.
     fn receipt_of(p: &OpenAiSsePayload) -> Option<&str> {
         as_json(p)
             .get("hellas")
-            .and_then(|h| h.get("receipt_id"))
+            .and_then(|h| h.get("receipt"))
             .and_then(|v| v.as_str())
+    }
+
+    fn assert_no_removed_hellas_fields(p: &OpenAiSsePayload) {
+        if let Some(hellas) = as_json(p).get("hellas") {
+            assert!(
+                hellas.get("commitment_id").is_none(),
+                "removed hellas.commitment_id leaked: {p:?}"
+            );
+            assert!(
+                hellas.get("receipt_id").is_none(),
+                "removed hellas.receipt_id leaked: {p:?}"
+            );
+        }
     }
 
     fn has_finish_reason(p: &OpenAiSsePayload) -> bool {
@@ -680,11 +747,18 @@ mod streaming_done_tests {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
         let upstream = futures::stream::iter(vec![
-            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>,
+            Err(anyhow::anyhow!("upstream blew up")) as anyhow::Result<GenerationEvent>
         ]);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -692,10 +766,8 @@ mod streaming_done_tests {
         .await;
 
         assert!(
-            payloads
-                .iter()
-                .any(|p| is_error_frame(p)
-                    && error_message(p).is_some_and(|m| m.contains("upstream blew up"))),
+            payloads.iter().any(|p| is_error_frame(p)
+                && error_message(p).is_some_and(|m| m.contains("upstream blew up"))),
             "expected error frame, got: {payloads:#?}"
         );
         assert!(
@@ -708,7 +780,7 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "transport error must not leak hellas.receipt_id, got: {payloads:#?}"
+            "transport error must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
@@ -723,7 +795,14 @@ mod streaming_done_tests {
         let upstream = futures::stream::pending::<anyhow::Result<GenerationEvent>>();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -746,7 +825,7 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "timeout must not leak hellas.receipt_id, got: {payloads:#?}"
+            "timeout must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
@@ -756,16 +835,20 @@ mod streaming_done_tests {
     async fn outcome_failed_emits_error_frame_without_done() {
         let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(
-            Outcome::Failed {
-                position: 0,
-                error: "executor exploded".to_string(),
-            },
-        ))
-            as anyhow::Result<GenerationEvent>]);
+        let upstream = futures::stream::iter(vec![Ok(GenerationEvent::Done(Outcome::Failed {
+            position: 0,
+            error: "executor exploded".to_string(),
+        })) as anyhow::Result<GenerationEvent>]);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(test_provenance()),
             upstream,
         )
@@ -773,10 +856,8 @@ mod streaming_done_tests {
         .await;
 
         assert!(
-            payloads
-                .iter()
-                .any(|p| is_error_frame(p)
-                    && error_message(p).is_some_and(|m| m.contains("executor exploded"))),
+            payloads.iter().any(|p| is_error_frame(p)
+                && error_message(p).is_some_and(|m| m.contains("executor exploded"))),
             "expected Outcome::Failed error frame, got: {payloads:#?}"
         );
         assert!(
@@ -788,13 +869,13 @@ mod streaming_done_tests {
                 .iter()
                 .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
                 .all(|p| receipt_of(p).is_none()),
-            "Outcome::Failed must not leak hellas.receipt_id, got: {payloads:#?}"
+            "Outcome::Failed must not leak hellas.receipt, got: {payloads:#?}"
         );
     }
 
     /// Happy path with provenance: first chunk carries
-    /// `hellas.commitment_id`; the SEMANTIC TERMINAL chunk (the one
-    /// just before `[DONE]`) carries `hellas.receipt_id`; intermediate
+    /// `hellas.commitment`; the SEMANTIC TERMINAL chunk (the one
+    /// just before `[DONE]`) carries `hellas.receipt`; intermediate
     /// chunks carry no hellas field.
     #[tokio::test]
     async fn commitment_on_first_chunk_receipt_on_terminal_chunk() {
@@ -804,7 +885,14 @@ mod streaming_done_tests {
         let receipt = test_receipt();
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             Some(prov.clone()),
             happy_upstream(receipt),
         )
@@ -816,8 +904,9 @@ mod streaming_done_tests {
 
         // First chunk has commitment.
         let first = payloads.first().expect("non-empty");
-        assert_eq!(commitment_of(first), Some("ab".repeat(32).as_str()));
+        assert_eq!(commitment_of(first), Some("ef".repeat(32).as_str()));
         assert_eq!(receipt_of(first), None);
+        assert_no_removed_hellas_fields(first);
 
         // Terminal data event = last payload before Done.
         let json_payloads: Vec<&OpenAiSsePayload> = payloads
@@ -829,13 +918,11 @@ mod streaming_done_tests {
             has_finish_reason(terminal),
             "without include_usage, terminal chunk must carry finish_reason: {terminal:?}"
         );
-        assert_eq!(receipt_of(terminal), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(terminal), Some("77".repeat(32).as_str()));
+        assert_no_removed_hellas_fields(terminal);
 
         // Receipt appears EXACTLY once across the whole stream.
-        let receipts: Vec<_> = json_payloads
-            .iter()
-            .filter_map(|p| receipt_of(p))
-            .collect();
+        let receipts: Vec<_> = json_payloads.iter().filter_map(|p| receipt_of(p)).collect();
         assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
     }
 
@@ -848,7 +935,14 @@ mod streaming_done_tests {
         let deadline = Instant::now() + Duration::from_secs(60);
 
         let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
-            id, created, model, prompt_tokens, deadline, false, parser, mapper,
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
             None,
             happy_upstream(test_receipt()),
         )
@@ -869,7 +963,52 @@ mod streaming_done_tests {
             .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
             .last()
             .unwrap();
-        assert_eq!(receipt_of(json_last), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(json_last), Some("77".repeat(32).as_str()));
+        assert_no_removed_hellas_fields(json_last);
+    }
+
+    #[tokio::test]
+    async fn deferred_provenance_rides_terminal_chunk_when_no_delta() {
+        let (id, created, model, prompt_tokens, parser, mapper) = make_test_inputs();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prov = test_provenance();
+        let receipt = test_receipt();
+        let upstream = futures::stream::iter(vec![
+            Ok(GenerationEvent::Provenance(prov)),
+            Ok(GenerationEvent::Done(Outcome::Completed {
+                total_tokens: 0,
+                stop_reason: ExecStopReason::EndOfSequence,
+                receipt_cid: receipt,
+                catnix_receipt_commitment: Some(test_catnix_receipt()),
+            })),
+        ]);
+
+        let payloads: Vec<OpenAiSsePayload> = build_openai_sse_stream(
+            id,
+            created,
+            model,
+            prompt_tokens,
+            deadline,
+            false,
+            parser,
+            mapper,
+            None,
+            upstream,
+        )
+        .collect()
+        .await;
+
+        let first = payloads.first().expect("non-empty");
+        assert!(as_json(first).get("hellas").is_none());
+
+        let json_payloads: Vec<&OpenAiSsePayload> = payloads
+            .iter()
+            .filter(|p| matches!(p, OpenAiSsePayload::Json(_)))
+            .collect();
+        let terminal = json_payloads.last().expect("terminal json");
+        assert_eq!(commitment_of(terminal), Some("ef".repeat(32).as_str()));
+        assert_eq!(receipt_of(terminal), Some("77".repeat(32).as_str()));
+        assert_no_removed_hellas_fields(terminal);
     }
 
     /// `include_usage=true`: receipt rides the trailing usage chunk
@@ -910,7 +1049,8 @@ mod streaming_done_tests {
             .expect("finish-reason chunk always emitted on success");
 
         // Usage chunk is the terminal event and carries the receipt.
-        assert_eq!(receipt_of(usage), Some("cd".repeat(32).as_str()));
+        assert_eq!(receipt_of(usage), Some("77".repeat(32).as_str()));
+        assert_no_removed_hellas_fields(usage);
         // Finish-reason chunk is NO LONGER the terminal event when
         // usage is enabled — it must NOT carry the receipt.
         assert_eq!(

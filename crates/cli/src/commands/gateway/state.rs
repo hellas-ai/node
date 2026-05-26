@@ -1,9 +1,8 @@
 use super::{GatewayOptions, json_error};
 use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
-    PreparedExecution, RemoteNodeTarget,
+    PreparedExecution, RemoteNodeTarget, StopReason,
 };
-use hellas_rpc::provenance::ExecutionProvenance;
 use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
 use async_stream::try_stream;
@@ -11,9 +10,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
-use catgrad_llm::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use catgrad_llm::types::Message;
-use catgrad_llm::types::{anthropic, openai, plain};
+use catgrad_llm::types::{ThinkingPolicy, anthropic, openai, plain};
 use futures::Stream;
 use futures::StreamExt;
 #[cfg(feature = "hellas-executor")]
@@ -21,6 +19,10 @@ use hellas_executor::Executor;
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
+use hellas_runtime::cid::Cid;
+use hellas_runtime::runtime::TextReceipt;
+use hellas_runtime::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -57,8 +59,8 @@ pub(super) struct PreparedGeneration {
     pub(super) prepared: PreparedExecution,
     /// Pre-flight provenance the executor committed to. `None` for routes
     /// that defer their quote until streaming starts (`RemoteDiscovery`);
-    /// in that case headers can't be set and clients must rely on the
-    /// in-band SSE `hellas-provenance` event.
+    /// in that case headers can't be set up front and clients must rely
+    /// on the in-band `hellas` extension carried by the stream.
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) stop_token_ids: Vec<i32>,
@@ -78,6 +80,7 @@ pub(super) struct PreparedGeneration {
 /// be reported in protocol-level usage frames.
 #[derive(Debug, Clone)]
 pub(super) enum GenerationEvent {
+    Provenance(ExecutionProvenance),
     Delta(String),
     Done(Outcome),
 }
@@ -85,6 +88,20 @@ pub(super) enum GenerationEvent {
 pub(super) struct HttpError {
     pub(super) status: StatusCode,
     pub(super) message: String,
+}
+
+pub(super) struct CompletedTextGeneration {
+    pub(super) text: String,
+    pub(super) provenance: Option<ExecutionProvenance>,
+    pub(super) total_tokens: u64,
+    pub(super) stop_reason: StopReason,
+    pub(super) receipt_cid: Cid<TextReceipt>,
+    pub(super) catnix_receipt_commitment: Option<CatnixReceiptCommitment>,
+}
+
+pub(super) enum TextGenerationError {
+    Failed { position: u64, error: String },
+    Stream(String),
 }
 
 impl GatewayState {
@@ -251,26 +268,19 @@ impl GatewayState {
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let messages: Vec<Message> = req.messages.iter().cloned().map(Message::from).collect();
-        let enable_thinking = req
-            .reasoning_effort
-            .is_some_and(openai::ReasoningEffort::enables_thinking);
-        let tools_dir = ToolDirectory::from_openai_tools(
-            req.tools.as_deref().unwrap_or(&[]),
-        )
-        .map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Invalid tool definitions: {err}"),
-        })?;
-        let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
+        let thinking = ThinkingPolicy::from(req.reasoning_effort);
+        let tools_dir = ToolDirectory::from_openai_tools(req.tools.as_deref().unwrap_or(&[]))
             .map_err(|err| HttpError {
                 status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
+                message: format!("Invalid tool definitions: {err}"),
             })?;
+        let model = self.resolve_model(&req.model);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let chat_turn = assets
-            .chat_turn(tools_dir, ChatOptions { enable_thinking })
+            .chat_turn(tools_dir, ChatOptions { thinking })
             .map_err(classify_chat_turn_error)?;
         let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -291,27 +301,15 @@ impl GatewayState {
         &self,
         req: &anthropic::MessageRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let messages = anthropic_request_to_openai_messages(req)
-            .into_iter()
-            .map(Message::from)
-            .collect::<Vec<_>>();
-        let tools_dir = ToolDirectory::from_anthropic_tools(
-            req.tools.as_deref().unwrap_or(&[]),
-        )
-        .map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Invalid tool definitions: {err}"),
-        })?;
+        let messages = Vec::<Message>::from(req);
+        let thinking = ThinkingPolicy::from(req.thinking);
         let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
-            .map_err(|err| HttpError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
-            })?;
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let chat_turn = assets
-            .chat_turn(tools_dir, ChatOptions::default())
+            .chat_turn(None, ChatOptions { thinking })
             .map_err(classify_chat_turn_error)?;
         let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -335,13 +333,10 @@ impl GatewayState {
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let prompt = req.prompt.clone();
         let model = self.resolve_model(&req.model);
-        let assets = self
-            .model_assets(&model)
-            .await
-            .map_err(|err| HttpError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to load local model assets for `{model}`: {err}"),
-            })?;
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
         let prepared_prompt = assets.prepare_plain(&prompt).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!(
@@ -356,6 +351,36 @@ impl GatewayState {
             max_tokens,
             None,
             "Failed to prepare completion prompt",
+        )
+        .await
+    }
+
+    pub(super) async fn prepare_openai_response(
+        &self,
+        req: &openai::responses::ResponseRequest,
+    ) -> Result<PreparedGeneration, HttpError> {
+        let max_tokens = req.max_output_tokens.unwrap_or(self.default_max_tokens);
+        let model = self.resolve_model(&req.model);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
+        let prepared_prompt = assets
+            .prepare_openai_response(req)
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "Failed to prepare Responses request: {}",
+                    format_error_causes(&err)
+                ),
+            })?;
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
+            max_tokens,
+            None,
+            "Failed to prepare Responses request",
         )
         .await
     }
@@ -402,6 +427,9 @@ impl PreparedGeneration {
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
                 match event? {
+                    ExecutionEvent::Provenance(provenance) => {
+                        yield GenerationEvent::Provenance(provenance);
+                    }
                     ExecutionEvent::Chunk { tokens, .. } => {
                         let delta = decoder.push_bytes(&tokens)?;
                         if !delta.is_empty() {
@@ -418,153 +446,58 @@ impl PreparedGeneration {
         }
     }
 
+    pub(super) async fn collect_text(self) -> Result<CompletedTextGeneration, TextGenerationError> {
+        let deadline = self.deadline();
+        let mut provenance = self.provenance.clone();
+        let stream = self.stream();
+        tokio::pin!(stream);
+        let mut text = String::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => provenance = Some(prov),
+                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => text.push_str(&delta),
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
+                    total_tokens,
+                    stop_reason,
+                    receipt_cid,
+                    catnix_receipt_commitment,
+                })))) => {
+                    return Ok(CompletedTextGeneration {
+                        text,
+                        provenance,
+                        total_tokens,
+                        stop_reason,
+                        receipt_cid,
+                        catnix_receipt_commitment,
+                    });
+                }
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {
+                    return Err(TextGenerationError::Failed { position, error });
+                }
+                Ok(Some(Err(err))) => {
+                    return Err(TextGenerationError::Stream(format!(
+                        "Inference error: {err:#}"
+                    )));
+                }
+                Ok(None) => {
+                    return Err(TextGenerationError::Stream(
+                        "execution stream ended without terminal outcome".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(TextGenerationError::Stream(format!(
+                        "inference timed out after {}s",
+                        super::timeout_secs_until(deadline)
+                    )));
+                }
+            }
+        }
+    }
+
     /// Absolute deadline for this generation's stream consumption.
     /// Computed at call time; covers the whole lifecycle from this point on.
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         tokio::time::Instant::now() + self.inference_timeout
-    }
-}
-
-/// Convert an Anthropic `MessageRequest` into a flat list of OpenAI chat
-/// messages so the existing OpenAI-style chat templates can consume it.
-///
-/// Rules:
-/// - `req.system` becomes a leading `system` role message.
-/// - Assistant messages with `ToolUse` blocks collapse into one OpenAI
-///   assistant message whose `tool_calls` carries each call.
-/// - User messages with `ToolResult` blocks expand into one `tool` role
-///   message per result (optionally preceded by a `user` message if the same
-///   Anthropic message also carried text blocks).
-fn anthropic_request_to_openai_messages(
-    req: &anthropic::MessageRequest,
-) -> Vec<openai::ChatMessage> {
-    let mut out = Vec::new();
-
-    if let Some(system) = &req.system {
-        let text = match system {
-            anthropic::SystemPrompt::Text(text) => text.clone(),
-            anthropic::SystemPrompt::Blocks(blocks) => blocks
-                .iter()
-                .map(|block| block.text.as_str())
-                .collect::<Vec<_>>()
-                .join(""),
-        };
-        out.push(openai::ChatMessage::system(text));
-    }
-
-    for msg in &req.messages {
-        let blocks = match &msg.content {
-            anthropic::MessageContent::Text(text) => {
-                vec![anthropic::ContentBlock::Text { text: text.clone() }]
-            }
-            anthropic::MessageContent::Blocks(blocks) => blocks.clone(),
-        };
-        match msg.role.as_str() {
-            "user" => emit_user_turn(&mut out, blocks),
-            "assistant" => emit_assistant_turn(&mut out, blocks),
-            _ => {
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        anthropic::ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                out.push(
-                    openai::ChatMessage::builder()
-                        .role(msg.role.clone())
-                        .content(Some(openai::MessageContent::Text(text)))
-                        .build(),
-                );
-            }
-        }
-    }
-
-    out
-}
-
-fn emit_user_turn(out: &mut Vec<openai::ChatMessage>, blocks: Vec<anthropic::ContentBlock>) {
-    let mut text_parts = Vec::new();
-    let mut tool_results = Vec::new();
-    for block in blocks {
-        match block {
-            anthropic::ContentBlock::Text { text } => text_parts.push(text),
-            anthropic::ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } => tool_results.push((tool_use_id, content)),
-            anthropic::ContentBlock::ToolUse { .. } => {}
-        }
-    }
-    if !text_parts.is_empty() {
-        out.push(openai::ChatMessage::user(text_parts.join("")));
-    }
-    for (tool_use_id, content) in tool_results {
-        out.push(
-            openai::ChatMessage::builder()
-                .role("tool".to_string())
-                .content(Some(openai::MessageContent::Text(
-                    anthropic_tool_result_to_string(&content),
-                )))
-                .tool_call_id(Some(tool_use_id))
-                .build(),
-        );
-    }
-}
-
-fn emit_assistant_turn(out: &mut Vec<openai::ChatMessage>, blocks: Vec<anthropic::ContentBlock>) {
-    let mut text_parts = Vec::new();
-    let mut tool_calls = Vec::new();
-    for block in blocks {
-        match block {
-            anthropic::ContentBlock::Text { text } => text_parts.push(text),
-            anthropic::ContentBlock::ToolUse { id, name, input } => {
-                let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                tool_calls.push(serde_json::json!({
-                    "id": id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments },
-                }));
-            }
-            anthropic::ContentBlock::ToolResult { .. } => {}
-        }
-    }
-    let content = if text_parts.is_empty() {
-        None
-    } else {
-        Some(openai::MessageContent::Text(text_parts.join("")))
-    };
-    let tool_calls = if tool_calls.is_empty() {
-        None
-    } else {
-        Some(tool_calls)
-    };
-    out.push(
-        openai::ChatMessage::builder()
-            .role("assistant".to_string())
-            .content(content)
-            .tool_calls(tool_calls)
-            .build(),
-    );
-}
-
-/// Convert an Anthropic `tool_result.content` payload to the single-string
-/// shape OpenAI's `tool` role message carries. Accepts raw strings, arrays of
-/// text blocks (Anthropic permits both), or falls back to JSON serialization.
-fn anthropic_tool_result_to_string(content: &serde_json::Value) -> String {
-    match content {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| {
-                block
-                    .as_object()
-                    .and_then(|obj| obj.get("text"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .collect(),
-        other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
@@ -677,179 +610,4 @@ mod tests {
             ExecutionStrategy::Run(ExecutionRoute::Local)
         );
     }
-}
-
-#[cfg(test)]
-mod anthropic_conversion_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn assistant_tool_calls(msg: &openai::ChatMessage) -> &[serde_json::Value] {
-        msg.tool_calls.as_deref().expect("tool_calls populated")
-    }
-
-    #[test]
-    fn system_prompt_text_becomes_leading_system_message() {
-        let req = anthropic::MessageRequest::builder()
-            .model("m".into())
-            .messages(vec![anthropic::AnthropicMessage::user("hi")])
-            .max_tokens(16)
-            .system(Some(anthropic::SystemPrompt::Text("be brief".into())))
-            .build();
-        let out = anthropic_request_to_openai_messages(&req);
-        assert_eq!(out[0].role, "system");
-        assert_eq!(
-            out[0].content,
-            Some(openai::MessageContent::Text("be brief".into()))
-        );
-        assert_eq!(out[1].role, "user");
-    }
-
-    #[test]
-    fn assistant_tool_use_collapses_to_openai_tool_calls() {
-        let req = anthropic::MessageRequest::builder()
-            .model("m".into())
-            .messages(vec![
-                anthropic::AnthropicMessage::user("what's the weather in Paris?"),
-                anthropic::AnthropicMessage {
-                    role: "assistant".into(),
-                    content: anthropic::MessageContent::Blocks(vec![
-                        anthropic::ContentBlock::Text {
-                            text: "Let me check.".into(),
-                        },
-                        anthropic::ContentBlock::ToolUse {
-                            id: "toolu_1".into(),
-                            name: "get_weather".into(),
-                            input: json!({"city": "Paris"}),
-                        },
-                    ]),
-                },
-            ])
-            .max_tokens(16)
-            .build();
-        let out = anthropic_request_to_openai_messages(&req);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].role, "assistant");
-        assert_eq!(
-            out[1].content,
-            Some(openai::MessageContent::Text("Let me check.".into()))
-        );
-        let tool_calls = assistant_tool_calls(&out[1]);
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0]["id"], "toolu_1");
-        assert_eq!(tool_calls[0]["type"], "function");
-        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
-        assert_eq!(
-            tool_calls[0]["function"]["arguments"],
-            r#"{"city":"Paris"}"#
-        );
-    }
-
-    #[test]
-    fn user_tool_result_becomes_tool_role_message() {
-        let req = anthropic::MessageRequest::builder()
-            .model("m".into())
-            .messages(vec![anthropic::AnthropicMessage {
-                role: "user".into(),
-                content: anthropic::MessageContent::Blocks(vec![
-                    anthropic::ContentBlock::ToolResult {
-                        tool_use_id: "toolu_1".into(),
-                        content: json!("sunny, 22C"),
-                        is_error: None,
-                    },
-                ]),
-            }])
-            .max_tokens(16)
-            .build();
-        let out = anthropic_request_to_openai_messages(&req);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].role, "tool");
-        assert_eq!(out[0].tool_call_id.as_deref(), Some("toolu_1"));
-        assert_eq!(
-            out[0].content,
-            Some(openai::MessageContent::Text("sunny, 22C".into()))
-        );
-    }
-
-    #[test]
-    fn user_message_with_text_and_tool_result_splits() {
-        let req = anthropic::MessageRequest::builder()
-            .model("m".into())
-            .messages(vec![anthropic::AnthropicMessage {
-                role: "user".into(),
-                content: anthropic::MessageContent::Blocks(vec![
-                    anthropic::ContentBlock::ToolResult {
-                        tool_use_id: "toolu_1".into(),
-                        content: json!("sunny"),
-                        is_error: None,
-                    },
-                    anthropic::ContentBlock::Text {
-                        text: "thanks!".into(),
-                    },
-                ]),
-            }])
-            .max_tokens(16)
-            .build();
-        let out = anthropic_request_to_openai_messages(&req);
-        // Text flushes first, then the tool messages follow.
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].role, "user");
-        assert_eq!(
-            out[0].content,
-            Some(openai::MessageContent::Text("thanks!".into()))
-        );
-        assert_eq!(out[1].role, "tool");
-        assert_eq!(out[1].tool_call_id.as_deref(), Some("toolu_1"));
-    }
-
-    #[test]
-    fn tool_result_content_accepts_blocks_or_object() {
-        assert_eq!(
-            anthropic_tool_result_to_string(&json!("plain")),
-            "plain".to_string()
-        );
-        assert_eq!(
-            anthropic_tool_result_to_string(&json!([
-                {"type": "text", "text": "alpha"},
-                {"type": "text", "text": "beta"},
-            ])),
-            "alphabeta".to_string()
-        );
-        assert_eq!(
-            anthropic_tool_result_to_string(&json!({"result": 42})),
-            r#"{"result":42}"#.to_string()
-        );
-    }
-
-    #[test]
-    fn parallel_tool_calls_all_land_on_single_assistant_message() {
-        let req = anthropic::MessageRequest::builder()
-            .model("m".into())
-            .messages(vec![anthropic::AnthropicMessage {
-                role: "assistant".into(),
-                content: anthropic::MessageContent::Blocks(vec![
-                    anthropic::ContentBlock::ToolUse {
-                        id: "toolu_1".into(),
-                        name: "get_weather".into(),
-                        input: json!({"city": "Paris"}),
-                    },
-                    anthropic::ContentBlock::ToolUse {
-                        id: "toolu_2".into(),
-                        name: "get_time".into(),
-                        input: json!({"tz": "UTC"}),
-                    },
-                ]),
-            }])
-            .max_tokens(16)
-            .build();
-        let out = anthropic_request_to_openai_messages(&req);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].role, "assistant");
-        assert_eq!(out[0].content, None);
-        let tool_calls = assistant_tool_calls(&out[0]);
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0]["id"], "toolu_1");
-        assert_eq!(tool_calls[1]["id"], "toolu_2");
-    }
-
 }

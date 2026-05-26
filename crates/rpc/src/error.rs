@@ -1,6 +1,6 @@
 use crate::TokenBytesError;
 use crate::model::ModelAssetsError;
-use catgrad_llm::LLMError;
+use hellas_runtime::LLMError;
 use thiserror::Error;
 use tonic::Status;
 
@@ -86,8 +86,9 @@ fn executor_status_code(err: &ExecutorError) -> tonic::Code {
         | ExecutorError::TokenBytes(_) => tonic::Code::InvalidArgument,
         ExecutorError::DtypeNotSupported { .. } => tonic::Code::FailedPrecondition,
         ExecutorError::ModelAssets(model_err) => model_assets_status_code(model_err),
-        ExecutorError::WeightsNotReady(_)
-        | ExecutorError::State(StateError::QuoteExpired(_)) => tonic::Code::FailedPrecondition,
+        ExecutorError::WeightsNotReady(_) | ExecutorError::State(StateError::QuoteExpired(_)) => {
+            tonic::Code::FailedPrecondition
+        }
         ExecutorError::PolicyDenied(_) => tonic::Code::PermissionDenied,
         ExecutorError::State(StateError::QuoteNotFound(_)) => tonic::Code::NotFound,
         ExecutorError::ChannelClosed

@@ -1,9 +1,20 @@
 [workspace]
 members = [
+    "crates/catnix",
     "crates/cli",
-    "crates/rpc",
+    "crates/core",
     "crates/executor",
+    "crates/rpc",
+    "crates/runtime",
 ]
+
+# `crates/wire` is intentionally NOT a workspace member: its optional
+# `discovery-mdns` feature pulls `iroh-mdns-address-lookup ^0.2` which
+# conflicts with the iroh version `tonic-iroh-transport ^0.9` resolves
+# to. External consumers (explorer, hellas-alto/chain, hellas-esp32)
+# path-depend on it directly; the internal node binary does not. Fold
+# back in when the iroh dep tree converges.
+exclude = ["crates/wire"]
 default-members = [
     "crates/cli",
 ]
@@ -17,8 +28,18 @@ repository = "https://github.com/hellas-ai/node"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
-catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "grw/feat/megatooler", default-features = false, features = ["serde", "dag-cbor"] }
-catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "grw/feat/megatooler", default-features = false }
+blake3 = "1"
+catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false, features = ["serde"] }
+catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
+catgrad-llm-models = { git = "https://github.com/hellas-ai/catgrad", branch = "master", package = "catgrad-llm-models" }
+catnix = { path = "crates/catnix", default-features = false }
+hellas-core = { path = "crates/core", default-features = false }
+hellas-runtime = { path = "crates/runtime", default-features = false }
+hellas-wire = { path = "crates/wire", default-features = false }
+iroh = "0.98"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+serde_bytes = "0.11"
+serde_ipld_dagcbor = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
