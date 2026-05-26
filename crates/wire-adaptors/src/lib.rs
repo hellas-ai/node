@@ -17,8 +17,8 @@ pub use error::{AdaptorError, AdaptorResult};
 pub use execution::{
     CanonicalExecution, ContentPart, ExecutionRequest, ExecutionResult, Input, InputItem, Message,
     ModelRef, OutputEvent, OutputItem, Provenance, ReasoningOptions, ResponseFormat,
-    SamplingOptions, StopReason, StructuredDelta, TextChannel, ToolCallDelta, ToolChoice, ToolKind,
-    ToolSpec, Usage,
+    SamplingOptions, StopReason, StructuredDelta, TextChannel, ToolCallArgumentsDelta,
+    ToolCallDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
 };
 pub use request::{FieldPath, PassthroughBag, PassthroughField, RawRequest};
 pub use wire::{

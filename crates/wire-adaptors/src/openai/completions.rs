@@ -107,7 +107,10 @@ impl WireAdaptor for OpenAiCompletionsAdaptor {
                     completion_chunk_json(state, json_to_wire_string(&value), None),
                 )])
             }
-            OutputEvent::ToolCallDelta(_) => Err(AdaptorError::unsupported(
+            OutputEvent::ToolCallDelta(_)
+            | OutputEvent::ToolCallStart(_)
+            | OutputEvent::ToolCallArgumentsDelta(_)
+            | OutputEvent::ToolCallEnd(_) => Err(AdaptorError::unsupported(
                 "text completions cannot render tool-call deltas",
             )),
             OutputEvent::Usage(_) => Ok(Vec::new()),

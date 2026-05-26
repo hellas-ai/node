@@ -211,6 +211,9 @@ pub enum OutputEvent {
         delta: String,
         channel: TextChannel,
     },
+    ToolCallStart(ToolCallStart),
+    ToolCallArgumentsDelta(ToolCallArgumentsDelta),
+    ToolCallEnd(ToolCallEnd),
     ToolCallDelta(ToolCallDelta),
     StructuredOutputDelta(StructuredDelta),
     Usage(Usage),
@@ -237,6 +240,25 @@ pub struct ToolCallDelta {
     pub id: Option<String>,
     pub name_delta: Option<String>,
     pub arguments_delta: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallStart {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallArgumentsDelta {
+    pub index: usize,
+    pub delta: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallEnd {
+    pub index: usize,
+    pub arguments: JsonValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

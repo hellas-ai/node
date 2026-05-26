@@ -4,8 +4,8 @@ use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
     ExecutionResult, FieldPath, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem,
     PassthroughBag, RawRequest, ReasoningOptions, RenderContext, ResponseFormat, StructuredDelta,
-    TextChannel, ToolCallDelta, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor, WireResponse,
-    WireStreamEvent,
+    TextChannel, ToolCallDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
+    WireAdaptor, WireResponse, WireStreamEvent,
 };
 
 const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -67,6 +67,16 @@ pub struct ResponsesStreamState {
     output_started: bool,
     usage: Option<Usage>,
     provenance: Option<crate::Provenance>,
+    tool_calls: Vec<ResponseToolCallState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResponseToolCallState {
+    parser_index: usize,
+    output_index: usize,
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl WireAdaptor for OpenAiResponsesAdaptor {
@@ -98,6 +108,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
             output_started: false,
             usage: None,
             provenance: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -219,6 +230,11 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                     "delta": delta,
                 }),
             )]),
+            OutputEvent::ToolCallStart(start) => render_tool_call_start(state, start),
+            OutputEvent::ToolCallArgumentsDelta(delta) => {
+                render_tool_call_arguments_delta(state, delta.index, delta.delta)
+            }
+            OutputEvent::ToolCallEnd(end) => render_tool_call_end(state, end),
             OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
             OutputEvent::StructuredOutputDelta(delta) => render_structured_delta(state, delta),
             OutputEvent::Usage(usage) => {
@@ -266,6 +282,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                     }),
                 );
                 let item = message_item_json(&state.message_id, "completed", vec![completed_text]);
+                let mut output = Vec::with_capacity(state.tool_calls.len() + 1);
+                output.push(item.clone());
+                output.extend(state.tool_calls.iter().map(response_tool_call_item));
                 let item_done = response_event(
                     "response.output_item.done",
                     json!({
@@ -285,7 +304,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                             state.created_at,
                             &request.model,
                             "completed",
-                            vec![item],
+                            output,
                             state.usage,
                             state.provenance.as_ref(),
                         ),
@@ -660,16 +679,147 @@ fn render_tool_call_delta(
     state: &mut ResponsesStreamState,
     delta: ToolCallDelta,
 ) -> AdaptorResult<Vec<WireStreamEvent>> {
+    if let Some(name) = delta.name_delta {
+        return render_tool_call_start(
+            state,
+            ToolCallStart {
+                index: delta.index,
+                id: delta.id,
+                name,
+            },
+        );
+    }
+    if let Some(arguments) = delta.arguments_delta {
+        return render_tool_call_arguments_delta(state, delta.index, arguments);
+    }
+    Ok(Vec::new())
+}
+
+fn render_tool_call_start(
+    state: &mut ResponsesStreamState,
+    start: ToolCallStart,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let id = start
+        .id
+        .ok_or_else(|| AdaptorError::render("Responses tool call start requires an id"))?;
+    if state
+        .tool_calls
+        .iter()
+        .any(|call| call.parser_index == start.index)
+    {
+        return Err(AdaptorError::render(format!(
+            "duplicate tool call start for index {}",
+            start.index
+        )));
+    }
+    let output_index = state.tool_calls.len() + usize::from(state.output_started);
+    state.tool_calls.push(ResponseToolCallState {
+        parser_index: start.index,
+        output_index,
+        id: id.clone(),
+        name: start.name.clone(),
+        arguments: String::new(),
+    });
+
+    Ok(vec![response_event(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "sequence_number": next_sequence(state),
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "function_call",
+                "call_id": id,
+                "name": start.name,
+                "arguments": "",
+                "status": "in_progress",
+            },
+        }),
+    )])
+}
+
+fn render_tool_call_arguments_delta(
+    state: &mut ResponsesStreamState,
+    index: usize,
+    delta: String,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let (id, output_index) = {
+        let call = response_tool_call_mut(state, index)?;
+        call.arguments.push_str(&delta);
+        (call.id.clone(), call.output_index)
+    };
     Ok(vec![response_event(
         "response.function_call_arguments.delta",
         json!({
             "type": "response.function_call_arguments.delta",
             "sequence_number": next_sequence(state),
-            "item_id": delta.id,
-            "output_index": delta.index,
-            "delta": delta.arguments_delta.unwrap_or_default(),
+            "item_id": id,
+            "output_index": output_index,
+            "delta": delta,
         }),
     )])
+}
+
+fn render_tool_call_end(
+    state: &mut ResponsesStreamState,
+    end: ToolCallEnd,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let (id, output_index, item, arguments) = {
+        let call = response_tool_call_mut(state, end.index)?;
+        if !end.arguments.is_null() {
+            call.arguments = json_to_output_string(&end.arguments);
+        }
+        (
+            call.id.clone(),
+            call.output_index,
+            response_tool_call_item(call),
+            call.arguments.clone(),
+        )
+    };
+    Ok(vec![
+        response_event(
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": next_sequence(state),
+                "item_id": id,
+                "output_index": output_index,
+                "arguments": arguments,
+            }),
+        ),
+        response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": next_sequence(state),
+                "output_index": output_index,
+                "item": item,
+            }),
+        ),
+    ])
+}
+
+fn response_tool_call_mut(
+    state: &mut ResponsesStreamState,
+    parser_index: usize,
+) -> AdaptorResult<&mut ResponseToolCallState> {
+    state
+        .tool_calls
+        .iter_mut()
+        .find(|call| call.parser_index == parser_index)
+        .ok_or_else(|| AdaptorError::render(format!("unknown tool call index {parser_index}")))
+}
+
+fn response_tool_call_item(call: &ResponseToolCallState) -> JsonValue {
+    json!({
+        "id": call.id,
+        "type": "function_call",
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": call.arguments,
+        "status": "completed",
+    })
 }
 
 fn render_structured_delta(
@@ -1118,5 +1268,121 @@ mod tests {
             "hello"
         );
         assert_eq!(completed["response"]["usage"]["total_tokens"], 6);
+    }
+
+    #[test]
+    fn render_stream_tool_call_sequence() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallStart(crate::ToolCallStart {
+                        index: 0,
+                        id: Some("call_1".to_string()),
+                        name: "lookup".to_string(),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallArgumentsDelta(crate::ToolCallArgumentsDelta {
+                        index: 0,
+                        delta: "{\"query\":\"tea\"}".to_string(),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallEnd(crate::ToolCallEnd {
+                        index: 0,
+                        arguments: json!({"query": "tea"}),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Finished {
+                        stop_reason: StopReason::ToolCall,
+                        usage: Some(Usage {
+                            input_tokens: Some(5),
+                            output_tokens: Some(1),
+                            total_tokens: Some(6),
+                        }),
+                    },
+                )
+                .unwrap(),
+        );
+
+        let names = events
+            .iter()
+            .map(|event| event.name.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let tool_added = match &events[4].data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected tool-call added event"),
+        };
+        assert_eq!(tool_added["output_index"], 1);
+        assert_eq!(tool_added["item"]["id"], "call_1");
+        assert_eq!(tool_added["item"]["name"], "lookup");
+        assert_eq!(tool_added["item"]["arguments"], "");
+
+        let args_delta = match &events[5].data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected tool-call arguments delta"),
+        };
+        assert_eq!(args_delta["item_id"], "call_1");
+        assert_eq!(args_delta["delta"], "{\"query\":\"tea\"}");
+
+        let args_done = match &events[6].data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected tool-call arguments done"),
+        };
+        assert_eq!(args_done["arguments"], "{\"query\":\"tea\"}");
+
+        let completed = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected completed event"),
+        };
+        assert_eq!(completed["response"]["output"][1]["type"], "function_call");
+        assert_eq!(completed["response"]["output"][1]["call_id"], "call_1");
+        assert_eq!(
+            completed["response"]["output"][1]["arguments"],
+            "{\"query\":\"tea\"}"
+        );
     }
 }

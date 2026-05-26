@@ -208,6 +208,11 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
                     None,
                 ),
             )]),
+            OutputEvent::ToolCallStart(start) => render_tool_call_start(state, start),
+            OutputEvent::ToolCallArgumentsDelta(delta) => {
+                render_tool_call_arguments_delta(state, delta.index, delta.delta)
+            }
+            OutputEvent::ToolCallEnd(_) => Ok(Vec::new()),
             OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
             OutputEvent::StructuredOutputDelta(delta) => Ok(vec![WireStreamEvent::json(
                 None,
@@ -588,19 +593,36 @@ fn render_tool_call_delta(
     state: &mut ChatCompletionsStreamState,
     delta: ToolCallDelta,
 ) -> AdaptorResult<Vec<WireStreamEvent>> {
-    let mut function = JsonMap::new();
     if let Some(name) = delta.name_delta {
-        function.insert("name".to_string(), JsonValue::String(name));
+        return render_tool_call_start(
+            state,
+            crate::ToolCallStart {
+                index: delta.index,
+                id: delta.id,
+                name,
+            },
+        );
     }
     if let Some(arguments) = delta.arguments_delta {
-        function.insert("arguments".to_string(), JsonValue::String(arguments));
+        return render_tool_call_arguments_delta(state, delta.index, arguments);
     }
+    Ok(Vec::new())
+}
+
+fn render_tool_call_start(
+    state: &mut ChatCompletionsStreamState,
+    start: crate::ToolCallStart,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let mut function = JsonMap::new();
+    function.insert("name".to_string(), JsonValue::String(start.name));
+    function.insert("arguments".to_string(), JsonValue::String(String::new()));
+
     let mut tool_call = JsonMap::new();
     tool_call.insert(
         "index".to_string(),
-        JsonValue::Number(serde_json::Number::from(delta.index)),
+        JsonValue::Number(serde_json::Number::from(start.index)),
     );
-    if let Some(id) = delta.id {
+    if let Some(id) = start.id {
         tool_call.insert("id".to_string(), JsonValue::String(id));
     }
     tool_call.insert(
@@ -616,6 +638,30 @@ fn render_tool_call_delta(
             vec![json!({
                 "index": 0,
                 "delta": {"tool_calls": [JsonValue::Object(tool_call)]},
+                "finish_reason": null,
+            })],
+            None,
+        ),
+    )])
+}
+
+fn render_tool_call_arguments_delta(
+    state: &mut ChatCompletionsStreamState,
+    index: usize,
+    delta: String,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    Ok(vec![WireStreamEvent::json(
+        None,
+        chat_chunk_json(
+            state,
+            vec![json!({
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "function": { "arguments": delta },
+                    }],
+                },
                 "finish_reason": null,
             })],
             None,
@@ -1017,5 +1063,89 @@ mod tests {
             _ => panic!("expected json event"),
         }
         assert_eq!(events[2].data, WireEventData::Text("[DONE]".to_string()));
+    }
+
+    #[test]
+    fn stream_tool_call_events_render_openai_chunks() {
+        let request = sample_request();
+        let mut state = adaptor().initial_state(
+            &request,
+            RenderContext::new("chatcmpl-test", "msg-test", 123),
+        );
+        let start = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallStart(crate::ToolCallStart {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: "lookup".to_string(),
+                }),
+            )
+            .unwrap();
+        let args = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallArgumentsDelta(crate::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: "{\"query\":\"tea\"}".to_string(),
+                }),
+            )
+            .unwrap();
+        let end = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallEnd(crate::ToolCallEnd {
+                    index: 0,
+                    arguments: json!({"query": "tea"}),
+                }),
+            )
+            .unwrap();
+        let finish = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Finished {
+                    stop_reason: StopReason::ToolCall,
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        let WireEventData::Json(start_json) = &start[0].data else {
+            panic!("expected tool start json");
+        };
+        assert_eq!(
+            start_json["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            start_json["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            start_json["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            ""
+        );
+
+        let WireEventData::Json(args_json) = &args[0].data else {
+            panic!("expected tool arguments json");
+        };
+        assert_eq!(
+            args_json["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"query\":\"tea\"}"
+        );
+
+        assert!(end.is_empty());
+        let WireEventData::Json(finish_json) = &finish[0].data else {
+            panic!("expected finish json");
+        };
+        assert_eq!(finish_json["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            finish.last().unwrap().data,
+            WireEventData::Text("[DONE]".to_string())
+        );
     }
 }

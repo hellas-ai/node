@@ -4,6 +4,9 @@ use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
 use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
+use hellas_runtime::runtime::chat::{
+    DecodeEvent, IncrementalToolCallParser, StopReason as ParserStopReason,
+};
 use hellas_wire_adaptors::{
     AdaptorError, ExecutionRequest, ExecutionResult, OutputEvent, OutputItem, Provenance,
     RawRequest, RenderContext, StopReason as WireStopReason, TextChannel, Usage, WireAdaptor,
@@ -13,7 +16,7 @@ use hellas_wire_adaptors::{
 use crate::execution::{Outcome, StopReason as RuntimeStopReason};
 
 use super::state::{GenerationEvent, PreparedGeneration, TextGenerationError};
-use super::{json_error, sse_data, sse_event_data, sse_response};
+use super::{json_error, next_id, sse_data, sse_event_data, sse_response};
 
 pub(super) fn parse_execution_request<A: WireAdaptor>(
     adaptor: &A,
@@ -418,10 +421,347 @@ where
     response
 }
 
+pub(super) fn chat_stream_response<A>(
+    adaptor: A,
+    parsed: A::ParsedRequest,
+    prepared: PreparedGeneration,
+    context: RenderContext,
+    tool_call_id_prefix: &'static str,
+    ready_message: &'static str,
+) -> Response
+where
+    A: WireAdaptor + Send + 'static,
+    A::ParsedRequest: Send + 'static,
+    A::StreamState: Send + 'static,
+{
+    let prompt_tokens = prepared.prompt_tokens;
+    let initial_provenance = prepared.provenance.clone();
+    let response_provenance = initial_provenance.clone();
+    let deadline = prepared.deadline();
+    let mut parser: Box<dyn IncrementalToolCallParser> = prepared
+        .chat_turn
+        .as_ref()
+        .expect("chat stream preparation attaches a ChatTurn")
+        .make_parser();
+
+    let mut response = sse_response(async_stream::stream! {
+        let mut state = adaptor.initial_state(&parsed, context);
+        let mut saw_tool_call = false;
+
+        if let Some(provenance) = initial_provenance.as_ref().and_then(provenance_from_execution) {
+            match render_events(adaptor.render_stream_event(
+                &parsed,
+                &mut state,
+                OutputEvent::Provenance(provenance),
+            )) {
+                Ok(events) => {
+                    for event in events {
+                        yield Ok(event);
+                    }
+                }
+                Err(event) => {
+                    yield Ok(event);
+                    return;
+                }
+            }
+        }
+
+        match render_events(adaptor.render_stream_start(&parsed, &mut state)) {
+            Ok(events) => {
+                for event in events {
+                    yield Ok(event);
+                }
+            }
+            Err(event) => {
+                yield Ok(event);
+                return;
+            }
+        }
+
+        let inner = prepared.stream();
+        tokio::pin!(inner);
+        let mut stream_provenance = initial_provenance;
+
+        loop {
+            match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
+                    stream_provenance = Some(prov);
+                    if let Some(provenance) = stream_provenance.as_ref().and_then(provenance_from_execution) {
+                        match render_events(adaptor.render_stream_event(
+                            &parsed,
+                            &mut state,
+                            OutputEvent::Provenance(provenance),
+                        )) {
+                            Ok(events) => {
+                                for event in events {
+                                    yield Ok(event);
+                                }
+                            }
+                            Err(event) => {
+                                yield Ok(event);
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
+                    match render_parser_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        parser.feed(&delta),
+                        tool_call_id_prefix,
+                        &mut saw_tool_call,
+                    ) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                            return;
+                        }
+                    }
+                }
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
+                    total_tokens,
+                    stop_reason,
+                    receipt_cid,
+                    catnix_receipt_commitment,
+                })))) => {
+                    info!(
+                        %receipt_cid,
+                        provenance = ?stream_provenance,
+                        total_tokens,
+                        ?stop_reason,
+                        message = ready_message,
+                        "gateway stream ready"
+                    );
+                    match render_parser_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        parser.finish(parser_stop_from_runtime(stop_reason)),
+                        tool_call_id_prefix,
+                        &mut saw_tool_call,
+                    ) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                            return;
+                        }
+                    }
+
+                    if let Some(provenance) = provenance_from_parts(
+                        stream_provenance.as_ref(),
+                        catnix_receipt_commitment.as_ref(),
+                    ) {
+                        match render_events(adaptor.render_stream_event(
+                            &parsed,
+                            &mut state,
+                            OutputEvent::Provenance(provenance),
+                        )) {
+                            Ok(events) => {
+                                for event in events {
+                                    yield Ok(event);
+                                }
+                            }
+                            Err(event) => {
+                                yield Ok(event);
+                                return;
+                            }
+                        }
+                    }
+
+                    let stop_reason = if saw_tool_call {
+                        WireStopReason::ToolCall
+                    } else {
+                        stop_reason_from_runtime(stop_reason)
+                    };
+                    match render_events(adaptor.render_stream_event(
+                        &parsed,
+                        &mut state,
+                        OutputEvent::Finished {
+                            stop_reason,
+                            usage: Some(usage(prompt_tokens, total_tokens)),
+                        },
+                    )) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(event) => yield Ok(event),
+                    }
+                    return;
+                }
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
+                    for event in render_error_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        format!("Inference error: {error}"),
+                    ) {
+                        yield Ok(event);
+                    }
+                    return;
+                }
+                Ok(Some(Err(err))) => {
+                    for event in render_error_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        format!("Inference error: {err:#}"),
+                    ) {
+                        yield Ok(event);
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    for event in render_error_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        "execution stream ended without terminal outcome".to_string(),
+                    ) {
+                        yield Ok(event);
+                    }
+                    return;
+                }
+                Err(_) => {
+                    for event in render_error_events(
+                        &adaptor,
+                        &parsed,
+                        &mut state,
+                        format!(
+                            "inference timed out after {}s",
+                            super::timeout_secs_until(deadline)
+                        ),
+                    ) {
+                        yield Ok(event);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+
+    if let Some(provenance) = response_provenance {
+        response.extensions_mut().insert(provenance);
+    }
+    response
+}
+
 fn render_events(events: Result<Vec<WireStreamEvent>, AdaptorError>) -> Result<Vec<Event>, Event> {
     events
         .map(|events| events.into_iter().map(sse_event).collect())
         .map_err(wire_error_event)
+}
+
+fn render_parser_events<A: WireAdaptor>(
+    adaptor: &A,
+    parsed: &A::ParsedRequest,
+    state: &mut A::StreamState,
+    events: Vec<DecodeEvent>,
+    tool_call_id_prefix: &'static str,
+    saw_tool_call: &mut bool,
+) -> Result<Vec<Event>, Vec<Event>> {
+    let mut rendered = Vec::new();
+    for event in events {
+        let output = match event {
+            DecodeEvent::TextDelta(delta) => Some(OutputEvent::TextDelta {
+                index: 0,
+                delta,
+                channel: TextChannel::Output,
+            }),
+            DecodeEvent::ToolCallStart { index, name } => {
+                *saw_tool_call = true;
+                Some(OutputEvent::ToolCallStart(
+                    hellas_wire_adaptors::ToolCallStart {
+                        index,
+                        id: Some(next_id(tool_call_id_prefix)),
+                        name,
+                    },
+                ))
+            }
+            DecodeEvent::ToolCallArgsDelta { index, delta } => {
+                Some(OutputEvent::ToolCallArgumentsDelta(
+                    hellas_wire_adaptors::ToolCallArgumentsDelta { index, delta },
+                ))
+            }
+            DecodeEvent::ToolCallEnd { index, args } => Some(OutputEvent::ToolCallEnd(
+                hellas_wire_adaptors::ToolCallEnd {
+                    index,
+                    arguments: args,
+                },
+            )),
+            DecodeEvent::Stop {
+                reason: ParserStopReason::ProtocolError,
+            } => {
+                return Err(render_error_events(
+                    adaptor,
+                    parsed,
+                    state,
+                    "tool-call protocol error".to_string(),
+                ));
+            }
+            DecodeEvent::Stop { .. } => None,
+            DecodeEvent::UnknownTool { name, .. } => {
+                return Err(render_error_events(
+                    adaptor,
+                    parsed,
+                    state,
+                    format!("unknown tool `{name}`"),
+                ));
+            }
+            DecodeEvent::InvalidArgs { name, errors, .. } => {
+                let errors = errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(render_error_events(
+                    adaptor,
+                    parsed,
+                    state,
+                    format!("invalid arguments for tool `{name}`: {errors}"),
+                ));
+            }
+            DecodeEvent::ParseError { source, .. } => {
+                return Err(render_error_events(
+                    adaptor,
+                    parsed,
+                    state,
+                    source.to_string(),
+                ));
+            }
+        };
+
+        if let Some(output) = output {
+            match render_events(adaptor.render_stream_event(parsed, state, output)) {
+                Ok(events) => rendered.extend(events),
+                Err(event) => return Err(vec![event]),
+            }
+        }
+    }
+    Ok(rendered)
+}
+
+fn parser_stop_from_runtime(stop_reason: RuntimeStopReason) -> ParserStopReason {
+    match stop_reason {
+        RuntimeStopReason::EndOfSequence => ParserStopReason::EndOfText,
+        RuntimeStopReason::MaxNewTokens => ParserStopReason::MaxTokens,
+        RuntimeStopReason::Cancelled => ParserStopReason::EndOfText,
+    }
 }
 
 fn render_error_events<A: WireAdaptor>(

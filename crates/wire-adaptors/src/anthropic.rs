@@ -38,6 +38,28 @@ pub struct AnthropicMessagesStreamState {
     started: bool,
     usage: Option<crate::Usage>,
     provenance: Option<crate::Provenance>,
+    next_block_index: usize,
+    open_block: Option<AnthropicOpenBlock>,
+    tool_calls: Vec<AnthropicToolCallState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnthropicOpenBlock {
+    index: usize,
+    kind: AnthropicBlockKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnthropicBlockKind {
+    Text,
+    Thinking,
+    Tool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AnthropicToolCallState {
+    parser_index: usize,
+    block_index: usize,
 }
 
 impl WireAdaptor for AnthropicMessagesAdaptor {
@@ -66,6 +88,9 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
             started: false,
             usage: None,
             provenance: None,
+            next_block_index: 0,
+            open_block: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -132,38 +157,26 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
     ) -> AdaptorResult<Vec<WireStreamEvent>> {
         match event {
             OutputEvent::TextDelta {
-                index,
                 delta,
                 channel: TextChannel::Output,
-            } => Ok(vec![WireStreamEvent::json(
-                Some("content_block_delta".to_string()),
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": delta},
-                }),
-            )]),
+                ..
+            } => render_text_delta(state, AnthropicBlockKind::Text, delta),
             OutputEvent::TextDelta {
-                index,
                 delta,
                 channel: TextChannel::Reasoning,
-            } => Ok(vec![WireStreamEvent::json(
-                Some("content_block_delta".to_string()),
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "thinking_delta", "thinking": delta},
-                }),
-            )]),
-            OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(delta),
-            OutputEvent::StructuredOutputDelta(delta) => Ok(vec![WireStreamEvent::json(
-                Some("content_block_delta".to_string()),
-                json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": structured_delta_string(delta)},
-                }),
-            )]),
+                ..
+            } => render_text_delta(state, AnthropicBlockKind::Thinking, delta),
+            OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
+            OutputEvent::StructuredOutputDelta(delta) => render_text_delta(
+                state,
+                AnthropicBlockKind::Text,
+                structured_delta_string(delta),
+            ),
+            OutputEvent::ToolCallStart(start) => render_tool_call_start(state, start),
+            OutputEvent::ToolCallArgumentsDelta(delta) => {
+                render_tool_call_arguments_delta(state, delta.index, delta.delta)
+            }
+            OutputEvent::ToolCallEnd(end) => render_tool_call_end(state, end.index),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
                 Ok(Vec::new())
@@ -172,36 +185,40 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
                 state.provenance = Some(provenance);
                 Ok(Vec::new())
             }
-            OutputEvent::Error { message, code } => Ok(vec![WireStreamEvent::json(
-                Some("error".to_string()),
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": code.unwrap_or_else(|| "invalid_request_error".to_string()),
-                        "message": message,
-                    },
-                }),
-            )]),
+            OutputEvent::Error { message, code } => {
+                let mut events = close_open_block(state);
+                events.push(WireStreamEvent::json(
+                    Some("error".to_string()),
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": code.unwrap_or_else(|| "invalid_request_error".to_string()),
+                            "message": message,
+                        },
+                    }),
+                ));
+                Ok(events)
+            }
             OutputEvent::Finished { stop_reason, usage } => {
                 if let Some(usage) = usage {
                     state.usage = Some(usage);
                 }
-                Ok(vec![
-                    WireStreamEvent::json(
-                        Some("message_delta".to_string()),
-                        json!({
-                            "type": "message_delta",
-                            "delta": {"stop_reason": stop_reason_json(stop_reason)},
-                            "usage": state.usage.map(usage_json).unwrap_or_else(|| {
-                                usage_json(crate::Usage::default())
-                            }),
+                let mut events = close_open_block(state);
+                events.push(WireStreamEvent::json(
+                    Some("message_delta".to_string()),
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason_json(stop_reason)},
+                        "usage": state.usage.map(usage_json).unwrap_or_else(|| {
+                            usage_json(crate::Usage::default())
                         }),
-                    ),
-                    WireStreamEvent::json(
-                        Some("message_stop".to_string()),
-                        attach_hellas(json!({"type": "message_stop"}), state.provenance.as_ref()),
-                    ),
-                ])
+                    }),
+                ));
+                events.push(WireStreamEvent::json(
+                    Some("message_stop".to_string()),
+                    attach_hellas(json!({"type": "message_stop"}), state.provenance.as_ref()),
+                ));
+                Ok(events)
             }
         }
     }
@@ -391,18 +408,203 @@ fn output_blocks_json(output: &[OutputItem]) -> Vec<JsonValue> {
     blocks
 }
 
-fn render_tool_call_delta(delta: ToolCallDelta) -> AdaptorResult<Vec<WireStreamEvent>> {
+fn render_text_delta(
+    state: &mut AnthropicMessagesStreamState,
+    kind: AnthropicBlockKind,
+    delta: String,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let mut events = ensure_open_block(state, kind);
+    let index = state
+        .open_block
+        .as_ref()
+        .expect("ensure_open_block leaves a block open")
+        .index;
+    let delta = match kind {
+        AnthropicBlockKind::Text => json!({"type": "text_delta", "text": delta}),
+        AnthropicBlockKind::Thinking => json!({"type": "thinking_delta", "thinking": delta}),
+        AnthropicBlockKind::Tool => {
+            return Err(AdaptorError::render(
+                "tool blocks cannot render text deltas",
+            ));
+        }
+    };
+    events.push(WireStreamEvent::json(
+        Some("content_block_delta".to_string()),
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta,
+        }),
+    ));
+    Ok(events)
+}
+
+fn ensure_open_block(
+    state: &mut AnthropicMessagesStreamState,
+    kind: AnthropicBlockKind,
+) -> Vec<WireStreamEvent> {
+    if state
+        .open_block
+        .as_ref()
+        .is_some_and(|block| block.kind == kind)
+    {
+        return Vec::new();
+    }
+
+    let mut events = close_open_block(state);
+    let index = next_block_index(state);
+    state.open_block = Some(AnthropicOpenBlock { index, kind });
+    events.push(WireStreamEvent::json(
+        Some("content_block_start".to_string()),
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": block_start_json(kind),
+        }),
+    ));
+    events
+}
+
+fn block_start_json(kind: AnthropicBlockKind) -> JsonValue {
+    match kind {
+        AnthropicBlockKind::Text => json!({"type": "text", "text": ""}),
+        AnthropicBlockKind::Thinking => json!({"type": "thinking", "thinking": ""}),
+        AnthropicBlockKind::Tool => unreachable!("tool block start requires tool metadata"),
+    }
+}
+
+fn close_open_block(state: &mut AnthropicMessagesStreamState) -> Vec<WireStreamEvent> {
+    let Some(block) = state.open_block.take() else {
+        return Vec::new();
+    };
+    vec![WireStreamEvent::json(
+        Some("content_block_stop".to_string()),
+        json!({
+            "type": "content_block_stop",
+            "index": block.index,
+        }),
+    )]
+}
+
+fn next_block_index(state: &mut AnthropicMessagesStreamState) -> usize {
+    let index = state.next_block_index;
+    state.next_block_index = state.next_block_index.saturating_add(1);
+    index
+}
+
+fn render_tool_call_delta(
+    state: &mut AnthropicMessagesStreamState,
+    delta: ToolCallDelta,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    if let Some(name) = delta.name_delta {
+        return render_tool_call_start(
+            state,
+            crate::ToolCallStart {
+                index: delta.index,
+                id: delta.id,
+                name,
+            },
+        );
+    }
+    render_tool_call_arguments_delta(
+        state,
+        delta.index,
+        delta.arguments_delta.unwrap_or_default(),
+    )
+}
+
+fn render_tool_call_start(
+    state: &mut AnthropicMessagesStreamState,
+    start: crate::ToolCallStart,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let id = start
+        .id
+        .ok_or_else(|| AdaptorError::render("Anthropic tool call start requires an id"))?;
+    if state
+        .tool_calls
+        .iter()
+        .any(|call| call.parser_index == start.index)
+    {
+        return Err(AdaptorError::render(format!(
+            "duplicate tool call start for index {}",
+            start.index
+        )));
+    }
+
+    let mut events = close_open_block(state);
+    let block_index = next_block_index(state);
+    state.open_block = Some(AnthropicOpenBlock {
+        index: block_index,
+        kind: AnthropicBlockKind::Tool,
+    });
+    state.tool_calls.push(AnthropicToolCallState {
+        parser_index: start.index,
+        block_index,
+    });
+
+    events.push(WireStreamEvent::json(
+        Some("content_block_start".to_string()),
+        json!({
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": id,
+                "name": start.name,
+                "input": {},
+            },
+        }),
+    ));
+    Ok(events)
+}
+
+fn render_tool_call_arguments_delta(
+    state: &AnthropicMessagesStreamState,
+    index: usize,
+    delta: String,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let block_index = tool_call_block_index(state, index)?;
     Ok(vec![WireStreamEvent::json(
         Some("content_block_delta".to_string()),
         json!({
             "type": "content_block_delta",
-            "index": delta.index,
+            "index": block_index,
             "delta": {
                 "type": "input_json_delta",
-                "partial_json": delta.arguments_delta.unwrap_or_default(),
+                "partial_json": delta,
             },
         }),
     )])
+}
+
+fn render_tool_call_end(
+    state: &mut AnthropicMessagesStreamState,
+    index: usize,
+) -> AdaptorResult<Vec<WireStreamEvent>> {
+    let block_index = tool_call_block_index(state, index)?;
+    state.tool_calls.retain(|call| call.parser_index != index);
+    if state
+        .open_block
+        .as_ref()
+        .is_some_and(|block| block.index == block_index && block.kind == AnthropicBlockKind::Tool)
+    {
+        return Ok(close_open_block(state));
+    }
+    Err(AdaptorError::render(format!(
+        "tool call index {index} is not open"
+    )))
+}
+
+fn tool_call_block_index(
+    state: &AnthropicMessagesStreamState,
+    parser_index: usize,
+) -> AdaptorResult<usize> {
+    state
+        .tool_calls
+        .iter()
+        .find(|call| call.parser_index == parser_index)
+        .map(|call| call.block_index)
+        .ok_or_else(|| AdaptorError::render(format!("unknown tool call index {parser_index}")))
 }
 
 fn attach_hellas(mut body: JsonValue, provenance: Option<&crate::Provenance>) -> JsonValue {
@@ -494,7 +696,7 @@ fn required_array(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldPath, Provenance, Usage, WireBody};
+    use crate::{FieldPath, Provenance, Usage, WireBody, WireEventData};
 
     fn adaptor() -> AnthropicMessagesAdaptor {
         AnthropicMessagesAdaptor
@@ -627,5 +829,126 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name.as_deref(), Some("message_delta"));
         assert_eq!(events[1].name.as_deref(), Some("message_stop"));
+    }
+
+    #[test]
+    fn stream_text_delta_opens_and_finish_closes_content_block() {
+        let request = sample_request();
+        let mut state =
+            adaptor().initial_state(&request, RenderContext::new("msg-test", "unused", 0));
+
+        let text = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::TextDelta {
+                    index: 0,
+                    delta: "hello".to_string(),
+                    channel: TextChannel::Output,
+                },
+            )
+            .unwrap();
+        let finish = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Finished {
+                    stop_reason: StopReason::EndOfText,
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(text[0].name.as_deref(), Some("content_block_start"));
+        assert_eq!(text[1].name.as_deref(), Some("content_block_delta"));
+        let WireEventData::Json(start_json) = &text[0].data else {
+            panic!("expected content block start json");
+        };
+        assert_eq!(start_json["index"], 0);
+        assert_eq!(start_json["content_block"]["type"], "text");
+        let WireEventData::Json(delta_json) = &text[1].data else {
+            panic!("expected content block delta json");
+        };
+        assert_eq!(delta_json["index"], 0);
+        assert_eq!(delta_json["delta"]["text"], "hello");
+
+        assert_eq!(finish[0].name.as_deref(), Some("content_block_stop"));
+        assert_eq!(finish[1].name.as_deref(), Some("message_delta"));
+        assert_eq!(finish[2].name.as_deref(), Some("message_stop"));
+    }
+
+    #[test]
+    fn stream_tool_call_events_render_anthropic_blocks() {
+        let request = sample_request();
+        let mut state =
+            adaptor().initial_state(&request, RenderContext::new("msg-test", "unused", 0));
+
+        let start = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallStart(crate::ToolCallStart {
+                    index: 0,
+                    id: Some("toolu_1".to_string()),
+                    name: "lookup".to_string(),
+                }),
+            )
+            .unwrap();
+        let args = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallArgumentsDelta(crate::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: "{\"query\":\"tea\"}".to_string(),
+                }),
+            )
+            .unwrap();
+        let end = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::ToolCallEnd(crate::ToolCallEnd {
+                    index: 0,
+                    arguments: json!({"query": "tea"}),
+                }),
+            )
+            .unwrap();
+        let finish = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Finished {
+                    stop_reason: StopReason::ToolCall,
+                    usage: Some(Usage {
+                        input_tokens: Some(4),
+                        output_tokens: Some(2),
+                        total_tokens: Some(6),
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(start[0].name.as_deref(), Some("content_block_start"));
+        let WireEventData::Json(start_json) = &start[0].data else {
+            panic!("expected tool start json");
+        };
+        assert_eq!(start_json["content_block"]["type"], "tool_use");
+        assert_eq!(start_json["content_block"]["id"], "toolu_1");
+        assert_eq!(start_json["content_block"]["name"], "lookup");
+
+        assert_eq!(args[0].name.as_deref(), Some("content_block_delta"));
+        let WireEventData::Json(args_json) = &args[0].data else {
+            panic!("expected tool arguments json");
+        };
+        assert_eq!(args_json["delta"]["type"], "input_json_delta");
+        assert_eq!(args_json["delta"]["partial_json"], "{\"query\":\"tea\"}");
+
+        assert_eq!(end[0].name.as_deref(), Some("content_block_stop"));
+        let WireEventData::Json(finish_json) = &finish[0].data else {
+            panic!("expected finish json");
+        };
+        assert_eq!(finish_json["delta"]["stop_reason"], "tool_use");
+        assert_eq!(finish[1].name.as_deref(), Some("message_stop"));
     }
 }
