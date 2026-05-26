@@ -25,11 +25,8 @@ impl MetricsBundle {
     }
 
     /// Attach iroh's `EndpointMetrics` so they are emitted alongside the
-    /// prometheus-client registry. Only the `serve` command currently calls
-    /// this — the gateway path could be wired up similarly once it has an
-    /// `Endpoint` handle to expose.
-    #[cfg(feature = "otel")]
-    #[allow(dead_code)] // unused in `--features otel` without `candle`
+    /// prometheus-client registry.
+    #[cfg(all(feature = "otel", feature = "hellas-executor"))]
     pub fn with_iroh(mut self, iroh: iroh::metrics::EndpointMetrics) -> Self {
         self.iroh = Some(iroh);
         self
