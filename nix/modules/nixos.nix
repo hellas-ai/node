@@ -9,6 +9,7 @@
 }: let
   inherit (lib) mkIf mkOption types;
   cfg = config.services.hellas;
+  gateway = cfg.gateway;
 in {
   options.services.hellas =
     hellas.commonOptions {
@@ -25,6 +26,7 @@ in {
     }
     // hellas.serveOptions {inherit lib;}
     // {
+      gateway = hellas.gatewayOptions {inherit lib;};
       openFirewall = mkOption {
         type = types.bool;
         default = false;
@@ -32,15 +34,37 @@ in {
       };
     };
 
-  config = mkIf cfg.enable {
+  config = mkIf (cfg.enable || gateway.enable) {
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
         message = "services.hellas is only supported on Linux.";
       }
+      {
+        assertion = gateway.nodeAddrs == [] || gateway.nodeId != null;
+        message = "services.hellas.gateway.nodeAddrs requires services.hellas.gateway.nodeId.";
+      }
+      {
+        assertion =
+          !gateway.local
+          || (gateway.nodeId == null && gateway.nodeAddrs == [] && gateway.verifyNodeId == null);
+        message = "services.hellas.gateway.local cannot be combined with direct or verification node ids.";
+      }
+      {
+        assertion = !(gateway.local && gateway.verifyLocal);
+        message = "services.hellas.gateway.local and services.hellas.gateway.verifyLocal are mutually exclusive.";
+      }
+      {
+        assertion = !(gateway.verifyLocal && gateway.verifyNodeId != null);
+        message = "services.hellas.gateway.verifyLocal and services.hellas.gateway.verifyNodeId are mutually exclusive.";
+      }
+      {
+        assertion = gateway.verifyNodeId == null || gateway.nodeId != null;
+        message = "services.hellas.gateway.verifyNodeId requires services.hellas.gateway.nodeId.";
+      }
     ];
 
-    systemd.services.hellas = {
+    systemd.services.hellas = mkIf cfg.enable {
       description = "Hellas node server";
       wantedBy = ["multi-user.target"];
       after = ["network-online.target"];
@@ -68,8 +92,41 @@ in {
       };
     };
 
-    networking.firewall = mkIf (cfg.openFirewall && cfg.port != null) {
-      allowedUDPPorts = [cfg.port];
+    systemd.services.hellas-gateway = mkIf gateway.enable {
+      description = "Hellas HTTP gateway";
+      wantedBy = ["multi-user.target"];
+      after = ["network-online.target"];
+      wants = ["network-online.target"];
+      environment = hellas.renderEnvironment (
+        hellas.mkOtelEnv {
+          inherit lib;
+          inherit (cfg) otel;
+        }
+        // cfg.environment
+        // {HOME = "/var/lib/hellas-gateway";}
+      );
+      serviceConfig =
+        {
+          ExecStart = lib.escapeShellArgs (
+            ["${cfg.package}/bin/hellas-cli"]
+            ++ hellas.mkGatewayArgs {
+              inherit lib;
+              inherit gateway;
+            }
+          );
+          Restart = "on-failure";
+          DynamicUser = true;
+          StateDirectory = "hellas-gateway";
+          WorkingDirectory = "/var/lib/hellas-gateway";
+        }
+        // lib.optionalAttrs (gateway.environmentFile != null) {
+          EnvironmentFile = gateway.environmentFile;
+        };
+    };
+
+    networking.firewall = {
+      allowedUDPPorts = lib.optionals (cfg.enable && cfg.openFirewall && cfg.port != null) [cfg.port];
+      allowedTCPPorts = lib.optionals (gateway.enable && gateway.openFirewall && gateway.port != null) [gateway.port];
     };
   };
 }

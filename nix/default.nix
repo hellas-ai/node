@@ -101,6 +101,19 @@
     inherit pkgs lib rustToolchain;
   };
 
+  mkHydraSourceCheck = {
+    name,
+    inputs,
+    command,
+  }:
+    pkgs.runCommand "hellas-${name}" {
+      nativeBuildInputs = inputs;
+    } ''
+      cd ${nativePkg.buildSrc}
+      ${command}
+      touch "$out"
+    '';
+
   hfCaches = import ./tests/huggingface.nix {
     inherit pkgs lib;
   };
@@ -140,6 +153,14 @@
 
   nativePackages = packagesFor null;
   crossOutputs = lib.mapAttrs (_: spec: packagesFor spec) crossTargets;
+  crossPackages = lib.concatMapAttrs (
+    target: targetPackages:
+      lib.mapAttrs' (
+        name: value: lib.nameValuePair "cross-${target}-${name}" value
+      )
+      targetPackages
+  ) crossOutputs;
+  isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
 
   linuxOutputs = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (let
     docker = import ./docker.nix {
@@ -148,10 +169,11 @@
       cliCandle = nativePackages.cli-candle;
     };
 
-    nixosTests = import ./tests {
-      inherit self pkgs lib;
-      package = nativePackages.cli-candle;
-    };
+    nixosTests =
+      lib.optionalAttrs isX86_64Linux (import ./tests {
+        inherit self pkgs lib;
+        package = nativePackages.cli-candle;
+      });
   in {
     packages =
       {cli-candle-cuda = docker.defaultCudaCli;}
@@ -174,15 +196,64 @@
 
     inherit nixosTests;
   });
+
+  defaultDevShell = pkgs.mkShell {
+    packages = devShellPackages;
+    shellHook = envShellHook;
+  };
+
+  hydraLints = {
+    sort = mkHydraSourceCheck {
+      name = "check-sort";
+      inputs = [pkgs.cargo-sort];
+      command = "cargo-sort --workspace --check";
+    };
+
+    fmt = mkHydraSourceCheck {
+      name = "check-fmt";
+      inputs = [rustToolchain];
+      command = "cargo fmt --all -- --check";
+    };
+
+    clippy = nativePkg.mkHellasPackage {
+      pname = "hellas-check-clippy";
+      cargoBuildType = "debug";
+      buildPhase = ''
+        runHook preBuild
+        cargo clippy --workspace --all-targets --offline -- -D warnings
+        runHook postBuild
+      '';
+      doCheck = false;
+      installPhase = ''
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
+    };
+  };
+
+  hydraPackages = {
+    inherit (nativePackages) cli cli-candle;
+  };
+
+  hydraE2e = linuxOutputs.nixosTests or {};
+
+  hydraRequired = pkgs.releaseTools.aggregate {
+    name = "hellas-required";
+    constituents =
+      [defaultDevShell]
+      ++ lib.attrValues hydraLints
+      ++ lib.attrValues hydraPackages
+      ++ lib.attrValues hydraE2e;
+  };
 in {
   packages =
     nativePackages
     // {
       default = nativePackages.cli;
-      cross = crossOutputs;
       "hf-cache-lfm2-350m" = hfCaches.lfm2_350MCache;
       "hf-cache-qwen3-0_6b" = hfCaches.qwen3_0_6BCache;
     }
+    // crossPackages
     // (linuxOutputs.packages or {});
 
   apps =
@@ -202,14 +273,26 @@ in {
 
   devShells =
     {
-      default = pkgs.mkShell {
-        packages = devShellPackages;
-        shellHook = envShellHook;
-      };
+      default = defaultDevShell;
     }
     // (linuxOutputs.devShells or {});
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
   checks = linuxOutputs.nixosTests or {};
   nixosTests = linuxOutputs.nixosTests or {};
+
+  hydraJobs =
+    {
+      devShell = defaultDevShell;
+      lints = hydraLints;
+      packages =
+        hydraPackages
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          inherit (nativePackages) cli-candle-metal;
+        };
+      required = hydraRequired;
+    }
+    // lib.optionalAttrs isX86_64Linux {
+      e2e = hydraE2e;
+    };
 }

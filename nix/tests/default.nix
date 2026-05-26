@@ -106,16 +106,6 @@
       --node-addr "$(< /var/lib/hellas-gateway/node-addr)"
   '';
 
-  # Same as `gatewayLauncher` but omits `--node-id`/`--node-addr` so the
-  # gateway falls back to mDNS+DHT discovery. Used by tests that exercise
-  # multi-executor routing.
-  gatewayLauncherDiscovery = pkgs.writeShellScript "hellas-gateway-launcher-discovery" ''
-    exec ${package}/bin/hellas-cli gateway \
-      --host=0.0.0.0 \
-      --port=${toString gatewayPort} \
-      --retries=1
-  '';
-
   mkGatewayNode = {
     hfHome,
     cores ? 2,
@@ -155,26 +145,25 @@
     hfHome,
     cores ? 2,
     memorySize ? 4096,
+    extraPackages ? [],
   }: _: {
+    imports = [hellasModule];
     config = lib.mkMerge [
       baseNode
       {
-        networking.firewall.allowedTCPPorts = [gatewayPort];
-        systemd.services.hellas-gateway = {
-          description = "Hellas gateway (discovery)";
-          after = ["network-online.target"];
-          wants = ["network-online.target"];
+        environment.systemPackages = extraPackages;
+        services.hellas = {
+          inherit package;
           environment = {
             HF_HOME = hfHome;
-            HOME = "/var/lib/hellas-gateway";
             RUST_LOG = "info,iroh=warn,iroh_relay=warn,pkarr=warn,iroh_dns=warn";
           };
-          serviceConfig = {
-            DynamicUser = true;
-            Restart = "on-failure";
-            StateDirectory = "hellas-gateway";
-            WorkingDirectory = "/var/lib/hellas-gateway";
-            ExecStart = "${gatewayLauncherDiscovery}";
+          gateway = {
+            enable = true;
+            host = "0.0.0.0";
+            port = gatewayPort;
+            retries = 1;
+            openFirewall = true;
           };
         };
         virtualisation.cores = cores;
@@ -216,6 +205,76 @@
     ];
     max_tokens = 8;
   });
+
+  proxyPort = 18080;
+  proxyRequest = pkgs.writeText "hellas-gateway-proxy-request.json" (builtins.toJSON {
+    model = "proxy-model";
+    input = "Return the proxy marker.";
+    max_output_tokens = 8;
+  });
+  proxyUpstream = pkgs.writeText "hellas-responses-upstream.py" ''
+    import json
+    import sys
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_error(404)
+
+        def do_POST(self):
+            if self.path != "/v1/responses":
+                self.send_error(404)
+                return
+            if self.headers.get("authorization") != "Bearer proxy-secret":
+                self.send_error(401)
+                return
+
+            length = int(self.headers.get("content-length", "0"))
+            request = json.loads(self.rfile.read(length))
+            body = {
+                "id": "resp_mock",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": request["model"],
+                "output": [
+                    {
+                        "id": "msg_mock",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "proxied-ok",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3,
+                },
+            }
+            encoded = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *args):
+            return
+
+    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+  '';
 
   # Drives the gateway through pi-coding-agent and verifies the full agentic
   # loop. The model must call the bash tool to read a file whose contents it
@@ -383,7 +442,7 @@ in {
   # Two executors (qwen + lfm2), one gateway in discovery mode, two pi
   # processes in parallel. Verifies that mDNS routing finds the right
   # executor for each requested model and that distinct requests produce
-  # distinct receipt/commitment CIDs in the gateway journal.
+  # distinct receipt and commitment values in the gateway journal.
   gateway-multi-model = pkgs.testers.runNixOSTest {
     name = "hellas-gateway-multi-model";
 
@@ -399,18 +458,11 @@ in {
       cores = 2;
       memorySize = 6144;
     };
-    nodes.gateway = _: {
-      config = lib.mkMerge [
-        ((mkGatewayNodeDiscovery {
-          hfHome = hfHomeBoth;
-          cores = 2;
-          memorySize = 4096;
-        }) {})
-        .config
-        {
-          environment.systemPackages = [pkgs.pi-coding-agent];
-        }
-      ];
+    nodes.gateway = mkGatewayNodeDiscovery {
+      hfHome = hfHomeBoth;
+      cores = 2;
+      memorySize = 4096;
+      extraPackages = [pkgs.pi-coding-agent];
     };
 
     testScript = {nodes, ...}: let
@@ -452,8 +504,6 @@ in {
       executor_lfm2.wait_for_unit("hellas.service")
       gateway.wait_for_unit("multi-user.target")
 
-      gateway.succeed("install -d -m 0755 /var/lib/hellas-gateway")
-      gateway.succeed("systemctl start hellas-gateway.service")
       gateway.wait_for_unit("hellas-gateway.service")
       gateway.wait_for_open_port(${toString gatewayPort})
 
@@ -495,14 +545,69 @@ in {
       gateway.succeed("grep -F ${qwenMarker} /tmp/pi-qwen.log")
       gateway.succeed("grep -F ${lfm2Marker} /tmp/pi-lfm2.log")
 
-      # CID distinctness — each successful request emits one info! line with
-      # both fields. With 2 distinct requests we expect ≥ 2 distinct
+      # Each successful request emits one info! line with both fields. With
+      # two distinct requests we expect ≥ 2 distinct
       # receipt_cid and ≥ 2 distinct commitment values.
       import re
       receipts = set(re.findall(r"receipt_cid=(\S+)", journal))
       commits  = set(re.findall(r"commitment=(\S+)", journal)) - {""}
       assert len(receipts) >= 2, f"expected ≥2 receipt_cid, got {receipts}"
       assert len(commits)  >= 2, f"expected ≥2 commitment, got {commits}"
+    '';
+  };
+
+  gateway-proxy-responses = pkgs.testers.runNixOSTest {
+    name = "hellas-gateway-proxy-responses";
+
+    nodes.gateway = _: {
+      imports = [hellasModule];
+      config = lib.mkMerge [
+        baseNode
+        {
+          services.hellas = {
+            inherit package;
+            environment = {
+              OPENAI_API_KEY = "proxy-secret";
+              RUST_LOG = "info";
+            };
+            gateway = {
+              enable = true;
+              host = "0.0.0.0";
+              port = gatewayPort;
+              responsesBackend = "proxy";
+              responsesProxyUrl = "http://127.0.0.1:${toString proxyPort}/v1/responses";
+              responsesProxyApiKeyEnv = "OPENAI_API_KEY";
+              openFirewall = true;
+            };
+          };
+          virtualisation.cores = 1;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+
+    nodes.client = clientNode;
+
+    testScript = {nodes, ...}: let
+      gatewayAddr = (lib.head nodes.gateway.networking.interfaces.eth1.ipv4.addresses).address;
+    in ''
+      start_all()
+      gateway.wait_for_unit("multi-user.target")
+      client.wait_for_unit("multi-user.target")
+
+      gateway.succeed("${pkgs.python3}/bin/python ${proxyUpstream} ${toString proxyPort} > /tmp/responses-upstream.log 2>&1 &")
+      gateway.wait_until_succeeds("curl -sf http://127.0.0.1:${toString proxyPort}/health")
+      gateway.wait_for_unit("hellas-gateway.service")
+      gateway.wait_for_open_port(${toString gatewayPort})
+
+      client.succeed(
+          "curl -sf http://${gatewayAddr}:${toString gatewayPort}/v1/responses -H 'content-type: application/json' --data @${proxyRequest} > /tmp/proxy-response.json"
+      )
+      client.succeed(
+          "${pkgs.jq}/bin/jq -e '.model == \"proxy-model\" and .output[0].content[0].text == \"proxied-ok\" and .usage.total_tokens == 3' /tmp/proxy-response.json"
+      )
+
+      client.copy_from_vm("/tmp/proxy-response.json", "hellas-gateway-proxy-response.json")
     '';
   };
 }

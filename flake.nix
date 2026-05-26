@@ -25,7 +25,12 @@
       "aarch64-linux"
       "aarch64-darwin"
     ];
+    hydraSystems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
     forAllSystems = nixpkgs.lib.genAttrs systems;
+    forHydraSystems = nixpkgs.lib.genAttrs hydraSystems;
     perSystem = forAllSystems (
       system:
         import ./nix {
@@ -44,6 +49,7 @@
     devShells = forAllSystems (system: perSystem.${system}.devShells);
     checks = forAllSystems (system: perSystem.${system}.checks);
     nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
+    hydraJobs = forHydraSystems (system: perSystem.${system}.hydraJobs);
 
     overlays.default = final: _prev: {
       hellas = self.packages.${final.system};
