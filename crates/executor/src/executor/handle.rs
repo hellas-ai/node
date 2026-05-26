@@ -175,8 +175,6 @@ impl SymbolicHandler for ExecutorHandle {
     ) -> Result<WithTrailer<Ticket>, WireStatus> {
         let outcome = self.create_symbolic_ticket(request).await?;
         let result = with_provenance(outcome);
-        // Provenance not yet plumbed into the wire-layer trailer; see
-        // CUTOVER_FINDINGS for the follow-up.
         Ok(result)
     }
 }
@@ -265,8 +263,7 @@ impl CourtesyHandler for ExecutorHandle {
     ) -> impl std::future::Future<Output = Result<DecodeTokensStream, WireStatus>> + Send
     {
         // The codegen does not yet emit a bidi-streaming dispatcher; this
-        // handler is unreachable until the wire-v2 streaming helpers
-        // land. See CUTOVER_FINDINGS.
+        // handler is unreachable until bidi streaming support is added.
         async move {
             Err(WireStatus::unimplemented(
                 "decode_tokens: bidi streaming pending wire-v2 helpers",

@@ -14,18 +14,16 @@
 //!                                ├─ primary: PreparedRoute::stream
 //!                                │   ├─ Local:        local stream over ExecutorHandle
 //!                                │   ├─ RemoteDirect: ExecuteClientImpl over IrohTransport
-//!                                │   └─ RemoteDiscovery: still stubbed (see CUTOVER_FINDINGS)
+//!                                │   └─ RemoteDiscovery: discover, quote, then execute
 //!                                └─ shadow (verify):  same shape, run after primary
 //! ```
 //!
 //! NOTE: RemoteDiscovery races peers from `ServiceRegistry::discover` and
-//! takes the first that returns a successful quote. The pre-cutover impl
-//! drove the same race over `IrohRpcPool::dial` + `discover_remote_quote`;
-//! the new shape uses the wire crate's pooled `transport()` API directly.
+//! takes the first that returns a successful quote. The run step then opens
+//! an Execute service transport for the selected peer.
 
-// A few "kept for shape" helpers are reachable from one feature combination
-// but not the other. Keep dead_code muted at the file level so we don't end
-// up sprinkling cfg-gated allows everywhere.
+// Some helpers are reachable only under specific feature combinations.
+// Keep the cfg noise localized to this module.
 #![allow(dead_code)]
 
 use anyhow::{Context, anyhow, bail};
@@ -593,10 +591,10 @@ async fn drain_to_outcome(
 }
 
 // ---------------------------------------------------------------------------
-// PreparedRoute — Local | RemoteDirect | RemoteDiscovery (last still stubbed)
+// PreparedRoute
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::large_enum_variant)] // see PreparedRoute (pre-cutover)
+#[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
@@ -724,7 +722,7 @@ impl PreparedRoute {
 }
 
 // ---------------------------------------------------------------------------
-// OpaquePreparedRoute — Local | RemoteDirect | RemoteDiscovery (last stubbed)
+// OpaquePreparedRoute
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)]
@@ -1075,8 +1073,7 @@ fn remote_execute_stream(
         }
         // Stream EOF: surface the terminal trailer. A non-Ok trailer
         // (handler aborted mid-stream, transport-level abort, etc.)
-        // becomes the call's Err — much more informative than the old
-        // "ended without terminal outcome" catch-all.
+        // becomes the call's error.
         wire.finish()
             .map_err(|status| anyhow!(status).context("remote execute stream trailer"))?;
         if !got_terminal {
