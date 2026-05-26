@@ -228,14 +228,6 @@ impl ReceiptArtifact {
             symbolic_text_artifact,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_bytes(dag_cbor: Vec<u8>) -> Self {
-        Self {
-            dag_cbor,
-            symbolic_text_artifact: None,
-        }
-    }
 }
 
 impl Outcome {
@@ -285,37 +277,21 @@ impl ExecutionRuntime {
     }
 
     /// Remote-capable runtime: binds an iroh `Endpoint` keyed on
-    /// `secret_key`, builds a `ServiceRegistry`, and registers no
-    /// discovery backends by default. `seed_targets` are dial hints
-    /// consumed at `Endpoint::connect` time per call site; they do
-    /// not become durable peer state.
-    pub async fn remote(
-        secret_key: SecretKey,
-        seed_targets: Vec<EndpointAddr>,
-    ) -> anyhow::Result<Self> {
-        Self::default().with_remote(secret_key, seed_targets).await
+    /// `secret_key` and builds a `ServiceRegistry`.
+    pub async fn remote(secret_key: SecretKey) -> anyhow::Result<Self> {
+        Self::default().with_remote(secret_key).await
     }
 
     /// Add remote-capability to an existing runtime (typically one
     /// built via [`Self::local`] when verify-against-local is active).
-    /// Builds the iroh `Endpoint` and `ServiceRegistry`; `seed_targets`
-    /// remain ephemeral dial hints (see [`RemoteNodeTarget`]).
-    pub async fn with_remote(
-        mut self,
-        secret_key: SecretKey,
-        _seed_targets: Vec<EndpointAddr>,
-    ) -> anyhow::Result<Self> {
+    /// Builds the iroh `Endpoint` and `ServiceRegistry`.
+    pub async fn with_remote(mut self, secret_key: SecretKey) -> anyhow::Result<Self> {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
             .context("failed to bind iroh endpoint for ExecutionRuntime")?;
         let registry = ServiceRegistry::new(&endpoint);
-        // Static dial hints belong at `Endpoint::connect` time (carried
-        // in `RemoteNodeTarget::addr`), not in discovery state. If a
-        // future use case wants gossip about these peers, add a
-        // `StaticBackend` here — the routing-level hints work without it.
-        let _ = _seed_targets;
         self.remote = Some(RemoteRpc { endpoint, registry });
         Ok(self)
     }

@@ -48,13 +48,13 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             vec![Dtype::F32],
             producer_key,
         )?
-        .with_remote(secret_key, Vec::new())
+        .with_remote(secret_key)
         .await?
     } else {
-        ExecutionRuntime::remote(secret_key, Vec::new()).await?
+        ExecutionRuntime::remote(secret_key).await?
     };
     #[cfg(not(feature = "hellas-executor"))]
-    let runtime = ExecutionRuntime::remote(secret_key, Vec::new()).await?;
+    let runtime = ExecutionRuntime::remote(secret_key).await?;
 
     let request = OpaqueRequest {
         service: options.service,

@@ -43,7 +43,7 @@ impl ExecutionBackend for GatewayBackend {
         })
     }
 
-    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>> {
+    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let prepared = self.prepare(&request).await?;
             let initial_provenance = prepared

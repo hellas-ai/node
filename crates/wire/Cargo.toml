@@ -32,9 +32,6 @@ discovery-mdns = [
     "dep:iroh-mdns-address-lookup",
     "dep:postcard",
 ]
-h2 = ["dep:h2", "dep:http"]
-h3 = []
-
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
 ws = ["mux", "dep:tokio-tungstenite"]
@@ -56,8 +53,6 @@ bytes = "1"
 data-encoding = { version = "2", optional = true }
 futures = "0.3"
 futures-core = "0.3"
-h2 = { version = "0.4", optional = true }
-http = { version = "1", optional = true }
 
 # Optional transport deps
 iroh = { workspace = true, optional = true }

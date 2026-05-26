@@ -1,7 +1,4 @@
 //! Peer feeds: static lists and broadcast-channel-backed feeds.
-//!
-//! mDNS and DHT feed constructors will land alongside the
-//! `discovery-mdns` / `discovery-dht` backends in later slices.
 
 use std::pin::Pin;
 
@@ -16,9 +13,7 @@ use super::discovery::DiscoveredPeer;
 /// transient discovery errors without tearing the whole engine down.
 pub type FeedResult<T> = std::result::Result<T, FeedError>;
 
-/// Discovery-side error. Kept opaque so future backends (DHT, mDNS) can
-/// fold their own error kinds in without breaking the registry's
-/// `Stream<Item = Result<Peer, _>>` shape.
+/// Discovery-side error for backend-specific failures.
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {
     /// Backend-specific error, stringified.

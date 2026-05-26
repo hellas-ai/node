@@ -12,7 +12,6 @@ mod commands;
 mod execution;
 mod identity;
 mod metrics;
-mod text_output;
 mod tracing_config;
 
 /// `clap` value parser for `--dtype`. Accepts model floating-point dtypes.

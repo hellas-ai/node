@@ -2,12 +2,11 @@ use crate::commands::CliResult;
 use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
 };
-use crate::text_output::TextOutputDecoder;
 use catgrad::prelude::Dtype;
 use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_rpc::ExecutorError;
-use hellas_rpc::model::ModelAssets;
+use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -102,13 +101,13 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                 options.dtype.clone(),
                 producer_key,
             )?
-            .with_remote(secret_key.clone(), Vec::new())
+            .with_remote(secret_key.clone())
             .await?
         } else {
-            ExecutionRuntime::remote(secret_key.clone(), Vec::new()).await?
+            ExecutionRuntime::remote(secret_key.clone()).await?
         };
         #[cfg(not(feature = "hellas-executor"))]
-        let runtime = ExecutionRuntime::remote(secret_key.clone(), Vec::new()).await?;
+        let runtime = ExecutionRuntime::remote(secret_key.clone()).await?;
 
         #[cfg(feature = "hellas-executor")]
         let strategy = if options.verify_local {

@@ -2,7 +2,7 @@ use async_stream::try_stream;
 use futures::StreamExt;
 
 use crate::execution::{Outcome, StopReason};
-use crate::text_output::TextOutputDecoder;
+use hellas_rpc::model::TextOutputDecoder;
 
 use super::super::state::PreparedGeneration;
 

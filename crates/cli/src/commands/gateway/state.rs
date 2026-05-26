@@ -96,13 +96,13 @@ impl GatewayState {
                 )
                 .context("failed to initialize local execution backend")?,
             )
-            .with_remote(options.secret_key.clone(), Vec::new())
+            .with_remote(options.secret_key.clone())
             .await?
         } else {
-            ExecutionRuntime::remote(options.secret_key.clone(), Vec::new()).await?
+            ExecutionRuntime::remote(options.secret_key.clone()).await?
         };
         #[cfg(not(feature = "hellas-executor"))]
-        let runtime = ExecutionRuntime::remote(options.secret_key.clone(), Vec::new()).await?;
+        let runtime = ExecutionRuntime::remote(options.secret_key.clone()).await?;
 
         Ok(Self {
             node_id: options.node_id,
