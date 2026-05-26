@@ -3,8 +3,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     InputItem, ModelRef, OutputEvent, OutputItem, PassthroughBag, RawRequest, ReasoningOptions,
-    RenderContext, StopReason, TextChannel, ToolCallDelta, WireAdaptor, WireResponse,
-    WireStreamEvent,
+    RenderContext, StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
 };
 
 const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -170,7 +169,6 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
                 channel: TextChannel::Reasoning,
                 ..
             } => render_text_delta(state, AnthropicBlockKind::Thinking, delta),
-            OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
             OutputEvent::StructuredOutputDelta(delta) => render_text_delta(
                 state,
                 AnthropicBlockKind::Text,
@@ -494,27 +492,6 @@ fn next_block_index(state: &mut AnthropicMessagesStreamState) -> usize {
     let index = state.next_block_index;
     state.next_block_index = state.next_block_index.saturating_add(1);
     index
-}
-
-fn render_tool_call_delta(
-    state: &mut AnthropicMessagesStreamState,
-    delta: ToolCallDelta,
-) -> AdaptorResult<Vec<WireStreamEvent>> {
-    if let Some(name) = delta.name_delta {
-        return render_tool_call_start(
-            state,
-            crate::ToolCallStart {
-                index: delta.index,
-                id: delta.id,
-                name,
-            },
-        );
-    }
-    render_tool_call_arguments_delta(
-        state,
-        delta.index,
-        delta.arguments_delta.unwrap_or_default(),
-    )
 }
 
 fn render_tool_call_start(

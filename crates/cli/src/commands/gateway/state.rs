@@ -1,28 +1,22 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
-    ExecutionEvent, ExecutionRequest as RuntimeExecutionRequest, ExecutionRoute, ExecutionRuntime,
-    ExecutionStrategy, Outcome, PreparedExecution, RemoteNodeTarget, StopReason,
+    ExecutionRequest as RuntimeExecutionRequest, ExecutionRoute, ExecutionRuntime,
+    ExecutionStrategy, PreparedExecution, RemoteNodeTarget,
 };
-use crate::text_output::TextOutputDecoder;
 use anyhow::Context;
-use async_stream::try_stream;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad::prelude::Dtype;
 use catgrad_llm::PreparedPrompt;
 use catgrad_llm::types::Message;
 use catgrad_llm::types::{ThinkingPolicy, anthropic, openai};
-use futures::Stream;
-use futures::StreamExt;
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::Executor;
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
-use hellas_runtime::cid::Cid;
-use hellas_runtime::runtime::TextReceipt;
+use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_runtime::runtime::chat::{ChatOptions, ChatTurn, ToolDirectory};
 use hellas_wire_adaptors::{
     CanonicalExecution, ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest,
@@ -37,8 +31,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tonic_iroh_transport::iroh::EndpointId;
 
-/// End-to-end deadline applied at the consumer of `PreparedGeneration::stream`.
-/// Covers preparation (quote / discovery) AND the entire decode stream.
+/// End-to-end deadline applied while consuming a prepared generation.
+/// Covers preparation (quote / discovery) and the entire decode stream.
 pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
@@ -77,34 +71,10 @@ pub(super) struct PreparedGeneration {
     pub(super) inference_timeout: Duration,
 }
 
-/// One observation from a generation. The `Done` event is the authoritative
-/// terminal frame — its `Outcome::Completed.total_tokens` is what should
-/// be reported in protocol-level usage frames.
-#[derive(Debug, Clone)]
-pub(super) enum GenerationEvent {
-    Provenance(ExecutionProvenance),
-    Delta(String),
-    Done(Outcome),
-}
-
 #[derive(Debug)]
 pub(super) struct HttpError {
     pub(super) status: StatusCode,
     pub(super) message: String,
-}
-
-pub(super) struct CompletedTextGeneration {
-    pub(super) text: String,
-    pub(super) provenance: Option<ExecutionProvenance>,
-    pub(super) total_tokens: u64,
-    pub(super) stop_reason: StopReason,
-    pub(super) receipt_cid: Cid<TextReceipt>,
-    pub(super) catnix_receipt_commitment: Option<CatnixReceiptCommitment>,
-}
-
-pub(super) enum TextGenerationError {
-    Failed { position: u64, error: String },
-    Stream(String),
 }
 
 impl GatewayState {
@@ -411,7 +381,7 @@ impl GatewayState {
         .await
     }
 
-    pub(super) async fn prepare_wire_execution(
+    pub(super) async fn prepare_responses_execution(
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
@@ -714,96 +684,6 @@ fn classify_chat_turn_error(err: ModelAssetsError) -> HttpError {
 }
 
 impl PreparedGeneration {
-    /// Drive the execution to completion as a stream of `GenerationEvent`s.
-    ///
-    /// Owning consumption: dropping the returned stream cancels everything
-    /// downstream (broadcast subscriber → executor's per-running cancel
-    /// token, or tonic stream → server-side close-monitor on remote).
-    ///
-    /// The `inference_timeout` field on `PreparedGeneration` is *not*
-    /// applied here — callers wrap the stream with `tokio::time::timeout_at`
-    /// against `Self::deadline()` so the protocol can shape the timeout
-    /// frame in its own format.
-    pub(super) fn stream(self) -> impl Stream<Item = anyhow::Result<GenerationEvent>> + Send {
-        let Self {
-            prepared,
-            assets,
-            stop_token_ids,
-            ..
-        } = self;
-        try_stream! {
-            let mut decoder = TextOutputDecoder::new(assets, &stop_token_ids);
-            let inner = prepared.stream();
-            tokio::pin!(inner);
-            while let Some(event) = inner.next().await {
-                match event? {
-                    ExecutionEvent::Provenance(provenance) => {
-                        yield GenerationEvent::Provenance(provenance);
-                    }
-                    ExecutionEvent::Chunk { tokens, .. } => {
-                        let delta = decoder.push_bytes(&tokens)?;
-                        if !delta.is_empty() {
-                            yield GenerationEvent::Delta(delta);
-                        }
-                    }
-                    ExecutionEvent::Done(outcome) => {
-                        yield GenerationEvent::Done(outcome);
-                        return;
-                    }
-                }
-            }
-            Err(anyhow::anyhow!("execution stream ended without terminal outcome"))?;
-        }
-    }
-
-    pub(super) async fn collect_text(self) -> Result<CompletedTextGeneration, TextGenerationError> {
-        let deadline = self.deadline();
-        let mut provenance = self.provenance.clone();
-        let stream = self.stream();
-        tokio::pin!(stream);
-        let mut text = String::new();
-        loop {
-            match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => provenance = Some(prov),
-                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => text.push_str(&delta),
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
-                    total_tokens,
-                    stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
-                })))) => {
-                    return Ok(CompletedTextGeneration {
-                        text,
-                        provenance,
-                        total_tokens,
-                        stop_reason,
-                        receipt_cid,
-                        catnix_receipt_commitment,
-                    });
-                }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {
-                    return Err(TextGenerationError::Failed { position, error });
-                }
-                Ok(Some(Err(err))) => {
-                    return Err(TextGenerationError::Stream(format!(
-                        "Inference error: {err:#}"
-                    )));
-                }
-                Ok(None) => {
-                    return Err(TextGenerationError::Stream(
-                        "execution stream ended without terminal outcome".to_string(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(TextGenerationError::Stream(format!(
-                        "inference timed out after {}s",
-                        super::timeout_secs_until(deadline)
-                    )));
-                }
-            }
-        }
-    }
-
     /// Absolute deadline for this generation's stream consumption.
     /// Computed at call time; covers the whole lifecycle from this point on.
     pub(super) fn deadline(&self) -> tokio::time::Instant {

@@ -214,7 +214,6 @@ pub enum OutputEvent {
     ToolCallStart(ToolCallStart),
     ToolCallArgumentsDelta(ToolCallArgumentsDelta),
     ToolCallEnd(ToolCallEnd),
-    ToolCallDelta(ToolCallDelta),
     StructuredOutputDelta(StructuredDelta),
     Usage(Usage),
     Finished {
@@ -232,16 +231,6 @@ pub enum OutputEvent {
 pub enum TextChannel {
     Output,
     Reasoning,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallDelta {
-    /// Compatibility form for callers that cannot yet split tool calls into
-    /// explicit start, arguments, and end events.
-    pub index: usize,
-    pub id: Option<String>,
-    pub name_delta: Option<String>,
-    pub arguments_delta: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -3,8 +3,8 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     InputItem, ModelRef, OutputEvent, OutputItem, PassthroughBag, RawRequest, ReasoningOptions,
-    RenderContext, ResponseFormat, StopReason, TextChannel, ToolCallDelta, ToolChoice, ToolKind,
-    ToolSpec, Usage, WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
+    RenderContext, ResponseFormat, StopReason, TextChannel, ToolChoice, ToolKind, ToolSpec, Usage,
+    WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
 };
 
 const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -213,7 +213,6 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
                 render_tool_call_arguments_delta(state, delta.index, delta.delta)
             }
             OutputEvent::ToolCallEnd(_) => Ok(Vec::new()),
-            OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
             OutputEvent::StructuredOutputDelta(delta) => Ok(vec![WireStreamEvent::json(
                 None,
                 chat_chunk_json(
@@ -587,26 +586,6 @@ fn output_message_json(output: &[OutputItem]) -> AdaptorResult<JsonValue> {
         message.insert("tool_calls".to_string(), JsonValue::Array(tool_calls));
     }
     Ok(JsonValue::Object(message))
-}
-
-fn render_tool_call_delta(
-    state: &mut ChatCompletionsStreamState,
-    delta: ToolCallDelta,
-) -> AdaptorResult<Vec<WireStreamEvent>> {
-    if let Some(name) = delta.name_delta {
-        return render_tool_call_start(
-            state,
-            crate::ToolCallStart {
-                index: delta.index,
-                id: delta.id,
-                name,
-            },
-        );
-    }
-    if let Some(arguments) = delta.arguments_delta {
-        return render_tool_call_arguments_delta(state, delta.index, arguments);
-    }
-    Ok(Vec::new())
 }
 
 fn render_tool_call_start(

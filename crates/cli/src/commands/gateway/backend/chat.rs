@@ -1,156 +1,24 @@
-use std::sync::Arc;
-
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
 use hellas_runtime::runtime::chat::{
     AssistantTurnAccumulator, DecodeEvent, DecodeFailure, DecodedPart, IncrementalToolCallParser,
     StopReason as ParserStopReason,
 };
 use hellas_wire_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, ExecutionResult,
-    OutputEvent, OutputItem, Provenance, StopReason as WireStopReason, TextChannel, Usage,
+    BackendError, ExecutionResult, OutputEvent, OutputItem, StopReason as WireStopReason,
+    TextChannel,
 };
 
 use crate::execution::{Outcome, StopReason as RuntimeStopReason};
 
-use super::next_id;
-use super::state::{GatewayState, GenerationEvent, PreparedGeneration, TextGenerationError};
+use super::super::next_id;
+use super::super::state::PreparedGeneration;
+use super::generation::{GenerationEvent, generation_stream};
+use super::provenance::{
+    provenance_from_execution, provenance_from_parts, stop_reason_from_runtime, usage,
+};
 
-#[derive(Clone)]
-pub(super) struct GatewayBackend {
-    state: Arc<GatewayState>,
-    surface: GatewaySurface,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum GatewaySurface {
-    Responses,
-    Completion,
-    OpenAiChat,
-    Anthropic,
-}
-
-impl GatewayBackend {
-    pub(super) fn new(state: Arc<GatewayState>, surface: GatewaySurface) -> Self {
-        Self { state, surface }
-    }
-
-    async fn prepare(&self, request: &BackendRequest) -> Result<PreparedGeneration, BackendError> {
-        let result = match self.surface {
-            GatewaySurface::Responses => {
-                self.state.prepare_wire_execution(&request.execution).await
-            }
-            GatewaySurface::Completion => {
-                self.state.prepare_plain_execution(&request.execution).await
-            }
-            GatewaySurface::OpenAiChat => {
-                self.state
-                    .prepare_openai_chat_execution(&request.execution)
-                    .await
-            }
-            GatewaySurface::Anthropic => {
-                self.state
-                    .prepare_anthropic_execution(&request.execution)
-                    .await
-            }
-        };
-        result.map_err(|err| {
-            if err.status.is_client_error() {
-                BackendError::rejected(err.message)
-            } else {
-                BackendError::execution(err.message)
-            }
-        })
-    }
-
-    fn tool_call_id_prefix(&self) -> &'static str {
-        match self.surface {
-            GatewaySurface::Anthropic => "toolu",
-            GatewaySurface::OpenAiChat => "call",
-            GatewaySurface::Responses | GatewaySurface::Completion => "call",
-        }
-    }
-
-    fn ready_message(&self) -> &'static str {
-        match self.surface {
-            GatewaySurface::Responses => "openai response ready",
-            GatewaySurface::Completion => "completion request ready",
-            GatewaySurface::OpenAiChat => "openai chat completion ready",
-            GatewaySurface::Anthropic => "anthropic message completion ready",
-        }
-    }
-}
-
-impl ExecutionBackend for GatewayBackend {
-    fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult> {
-        Box::pin(async move {
-            let prepared = self.prepare(&request).await?;
-            match self.surface {
-                GatewaySurface::Responses | GatewaySurface::Completion => {
-                    execute_text(prepared, self.ready_message()).await
-                }
-                GatewaySurface::OpenAiChat | GatewaySurface::Anthropic => {
-                    execute_chat(prepared, self.tool_call_id_prefix(), self.ready_message()).await
-                }
-            }
-        })
-    }
-
-    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>> {
-        Box::pin(async move {
-            let prepared = self.prepare(&request).await?;
-            let initial_provenance = prepared
-                .provenance
-                .as_ref()
-                .and_then(provenance_from_execution);
-            let stream = match self.surface {
-                GatewaySurface::Responses | GatewaySurface::Completion => BackendStream::new(
-                    text_events(prepared, self.ready_message()),
-                    initial_provenance,
-                ),
-                GatewaySurface::OpenAiChat | GatewaySurface::Anthropic => BackendStream::new(
-                    chat_events(prepared, self.tool_call_id_prefix(), self.ready_message()),
-                    initial_provenance,
-                ),
-            };
-            Ok(stream)
-        })
-    }
-}
-
-async fn execute_text(
-    prepared: PreparedGeneration,
-    ready_message: &'static str,
-) -> Result<ExecutionResult, BackendError> {
-    let prompt_tokens = prepared.prompt_tokens;
-    let completed = prepared
-        .collect_text()
-        .await
-        .map_err(text_generation_error)?;
-    info!(
-        %completed.receipt_cid,
-        provenance = ?completed.provenance,
-        total_tokens = completed.total_tokens,
-        stop_reason = ?completed.stop_reason,
-        message = ready_message,
-        "gateway response ready"
-    );
-    Ok(ExecutionResult {
-        output: vec![OutputItem::Text {
-            text: completed.text,
-            channel: TextChannel::Output,
-        }],
-        usage: Some(usage(prompt_tokens, completed.total_tokens)),
-        stop_reason: stop_reason_from_runtime(completed.stop_reason),
-        provenance: provenance_from_parts(
-            completed.provenance.as_ref(),
-            completed.catnix_receipt_commitment.as_ref(),
-        ),
-    })
-}
-
-async fn execute_chat(
+pub(super) async fn execute_chat(
     prepared: PreparedGeneration,
     tool_call_id_prefix: &'static str,
     ready_message: &'static str,
@@ -160,7 +28,7 @@ async fn execute_chat(
     let mut parser = chat_parser(&prepared)?;
     let mut accumulator = AssistantTurnAccumulator::new();
     let deadline = prepared.deadline();
-    let stream = prepared.stream();
+    let stream = generation_stream(prepared);
     tokio::pin!(stream);
 
     let (total_tokens, stop_reason, receipt_cid, catnix_receipt_commitment) = loop {
@@ -201,7 +69,7 @@ async fn execute_chat(
             Err(_) => {
                 return Err(BackendError::execution(format!(
                     "inference timed out after {}s",
-                    super::timeout_secs_until(deadline)
+                    super::super::timeout_secs_until(deadline)
                 )));
             }
         }
@@ -234,76 +102,7 @@ async fn execute_chat(
     })
 }
 
-fn text_events(
-    prepared: PreparedGeneration,
-    ready_message: &'static str,
-) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send {
-    try_stream! {
-        let prompt_tokens = prepared.prompt_tokens;
-        let mut stream_provenance = prepared.provenance.clone();
-        let deadline = prepared.deadline();
-        let inner = prepared.stream();
-        tokio::pin!(inner);
-
-        loop {
-            match tokio::time::timeout_at(deadline, inner.next()).await {
-                Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
-                    let should_emit = stream_provenance.is_none();
-                    stream_provenance = Some(prov.clone());
-                    if should_emit
-                        && let Some(provenance) = provenance_from_execution(&prov)
-                    {
-                        yield OutputEvent::Provenance(provenance);
-                    }
-                }
-                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
-                    yield OutputEvent::TextDelta {
-                        index: 0,
-                        delta,
-                        channel: TextChannel::Output,
-                    };
-                }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
-                    total_tokens,
-                    stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
-                })))) => {
-                    info!(
-                        %receipt_cid,
-                        provenance = ?stream_provenance,
-                        total_tokens,
-                        ?stop_reason,
-                        message = ready_message,
-                        "gateway stream ready"
-                    );
-                    if let Some(provenance) = provenance_from_parts(
-                        stream_provenance.as_ref(),
-                        catnix_receipt_commitment.as_ref(),
-                    ) {
-                        yield OutputEvent::Provenance(provenance);
-                    }
-                    yield OutputEvent::Finished {
-                        stop_reason: stop_reason_from_runtime(stop_reason),
-                        usage: Some(usage(prompt_tokens, total_tokens)),
-                    };
-                    return;
-                }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
-                    Err(BackendError::execution(format!("Inference error: {error}")))?;
-                }
-                Ok(Some(Err(err))) => Err(BackendError::execution(format!("Inference error: {err:#}")))?,
-                Ok(None) => Err(BackendError::execution("execution stream ended without terminal outcome"))?,
-                Err(_) => Err(BackendError::execution(format!(
-                    "inference timed out after {}s",
-                    super::timeout_secs_until(deadline)
-                )))?,
-            }
-        }
-    }
-}
-
-fn chat_events(
+pub(super) fn chat_events(
     prepared: PreparedGeneration,
     tool_call_id_prefix: &'static str,
     ready_message: &'static str,
@@ -313,7 +112,7 @@ fn chat_events(
         let mut stream_provenance = prepared.provenance.clone();
         let mut parser = chat_parser(&prepared)?;
         let deadline = prepared.deadline();
-        let inner = prepared.stream();
+        let inner = generation_stream(prepared);
         tokio::pin!(inner);
         let mut saw_tool_call = false;
 
@@ -382,7 +181,7 @@ fn chat_events(
                 Ok(None) => Err(BackendError::execution("execution stream ended without terminal outcome"))?,
                 Err(_) => Err(BackendError::execution(format!(
                     "inference timed out after {}s",
-                    super::timeout_secs_until(deadline)
+                    super::super::timeout_secs_until(deadline)
                 )))?,
             }
         }
@@ -493,59 +292,8 @@ fn chat_parser(
         .ok_or_else(|| BackendError::execution("chat execution missing prepared chat turn"))
 }
 
-fn text_generation_error(error: TextGenerationError) -> BackendError {
-    match error {
-        TextGenerationError::Failed { position, error } => {
-            warn!(position, %error, "gateway request failed");
-            BackendError::execution(format!("Inference error: {error}"))
-        }
-        TextGenerationError::Stream(message) => BackendError::execution(message),
-    }
-}
-
 fn decode_failure(failure: DecodeFailure) -> BackendError {
     BackendError::stream(failure.to_string())
-}
-
-pub(super) fn usage(prompt_tokens: u32, output_tokens: u64) -> Usage {
-    let input_tokens = u64::from(prompt_tokens);
-    Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        total_tokens: Some(input_tokens.saturating_add(output_tokens)),
-    }
-}
-
-pub(super) fn provenance_from_parts(
-    provenance: Option<&ExecutionProvenance>,
-    receipt: Option<&CatnixReceiptCommitment>,
-) -> Option<Provenance> {
-    let mut out = provenance
-        .and_then(provenance_from_execution)
-        .unwrap_or_default();
-    if let Some(receipt) = receipt {
-        out.receipt_commitment = Some(encode_hex(&receipt.0));
-    }
-    (out.call_commitment.is_some() || out.receipt_commitment.is_some()).then_some(out)
-}
-
-pub(super) fn provenance_from_execution(provenance: &ExecutionProvenance) -> Option<Provenance> {
-    provenance
-        .catnix_call_commitment
-        .as_ref()
-        .map(encode_hex)
-        .map(|call_commitment| Provenance {
-            call_commitment: Some(call_commitment),
-            receipt_commitment: None,
-        })
-}
-
-fn stop_reason_from_runtime(stop_reason: RuntimeStopReason) -> WireStopReason {
-    match stop_reason {
-        RuntimeStopReason::EndOfSequence => WireStopReason::EndOfText,
-        RuntimeStopReason::MaxNewTokens => WireStopReason::MaxOutputTokens,
-        RuntimeStopReason::Cancelled => WireStopReason::Cancelled,
-    }
 }
 
 fn parser_stop_from_runtime(stop_reason: RuntimeStopReason) -> ParserStopReason {

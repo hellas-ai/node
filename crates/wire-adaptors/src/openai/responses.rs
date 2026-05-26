@@ -4,8 +4,8 @@ use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
     ExecutionResult, FieldPath, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem,
     PassthroughBag, RawRequest, ReasoningOptions, RenderContext, ResponseFormat, StructuredDelta,
-    TextChannel, ToolCallDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
-    WireAdaptor, WireResponse, WireStreamEvent,
+    TextChannel, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor,
+    WireResponse, WireStreamEvent,
 };
 
 const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -218,7 +218,6 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 render_tool_call_arguments_delta(state, delta.index, delta.delta)
             }
             OutputEvent::ToolCallEnd(end) => render_tool_call_end(state, end),
-            OutputEvent::ToolCallDelta(delta) => render_tool_call_delta(state, delta),
             OutputEvent::StructuredOutputDelta(delta) => render_structured_delta(state, delta),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
@@ -624,26 +623,6 @@ fn output_items_json(message_id: &str, output: &[OutputItem]) -> AdaptorResult<V
         );
     }
     Ok(items)
-}
-
-fn render_tool_call_delta(
-    state: &mut ResponsesStreamState,
-    delta: ToolCallDelta,
-) -> AdaptorResult<Vec<WireStreamEvent>> {
-    if let Some(name) = delta.name_delta {
-        return render_tool_call_start(
-            state,
-            ToolCallStart {
-                index: delta.index,
-                id: delta.id,
-                name,
-            },
-        );
-    }
-    if let Some(arguments) = delta.arguments_delta {
-        return render_tool_call_arguments_delta(state, delta.index, arguments);
-    }
-    Ok(Vec::new())
 }
 
 fn render_tool_call_start(
