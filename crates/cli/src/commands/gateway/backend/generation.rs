@@ -4,7 +4,13 @@ use futures::StreamExt;
 use crate::execution::{Outcome, StopReason};
 use crate::text_output::TextOutputDecoder;
 
-use super::super::state::{GenerationEvent as PreparedEvent, PreparedGeneration};
+use super::super::state::PreparedGeneration;
+
+#[derive(Debug, Clone)]
+pub(super) enum GenerationEvent {
+    Delta(String),
+    Done(Outcome),
+}
 
 pub(super) struct CompletedTextGeneration {
     pub(super) text: String,
@@ -21,7 +27,7 @@ pub(super) enum TextGenerationError {
 
 pub(super) fn generation_stream(
     generation: PreparedGeneration,
-) -> impl futures::Stream<Item = anyhow::Result<PreparedEvent>> + Send {
+) -> impl futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send {
     let PreparedGeneration {
         prepared,
         assets,
@@ -37,11 +43,11 @@ pub(super) fn generation_stream(
                 crate::execution::ExecutionEvent::Chunk { tokens, .. } => {
                     let delta = decoder.push_bytes(&tokens)?;
                     if !delta.is_empty() {
-                        yield PreparedEvent::Delta(delta);
+                        yield GenerationEvent::Delta(delta);
                     }
                 }
                 crate::execution::ExecutionEvent::Done(outcome) => {
-                    yield PreparedEvent::Done(outcome);
+                    yield GenerationEvent::Done(outcome);
                     return;
                 }
             }
@@ -60,8 +66,8 @@ pub(super) async fn collect_text(
     let mut text = String::new();
     loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(PreparedEvent::Delta(delta)))) => text.push_str(&delta),
-            Ok(Some(Ok(PreparedEvent::Done(Outcome::Completed {
+            Ok(Some(Ok(GenerationEvent::Delta(delta)))) => text.push_str(&delta),
+            Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                 total_tokens,
                 stop_reason,
                 receipt,
@@ -74,7 +80,7 @@ pub(super) async fn collect_text(
                     receipt,
                 });
             }
-            Ok(Some(Ok(PreparedEvent::Done(Outcome::Failed { position, error })))) => {
+            Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {
                 return Err(TextGenerationError::Failed { position, error });
             }
             Ok(Some(Err(err))) => {
