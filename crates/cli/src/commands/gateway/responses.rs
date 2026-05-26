@@ -1,20 +1,22 @@
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration, TextGenerationError};
-use super::{next_id, now_unix, sse_data, sse_event_data, sse_response};
+use super::wire_adaptor::{
+    adaptor_error, attach_provenance, output_error_event, parse_execution_request,
+    provenance_from_execution, provenance_from_parts, sse_event, stop_reason_from_runtime, usage,
+    wire_error_event, wire_response,
+};
+use super::{next_id, now_unix, sse_response};
 use crate::execution::{Outcome, StopReason as RuntimeStopReason};
 use async_stream::stream;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
+use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
 use hellas_wire_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
 use hellas_wire_adaptors::{
-    AdaptorError, ExecutionResult, OutputEvent, OutputItem, Provenance, RawRequest, RenderContext,
-    StopReason, TextChannel, Usage, WireAdaptor, WireBody, WireEventData, WireResponse,
-    WireStreamEvent,
+    ExecutionResult, OutputEvent, OutputItem, RenderContext, TextChannel, WireAdaptor,
 };
-use serde_json::json;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
@@ -26,17 +28,9 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     }
 
     let adaptor = OpenAiResponsesAdaptor;
-    let raw = match RawRequest::from_slice(&body) {
-        Ok(raw) => raw,
-        Err(err) => return adaptor_error("OpenAI Responses", err),
-    };
-    let parsed = match adaptor.parse(raw) {
-        Ok(parsed) => parsed,
-        Err(err) => return adaptor_error("OpenAI Responses", err),
-    };
-    let execution = match adaptor.to_execution_request(&parsed) {
-        Ok(execution) => execution,
-        Err(err) => return adaptor_error("OpenAI Responses", err),
+    let (parsed, execution) = match parse_execution_request(&adaptor, &body, "OpenAI Responses") {
+        Ok(request) => request,
+        Err(response) => return response,
     };
     let stream = parsed.stream.unwrap_or(false);
     let prepared = match state.prepare_wire_execution(&execution).await {
@@ -286,124 +280,4 @@ fn execution_result(
         stop_reason: stop_reason_from_runtime(stop_reason),
         provenance: provenance_from_parts(provenance, receipt),
     }
-}
-
-fn usage(prompt_tokens: u32, output_tokens: u64) -> Usage {
-    let input_tokens = u64::from(prompt_tokens);
-    Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        total_tokens: Some(input_tokens.saturating_add(output_tokens)),
-    }
-}
-
-fn provenance_from_parts(
-    provenance: Option<&ExecutionProvenance>,
-    receipt: Option<&CatnixReceiptCommitment>,
-) -> Option<Provenance> {
-    let mut out = provenance
-        .and_then(provenance_from_execution)
-        .unwrap_or_default();
-    if let Some(receipt) = receipt {
-        out.receipt_commitment = Some(encode_hex(&receipt.0));
-    }
-    (out.call_commitment.is_some() || out.receipt_commitment.is_some()).then_some(out)
-}
-
-fn provenance_from_execution(provenance: &ExecutionProvenance) -> Option<Provenance> {
-    provenance
-        .catnix_call_commitment
-        .as_ref()
-        .map(encode_hex)
-        .map(|call_commitment| Provenance {
-            call_commitment: Some(call_commitment),
-            receipt_commitment: None,
-        })
-}
-
-fn stop_reason_from_runtime(stop_reason: RuntimeStopReason) -> StopReason {
-    match stop_reason {
-        RuntimeStopReason::EndOfSequence => StopReason::EndOfText,
-        RuntimeStopReason::MaxNewTokens => StopReason::MaxOutputTokens,
-        RuntimeStopReason::Cancelled => StopReason::Cancelled,
-    }
-}
-
-fn wire_response(response: WireResponse) -> Result<Response, String> {
-    let status = StatusCode::from_u16(response.status)
-        .map_err(|err| format!("adaptor rendered invalid HTTP status: {err}"))?;
-    let body = match response.body {
-        WireBody::Json(value) => Body::from(
-            serde_json::to_vec(&value)
-                .map_err(|err| format!("failed to encode JSON response: {err}"))?,
-        ),
-        WireBody::Bytes(bytes) => Body::from(bytes),
-    };
-
-    let mut builder = Response::builder().status(status);
-    for (name, value) in response.headers {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|err| format!("adaptor rendered invalid header name `{name}`: {err}"))?;
-        let value = HeaderValue::from_str(&value)
-            .map_err(|err| format!("adaptor rendered invalid header value for `{name}`: {err}"))?;
-        builder = builder.header(name, value);
-    }
-
-    builder
-        .body(body)
-        .map_err(|err| format!("failed to build HTTP response: {err}"))
-}
-
-fn attach_provenance(
-    response: &mut Response,
-    provenance: Option<ExecutionProvenance>,
-    receipt: Option<CatnixReceiptCommitment>,
-) {
-    if let Some(provenance) = provenance {
-        response.extensions_mut().insert(provenance);
-    }
-    if let Some(receipt) = receipt {
-        response.extensions_mut().insert(receipt);
-    }
-}
-
-fn sse_event(event: WireStreamEvent) -> axum::response::sse::Event {
-    match (event.name, event.data) {
-        (Some(name), WireEventData::Json(value)) => sse_event_data(&name, &value),
-        (Some(name), WireEventData::Text(value)) => axum::response::sse::Event::default()
-            .event(name)
-            .data(value),
-        (Some(name), WireEventData::Bytes(value)) => axum::response::sse::Event::default()
-            .event(name)
-            .data(String::from_utf8_lossy(&value)),
-        (None, WireEventData::Json(value)) => sse_data(&value),
-        (None, WireEventData::Text(value)) => axum::response::sse::Event::default().data(value),
-        (None, WireEventData::Bytes(value)) => {
-            axum::response::sse::Event::default().data(String::from_utf8_lossy(&value))
-        }
-    }
-}
-
-fn wire_error_event(error: AdaptorError) -> axum::response::sse::Event {
-    output_error_event(error.to_string())
-}
-
-fn output_error_event(message: impl Into<String>) -> axum::response::sse::Event {
-    sse_event_data(
-        "error",
-        &json!({
-            "error": { "message": message.into() }
-        }),
-    )
-}
-
-fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
-    let status = match error {
-        AdaptorError::InvalidJson(_)
-        | AdaptorError::InvalidRequest { .. }
-        | AdaptorError::Unsupported { .. }
-        | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
-        AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    super::json_error(status, format!("{surface}: {error}"))
 }

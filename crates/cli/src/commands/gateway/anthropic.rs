@@ -1,9 +1,12 @@
 use super::hellas_ext::{HellasExt, WithHellas};
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
+use super::wire_adaptor::{
+    adaptor_error, attach_provenance, parse_execution_request, provenance_from_parts, usage,
+    wire_response,
+};
 use super::{next_id, sse_event_data, sse_response};
 use crate::execution::{Outcome, StopReason as ExecStopReason};
 use async_stream::stream;
-use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -11,7 +14,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use catgrad_llm::types::anthropic;
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
+use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_runtime::runtime::chat::wire::anthropic::{
     AnthropicStopReason, AnthropicStreamFrame, AnthropicStreamMapper,
 };
@@ -21,25 +24,16 @@ use hellas_runtime::runtime::chat::{
 };
 use hellas_wire_adaptors::anthropic::{AnthropicMessagesAdaptor, ParsedAnthropicMessageRequest};
 use hellas_wire_adaptors::{
-    AdaptorError, ExecutionResult, OutputItem, Provenance, RawRequest, RenderContext,
-    StopReason as WireStopReason, Usage, WireAdaptor, WireBody,
+    ExecutionResult, OutputItem, RenderContext, StopReason as WireStopReason, WireAdaptor,
 };
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
     let adaptor = AnthropicMessagesAdaptor;
-    let raw = match RawRequest::from_slice(&body) {
-        Ok(raw) => raw,
-        Err(err) => return adaptor_error("Anthropic Messages", err),
-    };
-    let parsed = match adaptor.parse(raw) {
-        Ok(parsed) => parsed,
-        Err(err) => return adaptor_error("Anthropic Messages", err),
-    };
-    let execution = match adaptor.to_execution_request(&parsed) {
-        Ok(execution) => execution,
-        Err(err) => return adaptor_error("Anthropic Messages", err),
+    let (parsed, execution) = match parse_execution_request(&adaptor, &body, "Anthropic Messages") {
+        Ok(request) => request,
+        Err(response) => return response,
     };
     let stream_response_flag = parsed.stream == Some(true);
     let prepared = match state.prepare_anthropic_execution(&execution).await {
@@ -51,17 +45,6 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         return stream_response(prepared);
     }
     respond(adaptor, parsed, prepared).await
-}
-
-fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
-    let status = match error {
-        AdaptorError::InvalidJson(_)
-        | AdaptorError::InvalidRequest { .. }
-        | AdaptorError::Unsupported { .. }
-        | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
-        AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    super::json_error(status, format!("{surface}: {error}"))
 }
 
 /// Non-streaming endpoint. Same per-delta pipeline as streaming;
@@ -177,64 +160,12 @@ async fn respond(
         Ok(rendered) => rendered,
         Err(err) => return adaptor_error("Anthropic Messages", err),
     };
-    let WireBody::Json(body) = rendered.body else {
-        error!("anthropic adaptor rendered a non-json response");
-        return super::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "anthropic adaptor rendered an invalid response body",
-        );
+    let mut response = match wire_response(rendered) {
+        Ok(response) => response,
+        Err(message) => return super::json_error(StatusCode::INTERNAL_SERVER_ERROR, message),
     };
-    let status = match StatusCode::from_u16(rendered.status) {
-        Ok(status) => status,
-        Err(err) => {
-            error!(%err, "anthropic adaptor rendered an invalid status");
-            return super::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "anthropic adaptor rendered an invalid response status",
-            );
-        }
-    };
-
-    let mut response = (status, Json(body)).into_response();
-    if let Some(prov) = provenance {
-        response.extensions_mut().insert(prov);
-    }
-    if let Some(catnix) = catnix_receipt {
-        response.extensions_mut().insert(catnix);
-    }
+    attach_provenance(&mut response, provenance, catnix_receipt);
     response
-}
-
-fn usage(prompt_tokens: u32, output_tokens: u64) -> Usage {
-    Usage {
-        input_tokens: Some(u64::from(prompt_tokens)),
-        output_tokens: Some(output_tokens),
-        total_tokens: Some(u64::from(prompt_tokens).saturating_add(output_tokens)),
-    }
-}
-
-fn provenance_from_parts(
-    provenance: Option<&ExecutionProvenance>,
-    receipt: Option<&CatnixReceiptCommitment>,
-) -> Option<Provenance> {
-    let mut out = provenance
-        .and_then(provenance_from_execution)
-        .unwrap_or_default();
-    if let Some(receipt) = receipt {
-        out.receipt_commitment = Some(encode_hex(&receipt.0));
-    }
-    (out.call_commitment.is_some() || out.receipt_commitment.is_some()).then_some(out)
-}
-
-fn provenance_from_execution(provenance: &ExecutionProvenance) -> Option<Provenance> {
-    provenance
-        .catnix_call_commitment
-        .as_ref()
-        .map(encode_hex)
-        .map(|call_commitment| Provenance {
-            call_commitment: Some(call_commitment),
-            receipt_commitment: None,
-        })
 }
 
 fn wire_stop_reason_from_anthropic(reason: AnthropicStopReason) -> WireStopReason {

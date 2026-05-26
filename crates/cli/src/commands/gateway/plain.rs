@@ -1,41 +1,33 @@
 use super::hellas_ext::{HellasExt, WithHellas};
 use super::state::{GatewayState, GenerationEvent, PreparedGeneration, TextGenerationError};
+use super::wire_adaptor::{
+    adaptor_error, attach_provenance, parse_execution_request, provenance_from_parts,
+    stop_reason_from_runtime, usage, wire_response,
+};
 use super::{next_id, now_unix, sse_data, sse_response};
 use crate::execution::{Outcome, StopReason as RuntimeStopReason};
 use async_stream::stream;
-use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use catgrad_llm::types::{openai, plain};
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance, encode_hex};
+use hellas_rpc::provenance::CatnixReceiptCommitment;
 use hellas_runtime::cid::Cid;
 use hellas_runtime::runtime::TextReceipt;
 use hellas_wire_adaptors::openai::completions::{
     OpenAiCompletionsAdaptor, ParsedCompletionRequest,
 };
-use hellas_wire_adaptors::{
-    AdaptorError, ExecutionResult, OutputItem, Provenance, RawRequest, RenderContext,
-    StopReason as WireStopReason, TextChannel, Usage, WireAdaptor, WireBody,
-};
+use hellas_wire_adaptors::{ExecutionResult, OutputItem, RenderContext, TextChannel, WireAdaptor};
 use serde_json::json;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
     let adaptor = OpenAiCompletionsAdaptor;
-    let raw = match RawRequest::from_slice(&body) {
-        Ok(raw) => raw,
-        Err(err) => return adaptor_error("OpenAI Completions", err),
-    };
-    let parsed = match adaptor.parse(raw) {
-        Ok(parsed) => parsed,
-        Err(err) => return adaptor_error("OpenAI Completions", err),
-    };
-    let execution = match adaptor.to_execution_request(&parsed) {
-        Ok(execution) => execution,
-        Err(err) => return adaptor_error("OpenAI Completions", err),
+    let (parsed, execution) = match parse_execution_request(&adaptor, &body, "OpenAI Completions") {
+        Ok(request) => request,
+        Err(response) => return response,
     };
     let stream_response_flag = parsed.stream == Some(true);
     let prepared = match state.prepare_plain_execution(&execution).await {
@@ -47,17 +39,6 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         return stream_response(prepared);
     }
     respond(adaptor, parsed, prepared).await
-}
-
-fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
-    let status = match error {
-        AdaptorError::InvalidJson(_)
-        | AdaptorError::InvalidRequest { .. }
-        | AdaptorError::Unsupported { .. }
-        | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
-        AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    super::json_error(status, format!("{surface}: {error}"))
 }
 
 fn stream_response(prepared: PreparedGeneration) -> Response {
@@ -254,7 +235,7 @@ async fn respond(
             channel: TextChannel::Output,
         }],
         usage: Some(usage(prompt_tokens, completed.total_tokens)),
-        stop_reason: wire_stop_reason_from_runtime(completed.stop_reason),
+        stop_reason: stop_reason_from_runtime(completed.stop_reason),
         provenance: provenance_from_parts(provenance.as_ref(), receipt.as_ref()),
     };
     let rendered = match adaptor.render_response(
@@ -265,75 +246,12 @@ async fn respond(
         Ok(rendered) => rendered,
         Err(err) => return adaptor_error("OpenAI Completions", err),
     };
-    let WireBody::Json(body) = rendered.body else {
-        error!("completion adaptor rendered a non-json response");
-        return super::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "completion adaptor rendered an invalid response body",
-        );
+    let mut response = match wire_response(rendered) {
+        Ok(response) => response,
+        Err(message) => return super::json_error(StatusCode::INTERNAL_SERVER_ERROR, message),
     };
-    let status = match StatusCode::from_u16(rendered.status) {
-        Ok(status) => status,
-        Err(err) => {
-            error!(%err, "completion adaptor rendered an invalid status");
-            return super::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "completion adaptor rendered an invalid response status",
-            );
-        }
-    };
-
-    let mut response = (status, Json(body)).into_response();
-    if let Some(prov) = provenance {
-        response.extensions_mut().insert(prov);
-    } else if let Some(prov) = initial_provenance {
-        response.extensions_mut().insert(prov);
-    }
-    if let Some(catnix) = receipt {
-        response.extensions_mut().insert(catnix);
-    }
+    attach_provenance(&mut response, provenance.or(initial_provenance), receipt);
     response
-}
-
-fn usage(prompt_tokens: u32, output_tokens: u64) -> Usage {
-    let input_tokens = u64::from(prompt_tokens);
-    Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        total_tokens: Some(input_tokens.saturating_add(output_tokens)),
-    }
-}
-
-fn provenance_from_parts(
-    provenance: Option<&ExecutionProvenance>,
-    receipt: Option<&CatnixReceiptCommitment>,
-) -> Option<Provenance> {
-    let mut out = provenance
-        .and_then(provenance_from_execution)
-        .unwrap_or_default();
-    if let Some(receipt) = receipt {
-        out.receipt_commitment = Some(encode_hex(&receipt.0));
-    }
-    (out.call_commitment.is_some() || out.receipt_commitment.is_some()).then_some(out)
-}
-
-fn provenance_from_execution(provenance: &ExecutionProvenance) -> Option<Provenance> {
-    provenance
-        .catnix_call_commitment
-        .as_ref()
-        .map(encode_hex)
-        .map(|call_commitment| Provenance {
-            call_commitment: Some(call_commitment),
-            receipt_commitment: None,
-        })
-}
-
-fn wire_stop_reason_from_runtime(stop: RuntimeStopReason) -> WireStopReason {
-    match stop {
-        RuntimeStopReason::EndOfSequence => WireStopReason::EndOfText,
-        RuntimeStopReason::MaxNewTokens => WireStopReason::MaxOutputTokens,
-        RuntimeStopReason::Cancelled => WireStopReason::Cancelled,
-    }
 }
 
 fn map_finish_reason(stop: RuntimeStopReason) -> openai::FinishReason {

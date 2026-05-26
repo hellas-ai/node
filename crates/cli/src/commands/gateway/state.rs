@@ -230,6 +230,55 @@ impl GatewayState {
         Ok(assets)
     }
 
+    fn max_tokens_for(&self, req: &WireExecutionRequest) -> u32 {
+        req.canonical
+            .sampling
+            .max_output_tokens
+            .unwrap_or(self.default_max_tokens)
+    }
+
+    async fn resolved_model_assets(
+        &self,
+        request_model: &str,
+    ) -> Result<(String, Arc<ModelAssets>), HttpError> {
+        let model = self.resolve_model(request_model);
+        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("Failed to load local model assets for `{model}`: {err}"),
+        })?;
+        Ok((model, assets))
+    }
+
+    async fn prepare_chat_generation(
+        &self,
+        req: &WireExecutionRequest,
+        messages: Vec<Message>,
+        thinking: ThinkingPolicy,
+        tools_dir: Option<Arc<ToolDirectory>>,
+        prepare_error: &'static str,
+    ) -> Result<PreparedGeneration, HttpError> {
+        let max_tokens = self.max_tokens_for(req);
+        let (model, assets) = self
+            .resolved_model_assets(&req.canonical.model.name)
+            .await?;
+        let chat_turn = assets
+            .chat_turn(tools_dir, ChatOptions { thinking })
+            .map_err(classify_chat_turn_error)?;
+        let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("{prepare_error}: {err}"),
+        })?;
+        self.finalize_generation(
+            model,
+            assets,
+            prepared_prompt,
+            max_tokens,
+            Some(chat_turn),
+            prepare_error,
+        )
+        .await
+    }
+
     /// Drive the executor quote step and assemble a `PreparedGeneration`
     /// from already-prepared inputs. Surface-specific preparation
     /// produces the `PreparedPrompt` and, for chat surfaces, the
@@ -278,11 +327,6 @@ impl GatewayState {
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req
-            .canonical
-            .sampling
-            .max_output_tokens
-            .unwrap_or(self.default_max_tokens);
         let messages = wire_messages(&req.canonical).map_err(|message| HttpError {
             status: StatusCode::BAD_REQUEST,
             message,
@@ -302,24 +346,11 @@ impl GatewayState {
             status: StatusCode::BAD_REQUEST,
             message: format!("Invalid tool definitions: {err}"),
         })?;
-        let model = self.resolve_model(&req.canonical.model.name);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
-        let chat_turn = assets
-            .chat_turn(tools_dir, ChatOptions { thinking })
-            .map_err(classify_chat_turn_error)?;
-        let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to prepare chat request: {err}"),
-        })?;
-        self.finalize_generation(
-            model,
-            assets,
-            prepared_prompt,
-            max_tokens,
-            Some(chat_turn),
+        self.prepare_chat_generation(
+            req,
+            messages,
+            thinking,
+            tools_dir,
             "Failed to prepare chat request",
         )
         .await
@@ -329,11 +360,6 @@ impl GatewayState {
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req
-            .canonical
-            .sampling
-            .max_output_tokens
-            .unwrap_or(self.default_max_tokens);
         let messages = wire_anthropic_messages(&req.canonical).map_err(|message| HttpError {
             status: StatusCode::BAD_REQUEST,
             message,
@@ -348,24 +374,11 @@ impl GatewayState {
                     });
                 }
             };
-        let model = self.resolve_model(&req.canonical.model.name);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
-        let chat_turn = assets
-            .chat_turn(None, ChatOptions { thinking })
-            .map_err(classify_chat_turn_error)?;
-        let prepared_prompt = chat_turn.render(&messages).map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to prepare chat request: {err}"),
-        })?;
-        self.finalize_generation(
-            model,
-            assets,
-            prepared_prompt,
-            max_tokens,
-            Some(chat_turn),
+        self.prepare_chat_generation(
+            req,
+            messages,
+            thinking,
+            None,
             "Failed to prepare chat request",
         )
         .await
@@ -375,22 +388,16 @@ impl GatewayState {
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req
-            .canonical
-            .sampling
-            .max_output_tokens
-            .unwrap_or(self.default_max_tokens);
+        let max_tokens = self.max_tokens_for(req);
         let Input::Text(prompt) = &req.canonical.input else {
             return Err(HttpError {
                 status: StatusCode::BAD_REQUEST,
                 message: "Plain completion execution requires text input".to_string(),
             });
         };
-        let model = self.resolve_model(&req.canonical.model.name);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
+        let (model, assets) = self
+            .resolved_model_assets(&req.canonical.model.name)
+            .await?;
         let prepared_prompt = assets.prepare_plain(prompt).map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!(
@@ -413,21 +420,15 @@ impl GatewayState {
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, HttpError> {
-        let max_tokens = req
-            .canonical
-            .sampling
-            .max_output_tokens
-            .unwrap_or(self.default_max_tokens);
-        let model = self.resolve_model(&req.canonical.model.name);
+        let max_tokens = self.max_tokens_for(req);
         let messages = wire_messages(&req.canonical).map_err(|message| HttpError {
             status: StatusCode::BAD_REQUEST,
             message,
         })?;
         let tools = wire_tools(&req.canonical);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
+        let (model, assets) = self
+            .resolved_model_assets(&req.canonical.model.name)
+            .await?;
         let prepared_prompt = assets
             .prepare_chat_with_options(&messages, ThinkingPolicy::Disabled, tools.as_ref())
             .map_err(|err| HttpError {
