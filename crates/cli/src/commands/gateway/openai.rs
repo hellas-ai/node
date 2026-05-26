@@ -14,7 +14,7 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     let (mut parsed, mut request) =
         match parse_backend_request(&adaptor, &body, "OpenAI Chat Completions") {
             Ok(request) => request,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     let stream = parsed.stream == Some(true);
     if let Some(model) = state.force_model.as_ref() {

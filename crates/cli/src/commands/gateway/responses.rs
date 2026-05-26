@@ -15,7 +15,7 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     let (mut parsed, mut request) = match parse_backend_request(&adaptor, &body, "OpenAI Responses")
     {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let stream = parsed.stream.unwrap_or(false);
     if let Some(model) = state.force_model.as_ref() {

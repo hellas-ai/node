@@ -13,61 +13,54 @@ default = []
 # Backend variants: each pulls in the optional `hellas-executor` dep plus the
 # RPC/transport server bits. Source code gates on the implicit `hellas-executor`
 # feature that cargo creates from the optional dep (no `dep:` prefix used).
-candle = [
-    "hellas-executor/candle",
-    "hellas-rpc/server",
-    "tonic-iroh-transport/server",
-]
+candle = ["hellas-executor/candle", "hellas-rpc/server", "tonic-iroh-transport/server"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-opentelemetry.workspace = true
-opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
-opentelemetry-otlp.workspace = true
-reqwest.workspace = true
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
 catgrad = { workspace = true, default-features = false }
 catgrad-llm.workspace = true
-hellas-runtime = { workspace = true, features = ["dag-cbor"] }
-serde.workspace = true
-serde_json.workspace = true
-
-anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "node",
     "client",
     "compression",
     "discovery",
 ] }
+hellas-runtime = { workspace = true, features = ["dag-cbor"] }
 hellas-wire-adaptors.workspace = true
-hellas-executor = { workspace = true, default-features = false, optional = true }
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+prometheus-client = "0.24"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.9"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tonic-iroh-transport = { workspace = true, default-features = false, features = [
     "client",
     "discovery-mdns",
     "discovery-dht",
 ] }
-tonic = { workspace = true }
-tokio-stream = { workspace = true }
-futures = "0.3"
-async-stream = "0.3"
-axum = "0.8"
 tower = { version = "0.5", default-features = false, features = ["util"] }
-prometheus-client = "0.24"
-minijinja = "2"
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-qrcode = { version = "0.14", default-features = false }
-rand = "0.9"
-tempfile = "3"
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-# dev-dependencies- add 'compile' feature to hellas-rpc
 [dev-dependencies]
-# hellas-rpc = { workspace = true, features = ["compile"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }

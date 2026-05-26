@@ -29,8 +29,8 @@ pub(crate) struct ExecuteWorker {
 }
 
 pub(crate) enum EnqueueError {
-    Busy(ExecuteJob),
-    Stopped(ExecuteJob),
+    Busy(Box<ExecuteJob>),
+    Stopped(Box<ExecuteJob>),
 }
 
 pub(crate) struct ExecuteJob {
@@ -69,8 +69,8 @@ impl ExecuteWorker {
     pub(crate) fn try_enqueue(&self, job: ExecuteJob) -> Result<(), EnqueueError> {
         match self.tx.try_send(job) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(job)) => Err(EnqueueError::Busy(job)),
-            Err(TrySendError::Disconnected(job)) => Err(EnqueueError::Stopped(job)),
+            Err(TrySendError::Full(job)) => Err(EnqueueError::Busy(Box::new(job))),
+            Err(TrySendError::Disconnected(job)) => Err(EnqueueError::Stopped(Box::new(job))),
         }
     }
 
@@ -304,29 +304,6 @@ fn build_receipt_commitment(
     Ok(*receipt_commitment_digest.as_bytes())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::map_stop_reason;
-    use crate::state::StopReason as RuntimeStopReason;
-    use catnix::StopReason as CatnixStopReason;
-
-    #[test]
-    fn stop_reason_mapping_covers_all_runtime_variants() {
-        assert_eq!(
-            map_stop_reason(RuntimeStopReason::EndOfSequence),
-            CatnixStopReason::END_OF_SEQUENCE,
-        );
-        assert_eq!(
-            map_stop_reason(RuntimeStopReason::MaxNewTokens),
-            CatnixStopReason::MAX_OUTPUT,
-        );
-        assert_eq!(
-            map_stop_reason(RuntimeStopReason::Cancelled),
-            CatnixStopReason::CANCELLED,
-        );
-    }
-}
-
 /// Build the per-chunk callback the runner invokes. It pushes a `Chunk`
 /// frame onto the per-execution sender and, on send failure (consumer
 /// dropped the receiver), fires the cancel token so the runner exits at
@@ -349,5 +326,28 @@ fn make_on_progress(
             debug!(%execution_id, "consumer dropped; cancelling worker");
             cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_stop_reason;
+    use crate::state::StopReason as RuntimeStopReason;
+    use catnix::StopReason as CatnixStopReason;
+
+    #[test]
+    fn stop_reason_mapping_covers_all_runtime_variants() {
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::EndOfSequence),
+            CatnixStopReason::END_OF_SEQUENCE,
+        );
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::MaxNewTokens),
+            CatnixStopReason::MAX_OUTPUT,
+        );
+        assert_eq!(
+            map_stop_reason(RuntimeStopReason::Cancelled),
+            CatnixStopReason::CANCELLED,
+        );
     }
 }

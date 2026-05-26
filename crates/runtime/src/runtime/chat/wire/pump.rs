@@ -42,19 +42,19 @@ use crate::runtime::chat::{DecodeEvent, IncrementalToolCallParser, StopReason};
 /// renders its surface-specific error frame.
 #[derive(Debug)]
 pub struct PumpError<F> {
-    pub failure: DecodeFailure,
+    pub failure: Box<DecodeFailure>,
     pub cleanup: Vec<F>,
 }
 
 impl<F> std::fmt::Display for PumpError<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.failure, f)
+        std::fmt::Display::fmt(self.failure.as_ref(), f)
     }
 }
 
 impl<F: std::fmt::Debug> std::error::Error for PumpError<F> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.failure)
+        Some(self.failure.as_ref())
     }
 }
 
@@ -122,7 +122,10 @@ where
             Ok(more) => frames.extend(more),
             Err(failure) => {
                 let cleanup = mapper.close_for_error();
-                return Err(PumpError { failure, cleanup });
+                return Err(PumpError {
+                    failure: Box::new(failure),
+                    cleanup,
+                });
             }
         }
     }
@@ -147,7 +150,10 @@ where
             Ok(more) => frames.extend(more),
             Err(failure) => {
                 let cleanup = mapper.close_for_error();
-                return Err(PumpError { failure, cleanup });
+                return Err(PumpError {
+                    failure: Box::new(failure),
+                    cleanup,
+                });
             }
         }
     }
@@ -155,7 +161,10 @@ where
         Ok(tail) => frames.extend(tail),
         Err(failure) => {
             let cleanup = mapper.close_for_error();
-            return Err(PumpError { failure, cleanup });
+            return Err(PumpError {
+                failure: Box::new(failure),
+                cleanup,
+            });
         }
     }
     Ok(frames)

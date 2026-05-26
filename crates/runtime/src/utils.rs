@@ -203,13 +203,12 @@ fn anthropic_content_to_template_blocks(
         .iter()
         .map(|block| match block {
             types::anthropic::ContentBlock::Text { text } => {
-                Some(JsonValue::Object(JsonMap::from_iter([
+                JsonValue::Object(JsonMap::from_iter([
                     ("type".to_string(), JsonValue::String("text".to_string())),
                     ("text".to_string(), JsonValue::String(text.clone())),
-                ])))
+                ]))
             }
         })
-        .flatten()
         .collect()
 }
 

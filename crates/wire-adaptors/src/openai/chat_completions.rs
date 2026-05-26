@@ -537,10 +537,10 @@ fn project_response_format(value: &JsonValue) -> ResponseFormat {
 }
 
 fn output_message_json(output: &[OutputItem]) -> AdaptorResult<JsonValue> {
-    if let [OutputItem::Raw(value)] = output {
-        if value.get("role").and_then(JsonValue::as_str).is_some() {
-            return Ok(value.clone());
-        }
+    if let [OutputItem::Raw(value)] = output
+        && value.get("role").and_then(JsonValue::as_str).is_some()
+    {
+        return Ok(value.clone());
     }
 
     let mut content = String::new();

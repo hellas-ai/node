@@ -378,7 +378,7 @@ impl Canonical for Term {
         // on BindingKey is structural, not canonical-bytes — sort
         // explicitly here to be sure.
         let mut entries: Vec<(&BindingKey, &ValueId)> = self.bindings.iter().collect();
-        entries.sort_by(|a, b| a.0.canonical_bytes().cmp(&b.0.canonical_bytes()));
+        entries.sort_by_key(|entry| entry.0.canonical_bytes());
         encoder.array(entries.len() as u64);
         for (key, value) in entries {
             encoder.array(2);
@@ -618,17 +618,15 @@ impl CanonicalDecode for TextState {
 
 /// Why a text-run terminated.
 ///
-/// Same shape pattern as the now-removed `Dtype`: a `u8` newtype with
-/// named constants, deliberately no `Default`, an `unknown()` ctor
-/// for forward-compat on the wire. The numeric values intentionally
-/// align with `hellas.v1.FinishStatus`'s proto enum so the runtime
-/// bridge is a straight byte cast.
+/// Encoded as a `u8` newtype with named constants, deliberately no
+/// `Default`, and an `unknown()` constructor for forward-compatible
+/// decoding. The numeric values intentionally align with
+/// `hellas.v1.FinishStatus`'s proto enum so the runtime bridge is a
+/// straight byte cast.
 ///
 /// `UNSPECIFIED = 0` exists for forward-compat with serde-decoded
-/// reasons that pre-date a particular `stop_reason` migration; the
-/// projection layer rejects `UNSPECIFIED` for settlement-relevant
-/// runs (a producer signing a receipt with an `UNSPECIFIED` stop
-/// reason is hiding what actually happened).
+/// reasons; the projection layer rejects `UNSPECIFIED` for
+/// settlement-relevant runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StopReason(u8);
 
@@ -647,7 +645,7 @@ impl StopReason {
     }
 
     pub const fn is_known_concrete(self) -> bool {
-        matches!(self.0, 1 | 2 | 3)
+        matches!(self.0, 1..=3)
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -850,12 +848,12 @@ fn decode_term(decoder: &mut DagCborDecoder<'_>) -> Result<Term, DecodeError> {
         decoder.array_exact(2)?;
         let key = decode_binding_key(decoder)?;
         let key_bytes = key.canonical_bytes();
-        if let Some(prev) = &prev_key_bytes {
-            if &key_bytes <= prev {
-                return Err(DecodeError::new(
-                    "term bindings are not in canonical key-byte order",
-                ));
-            }
+        if let Some(prev) = &prev_key_bytes
+            && &key_bytes <= prev
+        {
+            return Err(DecodeError::new(
+                "term bindings are not in canonical key-byte order",
+            ));
         }
         prev_key_bytes = Some(key_bytes);
         let value = ValueId::from_bytes(decoder.bytes_32()?);

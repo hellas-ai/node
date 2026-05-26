@@ -32,21 +32,21 @@ node = [
 ]
 
 [dependencies]
-tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-tonic-prost = "0.14"
-prost = "0.14"
-futures-core = "0.3"
-futures = { version = "0.3", optional = true }
-mainline = { version = "6", optional = true }
-thiserror = { workspace = true }
-tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
+futures = { version = "0.3", optional = true }
+futures-core = "0.3"
 hellas-runtime = { workspace = true, features = ["dag-cbor"], optional = true }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
+mainline = { version = "6", optional = true }
+prost = "0.14"
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-iroh-transport = { workspace = true, default-features = false, optional = true }
+tonic-prost = "0.14"
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
 tokenizers = { version = "0.22.2", features = ["onig", "esaxx_fast"], optional = true }

@@ -288,9 +288,13 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
+    type CapturedRequest = (Option<String>, Bytes);
+    type CaptureSender = oneshot::Sender<CapturedRequest>;
+    type SharedCaptureSender = Arc<tokio::sync::Mutex<Option<CaptureSender>>>;
+
     #[derive(Clone)]
     struct Capture {
-        tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<(Option<String>, Bytes)>>>>,
+        tx: SharedCaptureSender,
     }
 
     async fn capture(

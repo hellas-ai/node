@@ -63,7 +63,7 @@ impl Executor {
                         capacity: self.queue_capacity,
                     });
                 }
-                self.pending_executions.push_back(job);
+                self.pending_executions.push_back(*job);
                 true
             }
             Err(StartExecutionError::Closed) => return Err(ExecutorError::ChannelClosed),
@@ -117,7 +117,7 @@ impl Executor {
             match self.try_start_execution(job) {
                 Ok(()) => return,
                 Err(StartExecutionError::Busy(job)) => {
-                    self.pending_executions.push_front(job);
+                    self.pending_executions.push_front(*job);
                     return;
                 }
                 Err(StartExecutionError::Closed) => {
@@ -129,6 +129,6 @@ impl Executor {
 }
 
 enum StartExecutionError {
-    Busy(ExecuteJob),
+    Busy(Box<ExecuteJob>),
     Closed,
 }

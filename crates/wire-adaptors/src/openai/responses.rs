@@ -122,16 +122,16 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         result: ExecutionResult,
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
-        let body = response_json(
-            &context.response_id,
-            context.created_at,
-            &request.model,
-            "completed",
-            output_items_json(&context.message_id, &result.output)?,
-            result.usage,
-            request_metadata(request),
-            result.provenance.as_ref(),
-        );
+        let body = response_json(ResponseJsonParts {
+            response_id: &context.response_id,
+            created_at: context.created_at,
+            model: &request.model,
+            status: "completed",
+            output: output_items_json(&context.message_id, &result.output)?,
+            usage: result.usage,
+            metadata: request_metadata(request),
+            provenance: result.provenance.as_ref(),
+        });
         Ok(WireResponse::json(200, body))
     }
 
@@ -247,16 +247,16 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                     json!({
                         "type": "response.completed",
                         "sequence_number": next_sequence(state),
-                        "response": response_json(
-                            &state.response_id,
-                            state.created_at,
-                            &request.model,
-                            "completed",
+                        "response": response_json(ResponseJsonParts {
+                            response_id: &state.response_id,
+                            created_at: state.created_at,
+                            model: &request.model,
+                            status: "completed",
                             output,
-                            state.usage,
-                            request_metadata(request),
-                            state.provenance.as_ref(),
-                        ),
+                            usage: state.usage,
+                            metadata: request_metadata(request),
+                            provenance: state.provenance.as_ref(),
+                        }),
                     }),
                 );
                 events.push(completed);
@@ -885,44 +885,46 @@ fn response_status_event(
     json!({
         "type": event_type,
         "sequence_number": next_sequence(state),
-        "response": response_json(
-            &state.response_id,
-            state.created_at,
-            &request.model,
+        "response": response_json(ResponseJsonParts {
+            response_id: &state.response_id,
+            created_at: state.created_at,
+            model: &request.model,
             status,
             output,
             usage,
-            request_metadata(request),
-            state.provenance.as_ref(),
-        ),
+            metadata: request_metadata(request),
+            provenance: state.provenance.as_ref(),
+        }),
     })
 }
 
-fn response_json(
-    response_id: &str,
+struct ResponseJsonParts<'a> {
+    response_id: &'a str,
     created_at: i64,
-    model: &str,
-    status: &str,
+    model: &'a str,
+    status: &'a str,
     output: Vec<JsonValue>,
     usage: Option<Usage>,
-    metadata: Option<&JsonValue>,
-    provenance: Option<&crate::Provenance>,
-) -> JsonValue {
+    metadata: Option<&'a JsonValue>,
+    provenance: Option<&'a crate::Provenance>,
+}
+
+fn response_json(parts: ResponseJsonParts<'_>) -> JsonValue {
     let mut object = json!({
-        "id": response_id,
+        "id": parts.response_id,
         "object": "response",
-        "created_at": created_at,
-        "status": status,
-        "model": model,
-        "output": output,
+        "created_at": parts.created_at,
+        "status": parts.status,
+        "model": parts.model,
+        "output": parts.output,
     });
-    if let Some(usage) = usage {
+    if let Some(usage) = parts.usage {
         object["usage"] = usage_json(usage);
     }
-    if let Some(metadata) = metadata {
+    if let Some(metadata) = parts.metadata {
         object["metadata"] = metadata.clone();
     }
-    if let Some(provenance) = provenance.and_then(provenance_json) {
+    if let Some(provenance) = parts.provenance.and_then(provenance_json) {
         object["hellas"] = provenance;
     }
     object

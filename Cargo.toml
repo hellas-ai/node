@@ -16,9 +16,7 @@ members = [
 # path-depend on it directly; the internal node binary does not. Fold
 # back in when the iroh dep tree converges.
 exclude = ["crates/wire"]
-default-members = [
-    "crates/cli",
-]
+default-members = ["crates/cli"]
 resolver = "2"
 
 [workspace.package]
@@ -35,34 +33,34 @@ catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "master",
 catgrad-llm-models = { git = "https://github.com/hellas-ai/catgrad", branch = "master", package = "catgrad-llm-models" }
 catnix = { path = "crates/catnix", default-features = false }
 hellas-core = { path = "crates/core", default-features = false }
+hellas-executor = { path = "crates/executor", default-features = false }
+# tonic-iroh-transport = { path = "../tonic-iroh-transport", default-features = false, features = ["otel", "native-defaults"] }
+# tonic-iroh-transport = { git = "https://github.com/hellas-ai/tonic-iroh-transport", branch = "grw/feat/iroh-0.98", default-features = false, features = ["otel", "native-defaults"] }
+
+hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-runtime = { path = "crates/runtime", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
 hellas-wire-adaptors = { path = "crates/wire-adaptors", default-features = false }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh = "0.98"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "stream"] }
+rustls-webpki = "0.103.9"
+serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_ipld_dagcbor = "0.6"
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.14", features = ["gzip"] }
 tonic-iroh-transport = { version = "0.9", default-features = false, features = ["otel", "native-defaults"] }
-# tonic-iroh-transport = { path = "../tonic-iroh-transport", default-features = false, features = ["otel", "native-defaults"] }
-# tonic-iroh-transport = { git = "https://github.com/hellas-ai/tonic-iroh-transport", branch = "grw/feat/iroh-0.98", default-features = false, features = ["otel", "native-defaults"] }
-
-hellas-rpc = { path = "crates/rpc", default-features = false }
-hellas-executor = { path = "crates/executor", default-features = false }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "stream"] }
-rustls-webpki = "0.103.9"
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # [patch."https://github.com/hellas-ai/catgrad"]
 # catgrad = { path = "../catgrad/catgrad" }

@@ -15,14 +15,14 @@ pub(super) fn parse_backend_request<A: WireAdaptor>(
     adaptor: &A,
     body: &Bytes,
     surface: &str,
-) -> Result<(A::ParsedRequest, BackendRequest), Response> {
-    let raw = RawRequest::from_slice(body).map_err(|err| adaptor_error(surface, err))?;
+) -> Result<(A::ParsedRequest, BackendRequest), Box<Response>> {
+    let raw = RawRequest::from_slice(body).map_err(|err| Box::new(adaptor_error(surface, err)))?;
     let parsed = adaptor
         .parse(raw.clone())
-        .map_err(|err| adaptor_error(surface, err))?;
+        .map_err(|err| Box::new(adaptor_error(surface, err)))?;
     let execution = adaptor
         .to_execution_request(&parsed)
-        .map_err(|err| adaptor_error(surface, err))?;
+        .map_err(|err| Box::new(adaptor_error(surface, err)))?;
     Ok((parsed, BackendRequest::new(execution, raw)))
 }
 

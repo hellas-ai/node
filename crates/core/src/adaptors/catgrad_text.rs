@@ -11,11 +11,11 @@
 //! sources of indeterminism mean two honest producers given the same
 //! `Call` may produce different output bytes. The protocol's only
 //! commitment is the producer signature on the receipt. When
-//! catgrad-text migrates to `Determinate` (fixed seed, deterministic
-//! kernels, fixed dtype/layout, all committed into the request bytes),
-//! the adaptor will switch to `ProtocolId::SYMBOLIC` and add a
-//! `Determinate` marker impl. That migration is a request-shape
-//! version bump, not a no-op flip; see `PROGRESS.md` and `docs/AXES.md`.
+//! catgrad-text becomes `Determinate` only with a fixed seed,
+//! deterministic kernels, fixed dtype/layout, and all such inputs
+//! committed into the request bytes. That requires a versioned
+//! `ProtocolId::SYMBOLIC` adaptor with its own request shape and
+//! `Determinate` marker impl.
 //!
 //! # Why `catnix.term.v1` and not `hellas.catgrad_text.request.v1`
 //!
@@ -93,9 +93,8 @@ pub type CatgradTextReply = TextRunOutput;
 // The binding-key conventions used by this adaptor. Documented here
 // rather than baked into magic strings at call sites — any change here
 // is a wire-format change for CatgradText specifically and gets
-// versioned via either a new adaptor (`CatgradTextV2`) or, eventually,
-// a `ProtocolId::SYMBOLIC` migration that also versions the request
-// shape.
+// versioned via either a new adaptor (`CatgradTextV2`) or a
+// `ProtocolId::SYMBOLIC` adaptor with its own request shape.
 
 // All bindings use `BindingKey::Named` for consistency. These are
 // *settlement-identity* keys (they distinguish this CatgradText Term
@@ -465,8 +464,9 @@ mod tests {
     ///   - the `Claim` preimage tag/encoding changed,
     ///   - the `ProducerId` derivation changed,
     ///   - `sample_request` constants changed.
-    /// All but the last are intentional wire-format changes — bump the
-    /// adaptor version and rev EXPECTED_HEX accordingly.
+    ///
+    /// All entries except `sample_request` are canonical wire changes; update
+    /// the adaptor version and EXPECTED_HEX when they change.
     #[test]
     fn end_to_end_claim_preimage_pinned() {
         use crate::ProducerSigningKey;

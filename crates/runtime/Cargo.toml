@@ -14,10 +14,10 @@ dag-cbor = ["serde"]
 ndarray-backend = []
 
 [dependencies]
+blake3 = "1"
 catgrad = { workspace = true, default-features = false, features = ["serde"] }
 catgrad-llm = { workspace = true, default-features = false }
 catgrad-llm-models = { workspace = true }
-blake3 = "1"
 half = "2"
 jsonschema = "0.36"
 minijinja = "2"

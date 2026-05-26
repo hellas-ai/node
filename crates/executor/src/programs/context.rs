@@ -126,8 +126,7 @@ impl ExecutionContext {
     }
 
     /// Build the request `TextExecution` commitment from this bound program
-    /// + invocation. Used at quote time to compute `commitment_id` before
-    /// the runner sees the request.
+    /// and invocation before the runner sees the request.
     pub(crate) fn build_text_execution(
         &self,
         initial_state_receipt_id: Cid<TextReceipt>,
