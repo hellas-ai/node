@@ -127,10 +127,7 @@ impl WireAdaptor for OpenAiCompletionsAdaptor {
             OutputEvent::Finished { stop_reason, .. } => Ok(vec![
                 WireStreamEvent::json(
                     None,
-                    attach_hellas(
-                        completion_chunk_json(state, String::new(), Some(stop_reason)),
-                        state.provenance.as_ref(),
-                    ),
+                    completion_chunk_json(state, String::new(), Some(stop_reason)),
                 ),
                 WireStreamEvent {
                     name: None,
@@ -216,17 +213,20 @@ fn completion_chunk_json(
     text: String,
     stop_reason: Option<StopReason>,
 ) -> JsonValue {
-    json!({
-        "id": state.id,
-        "object": "text_completion",
-        "created": state.created,
-        "model": state.model,
-        "choices": [{
-            "index": 0,
-            "text": text,
-            "finish_reason": stop_reason.map(finish_reason_json).unwrap_or(JsonValue::Null),
-        }],
-    })
+    attach_hellas(
+        json!({
+            "id": state.id,
+            "object": "text_completion",
+            "created": state.created,
+            "model": state.model,
+            "choices": [{
+                "index": 0,
+                "text": text,
+                "finish_reason": stop_reason.map(finish_reason_json).unwrap_or(JsonValue::Null),
+            }],
+        }),
+        state.provenance.as_ref(),
+    )
 }
 
 fn attach_hellas(mut body: JsonValue, provenance: Option<&crate::Provenance>) -> JsonValue {
@@ -310,7 +310,7 @@ fn optional_u32(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldPath, Provenance, Usage, WireBody};
+    use crate::{FieldPath, Provenance, Usage, WireBody, WireEventData};
 
     fn adaptor() -> OpenAiCompletionsAdaptor {
         OpenAiCompletionsAdaptor
@@ -406,5 +406,72 @@ mod tests {
         assert_eq!(body["usage"]["total_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn render_stream_events_carry_provenance_in_chunks() {
+        let request = adaptor()
+            .parse(raw(json!({
+                "model": "gpt-3.5-turbo-instruct",
+                "prompt": "Hello",
+                "stream": true
+            })))
+            .unwrap();
+        let mut state =
+            adaptor().initial_state(&request, RenderContext::new("cmpl-test", "unused", 123));
+
+        adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Provenance(Provenance {
+                    call_commitment: Some("aa".repeat(32)),
+                    receipt_commitment: None,
+                }),
+            )
+            .unwrap();
+        let delta = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::TextDelta {
+                    index: 0,
+                    delta: " world".to_string(),
+                    channel: TextChannel::Output,
+                },
+            )
+            .unwrap();
+        let WireEventData::Json(delta_json) = &delta[0].data else {
+            panic!("expected json delta");
+        };
+        assert_eq!(delta_json["choices"][0]["text"], " world");
+        assert_eq!(delta_json["hellas"]["commitment"], "aa".repeat(32));
+
+        adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Provenance(Provenance {
+                    call_commitment: Some("aa".repeat(32)),
+                    receipt_commitment: Some("bb".repeat(32)),
+                }),
+            )
+            .unwrap();
+        let finished = adaptor()
+            .render_stream_event(
+                &request,
+                &mut state,
+                OutputEvent::Finished {
+                    stop_reason: StopReason::EndOfText,
+                    usage: None,
+                },
+            )
+            .unwrap();
+        let WireEventData::Json(done_json) = &finished[0].data else {
+            panic!("expected json terminal chunk");
+        };
+        assert_eq!(done_json["hellas"]["commitment"], "aa".repeat(32));
+        assert_eq!(done_json["hellas"]["receipt"], "bb".repeat(32));
+        assert!(matches!(finished[1].data, WireEventData::Text(ref text) if text == "[DONE]"));
     }
 }
