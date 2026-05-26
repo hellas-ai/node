@@ -904,16 +904,16 @@ mod tests {
         assert_eq!(request.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(request.stream, Some(true));
         assert!(request.include_usage());
-        let paths: Vec<Vec<String>> = request
+        let paths = request
             .passthrough
             .fields()
             .iter()
-            .map(|field| field.path.segments().to_vec())
-            .collect();
-        assert!(paths.contains(&vec!["stream".to_string()]));
-        assert!(paths.contains(&vec!["stream_options".to_string()]));
-        assert!(paths.contains(&vec!["metadata".to_string()]));
-        assert!(paths.contains(&vec!["seed".to_string()]));
+            .map(|field| field.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            field_set(["stream", "stream_options", "metadata", "seed"])
+        );
     }
 
     #[test]
@@ -963,11 +963,9 @@ mod tests {
             .unwrap();
         let execution = adaptor().to_execution_request(&request).unwrap();
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(12));
-        assert!(
-            execution
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("max_completion_tokens"))
+        assert_eq!(
+            execution.canonical.committed_fields,
+            field_set(["model", "messages", "max_completion_tokens"])
         );
     }
 

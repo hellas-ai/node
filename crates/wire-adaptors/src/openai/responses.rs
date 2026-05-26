@@ -855,18 +855,23 @@ fn render_structured_delta(
         StructuredDelta::Text(text) => text,
         StructuredDelta::Json(value) => json_to_output_string(&value),
     };
+    let mut events = ensure_message_item_started(state);
+    let output_index = state
+        .message_output_index
+        .expect("message item is started before structured deltas");
     state.text.push_str(&rendered);
-    Ok(vec![response_event(
+    events.push(response_event(
         "response.output_text.delta",
         json!({
             "type": "response.output_text.delta",
             "sequence_number": next_sequence(state),
             "item_id": state.message_id,
-            "output_index": 0,
+            "output_index": output_index,
             "content_index": 0,
             "delta": rendered,
         }),
-    )])
+    ));
+    Ok(events)
 }
 
 fn response_status_event(
@@ -1131,28 +1136,13 @@ mod tests {
         assert_eq!(parsed.model, "gpt-4.1-mini");
         assert_eq!(parsed.max_output_tokens, Some(64));
         assert_eq!(parsed.stream, Some(true));
-        assert_eq!(parsed.passthrough.fields().len(), 3);
-        assert!(
-            parsed
-                .passthrough
-                .fields()
-                .iter()
-                .any(|field| field.path == FieldPath::from("metadata"))
-        );
-        assert!(
-            parsed
-                .passthrough
-                .fields()
-                .iter()
-                .any(|field| field.path == FieldPath::from("stream"))
-        );
-        assert!(
-            parsed
-                .passthrough
-                .fields()
-                .iter()
-                .any(|field| field.path == FieldPath::from("seed"))
-        );
+        let paths = parsed
+            .passthrough
+            .fields()
+            .iter()
+            .map(|field| field.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths, field_set(["stream", "metadata", "seed"]));
         assert!(parsed.raw.bytes().starts_with(b"{"));
     }
 
@@ -1560,6 +1550,75 @@ mod tests {
         assert_eq!(
             completed["response"]["output"][1]["content"][0]["text"],
             "after"
+        );
+    }
+
+    #[test]
+    fn render_stream_structured_delta_starts_message_item_after_tool_call() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::ToolCallStart(crate::ToolCallStart {
+                        index: 0,
+                        id: Some("call_1".to_string()),
+                        name: "lookup".to_string(),
+                    }),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::StructuredOutputDelta(crate::StructuredDelta::Json(json!({
+                        "answer": "after"
+                    }))),
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Finished {
+                        stop_reason: StopReason::ToolCall,
+                        usage: None,
+                    },
+                )
+                .unwrap(),
+        );
+
+        let text_delta = events
+            .iter()
+            .find_map(|event| match &event.data {
+                WireEventData::Json(value)
+                    if event.name.as_deref() == Some("response.output_text.delta") =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("structured delta should render as output text");
+        assert_eq!(text_delta["output_index"], 1);
+        assert_eq!(text_delta["delta"], "{\"answer\":\"after\"}");
+
+        let completed = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected completed event"),
+        };
+        assert_eq!(completed["response"]["output"][0]["type"], "function_call");
+        assert_eq!(completed["response"]["output"][1]["type"], "message");
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["text"],
+            "{\"answer\":\"after\"}"
         );
     }
 

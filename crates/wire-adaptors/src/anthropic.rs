@@ -711,15 +711,13 @@ mod tests {
         assert_eq!(request.model, "claude-3-5-sonnet");
         assert_eq!(request.max_tokens, 32);
         assert_eq!(request.stream, Some(true));
-        let paths: Vec<Vec<String>> = request
+        let paths = request
             .passthrough
             .fields()
             .iter()
-            .map(|field| field.path.segments().to_vec())
-            .collect();
-        assert!(paths.contains(&vec!["stream".to_string()]));
-        assert!(paths.contains(&vec!["metadata".to_string()]));
-        assert!(paths.contains(&vec!["temperature".to_string()]));
+            .map(|field| field.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths, field_set(["stream", "metadata", "temperature"]));
     }
 
     #[test]
