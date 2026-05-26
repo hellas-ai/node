@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn credit_ships_ahead_of_queued_body() {
-        // Regression for codex finding #17: Credit frame must be
+        // Credit frame must be
         // emitted ahead of queued Body frames so the peer doesn't
         // stall at zero credit waiting for our send queue to drain.
         let cfg = MuxConfig {
