@@ -680,10 +680,7 @@ fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIn
 
     // -- Generic Client over any StreamTransport, using rpc::call helpers --
     //
-    // Methods are inherent on `XClientImpl<T>`. There's no `XClient` trait:
-    // every consumer constructs `XClientImpl::new(t)` and calls methods
-    // directly; nothing in the workspace is generic over an `XClient`
-    // bound or uses `dyn XClient`, so the trait was pure indirection.
+    // Methods are inherent on `XClientImpl<T>`.
     let client_impl_name = format!("{}ClientImpl", service.proto_name);
     out.push_str(&format!(
         "    /// Generic client over any `StreamTransport`. Wraps a transport\n\
@@ -866,7 +863,7 @@ fn build_method_schema(
     let response_msg = index.message_schema(&method.response_proto_type);
     OwnedMethodSchema {
         // FQN matches HELLAS_WIRE_PLAN_v2.md's "Service/Method"
-        // convention — same shape as the gRPC :path on h2/h3.
+        // convention used by the generated service directory.
         fqn: format!("{service_fqn}/{}", method.proto_name),
         request: OwnedTypeSchema::Message(request_msg),
         response: OwnedTypeSchema::Message(response_msg),

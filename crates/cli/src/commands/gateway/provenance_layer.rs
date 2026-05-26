@@ -19,8 +19,6 @@ use hellas_rpc::provenance::{
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
-use crate::execution::ReceiptArtifact;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReceiptHeader(pub String);
 
@@ -74,11 +72,7 @@ fn apply_provenance_headers(response: &mut Response<Body>) {
             .headers_mut()
             .insert(commitment_header(), header_value(&prov.commitment_id));
     }
-    if let Some(receipt) = extensions.get::<ReceiptArtifact>() {
-        response
-            .headers_mut()
-            .insert(receipt_header(), receipt_header_value(receipt));
-    } else if let Some(receipt) = extensions.get::<ReceiptHeader>() {
+    if let Some(receipt) = extensions.get::<ReceiptHeader>() {
         response
             .headers_mut()
             .insert(receipt_header(), receipt_string_header_value(&receipt.0));
@@ -98,11 +92,6 @@ fn header_value(bytes: &[u8; 32]) -> HeaderValue {
         .expect("64-char lowercase hex is always a valid header value")
 }
 
-fn receipt_header_value(receipt: &ReceiptArtifact) -> HeaderValue {
-    HeaderValue::from_str(&receipt.encoded())
-        .expect("base64url receipt envelope is always a valid header value")
-}
-
 fn receipt_string_header_value(receipt: &str) -> HeaderValue {
     HeaderValue::from_str(receipt).expect("receipt envelope is always a valid header value")
 }
@@ -114,7 +103,7 @@ mod tests {
 
     fn build_response_with_extensions(
         prov: Option<ExecutionProvenance>,
-        receipt: Option<ReceiptArtifact>,
+        receipt: Option<ReceiptHeader>,
     ) -> Response<Body> {
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -134,8 +123,7 @@ mod tests {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
         };
-        let receipt = ReceiptArtifact::from_test_bytes(vec![0xef; 32]);
-        let expected_receipt = receipt.encoded();
+        let receipt = ReceiptHeader("AQID".to_string());
         let mut response = build_response_with_extensions(Some(prov.clone()), Some(receipt));
         apply_provenance_headers(&mut response);
         assert_eq!(
@@ -150,7 +138,7 @@ mod tests {
                 .headers()
                 .get(RECEIPT_HEADER)
                 .and_then(|v| v.to_str().ok()),
-            Some(expected_receipt.as_str())
+            Some("AQID")
         );
     }
 
@@ -187,10 +175,11 @@ mod tests {
             let prov = ExecutionProvenance {
                 commitment_id: [0x12; 32],
             };
-            let receipt = ReceiptArtifact::from_test_bytes(vec![0x56; 32]);
             let mut response = Response::new(Body::empty());
             response.extensions_mut().insert(prov);
-            response.extensions_mut().insert(receipt);
+            response
+                .extensions_mut()
+                .insert(ReceiptHeader("BAUG".to_string()));
             response
         }
 
@@ -204,9 +193,6 @@ mod tests {
             response.headers().get(COMMITMENT_HEADER).unwrap(),
             &"12".repeat(32)
         );
-        assert_eq!(
-            response.headers().get(RECEIPT_HEADER).unwrap(),
-            &ReceiptArtifact::from_test_bytes(vec![0x56; 32]).encoded()
-        );
+        assert_eq!(response.headers().get(RECEIPT_HEADER).unwrap(), "BAUG");
     }
 }

@@ -8,8 +8,7 @@ use crate::{ExecutionRequest, ExecutionResult, OutputEvent, RawRequest};
 
 pub type BackendResult<T> = Result<T, BackendError>;
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = BackendResult<T>> + Send + 'a>>;
-pub type OutputEventStream<'a> =
-    Pin<Box<dyn Stream<Item = BackendResult<OutputEvent>> + Send + 'a>>;
+pub type OutputEventStream = Pin<Box<dyn Stream<Item = BackendResult<OutputEvent>> + Send>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendRequest {
@@ -26,17 +25,17 @@ impl BackendRequest {
 pub trait ExecutionBackend {
     fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult>;
 
-    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>>;
+    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream>;
 }
 
-pub struct BackendStream<'a> {
-    pub events: OutputEventStream<'a>,
+pub struct BackendStream {
+    pub events: OutputEventStream,
     pub initial_provenance: Option<crate::Provenance>,
 }
 
-impl<'a> BackendStream<'a> {
+impl BackendStream {
     pub fn new(
-        events: impl Stream<Item = BackendResult<OutputEvent>> + Send + 'a,
+        events: impl Stream<Item = BackendResult<OutputEvent>> + Send + 'static,
         initial_provenance: Option<crate::Provenance>,
     ) -> Self {
         Self {

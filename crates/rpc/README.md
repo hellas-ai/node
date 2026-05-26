@@ -1,12 +1,12 @@
 # hellas-rpc
 
-The Hellas node RPC stack: service identities, codegen-emitted client/server
-traits, peer-state primitives, admission/accounting policy, response-trailer
-provenance helpers, and the call-side helpers used by node consumers.
+The Hellas node RPC stack: service identities, codegen-emitted client impls,
+server handler traits, peer-state primitives, admission/accounting policy,
+response-trailer provenance helpers, and the call-side helpers used by node
+consumers.
 
 Transport-independent in spirit; the in-tree transport is iroh's QUIC
-substreams via [`hellas-wire`](../wire). The wire layer's protocol is unique
-to Hellas — there is no longer a tonic/h2 codepath in production.
+substreams via [`hellas-wire`](../wire).
 
 ## Mental model
 
@@ -31,7 +31,7 @@ directions update the same peer record.
 ├──────────────────────────────────────────────────────────────┤
 │ generated clients & dispatchers (per service)               │
 │   Courtesy / Execute / Symbolic / Opaque / Node             │
-│   each → ServiceMarker, MethodMarker, Client trait + impl,  │
+│   each → ServiceMarker, MethodMarker, ClientImpl,           │
 │           Handler trait, Server dispatcher.                 │
 ├──────────────────────────────────────────────────────────────┤
 │ hellas_rpc::call helpers (transport-generic)                │
@@ -48,7 +48,6 @@ directions update the same peer record.
 │ transports                                                  │
 │   iroh::IrohTransport (QUIC bidi substreams) ← in prod      │
 │   ws::* (browser / native / CF Durable Object)              │
-│   h2::* (gRPC-compatible transport feature boundary)        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -61,10 +60,10 @@ message types, and emits hand-rolled service code via `quote!` +
 - `ServiceMarker` impl on a unit struct — carries `ALPN`, etc.
 - `MethodMarker` impl per method — carries `METHOD_ID` (a 32-bit
   Blake3-derived id), `NAME`, and the request/response prost types.
-- `pub trait XClient` — transport-agnostic in the trait signature, with one
-  blanket `impl<T: StreamTransport> XClient for XClientImpl<T>` over the
-  generic implementation. Methods delegate to `crate::call::unary` /
-  `crate::call::server_streaming` parameterized by `MethodMarker`.
+- `pub struct XClientImpl<T>` — transport-generic client with inherent
+  methods. Methods delegate to `crate::call::unary`,
+  `crate::call::server_streaming`, or `crate::call::bidi_streaming`
+  parameterized by `MethodMarker`.
 - `pub trait XHandler` — server-side handler trait. One concrete impl per
   application (`ExecutorHandle` in-tree for Courtesy/Execute/Symbolic/
   Opaque; `NodeHandlerImpl` for Node).
@@ -72,9 +71,8 @@ message types, and emits hand-rolled service code via `quote!` +
   Dispatcher<T> for XServer<H>` — routes inbound substreams by
   `method_id` and invokes the right handler method.
 
-The generated tables `KNOWN_SERVICES`, `KNOWN_METHODS`, and
-`KNOWN_RATE_LIMITED_METHODS` are populated alongside the codegen and feed
-the peer directory's policy lookups.
+The generated `KNOWN_SERVICES` table feeds the peer directory's service alias
+lookups.
 
 ## Call helpers
 
@@ -130,10 +128,9 @@ handed to `Endpoint::connect(addr, alpn)` once. They never enter
 address lookup, so identity-only routing works when iroh can resolve the
 peer.
 
-The CLI's `ExecutionRuntime::remote(secret_key, seed_targets)` builds the
-endpoint + `ServiceRegistry`; `RemoteNodeTarget::addr: EndpointAddr` is
-the dial-time bundle. `Pool::transport(impl Into<EndpointAddr>)` is the
-final dial boundary.
+The CLI's `ExecutionRuntime::remote(secret_key)` builds the endpoint +
+`ServiceRegistry`; `RemoteNodeTarget::addr: EndpointAddr` is the dial-time
+bundle. `Pool::transport(impl Into<EndpointAddr>)` is the final dial boundary.
 
 ## Provenance trailers
 
@@ -146,9 +143,6 @@ hard failure at the call site (no zero-digest fallback).
 
 ## Open work
 
-- **h2 / gRPC-compat transport** (task #14) — `hellas_wire::h2` is a stub.
-  Lands a `StreamTransport` impl over `h2` so external gRPC clients can
-  reach Hellas services.
 - **`AdmittingDispatcher` middleware** — the `PeerDirectory` policy hooks
   are in place, but no code calls them from the serve path yet.
 - **ESP32 follow-ups** — `get_known_peers` returns an empty list on

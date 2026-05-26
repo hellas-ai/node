@@ -18,9 +18,6 @@ pub mod mux;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 
-#[cfg(feature = "h2")]
-pub mod h2;
-
 #[cfg(any(feature = "ws", feature = "ws-wasm", feature = "ws-cf-do"))]
 pub mod ws;
 
