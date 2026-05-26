@@ -8,11 +8,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use catgrad::prelude::Dtype;
-use catgrad_llm::{Detokenizer, LLMError};
 use futures_core::Stream;
 use futures_util::StreamExt;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::call::WithTrailer;
-use hellas_rpc::model::ModelAssets;
+use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
     GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
@@ -28,7 +28,6 @@ use hellas_rpc::services::courtesy::CourtesyHandler;
 use hellas_rpc::services::execute::ExecuteHandler;
 use hellas_rpc::services::opaque::OpaqueHandler;
 use hellas_rpc::services::symbolic::SymbolicHandler;
-use hellas_rpc::{ExecutorError, decode_token_ids};
 use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -324,30 +323,12 @@ async fn load_decode_assets(
 struct DecodeSession {
     model_id: String,
     revision: String,
-    decoder: Detokenizer<'static>,
+    decoder: TextOutputDecoder,
 }
 
 impl DecodeSession {
     fn new(model_id: String, revision: String, assets: Arc<ModelAssets>) -> Self {
-        let stop_token_ids = assets.stop_token_ids().to_vec();
-        let decoder = Detokenizer::new(
-            move |token_ids| {
-                let token_ids: Vec<u32> = token_ids
-                    .iter()
-                    .map(|&token| {
-                        u32::try_from(token).map_err(|_| {
-                            LLMError::TokenizerError(format!(
-                                "negative token id {token} cannot be decoded"
-                            ))
-                        })
-                    })
-                    .collect::<catgrad_llm::Result<_>>()?;
-                assets
-                    .decode_tokens(&token_ids)
-                    .map_err(|err| LLMError::TokenizerError(err.to_string()))
-            },
-            &stop_token_ids,
-        );
+        let decoder = TextOutputDecoder::for_model(assets);
         Self {
             model_id,
             revision,
@@ -371,19 +352,8 @@ impl DecodeSession {
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) -> Result<String, WireStatus> {
-        let token_ids: Vec<i32> = decode_token_ids(bytes)?
-            .into_iter()
-            .map(|token| {
-                i32::try_from(token).map_err(|_| {
-                    WireStatus::new(
-                        WireCode::InvalidArgument,
-                        format!("token id {token} exceeds i32 range"),
-                    )
-                })
-            })
-            .collect::<Result<_, _>>()?;
         self.decoder
-            .push_tokens(&token_ids)
-            .map_err(|err| WireStatus::internal(format!("failed to detokenize token batch: {err}")))
+            .push_bytes(bytes)
+            .map_err(hellas_wire::WireStatus::from)
     }
 }

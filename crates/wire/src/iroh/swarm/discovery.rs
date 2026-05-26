@@ -93,9 +93,6 @@ pub trait Discovery: 'static {
 
 // ---------------------------------------------------------------------------
 // Built-in backends: static, peer-exchange.
-//
-// mDNS lives behind `discovery-mdns` (stub for v1); DHT lives behind
-// `discovery-dht` (also stub for v1).
 // ---------------------------------------------------------------------------
 
 /// Static peer data used to build a finite feed per request.

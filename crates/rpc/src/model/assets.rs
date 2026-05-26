@@ -4,8 +4,8 @@ use crate::pb::courtesy::{
     QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
 };
 use catgrad::prelude::Dtype;
-use catgrad_llm::LLMError;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
+use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
 use serde_json::Value;
@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
 use super::config::encode_i32_tokens;
 use super::hf::get_model_metadata_files;
 use super::{ModelAssetsError, Result};
-use crate::spec::ModelSpec;
+use crate::{decode_token_ids, spec::ModelSpec};
 
 pub struct ModelAssets {
     model: ModelSpec,
@@ -162,6 +162,55 @@ impl ModelAssets {
         get_model_architecture(&self.config)
             .map(str::to_string)
             .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+    }
+}
+
+/// Stateful decoder for streamed token batches.
+///
+/// The decoder preserves detokenizer state across chunks, including partial
+/// byte sequences and stop-token handling.
+pub struct TextOutputDecoder {
+    decoder: Detokenizer<'static>,
+}
+
+impl TextOutputDecoder {
+    pub fn new(assets: Arc<ModelAssets>, stop_token_ids: &[i32]) -> Self {
+        let decoder = Detokenizer::new(
+            move |token_ids| {
+                let token_ids: Vec<u32> = token_ids
+                    .iter()
+                    .map(|&token| {
+                        u32::try_from(token).map_err(|_| {
+                            LLMError::TokenizerError(format!(
+                                "negative token id {token} cannot be decoded"
+                            ))
+                        })
+                    })
+                    .collect::<catgrad_llm::Result<_>>()?;
+                assets
+                    .decode_tokens(&token_ids)
+                    .map_err(|err| LLMError::TokenizerError(err.to_string()))
+            },
+            stop_token_ids,
+        );
+        Self { decoder }
+    }
+
+    pub fn for_model(assets: Arc<ModelAssets>) -> Self {
+        let stop_token_ids = assets.stop_token_ids().to_vec();
+        Self::new(assets, &stop_token_ids)
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
+        let token_ids: Vec<i32> = decode_token_ids(bytes)?
+            .into_iter()
+            .map(|token| {
+                i32::try_from(token).map_err(|_| ModelAssetsError::OutputTokenOutOfRange { token })
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        self.decoder
+            .push_tokens(&token_ids)
+            .map_err(|source| ModelAssetsError::Detokenize { source })
     }
 }
 

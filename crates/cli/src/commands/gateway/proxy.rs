@@ -93,7 +93,7 @@ impl ExecutionBackend for ResponsesProxy {
         })
     }
 
-    fn stream<'a>(&'a self, _request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>> {
+    fn stream<'a>(&'a self, _request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             Err(BackendError::stream(
                 "Responses proxy streaming is forwarded at the HTTP response layer",

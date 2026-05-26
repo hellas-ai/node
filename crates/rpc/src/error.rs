@@ -74,7 +74,9 @@ fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
         | ModelAssetsError::ParseModelConfig { .. }
         | ModelAssetsError::ConstructModelConfig { .. }
         | ModelAssetsError::NegativePromptTokenId { .. }
-        | ModelAssetsError::NegativeStopTokenId { .. } => WireCode::InvalidArgument,
+        | ModelAssetsError::NegativeStopTokenId { .. }
+        | ModelAssetsError::TokenBytes { .. }
+        | ModelAssetsError::OutputTokenOutOfRange { .. } => WireCode::InvalidArgument,
         _ => WireCode::Internal,
     }
 }

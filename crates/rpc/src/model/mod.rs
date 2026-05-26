@@ -9,9 +9,9 @@ use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;
 
-use crate::spec::ModelSpecError;
+use crate::{TokenBytesError, spec::ModelSpecError};
 
-pub use assets::ModelAssets;
+pub use assets::{ModelAssets, TextOutputDecoder};
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
 
@@ -77,5 +77,17 @@ pub enum ModelAssetsError {
     DecodeTokens {
         #[source]
         source: TokenizerError,
+    },
+    #[error("failed to decode token byte payload")]
+    TokenBytes {
+        #[from]
+        source: TokenBytesError,
+    },
+    #[error("output token id {token} exceeds i32 range")]
+    OutputTokenOutOfRange { token: u32 },
+    #[error("failed to detokenize streamed output")]
+    Detokenize {
+        #[source]
+        source: LLMError,
     },
 }
