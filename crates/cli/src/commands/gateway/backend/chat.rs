@@ -31,7 +31,7 @@ pub(super) async fn execute_chat(
     let stream = generation_stream(prepared);
     tokio::pin!(stream);
 
-    let (total_tokens, stop_reason, receipt_cid, catnix_receipt_commitment) = loop {
+    let (total_tokens, stop_reason, receipt_commitment) = loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => provenance = Some(prov),
             Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
@@ -40,19 +40,13 @@ pub(super) async fn execute_chat(
             Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                 total_tokens,
                 stop_reason,
-                receipt_cid,
-                catnix_receipt_commitment,
+                receipt_commitment,
             })))) => {
                 feed_decode_events(
                     &mut accumulator,
                     parser.finish(parser_stop_from_runtime(stop_reason)),
                 )?;
-                break (
-                    total_tokens,
-                    stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
-                );
+                break (total_tokens, stop_reason, receipt_commitment);
             }
             Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {
                 warn!(position, %error, "gateway chat request failed");
@@ -86,11 +80,10 @@ pub(super) async fn execute_chat(
         stop_reason_from_runtime(stop_reason)
     };
     info!(
-        %receipt_cid,
+        %receipt_commitment,
         ?provenance,
         total_tokens,
         ?stop_reason,
-        ?catnix_receipt_commitment,
         message = ready_message,
         "gateway response ready"
     );
@@ -98,7 +91,7 @@ pub(super) async fn execute_chat(
         output,
         usage: Some(usage(prompt_tokens, total_tokens)),
         stop_reason,
-        provenance: provenance_from_parts(provenance.as_ref(), catnix_receipt_commitment.as_ref()),
+        provenance: provenance_from_parts(provenance.as_ref(), Some(&receipt_commitment)),
     })
 }
 
@@ -121,10 +114,8 @@ pub(super) fn chat_events(
                 Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
                     let should_emit = stream_provenance.is_none();
                     stream_provenance = Some(prov.clone());
-                    if should_emit
-                        && let Some(provenance) = provenance_from_execution(&prov)
-                    {
-                        yield OutputEvent::Provenance(provenance);
+                    if should_emit {
+                        yield OutputEvent::Provenance(provenance_from_execution(&prov));
                     }
                 }
                 Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
@@ -139,11 +130,10 @@ pub(super) fn chat_events(
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     total_tokens,
                     stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
+                    receipt_commitment,
                 })))) => {
                     info!(
-                        %receipt_cid,
+                        %receipt_commitment,
                         provenance = ?stream_provenance,
                         total_tokens,
                         ?stop_reason,
@@ -159,7 +149,7 @@ pub(super) fn chat_events(
                     }
                     if let Some(provenance) = provenance_from_parts(
                         stream_provenance.as_ref(),
-                        catnix_receipt_commitment.as_ref(),
+                        Some(&receipt_commitment),
                     ) {
                         yield OutputEvent::Provenance(provenance);
                     }

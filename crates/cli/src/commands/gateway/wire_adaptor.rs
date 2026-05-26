@@ -3,7 +3,7 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixCallCommitment, CatnixReceiptCommitment};
+use hellas_rpc::provenance::{CallCommitment, ReceiptCommitment};
 use hellas_wire_adaptors::{
     AdaptorError, BackendError, BackendRequest, ExecutionBackend, OutputEvent, Provenance,
     RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse, WireStreamEvent,
@@ -247,16 +247,14 @@ fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenanc
         .as_deref()
         .and_then(|value| decode_hex_32("call commitment", value))
     {
-        response.extensions_mut().insert(CatnixCallCommitment(call));
+        response.extensions_mut().insert(CallCommitment(call));
     }
     if let Some(receipt) = provenance
         .receipt_commitment
         .as_deref()
         .and_then(|value| decode_hex_32("receipt commitment", value))
     {
-        response
-            .extensions_mut()
-            .insert(CatnixReceiptCommitment(receipt));
+        response.extensions_mut().insert(ReceiptCommitment(receipt));
     }
 }
 

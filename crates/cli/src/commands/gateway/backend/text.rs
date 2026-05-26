@@ -19,7 +19,7 @@ pub(super) async fn execute_text(
         .await
         .map_err(text_generation_error)?;
     info!(
-        %completed.receipt_cid,
+        receipt_commitment = %completed.receipt_commitment,
         provenance = ?completed.provenance,
         total_tokens = completed.total_tokens,
         stop_reason = ?completed.stop_reason,
@@ -35,7 +35,7 @@ pub(super) async fn execute_text(
         stop_reason: stop_reason_from_runtime(completed.stop_reason),
         provenance: provenance_from_parts(
             completed.provenance.as_ref(),
-            completed.catnix_receipt_commitment.as_ref(),
+            Some(&completed.receipt_commitment),
         ),
     })
 }
@@ -56,10 +56,8 @@ pub(super) fn text_events(
                 Ok(Some(Ok(GenerationEvent::Provenance(prov)))) => {
                     let should_emit = stream_provenance.is_none();
                     stream_provenance = Some(prov.clone());
-                    if should_emit
-                        && let Some(provenance) = provenance_from_execution(&prov)
-                    {
-                        yield OutputEvent::Provenance(provenance);
+                    if should_emit {
+                        yield OutputEvent::Provenance(provenance_from_execution(&prov));
                     }
                 }
                 Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
@@ -72,11 +70,10 @@ pub(super) fn text_events(
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     total_tokens,
                     stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
+                    receipt_commitment,
                 })))) => {
                     info!(
-                        %receipt_cid,
+                        %receipt_commitment,
                         provenance = ?stream_provenance,
                         total_tokens,
                         ?stop_reason,
@@ -85,7 +82,7 @@ pub(super) fn text_events(
                     );
                     if let Some(provenance) = provenance_from_parts(
                         stream_provenance.as_ref(),
-                        catnix_receipt_commitment.as_ref(),
+                        Some(&receipt_commitment),
                     ) {
                         yield OutputEvent::Provenance(provenance);
                     }

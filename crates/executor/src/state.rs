@@ -14,9 +14,7 @@ use hellas_rpc::pb::hellas::{
     Outcome as PbOutcome, StopReason as PbStopReason,
 };
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-use hellas_runtime::cid::Cid;
 use hellas_runtime::graph::Program;
-use hellas_runtime::runtime::TextReceipt;
 use uuid::Uuid;
 
 pub use hellas_rpc::error::StateError;
@@ -158,13 +156,9 @@ pub struct QuoteRecord {
     pub start: ExecutionStart,
     pub expires_at: Instant,
     pub model_id: String,
-    /// Catnix projection of this quote's request, captured at quote time
-    /// so the completion path can build a matching `TextRunOutput` and
-    /// signed `Receipt` without re-projecting.
-    ///
-    /// `None` when projection failed. For CatgradText, `Call::payload`
-    /// is the canonical `catnix::Term` bytes for this quote.
-    pub catnix_call: Option<Call>,
+    /// Canonical projection of this quote's request, captured at quote time
+    /// so the completion path can build and sign the matching result.
+    pub call: Call,
 }
 
 #[derive(Default)]
@@ -218,8 +212,7 @@ fn make_id(prefix: &str) -> String {
 
 // =====================================================================
 // Termination — the worker's authoritative result for one execution.
-// Mirrors the wire `Outcome` shape but keeps the receipt CID typed and
-// the stop reason native.
+// Mirrors the wire `Outcome` shape while keeping the stop reason native.
 // =====================================================================
 
 /// Why the runner stopped emitting tokens.
@@ -245,11 +238,7 @@ pub enum Termination {
     Completed {
         total_tokens: u64,
         stop_reason: StopReason,
-        receipt_cid: Cid<TextReceipt>,
-        /// Catnix receipt commitment: BLAKE3 of the signed `Claim`
-        /// body. `None` when no catnix Call was captured for the quote
-        /// or result projection/signing failed.
-        catnix_receipt_commitment: Option<[u8; 32]>,
+        receipt_commitment: [u8; 32],
     },
     Failed {
         position: u64,
@@ -274,15 +263,11 @@ impl Termination {
             Self::Completed {
                 total_tokens,
                 stop_reason,
-                receipt_cid,
-                catnix_receipt_commitment,
+                receipt_commitment,
             } => pb::outcome::Kind::Completed(PbCompleted {
                 total_tokens,
                 stop_reason: stop_reason.to_pb() as i32,
-                receipt_cid: receipt_cid.as_bytes().to_vec(),
-                catnix_receipt_commitment: catnix_receipt_commitment
-                    .map(|c| c.to_vec())
-                    .unwrap_or_default(),
+                receipt_commitment: receipt_commitment.to_vec(),
             }),
             Self::Failed { position, error } => {
                 pb::outcome::Kind::Failed(PbFailed { position, error })

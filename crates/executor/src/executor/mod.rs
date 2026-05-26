@@ -30,9 +30,8 @@ pub struct QuoteOutcome<R> {
 }
 
 /// Streaming execution paired with the provenance committed to at
-/// quote-acceptance time. The receipt CID is *terminal* and travels via
-/// the existing `Completed.receipt_cid` proto field on the stream's
-/// final event — it's not part of `ExecutionProvenance`.
+/// quote-acceptance time. The receipt commitment is terminal and travels
+/// via the stream's final event.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
     pub provenance: ExecutionProvenance,

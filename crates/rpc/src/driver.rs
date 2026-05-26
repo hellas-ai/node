@@ -26,9 +26,8 @@ pub struct QuotedResponse {
 }
 
 /// Streaming execution paired with the provenance committed to at
-/// quote-acceptance time. The receipt CID is terminal and reaches the
-/// caller via the streamed `Completed.receipt_cid` proto field, not
-/// through `ExecutionProvenance`.
+/// quote-acceptance time. The receipt commitment is terminal and reaches
+/// the caller via the streamed `Completed.receipt_commitment` proto field.
 pub struct StreamedExecution {
     pub stream: ExecuteEventStream,
     pub provenance: ExecutionProvenance,

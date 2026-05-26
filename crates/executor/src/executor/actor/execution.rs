@@ -3,7 +3,7 @@ use crate::state::new_execution_id;
 use crate::worker::{EnqueueError, ExecuteJob};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::ExecuteRequest;
-use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::provenance::{CallCommitment, ExecutionProvenance};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -26,13 +26,8 @@ impl Executor {
         let stream_batch_size = request.stream_batch_size.unwrap_or(1).max(1);
         self.store.prune_expired_quotes(Instant::now());
         let quote = self.store.get_quote(&quote_id, Instant::now())?.clone();
-        let catnix_call_commitment = quote
-            .catnix_call
-            .as_ref()
-            .map(|call| *call.commitment().digest().as_bytes());
         let provenance = ExecutionProvenance {
-            commitment_id: *quote.start.commitment_id.as_bytes(),
-            catnix_call_commitment,
+            call_commitment: CallCommitment(*quote.call.commitment().digest().as_bytes()),
         };
 
         let stat_prompt = quote.invocation.input_ids.len() as u64;
@@ -56,7 +51,7 @@ impl Executor {
             cancel: CancellationToken::new(),
             sender,
             metrics: Arc::clone(&self.metrics),
-            catnix_call: quote.catnix_call.clone(),
+            call: quote.call.clone(),
             producer_key: Arc::clone(&self.producer_key),
         };
 
@@ -87,7 +82,7 @@ impl Executor {
         info!(
             %execution_id,
             %quote_id,
-            commitment_id = %quote.start.commitment_id,
+            runtime_commitment_id = %quote.start.commitment_id,
             queued,
             queue_len = self.pending_executions.len(),
             "accepted execution"

@@ -169,29 +169,32 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_request_uses_empty_catnix_state_not_receipt_cid() {
+    fn cold_start_request_uses_empty_catnix_state() {
         let program_cid = Cid::<Program>::from_bytes([0xaa; 32]);
-        let receipt_cid = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
+        let runtime_receipt_id = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
         let inv = invocation();
         let pol = policy();
         let loc = locator();
 
-        let req = build_catgrad_text_request(program_cid, &loc, receipt_cid, &inv, &pol);
+        let req = build_catgrad_text_request(program_cid, &loc, runtime_receipt_id, &inv, &pol);
 
         assert_eq!(req.from, empty_text_state_value_id());
-        assert_ne!(req.from, ValueId::from_bytes(*receipt_cid.as_bytes()));
+        assert_ne!(
+            req.from,
+            ValueId::from_bytes(*runtime_receipt_id.as_bytes())
+        );
     }
 
     #[test]
     fn build_then_project_is_deterministic() {
         let program_cid = Cid::<Program>::from_bytes([0xaa; 32]);
-        let receipt_cid = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
+        let runtime_receipt_id = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
         let inv = invocation();
         let pol = policy();
         let loc = locator();
 
-        let req_a = build_catgrad_text_request(program_cid, &loc, receipt_cid, &inv, &pol);
-        let req_b = build_catgrad_text_request(program_cid, &loc, receipt_cid, &inv, &pol);
+        let req_a = build_catgrad_text_request(program_cid, &loc, runtime_receipt_id, &inv, &pol);
+        let req_b = build_catgrad_text_request(program_cid, &loc, runtime_receipt_id, &inv, &pol);
         assert_eq!(req_a, req_b);
 
         let call_a = project_call_for_request(&req_a).unwrap();
@@ -201,7 +204,7 @@ mod tests {
 
     #[test]
     fn different_program_cid_produces_different_call() {
-        let receipt_cid = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
+        let runtime_receipt_id = Cid::<TextReceipt>::from_bytes([0xbb; 32]);
         let inv = invocation();
         let pol = policy();
         let loc = locator();
@@ -209,14 +212,14 @@ mod tests {
         let a = build_catgrad_text_request(
             Cid::<Program>::from_bytes([1; 32]),
             &loc,
-            receipt_cid,
+            runtime_receipt_id,
             &inv,
             &pol,
         );
         let b = build_catgrad_text_request(
             Cid::<Program>::from_bytes([2; 32]),
             &loc,
-            receipt_cid,
+            runtime_receipt_id,
             &inv,
             &pol,
         );

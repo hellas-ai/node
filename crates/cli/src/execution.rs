@@ -46,10 +46,8 @@ use hellas_rpc::pb::hellas::{
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
+use hellas_rpc::provenance::{ExecutionProvenance, ReceiptCommitment};
 use hellas_rpc::service::ExecuteService;
-use hellas_runtime::cid::Cid;
-use hellas_runtime::runtime::TextReceipt;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -164,10 +162,7 @@ pub enum Outcome {
     Completed {
         total_tokens: u64,
         stop_reason: StopReason,
-        receipt_cid: Cid<TextReceipt>,
-        /// Catnix receipt commitment from the producer's signed
-        /// `Claim`. `None` when the producer did not compute one.
-        catnix_receipt_commitment: Option<CatnixReceiptCommitment>,
+        receipt_commitment: ReceiptCommitment,
     },
     Failed {
         /// Tokens emitted before the failure (for honest usage reporting).
@@ -380,7 +375,7 @@ impl PreparedExecution {
 /// Cases:
 ///   - Primary Failed → return primary unchanged. Shadow doesn't run; no
 ///     point burning verification compute on a failure.
-///   - Primary Completed + shadow Completed + matching receipt CIDs →
+///   - Primary Completed + shadow Completed + matching receipt commitments →
 ///     primary unchanged.
 ///   - Primary Completed + shadow Completed + mismatched receipts →
 ///     synthetic Failed describing the divergence.
@@ -392,24 +387,26 @@ impl PreparedExecution {
 /// as stream-level errors (not Outcome::Failed) — they're also unverified
 /// situations but distinguished for diagnostics.
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
-    let primary_cid = match &primary {
-        Outcome::Completed { receipt_cid, .. } => *receipt_cid,
+    let primary_commitment = match &primary {
+        Outcome::Completed {
+            receipt_commitment, ..
+        } => *receipt_commitment,
         Outcome::Failed { .. } => return Ok(primary),
     };
 
     let shadow_outcome = drain_to_outcome(shadow.stream()).await?;
     match shadow_outcome {
         Outcome::Completed {
-            receipt_cid: shadow_cid,
+            receipt_commitment: shadow_commitment,
             ..
         } => {
-            if primary_cid == shadow_cid {
+            if primary_commitment == shadow_commitment {
                 Ok(primary)
             } else {
                 Ok(Outcome::Failed {
                     position: primary.position(),
                     error: format!(
-                        "verify mismatch: primary receipt {primary_cid} ≠ shadow receipt {shadow_cid}"
+                        "verify mismatch: primary receipt {primary_commitment} != shadow receipt {shadow_commitment}"
                     ),
                 })
             }
@@ -726,29 +723,12 @@ fn parse_outcome(outcome: Option<pb::Outcome>) -> anyhow::Result<Outcome> {
         .ok_or_else(|| anyhow!("outcome with no kind"))?;
     match kind {
         pb::outcome::Kind::Completed(c) => {
-            let receipt_cid = receipt_cid_from_bytes(&c.receipt_cid)?;
             let stop_reason = stop_reason_from_pb(c.stop_reason)?;
-            // Empty means the producer did not compute a catnix receipt.
-            // Non-empty values must be exactly 32 bytes.
-            let catnix_receipt_commitment =
-                if c.catnix_receipt_commitment.is_empty() {
-                    None
-                } else {
-                    let arr: [u8; 32] = c.catnix_receipt_commitment.as_slice().try_into().map_err(
-                        |_| {
-                            anyhow!(
-                                "catnix_receipt_commitment wire length {} bytes (expected 0 or 32)",
-                                c.catnix_receipt_commitment.len()
-                            )
-                        },
-                    )?;
-                    Some(CatnixReceiptCommitment(arr))
-                };
+            let receipt_commitment = receipt_commitment_from_bytes(&c.receipt_commitment)?;
             Ok(Outcome::Completed {
                 total_tokens: c.total_tokens,
                 stop_reason,
-                receipt_cid,
-                catnix_receipt_commitment,
+                receipt_commitment,
             })
         }
         pb::outcome::Kind::Failed(f) => Ok(Outcome::Failed {
@@ -758,14 +738,14 @@ fn parse_outcome(outcome: Option<pb::Outcome>) -> anyhow::Result<Outcome> {
     }
 }
 
-fn receipt_cid_from_bytes(bytes: &[u8]) -> anyhow::Result<Cid<TextReceipt>> {
+fn receipt_commitment_from_bytes(bytes: &[u8]) -> anyhow::Result<ReceiptCommitment> {
     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
         anyhow!(
-            "receipt_cid wire length {} bytes (expected 32)",
+            "receipt_commitment wire length {} bytes (expected 32)",
             bytes.len()
         )
     })?;
-    Ok(Cid::from_bytes(arr))
+    Ok(ReceiptCommitment(arr))
 }
 
 fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {

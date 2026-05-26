@@ -54,6 +54,8 @@ pub enum ExecutorError {
     PolicyDenied(String),
     #[error("invalid token payload: {0}")]
     InvalidTokenPayload(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error(transparent)]
     TokenBytes(#[from] TokenBytesError),
     #[error(
@@ -94,6 +96,7 @@ fn executor_status_code(err: &ExecutorError) -> tonic::Code {
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::Llm(_)
+        | ExecutorError::Protocol(_)
         | ExecutorError::WeightsError(_) => tonic::Code::Internal,
     }
 }

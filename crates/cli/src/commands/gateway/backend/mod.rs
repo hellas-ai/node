@@ -99,10 +99,7 @@ impl ExecutionBackend for GatewayBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>> {
         Box::pin(async move {
             let prepared = self.prepare(&request).await?;
-            let initial_provenance = prepared
-                .provenance
-                .as_ref()
-                .and_then(provenance_from_execution);
+            let initial_provenance = prepared.provenance.as_ref().map(provenance_from_execution);
             let stream = match self.surface {
                 GatewaySurface::Responses | GatewaySurface::Completion => BackendStream::new(
                     text_events(prepared, self.ready_message()),

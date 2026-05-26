@@ -1,109 +1,63 @@
-//! Execution provenance — content-addressed identifiers that travel
-//! alongside every gateway/executor RPC. Two boundaries to cross:
+//! Execution provenance commitments that travel alongside gateway/executor RPCs.
 //!
-//! - **Executor → gateway** over tonic Response metadata using the
-//!   `x-hellas-*` keys defined below. Mirrors the OTel W3C trace-context
-//!   propagation pattern; this module is the read/write half on both sides.
-//! - **Gateway → HTTP client** over response headers (same names) and named
-//!   SSE events. Translation happens in the gateway's tower layer and SSE
-//!   handlers, not here.
-//!
-//! Wire form everywhere: 64-char lowercase hex of the underlying 32-byte
-//! CID. Matches `hellas_runtime::cid::Cid<T>::Display` so a single value renders
-//! identically in tracing logs, headers, and metadata. We carry raw bytes
-//! in `ExecutionProvenance` rather than typed `Cid<T>` so this module
-//! doesn't pull catgrad into the rpc crate's `client` feature; callers
-//! reconstitute typed CIDs via `Cid::from_bytes` at their boundary.
+//! The wire form is 64-char lowercase hex over 32 canonical bytes. RPC metadata,
+//! HTTP headers, SSE events, and tracing output all use the same rendering.
 
 use std::fmt::Write;
+
 use thiserror::Error;
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
-/// Tonic metadata key for the runtime request commitment
-/// (`Cid<TextExecution>`).
-pub const COMMITMENT_HEADER: &str = "x-hellas-commitment-id";
+/// Tonic metadata and HTTP header key for the request call commitment.
+pub const COMMITMENT_HEADER: &str = "x-hellas-commitment";
 
-/// Tonic metadata key for the runtime terminal receipt
-/// (`Cid<TextReceipt>`).
-pub const RECEIPT_HEADER: &str = "x-hellas-receipt-id";
+/// Tonic metadata and HTTP header key for the terminal receipt commitment.
+pub const RECEIPT_HEADER: &str = "x-hellas-receipt";
 
-/// HTTP header / tonic metadata key for the catnix `CallCommitment`.
-/// This is the public gateway commitment header.
-pub const CATNIX_COMMITMENT_HEADER: &str = "x-hellas-commitment";
-
-/// HTTP header / tonic metadata key for the catnix receipt commitment.
-/// Emitted by the gateway when a completed response attaches a terminal
-/// [`CatnixReceiptCommitment`] extension.
-pub const CATNIX_RECEIPT_HEADER: &str = "x-hellas-receipt";
-
-/// Catnix call commitment rendered as the `x-hellas-commitment` header.
+/// Request call commitment rendered as the `x-hellas-commitment` header.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct CatnixCallCommitment(pub [u8; 32]);
+pub struct CallCommitment(pub [u8; 32]);
 
-impl std::fmt::Display for CatnixCallCommitment {
+impl std::fmt::Display for CallCommitment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(&encode_hex(&self.0))
     }
 }
 
-impl std::fmt::Debug for CatnixCallCommitment {
+impl std::fmt::Debug for CallCommitment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
-/// Catnix receipt commitment rendered as the `x-hellas-receipt` header.
+/// Producer receipt commitment rendered as the `x-hellas-receipt` header.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct CatnixReceiptCommitment(pub [u8; 32]);
+pub struct ReceiptCommitment(pub [u8; 32]);
 
-impl std::fmt::Display for CatnixReceiptCommitment {
+impl std::fmt::Display for ReceiptCommitment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(&encode_hex(&self.0))
     }
 }
 
-impl std::fmt::Debug for CatnixReceiptCommitment {
+impl std::fmt::Debug for ReceiptCommitment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
-/// Pre-flight provenance for a single execution. The catnix receipt
-/// commitment is terminal and travels via the streaming
-/// `Outcome::Completed` payload.
-///
-/// `catnix_call_commitment` is the commitment over the projected
-/// catnix `Term`. `None` when the executor could not project it.
+/// Pre-flight provenance for a single execution.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExecutionProvenance {
-    pub commitment_id: [u8; 32],
-    pub catnix_call_commitment: Option<[u8; 32]>,
+    pub call_commitment: CallCommitment,
 }
 
-/// Renders as the commitment's lowercase-hex string, matching how it
-/// appears in tonic metadata and HTTP headers. Lets callers log
-/// provenance with `%prov` (or `?Option<ExecutionProvenance>` for the
-/// `Some(deadbeef…) | None` form tracing produces) instead of
-/// hand-rolling the hex render.
 impl std::fmt::Display for ExecutionProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.commitment_id {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        std::fmt::Display::fmt(&self.call_commitment, f)
     }
 }
 
-/// Debug == Display so `?provenance` and `?Option<ExecutionProvenance>`
-/// stay readable in tracing output. The default derive would render
-/// `ExecutionProvenance { commitment_id: [171, 171, …] }` which is the
-/// opposite of useful.
 impl std::fmt::Debug for ExecutionProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
@@ -128,8 +82,7 @@ impl From<ProvenanceError> for tonic::Status {
     }
 }
 
-/// Render a 32-byte CID as 64-char lowercase hex. Matches
-/// `hellas_runtime::cid::Cid<T>::Display`.
+/// Render 32 commitment bytes as 64-char lowercase hex.
 pub fn encode_hex(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in bytes {
@@ -138,16 +91,15 @@ pub fn encode_hex(bytes: &[u8; 32]) -> String {
     s
 }
 
-/// Build an ASCII-typed tonic metadata value from a CID's bytes.
-pub fn cid_bytes_to_metadata(bytes: &[u8; 32]) -> MetadataValue<Ascii> {
+/// Build an ASCII-typed tonic metadata value from commitment bytes.
+pub fn commitment_bytes_to_metadata(bytes: &[u8; 32]) -> MetadataValue<Ascii> {
     encode_hex(bytes)
         .parse()
         .expect("64-char hex is always valid ASCII metadata")
 }
 
-/// Read a single CID-bearing key out of a tonic metadata map and decode
-/// the hex value back into raw bytes.
-pub fn cid_bytes_from_metadata(
+/// Read one commitment-bearing key out of a tonic metadata map.
+pub fn commitment_bytes_from_metadata(
     md: &MetadataMap,
     key: &'static str,
 ) -> Result<[u8; 32], ProvenanceError> {
@@ -168,36 +120,19 @@ pub fn cid_bytes_from_metadata(
     Ok(out)
 }
 
-/// Read the pre-flight provenance from a tonic metadata map. Returns
-/// `Err(Missing)` if the runtime commitment key is absent. The catnix
-/// commitment is optional for compatibility with producers that do not
-/// emit it yet.
+/// Read pre-flight provenance from a tonic metadata map.
 pub fn read_provenance_metadata(md: &MetadataMap) -> Result<ExecutionProvenance, ProvenanceError> {
-    let commitment_id = cid_bytes_from_metadata(md, COMMITMENT_HEADER)?;
-    let catnix_call_commitment = match cid_bytes_from_metadata(md, CATNIX_COMMITMENT_HEADER) {
-        Ok(bytes) => Some(bytes),
-        // The new header is optional; absence is fine, only flag
-        // genuinely-malformed values.
-        Err(ProvenanceError::Missing { .. }) => None,
-        Err(err) => return Err(err),
-    };
     Ok(ExecutionProvenance {
-        commitment_id,
-        catnix_call_commitment,
+        call_commitment: CallCommitment(commitment_bytes_from_metadata(md, COMMITMENT_HEADER)?),
     })
 }
 
-/// Insert pre-flight provenance into a tonic metadata map. Used
-/// server-side on `Response::metadata_mut()` for both unary and
-/// streaming RPCs.
+/// Insert pre-flight provenance into a tonic metadata map.
 pub fn write_provenance_metadata(md: &mut MetadataMap, prov: &ExecutionProvenance) {
     md.insert(
         COMMITMENT_HEADER,
-        cid_bytes_to_metadata(&prov.commitment_id),
+        commitment_bytes_to_metadata(&prov.call_commitment.0),
     );
-    if let Some(catnix) = &prov.catnix_call_commitment {
-        md.insert(CATNIX_COMMITMENT_HEADER, cid_bytes_to_metadata(catnix));
-    }
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -214,15 +149,7 @@ mod tests {
 
     fn sample() -> ExecutionProvenance {
         ExecutionProvenance {
-            commitment_id: [0xab; 32],
-            catnix_call_commitment: None,
-        }
-    }
-
-    fn sample_with_catnix() -> ExecutionProvenance {
-        ExecutionProvenance {
-            commitment_id: [0xab; 32],
-            catnix_call_commitment: Some([0xcd; 32]),
+            call_commitment: CallCommitment([0xab; 32]),
         }
     }
 
@@ -238,34 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn commitment_display_is_hex() {
+        assert_eq!(CallCommitment([0xcd; 32]).to_string(), "cd".repeat(32));
+        assert_eq!(ReceiptCommitment([0xef; 32]).to_string(), "ef".repeat(32));
+    }
+
+    #[test]
     fn round_trip_through_metadata() {
         let prov = sample();
         let mut md = MetadataMap::new();
         write_provenance_metadata(&mut md, &prov);
         let decoded = read_provenance_metadata(&md).expect("round-trip should succeed");
         assert_eq!(decoded, prov);
-        assert!(!md.contains_key(CATNIX_COMMITMENT_HEADER));
-    }
-
-    #[test]
-    fn round_trip_with_catnix_commitment() {
-        let prov = sample_with_catnix();
-        let mut md = MetadataMap::new();
-        write_provenance_metadata(&mut md, &prov);
-        // Both headers should be present.
         assert!(md.contains_key(COMMITMENT_HEADER));
-        assert!(md.contains_key(CATNIX_COMMITMENT_HEADER));
-        let decoded = read_provenance_metadata(&md).expect("round-trip should succeed");
-        assert_eq!(decoded, prov);
-    }
-
-    #[test]
-    fn missing_catnix_commitment_reads_as_none() {
-        let mut md = MetadataMap::new();
-        md.insert(COMMITMENT_HEADER, "ab".repeat(32).parse().unwrap());
-        let decoded = read_provenance_metadata(&md).expect("runtime commitment should parse");
-        assert_eq!(decoded.commitment_id, [0xab; 32]);
-        assert_eq!(decoded.catnix_call_commitment, None);
     }
 
     #[test]
@@ -309,7 +221,6 @@ mod tests {
 
     #[test]
     fn uppercase_hex_rejected() {
-        // Display is lowercase; we reject uppercase so the wire form is unambiguous.
         let mut md = MetadataMap::new();
         md.insert(COMMITMENT_HEADER, "AB".repeat(32).parse().unwrap());
         let err = read_provenance_metadata(&md).expect_err("uppercase hex must fail");
@@ -317,51 +228,6 @@ mod tests {
             err,
             ProvenanceError::BadHex {
                 key: COMMITMENT_HEADER
-            }
-        );
-    }
-
-    /// `CATNIX_COMMITMENT_HEADER` is optional, but a present malformed
-    /// value must be rejected rather than silently dropped.
-    #[test]
-    fn catnix_commitment_bad_length_rejected() {
-        let mut md = MetadataMap::new();
-        md.insert(COMMITMENT_HEADER, "ab".repeat(32).parse().unwrap());
-        md.insert(CATNIX_COMMITMENT_HEADER, "deadbeef".parse().unwrap());
-        let err = read_provenance_metadata(&md).expect_err("short catnix header must fail");
-        assert_eq!(
-            err,
-            ProvenanceError::BadLength {
-                key: CATNIX_COMMITMENT_HEADER,
-                len: 8,
-            }
-        );
-    }
-
-    #[test]
-    fn catnix_commitment_bad_hex_rejected() {
-        let mut md = MetadataMap::new();
-        md.insert(COMMITMENT_HEADER, "ab".repeat(32).parse().unwrap());
-        md.insert(CATNIX_COMMITMENT_HEADER, "z".repeat(64).parse().unwrap());
-        let err = read_provenance_metadata(&md).expect_err("non-hex catnix header must fail");
-        assert_eq!(
-            err,
-            ProvenanceError::BadHex {
-                key: CATNIX_COMMITMENT_HEADER,
-            }
-        );
-    }
-
-    #[test]
-    fn catnix_commitment_uppercase_hex_rejected() {
-        let mut md = MetadataMap::new();
-        md.insert(COMMITMENT_HEADER, "ab".repeat(32).parse().unwrap());
-        md.insert(CATNIX_COMMITMENT_HEADER, "AB".repeat(32).parse().unwrap());
-        let err = read_provenance_metadata(&md).expect_err("uppercase catnix header must fail");
-        assert_eq!(
-            err,
-            ProvenanceError::BadHex {
-                key: CATNIX_COMMITMENT_HEADER,
             }
         );
     }

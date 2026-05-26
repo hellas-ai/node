@@ -1,8 +1,6 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_rpc::provenance::{CatnixReceiptCommitment, ExecutionProvenance};
-use hellas_runtime::cid::Cid;
-use hellas_runtime::runtime::TextReceipt;
+use hellas_rpc::provenance::{ExecutionProvenance, ReceiptCommitment};
 
 use crate::execution::{ExecutionEvent, Outcome, StopReason};
 use crate::text_output::TextOutputDecoder;
@@ -21,8 +19,7 @@ pub(super) struct CompletedTextGeneration {
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) total_tokens: u64,
     pub(super) stop_reason: StopReason,
-    pub(super) receipt_cid: Cid<TextReceipt>,
-    pub(super) catnix_receipt_commitment: Option<CatnixReceiptCommitment>,
+    pub(super) receipt_commitment: ReceiptCommitment,
 }
 
 pub(super) enum TextGenerationError {
@@ -79,16 +76,14 @@ pub(super) async fn collect_text(
             Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                 total_tokens,
                 stop_reason,
-                receipt_cid,
-                catnix_receipt_commitment,
+                receipt_commitment,
             })))) => {
                 return Ok(CompletedTextGeneration {
                     text,
                     provenance,
                     total_tokens,
                     stop_reason,
-                    receipt_cid,
-                    catnix_receipt_commitment,
+                    receipt_commitment,
                 });
             }
             Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {

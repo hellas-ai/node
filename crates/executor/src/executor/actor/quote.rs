@@ -8,7 +8,7 @@ use hellas_rpc::pb::hellas::{
     GetQuoteRequest, GetQuoteResponse, ListModelsResponse, ModelInfo, ModelStatus,
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePromptRequest, QuotePromptResponse,
 };
-use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::provenance::{CallCommitment, ExecutionProvenance};
 use hellas_rpc::spec::ModelSpec;
 use hellas_runtime::runtime::TextPolicy;
 use std::str::FromStr;
@@ -128,9 +128,6 @@ impl Executor {
         let commitment_id = execution
             .build_text_execution(initial_receipt_id, &plan.invocation, &policy)?
             .id();
-        // Build the catnix projection over the same runtime inputs.
-        // Projection failure is non-fatal: the quote still runs without
-        // catnix provenance.
         let catnix_request = crate::catnix_bridge::build_catgrad_text_request(
             program_id,
             &plan.weights_key,
@@ -138,22 +135,10 @@ impl Executor {
             &plan.invocation,
             &policy,
         );
-        let (catnix_call, catnix_term_id_str, catnix_call_commitment_str) =
-            match crate::catnix_bridge::project_call_for_request(&catnix_request) {
-                Ok(call) => {
-                    let term_id = catnix::Digest::from_canonical_bytes(call.payload.as_bytes());
-                    let commitment = call.commitment().digest();
-                    (Some(call), format!("{term_id}"), format!("{commitment}"))
-                }
-                Err(err) => {
-                    warn!(error = %err, "catnix projection failed");
-                    (
-                        None,
-                        "projection_failed".to_string(),
-                        "projection_failed".to_string(),
-                    )
-                }
-            };
+        let call = crate::catnix_bridge::project_call_for_request(&catnix_request)
+            .map_err(|err| ExecutorError::Protocol(format!("quote projection failed: {err}")))?;
+        let term_id = catnix::Digest::from_canonical_bytes(call.payload.as_bytes());
+        let call_commitment = CallCommitment(*call.commitment().digest().as_bytes());
         let cache_start = Instant::now();
         let start = execution.execution_start(commitment_id, initial_receipt_id)?;
         let cache_lookup_ms = cache_start.elapsed().as_millis();
@@ -163,27 +148,21 @@ impl Executor {
         let prompt_tokens = plan.invocation.input_ids.len();
         let max_new_tokens = plan.invocation.max_new_tokens;
         let cached_output_tokens = start.cached.as_ref().map_or(0, |c| c.output_tokens.len());
-        // Capture the catnix commitment before `catnix_call` moves into
-        // QuoteRecord, so the provenance metadata below can carry it
-        // without re-projecting.
-        let catnix_call_commitment_bytes = catnix_call
-            .as_ref()
-            .map(|call| *call.commitment().digest().as_bytes());
         let quote_id = self.store.create_quote(QuoteRecord {
             invocation: plan.invocation,
             execution,
             start,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: model_id.clone(),
-            catnix_call,
+            call,
         });
 
         info!(
             %quote_id,
             %program_id,
             %commitment_id,
-            catnix_term_id = %catnix_term_id_str,
-            catnix_call_commitment = %catnix_call_commitment_str,
+            term_id = %term_id,
+            call_commitment = %call_commitment,
             amount = STATIC_QUOTE_AMOUNT,
             model = model_id,
             requested_revision,
@@ -211,10 +190,7 @@ impl Executor {
                 amount: STATIC_QUOTE_AMOUNT,
                 ttl_ms: QUOTE_TTL.as_millis() as u64,
             },
-            provenance: ExecutionProvenance {
-                commitment_id: *commitment_id.as_bytes(),
-                catnix_call_commitment: catnix_call_commitment_bytes,
-            },
+            provenance: ExecutionProvenance { call_commitment },
         })
     }
 

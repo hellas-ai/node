@@ -11,6 +11,7 @@ use catnix::{
 use hellas_core::ProducerSigningKey;
 use hellas_core::adaptors::catgrad_text::CatgradText;
 use hellas_core::protocol::{Call, EvidenceBinding, ProjectResult, Receipt};
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::hellas::{
     Chunk as PbChunk, ExecuteStreamEvent, execute_stream_event::Event as PbEvent,
 };
@@ -49,10 +50,9 @@ pub(crate) struct ExecuteJob {
     /// with the streaming-RPC consumer; dropping it is the cancel signal.
     pub sender: tokio_mpsc::Sender<Result<ExecuteStreamEvent, Status>>,
     pub metrics: Arc<ExecutorMetrics>,
-    /// Catnix projection captured from the corresponding quote. Used to
-    /// build and sign the terminal catnix `Receipt`.
-    pub catnix_call: Option<Call>,
-    /// Producer signing key. Used to sign the catnix `Receipt`.
+    /// Canonical call captured from the corresponding quote.
+    pub call: Call,
+    /// Producer signing key. Used to sign the terminal `Receipt`.
     pub producer_key: Arc<ProducerSigningKey>,
 }
 
@@ -92,9 +92,7 @@ fn worker_loop(
         let metrics = Arc::clone(&job.metrics);
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
-        // Capture state needed for the terminal catnix Receipt before
-        // `job` is moved into `run_job`.
-        let catnix_call = job.catnix_call.clone();
+        let call = job.call.clone();
         let producer_key = Arc::clone(&job.producer_key);
         let prompt_token_ids = job.invocation.input_ids.clone();
 
@@ -112,18 +110,26 @@ fn worker_loop(
             run_job(job, on_progress)
         })) {
             Ok(Ok(outcome)) => {
-                let catnix_receipt_commitment = build_catnix_receipt_commitment(
+                match build_receipt_commitment(
                     &execution_id,
-                    catnix_call.as_ref(),
+                    &call,
                     &producer_key,
                     &outcome,
                     &prompt_token_ids,
-                );
-                Termination::Completed {
-                    total_tokens: outcome.total_tokens,
-                    stop_reason: outcome.stop_reason,
-                    receipt_cid: outcome.receipt_cid,
-                    catnix_receipt_commitment,
+                ) {
+                    Ok(receipt_commitment) => Termination::Completed {
+                        total_tokens: outcome.total_tokens,
+                        stop_reason: outcome.stop_reason,
+                        receipt_commitment,
+                    },
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        warn!("execute worker job {execution_id} failed to produce receipt: {msg}");
+                        Termination::Failed {
+                            position: outcome.total_tokens,
+                            error: msg,
+                        }
+                    }
                 }
             }
             Ok(Err(err)) => {
@@ -212,22 +218,16 @@ fn map_stop_reason(reason: RuntimeStopReason) -> CatnixStopReason {
     }
 }
 
-/// Build a catnix `TextRunOutput` from the runtime's decode outcome,
-/// project it through CatgradText's `project_result`, and sign a
-/// `Receipt` with the executor's producer key. Any failure is logged and
-/// returned as `None` so the execution can still complete.
-fn build_catnix_receipt_commitment(
+/// Build a `TextRunOutput` from the runtime's decode outcome, project it
+/// through CatgradText's `project_result`, and sign a `Receipt` with the
+/// executor's producer key.
+fn build_receipt_commitment(
     execution_id: &str,
-    catnix_call: Option<&Call>,
+    call: &Call,
     producer_key: &ProducerSigningKey,
     outcome: &runner::DecodeOutcome,
     prompt_token_ids: &[u32],
-) -> Option<[u8; 32]> {
-    let Some(call) = catnix_call else {
-        debug!(%execution_id, "no catnix call captured at quote time; skipping catnix receipt");
-        return None;
-    };
-
+) -> Result<[u8; 32], ExecutorError> {
     // For CatgradText, the Call's payload bytes ARE a Term's canonical
     // bytes, so its TermId is the BLAKE3 of those bytes.
     let term_id = TermId::from_digest(CatnixDigest::from_canonical_bytes(call.payload.as_bytes()));
@@ -262,16 +262,18 @@ fn build_catnix_receipt_commitment(
     let result = match CatgradText::project_result(&text_run_output, call) {
         Ok(r) => r,
         Err(err) => {
-            warn!(%execution_id, error = %err, "catnix project_result failed");
-            return None;
+            return Err(ExecutorError::Protocol(format!(
+                "result projection failed: {err}"
+            )));
         }
     };
 
     let receipt = match Receipt::sign_delivery(call, &result, EvidenceBinding::None, producer_key) {
         Ok(r) => r,
         Err(err) => {
-            warn!(%execution_id, error = %err, "catnix Receipt::sign_delivery failed");
-            return None;
+            return Err(ExecutorError::Protocol(format!(
+                "receipt signing failed: {err}"
+            )));
         }
     };
 
@@ -284,22 +286,22 @@ fn build_catnix_receipt_commitment(
     let term_id_str = format!("{term_id}");
     info!(
         %execution_id,
-        catnix_receipt_persisted = false,
-        catnix_receipt_commitment_in_outcome = true,
+        receipt_persisted = false,
+        receipt_commitment_in_outcome = true,
         producer_key_ephemeral = true,
         producer_id = %producer_id,
-        catnix_term_id = %term_id_str,
-        catnix_call_commitment = %call_commitment,
-        catnix_result_commitment = %result_commitment,
-        catnix_receipt_commitment = %receipt_commitment_digest,
-        catnix_position = absolute_position,
-        catnix_total_generated = outcome.total_tokens,
-        catnix_stop_reason = ?stop_reason,
-        catnix_tokens_value_id = %tokens_value_id.digest(),
-        "catnix receipt signed and attached to terminal outcome"
+        term_id = %term_id_str,
+        call_commitment = %call_commitment,
+        result_commitment = %result_commitment,
+        receipt_commitment = %receipt_commitment_digest,
+        position = absolute_position,
+        total_generated = outcome.total_tokens,
+        stop_reason = ?stop_reason,
+        tokens_value_id = %tokens_value_id.digest(),
+        "receipt signed and attached to terminal outcome"
     );
 
-    Some(*receipt_commitment_digest.as_bytes())
+    Ok(*receipt_commitment_digest.as_bytes())
 }
 
 #[cfg(test)]
