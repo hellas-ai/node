@@ -26,7 +26,24 @@ impl BackendRequest {
 pub trait ExecutionBackend {
     fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult>;
 
-    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, OutputEventStream<'a>>;
+    fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>>;
+}
+
+pub struct BackendStream<'a> {
+    pub events: OutputEventStream<'a>,
+    pub initial_provenance: Option<crate::Provenance>,
+}
+
+impl<'a> BackendStream<'a> {
+    pub fn new(
+        events: impl Stream<Item = BackendResult<OutputEvent>> + Send + 'a,
+        initial_provenance: Option<crate::Provenance>,
+    ) -> Self {
+        Self {
+            events: Box::pin(events),
+            initial_provenance,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

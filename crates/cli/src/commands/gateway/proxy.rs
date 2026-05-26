@@ -3,8 +3,8 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use futures::TryStreamExt;
 use hellas_wire_adaptors::{
-    BackendError, BackendFuture, BackendRequest, ExecutionBackend, ExecutionResult,
-    OutputEventStream, OutputItem, StopReason, TextChannel, Usage,
+    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, ExecutionResult,
+    OutputItem, StopReason, TextChannel, Usage,
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName as ReqwestHeaderName};
@@ -82,7 +82,7 @@ impl ExecutionBackend for ResponsesProxy {
         })
     }
 
-    fn stream<'a>(&'a self, _request: BackendRequest) -> BackendFuture<'a, OutputEventStream<'a>> {
+    fn stream<'a>(&'a self, _request: BackendRequest) -> BackendFuture<'a, BackendStream<'static>> {
         Box::pin(async move {
             Err(BackendError::stream(
                 "Responses proxy streaming is forwarded at the HTTP response layer",

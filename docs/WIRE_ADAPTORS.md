@@ -122,6 +122,9 @@ and the original `RawRequest`; raw-preserving backends can forward exact input
 bytes while Hellas backends can ignore the raw bytes and execute only the
 canonical projection.
 
+Streaming backends return `BackendStream`, which carries an owned event stream
+and any pre-flight provenance known before the response body starts.
+
 Expected backend families:
 
 - local catgrad execution
@@ -134,9 +137,8 @@ assume which provider route produced the request beyond the fields present in
 `ExecutionRequest`.
 
 `hellas-wire-adaptors` defines the `ExecutionBackend` trait but does not ship
-transport-specific implementations. HTTP proxy backends belong in crates that
-can depend on an HTTP client. The gateway currently implements that for
-OpenAI Responses.
+transport-specific implementations. The gateway implements local catgrad
+execution and the OpenAI Responses HTTP proxy.
 
 ## OpenAI Adaptors
 

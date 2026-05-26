@@ -36,11 +36,26 @@ pub const CATNIX_COMMITMENT_HEADER: &str = "x-hellas-commitment";
 /// [`CatnixReceiptCommitment`] extension.
 pub const CATNIX_RECEIPT_HEADER: &str = "x-hellas-receipt";
 
-/// Terminal catnix receipt commitment — BLAKE3 of the signed
-/// `Claim`'s canonical body. The provenance tower layer renders it as
-/// the `x-hellas-receipt` header. Lifetime is post-completion (only known when the
-/// streaming `Outcome::Completed` arrives), in contrast to the
-/// pre-flight `ExecutionProvenance::catnix_call_commitment`.
+/// Catnix call commitment rendered as the `x-hellas-commitment` header.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CatnixCallCommitment(pub [u8; 32]);
+
+impl std::fmt::Display for CatnixCallCommitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for CatnixCallCommitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// Catnix receipt commitment rendered as the `x-hellas-receipt` header.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CatnixReceiptCommitment(pub [u8; 32]);
 

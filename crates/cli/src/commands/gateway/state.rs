@@ -62,7 +62,6 @@ pub(super) struct GatewayState {
 }
 
 pub(super) struct PreparedGeneration {
-    pub(super) model: String,
     pub(super) prepared: PreparedExecution,
     /// Pre-flight provenance the executor committed to. `None` for routes
     /// that defer their quote until streaming starts (`RemoteDiscovery`);
@@ -240,13 +239,13 @@ impl GatewayState {
     async fn resolved_model_assets(
         &self,
         request_model: &str,
-    ) -> Result<(String, Arc<ModelAssets>), HttpError> {
+    ) -> Result<Arc<ModelAssets>, HttpError> {
         let model = self.resolve_model(request_model);
         let assets = self.model_assets(&model).await.map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to load local model assets for `{model}`: {err}"),
         })?;
-        Ok((model, assets))
+        Ok(assets)
     }
 
     async fn prepare_chat_generation(
@@ -258,7 +257,7 @@ impl GatewayState {
         prepare_error: &'static str,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = self.max_tokens_for(req);
-        let (model, assets) = self
+        let assets = self
             .resolved_model_assets(&req.canonical.model.name)
             .await?;
         let chat_turn = assets
@@ -269,7 +268,6 @@ impl GatewayState {
             message: format!("{prepare_error}: {err}"),
         })?;
         self.finalize_generation(
-            model,
             assets,
             prepared_prompt,
             max_tokens,
@@ -285,7 +283,6 @@ impl GatewayState {
     /// `ChatTurn` before calling here.
     async fn finalize_generation(
         &self,
-        model: String,
         assets: Arc<ModelAssets>,
         prepared_prompt: PreparedPrompt,
         max_tokens: u32,
@@ -312,7 +309,6 @@ impl GatewayState {
         let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
-            model,
             assets,
             prepared,
             provenance,
@@ -395,7 +391,7 @@ impl GatewayState {
                 message: "Plain completion execution requires text input".to_string(),
             });
         };
-        let (model, assets) = self
+        let assets = self
             .resolved_model_assets(&req.canonical.model.name)
             .await?;
         let prepared_prompt = assets.prepare_plain(prompt).map_err(|err| HttpError {
@@ -406,7 +402,6 @@ impl GatewayState {
             ),
         })?;
         self.finalize_generation(
-            model,
             assets,
             prepared_prompt,
             max_tokens,
@@ -426,7 +421,7 @@ impl GatewayState {
             message,
         })?;
         let tools = wire_tools(&req.canonical);
-        let (model, assets) = self
+        let assets = self
             .resolved_model_assets(&req.canonical.model.name)
             .await?;
         let prepared_prompt = assets
@@ -439,7 +434,6 @@ impl GatewayState {
                 ),
             })?;
         self.finalize_generation(
-            model,
             assets,
             prepared_prompt,
             max_tokens,

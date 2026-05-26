@@ -11,7 +11,8 @@ pub mod wire;
 
 pub use adaptor::WireAdaptor;
 pub use backend::{
-    BackendError, BackendFuture, BackendRequest, BackendResult, ExecutionBackend, OutputEventStream,
+    BackendError, BackendFuture, BackendRequest, BackendResult, BackendStream, ExecutionBackend,
+    OutputEventStream,
 };
 pub use error::{AdaptorError, AdaptorResult};
 pub use execution::{

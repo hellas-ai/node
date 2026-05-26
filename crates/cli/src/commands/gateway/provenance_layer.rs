@@ -12,8 +12,8 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{
-    CATNIX_COMMITMENT_HEADER, CATNIX_RECEIPT_HEADER, CatnixReceiptCommitment, ExecutionProvenance,
-    encode_hex,
+    CATNIX_COMMITMENT_HEADER, CATNIX_RECEIPT_HEADER, CatnixCallCommitment, CatnixReceiptCommitment,
+    ExecutionProvenance, encode_hex,
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -63,7 +63,11 @@ where
 
 fn apply_provenance_headers(response: &mut Response<Body>) {
     let extensions = response.extensions().clone();
-    if let Some(prov) = extensions.get::<ExecutionProvenance>() {
+    if let Some(call) = extensions.get::<CatnixCallCommitment>() {
+        response
+            .headers_mut()
+            .insert(catnix_commitment_header(), header_value(&call.0));
+    } else if let Some(prov) = extensions.get::<ExecutionProvenance>() {
         if let Some(catnix) = &prov.catnix_call_commitment {
             response
                 .headers_mut()
@@ -174,6 +178,22 @@ mod tests {
             Some("cd".repeat(32).as_str())
         );
         assert!(!response.headers().contains_key(COMMITMENT_HEADER));
+    }
+
+    #[test]
+    fn applies_typed_catnix_call_header_when_present() {
+        let mut response = build_response_with_extensions(None, None, None);
+        response
+            .extensions_mut()
+            .insert(CatnixCallCommitment([0xcd; 32]));
+        apply_provenance_headers(&mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get(CATNIX_COMMITMENT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cd".repeat(32).as_str())
+        );
     }
 
     #[test]
