@@ -2,8 +2,8 @@
 
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
 
@@ -12,8 +12,8 @@ use futures_core::Stream as FuturesStream;
 use iroh::endpoint::{RecvStream, SendStream};
 
 use crate::frame::{
-    decode_frame, encode_frame, read_varint_partial, write_varint, EndFrame, Frame, FrameError,
-    OpenFrame, MAX_FRAME_BYTES,
+    EndFrame, Frame, FrameError, MAX_FRAME_BYTES, OpenFrame, decode_frame, encode_frame,
+    read_varint_partial, write_varint,
 };
 use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
@@ -341,10 +341,7 @@ mod parse_tests {
         let mut buf = BytesMut::new();
         write_varint(u64::MAX, &mut buf);
         let err = try_pop_frame(&mut buf).unwrap_err();
-        assert!(matches!(
-            err,
-            FrameError::OversizedFrame { len: _, cap: _ }
-        ));
+        assert!(matches!(err, FrameError::OversizedFrame { len: _, cap: _ }));
     }
 
     #[test]

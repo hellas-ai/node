@@ -125,6 +125,11 @@ let
     fi
   '';
 
+  defaultDevShell = pkgs.mkShell {
+    packages = devShellPackages;
+    shellHook = envShellHook;
+  };
+
   ci = import ./ci.nix {
     inherit
       pkgs
@@ -133,6 +138,25 @@ let
       workspaceNativeBuildInputs
       ;
   };
+
+  mkHydraSourceCheck =
+    {
+      name,
+      inputs,
+      command,
+    }:
+    pkgs.runCommand "hellas-${name}"
+      {
+        nativeBuildInputs = inputs;
+      }
+      ''
+        export HOME="$TMPDIR/home"
+        export XDG_CACHE_HOME="$TMPDIR/cache"
+        mkdir -p "$HOME" "$XDG_CACHE_HOME"
+        cd ${nativePkg.buildSrc}
+        ${command}
+        touch "$out"
+      '';
 
   hfCaches = pkgs.hellasLib.hf;
 
@@ -179,6 +203,7 @@ let
   };
 
   nativePackages = packagesFor null;
+  isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
   hellasRun = mkHellasRun {
     gatewayCommand = "${nativePackages.cli-candle}/bin/hellas-cli gateway";
   };
@@ -233,11 +258,13 @@ let
         cliCandle = nativePackages.cli-candle;
       };
 
-      nixosTests = import ./tests {
-        inherit self pkgs lib;
-        package = nativePackages.cli-candle;
-        inherit hellasRun;
-      };
+      nixosTests = lib.optionalAttrs isX86_64Linux (
+        import ./tests {
+          inherit self pkgs lib;
+          package = nativePackages.cli-candle;
+          inherit hellasRun;
+        }
+      );
     in
     {
       packages = {
@@ -266,6 +293,96 @@ let
       inherit nixosTests;
     }
   );
+
+  hydraLints = {
+    sort = mkHydraSourceCheck {
+      name = "check-sort";
+      inputs = [ pkgs.cargo-sort ];
+      command = "cargo-sort --workspace --check";
+    };
+
+    fmt = mkHydraSourceCheck {
+      name = "check-fmt";
+      inputs = [ rustToolchain ];
+      command = "cargo fmt --all -- --check";
+    };
+
+    clippy = nativePkg.mkHellasPackage {
+      pname = "hellas-check-clippy";
+      cargoBuildType = "debug";
+      buildPhase = ''
+        runHook preBuild
+        cargo clippy --workspace --all-targets --offline -- -D warnings
+        runHook postBuild
+      '';
+      doCheck = false;
+      installPhase = ''
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
+    };
+
+    taplo = mkHydraSourceCheck {
+      name = "check-taplo";
+      inputs = [ pkgs.taplo ];
+      command = "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'";
+    };
+
+    buf = mkHydraSourceCheck {
+      name = "check-buf";
+      inputs = [ pkgs.buf ];
+      command = "buf lint";
+    };
+
+    deadnix = mkHydraSourceCheck {
+      name = "check-deadnix";
+      inputs = [ pkgs.deadnix ];
+      command = ''
+        shopt -s globstar
+        deadnix --fail flake.nix nix/**/*.nix
+      '';
+    };
+
+    statix = mkHydraSourceCheck {
+      name = "check-statix";
+      inputs = [ pkgs.statix ];
+      command = "statix check .";
+    };
+
+    nixfmt = mkHydraSourceCheck {
+      name = "check-nixfmt";
+      inputs = [ pkgs.nixfmt-rfc-style ];
+      command = ''
+        shopt -s globstar
+        nixfmt --check flake.nix nix/**/*.nix
+      '';
+    };
+
+    wasm-rpc = hellasRpcWasm;
+  };
+
+  hydraPackages = {
+    inherit (nativePackages) cli cli-candle;
+  }
+  // lib.optionalAttrs isX86_64Linux {
+    static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
+    static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
+    static-windows = crossPackages.cross-x86_64-windows-cli;
+    inherit (linuxOutputs.packages) docker-cuda;
+    "hellas-rpc-wasm" = hellasRpcWasm;
+  };
+
+  hydraE2e = linuxOutputs.nixosTests or { };
+
+  hydraRequired = pkgs.releaseTools.aggregate {
+    name = "hellas-required";
+    constituents = [
+      defaultDevShell
+    ]
+    ++ lib.attrValues hydraLints
+    ++ lib.attrValues hydraPackages
+    ++ lib.attrValues hydraE2e;
+  };
 in
 {
   packages =
@@ -303,19 +420,26 @@ in
   // (linuxOutputs.apps or { });
 
   devShells = {
-    default = pkgs.mkShell {
-      packages = devShellPackages;
-      shellHook = envShellHook;
-    };
+    default = defaultDevShell;
   }
   // (linuxOutputs.devShells or { });
 
-  # Data exposed for the GitHub Actions matrix:
-  #   .checks → { name → derivation }  (workflow uses `attrNames`)
-  #   .builds → { name → attrPath }    (extended post-gate builds)
+  # Data exposed for local matrix runners:
+  #   .checks -> { name -> derivation }
+  #   .builds -> { name -> attrPath }
   ci = { inherit (ci) checks builds; };
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
   checks = linuxOutputs.nixosTests or { };
   nixosTests = linuxOutputs.nixosTests or { };
+
+  hydraJobs = {
+    devShell = defaultDevShell;
+    lints = hydraLints;
+    packages = hydraPackages;
+    required = hydraRequired;
+  }
+  // lib.optionalAttrs isX86_64Linux {
+    e2e = hydraE2e;
+  };
 }

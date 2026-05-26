@@ -17,10 +17,10 @@ pub mod stream;
 pub mod transport;
 
 pub use slot::{Role, SlotIndex, SlotState, StreamSlot};
-pub use state::{Event, MuxConfig, MuxError, Multiplexer};
+pub use state::{Event, Multiplexer, MuxConfig, MuxError};
 pub use stream::{MuxRecvHalf, MuxSendHalf, MuxStream, MuxStreamError};
 pub use transport::{MessagePipe, MuxTransport, MuxTransportError};
-pub use wire::{decode_keyed_frame, encode_keyed_frame, KeyedFrame, StreamKey};
+pub use wire::{KeyedFrame, StreamKey, decode_keyed_frame, encode_keyed_frame};
 
 /// Default body-frame max in bytes. Configurable per-transport.
 pub const DEFAULT_BODY_FRAME_MAX: usize = 1024 * 1024; // 1 MiB

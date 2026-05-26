@@ -1,6 +1,8 @@
 mod actor;
 mod handle;
 
+use catgrad::prelude::Dtype;
+use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
     GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
@@ -10,10 +12,9 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
-use hellas_rpc::ExecutorError;
 use hellas_rpc::provenance::ExecutionProvenance;
-use tokio::sync::{mpsc, oneshot};
 use hellas_wire::WireStatus;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::worker::WorkerCompletion;
 pub use actor::Executor;
@@ -103,4 +104,5 @@ pub(crate) enum ExecutorMessage {
 #[derive(Clone)]
 pub struct ExecutorHandle {
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
+    pub(super) preferred_dtype: Dtype,
 }

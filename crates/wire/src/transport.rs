@@ -113,10 +113,8 @@ pub trait SendHalf: Send {
 
     /// Send a body chunk. Resolves when the chunk has been handed off
     /// to the transport (not necessarily flushed to the wire).
-    fn send_body(
-        &mut self,
-        payload: Bytes,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn send_body(&mut self, payload: Bytes)
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Close the send direction, optionally with a trailer.
     fn close_send(

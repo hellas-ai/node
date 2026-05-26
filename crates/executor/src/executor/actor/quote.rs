@@ -6,6 +6,8 @@ use crate::state::{
 use catgrad::prelude::Dtype;
 use chatgrad::types;
 use hellas_core::{CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, Symbolic};
+use hellas_rpc::ExecutorError;
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
     PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
@@ -14,8 +16,6 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::model::ModelAssets;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::spec::ModelSpec;
 use std::time::{Duration, Instant};

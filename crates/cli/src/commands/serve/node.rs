@@ -15,8 +15,8 @@ use anyhow::Context;
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
 use hellas_executor::{
-    ArtifactStoreConfig, CourtesyServer, Executor, ExecuteServer, ExecutorMetrics,
-    OpaqueServer, SymbolicServer,
+    ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, OpaqueServer,
+    SymbolicServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
@@ -28,7 +28,7 @@ use hellas_rpc::services::opaque::Opaque;
 use hellas_rpc::services::symbolic::Symbolic;
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
-use iroh::{endpoint::Connection, endpoint::presets, Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -121,12 +121,9 @@ pub(super) async fn spawn_node(
     // across the dispatch path.
     //
     // Deferred until a concrete abuse scenario warrants it: an
-    // `AdmittingDispatcher<S>` that, before forwarding to the
-    // generated dispatcher, looks up `policy_for(inbound.method_id)`
-    // via `KNOWN_RATE_LIMITED_METHODS` and calls
-    // `directory.observe_inbound_request(...)`. The plan in
-    // `/home/grw/.claude/plans/recursive-mixing-neumann.md` Phase F
-    // is the implementation sketch when needed.
+    // `AdmittingDispatcher<S>` that looks up per-method policy before
+    // forwarding to the generated dispatcher and records inbound request
+    // observations in the directory.
     let local_peer = PeerId::from_bytes(*node_id.as_bytes());
     let directory = Arc::new(PeerDirectory::new(local_peer));
 
@@ -226,10 +223,7 @@ async fn serve_connection(
     }
 }
 
-async fn serve_loop<S>(
-    transport: &IrohTransport,
-    server: &S,
-) -> anyhow::Result<()>
+async fn serve_loop<S>(transport: &IrohTransport, server: &S) -> anyhow::Result<()>
 where
     S: Dispatcher<IrohTransport> + Send + Sync,
     S::Error: Send + Sync + 'static,

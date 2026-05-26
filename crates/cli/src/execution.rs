@@ -43,21 +43,21 @@ use hellas_core::{
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
+use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
 use hellas_rpc::pb::execute::{
     self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
 };
 use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
-use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::opaque::Opaque;
-use hellas_wire::{ServiceMarker, WireStatus};
-use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::iroh::IrohTransport;
+use hellas_wire::iroh::swarm::ServiceRegistry;
+use hellas_wire::{ServiceMarker, WireStatus};
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -636,9 +636,10 @@ impl PreparedRoute {
                     .quote_prepared_text(quote_req.clone())
                     .await
                     .context("local quote_prepared_text failed")?;
-                let ticket = outcome.response.ticket.clone().ok_or_else(|| {
-                    anyhow!("local quote_prepared_text response missing ticket")
-                })?;
+                let ticket =
+                    outcome.response.ticket.clone().ok_or_else(|| {
+                        anyhow!("local quote_prepared_text response missing ticket")
+                    })?;
                 Ok(Self::Local {
                     handle,
                     request_commitment: ticket.request_commitment,
@@ -646,22 +647,22 @@ impl PreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let transport = runtime
-                    .remote_transport::<Courtesy>(target)
-                    .await?;
+                let transport = runtime.remote_transport::<Courtesy>(target).await?;
                 // Use unary_with_trailer to receive both the response and
                 // the server's End-frame metadata (provenance headers).
                 let with_trailer = hellas_rpc::call::unary_with_trailer::<
                     _,
                     hellas_rpc::services::courtesy::QuotePreparedText,
-                >(&transport, quote_req.clone(), hellas_wire::Metadata::new())
-                    .await
-                    .map_err(|status| {
-                        anyhow!(status).context(format!(
-                            "node {} declined quote_prepared_text",
-                            target.node_id()
-                        ))
-                    })?;
+                >(
+                    &transport, quote_req.clone(), hellas_wire::Metadata::new()
+                )
+                .await
+                .map_err(|status| {
+                    anyhow!(status).context(format!(
+                        "node {} declined quote_prepared_text",
+                        target.node_id()
+                    ))
+                })?;
                 let ticket = with_trailer.response.ticket.ok_or_else(|| {
                     anyhow!(
                         "quote_prepared_text response from {} missing ticket",
@@ -848,9 +849,8 @@ async fn discover_and_quote(
         let transport = match pool.transport(peer_id).await {
             Ok(t) => t,
             Err(err) => {
-                last_error = Some(
-                    anyhow!(err).context(format!("failed to dial Courtesy on {peer_id}")),
-                );
+                last_error =
+                    Some(anyhow!(err).context(format!("failed to dial Courtesy on {peer_id}")));
                 if attempts >= max_attempts {
                     break;
                 }
@@ -861,14 +861,15 @@ async fn discover_and_quote(
         let with_trailer = match hellas_rpc::call::unary_with_trailer::<
             _,
             hellas_rpc::services::courtesy::QuotePreparedText,
-        >(&transport, quote_req.clone(), hellas_wire::Metadata::new())
+        >(
+            &transport, quote_req.clone(), hellas_wire::Metadata::new()
+        )
         .await
         {
             Ok(t) => t,
             Err(status) => {
                 last_error = Some(
-                    anyhow!(status)
-                        .context(format!("node {peer_id} declined quote_prepared_text")),
+                    anyhow!(status).context(format!("node {peer_id} declined quote_prepared_text")),
                 );
                 if attempts >= max_attempts {
                     break;
@@ -937,9 +938,8 @@ async fn discover_and_opaque_quote(
         let transport = match pool.transport(peer_id).await {
             Ok(t) => t,
             Err(err) => {
-                last_error = Some(
-                    anyhow!(err).context(format!("failed to dial Opaque on {peer_id}")),
-                );
+                last_error =
+                    Some(anyhow!(err).context(format!("failed to dial Opaque on {peer_id}")));
                 if attempts >= max_attempts {
                     break;
                 }
@@ -965,9 +965,8 @@ async fn discover_and_opaque_quote(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        anyhow!("discovery stream exhausted without a successful opaque quote")
-    }))
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("discovery stream exhausted without a successful opaque quote")))
 }
 
 // ---------------------------------------------------------------------------

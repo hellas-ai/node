@@ -4,11 +4,11 @@ use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
 use hellas_executor::ExecutorMetrics;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use iroh::SecretKey;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
-use iroh::SecretKey;
 use tracing::warn;
 
 mod node;

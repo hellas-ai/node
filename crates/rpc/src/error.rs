@@ -2,8 +2,8 @@ use catgrad_llm::LLMError;
 use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
 
-use crate::model::ModelAssetsError;
 use crate::TokenBytesError;
+use crate::model::ModelAssetsError;
 
 /// Error returned when the backend fails to initialize.
 #[derive(Clone, Debug, Error)]

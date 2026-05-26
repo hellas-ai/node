@@ -5,6 +5,8 @@ use std::time::Instant;
 use crate::DEFAULT_MAX_SEQ;
 use catgrad::prelude::Dtype;
 use hellas_core::{Digest, JsonBytes, OpaqueRequest, RequestCommitment, SymbolicRequest};
+use hellas_rpc::ExecutorError;
+use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::courtesy::{
     QuotePreparedTextRequest, SymbolicStart as PbSymbolicStart, symbolic_start,
 };
@@ -13,8 +15,6 @@ use hellas_rpc::pb::execute::{
     WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
 };
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::encode_token_ids;
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 use uuid::Uuid;
 

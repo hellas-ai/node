@@ -6,11 +6,11 @@ use crate::execution::{
 use catgrad::prelude::Dtype;
 use futures::StreamExt;
 use hellas_rpc::pb::opaque::OpaqueRequest;
+use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
-use iroh::{EndpointId, SecretKey};
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,

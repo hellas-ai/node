@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
+use crate::pb::courtesy::{
+    QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
+};
 use catgrad::prelude::Dtype;
 use catgrad_llm::LLMError;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
-use crate::pb::courtesy::{
-    QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
-};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -152,6 +152,10 @@ impl ModelAssets {
         self.tokenizer
             .decode(token_ids, false)
             .map_err(|source| ModelAssetsError::DecodeTokens { source })
+    }
+
+    pub fn stop_token_ids(&self) -> &[i32] {
+        &self.stop_token_ids
     }
 
     pub fn architecture(&self) -> Result<String> {

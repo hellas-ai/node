@@ -1,16 +1,12 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_wire_adaptors::{
-    BackendError, ExecutionResult, OutputEvent, OutputItem, TextChannel,
-};
+use hellas_wire_adaptors::{BackendError, ExecutionResult, OutputEvent, OutputItem, TextChannel};
 
 use crate::execution::Outcome;
 
 use super::super::state::PreparedGeneration;
 use super::generation::{GenerationEvent, TextGenerationError, collect_text, generation_stream};
-use super::provenance::{
-    provenance_from_parts, stop_reason_from_runtime, usage,
-};
+use super::provenance::{provenance_from_parts, stop_reason_from_runtime, usage};
 
 pub(super) async fn execute_text(
     prepared: PreparedGeneration,
@@ -33,10 +29,7 @@ pub(super) async fn execute_text(
         }],
         usage: Some(usage(prompt_tokens, completed.total_tokens)),
         stop_reason: stop_reason_from_runtime(completed.stop_reason),
-        provenance: provenance_from_parts(
-            completed.provenance.as_ref(),
-            Some(&completed.receipt),
-        ),
+        provenance: provenance_from_parts(completed.provenance.as_ref(), Some(&completed.receipt)),
     })
 }
 

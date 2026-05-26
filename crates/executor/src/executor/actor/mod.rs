@@ -8,8 +8,8 @@ use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
-use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::ExecutorError;
+use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -135,6 +135,7 @@ impl Executor {
             !supported_dtypes.is_empty(),
             "executor must support at least one dtype"
         );
+        let preferred_dtype = supported_dtypes[0];
         let (tx, rx) = mpsc::unbounded_channel();
         backend::create_backend()?;
         let executor = Self {
@@ -151,7 +152,10 @@ impl Executor {
             supported_dtypes,
         };
         tokio::spawn(executor.run());
-        Ok(ExecutorHandle { tx })
+        Ok(ExecutorHandle {
+            tx,
+            preferred_dtype,
+        })
     }
 
     /// First entry of [`Executor::supported_dtypes`]. Used when this

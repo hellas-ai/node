@@ -11,12 +11,7 @@ documentation.workspace = true
 default = []
 
 # Transports
-iroh = [
-    "dep:iroh",
-    "dep:n0-future",
-    "dep:portable-atomic",
-    "dep:tokio-stream",
-]
+iroh = ["dep:iroh", "dep:n0-future", "dep:portable-atomic", "dep:tokio-stream"]
 # Discovery backends. `discovery-dht` pulls in `mainline` for the
 # shared shard buckets, plus the small crypto/encoding deps shared with
 # `discovery-mdns` (postcard, sha2, async-stream, serde). `discovery-mdns`
@@ -38,7 +33,7 @@ discovery-mdns = [
     "dep:postcard",
 ]
 h2 = ["dep:h2", "dep:http"]
-h3 = []  # scaffold only
+h3 = []
 
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
@@ -53,45 +48,45 @@ otel = ["dep:opentelemetry"]
 server = []
 
 [dependencies]
+
+# Discovery backend deps (gated behind discovery-{dht,mdns}).
+async-stream = { version = "0.3", optional = true }
 blake3 = { workspace = true }
 bytes = "1"
+data-encoding = { version = "2", optional = true }
 futures = "0.3"
 futures-core = "0.3"
-pin-project-lite = "0.2"
-smol_str = "0.3"
-thiserror = { workspace = true }
-tracing = { workspace = true }
-web-time = "1"
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
 
 # Optional transport deps
 iroh = { workspace = true, optional = true }
+iroh-mdns-address-lookup = { version = "0.2", optional = true }
+mainline = { version = "6", optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
+
+opentelemetry = { workspace = true, optional = true }
+pin-project-lite = "0.2"
 # Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic
 # provides a mutex-fallback `AtomicU64` so the iroh ConnectionPool's
 # generation counter compiles on embedded targets.
 portable-atomic = { version = "1", default-features = false, features = [
     "fallback",
 ], optional = true }
-tokio-stream = { workspace = true, optional = true }
-h2 = { version = "0.4", optional = true }
-http = { version = "1", optional = true }
-tokio-tungstenite = { version = "0.27", optional = true }
-ws_stream_wasm = { version = "0.7", optional = true }
-wasm-bindgen-futures = { version = "0.4", optional = true }
-worker = { version = "0.6", optional = true, default-features = false }
-
-opentelemetry = { workspace = true, optional = true }
-
-# Discovery backend deps (gated behind discovery-{dht,mdns}).
-async-stream = { version = "0.3", optional = true }
-data-encoding = { version = "2", optional = true }
-iroh-mdns-address-lookup = { version = "0.2", optional = true }
-mainline = { version = "6", optional = true }
 postcard = { version = "1", default-features = false, features = [
     "alloc",
 ], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }
+smol_str = "0.3"
+thiserror = { workspace = true }
+tokio-stream = { workspace = true, optional = true }
+tokio-tungstenite = { version = "0.27", optional = true }
+tracing = { workspace = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-time = "1"
+worker = { version = "0.6", optional = true, default-features = false }
+ws_stream_wasm = { version = "0.7", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = [
@@ -104,8 +99,13 @@ tokio = { workspace = true, features = [
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
-tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "macros",
+] }
+tokio-util = { version = "0.7", default-features = false, features = [
+    "compat",
+] }
 
 [dev-dependencies]
 proptest = "1"

@@ -33,11 +33,11 @@ pub use crate::frame::{
 pub use crate::latency::{EwmaLatency, LatencyEstimator};
 pub use crate::metadata::{Metadata, MetadataValue, Trailer};
 pub use crate::schema::{
-    FieldSchema, MessageSchema, MethodSchema, PrimKind, ServiceSchema, TypeSchema,
-    METHOD_DOMAIN, SERVICE_DOMAIN,
+    FieldSchema, METHOD_DOMAIN, MessageSchema, MethodSchema, PrimKind, SERVICE_DOMAIN,
+    ServiceSchema, TypeSchema,
 };
 pub use crate::status::{WireCode, WireStatus};
 pub use crate::transport::{
-    AuthLevel, Dispatcher, Inbound, MethodMarker, PeerIdentity, RecvHalf, SendHalf,
-    ServiceMarker, Stream, StreamTransport, TransportContext,
+    AuthLevel, Dispatcher, Inbound, MethodMarker, PeerIdentity, RecvHalf, SendHalf, ServiceMarker,
+    Stream, StreamTransport, TransportContext,
 };
