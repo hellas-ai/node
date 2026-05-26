@@ -7,7 +7,7 @@ use hellas_wire_adaptors::{
 use crate::execution::Outcome;
 
 use super::super::state::PreparedGeneration;
-use super::generation::{TextGenerationError, collect_text, generation_stream};
+use super::generation::{GenerationEvent, TextGenerationError, collect_text, generation_stream};
 use super::provenance::{
     provenance_from_parts, stop_reason_from_runtime, usage,
 };
@@ -52,14 +52,14 @@ pub(super) fn text_events(
 
         loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
-                Ok(Some(Ok(super::super::state::GenerationEvent::Delta(delta)))) => {
+                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
                     yield OutputEvent::TextDelta {
                         index: 0,
                         delta,
                         channel: TextChannel::Output,
                     };
                 }
-                Ok(Some(Ok(super::super::state::GenerationEvent::Done(Outcome::Completed {
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     total_tokens,
                     stop_reason,
                     receipt,
@@ -83,7 +83,7 @@ pub(super) fn text_events(
                     };
                     return;
                 }
-                Ok(Some(Ok(super::super::state::GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
+                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
                     Err(BackendError::execution(format!("Inference error: {error}")))?;
                 }
                 Ok(Some(Err(err))) => Err(BackendError::execution(format!("Inference error: {err:#}")))?,

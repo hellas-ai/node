@@ -1,259 +1,50 @@
-use super::hellas_ext::{HellasExt, WithHellas};
-use super::state::{GatewayState, GenerationEvent, PreparedGeneration};
-use super::{next_id, now_unix, parse_json_body, sse_data, sse_response};
-use crate::execution::{Outcome, ReceiptArtifact, StopReason};
-use async_stream::stream;
-use axum::Json;
+use super::backend::GatewayBackend;
+use super::state::GatewayState;
+use super::wire_adaptor::{backend_response, backend_stream_response, parse_backend_request};
+use super::{next_id, now_unix};
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::{IntoResponse, Response};
-use chatgrad::types::{openai, plain};
-use futures::StreamExt;
-use serde_json::json;
+use axum::response::Response;
+use hellas_wire_adaptors::RenderContext;
+use hellas_wire_adaptors::openai::completions::OpenAiCompletionsAdaptor;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
-    let req = match parse_json_body::<plain::CompletionRequest>(&body, "completion") {
-        Ok(req) => req,
-        Err(err) => return err.into_response(),
-    };
-    let stream_response_flag = req.stream == Some(true);
-    let prepared = match state.prepare_plain(&req).await {
-        Ok(prepared) => prepared,
-        Err(err) => return err.into_response(),
-    };
-
+    let adaptor = OpenAiCompletionsAdaptor;
+    let (mut parsed, mut request) =
+        match parse_backend_request(&adaptor, &body, "OpenAI Completions") {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+    let stream_response_flag = parsed.stream == Some(true);
+    if let Some(model) = state.force_model.as_ref() {
+        parsed.model = model.clone();
+        request.execution.canonical.model.name = model.clone();
+    }
+    let backend = GatewayBackend::new(state);
     if stream_response_flag {
-        return stream_response(prepared);
+        backend_stream_response(
+            adaptor,
+            parsed,
+            backend,
+            request,
+            render_context(),
+            "OpenAI Completions",
+        )
+        .await
+    } else {
+        backend_response(
+            adaptor,
+            parsed,
+            backend,
+            request,
+            render_context(),
+            "OpenAI Completions",
+        )
+        .await
     }
-    respond(prepared).await
 }
 
-fn stream_response(prepared: PreparedGeneration) -> Response {
-    let id = next_id("cmpl");
-    let created = now_unix();
-    let model = prepared.model.clone();
-    let provenance = prepared.provenance.clone();
-    let deadline = prepared.deadline();
-
-    let stream_provenance = provenance.clone();
-    let mut response = sse_response(stream! {
-        let inner = prepared.stream();
-        tokio::pin!(inner);
-
-        let mut completed: Option<(openai::FinishReason, ReceiptArtifact)> = None;
-        let mut error_message: Option<String> = None;
-        // Track whether the commitment has been stamped on a chunk
-        // yet. The first per-delta chunk carries it; if the stream
-        // terminates with zero deltas, the terminal chunk carries
-        // both commitment and receipt.
-        let mut commitment_pending = stream_provenance.is_some();
-
-        loop {
-            match tokio::time::timeout_at(deadline, inner.next()).await {
-                Ok(Some(Ok(GenerationEvent::Delta(text)))) => {
-                    let chunk = plain::CompletionChunk::builder()
-                        .id(id.clone())
-                        .object("text_completion".to_string())
-                        .created(created)
-                        .model(model.clone())
-                        .choices(vec![
-                            plain::CompletionChoice::builder()
-                                .index(0)
-                                .text(text)
-                                .build(),
-                        ])
-                        .build();
-                    let hellas = if commitment_pending {
-                        commitment_pending = false;
-                        match stream_provenance.as_ref() {
-                            Some(prov) => HellasExt::commitment(prov),
-                            None => HellasExt::default(),
-                        }
-                    } else {
-                        HellasExt::default()
-                    };
-                    yield Ok(sse_data(&WithHellas::new(chunk, hellas)));
-                }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
-                    stop_reason,
-                    total_tokens,
-                    receipt,
-                })))) => {
-                    info!(
-                        receipt = %receipt.encoded(),
-                        provenance = ?stream_provenance,
-                        total_tokens,
-                        ?stop_reason,
-                        "completion request ready"
-                    );
-                    completed = Some((map_finish_reason(stop_reason), receipt));
-                    break;
-                }
-                Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
-                    error_message = Some(error);
-                    break;
-                }
-                Ok(Some(Err(err))) => {
-                    error_message = Some(format!("{err:#}"));
-                    break;
-                }
-                Ok(None) => {
-                    error_message =
-                        Some("execution stream ended without terminal outcome".to_string());
-                    break;
-                }
-                Err(_) => {
-                    error_message =
-                        Some(format!("inference timed out after {}s", super::timeout_secs_until(deadline)));
-                    break;
-                }
-            }
-        }
-
-        if let Some(err) = error_message {
-            // Error path: receipt stays fenced inside the Completed
-            // arm. Commitment can still ride the error frame if it
-            // hasn't been stamped yet — the stream terminated before
-            // any delta carried it.
-            let mut error_value = json!({
-                "error": { "message": format!("Inference error: {err}") }
-            });
-            if commitment_pending
-                && let (Some(prov), Some(map)) = (
-                    stream_provenance.as_ref(),
-                    error_value.as_object_mut(),
-                ) {
-                    map.insert(
-                        "hellas".to_string(),
-                        serde_json::to_value(HellasExt::commitment(prov)).unwrap(),
-                    );
-                }
-            yield Ok(sse_data(&error_value));
-        } else if let Some((reason, receipt)) = completed {
-            let final_chunk = plain::CompletionChunk::builder()
-                .id(id.clone())
-                .object("text_completion".to_string())
-                .created(created)
-                .model(model.clone())
-                .choices(vec![
-                    plain::CompletionChoice::builder()
-                        .index(0)
-                        .text(String::new())
-                        .finish_reason(Some(reason))
-                        .build(),
-                ])
-                .build();
-            // Terminal chunk carries the receipt. If zero deltas ran,
-            // it ALSO carries the commitment.
-            let hellas = if commitment_pending {
-                match stream_provenance.as_ref() {
-                    Some(prov) => HellasExt::both(prov, &receipt),
-                    None => HellasExt::receipt(&receipt),
-                }
-            } else {
-                HellasExt::receipt(&receipt)
-            };
-            yield Ok(sse_data(&WithHellas::new(final_chunk, hellas)));
-        }
-
-        yield Ok(axum::response::sse::Event::default().data("[DONE]"));
-    });
-    if let Some(prov) = provenance {
-        response.extensions_mut().insert(prov);
-    }
-    response
-}
-
-async fn respond(prepared: PreparedGeneration) -> Response {
-    let id = next_id("cmpl");
-    let created = now_unix();
-    let model = prepared.model.clone();
-    let prompt_tokens = prepared.prompt_tokens;
-    let provenance = prepared.provenance.clone();
-    let deadline = prepared.deadline();
-
-    let stream = prepared.stream();
-    tokio::pin!(stream);
-    let mut text = String::new();
-    let outcome = loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(GenerationEvent::Delta(d)))) => text.push_str(&d),
-            Ok(Some(Ok(GenerationEvent::Done(o)))) => break Ok(o),
-            Ok(Some(Err(err))) => break Err(format!("Inference error: {err:#}")),
-            Ok(None) => break Err("execution stream ended without terminal outcome".to_string()),
-            Err(_) => {
-                break Err(format!(
-                    "inference timed out after {}s",
-                    super::timeout_secs_until(deadline)
-                ));
-            }
-        }
-    };
-
-    let (completion_tokens, finish_reason, receipt) = match outcome {
-        Ok(Outcome::Completed {
-            total_tokens,
-            stop_reason,
-            receipt,
-        }) => {
-            info!(
-                receipt = %receipt.encoded(),
-                ?provenance,
-                total_tokens,
-                ?stop_reason,
-                "completion request ready"
-            );
-            (total_tokens, map_finish_reason(stop_reason), receipt)
-        }
-        Ok(Outcome::Failed { position, error }) => {
-            warn!(position, %error, "completion request failed");
-            return super::json_error(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Inference error: {error}"),
-            );
-        }
-        Err(message) => {
-            error!(%message, "completion request failed");
-            return super::json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, message);
-        }
-    };
-
-    let response = plain::CompletionResponse::builder()
-        .id(id)
-        .object("text_completion".to_string())
-        .created(created)
-        .model(model)
-        .choices(vec![
-            plain::CompletionChoice::builder()
-                .index(0)
-                .text(text)
-                .finish_reason(Some(finish_reason))
-                .build(),
-        ])
-        .usage(Some(openai::Usage::from_counts(
-            prompt_tokens,
-            u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-        )))
-        .build();
-
-    let hellas = match provenance.as_ref() {
-        Some(prov) => HellasExt::both(prov, &receipt),
-        None => HellasExt::receipt(&receipt),
-    };
-    let body = WithHellas::new(response, hellas);
-
-    let mut response = Json(body).into_response();
-    if let Some(prov) = provenance {
-        response.extensions_mut().insert(prov);
-    }
-    response.extensions_mut().insert(receipt);
-    response
-}
-
-fn map_finish_reason(stop: StopReason) -> openai::FinishReason {
-    match stop {
-        StopReason::EndOfSequence | StopReason::Cancelled => openai::FinishReason::Stop,
-        StopReason::MaxNewTokens => openai::FinishReason::Length,
-    }
+fn render_context() -> RenderContext {
+    RenderContext::new(next_id("cmpl"), next_id("unused"), now_unix())
 }
