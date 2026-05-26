@@ -2,7 +2,7 @@
 extern crate tracing;
 
 use catgrad::prelude::Dtype;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -35,6 +35,21 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
 const DEFAULT_DTYPE_STR: &str = "bf16";
 #[cfg(not(any(feature = "candle-cuda", feature = "candle-metal")))]
 const DEFAULT_DTYPE_STR: &str = "f32";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum GatewayResponsesBackend {
+    Hellas,
+    Proxy,
+}
+
+impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
+    fn from(value: GatewayResponsesBackend) -> Self {
+        match value {
+            GatewayResponsesBackend::Hellas => Self::Hellas,
+            GatewayResponsesBackend::Proxy => Self::Proxy,
+        }
+    }
+}
 
 /// Default `--dtype` preference list for `llm`, resolved at dispatch.
 ///
@@ -205,6 +220,15 @@ enum Commands {
         /// and the dtype the client builds the quote program at: f32, f16, or bf16
         #[arg(long = "dtype", default_value = DEFAULT_DTYPE_STR, value_parser = parse_model_dtype)]
         dtype: Dtype,
+        /// Backend for /v1/responses.
+        #[arg(long = "responses-backend", value_enum, default_value_t = GatewayResponsesBackend::Hellas)]
+        responses_backend: GatewayResponsesBackend,
+        /// Upstream endpoint used when --responses-backend=proxy.
+        #[arg(long = "responses-proxy-url", default_value = "https://api.openai.com/v1/responses")]
+        responses_proxy_url: String,
+        /// Environment variable holding the bearer token for --responses-backend=proxy.
+        #[arg(long = "responses-proxy-api-key-env", default_value = "OPENAI_API_KEY")]
+        responses_proxy_api_key_env: String,
         /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
         #[arg(long = "wrap")]
         wrap: Option<String>,
@@ -416,6 +440,9 @@ async fn main() {
             force_model,
             metrics_port,
             dtype,
+            responses_backend,
+            responses_proxy_url,
+            responses_proxy_api_key_env,
             wrap,
             wrap_args,
         } => {
@@ -436,6 +463,9 @@ async fn main() {
                 force_model,
                 metrics_port,
                 dtype,
+                responses_backend: responses_backend.into(),
+                responses_proxy_url,
+                responses_proxy_api_key_env,
                 #[cfg(feature = "hellas-executor")]
                 producer_key_path: producer_key_path.clone(),
                 secret_key,
