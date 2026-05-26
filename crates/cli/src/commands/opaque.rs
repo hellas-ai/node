@@ -66,27 +66,21 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let stream = execution.stream();
     tokio::pin!(stream);
 
-    let mut completed = false;
-    while let Some(event) = stream.next().await {
-        match event? {
-            OpaqueExecutionEvent::Chunk { .. } => {}
-            OpaqueExecutionEvent::Done(OpaqueOutcome::Completed { output, .. }) => {
-                io::stdout().write_all(&output)?;
-                io::stdout().flush()?;
-                completed = true;
-                break;
-            }
-            OpaqueExecutionEvent::Done(OpaqueOutcome::Failed { error, .. }) => {
-                anyhow::bail!("opaque execution failed: {error}");
-            }
+    let event = stream.next().await.ok_or_else(|| {
+        anyhow::anyhow!("opaque execution stream ended without terminal outcome")
+    })??;
+    match event {
+        OpaqueExecutionEvent::Done(OpaqueOutcome::Completed { output, .. }) => {
+            io::stdout().write_all(&output)?;
+            io::stdout().flush()?;
+        }
+        OpaqueExecutionEvent::Done(OpaqueOutcome::Failed { error, .. }) => {
+            anyhow::bail!("opaque execution failed: {error}");
         }
     }
 
     if uses_remote {
         crate::tracing_config::suppress_execute_tail_logs();
-    }
-    if !completed {
-        anyhow::bail!("opaque execution stream ended without terminal outcome");
     }
     Ok(())
 }

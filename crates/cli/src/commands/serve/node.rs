@@ -66,7 +66,7 @@ pub(super) async fn spawn_node(
     download_policy: DownloadPolicy,
     execute_policy: ExecutePolicy,
     queue_size: usize,
-    preload_weights: Vec<String>,
+    preload_models: &[String],
     build: String,
     graffiti: Vec<u8>,
     supported_dtypes: Vec<Dtype>,
@@ -87,10 +87,12 @@ pub(super) async fn spawn_node(
     )
     .await
     .context("failed to spawn executor")?;
-    // `preload_weights` is accepted for CLI compatibility; model loading is
-    // demand-driven by the executor. `build` and `graffiti` are surfaced via
-    // the Node service's GetNodeInfoResponse below.
-    let _ = preload_weights;
+    for model in preload_models {
+        handle
+            .load_model_metadata(model.clone())
+            .await
+            .with_context(|| format!("failed to load model metadata for {model}"))?;
+    }
 
     // -- Bind iroh Endpoint with one ALPN per service we serve.
     let alpns: Vec<Vec<u8>> = vec![

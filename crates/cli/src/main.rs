@@ -130,9 +130,9 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Preload model weights on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
+        /// Load model metadata on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
         #[arg(long = "preload", value_delimiter = ',')]
-        preload_weights: Vec<String>,
+        preload_models: Vec<String>,
         /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
         #[arg(long = "artifact-store-path")]
         artifact_store_path: Option<PathBuf>,
@@ -396,7 +396,7 @@ async fn main() {
             download_policy,
             execute_policy,
             queue_size,
-            preload_weights,
+            preload_models,
             artifact_store_path,
             metrics_port,
             graffiti,
@@ -415,7 +415,7 @@ async fn main() {
                 download_policy,
                 execute_policy,
                 queue_size,
-                preload_weights,
+                preload_models,
                 artifact_store_path,
                 metrics_port,
                 graffiti,

@@ -40,7 +40,10 @@ impl Executor {
         resolve_accept_dtypes(prefs, &self.supported_dtypes)
     }
 
-    pub(super) async fn handle_preload(&mut self, model: String) -> Result<(), ExecutorError> {
+    pub(super) async fn handle_load_model_metadata(
+        &mut self,
+        model: String,
+    ) -> Result<(), ExecutorError> {
         let spec = ModelSpec::parse(&model).map_err(hellas_rpc::ModelAssetsError::from)?;
         let locator = ModelLocator {
             model_id: spec.id,
@@ -55,7 +58,7 @@ impl Executor {
                     model = %key.model_id,
                     requested_revision = %key.revision,
                     dtype = %dtype_to_wire(key.dtype),
-                    "preloaded model metadata"
+                    "loaded model metadata"
                 );
                 Ok(())
             }

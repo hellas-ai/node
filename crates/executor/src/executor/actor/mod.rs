@@ -29,9 +29,7 @@ pub struct Executor {
     pub(super) metrics: Arc<ExecutorMetrics>,
     pub(super) producer_key: Arc<ProducerSigningKey>,
     /// Dtypes this executor will accept. The first entry is the *preferred*
-    /// dtype, used whenever the executor itself constructs a program (e.g.
-    /// the `QuotePromptRequest` convenience path or `handle_preload`, which
-    /// don't carry a wire dtype).
+    /// dtype, used whenever the executor itself constructs a program.
     pub(super) supported_dtypes: Vec<Dtype>,
 }
 
@@ -159,8 +157,7 @@ impl Executor {
     }
 
     /// First entry of [`Executor::supported_dtypes`]. Used when this
-    /// executor must pick a dtype itself (e.g. preload, prompt-build
-    /// convenience RPCs).
+    /// executor must pick a dtype itself.
     pub(super) fn preferred_dtype(&self) -> Dtype {
         self.supported_dtypes[0]
     }
@@ -189,8 +186,8 @@ impl Executor {
                 ExecutorMessage::GetArtifact { request, reply } => {
                     let _ = reply.send(self.handle_get_artifact(request).await);
                 }
-                ExecutorMessage::Preload { model, reply } => {
-                    let _ = reply.send(self.handle_preload(model).await);
+                ExecutorMessage::LoadModelMetadata { model, reply } => {
+                    let _ = reply.send(self.handle_load_model_metadata(model).await);
                 }
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);

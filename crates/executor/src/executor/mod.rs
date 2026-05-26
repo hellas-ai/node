@@ -74,7 +74,7 @@ pub(crate) enum ExecutorMessage {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
     },
-    Preload {
+    LoadModelMetadata {
         model: String,
         reply: oneshot::Sender<Result<(), ExecutorError>>,
     },
