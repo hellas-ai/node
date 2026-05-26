@@ -18,6 +18,13 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
+    if let Some(proxy) = state.responses_proxy.as_ref() {
+        return match proxy.forward(body).await {
+            Ok(response) => response,
+            Err(err) => err.into_response(),
+        };
+    }
+
     let adaptor = OpenAiResponsesAdaptor;
     let raw = match RawRequest::from_slice(&body) {
         Ok(raw) => raw,

@@ -132,7 +132,8 @@ assume which provider route produced the request beyond the fields present in
 
 `hellas-wire-adaptors` defines the `ExecutionBackend` trait but does not ship
 transport-specific implementations. HTTP proxy backends belong in crates that
-can depend on an HTTP client.
+can depend on an HTTP client. The gateway currently implements that for
+OpenAI Responses.
 
 ## OpenAI Responses First
 
@@ -147,6 +148,7 @@ Implementation order:
 3. non-streaming response rendering
 4. streaming event rendering
 5. gateway integration
+6. raw HTTP proxy backend
 
 Each step should add fixtures that pin both wire compatibility and the
 canonical-versus-passthrough split.

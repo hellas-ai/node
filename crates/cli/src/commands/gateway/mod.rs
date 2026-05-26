@@ -3,6 +3,7 @@ mod hellas_ext;
 mod openai;
 mod plain;
 mod provenance_layer;
+mod proxy;
 mod responses;
 mod state;
 mod wrap;
@@ -16,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use catgrad::prelude::Dtype;
+use clap::ValueEnum;
 use futures::Stream;
 use serde::Serialize;
 use serde_json::json;
@@ -31,6 +33,16 @@ use self::state::{GatewayState, HttpError};
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub const DEFAULT_RESPONSES_PROXY_URL: &str = "https://api.openai.com/v1/responses";
+pub const DEFAULT_RESPONSES_PROXY_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ResponsesBackend {
+    #[default]
+    Hellas,
+    Proxy,
+}
 
 pub struct GatewayOptions {
     pub host: String,
@@ -52,6 +64,9 @@ pub struct GatewayOptions {
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
     pub wrap_args: Vec<String>,
+    pub responses_backend: ResponsesBackend,
+    pub responses_proxy_url: String,
+    pub responses_proxy_api_key_env: String,
 }
 
 pub async fn run(options: GatewayOptions) -> CliResult<()> {

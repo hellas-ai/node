@@ -1,4 +1,5 @@
-use super::{GatewayOptions, json_error};
+use super::proxy::ResponsesProxy;
+use super::{GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
     ExecutionEvent, ExecutionRequest as RuntimeExecutionRequest, ExecutionRoute, ExecutionRuntime,
     ExecutionStrategy, Outcome, PreparedExecution, RemoteNodeTarget, StopReason,
@@ -55,6 +56,7 @@ pub(super) struct GatewayState {
     pub(super) inference_timeout: Duration,
     pub(super) dtype: Dtype,
     runtime: ExecutionRuntime,
+    pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -86,6 +88,7 @@ pub(super) enum GenerationEvent {
     Done(Outcome),
 }
 
+#[derive(Debug)]
 pub(super) struct HttpError {
     pub(super) status: StatusCode,
     pub(super) message: String,
@@ -107,6 +110,14 @@ pub(super) enum TextGenerationError {
 
 impl GatewayState {
     pub(super) fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+        let responses_proxy = match options.responses_backend {
+            ResponsesBackend::Hellas => None,
+            ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
+                &options.responses_proxy_url,
+                &options.responses_proxy_api_key_env,
+            )?)),
+        };
+
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
             ExecutionRuntime::with_local_executor(
@@ -139,6 +150,7 @@ impl GatewayState {
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             dtype: options.dtype,
             runtime,
+            responses_proxy,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -712,6 +724,7 @@ mod tests {
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             dtype: Dtype::F32,
             runtime: ExecutionRuntime::default(),
+            responses_proxy: None,
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),
         }

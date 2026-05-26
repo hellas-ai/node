@@ -24,6 +24,8 @@ Audited 2026-05-26 against the live tree.
 - `crates/wire-adaptors` is a workspace crate. It defines the
   transport-neutral wire adaptor boundary, backend-neutral execution
   request/result types, and the OpenAI Responses adaptor.
+- `/v1/responses` can use either Hellas execution or a raw HTTP proxy
+  backend selected by `--responses-backend`.
 
 ## Architecture
 
@@ -65,7 +67,7 @@ depend on transport/runtime code.
   that route.
 - Chat Completions, Anthropic Messages, and plain completions still use their
   route-local gateway code instead of `hellas-wire-adaptors`.
-- HTTP proxy execution is not implemented.
+- HTTP proxy execution currently exists only for `/v1/responses`.
 
 ## Verification
 

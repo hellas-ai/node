@@ -198,6 +198,21 @@ enum Commands {
         /// Trailing args forwarded verbatim to the wrapped command (after `--`).
         #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
         wrap_args: Vec<String>,
+        /// Backend used by `/v1/responses`.
+        #[arg(long = "responses-backend", default_value = "hellas")]
+        responses_backend: commands::gateway::ResponsesBackend,
+        /// Upstream endpoint used when `--responses-backend proxy`.
+        #[arg(
+            long = "responses-proxy-url",
+            default_value = commands::gateway::DEFAULT_RESPONSES_PROXY_URL
+        )]
+        responses_proxy_url: String,
+        /// Environment variable containing the bearer token for Responses proxy mode.
+        #[arg(
+            long = "responses-proxy-api-key-env",
+            default_value = commands::gateway::DEFAULT_RESPONSES_PROXY_API_KEY_ENV
+        )]
+        responses_proxy_api_key_env: String,
     },
     /// Query a remote node via RPC
     Rpc {
@@ -338,6 +353,9 @@ async fn main() {
             dtype,
             wrap,
             wrap_args,
+            responses_backend,
+            responses_proxy_url,
+            responses_proxy_api_key_env,
         } => {
             commands::gateway::run(commands::gateway::GatewayOptions {
                 host,
@@ -359,6 +377,9 @@ async fn main() {
                 secret_key,
                 wrap,
                 wrap_args,
+                responses_backend,
+                responses_proxy_url,
+                responses_proxy_api_key_env,
             })
             .await
         }
@@ -629,6 +650,35 @@ mod tests {
     fn gateway_wrap_args_require_wrap() {
         let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
         assert!(result.is_err(), "trailing args without --wrap should error");
+    }
+
+    #[test]
+    fn gateway_accepts_responses_proxy_backend() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "gateway",
+            "--responses-backend",
+            "proxy",
+            "--responses-proxy-url",
+            "http://127.0.0.1:9999/v1/responses",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Gateway {
+                responses_backend,
+                responses_proxy_url,
+                responses_proxy_api_key_env,
+                ..
+            } => {
+                assert_eq!(
+                    responses_backend,
+                    commands::gateway::ResponsesBackend::Proxy
+                );
+                assert_eq!(responses_proxy_url, "http://127.0.0.1:9999/v1/responses");
+                assert_eq!(responses_proxy_api_key_env, "OPENAI_API_KEY");
+            }
+            _ => panic!("expected gateway command"),
+        }
     }
 
     #[cfg(feature = "hellas-executor")]

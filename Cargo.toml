@@ -58,7 +58,7 @@ tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-native-certs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "stream"] }
 rustls-webpki = "0.103.9"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 serde = { version = "1", features = ["derive"] }
