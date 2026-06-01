@@ -1,11 +1,14 @@
+use std::collections::HashMap;
+
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
     ExecutionResult, FieldPath, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem,
-    PassthroughBag, RawRequest, ReasoningOptions, RenderContext, ResponseFormat, StructuredDelta,
-    TextChannel, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor,
-    WireResponse, WireStreamEvent,
+    PassthroughBag, RawRequest, ReasoningOptions, RenderContext, ResponseFormat, StopReason,
+    StructuredDelta, TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice,
+    ToolKind, ToolSpec, Usage, WireAdaptor, WireEventData, WireIngress, WireResponse,
+    WireStreamEvent,
 };
 
 const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -262,6 +265,148 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 events.push(completed);
                 Ok(events)
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResponsesIngressState {
+    item_to_tool_index: HashMap<String, usize>,
+    next_tool_index: usize,
+    saw_text_delta: bool,
+    saw_tool_call: bool,
+}
+
+impl WireIngress for OpenAiResponsesAdaptor {
+    type IngressState = ResponsesIngressState;
+
+    fn decode_response(
+        &self,
+        _request: &Self::ParsedRequest,
+        bytes: &[u8],
+    ) -> AdaptorResult<ExecutionResult> {
+        let value: JsonValue = serde_json::from_slice(bytes).map_err(|source| {
+            AdaptorError::invalid_response(format!("invalid Responses JSON: {source}"))
+        })?;
+        let output = value
+            .get("output")
+            .and_then(JsonValue::as_array)
+            .map(|items| decode_output_items(items))
+            .unwrap_or_else(|| {
+                value
+                    .get("output_text")
+                    .and_then(JsonValue::as_str)
+                    .map(|text| {
+                        vec![OutputItem::Text {
+                            text: text.to_string(),
+                            channel: TextChannel::Output,
+                        }]
+                    })
+                    .unwrap_or_default()
+            });
+
+        Ok(ExecutionResult {
+            output,
+            usage: value.get("usage").map(decode_usage),
+            stop_reason: decode_stop_reason(&value),
+            provenance: None,
+        })
+    }
+
+    fn initial_ingress_state(&self, _request: &Self::ParsedRequest) -> Self::IngressState {
+        ResponsesIngressState::default()
+    }
+
+    fn decode_stream_event(
+        &self,
+        _request: &Self::ParsedRequest,
+        state: &mut Self::IngressState,
+        event: WireStreamEvent,
+    ) -> AdaptorResult<Vec<OutputEvent>> {
+        if matches!(&event.data, WireEventData::Text(value) if value == "[DONE]") {
+            return Ok(Vec::new());
+        }
+        let data = event_json(event)?;
+        let event_type = data
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+
+        match event_type {
+            "response.output_text.delta" => {
+                let Some(delta) = data.get("delta").and_then(JsonValue::as_str) else {
+                    return Ok(Vec::new());
+                };
+                state.saw_text_delta = true;
+                Ok(vec![OutputEvent::TextDelta {
+                    index: output_index(&data),
+                    delta: delta.to_string(),
+                    channel: TextChannel::Output,
+                }])
+            }
+            "response.reasoning_text.delta" => {
+                let Some(delta) = data.get("delta").and_then(JsonValue::as_str) else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![OutputEvent::TextDelta {
+                    index: output_index(&data),
+                    delta: delta.to_string(),
+                    channel: TextChannel::Reasoning,
+                }])
+            }
+            "response.output_text.done" if !state.saw_text_delta => {
+                let Some(text) = data.get("text").and_then(JsonValue::as_str) else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![OutputEvent::TextDelta {
+                    index: output_index(&data),
+                    delta: text.to_string(),
+                    channel: TextChannel::Output,
+                }])
+            }
+            "response.output_item.added" => decode_output_item_added(state, &data),
+            "response.function_call_arguments.delta" => {
+                let Some(delta) = data.get("delta").and_then(JsonValue::as_str) else {
+                    return Ok(Vec::new());
+                };
+                let Some(index) = tool_index_for_event(state, &data) else {
+                    return Err(AdaptorError::invalid_response(
+                        "Responses stream tool-call arguments arrived before tool-call start",
+                    ));
+                };
+                Ok(vec![OutputEvent::ToolCallArgumentsDelta(
+                    ToolCallArgumentsDelta {
+                        index,
+                        delta: delta.to_string(),
+                    },
+                )])
+            }
+            "response.output_item.done" => decode_output_item_done(state, &data),
+            "response.completed" => {
+                let response = data.get("response").unwrap_or(&data);
+                Ok(vec![OutputEvent::Finished {
+                    stop_reason: decode_stream_stop_reason(response, state),
+                    usage: response.get("usage").map(decode_usage),
+                }])
+            }
+            "response.failed" => {
+                let response = data.get("response").unwrap_or(&data);
+                let message = response
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Responses stream failed")
+                    .to_string();
+                Ok(vec![OutputEvent::Error {
+                    message,
+                    code: response
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(JsonValue::as_str)
+                        .map(ToString::to_string),
+                }])
+            }
+            _ => Ok(Vec::new()),
         }
     }
 }
@@ -623,6 +768,199 @@ fn output_items_json(message_id: &str, output: &[OutputItem]) -> AdaptorResult<V
         );
     }
     Ok(items)
+}
+
+fn decode_output_items(items: &[JsonValue]) -> Vec<OutputItem> {
+    items.iter().flat_map(decode_output_item).collect()
+}
+
+fn decode_output_item(item: &JsonValue) -> Vec<OutputItem> {
+    match item.get("type").and_then(JsonValue::as_str) {
+        Some("message") => item
+            .get("content")
+            .and_then(JsonValue::as_array)
+            .map(|parts| parts.iter().map(decode_message_content_part).collect())
+            .unwrap_or_default(),
+        Some("function_call") => vec![OutputItem::ToolCall {
+            id: item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: item
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: decode_arguments(item.get("arguments")),
+        }],
+        _ => vec![OutputItem::Raw(item.clone())],
+    }
+}
+
+fn decode_message_content_part(part: &JsonValue) -> OutputItem {
+    match part.get("type").and_then(JsonValue::as_str) {
+        Some("output_text" | "text") => OutputItem::Text {
+            text: part
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            channel: TextChannel::Output,
+        },
+        Some("reasoning_text") => OutputItem::Text {
+            text: part
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            channel: TextChannel::Reasoning,
+        },
+        _ => OutputItem::Raw(part.clone()),
+    }
+}
+
+fn decode_arguments(arguments: Option<&JsonValue>) -> JsonValue {
+    match arguments {
+        Some(JsonValue::String(value)) => {
+            serde_json::from_str(value).unwrap_or_else(|_| JsonValue::String(value.clone()))
+        }
+        Some(value) => value.clone(),
+        None => JsonValue::Null,
+    }
+}
+
+fn decode_usage(value: &JsonValue) -> Usage {
+    Usage {
+        input_tokens: value.get("input_tokens").and_then(JsonValue::as_u64),
+        output_tokens: value.get("output_tokens").and_then(JsonValue::as_u64),
+        total_tokens: value.get("total_tokens").and_then(JsonValue::as_u64),
+    }
+}
+
+fn decode_stop_reason(value: &JsonValue) -> StopReason {
+    match value.get("status").and_then(JsonValue::as_str) {
+        Some("incomplete")
+            if value
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(JsonValue::as_str)
+                == Some("max_output_tokens") =>
+        {
+            StopReason::MaxOutputTokens
+        }
+        Some("cancelled") => StopReason::Cancelled,
+        _ => StopReason::EndOfText,
+    }
+}
+
+fn event_json(event: WireStreamEvent) -> AdaptorResult<JsonValue> {
+    match event.data {
+        WireEventData::Json(value) => Ok(value),
+        WireEventData::Text(value) => serde_json::from_str(&value).map_err(|source| {
+            AdaptorError::invalid_response(format!("invalid Responses stream JSON: {source}"))
+        }),
+        WireEventData::Bytes(bytes) => serde_json::from_slice(&bytes).map_err(|source| {
+            AdaptorError::invalid_response(format!("invalid Responses stream JSON: {source}"))
+        }),
+    }
+}
+
+fn output_index(data: &JsonValue) -> usize {
+    data.get("output_index")
+        .and_then(JsonValue::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn decode_output_item_added(
+    state: &mut ResponsesIngressState,
+    data: &JsonValue,
+) -> AdaptorResult<Vec<OutputEvent>> {
+    let Some(item) = data.get("item") else {
+        return Ok(Vec::new());
+    };
+    if item.get("type").and_then(JsonValue::as_str) != Some("function_call") {
+        return Ok(Vec::new());
+    }
+    let id = tool_call_id(item);
+    let Some(name) = item.get("name").and_then(JsonValue::as_str) else {
+        return Ok(Vec::new());
+    };
+    let index = state.next_tool_index;
+    state.next_tool_index = state.next_tool_index.saturating_add(1);
+    state.saw_tool_call = true;
+    if let Some(id) = id.as_ref() {
+        state.item_to_tool_index.insert(id.clone(), index);
+    }
+
+    let mut events = vec![OutputEvent::ToolCallStart(ToolCallStart {
+        index,
+        id,
+        name: name.to_string(),
+    })];
+    if let Some(arguments) = item
+        .get("arguments")
+        .and_then(JsonValue::as_str)
+        .filter(|arguments| !arguments.is_empty())
+    {
+        events.push(OutputEvent::ToolCallArgumentsDelta(
+            ToolCallArgumentsDelta {
+                index,
+                delta: arguments.to_string(),
+            },
+        ));
+    }
+    Ok(events)
+}
+
+fn decode_output_item_done(
+    state: &mut ResponsesIngressState,
+    data: &JsonValue,
+) -> AdaptorResult<Vec<OutputEvent>> {
+    let Some(item) = data.get("item") else {
+        return Ok(Vec::new());
+    };
+    if item.get("type").and_then(JsonValue::as_str) != Some("function_call") {
+        return Ok(Vec::new());
+    }
+    let Some(index) = tool_index_for_item(state, item) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![OutputEvent::ToolCallEnd(ToolCallEnd {
+        index,
+        arguments: decode_arguments(item.get("arguments")),
+    })])
+}
+
+fn tool_index_for_event(state: &ResponsesIngressState, data: &JsonValue) -> Option<usize> {
+    data.get("item_id")
+        .and_then(JsonValue::as_str)
+        .and_then(|id| state.item_to_tool_index.get(id).copied())
+        .or_else(|| {
+            data.get("output_index")
+                .and_then(JsonValue::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+        })
+}
+
+fn tool_index_for_item(state: &ResponsesIngressState, item: &JsonValue) -> Option<usize> {
+    tool_call_id(item).and_then(|id| state.item_to_tool_index.get(&id).copied())
+}
+
+fn tool_call_id(item: &JsonValue) -> Option<String> {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+}
+
+fn decode_stream_stop_reason(response: &JsonValue, state: &ResponsesIngressState) -> StopReason {
+    match decode_stop_reason(response) {
+        StopReason::EndOfText if state.saw_tool_call => StopReason::ToolCall,
+        reason => reason,
+    }
 }
 
 fn render_tool_call_start(
@@ -1075,7 +1413,7 @@ fn optional_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Provenance, StopReason, WireEventData};
+    use crate::{Provenance, StopReason, WireEventData, WireIngress};
 
     fn adaptor() -> OpenAiResponsesAdaptor {
         OpenAiResponsesAdaptor
@@ -1275,6 +1613,166 @@ mod tests {
         assert_eq!(body["output"][0]["type"], "function_call");
         assert_eq!(body["output"][0]["call_id"], "call_1");
         assert_eq!(body["output"][0]["arguments"], "{\"query\":\"tea\"}");
+    }
+
+    #[test]
+    fn decode_non_streaming_response() {
+        let parsed = sample_request();
+        let result = adaptor()
+            .decode_response(
+                &parsed,
+                br#"{
+                    "id": "resp_test",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "done"}
+                            ]
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "lookup",
+                            "arguments": "{\"query\":\"tea\"}"
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5
+                    }
+                }"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.output,
+            vec![
+                OutputItem::Text {
+                    text: "done".to_string(),
+                    channel: TextChannel::Output,
+                },
+                OutputItem::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: json!({"query": "tea"}),
+                },
+            ]
+        );
+        assert_eq!(result.usage.unwrap().total_tokens, Some(5));
+        assert_eq!(result.stop_reason, StopReason::EndOfText);
+    }
+
+    #[test]
+    fn decode_stream_text_events_without_indexes() {
+        let parsed = sample_request();
+        let mut state = adaptor().initial_ingress_state(&parsed);
+        let mut events = Vec::new();
+        for event in [
+            WireStreamEvent::text(
+                Some("response.output_text.delta".to_string()),
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"hel"}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.output_text.delta".to_string()),
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"lo"}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.completed".to_string()),
+                r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+            ),
+        ] {
+            events.extend(
+                adaptor()
+                    .decode_stream_event(&parsed, &mut state, event)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                OutputEvent::TextDelta {
+                    index: 0,
+                    delta: "hel".to_string(),
+                    channel: TextChannel::Output,
+                },
+                OutputEvent::TextDelta {
+                    index: 0,
+                    delta: "lo".to_string(),
+                    channel: TextChannel::Output,
+                },
+                OutputEvent::Finished {
+                    stop_reason: StopReason::EndOfText,
+                    usage: Some(Usage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(2),
+                        total_tokens: Some(5),
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_stream_tool_call_events_without_indexes() {
+        let parsed = sample_request();
+        let mut state = adaptor().initial_ingress_state(&parsed);
+        let mut events = Vec::new();
+        for event in [
+            WireStreamEvent::text(
+                Some("response.output_item.added".to_string()),
+                r#"{"type":"response.output_item.added","item":{"id":"call_1","call_id":"call_1","type":"function_call","name":"bash","arguments":"","status":"in_progress"}}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.function_call_arguments.delta".to_string()),
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\"command\":\"printf hi\"}"}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.output_item.done".to_string()),
+                r#"{"type":"response.output_item.done","item":{"id":"call_1","call_id":"call_1","type":"function_call","name":"bash","arguments":"{\"command\":\"printf hi\"}","status":"completed"}}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.completed".to_string()),
+                r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+            ),
+        ] {
+            events.extend(
+                adaptor()
+                    .decode_stream_event(&parsed, &mut state, event)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                OutputEvent::ToolCallStart(ToolCallStart {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: "bash".to_string(),
+                }),
+                OutputEvent::ToolCallArgumentsDelta(ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: r#"{"command":"printf hi"}"#.to_string(),
+                }),
+                OutputEvent::ToolCallEnd(ToolCallEnd {
+                    index: 0,
+                    arguments: json!({"command": "printf hi"}),
+                }),
+                OutputEvent::Finished {
+                    stop_reason: StopReason::ToolCall,
+                    usage: Some(Usage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(2),
+                        total_tokens: Some(5),
+                    }),
+                },
+            ]
+        );
     }
 
     #[test]

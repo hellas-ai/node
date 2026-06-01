@@ -4,7 +4,7 @@ use super::wire_adaptor::{backend_response, backend_stream_response, parse_backe
 use super::{next_id, now_unix};
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use hellas_wire_adaptors::openai::responses::OpenAiResponsesAdaptor;
 use hellas_wire_adaptors::openai::responses::ParsedResponseRequest;
 use hellas_wire_adaptors::{BackendRequest, RenderContext};
@@ -24,10 +24,15 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
 
     if let Some(proxy) = state.responses_proxy.as_ref() {
         if stream {
-            return match proxy.forward_request(request).await {
-                Ok(response) => response,
-                Err(err) => err.into_response(),
-            };
+            return backend_stream_response(
+                adaptor,
+                parsed,
+                proxy.as_ref().clone(),
+                request,
+                render_context(),
+                "OpenAI Responses",
+            )
+            .await;
         }
         return backend_response(
             adaptor,

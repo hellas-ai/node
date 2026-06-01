@@ -9,7 +9,7 @@ pub mod openai;
 pub mod request;
 pub mod wire;
 
-pub use adaptor::WireAdaptor;
+pub use adaptor::{WireAdaptor, WireIngress};
 pub use backend::{
     BackendError, BackendFuture, BackendRequest, BackendResult, BackendStream, ExecutionBackend,
     OutputEventStream,
@@ -23,5 +23,5 @@ pub use execution::{
 };
 pub use request::{FieldPath, PassthroughBag, PassthroughField, RawRequest};
 pub use wire::{
-    RenderContext, WireBody, WireEventData, WireHeaders, WireResponse, WireStreamEvent,
+    RenderContext, SseDecoder, WireBody, WireEventData, WireHeaders, WireResponse, WireStreamEvent,
 };
