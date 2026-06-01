@@ -219,7 +219,7 @@ impl GatewayState {
         })?;
         let prepared = request.prepare().await.map_err(|err| HttpError {
             status: StatusCode::BAD_GATEWAY,
-            message: format!("{prepare_error}: {}", format_error_causes(err.as_ref())),
+            message: format!("{prepare_error}: {}", format_error_causes(&err)),
         })?;
         let provenance = prepared.provenance().cloned();
 

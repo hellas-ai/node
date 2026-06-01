@@ -2597,6 +2597,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "test-log",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tower",

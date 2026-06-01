@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
+use tracing::trace;
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
@@ -66,17 +67,31 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let stream = execution.stream();
     tokio::pin!(stream);
 
-    let event = stream.next().await.ok_or_else(|| {
-        anyhow::anyhow!("opaque execution stream ended without terminal outcome")
-    })??;
-    match event {
-        OpaqueExecutionEvent::Done(OpaqueOutcome::Completed { output, .. }) => {
-            io::stdout().write_all(&output)?;
-            io::stdout().flush()?;
+    let mut wrote_chunks = false;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event? {
+            OpaqueExecutionEvent::Chunk { position, bytes } => {
+                trace!(position, bytes = bytes.len(), "opaque output chunk");
+                wrote_chunks = true;
+                io::stdout().write_all(&bytes)?;
+                io::stdout().flush()?;
+            }
+            OpaqueExecutionEvent::Done(OpaqueOutcome::Completed { output, .. }) => {
+                if !wrote_chunks {
+                    io::stdout().write_all(&output)?;
+                    io::stdout().flush()?;
+                }
+                completed = true;
+                break;
+            }
+            OpaqueExecutionEvent::Done(OpaqueOutcome::Failed { position, error }) => {
+                anyhow::bail!("opaque execution failed at position {position}: {error}");
+            }
         }
-        OpaqueExecutionEvent::Done(OpaqueOutcome::Failed { error, .. }) => {
-            anyhow::bail!("opaque execution failed: {error}");
-        }
+    }
+    if !completed {
+        anyhow::bail!("opaque execution stream ended without terminal outcome");
     }
 
     if uses_remote {
