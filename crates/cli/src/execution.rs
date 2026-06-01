@@ -1,7 +1,8 @@
-//! Stream-shaped CLI execution layer.
+//! Stream-shaped execution layer.
 //!
 //! The fundamental shape: every layer returns
-//! `impl Stream<Item = anyhow::Result<ExecutionEvent>>`. Drop-cancellation
+//! `impl Stream<Item = Result<ExecutionEvent, ExecutionError>>` or
+//! `impl Stream<Item = Result<OpaqueExecutionEvent, ExecutionError>>`. Drop-cancellation
 //! propagates naturally — when a consumer drops the stream, the generator
 //! is dropped, which drops every in-flight future, which drops every
 //! resource, which (for local executions) drops the per-execution
@@ -22,7 +23,6 @@
 //! takes the first that returns a successful quote. The run step then opens
 //! an Execute service transport for the selected peer.
 
-use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -34,12 +34,13 @@ use futures::stream::{BoxStream, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    DeliveryOutput, DeliveryRequest, Digest, JsonBytes, OpaqueRequest as CoreOpaqueRequest,
-    SchemeId, SignedReceipt as CoreSignedReceipt, decode_dag_cbor, verify_delivery, verify_receipt,
+    DagCborDecodeError, DeliveryOutput, DeliveryRequest, Digest, JsonBytes,
+    OpaqueRequest as CoreOpaqueRequest, SchemeId, SignedReceipt as CoreSignedReceipt, VerifyError,
+    decode_dag_cbor, verify_delivery, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
-use hellas_rpc::model::ModelAssets;
+use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
 use hellas_rpc::pb::execute::{
     self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
@@ -55,11 +56,107 @@ use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use thiserror::Error;
 #[cfg(feature = "hellas-executor")]
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
+
+pub type ExecutionResult<T> = Result<T, ExecutionError>;
+
+#[derive(Debug, Error)]
+pub enum ExecutionError {
+    #[error("{0}")]
+    Protocol(String),
+    #[error("{context}: {source}")]
+    Source {
+        context: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync + 'static>,
+    },
+    #[error("{context}: {source}")]
+    Wire {
+        context: String,
+        #[source]
+        source: WireStatus,
+    },
+    #[error(transparent)]
+    ModelAssets(#[from] ModelAssetsError),
+    #[error("finished event missing receipt envelope")]
+    MissingReceiptEnvelope,
+    #[error("failed to decode receipt envelope dag-cbor: {source}")]
+    ReceiptDecode {
+        #[source]
+        source: DagCborDecodeError,
+    },
+    #[error("receipt signature verification failed: {source}")]
+    ReceiptSignature {
+        #[source]
+        source: VerifyError,
+    },
+    #[error("opaque receipt verification failed: {source}")]
+    OpaqueReceipt {
+        #[source]
+        source: VerifyError,
+    },
+    #[error("unknown finish status {value}")]
+    UnknownFinishStatus { value: i32 },
+    #[error("wire finish status is unspecified")]
+    UnspecifiedFinishStatus,
+    #[error("symbolic execution returned an opaque receipt")]
+    SymbolicReceiptExpected,
+    #[error("opaque execution returned a symbolic receipt")]
+    OpaqueReceiptExpected,
+    #[error("opaque service must not be empty")]
+    EmptyOpaqueService,
+    #[error("opaque method must not be empty")]
+    EmptyOpaqueMethod,
+    #[error("opaque payload must be UTF-8 JSON: {source}")]
+    OpaquePayloadJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("opaque output must be UTF-8 JSON: {source}")]
+    OpaqueOutputJson {
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl ExecutionError {
+    fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol(message.into())
+    }
+
+    fn source(context: impl Into<String>, source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Source {
+            context: context.into(),
+            source: Box::new(source),
+        }
+    }
+
+    fn wire(context: impl Into<String>, source: WireStatus) -> Self {
+        Self::Wire {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+trait ExecutionContext<T> {
+    fn exec_context(self, context: impl Into<String>) -> ExecutionResult<T>;
+}
+
+impl<T, E> ExecutionContext<T> for Result<T, E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    fn exec_context(self, context: impl Into<String>) -> ExecutionResult<T> {
+        self.map_err(|source| ExecutionError::source(context, source))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public configuration types
@@ -199,9 +296,9 @@ pub struct ReceiptArtifact {
 }
 
 impl ReceiptArtifact {
-    pub fn from_pb(envelope: Option<pb::ReceiptEnvelope>) -> anyhow::Result<Self> {
+    pub fn from_pb(envelope: Option<pb::ReceiptEnvelope>) -> ExecutionResult<Self> {
         let (dag_cbor, core) = decode_receipt_envelope(envelope)?;
-        verify_receipt(&core).context("receipt signature verification failed")?;
+        verify_receipt(&core).map_err(|source| ExecutionError::ReceiptSignature { source })?;
         Ok(Self::from_verified_core(dag_cbor, &core))
     }
 
@@ -245,13 +342,14 @@ pub enum StopReason {
 
 #[derive(Debug, Clone)]
 pub enum OpaqueExecutionEvent {
+    Chunk { position: u64, bytes: Vec<u8> },
     Done(OpaqueOutcome),
 }
 
 #[derive(Debug, Clone)]
 pub enum OpaqueOutcome {
     Completed { output: Vec<u8> },
-    Failed { error: String },
+    Failed { position: u64, error: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -272,19 +370,19 @@ impl ExecutionRuntime {
 
     /// Remote-capable runtime: binds an iroh `Endpoint` keyed on
     /// `secret_key` and builds a `ServiceRegistry`.
-    pub async fn remote(secret_key: SecretKey) -> anyhow::Result<Self> {
+    pub async fn remote(secret_key: SecretKey) -> ExecutionResult<Self> {
         Self::default().with_remote(secret_key).await
     }
 
     /// Add remote-capability to an existing runtime (typically one
     /// built via [`Self::local`] when verify-against-local is active).
     /// Builds the iroh `Endpoint` and `ServiceRegistry`.
-    pub async fn with_remote(mut self, secret_key: SecretKey) -> anyhow::Result<Self> {
+    pub async fn with_remote(mut self, secret_key: SecretKey) -> ExecutionResult<Self> {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
-            .context("failed to bind iroh endpoint for ExecutionRuntime")?;
+            .exec_context("failed to bind iroh endpoint for ExecutionRuntime")?;
         let registry = ServiceRegistry::new(&endpoint);
         self.remote = Some(RemoteRpc {
             _endpoint: endpoint,
@@ -298,7 +396,7 @@ impl ExecutionRuntime {
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
-    ) -> anyhow::Result<Self> {
+    ) -> ExecutionResult<Self> {
         let local_executor = Executor::spawn_with_producer_key(
             DownloadPolicy::Eager,
             ExecutePolicy::Eager,
@@ -306,15 +404,17 @@ impl ExecutionRuntime {
             supported_dtypes,
             producer_key,
         )
-        .context("failed to initialize local execution backend")?;
+        .exec_context("failed to initialize local execution backend")?;
         Ok(Self::local(local_executor))
     }
 
     #[cfg(feature = "hellas-executor")]
-    fn require_local_executor(&self) -> Result<ExecutorHandle, anyhow::Error> {
-        self.local_executor
-            .clone()
-            .ok_or_else(|| anyhow!("local execution requested but no local executor is configured"))
+    fn require_local_executor(&self) -> ExecutionResult<ExecutorHandle> {
+        self.local_executor.clone().ok_or_else(|| {
+            ExecutionError::protocol(
+                "local execution requested but no local executor is configured",
+            )
+        })
     }
 
     /// Get a typed `IrohTransport` for one service, dialing the
@@ -323,20 +423,21 @@ impl ExecutionRuntime {
     async fn remote_transport<S: ServiceMarker>(
         &self,
         target: &RemoteNodeTarget,
-    ) -> anyhow::Result<IrohTransport> {
+    ) -> ExecutionResult<IrohTransport> {
         let r = self.remote.as_ref().ok_or_else(|| {
-            anyhow!("remote dispatch on a local-only runtime — construct via ExecutionRuntime::remote(...)")
+            ExecutionError::protocol(
+                "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)",
+            )
         })?;
         r.registry
             .pool::<S>()
             .transport(target.addr.clone())
             .await
-            .map_err(|err| {
-                anyhow!(err).context(format!(
-                    "failed to dial {} on {}",
-                    S::ALPN,
-                    target.node_id()
-                ))
+            .map_err(|source| {
+                ExecutionError::source(
+                    format!("failed to dial {} on {}", S::ALPN, target.node_id()),
+                    source,
+                )
             })
     }
 }
@@ -358,7 +459,7 @@ impl ExecutionRequest {
         prepared_prompt: PreparedPrompt,
         max_seq: u32,
         strategy: ExecutionStrategy,
-    ) -> anyhow::Result<Self> {
+    ) -> ExecutionResult<Self> {
         Ok(Self {
             runtime,
             quote_req: assets.build_quote_prepared_text_request(&prepared_prompt, max_seq)?,
@@ -385,7 +486,7 @@ impl ExecutionRequest {
     /// (notably the gateway) read pre-flight provenance off
     /// `PreparedExecution::provenance()` *before* the response stream
     /// flushes its headers.
-    pub async fn prepare(self) -> anyhow::Result<PreparedExecution> {
+    pub async fn prepare(self) -> ExecutionResult<PreparedExecution> {
         match self.strategy {
             ExecutionStrategy::Run(route) => Ok(PreparedExecution {
                 primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, &route).await?,
@@ -405,7 +506,7 @@ impl ExecutionRequest {
     /// Owning consumption: dropping the returned stream cancels everything
     /// downstream (broadcast subscribers, wire streams, the executor's
     /// per-running cancel token).
-    pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
         try_stream! {
             let prepared = self.prepare().await?;
             let inner = prepared.stream();
@@ -439,14 +540,15 @@ impl OpaqueExecutionRequest {
         return true;
     }
 
-    pub fn stream(self) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+    pub async fn prepare(self) -> ExecutionResult<PreparedOpaqueExecution> {
+        Ok(PreparedOpaqueExecution {
+            route: OpaquePreparedRoute::prepare(&self.runtime, &self.request, &self.route).await?,
+        })
+    }
+
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
         try_stream! {
-            let prepared = OpaquePreparedRoute::prepare(
-                &self.runtime,
-                &self.request,
-                &self.route,
-            )
-            .await?;
+            let prepared = self.prepare().await?;
             let inner = prepared.stream();
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
@@ -465,6 +567,16 @@ pub struct PreparedExecution {
     shadow: Option<PreparedRoute>,
 }
 
+pub struct PreparedOpaqueExecution {
+    route: OpaquePreparedRoute,
+}
+
+impl PreparedOpaqueExecution {
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
+        self.route.stream()
+    }
+}
+
 impl PreparedExecution {
     /// See [`PreparedRoute::provenance`] — this delegates to the primary
     /// route. Shadow's provenance is intentionally not exposed (verify is
@@ -477,7 +589,7 @@ impl PreparedExecution {
     /// after primary completes and only emit primary's `Done` once the two
     /// receipts agree. Mismatch is reported as a `Done(Failed)` so the
     /// terminal frame is honest about the disagreement.
-    pub fn stream(self) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
         let Self { primary, shadow } = self;
         try_stream! {
             let mut primary_done: Option<Outcome> = None;
@@ -497,7 +609,7 @@ impl PreparedExecution {
                 }
             }
             let primary_outcome = primary_done
-                .ok_or_else(|| anyhow!("primary stream ended without terminal outcome"))?;
+                .ok_or_else(|| ExecutionError::protocol("primary stream ended without terminal outcome"))?;
 
             let final_outcome = match shadow {
                 None => primary_outcome,
@@ -510,11 +622,13 @@ impl PreparedExecution {
 
 /// Run the shadow stream to completion (discarding its chunks), extract
 /// its terminal outcome, and return the reconciled outcome.
-async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Result<Outcome> {
+async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { receipt, .. } => {
             receipt.symbolic_text_artifact().ok_or_else(|| {
-                anyhow!("primary symbolic execution did not produce symbolic artifact digest")
+                ExecutionError::protocol(
+                    "primary symbolic execution did not produce symbolic artifact digest",
+                )
             })?
         }
         Outcome::Failed { .. } => return Ok(primary),
@@ -527,7 +641,9 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Resul
             ..
         } => {
             let shadow_digest = shadow_receipt.symbolic_text_artifact().ok_or_else(|| {
-                anyhow!("shadow symbolic execution did not produce symbolic artifact digest")
+                ExecutionError::protocol(
+                    "shadow symbolic execution did not produce symbolic artifact digest",
+                )
             })?;
             if primary_digest == shadow_digest {
                 Ok(primary)
@@ -552,15 +668,17 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> anyhow::Resul
 
 /// Consume a stream to its terminal `Done`, discarding chunks.
 async fn drain_to_outcome(
-    stream: impl Stream<Item = anyhow::Result<ExecutionEvent>>,
-) -> anyhow::Result<Outcome> {
+    stream: impl Stream<Item = ExecutionResult<ExecutionEvent>>,
+) -> ExecutionResult<Outcome> {
     tokio::pin!(stream);
     while let Some(event) = stream.next().await {
         if let ExecutionEvent::Done(outcome) = event? {
             return Ok(outcome);
         }
     }
-    Err(anyhow!("shadow stream ended without terminal outcome"))
+    Err(ExecutionError::protocol(
+        "shadow stream ended without terminal outcome",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +714,7 @@ impl PreparedRoute {
         runtime: &ExecutionRuntime,
         quote_req: &QuotePreparedTextRequest,
         route: &ExecutionRoute,
-    ) -> anyhow::Result<Self> {
+    ) -> ExecutionResult<Self> {
         match route {
             #[cfg(feature = "hellas-executor")]
             ExecutionRoute::Local => {
@@ -604,15 +722,14 @@ impl PreparedRoute {
                 handle
                     .load_model_metadata(local_model_spec(quote_req))
                     .await
-                    .context("failed to load local model metadata")?;
+                    .exec_context("failed to load local model metadata")?;
                 let outcome = handle
                     .quote_prepared_text(quote_req.clone())
                     .await
-                    .context("local quote_prepared_text failed")?;
-                let ticket =
-                    outcome.response.ticket.clone().ok_or_else(|| {
-                        anyhow!("local quote_prepared_text response missing ticket")
-                    })?;
+                    .exec_context("local quote_prepared_text failed")?;
+                let ticket = outcome.response.ticket.clone().ok_or_else(|| {
+                    ExecutionError::protocol("local quote_prepared_text response missing ticket")
+                })?;
                 Ok(Self::Local {
                     handle,
                     request_commitment: ticket.request_commitment,
@@ -631,24 +748,27 @@ impl PreparedRoute {
                 )
                 .await
                 .map_err(|status| {
-                    anyhow!(status).context(format!(
-                        "node {} declined quote_prepared_text",
+                    ExecutionError::wire(
+                        format!("node {} declined quote_prepared_text", target.node_id()),
+                        status,
+                    )
+                })?;
+                let ticket = with_trailer.response.ticket.ok_or_else(|| {
+                    ExecutionError::protocol(format!(
+                        "quote_prepared_text response from {} missing ticket",
                         target.node_id()
                     ))
                 })?;
-                let ticket = with_trailer.response.ticket.ok_or_else(|| {
-                    anyhow!(
-                        "quote_prepared_text response from {} missing ticket",
-                        target.node_id()
-                    )
-                })?;
                 let provenance =
                     hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
-                        .map_err(|e| {
-                            anyhow!(e).context(format!(
-                                "node {} response missing provenance metadata",
-                                target.node_id()
-                            ))
+                        .map_err(|source| {
+                            ExecutionError::source(
+                                format!(
+                                    "node {} response missing provenance metadata",
+                                    target.node_id()
+                                ),
+                                source,
+                            )
                         })?;
 
                 // Open a fresh Execute-ALPN transport for the run step.
@@ -661,9 +781,8 @@ impl PreparedRoute {
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
                 let remote = runtime.remote.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "remote dispatch on a local-only runtime — \
-                         construct via ExecutionRuntime::remote(...)"
+                    ExecutionError::protocol(
+                        "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
                     )
                 })?;
                 let (target, request_commitment, provenance) =
@@ -678,7 +797,7 @@ impl PreparedRoute {
         }
     }
 
-    fn stream(self) -> BoxStream<'static, anyhow::Result<ExecutionEvent>> {
+    fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
         match self {
             #[cfg(feature = "hellas-executor")]
             PreparedRoute::Local {
@@ -719,7 +838,7 @@ impl OpaquePreparedRoute {
         runtime: &ExecutionRuntime,
         request: &PbOpaqueRequest,
         route: &ExecutionRoute,
-    ) -> anyhow::Result<Self> {
+    ) -> ExecutionResult<Self> {
         match route {
             #[cfg(feature = "hellas-executor")]
             ExecutionRoute::Local => {
@@ -727,7 +846,7 @@ impl OpaquePreparedRoute {
                 let outcome = handle
                     .create_opaque_ticket(request.clone())
                     .await
-                    .context("local create_opaque_ticket failed")?;
+                    .exec_context("local create_opaque_ticket failed")?;
                 Ok(Self::Local {
                     handle,
                     request: request.clone(),
@@ -741,10 +860,10 @@ impl OpaquePreparedRoute {
                     .create_ticket(request.clone())
                     .await
                     .map_err(|status| {
-                        anyhow!(status).context(format!(
-                            "node {} declined opaque create_ticket",
-                            target.node_id()
-                        ))
+                        ExecutionError::wire(
+                            format!("node {} declined opaque create_ticket", target.node_id()),
+                            status,
+                        )
                     })?;
                 let execute_transport = runtime.remote_transport::<Execute>(target).await?;
                 Ok(Self::RemoteDirect {
@@ -755,9 +874,8 @@ impl OpaquePreparedRoute {
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
                 let remote = runtime.remote.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "remote dispatch on a local-only runtime — \
-                         construct via ExecutionRuntime::remote(...)"
+                    ExecutionError::protocol(
+                        "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
                     )
                 })?;
                 let (target, request_commitment) =
@@ -772,7 +890,7 @@ impl OpaquePreparedRoute {
         }
     }
 
-    fn stream(self) -> BoxStream<'static, anyhow::Result<OpaqueExecutionEvent>> {
+    fn stream(self) -> BoxStream<'static, ExecutionResult<OpaqueExecutionEvent>> {
         match self {
             #[cfg(feature = "hellas-executor")]
             Self::Local {
@@ -801,10 +919,10 @@ async fn discover_and_quote(
     registry: &ServiceRegistry,
     quote_req: &QuotePreparedTextRequest,
     retries: usize,
-) -> anyhow::Result<(RemoteNodeTarget, Vec<u8>, ExecutionProvenance)> {
+) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>, ExecutionProvenance)> {
     let mut stream = Box::pin(registry.discover::<Courtesy>());
     let pool = registry.pool::<Courtesy>();
-    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_error: Option<ExecutionError> = None;
     let mut attempts: usize = 0;
     let max_attempts = retries.saturating_add(1);
 
@@ -812,7 +930,7 @@ async fn discover_and_quote(
         let peer = match peer {
             Ok(p) => p,
             Err(err) => {
-                last_error = Some(anyhow!("discovery feed error: {err}"));
+                last_error = Some(ExecutionError::source("discovery feed error", err));
                 continue;
             }
         };
@@ -822,8 +940,10 @@ async fn discover_and_quote(
         let transport = match pool.transport(peer_id).await {
             Ok(t) => t,
             Err(err) => {
-                last_error =
-                    Some(anyhow!(err).context(format!("failed to dial Courtesy on {peer_id}")));
+                last_error = Some(ExecutionError::source(
+                    format!("failed to dial Courtesy on {peer_id}"),
+                    err,
+                ));
                 if attempts >= max_attempts {
                     break;
                 }
@@ -831,30 +951,30 @@ async fn discover_and_quote(
             }
         };
 
-        let with_trailer = match hellas_rpc::call::unary_with_trailer::<
-            _,
-            hellas_rpc::services::courtesy::QuotePreparedText,
-        >(
-            &transport, quote_req.clone(), hellas_wire::Metadata::new()
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(status) => {
-                last_error = Some(
-                    anyhow!(status).context(format!("node {peer_id} declined quote_prepared_text")),
-                );
-                if attempts >= max_attempts {
-                    break;
+        let with_trailer =
+            match hellas_rpc::call::unary_with_trailer::<
+                _,
+                hellas_rpc::services::courtesy::QuotePreparedText,
+            >(&transport, quote_req.clone(), hellas_wire::Metadata::new())
+            .await
+            {
+                Ok(t) => t,
+                Err(status) => {
+                    last_error = Some(ExecutionError::wire(
+                        format!("node {peer_id} declined quote_prepared_text"),
+                        status,
+                    ));
+                    if attempts >= max_attempts {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         let Some(ticket) = with_trailer.response.ticket else {
-            last_error = Some(anyhow!(
+            last_error = Some(ExecutionError::protocol(format!(
                 "quote_prepared_text response from {peer_id} missing ticket"
-            ));
+            )));
             if attempts >= max_attempts {
                 break;
             }
@@ -865,9 +985,10 @@ async fn discover_and_quote(
             match hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata) {
                 Ok(p) => p,
                 Err(e) => {
-                    last_error = Some(anyhow!(e).context(format!(
-                        "peer {peer_id} response missing provenance metadata"
-                    )));
+                    last_error = Some(ExecutionError::source(
+                        format!("peer {peer_id} response missing provenance metadata"),
+                        e,
+                    ));
                     if attempts >= max_attempts {
                         break;
                     }
@@ -880,7 +1001,9 @@ async fn discover_and_quote(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        anyhow!("discovery stream exhausted without a successful quote (no peers found)")
+        ExecutionError::protocol(
+            "discovery stream exhausted without a successful quote (no peers found)",
+        )
     }))
 }
 
@@ -889,11 +1012,11 @@ async fn discover_and_opaque_quote(
     registry: &ServiceRegistry,
     request: &PbOpaqueRequest,
     retries: usize,
-) -> anyhow::Result<(RemoteNodeTarget, Vec<u8>)> {
+) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>)> {
     use hellas_rpc::services::opaque::OpaqueClientImpl;
     let mut stream = Box::pin(registry.discover::<Opaque>());
     let pool = registry.pool::<Opaque>();
-    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_error: Option<ExecutionError> = None;
     let mut attempts: usize = 0;
     let max_attempts = retries.saturating_add(1);
 
@@ -901,7 +1024,7 @@ async fn discover_and_opaque_quote(
         let peer = match peer {
             Ok(p) => p,
             Err(err) => {
-                last_error = Some(anyhow!("discovery feed error: {err}"));
+                last_error = Some(ExecutionError::source("discovery feed error", err));
                 continue;
             }
         };
@@ -911,8 +1034,10 @@ async fn discover_and_opaque_quote(
         let transport = match pool.transport(peer_id).await {
             Ok(t) => t,
             Err(err) => {
-                last_error =
-                    Some(anyhow!(err).context(format!("failed to dial Opaque on {peer_id}")));
+                last_error = Some(ExecutionError::source(
+                    format!("failed to dial Opaque on {peer_id}"),
+                    err,
+                ));
                 if attempts >= max_attempts {
                     break;
                 }
@@ -926,10 +1051,10 @@ async fn discover_and_opaque_quote(
                 return Ok((RemoteNodeTarget::from(peer_id), ticket.request_commitment));
             }
             Err(status) => {
-                last_error = Some(
-                    anyhow!(status)
-                        .context(format!("node {peer_id} declined opaque create_ticket")),
-                );
+                last_error = Some(ExecutionError::wire(
+                    format!("node {peer_id} declined opaque create_ticket"),
+                    status,
+                ));
                 if attempts >= max_attempts {
                     break;
                 }
@@ -938,8 +1063,9 @@ async fn discover_and_opaque_quote(
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| anyhow!("discovery stream exhausted without a successful opaque quote")))
+    Err(last_error.unwrap_or_else(|| {
+        ExecutionError::protocol("discovery stream exhausted without a successful opaque quote")
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -950,19 +1076,18 @@ async fn discover_and_opaque_quote(
 fn local_execute_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
-) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let outcome = handle
             .run_ticket_handle(RunTicketRequest { request_commitment })
             .await
-            .context("failed to start local execution stream")?;
+            .exec_context("failed to start local execution stream")?;
         let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
         let mut events = ReceiverStream::new(outcome.events);
         let mut got_terminal = false;
         while let Some(item) = events.next().await {
-            let wire = item.map_err(|status: WireStatus| {
-                anyhow!(status).context("local execution stream failed")
-            })?;
+            let wire = item
+                .map_err(|status: WireStatus| ExecutionError::wire("local execution stream failed", status))?;
             let event = convert_wire_event(wire)?;
             let is_done = matches!(event, ExecutionEvent::Done(_));
             yield event;
@@ -972,7 +1097,7 @@ fn local_execute_stream(
             }
         }
         if !got_terminal {
-            Err(anyhow!("local execution stream ended without terminal outcome"))?;
+            Err(ExecutionError::protocol("local execution stream ended without terminal outcome"))?;
         }
         // Keep the handle alive for the lifetime of the stream so the
         // worker's per-execution sender doesn't trip the channel-closed
@@ -986,28 +1111,29 @@ fn local_execute_opaque_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
     request: PbOpaqueRequest,
-) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
     try_stream! {
         let core_request = core_opaque_request(&request)?;
         let outcome = handle
             .run_ticket_handle(RunTicketRequest { request_commitment })
             .await
-            .context("failed to start local opaque execution stream")?;
+            .exec_context("failed to start local opaque execution stream")?;
         let _provenance = outcome.provenance;
         let mut events = ReceiverStream::new(outcome.events);
         let mut got_terminal = false;
         while let Some(item) = events.next().await {
-            let wire = item.map_err(|status: WireStatus| {
-                anyhow!(status).context("local opaque execution stream failed")
-            })?;
-            if let Some(event) = convert_opaque_wire_event(wire, &core_request)? {
-                yield event;
+            let wire = item
+                .map_err(|status: WireStatus| ExecutionError::wire("local opaque execution stream failed", status))?;
+            let event = convert_opaque_wire_event(wire, &core_request)?;
+            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            yield event;
+            if is_done {
                 got_terminal = true;
                 break;
             }
         }
         if !got_terminal {
-            Err(anyhow!(
+            Err(ExecutionError::protocol(
                 "local opaque execution stream ended without terminal outcome"
             ))?;
         }
@@ -1022,18 +1148,18 @@ fn local_execute_opaque_stream(
 fn remote_execute_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
-) -> impl Stream<Item = anyhow::Result<ExecutionEvent>> + Send {
+) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
         let mut wire = client
             .run_ticket(RunTicketRequest { request_commitment })
             .await
-            .map_err(|status| anyhow!(status).context("failed to start remote execute stream"))?;
+            .map_err(|status| ExecutionError::wire("failed to start remote execute stream", status))?;
         let mut got_terminal = false;
         while let Some(item) = wire.next().await {
-            let event = convert_wire_event(item.map_err(|status: WireStatus| {
-                anyhow!(status).context("remote execute stream failed")
-            })?)?;
+            let event = convert_wire_event(
+                item.map_err(|status: WireStatus| ExecutionError::wire("remote execute stream failed", status))?
+            )?;
             let is_done = matches!(event, ExecutionEvent::Done(_));
             yield event;
             if is_done {
@@ -1045,9 +1171,9 @@ fn remote_execute_stream(
         // (handler aborted mid-stream, transport-level abort, etc.)
         // becomes the call's error.
         wire.finish()
-            .map_err(|status| anyhow!(status).context("remote execute stream trailer"))?;
+            .map_err(|status| ExecutionError::wire("remote execute stream trailer", status))?;
         if !got_terminal {
-            Err(anyhow!("remote execute stream ended Ok but emitted no Done event"))?;
+            Err(ExecutionError::protocol("remote execute stream ended Ok but emitted no Done event"))?;
         }
         drop(client);
     }
@@ -1057,36 +1183,35 @@ fn remote_execute_opaque_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
     request: PbOpaqueRequest,
-) -> impl Stream<Item = anyhow::Result<OpaqueExecutionEvent>> + Send {
+) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
     try_stream! {
         let core_request = core_opaque_request(&request)?;
         let client = ExecuteClientImpl::new(transport);
         let mut wire = client
             .run_ticket(RunTicketRequest { request_commitment })
             .await
-            .map_err(|status| {
-                anyhow!(status).context("failed to start remote opaque execute stream")
-            })?;
+            .map_err(|status| ExecutionError::wire("failed to start remote opaque execute stream", status))?;
         let mut got_terminal = false;
         while let Some(item) = wire.next().await {
-            let Some(event) = convert_opaque_wire_event(
+            let event = convert_opaque_wire_event(
                 item.map_err(|status: WireStatus| {
-                    anyhow!(status).context("remote opaque execute stream failed")
+                    ExecutionError::wire("remote opaque execute stream failed", status)
                 })?,
                 &core_request,
-            )? else {
-                continue;
-            };
+            )?;
+            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
             yield event;
-            got_terminal = true;
-            break;
+            if is_done {
+                got_terminal = true;
+                break;
+            }
         }
         wire.finish()
             .map_err(|status| {
-                anyhow!(status).context("remote opaque execute stream trailer")
+                ExecutionError::wire("remote opaque execute stream trailer", status)
             })?;
         if !got_terminal {
-            Err(anyhow!(
+            Err(ExecutionError::protocol(
                 "remote opaque execute stream ended Ok but emitted no Done event"
             ))?;
         }
@@ -1095,12 +1220,12 @@ fn remote_execute_opaque_stream(
 }
 
 // ---------------------------------------------------------------------------
-// WorkEvent → ExecutionEvent / OpaqueExecutionEvent
+// WorkEvent → execution events
 // ---------------------------------------------------------------------------
 
-fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
+fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
     let Some(event) = event.kind else {
-        bail!("wire event with no body");
+        return Err(ExecutionError::protocol("wire event with no body"));
     };
     match event {
         work_event::Kind::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
@@ -1118,27 +1243,29 @@ fn convert_wire_event(event: WorkEvent) -> anyhow::Result<ExecutionEvent> {
 fn convert_opaque_wire_event(
     event: WorkEvent,
     request: &CoreOpaqueRequest,
-) -> anyhow::Result<Option<OpaqueExecutionEvent>> {
+) -> ExecutionResult<OpaqueExecutionEvent> {
     let Some(event) = event.kind else {
-        bail!("wire event with no body");
+        return Err(ExecutionError::protocol("wire event with no body"));
     };
     match event {
-        work_event::Kind::Chunk(_) => Ok(None),
-        work_event::Kind::Finished(finished) => Ok(Some(OpaqueExecutionEvent::Done(
+        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
+            position: chunk.position,
+            bytes: chunk.bytes,
+        }),
+        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
             parse_opaque_finished(finished, request)?,
-        ))),
-        work_event::Kind::Failed(failed) => {
-            Ok(Some(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
-                error: failed.error,
-            })))
-        }
+        )),
+        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+            position: failed.position,
+            error: failed.error,
+        })),
     }
 }
 
-fn parse_finished(finished: WorkFinished) -> anyhow::Result<Outcome> {
+fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
     let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
     if receipt.symbolic_text_artifact().is_none() {
-        bail!("symbolic execution returned an opaque receipt");
+        return Err(ExecutionError::SymbolicReceiptExpected);
     }
     let stop_reason = stop_reason_from_pb(finished.status)?;
     Ok(Outcome::Completed {
@@ -1151,10 +1278,10 @@ fn parse_finished(finished: WorkFinished) -> anyhow::Result<Outcome> {
 fn parse_opaque_finished(
     finished: WorkFinished,
     request: &CoreOpaqueRequest,
-) -> anyhow::Result<OpaqueOutcome> {
+) -> ExecutionResult<OpaqueOutcome> {
     stop_reason_from_pb(finished.status)?;
     serde_json::from_slice::<serde_json::Value>(&finished.output)
-        .context("opaque output must be UTF-8 JSON")?;
+        .map_err(|source| ExecutionError::OpaqueOutputJson { source })?;
     let output = JsonBytes::new(finished.output.clone());
     let (_dag_cbor, core) = decode_receipt_envelope(finished.receipt)?;
     verify_delivery(
@@ -1162,20 +1289,20 @@ fn parse_opaque_finished(
         DeliveryOutput::Opaque(&output),
         &core,
     )
-    .context("opaque receipt verification failed")?;
+    .map_err(|source| ExecutionError::OpaqueReceipt { source })?;
     if core.body().scheme() != SchemeId::Opaque {
-        bail!("opaque execution returned a symbolic receipt");
+        return Err(ExecutionError::OpaqueReceiptExpected);
     }
     Ok(OpaqueOutcome::Completed {
         output: output.into_bytes(),
     })
 }
 
-fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
+fn stop_reason_from_pb(value: i32) -> ExecutionResult<StopReason> {
     let pb_value =
-        FinishStatus::try_from(value).with_context(|| format!("unknown finish status {value}"))?;
+        FinishStatus::try_from(value).map_err(|_| ExecutionError::UnknownFinishStatus { value })?;
     match pb_value {
-        FinishStatus::Unspecified => bail!("wire finish status is unspecified"),
+        FinishStatus::Unspecified => Err(ExecutionError::UnspecifiedFinishStatus),
         FinishStatus::EndOfSequence => Ok(StopReason::EndOfSequence),
         FinishStatus::MaxOutput => Ok(StopReason::MaxNewTokens),
         FinishStatus::Cancelled => Ok(StopReason::Cancelled),
@@ -1186,15 +1313,15 @@ fn stop_reason_from_pb(value: i32) -> anyhow::Result<StopReason> {
 // Misc helpers
 // ---------------------------------------------------------------------------
 
-fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRequest> {
+fn core_opaque_request(request: &PbOpaqueRequest) -> ExecutionResult<CoreOpaqueRequest> {
     if request.service.is_empty() {
-        bail!("opaque service must not be empty");
+        return Err(ExecutionError::EmptyOpaqueService);
     }
     if request.method.is_empty() {
-        bail!("opaque method must not be empty");
+        return Err(ExecutionError::EmptyOpaqueMethod);
     }
     serde_json::from_slice::<serde_json::Value>(&request.payload)
-        .context("opaque payload must be UTF-8 JSON")?;
+        .map_err(|source| ExecutionError::OpaquePayloadJson { source })?;
     Ok(CoreOpaqueRequest {
         service: request.service.clone(),
         method: request.method.clone(),
@@ -1204,10 +1331,10 @@ fn core_opaque_request(request: &PbOpaqueRequest) -> anyhow::Result<CoreOpaqueRe
 
 fn decode_receipt_envelope(
     envelope: Option<pb::ReceiptEnvelope>,
-) -> anyhow::Result<(Vec<u8>, CoreSignedReceipt)> {
-    let envelope = envelope.ok_or_else(|| anyhow!("finished event missing receipt envelope"))?;
+) -> ExecutionResult<(Vec<u8>, CoreSignedReceipt)> {
+    let envelope = envelope.ok_or(ExecutionError::MissingReceiptEnvelope)?;
     let core: CoreSignedReceipt = decode_dag_cbor(&envelope.dag_cbor)
-        .context("failed to decode receipt envelope dag-cbor")?;
+        .map_err(|source| ExecutionError::ReceiptDecode { source })?;
     Ok((envelope.dag_cbor, core))
 }
 
