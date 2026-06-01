@@ -36,6 +36,33 @@ let
     import json
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
+    def response_body(request, text):
+        return {
+            "id": "resp_mock",
+            "object": "response",
+            "created_at": 0,
+            "model": request["model"],
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_mock",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                }],
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            },
+        }
+
+    def sse_frame(name, data):
+        encoded = json.dumps(data, separators=(",", ":"))
+        return f"event: {name}\ndata: {encoded}\n\n".encode()
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("content-length", "0"))
@@ -43,28 +70,47 @@ let
             assert self.path == "/v1/responses", self.path
             assert self.headers.get("authorization") == "Bearer proxy-secret"
             request = json.loads(body)
-            response = {
-                "id": "resp_mock",
-                "object": "response",
-                "created_at": 0,
-                "model": request["model"],
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_mock",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "proxied-ok",
-                    }],
-                }],
-                "usage": {
-                    "input_tokens": 1,
-                    "output_tokens": 1,
-                    "total_tokens": 2,
-                },
-            }
-            encoded = json.dumps(response).encode()
+            if request.get("stream"):
+                frames = [
+                    sse_frame("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "message",
+                            "id": "msg_mock",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    }),
+                    sse_frame("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_mock",
+                        "delta": "stream",
+                    }),
+                    sse_frame("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_mock",
+                        "delta": "-proxied-ok",
+                    }),
+                    sse_frame("response.output_text.done", {
+                        "type": "response.output_text.done",
+                        "item_id": "msg_mock",
+                        "text": "stream-proxied-ok",
+                    }),
+                    sse_frame("response.completed", {
+                        "type": "response.completed",
+                        "response": response_body(request, "stream-proxied-ok"),
+                    }),
+                ]
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                for frame in frames:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                return
+
+            encoded = json.dumps(response_body(request, "proxied-ok")).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(encoded)))
@@ -579,6 +625,12 @@ in
       response = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
       print(response)
       assert "proxied-ok" in response
+      stream = gateway.succeed("curl -sS -N -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\",\"stream\":true}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
+      print(stream)
+      assert "stream-proxied-ok" in stream
+      assert "response.output_text.delta" in stream
+      assert '"output_index":0' in stream
+      assert '"content_index":0' in stream
     '';
   };
 }

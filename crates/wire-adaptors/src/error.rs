@@ -12,6 +12,8 @@ pub enum AdaptorError {
     Unsupported { feature: String },
     #[error("execution projection failed: {message}")]
     Projection { message: String },
+    #[error("invalid wire response: {message}")]
+    InvalidResponse { message: String },
     #[error("response rendering failed: {message}")]
     Render { message: String },
 }
@@ -31,6 +33,12 @@ impl AdaptorError {
 
     pub fn projection(message: impl Into<String>) -> Self {
         Self::Projection {
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_response(message: impl Into<String>) -> Self {
+        Self::InvalidResponse {
             message: message.into(),
         }
     }

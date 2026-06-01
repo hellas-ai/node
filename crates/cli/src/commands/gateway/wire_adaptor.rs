@@ -145,6 +145,7 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
         | AdaptorError::InvalidRequest { .. }
         | AdaptorError::Unsupported { .. }
         | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
+        AdaptorError::InvalidResponse { .. } => StatusCode::BAD_GATEWAY,
         AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, format!("{surface}: {error}"))
