@@ -2,22 +2,9 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
-    InputItem, ModelRef, OutputEvent, OutputItem, PassthroughBag, RawRequest, ReasoningOptions,
-    RenderContext, StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
+    InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
+    StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
 };
-
-const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
-    "model",
-    "messages",
-    "max_tokens",
-    "system",
-    "stream",
-    "thinking",
-];
-
-// Anthropic tool declarations stay in passthrough until there is a
-// provider-neutral tool schema for this surface. Tool-use history itself is
-// preserved in the message content blocks.
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnthropicMessagesAdaptor;
@@ -31,7 +18,6 @@ pub struct ParsedAnthropicMessageRequest {
     pub system: Option<JsonValue>,
     pub stream: Option<bool>,
     pub thinking: Option<JsonValue>,
-    pub passthrough: PassthroughBag,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,8 +232,6 @@ impl ParsedAnthropicMessageRequest {
         if let Some(thinking) = &thinking {
             validate_thinking(thinking)?;
         }
-        let passthrough = passthrough_fields(object);
-
         Ok(Self {
             raw,
             model,
@@ -256,7 +240,6 @@ impl ParsedAnthropicMessageRequest {
             system,
             stream,
             thinking,
-            passthrough,
         })
     }
 
@@ -280,21 +263,8 @@ impl ParsedAnthropicMessageRequest {
             });
         }
 
-        Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
+        Ok(ExecutionRequest::new(canonical))
     }
-}
-
-fn passthrough_fields(object: &JsonMap<String, JsonValue>) -> PassthroughBag {
-    let mut bag = PassthroughBag::new();
-    for (key, value) in object {
-        if !KNOWN_TOP_LEVEL_FIELDS.contains(&key.as_str()) {
-            bag.push(key.as_str(), value.clone());
-        }
-    }
-    if let Some(value) = object.get("stream") {
-        bag.push("stream", value.clone());
-    }
-    bag
 }
 
 fn validate_message(value: &JsonValue) -> AdaptorResult<()> {
@@ -670,7 +640,7 @@ fn required_array(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldPath, Provenance, Usage, WireBody, WireEventData};
+    use crate::{Provenance, Usage, WireBody, WireEventData};
 
     fn adaptor() -> AnthropicMessagesAdaptor {
         AnthropicMessagesAdaptor
@@ -699,18 +669,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_preserves_passthrough() {
+    fn parse_preserves_raw_request() {
         let request = sample_request();
         assert_eq!(request.model, "claude-3-5-sonnet");
         assert_eq!(request.max_tokens, 32);
         assert_eq!(request.stream, Some(true));
-        let paths = request
-            .passthrough
-            .fields()
-            .iter()
-            .map(|field| field.path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(paths, field_set(["stream", "metadata", "temperature"]));
+        assert_eq!(request.raw.value()["metadata"]["user_id"], "u-1");
+        assert_eq!(request.raw.value()["temperature"], 0.4);
     }
 
     #[test]
@@ -763,10 +728,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_project_render_keeps_passthrough_available() {
+    fn parse_project_render_uses_projected_request() {
         let request = sample_request();
-        let execution = adaptor().to_execution_request(&request).unwrap();
-        assert_eq!(execution.passthrough, request.passthrough);
+        adaptor().to_execution_request(&request).unwrap();
 
         let response = adaptor()
             .render_response(
@@ -933,9 +897,5 @@ mod tests {
         };
         assert_eq!(finish_json["delta"]["stop_reason"], "tool_use");
         assert_eq!(finish[1].name.as_deref(), Some("message_stop"));
-    }
-
-    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
-        fields.into_iter().map(FieldPath::from).collect()
     }
 }

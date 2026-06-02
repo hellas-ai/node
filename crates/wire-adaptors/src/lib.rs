@@ -21,7 +21,7 @@ pub use execution::{
     SamplingOptions, StopReason, StructuredDelta, TextChannel, ToolCallArgumentsDelta, ToolCallEnd,
     ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
 };
-pub use request::{FieldPath, PassthroughBag, PassthroughField, RawRequest};
+pub use request::RawRequest;
 pub use wire::{
     RenderContext, SseDecoder, WireBody, WireEventData, WireHeaders, WireResponse, WireStreamEvent,
 };

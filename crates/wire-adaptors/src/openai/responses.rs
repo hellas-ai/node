@@ -4,32 +4,11 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
-    ExecutionResult, FieldPath, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem,
-    PassthroughBag, RawRequest, ReasoningOptions, RenderContext, ResponseFormat, StopReason,
-    StructuredDelta, TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice,
-    ToolKind, ToolSpec, Usage, WireAdaptor, WireEventData, WireIngress, WireResponse,
-    WireStreamEvent,
+    ExecutionResult, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem, RawRequest,
+    ReasoningOptions, RenderContext, ResponseFormat, StopReason, StructuredDelta, TextChannel,
+    ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
+    WireAdaptor, WireEventData, WireIngress, WireResponse, WireStreamEvent,
 };
-
-const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
-    "model",
-    "input",
-    "instructions",
-    "tools",
-    "max_output_tokens",
-    "stream",
-    "temperature",
-    "top_p",
-    "top_logprobs",
-    "parallel_tool_calls",
-    "truncation",
-    "tool_choice",
-    "text",
-    "response_format",
-    "reasoning",
-    "previous_response_id",
-    "metadata",
-];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenAiResponsesAdaptor;
@@ -48,7 +27,6 @@ pub struct ParsedResponseRequest {
     pub response_format: Option<JsonValue>,
     pub reasoning: Option<JsonValue>,
     pub previous_response_id: Option<String>,
-    pub passthrough: PassthroughBag,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -438,8 +416,6 @@ impl ParsedResponseRequest {
         let reasoning = object.get("reasoning").cloned();
         let previous_response_id = optional_string(object, "previous_response_id")?;
 
-        let passthrough = passthrough_fields(object);
-
         Ok(Self {
             raw,
             model,
@@ -453,7 +429,6 @@ impl ParsedResponseRequest {
             response_format,
             reasoning,
             previous_response_id,
-            passthrough,
         })
     }
 
@@ -506,31 +481,8 @@ impl ParsedResponseRequest {
             canonical.previous_response_id = Some(previous_response_id.clone());
         }
 
-        Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
+        Ok(ExecutionRequest::new(canonical))
     }
-}
-
-fn passthrough_fields(object: &JsonMap<String, JsonValue>) -> PassthroughBag {
-    let mut bag = PassthroughBag::new();
-    for (key, value) in object {
-        if !KNOWN_TOP_LEVEL_FIELDS.contains(&key.as_str()) {
-            bag.push(key.as_str(), value.clone());
-        }
-    }
-    if let Some(value) = object.get("metadata") {
-        bag.push("metadata", value.clone());
-    }
-    if let Some(value) = object.get("stream") {
-        bag.push("stream", value.clone());
-    }
-    if let Some(text) = object.get("text").and_then(JsonValue::as_object) {
-        for (key, value) in text {
-            if key != "format" {
-                bag.push(FieldPath::new(["text", key.as_str()]), value.clone());
-            }
-        }
-    }
-    bag
 }
 
 fn response_format_value(object: &JsonMap<String, JsonValue>) -> Option<JsonValue> {
@@ -1249,12 +1201,7 @@ fn response_json(parts: ResponseJsonParts<'_>) -> JsonValue {
 }
 
 fn request_metadata(request: &ParsedResponseRequest) -> Option<&JsonValue> {
-    request
-        .passthrough
-        .fields()
-        .iter()
-        .find(|field| field.path == FieldPath::from("metadata"))
-        .map(|field| &field.value)
+    request.raw.value().get("metadata")
 }
 
 fn message_item_json(message_id: &str, status: &str, content: Vec<JsonValue>) -> JsonValue {
@@ -1451,18 +1398,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_preserves_raw_and_passthrough() {
+    fn parse_preserves_raw_request() {
         let parsed = sample_request();
         assert_eq!(parsed.model, "gpt-4.1-mini");
         assert_eq!(parsed.max_output_tokens, Some(64));
         assert_eq!(parsed.stream, Some(true));
-        let paths = parsed
-            .passthrough
-            .fields()
-            .iter()
-            .map(|field| field.path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(paths, field_set(["stream", "metadata", "seed"]));
+        assert_eq!(parsed.raw.value()["metadata"]["request_id"], "r1");
+        assert_eq!(parsed.raw.value()["seed"], 42);
         assert!(parsed.raw.bytes().starts_with(b"{"));
     }
 
@@ -1482,7 +1424,6 @@ mod tests {
             execution.canonical.previous_response_id.as_deref(),
             Some("resp_prev")
         );
-        assert_eq!(execution.passthrough.fields().len(), 3);
     }
 
     #[test]
@@ -1521,8 +1462,7 @@ mod tests {
     #[test]
     fn render_non_streaming_text_response() {
         let parsed = sample_request();
-        let execution = adaptor().to_execution_request(&parsed).unwrap();
-        assert_eq!(execution.passthrough, parsed.passthrough);
+        adaptor().to_execution_request(&parsed).unwrap();
         let response = adaptor()
             .render_response(
                 &parsed,
@@ -2092,9 +2032,5 @@ mod tests {
             completed["response"]["output"][1]["content"][0]["text"],
             "{\"answer\":\"after\"}"
         );
-    }
-
-    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
-        fields.into_iter().map(FieldPath::from).collect()
     }
 }

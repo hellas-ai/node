@@ -2,29 +2,10 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
-    InputItem, ModelRef, OutputEvent, OutputItem, PassthroughBag, RawRequest, ReasoningOptions,
-    RenderContext, ResponseFormat, StopReason, TextChannel, ToolChoice, ToolKind, ToolSpec, Usage,
-    WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
+    InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
+    ResponseFormat, StopReason, TextChannel, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor,
+    WireEventData, WireResponse, WireStreamEvent,
 };
-
-const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &[
-    "model",
-    "messages",
-    "tools",
-    "tool_choice",
-    "max_tokens",
-    "max_completion_tokens",
-    "stream",
-    "stream_options",
-    "reasoning_effort",
-    "response_format",
-    "temperature",
-    "top_p",
-    "top_logprobs",
-    "parallel_tool_calls",
-    "stop",
-    "metadata",
-];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenAiChatCompletionsAdaptor;
@@ -42,7 +23,6 @@ pub struct ParsedChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     pub response_format: Option<JsonValue>,
     pub sampling: ChatSampling,
-    pub passthrough: PassthroughBag,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -288,8 +268,6 @@ impl ParsedChatCompletionRequest {
             parallel_tool_calls: optional_bool(object, "parallel_tool_calls")?,
             stop: stop_strings(object)?,
         };
-        let passthrough = passthrough_fields(object);
-
         Ok(Self {
             raw,
             model,
@@ -302,7 +280,6 @@ impl ParsedChatCompletionRequest {
             reasoning_effort,
             response_format,
             sampling,
-            passthrough,
         })
     }
 
@@ -337,7 +314,7 @@ impl ParsedChatCompletionRequest {
             });
         }
 
-        Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
+        Ok(ExecutionRequest::new(canonical))
     }
 }
 
@@ -360,25 +337,6 @@ fn apply_sampling(canonical: &mut CanonicalExecution, request: &ParsedChatComple
     if !request.sampling.stop.is_empty() {
         canonical.sampling.stop = request.sampling.stop.clone();
     }
-}
-
-fn passthrough_fields(object: &JsonMap<String, JsonValue>) -> PassthroughBag {
-    let mut bag = PassthroughBag::new();
-    for (key, value) in object {
-        if !KNOWN_TOP_LEVEL_FIELDS.contains(&key.as_str()) {
-            bag.push(key.as_str(), value.clone());
-        }
-    }
-    if let Some(value) = object.get("metadata") {
-        bag.push("metadata", value.clone());
-    }
-    if let Some(value) = object.get("stream") {
-        bag.push("stream", value.clone());
-    }
-    if let Some(value) = object.get("stream_options") {
-        bag.push("stream_options", value.clone());
-    }
-    bag
 }
 
 fn validate_message(value: &JsonValue) -> AdaptorResult<()> {
@@ -810,7 +768,7 @@ fn optional_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldPath, Provenance, StopReason, WireEventData};
+    use crate::{Provenance, StopReason, WireEventData};
 
     fn adaptor() -> OpenAiChatCompletionsAdaptor {
         OpenAiChatCompletionsAdaptor
@@ -859,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_preserves_stream_options_and_passthrough() {
+    fn parse_preserves_stream_options_and_raw_request() {
         let request = sample_request();
         assert_eq!(request.model, "gpt-4.1-mini");
         assert_eq!(request.messages.len(), 2);
@@ -867,16 +825,8 @@ mod tests {
         assert_eq!(request.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(request.stream, Some(true));
         assert!(request.include_usage());
-        let paths = request
-            .passthrough
-            .fields()
-            .iter()
-            .map(|field| field.path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            paths,
-            field_set(["stream", "stream_options", "metadata", "seed"])
-        );
+        assert_eq!(request.raw.value()["metadata"]["trace"], "abc");
+        assert_eq!(request.raw.value()["seed"], 7);
     }
 
     #[test]
@@ -949,10 +899,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_project_render_keeps_passthrough_available() {
+    fn parse_project_render_uses_projected_request() {
         let request = sample_request();
-        let execution = adaptor().to_execution_request(&request).unwrap();
-        assert_eq!(execution.passthrough, request.passthrough);
+        adaptor().to_execution_request(&request).unwrap();
 
         let response = adaptor()
             .render_response(
@@ -1099,9 +1048,5 @@ mod tests {
             finish.last().unwrap().data,
             WireEventData::Text("[DONE]".to_string())
         );
-    }
-
-    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
-        fields.into_iter().map(FieldPath::from).collect()
     }
 }

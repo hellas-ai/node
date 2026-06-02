@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::PassthroughBag;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRef {
     pub name: String,
@@ -23,15 +21,11 @@ impl ModelRef {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionRequest {
     pub canonical: CanonicalExecution,
-    pub passthrough: PassthroughBag,
 }
 
 impl ExecutionRequest {
-    pub fn new(canonical: CanonicalExecution, passthrough: PassthroughBag) -> Self {
-        Self {
-            canonical,
-            passthrough,
-        }
+    pub fn new(canonical: CanonicalExecution) -> Self {
+        Self { canonical }
     }
 }
 
@@ -277,25 +271,16 @@ pub struct Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn execution_request_keeps_canonical_and_passthrough_separate() {
+    fn execution_request_keeps_canonical_shape() {
         let canonical =
             CanonicalExecution::new(ModelRef::new("model-a"), Input::Text("hello".to_string()));
 
-        let mut passthrough = PassthroughBag::new();
-        passthrough.push("metadata", json!({"trace_id": "abc"}));
-
-        let request = ExecutionRequest::new(canonical, passthrough);
+        let request = ExecutionRequest::new(canonical);
 
         assert_eq!(request.canonical.model.name, "model-a");
         assert_eq!(request.canonical.input, Input::Text("hello".to_string()));
-        assert_eq!(request.passthrough.fields().len(), 1);
-        assert_eq!(
-            request.passthrough.fields()[0].path,
-            crate::FieldPath::from("metadata")
-        );
     }
 
     #[test]
