@@ -514,41 +514,76 @@ impl ExecutionRequest {
     }
 }
 
-pub struct FetchExecutionRequest {
+pub fn fetch_execution_stream(
     runtime: ExecutionRuntime,
     request: PbFetchRequest,
     route: ExecutionRoute,
-}
-
-impl FetchExecutionRequest {
-    pub fn new(runtime: ExecutionRuntime, request: PbFetchRequest, route: ExecutionRoute) -> Self {
-        Self {
-            runtime,
-            request,
-            route,
-        }
-    }
-
-    pub fn uses_remote_transport(&self) -> bool {
-        #[cfg(feature = "hellas-executor")]
-        return !matches!(self.route, ExecutionRoute::Local);
-        #[cfg(not(feature = "hellas-executor"))]
-        return true;
-    }
-
-    pub async fn prepare(self) -> ExecutionResult<PreparedFetchExecution> {
-        Ok(PreparedFetchExecution {
-            route: FetchPreparedRoute::prepare(&self.runtime, &self.request, &self.route).await?,
-        })
-    }
-
-    pub fn stream(self) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
-        try_stream! {
-            let prepared = self.prepare().await?;
-            let inner = prepared.stream();
-            tokio::pin!(inner);
-            while let Some(event) = inner.next().await {
-                yield event?;
+) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
+    try_stream! {
+        let input_commitment = verified_fetch_input(&request)?.input_commitment;
+        match route {
+            #[cfg(feature = "hellas-executor")]
+            ExecutionRoute::Local => {
+                let handle = runtime.require_local_executor()?;
+                let outcome = handle
+                    .create_fetch_ticket(request)
+                    .await
+                    .exec_context("local create_fetch_ticket failed")?;
+                let request_commitment =
+                    validate_fetch_ticket(&outcome.response, input_commitment)?;
+                let inner = local_execute_fetch_stream(
+                    handle,
+                    request_commitment,
+                    input_commitment,
+                );
+                tokio::pin!(inner);
+                while let Some(event) = inner.next().await {
+                    yield event?;
+                }
+            }
+            ExecutionRoute::RemoteDirect(target) => {
+                let fetch_transport = runtime.remote_transport::<Fetch>(&target).await?;
+                let client = hellas_rpc::services::fetch::FetchClientImpl::new(fetch_transport);
+                let ticket = client
+                    .create_ticket(request)
+                    .await
+                    .map_err(|status| {
+                        ExecutionError::wire(
+                            format!("node {} declined fetch create_ticket", target.node_id()),
+                            status,
+                        )
+                    })?;
+                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
+                let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
+                let inner = remote_execute_fetch_stream(
+                    execute_transport,
+                    request_commitment,
+                    input_commitment,
+                );
+                tokio::pin!(inner);
+                while let Some(event) = inner.next().await {
+                    yield event?;
+                }
+            }
+            ExecutionRoute::RemoteDiscovery { retries } => {
+                let remote = runtime.remote.as_ref().ok_or_else(|| {
+                    ExecutionError::protocol(
+                        "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
+                    )
+                })?;
+                let (target, request_commitment) =
+                    discover_and_fetch_quote(&remote.registry, &request, input_commitment, retries)
+                        .await?;
+                let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
+                let inner = remote_execute_fetch_stream(
+                    execute_transport,
+                    request_commitment,
+                    input_commitment,
+                );
+                tokio::pin!(inner);
+                while let Some(event) = inner.next().await {
+                    yield event?;
+                }
             }
         }
     }
@@ -561,16 +596,6 @@ impl FetchExecutionRequest {
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
-}
-
-pub struct PreparedFetchExecution {
-    route: FetchPreparedRoute,
-}
-
-impl PreparedFetchExecution {
-    pub fn stream(self) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
-        self.route.stream()
-    }
 }
 
 impl PreparedExecution {
@@ -811,108 +836,7 @@ impl PreparedRoute {
 }
 
 // ---------------------------------------------------------------------------
-// FetchPreparedRoute
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::large_enum_variant)]
-enum FetchPreparedRoute {
-    #[cfg(feature = "hellas-executor")]
-    Local {
-        handle: ExecutorHandle,
-        input_commitment: InputCommitment,
-        request_commitment: Vec<u8>,
-    },
-    RemoteDirect {
-        transport: IrohTransport,
-        input_commitment: InputCommitment,
-        request_commitment: Vec<u8>,
-    },
-}
-
-impl FetchPreparedRoute {
-    async fn prepare(
-        runtime: &ExecutionRuntime,
-        request: &PbFetchRequest,
-        route: &ExecutionRoute,
-    ) -> ExecutionResult<Self> {
-        let input_commitment = verified_fetch_input(request)?.input_commitment;
-        match route {
-            #[cfg(feature = "hellas-executor")]
-            ExecutionRoute::Local => {
-                let handle = runtime.require_local_executor()?;
-                let outcome = handle
-                    .create_fetch_ticket(request.clone())
-                    .await
-                    .exec_context("local create_fetch_ticket failed")?;
-                let request_commitment =
-                    validate_fetch_ticket(&outcome.response, input_commitment)?;
-                Ok(Self::Local {
-                    handle,
-                    input_commitment,
-                    request_commitment,
-                })
-            }
-            ExecutionRoute::RemoteDirect(target) => {
-                let fetch_transport = runtime.remote_transport::<Fetch>(target).await?;
-                let client = hellas_rpc::services::fetch::FetchClientImpl::new(fetch_transport);
-                let ticket = client
-                    .create_ticket(request.clone())
-                    .await
-                    .map_err(|status| {
-                        ExecutionError::wire(
-                            format!("node {} declined fetch create_ticket", target.node_id()),
-                            status,
-                        )
-                    })?;
-                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
-                let execute_transport = runtime.remote_transport::<Execute>(target).await?;
-                Ok(Self::RemoteDirect {
-                    transport: execute_transport,
-                    input_commitment,
-                    request_commitment,
-                })
-            }
-            ExecutionRoute::RemoteDiscovery { retries } => {
-                let remote = runtime.remote.as_ref().ok_or_else(|| {
-                    ExecutionError::protocol(
-                        "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
-                    )
-                })?;
-                let (target, request_commitment) =
-                    discover_and_fetch_quote(&remote.registry, request, input_commitment, *retries)
-                        .await?;
-                let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
-                Ok(Self::RemoteDirect {
-                    transport: execute_transport,
-                    input_commitment,
-                    request_commitment,
-                })
-            }
-        }
-    }
-
-    fn stream(self) -> BoxStream<'static, ExecutionResult<FetchExecutionEvent>> {
-        match self {
-            #[cfg(feature = "hellas-executor")]
-            Self::Local {
-                handle,
-                input_commitment,
-                request_commitment,
-            } => local_execute_fetch_stream(handle, request_commitment, input_commitment).boxed(),
-            Self::RemoteDirect {
-                transport,
-                input_commitment,
-                request_commitment,
-            } => {
-                remote_execute_fetch_stream(transport, request_commitment, input_commitment).boxed()
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Discovery — race the registry's Courtesy/Fetch feed and take the first
-// peer that returns a successful quote.
+// Discovery
 // ---------------------------------------------------------------------------
 
 /// Drain `ServiceRegistry::discover::<Courtesy>()` until we get a quote,

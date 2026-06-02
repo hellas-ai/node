@@ -1,6 +1,6 @@
 use crate::commands::CliResult;
 use crate::execution::{
-    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchExecutionRequest, FetchOutcome,
+    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, fetch_execution_stream,
 };
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
@@ -67,9 +67,11 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             &caller_key,
         )?,
     };
-    let execution = FetchExecutionRequest::new(runtime, request, route);
-    let uses_remote = execution.uses_remote_transport();
-    let stream = execution.stream();
+    #[cfg(feature = "hellas-executor")]
+    let uses_remote = !matches!(route, ExecutionRoute::Local);
+    #[cfg(not(feature = "hellas-executor"))]
+    let uses_remote = true;
+    let stream = fetch_execution_stream(runtime, request, route);
     tokio::pin!(stream);
 
     let mut wrote_chunks = false;
