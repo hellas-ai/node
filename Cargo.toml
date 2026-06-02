@@ -13,7 +13,6 @@ default = []
 
 [dependencies]
 axum = { workspace = true }
-base64ct = { version = "1", default-features = false, features = ["alloc"] }
 bytes = { workspace = true }
 clap = { workspace = true }
 commonware-actor = { workspace = true }
@@ -36,16 +35,15 @@ hellas-wire = { path = "../../node/crates/wire" }
 hex = { workspace = true }
 http = "1"
 indexmap = { workspace = true }
-opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = { workspace = true }
-sha2 = { version = "0.10", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -57,5 +55,5 @@ tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-types = { workspace = true, features = ["consensus", "test-support"] }
-proptest = "1.6"
+proptest = "1.11"
 test-log = { version = "0.2", features = ["trace"] }

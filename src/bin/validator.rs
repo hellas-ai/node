@@ -1,4 +1,3 @@
-use base64ct::{Base64UrlUnpadded, Encoding};
 use clap::{Parser, Subcommand};
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
@@ -36,13 +35,11 @@ use hellas_types::{PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, Thres
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use p256::ecdsa::SigningKey as UserSigningKey;
-use p256::ecdsa::signature::Signer as _;
 use prometheus_client::metrics::gauge::Gauge;
 use rand::{
     RngCore, SeedableRng,
     rngs::{OsRng, StdRng},
 };
-use sha2::{Digest as _, Sha256 as Sha2};
 use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
@@ -109,52 +106,6 @@ fn wallet_address_from_signing_key(key: &UserSigningKey) -> hellas_types::Addres
     hellas_types::Address::from(hellas_types::UserPublicKey::from(
         key.verifying_key().to_owned(),
     ))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha2::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
-fn mock_webauthn_sign(
-    key: &UserSigningKey,
-    challenge: &commonware_cryptography::sha256::Digest,
-    origin: &str,
-) -> Result<hellas_types::WebAuthnSignature, ValidatorError> {
-    let challenge_b64 = Base64UrlUnpadded::encode_string(challenge.as_ref());
-    let client_data_json = format!(
-        r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
-        hellas_types::WEBAUTHN_TYPE_GET,
-        challenge_b64,
-        origin
-    )
-    .into_bytes();
-
-    let rp_id_hash = hellas_types::rp_id_hash_from_origin(origin).ok_or_else(|| {
-        ValidatorError::InvalidSetup(format!("invalid WebAuthn origin for signing: {origin}"))
-    })?;
-
-    let mut authenticator_data = Vec::with_capacity(hellas_types::MIN_AUTHENTICATOR_DATA_LEN);
-    authenticator_data.extend_from_slice(&rp_id_hash);
-    authenticator_data.push(0x05); // UP | UV
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-
-    let client_hash = sha256_bytes(&client_data_json);
-    let mut msg = Vec::with_capacity(authenticator_data.len() + client_hash.len());
-    msg.extend_from_slice(&authenticator_data);
-    msg.extend_from_slice(&client_hash);
-
-    let signed: p256::ecdsa::Signature = key.sign(&msg);
-    let normalized = signed.normalize_s().unwrap_or(signed);
-    let signature = hellas_types::UserSignature::decode(normalized.to_bytes().as_ref())
-        .map_err(|e| ValidatorError::InvalidSetup(format!("invalid signature bytes: {e}")))?;
-
-    Ok(hellas_types::WebAuthnSignature {
-        signature,
-        authenticator_data,
-        client_data_json,
-    })
 }
 
 #[derive(Debug, Error)]
@@ -320,7 +271,7 @@ fn main() {
             ws_bind,
             ws_push,
             metrics_port,
-        } => setup(
+        } => setup(SetupArgs {
             validators,
             node,
             start_port,
@@ -329,7 +280,7 @@ fn main() {
             ws_bind,
             ws_push,
             metrics_port,
-        ),
+        }),
         Command::Run { config } => run(config),
         Command::CheckConfig { config } => check_config(config),
         Command::Query { rpc, query } => do_query(rpc, query),
@@ -388,7 +339,7 @@ fn do_wallet(cmd: WalletCommand) -> Result<(), ValidatorError> {
     }
 }
 
-fn setup(
+struct SetupArgs {
     validators: u32,
     node: u32,
     start_port: u16,
@@ -397,7 +348,20 @@ fn setup(
     ws_bind: Option<String>,
     ws_push: Option<String>,
     metrics_port: Option<u16>,
-) -> Result<(), ValidatorError> {
+}
+
+fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
+    let SetupArgs {
+        validators,
+        node,
+        start_port,
+        seed,
+        addresses,
+        ws_bind,
+        ws_push,
+        metrics_port,
+    } = args;
+
     if validators == 0 {
         return Err(ValidatorError::InvalidSetup(
             "need at least one validator".to_string(),
@@ -477,18 +441,6 @@ fn setup(
     Ok(())
 }
 
-fn parse_hex_digest(
-    hex_str: &str,
-    field: &str,
-) -> Result<commonware_cryptography::sha256::Digest, ValidatorError> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for {field}: {e}")))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| ValidatorError::InvalidSetup(format!("{field} must be 32 bytes")))?;
-    Ok(commonware_cryptography::sha256::Digest::from(arr))
-}
-
 fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for key: {e}")))?;
@@ -498,16 +450,9 @@ fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError
 }
 
 fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
-    // The remote LightClient client used to be implemented in
-    // `hellas_rpc::client::RemoteLightClient` (alto's tonic-based crate).
-    // The hellas-wire / hellas-rpc cutover has not yet ported the
-    // LightClient service into the new codegen, so the CLI `query`
-    // subcommand is temporarily disabled. See CUTOVER_FINDINGS #5.
     let _ = (rpc, query);
     Err(ValidatorError::InvalidSetup(
-        "the `validator query` subcommand is temporarily disabled while the \
-         LightClient service is migrated onto hellas-wire/hellas-rpc"
-            .to_string(),
+        "the `validator query` subcommand is not implemented".to_string(),
     ))
 }
 
@@ -751,25 +696,6 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-/// Open a WebSocket to `url` and serve LightClient RPCs.
-///
-/// Historically built on top of `ws-mux`; the hellas-wire / hellas-rpc
-/// cutover replaces that with `hellas_wire::ws` substreams plus a
-/// codegen-emitted `LightClientServer<H>` dispatcher. Neither half is in
-/// place yet (the new `hellas-rpc` doesn't ship a LightClient service),
-/// so this function panics on call. The validator's `run` path skips
-/// invoking it via the same stubbing pattern.
-async fn serve_relay(
-    url: &str,
-    svc: hellas_chain::rpc::LightClientServerStub,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = (url, svc);
-    unimplemented!(
-        "relay serving over the new hellas-wire WS transport is pending the \
-         LightClient service codegen; see CUTOVER_FINDINGS #5"
-    )
-}
-
 type Finalization = commonware_consensus::simplex::types::Finalization<
     Scheme,
     commonware_cryptography::sha256::Digest,
@@ -979,13 +905,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
         });
 
-        // Extract validator names before scheme is moved into the engine.
-        let validators: Vec<String> = scheme
-            .participants()
-            .iter()
-            .map(|pk| hex::encode(&pk.encode()[..8]))
-            .collect();
-
         let chain_config = Config::mainnet();
         let partition_prefix = format!("hellas_{me}");
         let page_cache = chain_config.page_cache(&context);
@@ -1183,43 +1102,18 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let databases = stateful_mailbox.subscribe_databases().await;
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
-        let light_client = hellas_chain::rpc::LocalLightClient::new(
-            databases,
-            mempool,
-            marshal_mailbox,
-            validators,
-        );
-
-        // Light-client gRPC server over WebSocket: temporarily disabled
-        // during the hellas-wire / hellas-rpc cutover. The new RPC stack
-        // doesn't yet codegen a LightClient service, and the legacy
-        // `tonic::transport::Server` / `hellas_rpc::ws::ws_incoming`
-        // / `ws-mux` paths are gone. See CUTOVER_FINDINGS #5.
-        // `LocalLightClient` is still constructed because future cutover
-        // work will plug it into the new dispatcher; we silence the unused
-        // warning explicitly.
-        let _ = (&light_client, &activity_tx);
         if let Some(ws_bind) = &node_config.ws_bind {
             warn!(
                 addr = %ws_bind,
-                "ws_bind set in config but the LightClient WebSocket server is \
-                 temporarily disabled during the hellas-wire cutover",
+                "ws_bind is not implemented",
             );
         }
 
-        // Connect to explorer relay DO (if configured).
-        // Single outbound WebSocket: historically the validator served
-        // LightClient RPCs (including subscribe_activity) via ws-mux and the
-        // relay DO acted as ws-mux client. The replacement is the
-        // hellas-wire WS transport plus the codegen-emitted dispatcher; both
-        // halves are pending. See CUTOVER_FINDINGS #5.
         if let Some(explorer_url) = &node_config.explorer_url {
             warn!(
                 %explorer_url,
-                "explorer_url set in config but the relay connection is \
-                 temporarily disabled during the hellas-wire cutover",
+                "explorer_url is not implemented",
             );
-            let _ = &me; // pulled in by the original `validator_name` derivation
         }
 
         // Start networking only after the app + consensus engine are initialized.
