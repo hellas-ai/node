@@ -9,17 +9,43 @@ path = "src/lib.rs"
 
 [features]
 default = []
+consensus = ["domain", "dep:commonware-consensus"]
+domain = [
+    "dep:base64ct",
+    "dep:bs58",
+    "dep:bytes",
+    "dep:commonware-codec",
+    "dep:commonware-cryptography",
+    "dep:p256",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:thiserror",
+    "dep:url",
+]
+domain-std = ["domain", "commonware-codec/std", "commonware-cryptography/std"]
 secp256k1 = ["dep:secp256k1"]
+test-support = ["domain"]
 webauthn = ["dep:p256", "dep:sha2"]
 
 [dependencies]
+base64ct = { version = "1", default-features = false, features = ["alloc"], optional = true }
 blake3 = { version = "1", default-features = false }
+bs58 = { version = "0.5", optional = true }
+bytes = { workspace = true, optional = true }
+commonware-codec = { workspace = true, optional = true }
+commonware-consensus = { workspace = true, optional = true }
+commonware-cryptography = { workspace = true, optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
 secp256k1 = { version = "0.31", default-features = false, optional = true, features = ["alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
 sha2 = { version = "0.11", default-features = false, optional = true }
+thiserror = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 allocation-counter = "0.8"
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true, features = ["mocks"] }
 criterion = "0.8.2"
 itf = "0.4"
 proptest = "1"
