@@ -3,6 +3,7 @@
 use crate::{
     app::{MarshalMailbox, Mempool},
     execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
+    indexer::Indexer,
 };
 use commonware_consensus::{Heightable, marshal::Identifier as MarshalIdentifier};
 use commonware_cryptography::{Digestible, sha256::Digest};
@@ -13,6 +14,7 @@ use hellas_rpc::{LatestBlock, LightClient, QueryError};
 #[derive(Clone)]
 pub struct LocalLightClient {
     databases: UtxoDatabase<commonware_runtime::tokio::Context>,
+    indexer: Indexer,
     mempool: Mempool,
     marshal: MarshalMailbox,
     validators: Vec<String>,
@@ -21,12 +23,14 @@ pub struct LocalLightClient {
 impl LocalLightClient {
     pub fn new(
         databases: UtxoDatabase<commonware_runtime::tokio::Context>,
+        indexer: Indexer,
         mempool: Mempool,
         marshal: MarshalMailbox,
         validators: Vec<String>,
     ) -> Self {
         Self {
             databases,
+            indexer,
             mempool,
             marshal,
             validators,
@@ -93,9 +97,16 @@ impl LightClient for LocalLightClient {
     }
 
     async fn get_coins_by_owner(&self, owner: Address) -> Result<Vec<(ObjectId, u64)>, QueryError> {
-        let _ = owner;
-        Err(QueryError::StateUnavailable(
-            "owner scans are not available".to_string(),
-        ))
+        let latest = self.get_latest_block().await?;
+        let Some(latest) = latest else {
+            return Ok(Vec::new());
+        };
+        let cursor = self.indexer.cursor();
+        if cursor.payload != latest.payload {
+            return Err(QueryError::StateUnavailable(
+                "owner index has not reached latest payload".to_string(),
+            ));
+        }
+        Ok(self.indexer.get_coins_by_owner(&owner))
     }
 }

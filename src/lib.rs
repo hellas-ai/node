@@ -10,6 +10,8 @@ pub mod client;
 pub mod config;
 #[cfg(feature = "node")]
 mod execution;
+#[cfg(feature = "node")]
+pub mod indexer;
 #[cfg(feature = "api")]
 pub mod pb;
 #[cfg(feature = "node")]
@@ -19,3 +21,5 @@ pub mod rpc;
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
 #[cfg(feature = "node")]
 pub use execution::store::{UtxoDb, utxo_db_config};
+#[cfg(feature = "node")]
+pub use indexer::{ApplyOutcome, Cursor as IndexCursor, IndexError, Indexer};

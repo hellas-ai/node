@@ -6,6 +6,7 @@ use crate::execution::{
     execute_all, execute_proposal,
     store::{UtxoDatabase, UtxoSyncTarget, empty_state},
 };
+use crate::indexer::Indexer;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
@@ -78,11 +79,16 @@ pub struct Application {
     genesis: HellasBlock,
     genesis_allocations: Arc<Vec<(Address, u64)>>,
     finalized_height: Registered<Gauge>,
+    indexer: Indexer,
 }
 
 impl Application {
     pub fn genesis_block(&self) -> HellasBlock {
         self.genesis.clone()
+    }
+
+    pub fn indexer(&self) -> Indexer {
+        self.indexer.clone()
     }
 
     pub async fn new<E>(
@@ -107,10 +113,13 @@ impl Application {
             config.page_cache_count,
         )
         .await;
+        let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
+        let indexer = Indexer::new(&genesis, genesis_allocations.clone());
         Self {
-            genesis: HellasBlock::genesis(genesis_leader, state_root, sync_target),
+            genesis,
             genesis_allocations: Arc::new(genesis_allocations),
             finalized_height,
+            indexer,
         }
     }
 }
@@ -270,6 +279,9 @@ where
     ) {
         self.finalized_height
             .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
+        self.indexer
+            .apply_finalized(block)
+            .expect("finalized block indexing failed");
         info!(
             name: "app.finalized",
             height = %block.height(),

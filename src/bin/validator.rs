@@ -21,7 +21,10 @@ use commonware_glue::stateful::{
 use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
-use commonware_storage::{archive::immutable, mmr};
+use commonware_storage::{
+    archive::{Archive as _, Identifier as ArchiveIdentifier, immutable},
+    mmr,
+};
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
 use hellas_chain::config::{
@@ -29,7 +32,7 @@ use hellas_chain::config::{
     encode_threshold_share,
 };
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, Mempool, UtxoDb, utxo_db_config,
+    ActivityReporter, Application, ApplicationConfig, Indexer, Mempool, UtxoDb, utxo_db_config,
 };
 use hellas_kernel::domain::{
     Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
@@ -52,7 +55,7 @@ use std::{
     path::PathBuf,
 };
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
@@ -127,6 +130,8 @@ enum ValidatorError {
     Scheme(String),
     #[error("storage directory is not valid UTF-8: {0}")]
     NonUtf8StorageDirectory(PathBuf),
+    #[error("failed to replay owner index: {0}")]
+    OwnerIndex(String),
 }
 
 #[derive(Parser)]
@@ -785,6 +790,33 @@ async fn init_block_store(
     .expect("failed to initialize finalized blocks archive")
 }
 
+async fn replay_owner_index(
+    indexer: &Indexer,
+    finalized_blocks: &BlockStore,
+) -> Result<(), ValidatorError> {
+    for (start, end) in finalized_blocks.ranges() {
+        for height in start..=end {
+            let block = finalized_blocks
+                .get(ArchiveIdentifier::Index(height))
+                .await
+                .map_err(|err| {
+                    ValidatorError::OwnerIndex(format!(
+                        "failed to load finalized block at height {height}: {err}"
+                    ))
+                })?;
+            let Some(block) = block else {
+                continue;
+            };
+            indexer.apply_finalized(&block).map_err(|err| {
+                ValidatorError::OwnerIndex(format!(
+                    "failed to index finalized block at height {height}: {err}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Run all `NodeConfig` validations the runtime would perform at startup.
 /// Used by `validator check-config` and by `nix build` via runCommand.
 fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
@@ -945,6 +977,17 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             },
         )
         .await;
+        let owner_index = application.indexer();
+        if let Err(err) = replay_owner_index(&owner_index, &finalized_blocks).await {
+            error!(?err, "owner index replay failed");
+            panic!("{err}");
+        }
+        let owner_index_cursor = owner_index.cursor();
+        info!(
+            height = owner_index_cursor.height,
+            payload = ?owner_index_cursor.payload,
+            "owner index replayed",
+        );
         let genesis_block = application.genesis_block();
         let stateful_startup_context = context.child("stateful_startup");
         let plan = SyncPlan::<_, Scheme, Standard<hellas_chain::HellasBlock>>::init(
