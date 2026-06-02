@@ -107,7 +107,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     Ok(())
 }
 
-fn signed_input_events(
+pub(crate) fn signed_input_events(
     service: &str,
     method: &str,
     payload: &[u8],

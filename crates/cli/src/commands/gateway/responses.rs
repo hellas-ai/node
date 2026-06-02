@@ -35,6 +35,19 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         .await;
     }
 
+    if let Some(fetch) = state.responses_fetch.as_ref() {
+        return backend_wire_response(
+            stream,
+            adaptor,
+            parsed,
+            fetch.as_ref().clone(),
+            request,
+            render_context(),
+            "OpenAI Responses",
+        )
+        .await;
+    }
+
     let backend = GatewayBackend::new(state);
     backend_wire_response(
         stream,
