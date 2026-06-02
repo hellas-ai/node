@@ -66,7 +66,7 @@ pub fn encode_hex(bytes: &[u8; 32]) -> String {
 }
 
 /// Read a `-bin` 32-byte digest from a wire Metadata map.
-pub fn cid_bytes_from_metadata(
+pub fn digest_bytes_from_metadata(
     md: &Metadata,
     key: &'static str,
 ) -> Result<[u8; 32], ProvenanceError> {
@@ -88,7 +88,7 @@ pub fn cid_bytes_from_metadata(
 /// Read the pre-flight provenance from a wire Metadata map.
 pub fn read_provenance_metadata(md: &Metadata) -> Result<ExecutionProvenance, ProvenanceError> {
     Ok(ExecutionProvenance {
-        commitment_id: cid_bytes_from_metadata(md, COMMITMENT_KEY)?,
+        commitment_id: digest_bytes_from_metadata(md, COMMITMENT_KEY)?,
     })
 }
 

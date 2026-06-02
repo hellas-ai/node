@@ -13,5 +13,5 @@ service Symbolic {
 
 message SymbolicRequest {
   // catnix InputId<TextExecution>; exactly 32 bytes.
-  bytes text_execution_cid = 1;
+  bytes text_execution = 1;
 }

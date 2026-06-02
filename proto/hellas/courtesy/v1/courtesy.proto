@@ -32,7 +32,7 @@ message SymbolicGenesisStart {}
 
 message SymbolicArtifactStart {
   // catnix OutputId<TextArtifact>; exactly 32 bytes.
-  bytes artifact_cid = 1;
+  bytes artifact = 1;
 }
 
 message QuotePreparedTextRequest {
@@ -112,7 +112,7 @@ message QuoteChatPromptResponse {
   .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
 }
 
-// Store one canonical catnix artifact by its BLAKE3 CID. This API does not
+// Store one canonical catnix artifact by its BLAKE3 digest. This API does not
 // publish symbolic metadata such as model locators or lazy substitutions; those
 // are separate provider-local interpretation state.
 message PutArtifactRequest {
@@ -121,12 +121,12 @@ message PutArtifactRequest {
 
 message PutArtifactResponse {
   // BLAKE3 digest of canonical_artifact; exactly 32 bytes.
-  bytes cid = 1;
+  bytes digest = 1;
 }
 
 message GetArtifactRequest {
   // BLAKE3 digest of canonical artifact bytes; exactly 32 bytes.
-  bytes cid = 1;
+  bytes digest = 1;
 }
 
 message GetArtifactResponse {

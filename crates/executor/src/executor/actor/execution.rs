@@ -274,11 +274,11 @@ impl Executor {
         stop_reason: crate::state::StopReason,
         output_tokens: Vec<u32>,
     ) -> Result<crate::state::Termination, ExecutorError> {
-        let text_artifact_cid = self
+        let text_artifact = self
             .artifacts
             .record_completed_text(symbolic_request, invocation, &output_tokens)
             .await?;
-        let symbolic_output = SymbolicOutput { text_artifact_cid };
+        let symbolic_output = SymbolicOutput { text_artifact };
         let receipt =
             SignedReceipt::sign::<Symbolic>(symbolic_request, &symbolic_output, &self.producer_key)
                 .map_err(|err| {
