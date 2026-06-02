@@ -21,82 +21,6 @@ let
     workspaceNativeBuildInputs
     ;
 
-  # Template for the pi provider extension. Substituted by piShim at runtime.
-  piExtensionTemplate = pkgs.writeText "hellas-pi-extension.template.js" ''
-    export default function (pi) {
-      pi.registerProvider("hellas", {
-        baseUrl: "@@BASE@@",
-        apiKey: "unused",
-        api: "@@API@@",
-        models: [{
-          id: "@@MODEL@@",
-          name: "@@MODEL@@ (Hellas)",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 32768,
-          maxTokens: 2048,
-        }],
-      });
-    }
-  '';
-
-  # Wrapper for running pi behind `hellas-cli gateway --wrap`. It reads the
-  # gateway base URL from env (set by `--wrap`), writes a one-shot provider
-  # extension, then execs pi against that provider.
-  piShim = pkgs.writeShellApplication {
-    name = "hellas-pi-shim";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.gnused
-    ];
-    text = ''
-      set -eu
-      model="''${HELLAS_MODEL:-Qwen/Qwen3-0.6B}"
-      api="''${HELLAS_API:-anthropic-messages}"
-      case "$api" in
-        anthropic-messages) base="''${ANTHROPIC_BASE_URL:?ANTHROPIC_BASE_URL not set}" ;;
-        openai-completions) base="''${OPENAI_BASE_URL:?OPENAI_BASE_URL not set}" ;;
-        *) echo "hellas-pi-shim: unsupported HELLAS_API='$api'" >&2; exit 2 ;;
-      esac
-      ext=$(mktemp --suffix=.js -t hellas-pi-XXXXXX)
-      sed -e "s|@@BASE@@|$base|g" -e "s|@@API@@|$api|g" -e "s|@@MODEL@@|$model|g" \
-        ${piExtensionTemplate} > "$ext"
-      export ANTHROPIC_API_KEY=unused OPENAI_API_KEY=unused
-      exec ${pkgs.pi-coding-agent}/bin/pi -e "$ext" --provider hellas --model "$model" "$@"
-    '';
-  };
-
-  piShimPath = pkgs.runCommand "hellas-pi-shim-path" { } ''
-    mkdir -p "$out/bin"
-    ln -s ${piShim}/bin/hellas-pi-shim "$out/bin/pi"
-  '';
-
-  mkHellasRun =
-    { gatewayCommand }:
-    pkgs.writeShellScriptBin "hellas-run" ''
-      # Usage:  hellas-run [--gw-flag=value...] CMD [CMD-ARGS...]
-      # Leading flags (anything starting with `-`) go to `hellas-cli gateway`.
-      # First positional is the wrapped command; the rest are its args.
-      # Use `--flag=value` for gateway options that take a value.
-      set -eu
-      export PATH="${piShimPath}/bin:$PATH"
-      gw=()
-      while [ $# -gt 0 ]; do
-        case "$1" in -*) gw+=("$1"); shift ;; *) break ;; esac
-      done
-      [ $# -gt 0 ] || { echo "usage: hellas-run [--gw-flag=value...] CMD [args]" >&2; exit 2; }
-      cmd="$1"; shift
-      # `pi` doesn't honor *_BASE_URL env vars — route it through the packaged
-      # shim that runs inside the wrap and registers a hellas provider.
-      case "$(${pkgs.coreutils}/bin/basename "$cmd")" in pi) cmd=${piShim}/bin/hellas-pi-shim ;; esac
-      exec ${gatewayCommand} "''${gw[@]}" --wrap "$cmd" -- "$@"
-    '';
-
-  hellasRunDev = mkHellasRun {
-    gatewayCommand = "cargo run --quiet --features candle --bin hellas-cli -- gateway";
-  };
-
   devShellPackages = with pkgs; [
     rustToolchain
     perl
@@ -124,9 +48,6 @@ let
     stdenv.cc.cc.lib
     taplo
     temurin-bin
-    pi-coding-agent
-    piShim
-    hellasRunDev
   ];
 
   envShellHook = ''
@@ -218,9 +139,6 @@ let
 
   nativePackages = packagesFor null;
   isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
-  hellasRun = mkHellasRun {
-    gatewayCommand = "${nativePackages.cli-candle}/bin/hellas-cli gateway";
-  };
   # Flat `cross-<target>-<name>` packages. Nested `packages.<sys>.cross.<target>.<name>`
   # violates the flake schema (each entry must be a derivation), which `nix flake check`
   # rightly flags.
@@ -312,7 +230,6 @@ let
         import ./tests {
           inherit self pkgs lib;
           package = nativePackages.cli-candle;
-          inherit hellasRun;
         }
       );
     in
@@ -442,8 +359,6 @@ in
       default = nativePackages.cli;
       "hf-cache-lfm2-350m" = hfCaches.lfm2_350MCache;
       "hf-cache-qwen3-0_6b" = hfCaches.qwen3_0_6BCache;
-      "hellas-pi-shim" = piShim;
-      "hellas-run" = hellasRun;
       "hellas-rpc-wasm" = hellasRpcWasm;
     }
     // (linuxOutputs.packages or { });
