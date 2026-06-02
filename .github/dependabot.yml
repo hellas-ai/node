@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      nix-inputs:
+        patterns:
+          - "*"
+        group-by: "dependency-name"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
