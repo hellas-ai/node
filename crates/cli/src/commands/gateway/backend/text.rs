@@ -1,37 +1,12 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_wire_adaptors::{BackendError, ExecutionResult, OutputEvent, OutputItem, TextChannel};
+use hellas_wire_adaptors::{BackendError, OutputEvent, TextChannel};
 
 use crate::execution::Outcome;
 
 use super::super::state::PreparedGeneration;
-use super::generation::{GenerationEvent, TextGenerationError, collect_text, generation_stream};
+use super::generation::{GenerationEvent, generation_stream};
 use super::provenance::{provenance_from_parts, stop_reason_from_runtime, usage};
-
-pub(super) async fn execute_text(
-    prepared: PreparedGeneration,
-) -> Result<ExecutionResult, BackendError> {
-    let prompt_tokens = prepared.prompt_tokens;
-    let completed = collect_text(prepared)
-        .await
-        .map_err(text_generation_error)?;
-    info!(
-        receipt = %completed.receipt.encoded(),
-        provenance = ?completed.provenance,
-        total_tokens = completed.total_tokens,
-        stop_reason = ?completed.stop_reason,
-        "gateway response ready"
-    );
-    Ok(ExecutionResult {
-        output: vec![OutputItem::Text {
-            text: completed.text,
-            channel: TextChannel::Output,
-        }],
-        usage: Some(usage(prompt_tokens, completed.total_tokens)),
-        stop_reason: stop_reason_from_runtime(completed.stop_reason),
-        provenance: provenance_from_parts(completed.provenance.as_ref(), Some(&completed.receipt)),
-    })
-}
 
 pub(super) fn text_events(
     prepared: PreparedGeneration,
@@ -87,15 +62,5 @@ pub(super) fn text_events(
                 )))?,
             }
         }
-    }
-}
-
-fn text_generation_error(error: TextGenerationError) -> BackendError {
-    match error {
-        TextGenerationError::Failed { position, error } => {
-            warn!(position, %error, "gateway request failed");
-            BackendError::execution(format!("Inference error: {error}"))
-        }
-        TextGenerationError::Stream(message) => BackendError::execution(message),
     }
 }

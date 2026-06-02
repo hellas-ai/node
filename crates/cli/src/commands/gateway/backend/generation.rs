@@ -1,7 +1,7 @@
 use async_stream::try_stream;
 use futures::StreamExt;
 
-use crate::execution::{Outcome, StopReason};
+use crate::execution::Outcome;
 use hellas_rpc::model::TextOutputDecoder;
 
 use super::super::state::PreparedGeneration;
@@ -10,19 +10,6 @@ use super::super::state::PreparedGeneration;
 pub(super) enum GenerationEvent {
     Delta(String),
     Done(Outcome),
-}
-
-pub(super) struct CompletedTextGeneration {
-    pub(super) text: String,
-    pub(super) provenance: Option<hellas_rpc::provenance::ExecutionProvenance>,
-    pub(super) total_tokens: u64,
-    pub(super) stop_reason: StopReason,
-    pub(super) receipt: crate::execution::ReceiptArtifact,
-}
-
-pub(super) enum TextGenerationError {
-    Failed { position: u64, error: String },
-    Stream(String),
 }
 
 pub(super) fn generation_stream(
@@ -53,52 +40,5 @@ pub(super) fn generation_stream(
             }
         }
         Err(anyhow::anyhow!("execution stream ended without terminal outcome"))?;
-    }
-}
-
-pub(super) async fn collect_text(
-    generation: PreparedGeneration,
-) -> Result<CompletedTextGeneration, TextGenerationError> {
-    let deadline = generation.deadline();
-    let provenance = generation.provenance.clone();
-    let stream = generation_stream(generation);
-    tokio::pin!(stream);
-    let mut text = String::new();
-    loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(GenerationEvent::Delta(delta)))) => text.push_str(&delta),
-            Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
-                total_tokens,
-                stop_reason,
-                receipt,
-            })))) => {
-                return Ok(CompletedTextGeneration {
-                    text,
-                    provenance,
-                    total_tokens,
-                    stop_reason,
-                    receipt,
-                });
-            }
-            Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { position, error })))) => {
-                return Err(TextGenerationError::Failed { position, error });
-            }
-            Ok(Some(Err(err))) => {
-                return Err(TextGenerationError::Stream(format!(
-                    "Inference error: {err:#}"
-                )));
-            }
-            Ok(None) => {
-                return Err(TextGenerationError::Stream(
-                    "execution stream ended without terminal outcome".to_string(),
-                ));
-            }
-            Err(_) => {
-                return Err(TextGenerationError::Stream(format!(
-                    "inference timed out after {}s",
-                    super::super::timeout_secs_until(deadline)
-                )));
-            }
-        }
     }
 }

@@ -5,8 +5,8 @@ use hellas_wire_adaptors::openai::responses::{
     OpenAiResponsesAdaptor, ParsedResponseRequest, ResponsesIngressState,
 };
 use hellas_wire_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, ExecutionResult,
-    OutputEvent, SseDecoder, WireAdaptor, WireIngress, WireStreamEvent,
+    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
+    SseDecoder, WireAdaptor, WireIngress, WireStreamEvent,
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -63,32 +63,6 @@ impl ResponsesProxy {
 }
 
 impl ExecutionBackend for ResponsesProxy {
-    fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult> {
-        Box::pin(async move {
-            let adaptor = OpenAiResponsesAdaptor;
-            let parsed = adaptor
-                .parse(request.raw.clone())
-                .map_err(|err| BackendError::rejected(err.to_string()))?;
-            let upstream = self
-                .send_raw(forwarded_body(&request).map_err(BackendError::rejected)?)
-                .await
-                .map_err(|err| BackendError::execution(err.message))?;
-            let status = upstream.status();
-            if !status.is_success() {
-                return Err(BackendError::execution(format!(
-                    "Responses proxy returned HTTP {status}"
-                )));
-            }
-            let body = upstream
-                .bytes()
-                .await
-                .map_err(|source| BackendError::execution(source.to_string()))?;
-            adaptor
-                .decode_response(&parsed, &body)
-                .map_err(|err| BackendError::execution(err.to_string()))
-        })
-    }
-
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let adaptor = OpenAiResponsesAdaptor;
@@ -115,11 +89,6 @@ impl ExecutionBackend for ResponsesProxy {
 
 fn forwarded_body(request: &BackendRequest) -> Result<Bytes, String> {
     let upstream_model = request.execution.canonical.model.name.as_str();
-    let raw_model = request.raw.value().get("model").and_then(JsonValue::as_str);
-    if raw_model == Some(upstream_model) {
-        return Ok(Bytes::copy_from_slice(request.raw.bytes()));
-    }
-
     let JsonValue::Object(mut object) = request.raw.value().clone() else {
         return Err("Responses proxy request body must be a JSON object".to_string());
     };
@@ -127,6 +96,7 @@ fn forwarded_body(request: &BackendRequest) -> Result<Bytes, String> {
         "model".to_string(),
         JsonValue::String(upstream_model.to_string()),
     );
+    object.insert("stream".to_string(), JsonValue::Bool(true));
     encode_json_object(object)
 }
 
@@ -235,59 +205,6 @@ mod tests {
         tx: SharedCaptureSender,
     }
 
-    async fn capture(
-        State(capture): State<Capture>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> &'static str {
-        let auth = headers
-            .get(AUTHORIZATION.as_str())
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
-        if let Some(tx) = capture.tx.lock().await.take() {
-            let _ = tx.send((auth, body));
-        }
-        r#"{"ok":true}"#
-    }
-
-    async fn capture_responses_json(
-        State(capture): State<Capture>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> &'static str {
-        let auth = headers
-            .get(AUTHORIZATION.as_str())
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
-        if let Some(tx) = capture.tx.lock().await.take() {
-            let _ = tx.send((auth, body));
-        }
-        r#"{
-            "id": "resp_test",
-            "object": "response",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [
-                        {"type": "output_text", "text": "done"}
-                    ]
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "lookup",
-                    "arguments": "{\"query\":\"tea\"}"
-                }
-            ],
-            "usage": {
-                "input_tokens": 3,
-                "output_tokens": 2,
-                "total_tokens": 5
-            }
-        }"#
-    }
-
     async fn capture_responses_sse(
         State(capture): State<Capture>,
         headers: HeaderMap,
@@ -347,13 +264,13 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
     }
 
     #[tokio::test]
-    async fn execution_backend_forwards_request_body_and_bearer_token() {
+    async fn streaming_backend_forwards_request_body_and_bearer_token() {
         let (tx, rx) = oneshot::channel();
         let captured = Capture {
             tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
         };
         let app = Router::new()
-            .route("/v1/responses", post(capture))
+            .route("/v1/responses", post(capture_responses_sse))
             .with_state(captured);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -363,15 +280,16 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
 
         let proxy = test_proxy(addr, Some("test-key".to_string()));
         let body = Bytes::from_static(br#"{"model":"m","input":"hello","seed":7}"#);
-        let result = proxy.execute(backend_request(body.clone())).await.unwrap();
+        let stream = proxy.stream(backend_request(body)).await.unwrap();
+        let _result = stream.collect().await.unwrap();
 
-        let (auth, body) = rx.await.unwrap();
+        let (auth, forwarded_body) = rx.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
-        assert_eq!(
-            body,
-            Bytes::from_static(br#"{"model":"m","input":"hello","seed":7}"#)
-        );
-        assert_eq!(result.output, Vec::new());
+        let forwarded: JsonValue = serde_json::from_slice(&forwarded_body).unwrap();
+        assert_eq!(forwarded["model"], "m");
+        assert_eq!(forwarded["input"], "hello");
+        assert_eq!(forwarded["seed"], 7);
+        assert_eq!(forwarded["stream"], true);
     }
 
     #[tokio::test]
@@ -381,7 +299,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
             tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
         };
         let app = Router::new()
-            .route("/v1/responses", post(capture))
+            .route("/v1/responses", post(capture_responses_sse))
             .with_state(captured);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -394,24 +312,25 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
         let mut request = backend_request(body);
         request.execution.canonical.model.name = "upstream".to_string();
 
-        let result = proxy.execute(request).await.unwrap();
+        let stream = proxy.stream(request).await.unwrap();
+        let _result = stream.collect().await.unwrap();
 
         let (_auth, forwarded_body) = rx.await.unwrap();
         let forwarded: JsonValue = serde_json::from_slice(&forwarded_body).unwrap();
         assert_eq!(forwarded["model"], "upstream");
         assert_eq!(forwarded["input"], "hello");
         assert_eq!(forwarded["seed"], 7);
-        assert_eq!(result.output, Vec::new());
+        assert_eq!(forwarded["stream"], true);
     }
 
     #[tokio::test]
-    async fn execution_backend_forwards_request_and_projects_response() {
+    async fn stream_collects_projected_response() {
         let (tx, rx) = oneshot::channel();
         let captured = Capture {
             tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
         };
         let app = Router::new()
-            .route("/v1/responses", post(capture_responses_json))
+            .route("/v1/responses", post(capture_responses_sse))
             .with_state(captured);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -423,26 +342,24 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
             Bytes::from_static(br#"{"model":"m","input":"hello","metadata":{"trace":"abc"}}"#);
         let proxy = test_proxy(addr, Some("test-key".to_string()));
 
-        let result = proxy.execute(backend_request(body.clone())).await.unwrap();
+        let stream = proxy.stream(backend_request(body)).await.unwrap();
+        let result = stream.collect().await.unwrap();
 
         let (auth, forwarded_body) = rx.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
-        assert_eq!(forwarded_body, body);
+        let forwarded: JsonValue = serde_json::from_slice(&forwarded_body).unwrap();
+        assert_eq!(forwarded["model"], "m");
+        assert_eq!(forwarded["input"], "hello");
+        assert_eq!(forwarded["metadata"]["trace"], "abc");
+        assert_eq!(forwarded["stream"], true);
         assert_eq!(result.usage.unwrap().total_tokens, Some(5));
         assert_eq!(result.stop_reason, StopReason::EndOfText);
         assert_eq!(
             result.output,
-            vec![
-                OutputItem::Text {
-                    text: "done".to_string(),
-                    channel: TextChannel::Output,
-                },
-                OutputItem::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "lookup".to_string(),
-                    arguments: serde_json::json!({"query": "tea"}),
-                }
-            ]
+            vec![OutputItem::Text {
+                text: "hello".to_string(),
+                channel: TextChannel::Output,
+            }]
         );
     }
 
@@ -474,7 +391,10 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
 
         let (auth, forwarded_body) = rx.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
-        assert_eq!(forwarded_body, body);
+        let forwarded: JsonValue = serde_json::from_slice(&forwarded_body).unwrap();
+        assert_eq!(forwarded["model"], "m");
+        assert_eq!(forwarded["input"], "hello");
+        assert_eq!(forwarded["stream"], true);
         assert_eq!(
             events,
             vec![
