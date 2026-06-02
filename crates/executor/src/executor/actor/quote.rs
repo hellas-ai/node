@@ -314,12 +314,12 @@ impl Executor {
         &mut self,
         request: PutArtifactRequest,
     ) -> Result<PutArtifactResponse, ExecutorError> {
-        let cid = self
+        let digest = self
             .artifacts
             .publish_canonical_bytes(request.canonical_artifact)
             .await?;
         Ok(PutArtifactResponse {
-            cid: cid.as_bytes().to_vec(),
+            digest: digest.as_bytes().to_vec(),
         })
     }
 
@@ -329,7 +329,7 @@ impl Executor {
     ) -> Result<GetArtifactResponse, ExecutorError> {
         let canonical_artifact = self
             .artifacts
-            .get_canonical_bytes(digest_from_slice(&request.cid, "cid")?)
+            .get_canonical_bytes(digest_from_slice(&request.digest, "digest")?)
             .await?;
         Ok(GetArtifactResponse { canonical_artifact })
     }

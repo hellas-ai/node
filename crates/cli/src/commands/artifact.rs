@@ -18,20 +18,20 @@ use crate::commands::CliResult;
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
-    /// Store exact canonical artifact bytes on a provider and print the CID
+    /// Store exact canonical artifact bytes on a provider and print the digest
     Put {
         node_id: EndpointId,
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
         path: PathBuf,
     },
-    /// Fetch canonical artifact bytes by CID from a provider
+    /// Fetch canonical artifact bytes by digest from a provider
     Get {
         node_id: EndpointId,
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
-        /// 32-byte artifact CID as hex
-        cid: String,
+        /// 32-byte artifact digest as hex
+        digest: String,
         #[arg(short = 'o', long = "output")]
         output: PathBuf,
     },
@@ -47,9 +47,9 @@ pub async fn run(command: ArtifactCommand, secret_key: SecretKey) -> CliResult<(
         ArtifactCommand::Get {
             node_id,
             node_addrs,
-            cid,
+            digest,
             output,
-        } => get(node_id, node_addrs, cid, output, secret_key).await,
+        } => get(node_id, node_addrs, digest, output, secret_key).await,
     }
 }
 
@@ -67,30 +67,30 @@ async fn put(
         .put_artifact(PutArtifactRequest { canonical_artifact })
         .await
         .map_err(|e| anyhow::anyhow!("put_artifact: {e}"))?;
-    let cid = Digest::from_slice(&response.cid)
-        .map_err(|e| anyhow::anyhow!("provider returned invalid artifact cid: {e}"))?;
-    println!("{cid}");
+    let digest = Digest::from_slice(&response.digest)
+        .map_err(|e| anyhow::anyhow!("provider returned invalid artifact digest: {e}"))?;
+    println!("{digest}");
     Ok(())
 }
 
 async fn get(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
-    cid: String,
+    digest: String,
     output: PathBuf,
     secret_key: SecretKey,
 ) -> CliResult<()> {
-    let cid = parse_digest_hex(&cid)?;
+    let digest = parse_digest_hex(&digest)?;
     let client = connect_courtesy(node_id, node_addrs, secret_key).await?;
     let response = client
         .get_artifact(GetArtifactRequest {
-            cid: cid.as_bytes().to_vec(),
+            digest: digest.as_bytes().to_vec(),
         })
         .await
         .map_err(|e| anyhow::anyhow!("get_artifact: {e}"))?;
     let actual = Digest::hash(&response.canonical_artifact);
-    if actual != cid {
-        bail!("provider returned bytes with cid {actual}, expected {cid}");
+    if actual != digest {
+        bail!("provider returned bytes with digest {actual}, expected {digest}");
     }
     tokio::fs::write(&output, response.canonical_artifact)
         .await
@@ -121,12 +121,12 @@ async fn connect_courtesy(
 fn parse_digest_hex(raw: &str) -> CliResult<Digest> {
     let raw = raw.trim();
     if raw.len() != 64 {
-        bail!("artifact cid must be 64 hex chars, got {}", raw.len());
+        bail!("artifact digest must be 64 hex chars, got {}", raw.len());
     }
     let mut bytes = [0u8; 32];
     for (i, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16)
-            .with_context(|| format!("invalid hex in artifact cid at position {}", i * 2))?;
+            .with_context(|| format!("invalid hex in artifact digest at position {}", i * 2))?;
     }
     Ok(Digest::from_bytes(bytes))
 }

@@ -205,13 +205,13 @@ mod tests {
 
     fn symbolic_request() -> SymbolicRequest {
         SymbolicRequest {
-            text_execution_cid: Digest::from_bytes([4; 32]),
+            text_execution: Digest::from_bytes([4; 32]),
         }
     }
 
     fn symbolic_output() -> SymbolicOutput {
         SymbolicOutput {
-            text_artifact_cid: Digest::from_bytes([9; 32]),
+            text_artifact: Digest::from_bytes([9; 32]),
         }
     }
 
@@ -237,7 +237,7 @@ mod tests {
         let request = symbolic_request();
         let output = symbolic_output();
         let wrong = SymbolicOutput {
-            text_artifact_cid: Digest::from_bytes([8; 32]),
+            text_artifact: Digest::from_bytes([8; 32]),
         };
         let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
         let envelope = receipt;

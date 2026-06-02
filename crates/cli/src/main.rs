@@ -799,14 +799,14 @@ mod tests {
     }
 
     #[test]
-    fn artifact_get_accepts_cid_and_output() {
-        let cid = "00".repeat(32);
+    fn artifact_get_accepts_digest_and_output() {
+        let digest = "00".repeat(32);
         let cli = Cli::try_parse_from([
             "hellas",
             "artifact",
             "get",
             "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-            &cid,
+            &digest,
             "--output",
             "/tmp/artifact.cbor",
         ])
@@ -817,12 +817,12 @@ mod tests {
                     commands::artifact::ArtifactCommand::Get {
                         node_id: _,
                         node_addrs,
-                        cid: parsed_cid,
+                        digest: parsed_digest,
                         output,
                     },
             } => {
                 assert!(node_addrs.is_empty());
-                assert_eq!(parsed_cid, cid);
+                assert_eq!(parsed_digest, digest);
                 assert_eq!(output, std::path::Path::new("/tmp/artifact.cbor"));
             }
             _ => panic!("expected artifact get command"),

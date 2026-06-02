@@ -146,7 +146,7 @@ pub(crate) fn resolve_accept_dtypes(
 
 pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> PbSymbolicRequest {
     PbSymbolicRequest {
-        text_execution_cid: request.text_execution_cid.as_bytes().to_vec(),
+        text_execution: request.text_execution.as_bytes().to_vec(),
     }
 }
 
@@ -154,10 +154,7 @@ pub(crate) fn symbolic_request_from_pb(
     request: PbSymbolicRequest,
 ) -> Result<SymbolicRequest, ExecutorError> {
     Ok(SymbolicRequest {
-        text_execution_cid: Digest::from_bytes(bytes32(
-            &request.text_execution_cid,
-            "text_execution_cid",
-        )?),
+        text_execution: Digest::from_bytes(bytes32(&request.text_execution, "text_execution")?),
     })
 }
 
@@ -168,8 +165,8 @@ fn parse_symbolic_start(start: Option<PbSymbolicStart>) -> Result<Option<Digest>
     match start {
         symbolic_start::Kind::Genesis(_) => Ok(None),
         symbolic_start::Kind::Artifact(artifact) => Ok(Some(Digest::from_bytes(bytes32(
-            &artifact.artifact_cid,
-            "artifact_cid",
+            &artifact.artifact,
+            "artifact",
         )?))),
     }
 }

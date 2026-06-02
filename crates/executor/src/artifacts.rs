@@ -255,7 +255,7 @@ impl SymbolicArtifactStore {
         let execution = catnix::TextExecution::new(from, prompt_tokens_id, policy_id);
         let execution_id = self.insert_text_execution(execution).await?;
         let symbolic_request = SymbolicRequest {
-            text_execution_cid: from_catnix_digest(execution_id.digest()),
+            text_execution: from_catnix_digest(execution_id.digest()),
         };
 
         Ok(ResolvedSymbolicExecution {
@@ -269,9 +269,8 @@ impl SymbolicArtifactStore {
         &mut self,
         symbolic_request: SymbolicRequest,
     ) -> Result<ResolvedSymbolicExecution, ExecutorError> {
-        let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            symbolic_request.text_execution_cid,
-        ));
+        let execution_id =
+            catnix::TextExecutionId::from_digest(to_catnix_digest(symbolic_request.text_execution));
         let execution = self.text_execution(execution_id).await?;
         let source = self.materialize_source(execution.from()).await?;
         let prompt_tokens = self.token_ids(execution.prompt_tokens()).await?;
@@ -334,9 +333,8 @@ impl SymbolicArtifactStore {
         invocation: &Invocation,
         output_tokens: &[u32],
     ) -> Result<Digest, ExecutorError> {
-        let execution_id = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            symbolic_request.text_execution_cid,
-        ));
+        let execution_id =
+            catnix::TextExecutionId::from_digest(to_catnix_digest(symbolic_request.text_execution));
         let _ = self.text_execution(execution_id).await?;
 
         let generated_tokens_id = self
@@ -973,7 +971,7 @@ mod tests {
             .await
             .unwrap();
         let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            first.symbolic_request.text_execution_cid,
+            first.symbolic_request.text_execution,
         ));
         let prompt_tokens = store
             .insert_token_ids(catnix::TokenIds::from([20]))
@@ -991,7 +989,7 @@ mod tests {
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let resolved = store
             .resolve_symbolic_request(SymbolicRequest {
-                text_execution_cid: from_catnix_digest(lazy_id.digest()),
+                text_execution: from_catnix_digest(lazy_id.digest()),
             })
             .await
             .unwrap();
@@ -1004,7 +1002,7 @@ mod tests {
         let mut store = SymbolicArtifactStore::default();
         let first = store.record_prepared_text(&plan()).await.unwrap();
         let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            first.symbolic_request.text_execution_cid,
+            first.symbolic_request.text_execution,
         ));
         let first_execution_value = store.text_execution(first_execution).await.unwrap();
         let identity_id = match first_execution_value.from() {
@@ -1030,7 +1028,7 @@ mod tests {
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let err = store
             .resolve_symbolic_request(SymbolicRequest {
-                text_execution_cid: from_catnix_digest(lazy_id.digest()),
+                text_execution: from_catnix_digest(lazy_id.digest()),
             })
             .await
             .unwrap_err();
@@ -1043,7 +1041,7 @@ mod tests {
         let mut store = SymbolicArtifactStore::default();
         let err = store
             .resolve_symbolic_request(SymbolicRequest {
-                text_execution_cid: Digest::from_bytes([7; 32]),
+                text_execution: Digest::from_bytes([7; 32]),
             })
             .await
             .unwrap_err();
@@ -1120,7 +1118,7 @@ mod tests {
                 .await
                 .unwrap();
             first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-                first.symbolic_request.text_execution_cid,
+                first.symbolic_request.text_execution,
             ));
             store.shutdown().await.unwrap();
         }
@@ -1145,7 +1143,7 @@ mod tests {
             let lazy_id = store.insert_text_execution(lazy).await.unwrap();
             let resolved = store
                 .resolve_symbolic_request(SymbolicRequest {
-                    text_execution_cid: from_catnix_digest(lazy_id.digest()),
+                    text_execution: from_catnix_digest(lazy_id.digest()),
                 })
                 .await
                 .unwrap();
