@@ -7,6 +7,14 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = [
+    "blake3",
+    "prost-build",
+    "prost-types",
+    "protox",
+]
+
 [features]
 default = []
 
@@ -35,9 +43,6 @@ iroh = ["dep:iroh"]
 iroh-client = ["iroh"]
 iroh-server = ["iroh"]
 
-# Discovery (mDNS + DHT).
-discovery = ["dep:futures", "dep:mainline"]
-
 # Binary-side bundle for the node binary (executor / model deps).
 node = [
     "server",
@@ -45,7 +50,6 @@ node = [
     "dep:catgrad",
     "dep:catgrad-llm",
     "dep:chatgrad",
-    "dep:serde",
     "dep:serde_json",
     "dep:tokenizers",
     "dep:hf-hub",
@@ -58,7 +62,6 @@ catgrad = { workspace = true, default-features = false, features = [
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
-futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 hellas-core = { workspace = true }
@@ -66,13 +69,8 @@ hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
     "ureq",
 ], optional = true }
-http = "1"
-http-body = "1"
 iroh = { workspace = true, optional = true }
-mainline = { version = "6", optional = true }
-pin-project = "1"
 prost = { version = "0.14", default-features = false, features = ["derive"] }
-serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
@@ -80,8 +78,6 @@ tokenizers = { version = "0.21", default-features = false, features = [
     "progressbar",
     "fancy-regex",
 ], optional = true }
-tower-layer = "0.3"
-tower-service = "0.3"
 # `web-time` provides `std::time::Instant` / `SystemTime` equivalents so the
 # peer registry's monotonic clock works under wasm (where `Instant::now` panics with
 # "time not implemented on this platform"). Identical to std on native targets.

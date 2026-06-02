@@ -14,6 +14,3 @@ serde.workspace = true
 serde_bytes.workspace = true
 serde_ipld_dagcbor.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

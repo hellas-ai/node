@@ -38,9 +38,6 @@ ws = ["mux", "dep:tokio-tungstenite"]
 ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 ws-cf-do = ["mux", "dep:worker"]
 
-# OpenTelemetry header propagation on Metadata
-otel = ["dep:opentelemetry"]
-
 # Server role (accept side; non-wasm)
 server = []
 
@@ -60,8 +57,6 @@ iroh-mdns-address-lookup = { version = "0.2", optional = true }
 mainline = { version = "6", optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
 
-opentelemetry = { workspace = true, optional = true }
-pin-project-lite = "0.2"
 # Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic
 # provides a mutex-fallback `AtomicU64` so the iroh ConnectionPool's
 # generation counter compiles on embedded targets.
@@ -91,15 +86,11 @@ tokio = { workspace = true, features = [
     "rt",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "sync",
     "macros",
-] }
-tokio-util = { version = "0.7", default-features = false, features = [
-    "compat",
 ] }
 
 [dev-dependencies]
