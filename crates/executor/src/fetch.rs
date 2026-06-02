@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hellas_core::{
-    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey, StreamId,
+    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey,
     canonical_dag_cbor, decode_dag_cbor,
 };
 use hellas_rpc::fetch::{
@@ -17,7 +17,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchTranscript {
     input_commitment: InputCommitment,
-    stream_id: StreamId,
     input: Vec<InputEventEnvelope>,
     output: Vec<OutputEventEnvelope>,
 }
@@ -30,7 +29,6 @@ impl FetchTranscript {
     ) -> Self {
         Self {
             input_commitment,
-            stream_id: StreamId::from_input_commitment(input_commitment),
             input,
             output,
         }
@@ -38,10 +36,6 @@ impl FetchTranscript {
 
     pub const fn input_commitment(&self) -> InputCommitment {
         self.input_commitment
-    }
-
-    pub const fn stream_id(&self) -> StreamId {
-        self.stream_id
     }
 
     pub fn output_events(&self) -> &[OutputEventEnvelope] {
@@ -57,10 +51,6 @@ impl FetchTranscript {
         if input.input_commitment != self.input_commitment {
             return Err(FetchTranscriptError::InputCommitmentMismatch);
         }
-        let expected_stream = StreamId::from_input_commitment(input.input_commitment);
-        if expected_stream != self.stream_id {
-            return Err(FetchTranscriptError::StreamIdMismatch);
-        }
         let output = verify_output_events(input.input_commitment, &self.output)?;
         if output.producer_key != *producer_key {
             return Err(FetchTranscriptError::ProducerKeyMismatch);
@@ -72,7 +62,6 @@ impl FetchTranscript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchQuote {
     pub input_commitment: InputCommitment,
-    pub stream_id: StreamId,
     pub caller_key: PublicKey,
     pub input: Vec<InputEventEnvelope>,
 }
@@ -81,7 +70,6 @@ impl FetchQuote {
     pub fn from_verified(verified: &FetchInput, input: Vec<InputEventEnvelope>) -> Self {
         Self {
             input_commitment: verified.input_commitment,
-            stream_id: StreamId::from_input_commitment(verified.input_commitment),
             caller_key: verified.caller_key,
             input,
         }
@@ -393,7 +381,7 @@ where
             Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
             None => return Err(FetchStateError::NotFound),
         };
-        if transcript.input != quote.input || transcript.stream_id() != quote.stream_id {
+        if transcript.input != quote.input {
             return Err(FetchStateError::QuoteMismatch);
         }
         let verified = transcript.verify(producer_key)?;
@@ -457,8 +445,6 @@ where
 pub enum FetchTranscriptError {
     #[error("stored input commitment does not match input transcript")]
     InputCommitmentMismatch,
-    #[error("stored stream id does not match input transcript")]
-    StreamIdMismatch,
     #[error("producer key does not match output transcript signer")]
     ProducerKeyMismatch,
     #[error("fetch protocol error: {0}")]
