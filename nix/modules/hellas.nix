@@ -133,6 +133,36 @@ rec {
         default = [ ];
         description = "Model identifiers to preload on startup.";
       };
+      fetchOpenaiResponses = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Enable OpenAI Responses Fetch execution.";
+      };
+      fetchOpenaiResponsesUrl = mkOption {
+        type = types.str;
+        default = "https://api.openai.com/v1/responses";
+        description = "OpenAI-compatible Responses endpoint used by Fetch execution.";
+      };
+      fetchOpenaiApiKeyEnv = mkOption {
+        type = types.str;
+        default = "OPENAI_API_KEY";
+        description = "Environment variable containing the OpenAI Responses Fetch bearer token.";
+      };
+      fetchCodexResponses = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Enable Codex OAuth Responses Fetch execution.";
+      };
+      fetchCodexBaseUrl = mkOption {
+        type = types.str;
+        default = "https://chatgpt.com/backend-api/codex";
+        description = "Codex backend base URL used by Fetch execution.";
+      };
+      fetchCodexAuthPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Codex auth store path.";
+      };
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
@@ -331,6 +361,16 @@ rec {
       "--preload"
       model
     ]) serve.preloadWeights
+    ++ lib.optionals serve.fetchOpenaiResponses (
+      [ "--fetch-openai-responses" ]
+      ++ optArg "--fetch-openai-responses-url" serve.fetchOpenaiResponsesUrl
+      ++ optArg "--fetch-openai-api-key-env" serve.fetchOpenaiApiKeyEnv
+    )
+    ++ lib.optionals serve.fetchCodexResponses (
+      [ "--fetch-codex-responses" ]
+      ++ optArg "--fetch-codex-base-url" serve.fetchCodexBaseUrl
+      ++ optArg "--fetch-codex-auth-path" serve.fetchCodexAuthPath
+    )
     ++ serve.extraArgs;
 
   mkGatewayArgs =

@@ -2,19 +2,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use futures::{StreamExt, stream};
+use futures::stream;
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
     FetchProviderStream,
 };
-use hellas_wire_adaptors::openai::responses::OpenAiResponsesAdaptor;
-use hellas_wire_adaptors::{
-    BackendStream, RawRequest, RenderContext, WireAdaptor, WireBody, WireIngress,
-};
+use hellas_wire_adaptors::RenderContext;
 use reqwest::Url;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
-use crate::commands::openai_responses_stream::ResponsesSseProjector;
+use super::responses_fetch::{execute_responses_request, parsed_streaming_request};
 
 const SERVICE_OPENAI: &str = "openai";
 const METHOD_RESPONSES: &str = "responses";
@@ -61,52 +57,17 @@ impl OpenAiResponsesFetchProvider {
             )));
         }
 
-        let adaptor = OpenAiResponsesAdaptor;
-        let raw = RawRequest::from_slice(request.body.as_bytes()).map_err(|err| {
-            FetchProviderError::Rejected(format!("invalid OpenAI Responses request: {err}"))
-        })?;
-        let parsed = adaptor.parse(raw).map_err(|err| {
-            FetchProviderError::Rejected(format!("invalid OpenAI Responses request: {err}"))
-        })?;
-        if parsed.stream != Some(true) {
-            return Err(FetchProviderError::Rejected(
-                "OpenAI Responses fetch requests must set stream=true".to_string(),
-            ));
-        }
-
-        let upstream = self.send(request.body.as_bytes().to_vec()).await?;
-        let status = upstream.status();
-        if !status.is_success() {
-            let body = upstream.text().await.unwrap_or_default();
-            return Err(FetchProviderError::Failed(format!(
-                "OpenAI Responses returned HTTP {status}: {body}"
-            )));
-        }
-
-        if is_event_stream(&upstream) {
-            collect_sse_response(upstream, adaptor, parsed).await
-        } else {
-            let body = upstream.bytes().await.map_err(|source| {
-                FetchProviderError::Failed(format!("OpenAI Responses body read failed: {source}"))
-            })?;
-            adaptor.decode_response(&parsed, &body).map_err(|err| {
-                FetchProviderError::Failed(format!("invalid OpenAI Responses body: {err}"))
-            })?;
-            Ok(body.to_vec())
-        }
-    }
-
-    async fn send(&self, body: Vec<u8>) -> Result<reqwest::Response, FetchProviderError> {
-        self.client
-            .post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.bearer_token))
-            .body(body)
-            .send()
-            .await
-            .map_err(|source| {
-                FetchProviderError::Failed(format!("OpenAI Responses request failed: {source}"))
-            })
+        let parsed = parsed_streaming_request(&request)?;
+        execute_responses_request(
+            &self.client,
+            self.endpoint.clone(),
+            &self.bearer_token,
+            request.body.as_bytes().to_vec(),
+            parsed,
+            render_context(),
+            "OpenAI Responses",
+        )
+        .await
     }
 }
 
@@ -117,59 +78,6 @@ impl FetchProvider for OpenAiResponsesFetchProvider {
             Ok(Box::pin(stream::once(async move { Ok(body) })) as FetchProviderStream)
         })
     }
-}
-
-async fn collect_sse_response(
-    upstream: reqwest::Response,
-    adaptor: OpenAiResponsesAdaptor,
-    parsed: hellas_wire_adaptors::openai::responses::ParsedResponseRequest,
-) -> Result<Vec<u8>, FetchProviderError> {
-    let mut chunks = upstream.bytes_stream();
-    let mut projector = ResponsesSseProjector::new(parsed.clone());
-    let mut events = Vec::new();
-
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|source| {
-            FetchProviderError::Failed(format!("OpenAI Responses stream failed: {source}"))
-        })?;
-        events.extend(
-            projector
-                .push(&chunk)
-                .map_err(|err| FetchProviderError::Failed(err.to_string()))?,
-        );
-    }
-    events.extend(
-        projector
-            .finish()
-            .map_err(|err| FetchProviderError::Failed(err.to_string()))?,
-    );
-
-    let result = BackendStream::new(futures::stream::iter(events.into_iter().map(Ok)), None)
-        .collect()
-        .await
-        .map_err(|err| FetchProviderError::Failed(err.to_string()))?;
-    let context = projector.render_context(render_context());
-    let response = adaptor
-        .render_response(&parsed, result, context)
-        .map_err(|err| FetchProviderError::Failed(err.to_string()))?;
-    match response.body {
-        WireBody::Json(value) => serde_json::to_vec(&value).map_err(|source| {
-            FetchProviderError::Failed(format!("JSON encoding failed: {source}"))
-        }),
-        WireBody::Bytes(bytes) => Ok(bytes),
-    }
-}
-
-fn is_event_stream(response: &reqwest::Response) -> bool {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
-        })
 }
 
 fn render_context() -> RenderContext {
@@ -197,7 +105,9 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::post;
+    use futures::StreamExt;
     use hellas_core::JsonBytes;
+    use reqwest::header::AUTHORIZATION;
     use serde_json::Value as JsonValue;
     use std::sync::Arc;
     use tokio::sync::oneshot;
