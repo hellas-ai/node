@@ -15,7 +15,7 @@ use chatgrad::types::openai;
 use hellas_executor::Executor;
 use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "hellas-executor")]
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
@@ -88,7 +88,6 @@ impl GatewayState {
                 crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
             ExecutionRuntime::local(
                 Executor::spawn_with_producer_key(
-                    DownloadPolicy::Eager,
                     ExecutePolicy::Eager,
                     options.queue_size,
                     vec![options.dtype],

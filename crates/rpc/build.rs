@@ -87,6 +87,10 @@ fn regenerate() {
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);
+    config.enum_attribute(
+        "hellas.v1.WorkEvent.kind",
+        "#[allow(clippy::large_enum_variant)]",
+    );
     config.service_generator(Box::new(generator));
 
     // prost-build needs a Clone-able copy because we also walked the same

@@ -17,7 +17,7 @@ use hellas_wire::WireStatus;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::worker::WorkerCompletion;
-pub use actor::Executor;
+pub use actor::{Executor, ExecutorSpawnConfig};
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the

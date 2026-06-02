@@ -155,8 +155,11 @@ fn with_provenance<R>(outcome: TicketOutcome<R>) -> WithTrailer<R> {
 impl ExecuteHandler for ExecutorHandle {
     async fn run_ticket(&self, request: RunTicketRequest) -> Result<ExecuteStream, WireStatus> {
         let outcome = self.run_ticket_handle(request).await?;
-        let stream: ExecuteStream = Box::pin(ReceiverStream::new(outcome.events));
-        drop(outcome.provenance);
+        let ExecuteOutcome {
+            events,
+            provenance: _,
+        } = outcome;
+        let stream: ExecuteStream = Box::pin(ReceiverStream::new(events));
         Ok(stream)
     }
 }

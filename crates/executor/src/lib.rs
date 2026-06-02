@@ -10,7 +10,7 @@ mod state;
 mod worker;
 
 pub use artifacts::ArtifactStoreConfig;
-pub use executor::{Executor, ExecutorHandle};
+pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch::FetchCallerPolicy;
 pub use hellas_rpc::services::courtesy::CourtesyServer;
 pub use hellas_rpc::services::execute::ExecuteServer;

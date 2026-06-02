@@ -52,21 +52,20 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     // counter handles into a registry just adds a scrape view on the same
     // underlying state.
     let metrics = Arc::new(ExecutorMetrics::default());
-    let node = node::spawn_node(
-        options.port,
-        options.download_policy.clone(),
-        options.execute_policy.clone(),
-        options.queue_size,
-        &preload_models,
+    let node = node::spawn_node(node::NodeConfig {
+        port: options.port,
+        execute_policy: options.execute_policy.clone(),
+        queue_size: options.queue_size,
+        preload_models: preload_models.clone(),
         build,
         graffiti,
-        options.dtype,
+        supported_dtypes: options.dtype,
         trusted_caller_public_keys,
         artifact_store_path,
-        options.secret_key,
-        options.producer_key,
-        metrics.clone(),
-    )
+        secret_key: options.secret_key,
+        producer_key: options.producer_key,
+        metrics: metrics.clone(),
+    })
     .await
     .context("failed to start node server")?;
 
