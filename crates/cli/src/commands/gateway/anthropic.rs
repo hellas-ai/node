@@ -1,7 +1,7 @@
 use super::backend::GatewayBackend;
 use super::next_id;
 use super::state::GatewayState;
-use super::wire_adaptor::{backend_response, backend_stream_response, parse_backend_request};
+use super::wire_adaptor::{backend_wire_response, parse_backend_request};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
@@ -22,27 +22,16 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         request.execution.canonical.model.name = model.clone();
     }
     let backend = GatewayBackend::new(state);
-    if stream {
-        backend_stream_response(
-            adaptor,
-            parsed,
-            backend,
-            request,
-            render_context(),
-            "Anthropic Messages",
-        )
-        .await
-    } else {
-        backend_response(
-            adaptor,
-            parsed,
-            backend,
-            request,
-            render_context(),
-            "Anthropic Messages",
-        )
-        .await
-    }
+    backend_wire_response(
+        stream,
+        adaptor,
+        parsed,
+        backend,
+        request,
+        render_context(),
+        "Anthropic Messages",
+    )
+    .await
 }
 
 fn render_context() -> RenderContext {

@@ -27,7 +27,29 @@ pub(super) fn parse_backend_request<A: WireAdaptor>(
     Ok((parsed, BackendRequest::new(execution, raw)))
 }
 
-pub(super) async fn backend_response<A, B>(
+pub(super) async fn backend_wire_response<A, B>(
+    stream: bool,
+    adaptor: A,
+    parsed: A::ParsedRequest,
+    backend: B,
+    request: BackendRequest,
+    context: RenderContext,
+    surface: &'static str,
+) -> Response
+where
+    A: WireAdaptor + Send + 'static,
+    A::ParsedRequest: Send + 'static,
+    A::StreamState: Send + 'static,
+    B: ExecutionBackend,
+{
+    if stream {
+        backend_stream_response(adaptor, parsed, backend, request, context, surface).await
+    } else {
+        backend_response(adaptor, parsed, backend, request, context, surface).await
+    }
+}
+
+async fn backend_response<A, B>(
     adaptor: A,
     parsed: A::ParsedRequest,
     backend: B,
@@ -60,7 +82,7 @@ where
     response
 }
 
-pub(super) async fn backend_stream_response<A, B>(
+async fn backend_stream_response<A, B>(
     adaptor: A,
     parsed: A::ParsedRequest,
     backend: B,
