@@ -409,7 +409,7 @@ mod tests {
     use hellas_core::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;
     use hellas_rpc::pb::fetch::FetchRequest;
-    use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+    use hellas_rpc::policy::ExecutePolicy;
     use hellas_rpc::stream::input_event_to_pb;
 
     fn key() -> ProducerSigningKey {
@@ -440,14 +440,9 @@ mod tests {
     async fn fetch_execution_replays_completed_transcript() {
         let signing_key = key();
         let request = fetch_request(&signing_key, br#"{"hello":"world"}"#);
-        let handle = Executor::spawn_with_producer_key(
-            DownloadPolicy::Eager,
-            ExecutePolicy::Eager,
-            1,
-            vec![Dtype::F32],
-            key(),
-        )
-        .unwrap();
+        let handle =
+            Executor::spawn_with_producer_key(ExecutePolicy::Eager, 1, vec![Dtype::F32], key())
+                .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
         let first = run_one(&handle, ticket.request_commitment.clone()).await;

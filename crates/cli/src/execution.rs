@@ -49,7 +49,7 @@ use hellas_rpc::pb::execute::{
 };
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "hellas-executor")]
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
@@ -394,7 +394,6 @@ impl ExecutionRuntime {
         producer_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
         let local_executor = Executor::spawn_with_producer_key(
-            DownloadPolicy::Eager,
             ExecutePolicy::Eager,
             queue_capacity,
             supported_dtypes,

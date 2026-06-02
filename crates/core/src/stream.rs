@@ -94,6 +94,17 @@ impl StreamId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputEventBodyParts {
+    pub scheme: SchemeId,
+    pub sequence: u64,
+    pub previous_event: EventCommitment,
+    pub kind: String,
+    pub payload: Digest,
+    pub signer: ProducerId,
+    pub canonicalization: CanonicalizationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputEventBody {
     scheme: SchemeId,
     sequence: u64,
@@ -105,43 +116,15 @@ pub struct InputEventBody {
 }
 
 impl InputEventBody {
-    pub fn new(
-        scheme: SchemeId,
-        sequence: u64,
-        previous_event: EventCommitment,
-        kind: impl Into<String>,
-        payload: Digest,
-        canonicalization: CanonicalizationId,
-        signer: &PublicKey,
-    ) -> Self {
+    pub fn from_parts(parts: InputEventBodyParts) -> Self {
         Self {
-            scheme,
-            sequence,
-            previous_event,
-            kind: kind.into(),
-            payload,
-            signer: ProducerId::from_public_key(signer),
-            canonicalization,
-        }
-    }
-
-    pub fn from_parts(
-        scheme: SchemeId,
-        sequence: u64,
-        previous_event: EventCommitment,
-        kind: impl Into<String>,
-        payload: Digest,
-        signer: ProducerId,
-        canonicalization: CanonicalizationId,
-    ) -> Self {
-        Self {
-            scheme,
-            sequence,
-            previous_event,
-            kind: kind.into(),
-            payload,
-            signer,
-            canonicalization,
+            scheme: parts.scheme,
+            sequence: parts.sequence,
+            previous_event: parts.previous_event,
+            kind: parts.kind,
+            payload: parts.payload,
+            signer: parts.signer,
+            canonicalization: parts.canonicalization,
         }
     }
 
@@ -197,6 +180,19 @@ impl InputEventBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputEventBodyParts {
+    pub scheme: SchemeId,
+    pub input: InputCommitment,
+    pub stream_id: StreamId,
+    pub sequence: u64,
+    pub previous_event: EventCommitment,
+    pub kind: String,
+    pub payload: Digest,
+    pub signer: ProducerId,
+    pub canonicalization: CanonicalizationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputEventBody {
     scheme: SchemeId,
     input: InputCommitment,
@@ -210,51 +206,17 @@ pub struct OutputEventBody {
 }
 
 impl OutputEventBody {
-    pub fn new(
-        scheme: SchemeId,
-        input: InputCommitment,
-        stream_id: StreamId,
-        sequence: u64,
-        previous_event: EventCommitment,
-        kind: impl Into<String>,
-        payload: Digest,
-        canonicalization: CanonicalizationId,
-        signer: &PublicKey,
-    ) -> Self {
+    pub fn from_parts(parts: OutputEventBodyParts) -> Self {
         Self {
-            scheme,
-            input,
-            stream_id,
-            sequence,
-            previous_event,
-            kind: kind.into(),
-            payload,
-            signer: ProducerId::from_public_key(signer),
-            canonicalization,
-        }
-    }
-
-    pub fn from_parts(
-        scheme: SchemeId,
-        input: InputCommitment,
-        stream_id: StreamId,
-        sequence: u64,
-        previous_event: EventCommitment,
-        kind: impl Into<String>,
-        payload: Digest,
-        signer: ProducerId,
-        canonicalization: CanonicalizationId,
-    ) -> Self {
-        Self {
-            scheme,
-            input,
-            stream_id,
-            sequence,
-            previous_event,
-            kind: kind.into(),
-            payload,
-            signer,
-            canonicalization,
+            scheme: parts.scheme,
+            input: parts.input,
+            stream_id: parts.stream_id,
+            sequence: parts.sequence,
+            previous_event: parts.previous_event,
+            kind: parts.kind,
+            payload: parts.payload,
+            signer: parts.signer,
+            canonicalization: parts.canonicalization,
         }
     }
 
@@ -560,15 +522,15 @@ impl<'a> InputTranscriptBuilder<'a> {
             .checked_add(1)
             .ok_or(StreamVerifyError::SequenceOverflow)?;
         let public_key = self.signing_key.public_key();
-        let body = InputEventBody::new(
-            self.scheme,
+        let body = InputEventBody::from_parts(InputEventBodyParts {
+            scheme: self.scheme,
             sequence,
-            self.previous_event,
-            kind,
-            Digest::hash(&payload),
-            self.canonicalization,
-            &public_key,
-        );
+            previous_event: self.previous_event,
+            kind: kind.into(),
+            payload: Digest::hash(&payload),
+            signer: ProducerId::from_public_key(&public_key),
+            canonicalization: self.canonicalization,
+        });
         let event = SignedInputEvent::sign(body, self.signing_key)?;
         let envelope = InputEventEnvelope::new(event, payload)?;
         let commitment = envelope.event_commitment();
@@ -631,17 +593,17 @@ impl<'a> OutputTranscriptBuilder<'a> {
             .checked_add(1)
             .ok_or(StreamVerifyError::SequenceOverflow)?;
         let public_key = self.signing_key.public_key();
-        let body = OutputEventBody::new(
-            self.scheme,
-            self.input,
-            self.stream_id,
+        let body = OutputEventBody::from_parts(OutputEventBodyParts {
+            scheme: self.scheme,
+            input: self.input,
+            stream_id: self.stream_id,
             sequence,
-            self.previous_event,
-            kind,
-            Digest::hash(&payload),
-            self.canonicalization,
-            &public_key,
-        );
+            previous_event: self.previous_event,
+            kind: kind.into(),
+            payload: Digest::hash(&payload),
+            signer: ProducerId::from_public_key(&public_key),
+            canonicalization: self.canonicalization,
+        });
         let event = SignedOutputEvent::sign(body, self.signing_key)?;
         let envelope = OutputEventEnvelope::new(event, payload)?;
         let commitment = envelope.event_commitment();

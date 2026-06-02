@@ -1,8 +1,9 @@
 use hellas_core::commitment::TagError;
 use hellas_core::{
     CanonicalizationId, Digest, EventCommitment, InputCommitment, InputEventBody,
-    InputEventEnvelope, OutputEventBody, OutputEventEnvelope, ProducerId, PublicKey, SchemeId,
-    Signature, SignatureKind, SignedInputEvent, SignedOutputEvent, StreamId, StreamVerifyError,
+    InputEventBodyParts, InputEventEnvelope, OutputEventBody, OutputEventBodyParts,
+    OutputEventEnvelope, ProducerId, PublicKey, SchemeId, Signature, SignatureKind,
+    SignedInputEvent, SignedOutputEvent, StreamId, StreamVerifyError,
 };
 
 use crate::pb::execute as pb;
@@ -37,21 +38,21 @@ pub fn input_event_from_pb(
         .ok_or(StreamEnvelopeError::MissingPublicKey)?;
     let public_key = public_key_from_pb(public_key)?;
     let signed = SignedInputEvent::from_parts(
-        InputEventBody::from_parts(
-            scheme_from_u32(body.scheme)?,
-            body.sequence,
-            EventCommitment::from_digest(digest_from_bytes(
+        InputEventBody::from_parts(InputEventBodyParts {
+            scheme: scheme_from_u32(body.scheme)?,
+            sequence: body.sequence,
+            previous_event: EventCommitment::from_digest(digest_from_bytes(
                 "previous_event",
                 &body.previous_event,
             )?),
-            body.kind,
-            digest_from_bytes("payload_commitment", &body.payload_commitment)?,
-            ProducerId::from_digest(digest_from_bytes("signer", &body.signer)?),
-            CanonicalizationId::from_digest(digest_from_bytes(
+            kind: body.kind,
+            payload: digest_from_bytes("payload_commitment", &body.payload_commitment)?,
+            signer: ProducerId::from_digest(digest_from_bytes("signer", &body.signer)?),
+            canonicalization: CanonicalizationId::from_digest(digest_from_bytes(
                 "canonicalization_id",
                 &body.canonicalization_id,
             )?),
-        ),
+        }),
         signature_from_pb(signature)?,
         public_key,
     )?;
@@ -90,26 +91,26 @@ pub fn output_event_from_pb(
         .ok_or(StreamEnvelopeError::MissingPublicKey)?;
     let public_key = public_key_from_pb(public_key)?;
     let signed = SignedOutputEvent::from_parts(
-        OutputEventBody::from_parts(
-            scheme_from_u32(body.scheme)?,
-            InputCommitment::from_digest(digest_from_bytes(
+        OutputEventBody::from_parts(OutputEventBodyParts {
+            scheme: scheme_from_u32(body.scheme)?,
+            input: InputCommitment::from_digest(digest_from_bytes(
                 "input_commitment",
                 &body.input_commitment,
             )?),
-            StreamId::from_digest(digest_from_bytes("stream_id", &body.stream_id)?),
-            body.sequence,
-            EventCommitment::from_digest(digest_from_bytes(
+            stream_id: StreamId::from_digest(digest_from_bytes("stream_id", &body.stream_id)?),
+            sequence: body.sequence,
+            previous_event: EventCommitment::from_digest(digest_from_bytes(
                 "previous_event",
                 &body.previous_event,
             )?),
-            body.kind,
-            digest_from_bytes("payload_commitment", &body.payload_commitment)?,
-            ProducerId::from_digest(digest_from_bytes("signer", &body.signer)?),
-            CanonicalizationId::from_digest(digest_from_bytes(
+            kind: body.kind,
+            payload: digest_from_bytes("payload_commitment", &body.payload_commitment)?,
+            signer: ProducerId::from_digest(digest_from_bytes("signer", &body.signer)?),
+            canonicalization: CanonicalizationId::from_digest(digest_from_bytes(
                 "canonicalization_id",
                 &body.canonicalization_id,
             )?),
-        ),
+        }),
         signature_from_pb(signature)?,
         public_key,
     )?;

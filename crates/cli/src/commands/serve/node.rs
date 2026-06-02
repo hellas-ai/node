@@ -16,10 +16,10 @@ use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics,
-    FetchCallerPolicy, FetchServer, SymbolicServer,
+    ExecutorSpawnConfig, FetchCallerPolicy, FetchServer, SymbolicServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::Execute;
@@ -66,36 +66,34 @@ impl NodeHandle {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn spawn_node(
-    port: Option<u16>,
-    download_policy: DownloadPolicy,
-    execute_policy: ExecutePolicy,
-    queue_size: usize,
-    preload_models: &[String],
-    build: String,
-    graffiti: Vec<u8>,
-    supported_dtypes: Vec<Dtype>,
-    trusted_caller_public_keys: Vec<PublicKey>,
-    artifact_store_path: PathBuf,
-    secret_key: SecretKey,
-    producer_key: ProducerSigningKey,
-    metrics: Arc<ExecutorMetrics>,
-) -> anyhow::Result<NodeHandle> {
-    // -- Spawn the executor (the local handler that backs all four RPC services).
-    let handle = Executor::spawn_with_metrics_producer_key_callers_and_artifact_store(
-        download_policy,
-        execute_policy,
-        queue_size,
-        supported_dtypes,
-        metrics.clone(),
-        Arc::new(producer_key),
-        FetchCallerPolicy::new(trusted_caller_public_keys),
-        ArtifactStoreConfig::Fs(artifact_store_path),
-    )
+pub(super) struct NodeConfig {
+    pub(super) port: Option<u16>,
+    pub(super) execute_policy: ExecutePolicy,
+    pub(super) queue_size: usize,
+    pub(super) preload_models: Vec<String>,
+    pub(super) build: String,
+    pub(super) graffiti: Vec<u8>,
+    pub(super) supported_dtypes: Vec<Dtype>,
+    pub(super) trusted_caller_public_keys: Vec<PublicKey>,
+    pub(super) artifact_store_path: PathBuf,
+    pub(super) secret_key: SecretKey,
+    pub(super) producer_key: ProducerSigningKey,
+    pub(super) metrics: Arc<ExecutorMetrics>,
+}
+
+pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
+    let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        execute_policy: config.execute_policy,
+        queue_capacity: config.queue_size,
+        supported_dtypes: config.supported_dtypes,
+        metrics: config.metrics.clone(),
+        producer_key: Arc::new(config.producer_key),
+        fetch_caller_policy: FetchCallerPolicy::new(config.trusted_caller_public_keys),
+        artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
+    })
     .await
     .context("failed to spawn executor")?;
-    for model in preload_models {
+    for model in &config.preload_models {
         handle
             .load_model_metadata(model.clone())
             .await
@@ -104,9 +102,9 @@ pub(super) async fn spawn_node(
 
     let alpns = served_alpns();
     let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
+        .secret_key(config.secret_key)
         .alpns(alpns.clone());
-    if let Some(port) = port {
+    if let Some(port) = config.port {
         builder = builder
             .bind_addr(format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?)
             .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
@@ -135,7 +133,8 @@ pub(super) async fn spawn_node(
     //    and graffiti so introspection (`hellas rpc`) returns real data.
     //    `NodeHandlerImpl: Clone` (its fields are Arc/Copy), so we
     //    clone per-connection rather than wrap in Arc<dyn>.
-    let node_handler = NodeHandlerImpl::new(node_id, build, graffiti, directory.clone());
+    let node_handler =
+        NodeHandlerImpl::new(node_id, config.build, config.graffiti, directory.clone());
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.

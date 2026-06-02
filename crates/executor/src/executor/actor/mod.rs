@@ -11,7 +11,7 @@ use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::policy::ExecutePolicy;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -35,153 +35,85 @@ pub struct Executor {
     pub(super) supported_dtypes: Vec<Dtype>,
 }
 
-impl Executor {
-    pub fn spawn(
-        download_policy: DownloadPolicy,
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-    ) -> Result<ExecutorHandle, ExecutorError> {
-        Self::spawn_with_metrics(
-            download_policy,
-            execute_policy,
-            queue_capacity,
-            supported_dtypes,
-            Arc::new(ExecutorMetrics::default()),
-        )
-    }
+pub struct ExecutorSpawnConfig {
+    pub execute_policy: ExecutePolicy,
+    pub queue_capacity: usize,
+    pub supported_dtypes: Vec<Dtype>,
+    pub metrics: Arc<ExecutorMetrics>,
+    pub producer_key: Arc<ProducerSigningKey>,
+    pub fetch_caller_policy: FetchCallerPolicy,
+    pub artifact_store: ArtifactStoreConfig,
+}
 
+struct ExecutorRuntimeConfig {
+    execute_policy: ExecutePolicy,
+    queue_capacity: usize,
+    supported_dtypes: Vec<Dtype>,
+    metrics: Arc<ExecutorMetrics>,
+    producer_key: Arc<ProducerSigningKey>,
+    fetch_caller_policy: FetchCallerPolicy,
+    artifacts: SymbolicArtifactStore,
+    fetch_store: FetchTranscriptStoreBackend,
+}
+
+impl Executor {
     pub fn spawn_with_producer_key(
-        download_policy: DownloadPolicy,
         execute_policy: ExecutePolicy,
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
     ) -> Result<ExecutorHandle, ExecutorError> {
-        Self::spawn_with_metrics_and_producer_key(
-            download_policy,
+        let producer_key = Arc::new(producer_key);
+        Self::spawn_runtime(ExecutorRuntimeConfig {
             execute_policy,
             queue_capacity,
             supported_dtypes,
-            Arc::new(ExecutorMetrics::default()),
-            Arc::new(producer_key),
-        )
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: producer_key.clone(),
+            fetch_caller_policy: FetchCallerPolicy::single(producer_key.public_key()),
+            artifacts: SymbolicArtifactStore::memory(),
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+        })
     }
 
-    pub fn spawn_with_metrics(
-        download_policy: DownloadPolicy,
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-        metrics: Arc<ExecutorMetrics>,
+    pub async fn spawn_configured(
+        config: ExecutorSpawnConfig,
     ) -> Result<ExecutorHandle, ExecutorError> {
-        Self::spawn_with_metrics_and_producer_key(
-            download_policy,
-            execute_policy,
-            queue_capacity,
-            supported_dtypes,
-            metrics,
-            Arc::new(ProducerSigningKey::generate()),
-        )
-    }
-
-    pub fn spawn_with_metrics_and_producer_key(
-        _download_policy: DownloadPolicy,
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-        metrics: Arc<ExecutorMetrics>,
-        producer_key: Arc<ProducerSigningKey>,
-    ) -> Result<ExecutorHandle, ExecutorError> {
-        Self::spawn_with_metrics_producer_key_and_artifacts(
-            execute_policy,
-            queue_capacity,
-            supported_dtypes,
-            metrics,
-            producer_key.clone(),
-            FetchCallerPolicy::single(producer_key.public_key()),
-            SymbolicArtifactStore::memory(),
-            FetchTranscriptStoreBackend::memory(),
-        )
-    }
-
-    pub async fn spawn_with_metrics_and_producer_key_and_artifact_store(
-        _download_policy: DownloadPolicy,
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-        metrics: Arc<ExecutorMetrics>,
-        producer_key: Arc<ProducerSigningKey>,
-        artifact_store: ArtifactStoreConfig,
-    ) -> Result<ExecutorHandle, ExecutorError> {
-        let fetch_store = fetch_store_from_artifact_config(&artifact_store);
-        let artifacts = SymbolicArtifactStore::open(artifact_store).await?;
-        Self::spawn_with_metrics_producer_key_and_artifacts(
-            execute_policy,
-            queue_capacity,
-            supported_dtypes,
-            metrics,
-            producer_key.clone(),
-            FetchCallerPolicy::single(producer_key.public_key()),
+        let fetch_store = fetch_store_from_artifact_config(&config.artifact_store);
+        let artifacts = SymbolicArtifactStore::open(config.artifact_store).await?;
+        Self::spawn_runtime(ExecutorRuntimeConfig {
+            execute_policy: config.execute_policy,
+            queue_capacity: config.queue_capacity,
+            supported_dtypes: config.supported_dtypes,
+            metrics: config.metrics,
+            producer_key: config.producer_key,
+            fetch_caller_policy: config.fetch_caller_policy,
             artifacts,
             fetch_store,
-        )
+        })
     }
 
-    pub async fn spawn_with_metrics_producer_key_callers_and_artifact_store(
-        _download_policy: DownloadPolicy,
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-        metrics: Arc<ExecutorMetrics>,
-        producer_key: Arc<ProducerSigningKey>,
-        fetch_caller_policy: FetchCallerPolicy,
-        artifact_store: ArtifactStoreConfig,
-    ) -> Result<ExecutorHandle, ExecutorError> {
-        let fetch_store = fetch_store_from_artifact_config(&artifact_store);
-        let artifacts = SymbolicArtifactStore::open(artifact_store).await?;
-        Self::spawn_with_metrics_producer_key_and_artifacts(
-            execute_policy,
-            queue_capacity,
-            supported_dtypes,
-            metrics,
-            producer_key,
-            fetch_caller_policy,
-            artifacts,
-            fetch_store,
-        )
-    }
-
-    fn spawn_with_metrics_producer_key_and_artifacts(
-        execute_policy: ExecutePolicy,
-        queue_capacity: usize,
-        supported_dtypes: Vec<Dtype>,
-        metrics: Arc<ExecutorMetrics>,
-        producer_key: Arc<ProducerSigningKey>,
-        fetch_caller_policy: FetchCallerPolicy,
-        artifacts: SymbolicArtifactStore,
-        fetch_store: FetchTranscriptStoreBackend,
-    ) -> Result<ExecutorHandle, ExecutorError> {
+    fn spawn_runtime(config: ExecutorRuntimeConfig) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
-            !supported_dtypes.is_empty(),
+            !config.supported_dtypes.is_empty(),
             "executor must support at least one dtype"
         );
-        let preferred_dtype = supported_dtypes[0];
+        let preferred_dtype = config.supported_dtypes[0];
         let (tx, rx) = mpsc::unbounded_channel();
         backend::create_backend()?;
         let executor = Self {
             rx,
             store: ExecutorState::new(),
-            artifacts,
+            artifacts: config.artifacts,
             pending_executions: VecDeque::new(),
-            queue_capacity,
+            queue_capacity: config.queue_capacity,
             models: HashMap::new(),
             worker: ExecuteWorker::spawn(tx.clone()),
-            execute_policy,
-            metrics,
-            producer_key,
-            fetch_state: FetchStateMachine::new(fetch_store, fetch_caller_policy),
-            supported_dtypes,
+            execute_policy: config.execute_policy,
+            metrics: config.metrics,
+            producer_key: config.producer_key,
+            fetch_state: FetchStateMachine::new(config.fetch_store, config.fetch_caller_policy),
+            supported_dtypes: config.supported_dtypes,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {
