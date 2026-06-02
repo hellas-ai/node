@@ -1,8 +1,10 @@
 use async_stream::try_stream;
 use futures::StreamExt;
+use hellas_wire_adaptors::BackendError;
+use thiserror::Error;
 
-use crate::execution::Outcome;
-use hellas_rpc::model::TextOutputDecoder;
+use crate::execution::{ExecutionError, Outcome};
+use hellas_rpc::model::{ModelAssetsError, TextOutputDecoder};
 
 use super::super::state::PreparedGeneration;
 
@@ -12,9 +14,25 @@ pub(super) enum GenerationEvent {
     Done(Outcome),
 }
 
+#[derive(Debug, Error)]
+pub(super) enum GenerationError {
+    #[error("Inference error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error("Inference error: {0}")]
+    Decode(#[from] ModelAssetsError),
+    #[error("execution stream ended without terminal outcome")]
+    MissingTerminalOutcome,
+}
+
+impl From<GenerationError> for BackendError {
+    fn from(error: GenerationError) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
 pub(super) fn generation_stream(
     generation: PreparedGeneration,
-) -> impl futures::Stream<Item = anyhow::Result<GenerationEvent>> + Send {
+) -> impl futures::Stream<Item = Result<GenerationEvent, GenerationError>> + Send {
     let PreparedGeneration {
         prepared,
         assets,
@@ -39,6 +57,6 @@ pub(super) fn generation_stream(
                 }
             }
         }
-        Err(anyhow::anyhow!("execution stream ended without terminal outcome"))?;
+        Err(GenerationError::MissingTerminalOutcome)?;
     }
 }

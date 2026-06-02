@@ -158,9 +158,7 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
 fn backend_error(surface: &str, error: BackendError) -> Response {
     let status = match error {
         BackendError::Rejected { .. } => StatusCode::BAD_REQUEST,
-        BackendError::Execution { .. } | BackendError::Stream { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        BackendError::Failed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, format!("{surface}: {error}"))
 }
