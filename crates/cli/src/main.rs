@@ -174,6 +174,18 @@ enum Commands {
         /// Repeat or comma-separate compressed secp256k1 keys as hex.
         #[arg(long = "trusted-caller-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
         trusted_caller_public_keys: Vec<hellas_core::PublicKey>,
+        /// Enable OpenAI Responses Fetch execution over the node's p2p Fetch service.
+        #[arg(long = "fetch-openai-responses")]
+        fetch_openai_responses: bool,
+        /// OpenAI-compatible Responses endpoint used by Fetch execution.
+        #[arg(
+            long = "fetch-openai-responses-url",
+            default_value = "https://api.openai.com/v1/responses"
+        )]
+        fetch_openai_responses_url: String,
+        /// Environment variable containing the OpenAI API key for Fetch execution.
+        #[arg(long = "fetch-openai-api-key-env", default_value = "OPENAI_API_KEY")]
+        fetch_openai_api_key_env: String,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -420,6 +432,9 @@ async fn main() {
             graffiti,
             dtype,
             trusted_caller_public_keys,
+            fetch_openai_responses,
+            fetch_openai_responses_url,
+            fetch_openai_api_key_env,
         } => {
             let producer_key =
                 match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
@@ -439,6 +454,9 @@ async fn main() {
                 graffiti,
                 dtype,
                 trusted_caller_public_keys,
+                fetch_openai_responses,
+                fetch_openai_responses_url,
+                fetch_openai_api_key_env,
                 secret_key,
                 producer_key,
             })
@@ -975,6 +993,37 @@ mod tests {
         let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f16"]).unwrap();
         match cli.command {
             Commands::Serve { dtype, .. } => assert_eq!(dtype, vec![Dtype::F16]),
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[cfg(feature = "hellas-executor")]
+    #[test]
+    fn serve_accepts_openai_fetch_config() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "serve",
+            "--fetch-openai-responses",
+            "--fetch-openai-responses-url",
+            "https://example.test/v1/responses",
+            "--fetch-openai-api-key-env",
+            "TEST_OPENAI_KEY",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve {
+                fetch_openai_responses,
+                fetch_openai_responses_url,
+                fetch_openai_api_key_env,
+                ..
+            } => {
+                assert!(fetch_openai_responses);
+                assert_eq!(
+                    fetch_openai_responses_url,
+                    "https://example.test/v1/responses"
+                );
+                assert_eq!(fetch_openai_api_key_env, "TEST_OPENAI_KEY");
+            }
             _ => panic!("expected serve command"),
         }
     }

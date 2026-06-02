@@ -1,11 +1,10 @@
+use crate::commands::openai_responses_stream::ResponsesSseProjector;
 use axum::body::Bytes;
 use futures::StreamExt;
-use hellas_wire_adaptors::openai::responses::{
-    OpenAiResponsesAdaptor, ParsedResponseRequest, ResponsesIngressState,
-};
+use hellas_wire_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
 use hellas_wire_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
-    SseDecoder, WireAdaptor, WireIngress, WireStreamEvent,
+    WireAdaptor,
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -73,7 +72,7 @@ impl ExecutionBackend for ResponsesProxy {
                 )));
             }
             Ok(BackendStream::new(
-                responses_event_stream(upstream, adaptor, parsed),
+                responses_event_stream(upstream, parsed),
                 None,
             ))
         })
@@ -103,13 +102,11 @@ fn forwarded_body(request: &BackendRequest) -> Result<Bytes, BackendError> {
 
 fn responses_event_stream(
     upstream: reqwest::Response,
-    adaptor: OpenAiResponsesAdaptor,
     parsed: ParsedResponseRequest,
 ) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send + 'static {
     async_stream::stream! {
         let mut chunks = upstream.bytes_stream();
-        let mut decoder = SseDecoder::new();
-        let mut state = adaptor.initial_ingress_state(&parsed);
+        let mut projector = ResponsesSseProjector::new(parsed);
 
         while let Some(chunk) = chunks.next().await {
             let chunk = match chunk {
@@ -119,14 +116,7 @@ fn responses_event_stream(
                     return;
                 }
             };
-            let frames = match decoder.push(&chunk) {
-                Ok(frames) => decode_sse_frames(&adaptor, &parsed, &mut state, frames),
-                Err(err) => {
-                    yield Err(BackendError::failed(err.to_string()));
-                    return;
-                }
-            };
-            let events = match frames {
+            let events = match projector.push(&chunk) {
                 Ok(events) => events,
                 Err(err) => {
                     yield Err(err);
@@ -138,14 +128,7 @@ fn responses_event_stream(
             }
         }
 
-        let frames = match decoder.finish() {
-            Ok(frames) => decode_sse_frames(&adaptor, &parsed, &mut state, frames),
-            Err(err) => {
-                yield Err(BackendError::failed(err.to_string()));
-                return;
-            }
-        };
-        let events = match frames {
+        let events = match projector.finish() {
             Ok(events) => events,
             Err(err) => {
                 yield Err(err);
@@ -156,23 +139,6 @@ fn responses_event_stream(
             yield Ok(event);
         }
     }
-}
-
-fn decode_sse_frames(
-    adaptor: &OpenAiResponsesAdaptor,
-    parsed: &ParsedResponseRequest,
-    state: &mut ResponsesIngressState,
-    frames: Vec<WireStreamEvent>,
-) -> Result<Vec<OutputEvent>, BackendError> {
-    let mut output = Vec::new();
-    for frame in frames {
-        output.extend(
-            adaptor
-                .decode_stream_event(parsed, state, frame)
-                .map_err(|err| BackendError::failed(err.to_string()))?,
-        );
-    }
-    Ok(output)
 }
 
 #[cfg(test)]
