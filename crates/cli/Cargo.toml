@@ -59,14 +59,11 @@ iroh-mdns-address-lookup = "0.2"
 iroh-metrics = { version = "1.0.0-rc.0", default-features = false, features = [
     "metrics",
 ], optional = true }
-minijinja = "2"
-minijinja-contrib = { version = "2", features = ["pycompat"] }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 prometheus-client = "0.24"
 qrcode = { version = "0.14", default-features = false }
-rand = "0.9"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -78,8 +75,3 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
-
-# dev-dependencies: enable `hellas-pb/compile` when regenerating checked-in protos.
-[dev-dependencies]
-# hellas-pb = { workspace = true, features = ["compile"] }
-test-log = { version = "0.2", default-features = false, features = ["trace"] }
