@@ -4,11 +4,11 @@ use crate::{
     app::{MarshalMailbox, Mempool},
     execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
     indexer::Indexer,
+    light_client::{LatestBlock, LightClient, QueryError},
 };
 use commonware_consensus::{Heightable, marshal::Identifier as MarshalIdentifier};
 use commonware_cryptography::{Digestible, sha256::Digest};
 use hellas_kernel::domain::{Address, Coin, Encode, ObjectId, Transaction};
-use hellas_rpc::{LatestBlock, LightClient, QueryError};
 
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]

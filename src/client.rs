@@ -5,6 +5,8 @@ use crate::pb::hellas::light_client_client::LightClientClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::*;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::{LatestBlock, LightClient, QueryError};
+#[cfg(not(target_arch = "wasm32"))]
 use hellas_kernel::domain::{
     Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
     WebAuthnSignature as DomainWebAuthnSignature,
@@ -12,8 +14,6 @@ use hellas_kernel::domain::{
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_rpc::mux::MuxGrpcService;
 use hellas_rpc::ws_mux;
-#[cfg(not(target_arch = "wasm32"))]
-use hellas_rpc::{LatestBlock, LightClient, QueryError};
 #[cfg(not(target_arch = "wasm32"))]
 use p256::ecdsa::Signature as P256Signature;
 

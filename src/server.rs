@@ -1,4 +1,5 @@
 use crate::{
+    ConsensusActivity, LatestBlock, LightClient as LightClientApi, ProposalInfo,
     methods::LIGHT_CLIENT_METHODS,
     pb::hellas::{
         self as pb, ActivityEvent, CoinEntry, FinalizationEvent, GetCoinResponse,
@@ -9,15 +10,13 @@ use crate::{
         light_client_server, submit_tx_request,
     },
 };
-use commonware_codec::DecodeExt as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use hellas_kernel::List;
 use hellas_kernel::domain::{
-    Address, Coin, Digest, Encode, MAX_MERGE_INPUTS, ObjectId, Transaction, UserPublicKey,
-    UserSignature, WebAuthnSignature,
+    Address, Coin, DecodeExt, Digest, Encode, MAX_MERGE_INPUTS, ObjectId, Transaction,
+    UserPublicKey, UserSignature, WebAuthnSignature,
 };
 use hellas_rpc::mux::MuxServiceDispatch;
-use hellas_rpc::{ConsensusActivity, LightClient as LightClientApi, ProposalInfo};
 use p256::ecdsa::Signature as P256Signature;
 use std::{io, net::SocketAddr, pin::Pin, sync::Arc};
 use tokio::{
@@ -377,7 +376,7 @@ fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
     }
 }
 
-fn latest_block_response(latest: Option<hellas_rpc::LatestBlock>) -> GetLatestBlockResponse {
+fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
     match latest {
         Some(latest) => GetLatestBlockResponse {
             height: Some(latest.height),

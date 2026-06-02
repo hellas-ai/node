@@ -34,14 +34,13 @@ use hellas_chain::config::{
 };
 use hellas_chain::rpc::LocalLightClient;
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, Indexer, Mempool, UtxoDb,
+    ActivityReporter, Application, ApplicationConfig, Indexer, LightClient as _, Mempool, UtxoDb,
     spawn_light_client_server, utxo_db_config,
 };
 use hellas_kernel::domain::{
     Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
     UserPublicKey,
 };
-use hellas_rpc::LightClient as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use p256::ecdsa::SigningKey as UserSigningKey;

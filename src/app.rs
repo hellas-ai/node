@@ -7,6 +7,7 @@ use crate::execution::{
     store::{UtxoDatabase, UtxoSyncTarget, empty_state},
 };
 use crate::indexer::Indexer;
+use crate::light_client::{ConsensusActivity, ProposalInfo};
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
@@ -26,7 +27,6 @@ use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::{SystemTimeExt, non_empty_range};
 use futures::{Stream, StreamExt};
 use hellas_kernel::domain::{Activity, Address, MAX_TXS_PER_BLOCK, PublicKey, Scheme, Transaction};
-use hellas_rpc::{ConsensusActivity, ProposalInfo};
 use prometheus_client::metrics::gauge::Gauge;
 use rand::Rng;
 use std::{collections::VecDeque, sync::Arc};

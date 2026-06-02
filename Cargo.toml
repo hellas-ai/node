@@ -17,8 +17,8 @@ client = [
     "dep:hellas-kernel",
     "dep:hellas-rpc",
     "dep:p256",
+    "dep:thiserror",
     "hellas-kernel/domain",
-    "hellas-rpc/light-client",
     "hellas-rpc/mux-client",
 ]
 compile = ["dep:tonic-prost-build"]
@@ -57,7 +57,6 @@ node = [
     "dep:tracing-subscriber",
     "dep:hellas-kernel",
     "hellas-kernel/consensus",
-    "hellas-rpc/light-client",
 ]
 server = [
     "api",
@@ -65,12 +64,12 @@ server = [
     "dep:hellas-kernel",
     "dep:hellas-rpc",
     "dep:p256",
+    "dep:thiserror",
     "dep:tokio",
     "dep:tokio-stream",
     "dep:tokio-tungstenite",
     "dep:tracing",
     "hellas-kernel/domain",
-    "hellas-rpc/light-client",
     "hellas-rpc/mux-server",
     "tokio/net",
     "tokio/rt",
