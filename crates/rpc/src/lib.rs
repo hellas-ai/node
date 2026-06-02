@@ -11,9 +11,13 @@ pub mod error;
 pub mod model;
 
 pub mod call;
+#[cfg(feature = "fetch")]
+pub mod fetch;
 pub mod peers;
 pub mod serve;
 pub mod spec;
+#[cfg(feature = "execute")]
+pub mod stream;
 pub use spec::ModelSpec;
 
 #[cfg(feature = "node")]
@@ -24,7 +28,7 @@ pub mod provenance;
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is
 /// doc-hidden; downstream consumers should reach for the per-service
-/// re-exports under `pb::{courtesy, swarm, execute, opaque, symbolic}` or
+/// re-exports under `pb::{courtesy, swarm, execute, fetch, symbolic}` or
 /// the per-service marker/trait modules under `pb::services::*`.
 #[doc(hidden)]
 pub mod pb;

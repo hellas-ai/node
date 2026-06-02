@@ -1,14 +1,19 @@
 use crate::executor::ExecuteOutcome;
+use crate::fetch::{FetchStateError, FetchTranscript};
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
-use hellas_core::{Digest, Opaque, SignedReceipt, canonical_dag_cbor};
+use hellas_core::{
+    Digest, InputCommitment, OutputEventEnvelope, SignedReceipt, canonical_dag_cbor,
+};
 use hellas_core::{Symbolic, SymbolicOutput};
 use hellas_rpc::ExecutorError;
+use hellas_rpc::error::StateError;
+use hellas_rpc::fetch::{build_output_events, output_body};
 use hellas_rpc::pb::execute::{
-    FinishStatus, ReceiptEnvelope as PbReceiptEnvelope, RunTicketRequest, WorkEvent, WorkFinished,
-    work_event,
+    FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
 };
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::stream::output_event_to_pb;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +32,21 @@ impl Executor {
         request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let request_commitment = request.request_commitment;
+        let request_commitment_id: [u8; 32] =
+            request_commitment.as_slice().try_into().map_err(|_| {
+                ExecutorError::State(hellas_rpc::error::StateError::QuoteNotFound(format!(
+                    "invalid request_commitment length {}",
+                    request_commitment.len()
+                )))
+            })?;
+        let input_commitment =
+            InputCommitment::from_digest(Digest::from_bytes(request_commitment_id));
+        if let Some(outcome) = self
+            .replay_fetch_execution(input_commitment, request_commitment_id)
+            .await?
+        {
+            return Ok(outcome);
+        }
         let stream_batch_size = 1;
         self.store.prune_expired_quotes(Instant::now());
         let quote = self
@@ -98,34 +118,50 @@ impl Executor {
                     events: receiver,
                 })
             }
-            QuoteKind::Opaque { request, output } => {
+            QuoteKind::Fetch { output } => {
                 let provenance = ExecutionProvenance {
-                    commitment_id: *quote.request_commitment.as_bytes(),
+                    commitment_id: request_commitment_id,
+                };
+                let _fetch_quote = match self.fetch_state.start(input_commitment) {
+                    Ok(quote) => quote,
+                    Err(FetchStateError::AlreadyCompleted) => {
+                        if let Some(outcome) = self
+                            .replay_fetch_execution(input_commitment, request_commitment_id)
+                            .await?
+                        {
+                            return Ok(outcome);
+                        }
+                        return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                    }
+                    Err(err) => return Err(fetch_execute_error(err)),
                 };
                 let model_id = quote.model_id.clone();
                 let execution_id = new_execution_id();
                 let total_units = output.as_bytes().len() as u64;
-                let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &self.producer_key)
-                    .map_err(|err| {
-                        ExecutorError::WeightsError(format!("opaque receipt signing failed: {err}"))
-                    })?;
-                let receipt_dag_cbor = canonical_dag_cbor(&receipt).map_err(|err| {
-                    ExecutorError::WeightsError(format!("opaque receipt encoding failed: {err}"))
-                })?;
-                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
-                sender
-                    .send(Ok(WorkEvent {
-                        kind: Some(work_event::Kind::Finished(WorkFinished {
-                            output: output.into_bytes(),
-                            receipt: Some(PbReceiptEnvelope {
-                                dag_cbor: receipt_dag_cbor,
-                            }),
-                            status: FinishStatus::EndOfSequence as i32,
-                            total_units,
-                        })),
-                    }))
-                    .await
-                    .map_err(|_| ExecutorError::ChannelClosed)?;
+                let output_events =
+                    build_output_events(input_commitment, output.as_bytes(), &self.producer_key)
+                        .map_err(|err| {
+                            ExecutorError::WeightsError(format!(
+                                "fetch output transcript failed: {err}"
+                            ))
+                        })?;
+                let transcript = match self.fetch_state.complete_output(
+                    input_commitment,
+                    output_events,
+                    &self.producer_key.public_key(),
+                ) {
+                    Ok(transcript) => transcript,
+                    Err(err) => {
+                        let _ = self.fetch_state.fail(input_commitment, err.to_string());
+                        return Err(fetch_execute_error(err));
+                    }
+                };
+                let outcome = fetch_finished_outcome(
+                    provenance,
+                    transcript.output_events(),
+                    FinishStatus::EndOfSequence,
+                )
+                .await?;
 
                 self.metrics.record_execution_started(
                     &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
@@ -139,15 +175,34 @@ impl Executor {
                     %execution_id,
                     request_commitment = %format_request_commitment(&request_commitment),
                     total_units,
-                    "accepted opaque execution"
+                    "accepted fetch execution"
                 );
 
-                Ok(ExecuteOutcome {
-                    provenance,
-                    events: receiver,
-                })
+                Ok(outcome)
             }
         }
+    }
+
+    async fn replay_fetch_execution(
+        &self,
+        input_commitment: InputCommitment,
+        request_commitment_id: [u8; 32],
+    ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
+        let producer_key = self.producer_key.public_key();
+        let transcript = match self
+            .fetch_state
+            .replay_completed(input_commitment, &producer_key)
+        {
+            Ok(transcript) => transcript,
+            Err(FetchStateError::NotFound | FetchStateError::NotCompleted) => return Ok(None),
+            Err(err) => return Err(fetch_execute_error(err)),
+        };
+        let outcome = fetch_transcript_outcome(request_commitment_id, &transcript).await?;
+        info!(
+            request_commitment = %format_request_commitment(input_commitment.as_bytes()),
+            "replayed fetch execution"
+        );
+        Ok(Some(outcome))
     }
 
     fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
@@ -272,7 +327,136 @@ fn format_request_commitment(bytes: &[u8]) -> String {
         .unwrap_or_else(|_| format!("invalid:{}bytes", bytes.len()))
 }
 
+async fn fetch_transcript_outcome(
+    request_commitment_id: [u8; 32],
+    transcript: &FetchTranscript,
+) -> Result<ExecuteOutcome, ExecutorError> {
+    fetch_finished_outcome(
+        ExecutionProvenance {
+            commitment_id: request_commitment_id,
+        },
+        transcript.output_events(),
+        FinishStatus::EndOfSequence,
+    )
+    .await
+}
+
+async fn fetch_finished_outcome(
+    provenance: ExecutionProvenance,
+    output_events: &[OutputEventEnvelope],
+    status: FinishStatus,
+) -> Result<ExecuteOutcome, ExecutorError> {
+    let output = output_body(output_events).map_err(|err| {
+        ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
+    })?;
+    let total_units = output.as_bytes().len() as u64;
+    let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
+    let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+    sender
+        .send(Ok(WorkEvent {
+            kind: Some(work_event::Kind::Finished(WorkFinished {
+                output: output.into_bytes(),
+                receipt: None,
+                status: status as i32,
+                total_units,
+                output_events: pb_output_events,
+            })),
+        }))
+        .await
+        .map_err(|_| ExecutorError::ChannelClosed)?;
+
+    Ok(ExecuteOutcome {
+        provenance,
+        events: receiver,
+    })
+}
+
+fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
+    match err {
+        FetchStateError::NotFound => {
+            ExecutorError::State(StateError::QuoteNotFound(err.to_string()))
+        }
+        FetchStateError::AlreadyExists
+        | FetchStateError::AlreadyRunning
+        | FetchStateError::NotRunning
+        | FetchStateError::NotCompleted
+        | FetchStateError::AlreadyCompleted
+        | FetchStateError::Failed => {
+            ExecutorError::State(StateError::QuoteExpired(err.to_string()))
+        }
+        FetchStateError::Store(err) => {
+            ExecutorError::ArtifactStore(format!("fetch transcript store error: {err}"))
+        }
+        FetchStateError::QuoteMismatch
+        | FetchStateError::UnauthorizedCaller
+        | FetchStateError::Verify(_)
+        | FetchStateError::Input(_) => {
+            ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
+        }
+    }
+}
+
 enum StartExecutionError {
     Busy(Box<ExecuteJob>),
     Closed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Executor;
+    use catgrad::prelude::Dtype;
+    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::fetch::build_input_events;
+    use hellas_rpc::pb::fetch::FetchRequest;
+    use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+    use hellas_rpc::stream::input_event_to_pb;
+
+    fn key() -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
+    }
+
+    fn fetch_request(key: &ProducerSigningKey, body: &[u8]) -> FetchRequest {
+        let events = build_input_events("echo", "run", body, key).unwrap();
+        FetchRequest {
+            service: "echo".to_string(),
+            method: "run".to_string(),
+            input: events.iter().map(input_event_to_pb).collect(),
+        }
+    }
+
+    async fn run_one(handle: &crate::ExecutorHandle, request_commitment: Vec<u8>) -> WorkFinished {
+        let mut outcome = handle
+            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .await
+            .unwrap()
+            .events;
+        let event = outcome.recv().await.unwrap().unwrap();
+        match event.kind.unwrap() {
+            work_event::Kind::Finished(finished) => finished,
+            other => panic!("expected finished event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_execution_replays_completed_transcript() {
+        let signing_key = key();
+        let request = fetch_request(&signing_key, br#"{"hello":"world"}"#);
+        let handle = Executor::spawn_with_producer_key(
+            DownloadPolicy::Eager,
+            ExecutePolicy::Eager,
+            1,
+            vec![Dtype::F32],
+            key(),
+        )
+        .unwrap();
+        let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+
+        let first = run_one(&handle, ticket.request_commitment.clone()).await;
+        let replayed = run_one(&handle, ticket.request_commitment).await;
+
+        assert_eq!(first.output, br#"{"hello":"world"}"#);
+        assert_eq!(replayed.output, first.output);
+        assert_eq!(replayed.output_events, first.output_events);
+    }
 }

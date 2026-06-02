@@ -25,11 +25,11 @@ pub mod hellas {
         }
     }
 
-    #[cfg(feature = "opaque")]
+    #[cfg(feature = "fetch")]
     #[allow(dead_code)]
-    pub mod opaque {
+    pub mod fetch {
         pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/hellas.opaque.v1.rs"));
+            include!(concat!(env!("OUT_DIR"), "/hellas.fetch.v1.rs"));
         }
     }
 
@@ -62,10 +62,10 @@ pub mod symbolic {
     pub use crate::pb::hellas::symbolic::v1::*;
 }
 
-/// Re-exports of `hellas.opaque.v1`.
-#[cfg(feature = "opaque")]
-pub mod opaque {
-    pub use crate::pb::hellas::opaque::v1::*;
+/// Re-exports of `hellas.fetch.v1`.
+#[cfg(feature = "fetch")]
+pub mod fetch {
+    pub use crate::pb::hellas::fetch::v1::*;
 }
 
 /// Re-exports of `hellas.courtesy.v1`.

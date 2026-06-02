@@ -3,7 +3,7 @@
 //!
 //! Wire form: 32-byte digest carried as a `-bin` metadata value in
 //! `hellas_wire::Metadata`. Per the gRPC convention, binary metadata
-//! keys end with `-bin` and the value is opaque bytes (decoded as such
+//! keys end with `-bin` and the value is raw bytes (decoded as such
 //! by gRPC peers via base64 in HTTP/2 land, but the wire-layer keeps
 //! it raw).
 

@@ -2,7 +2,7 @@
 //!
 //! The fundamental shape: every layer returns
 //! `impl Stream<Item = Result<ExecutionEvent, ExecutionError>>` or
-//! `impl Stream<Item = Result<OpaqueExecutionEvent, ExecutionError>>`. Drop-cancellation
+//! `impl Stream<Item = Result<FetchExecutionEvent, ExecutionError>>`. Drop-cancellation
 //! propagates naturally — when a consumer drops the stream, the generator
 //! is dropped, which drops every in-flight future, which drops every
 //! resource, which (for local executions) drops the per-execution
@@ -34,24 +34,27 @@ use futures::stream::{BoxStream, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    DagCborDecodeError, DeliveryOutput, DeliveryRequest, Digest, JsonBytes,
-    OpaqueRequest as CoreOpaqueRequest, SchemeId, SignedReceipt as CoreSignedReceipt, VerifyError,
-    decode_dag_cbor, verify_delivery, verify_receipt,
+    DagCborDecodeError, Digest, SchemeId, SignedReceipt as CoreSignedReceipt, VerifyError,
+    decode_dag_cbor, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
+use hellas_rpc::fetch::{
+    FetchInput, FetchProtocolError, verify_input_events, verify_output_events,
+};
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
 use hellas_rpc::pb::execute::{
     self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
 };
-use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
-use hellas_rpc::services::opaque::Opaque;
+use hellas_rpc::services::fetch::Fetch;
+use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
@@ -98,32 +101,21 @@ pub enum ExecutionError {
         #[source]
         source: VerifyError,
     },
-    #[error("opaque receipt verification failed: {source}")]
-    OpaqueReceipt {
-        #[source]
-        source: VerifyError,
-    },
     #[error("unknown finish status {value}")]
     UnknownFinishStatus { value: i32 },
     #[error("wire finish status is unspecified")]
     UnspecifiedFinishStatus,
-    #[error("symbolic execution returned an opaque receipt")]
+    #[error("symbolic execution returned a fetch receipt")]
     SymbolicReceiptExpected,
-    #[error("opaque execution returned a symbolic receipt")]
-    OpaqueReceiptExpected,
-    #[error("opaque service must not be empty")]
-    EmptyOpaqueService,
-    #[error("opaque method must not be empty")]
-    EmptyOpaqueMethod,
-    #[error("opaque payload must be UTF-8 JSON: {source}")]
-    OpaquePayloadJson {
+    #[error("fetch stream envelope decode failed: {source}")]
+    FetchStreamEnvelope {
         #[source]
-        source: serde_json::Error,
+        source: hellas_rpc::stream::StreamEnvelopeError,
     },
-    #[error("opaque output must be UTF-8 JSON: {source}")]
-    OpaqueOutputJson {
+    #[error("fetch transcript verification failed: {source}")]
+    FetchTranscript {
         #[source]
-        source: serde_json::Error,
+        source: FetchProtocolError,
     },
 }
 
@@ -342,14 +334,14 @@ pub enum StopReason {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
-pub enum OpaqueExecutionEvent {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchExecutionEvent {
     Chunk { position: u64, bytes: Vec<u8> },
-    Done(OpaqueOutcome),
+    Done(FetchOutcome),
 }
 
-#[derive(Debug, Clone)]
-pub enum OpaqueOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
     Completed { output: Vec<u8> },
     Failed { position: u64, error: String },
 }
@@ -522,14 +514,14 @@ impl ExecutionRequest {
     }
 }
 
-pub struct OpaqueExecutionRequest {
+pub struct FetchExecutionRequest {
     runtime: ExecutionRuntime,
-    request: PbOpaqueRequest,
+    request: PbFetchRequest,
     route: ExecutionRoute,
 }
 
-impl OpaqueExecutionRequest {
-    pub fn new(runtime: ExecutionRuntime, request: PbOpaqueRequest, route: ExecutionRoute) -> Self {
+impl FetchExecutionRequest {
+    pub fn new(runtime: ExecutionRuntime, request: PbFetchRequest, route: ExecutionRoute) -> Self {
         Self {
             runtime,
             request,
@@ -544,13 +536,13 @@ impl OpaqueExecutionRequest {
         return true;
     }
 
-    pub async fn prepare(self) -> ExecutionResult<PreparedOpaqueExecution> {
-        Ok(PreparedOpaqueExecution {
-            route: OpaquePreparedRoute::prepare(&self.runtime, &self.request, &self.route).await?,
+    pub async fn prepare(self) -> ExecutionResult<PreparedFetchExecution> {
+        Ok(PreparedFetchExecution {
+            route: FetchPreparedRoute::prepare(&self.runtime, &self.request, &self.route).await?,
         })
     }
 
-    pub fn stream(self) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
         try_stream! {
             let prepared = self.prepare().await?;
             let inner = prepared.stream();
@@ -571,12 +563,12 @@ pub struct PreparedExecution {
     shadow: Option<PreparedRoute>,
 }
 
-pub struct PreparedOpaqueExecution {
-    route: OpaquePreparedRoute,
+pub struct PreparedFetchExecution {
+    route: FetchPreparedRoute,
 }
 
-impl PreparedOpaqueExecution {
-    pub fn stream(self) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
+impl PreparedFetchExecution {
+    pub fn stream(self) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
         self.route.stream()
     }
 }
@@ -819,28 +811,28 @@ impl PreparedRoute {
 }
 
 // ---------------------------------------------------------------------------
-// OpaquePreparedRoute
+// FetchPreparedRoute
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)]
-enum OpaquePreparedRoute {
+enum FetchPreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
         handle: ExecutorHandle,
-        request: PbOpaqueRequest,
+        request: PbFetchRequest,
         request_commitment: Vec<u8>,
     },
     RemoteDirect {
         transport: IrohTransport,
-        request: PbOpaqueRequest,
+        request: PbFetchRequest,
         request_commitment: Vec<u8>,
     },
 }
 
-impl OpaquePreparedRoute {
+impl FetchPreparedRoute {
     async fn prepare(
         runtime: &ExecutionRuntime,
-        request: &PbOpaqueRequest,
+        request: &PbFetchRequest,
         route: &ExecutionRoute,
     ) -> ExecutionResult<Self> {
         match route {
@@ -848,9 +840,9 @@ impl OpaquePreparedRoute {
             ExecutionRoute::Local => {
                 let handle = runtime.require_local_executor()?;
                 let outcome = handle
-                    .create_opaque_ticket(request.clone())
+                    .create_fetch_ticket(request.clone())
                     .await
-                    .exec_context("local create_opaque_ticket failed")?;
+                    .exec_context("local create_fetch_ticket failed")?;
                 Ok(Self::Local {
                     handle,
                     request: request.clone(),
@@ -858,14 +850,14 @@ impl OpaquePreparedRoute {
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let opaque_transport = runtime.remote_transport::<Opaque>(target).await?;
-                let client = hellas_rpc::services::opaque::OpaqueClientImpl::new(opaque_transport);
+                let fetch_transport = runtime.remote_transport::<Fetch>(target).await?;
+                let client = hellas_rpc::services::fetch::FetchClientImpl::new(fetch_transport);
                 let ticket = client
                     .create_ticket(request.clone())
                     .await
                     .map_err(|status| {
                         ExecutionError::wire(
-                            format!("node {} declined opaque create_ticket", target.node_id()),
+                            format!("node {} declined fetch create_ticket", target.node_id()),
                             status,
                         )
                     })?;
@@ -883,7 +875,7 @@ impl OpaquePreparedRoute {
                     )
                 })?;
                 let (target, request_commitment) =
-                    discover_and_opaque_quote(&remote.registry, request, *retries).await?;
+                    discover_and_fetch_quote(&remote.registry, request, *retries).await?;
                 let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
@@ -894,25 +886,25 @@ impl OpaquePreparedRoute {
         }
     }
 
-    fn stream(self) -> BoxStream<'static, ExecutionResult<OpaqueExecutionEvent>> {
+    fn stream(self) -> BoxStream<'static, ExecutionResult<FetchExecutionEvent>> {
         match self {
             #[cfg(feature = "hellas-executor")]
             Self::Local {
                 handle,
                 request,
                 request_commitment,
-            } => local_execute_opaque_stream(handle, request_commitment, request).boxed(),
+            } => local_execute_fetch_stream(handle, request_commitment, request).boxed(),
             Self::RemoteDirect {
                 transport,
                 request,
                 request_commitment,
-            } => remote_execute_opaque_stream(transport, request_commitment, request).boxed(),
+            } => remote_execute_fetch_stream(transport, request_commitment, request).boxed(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Discovery — race the registry's Courtesy/Opaque feed and take the first
+// Discovery — race the registry's Courtesy/Fetch feed and take the first
 // peer that returns a successful quote.
 // ---------------------------------------------------------------------------
 
@@ -1011,15 +1003,15 @@ async fn discover_and_quote(
     }))
 }
 
-/// Same shape as [`discover_and_quote`] for opaque tickets.
-async fn discover_and_opaque_quote(
+/// Same shape as [`discover_and_quote`] for fetch tickets.
+async fn discover_and_fetch_quote(
     registry: &ServiceRegistry,
-    request: &PbOpaqueRequest,
+    request: &PbFetchRequest,
     retries: usize,
 ) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>)> {
-    use hellas_rpc::services::opaque::OpaqueClientImpl;
-    let mut stream = Box::pin(registry.discover::<Opaque>());
-    let pool = registry.pool::<Opaque>();
+    use hellas_rpc::services::fetch::FetchClientImpl;
+    let mut stream = Box::pin(registry.discover::<Fetch>());
+    let pool = registry.pool::<Fetch>();
     let mut last_error: Option<ExecutionError> = None;
     let mut attempts: usize = 0;
     let max_attempts = retries.saturating_add(1);
@@ -1039,7 +1031,7 @@ async fn discover_and_opaque_quote(
             Ok(t) => t,
             Err(err) => {
                 last_error = Some(ExecutionError::source(
-                    format!("failed to dial Opaque on {peer_id}"),
+                    format!("failed to dial Fetch on {peer_id}"),
                     err,
                 ));
                 if attempts >= max_attempts {
@@ -1049,14 +1041,14 @@ async fn discover_and_opaque_quote(
             }
         };
 
-        let client = OpaqueClientImpl::new(transport);
+        let client = FetchClientImpl::new(transport);
         match client.create_ticket(request.clone()).await {
             Ok(ticket) => {
                 return Ok((RemoteNodeTarget::from(peer_id), ticket.request_commitment));
             }
             Err(status) => {
                 last_error = Some(ExecutionError::wire(
-                    format!("node {peer_id} declined opaque create_ticket"),
+                    format!("node {peer_id} declined fetch create_ticket"),
                     status,
                 ));
                 if attempts >= max_attempts {
@@ -1068,7 +1060,7 @@ async fn discover_and_opaque_quote(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        ExecutionError::protocol("discovery stream exhausted without a successful opaque quote")
+        ExecutionError::protocol("discovery stream exhausted without a successful fetch quote")
     }))
 }
 
@@ -1111,25 +1103,24 @@ fn local_execute_stream(
 }
 
 #[cfg(feature = "hellas-executor")]
-fn local_execute_opaque_stream(
+fn local_execute_fetch_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
-    request: PbOpaqueRequest,
-) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
+    request: PbFetchRequest,
+) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
-        let core_request = core_opaque_request(&request)?;
         let outcome = handle
             .run_ticket_handle(RunTicketRequest { request_commitment })
             .await
-            .exec_context("failed to start local opaque execution stream")?;
+            .exec_context("failed to start local fetch execution stream")?;
         let _provenance = outcome.provenance;
         let mut events = ReceiverStream::new(outcome.events);
         let mut got_terminal = false;
         while let Some(item) = events.next().await {
             let wire = item
-                .map_err(|status: WireStatus| ExecutionError::wire("local opaque execution stream failed", status))?;
-            let event = convert_opaque_wire_event(wire, &core_request)?;
-            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+                .map_err(|status: WireStatus| ExecutionError::wire("local fetch execution stream failed", status))?;
+            let event = convert_fetch_wire_event(wire, &request)?;
+            let is_done = matches!(event, FetchExecutionEvent::Done(_));
             yield event;
             if is_done {
                 got_terminal = true;
@@ -1138,7 +1129,7 @@ fn local_execute_opaque_stream(
         }
         if !got_terminal {
             Err(ExecutionError::protocol(
-                "local opaque execution stream ended without terminal outcome"
+                "local fetch execution stream ended without terminal outcome"
             ))?;
         }
         drop(handle);
@@ -1183,27 +1174,26 @@ fn remote_execute_stream(
     }
 }
 
-fn remote_execute_opaque_stream(
+fn remote_execute_fetch_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
-    request: PbOpaqueRequest,
-) -> impl Stream<Item = ExecutionResult<OpaqueExecutionEvent>> + Send {
+    request: PbFetchRequest,
+) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
-        let core_request = core_opaque_request(&request)?;
         let client = ExecuteClientImpl::new(transport);
         let mut wire = client
             .run_ticket(RunTicketRequest { request_commitment })
             .await
-            .map_err(|status| ExecutionError::wire("failed to start remote opaque execute stream", status))?;
+            .map_err(|status| ExecutionError::wire("failed to start remote fetch execute stream", status))?;
         let mut got_terminal = false;
         while let Some(item) = wire.next().await {
-            let event = convert_opaque_wire_event(
+            let event = convert_fetch_wire_event(
                 item.map_err(|status: WireStatus| {
-                    ExecutionError::wire("remote opaque execute stream failed", status)
+                    ExecutionError::wire("remote fetch execute stream failed", status)
                 })?,
-                &core_request,
+                &request,
             )?;
-            let is_done = matches!(event, OpaqueExecutionEvent::Done(_));
+            let is_done = matches!(event, FetchExecutionEvent::Done(_));
             yield event;
             if is_done {
                 got_terminal = true;
@@ -1212,11 +1202,11 @@ fn remote_execute_opaque_stream(
         }
         wire.finish()
             .map_err(|status| {
-                ExecutionError::wire("remote opaque execute stream trailer", status)
+                ExecutionError::wire("remote fetch execute stream trailer", status)
             })?;
         if !got_terminal {
             Err(ExecutionError::protocol(
-                "remote opaque execute stream ended Ok but emitted no Done event"
+                "remote fetch execute stream ended Ok but emitted no Done event"
             ))?;
         }
         drop(client);
@@ -1244,22 +1234,22 @@ fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
     }
 }
 
-fn convert_opaque_wire_event(
+fn convert_fetch_wire_event(
     event: WorkEvent,
-    request: &CoreOpaqueRequest,
-) -> ExecutionResult<OpaqueExecutionEvent> {
+    request: &PbFetchRequest,
+) -> ExecutionResult<FetchExecutionEvent> {
     let Some(event) = event.kind else {
         return Err(ExecutionError::protocol("wire event with no body"));
     };
     match event {
-        work_event::Kind::Chunk(chunk) => Ok(OpaqueExecutionEvent::Chunk {
+        work_event::Kind::Chunk(chunk) => Ok(FetchExecutionEvent::Chunk {
             position: chunk.position,
             bytes: chunk.bytes,
         }),
-        work_event::Kind::Finished(finished) => Ok(OpaqueExecutionEvent::Done(
-            parse_opaque_finished(finished, request)?,
+        work_event::Kind::Finished(finished) => Ok(FetchExecutionEvent::Done(
+            parse_fetch_finished(finished, request)?,
         )),
-        work_event::Kind::Failed(failed) => Ok(OpaqueExecutionEvent::Done(OpaqueOutcome::Failed {
+        work_event::Kind::Failed(failed) => Ok(FetchExecutionEvent::Done(FetchOutcome::Failed {
             position: failed.position,
             error: failed.error,
         })),
@@ -1279,26 +1269,27 @@ fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
     })
 }
 
-fn parse_opaque_finished(
+fn parse_fetch_finished(
     finished: WorkFinished,
-    request: &CoreOpaqueRequest,
-) -> ExecutionResult<OpaqueOutcome> {
+    request: &PbFetchRequest,
+) -> ExecutionResult<FetchOutcome> {
     stop_reason_from_pb(finished.status)?;
-    serde_json::from_slice::<serde_json::Value>(&finished.output)
-        .map_err(|source| ExecutionError::OpaqueOutputJson { source })?;
-    let output = JsonBytes::new(finished.output.clone());
-    let (_dag_cbor, core) = decode_receipt_envelope(finished.receipt)?;
-    verify_delivery(
-        DeliveryRequest::Opaque(request),
-        DeliveryOutput::Opaque(&output),
-        &core,
-    )
-    .map_err(|source| ExecutionError::OpaqueReceipt { source })?;
-    if core.body().scheme() != SchemeId::Opaque {
-        return Err(ExecutionError::OpaqueReceiptExpected);
+    let input = verified_fetch_input(request)?;
+    let output_events = finished
+        .output_events
+        .into_iter()
+        .map(output_event_from_pb)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
+    let output = verify_output_events(input.input_commitment, &output_events)
+        .map_err(|source| ExecutionError::FetchTranscript { source })?;
+    if finished.output != output.body.as_bytes() {
+        return Err(ExecutionError::protocol(
+            "fetch finished output does not match signed output transcript",
+        ));
     }
-    Ok(OpaqueOutcome::Completed {
-        output: output.into_bytes(),
+    Ok(FetchOutcome::Completed {
+        output: output.body.into_bytes(),
     })
 }
 
@@ -1317,20 +1308,16 @@ fn stop_reason_from_pb(value: i32) -> ExecutionResult<StopReason> {
 // Misc helpers
 // ---------------------------------------------------------------------------
 
-fn core_opaque_request(request: &PbOpaqueRequest) -> ExecutionResult<CoreOpaqueRequest> {
-    if request.service.is_empty() {
-        return Err(ExecutionError::EmptyOpaqueService);
-    }
-    if request.method.is_empty() {
-        return Err(ExecutionError::EmptyOpaqueMethod);
-    }
-    serde_json::from_slice::<serde_json::Value>(&request.payload)
-        .map_err(|source| ExecutionError::OpaquePayloadJson { source })?;
-    Ok(CoreOpaqueRequest {
-        service: request.service.clone(),
-        method: request.method.clone(),
-        payload: JsonBytes::new(request.payload.clone()),
-    })
+fn verified_fetch_input(request: &PbFetchRequest) -> ExecutionResult<FetchInput> {
+    let input = request
+        .input
+        .iter()
+        .cloned()
+        .map(input_event_from_pb)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
+    verify_input_events(&request.service, &request.method, &input)
+        .map_err(|source| ExecutionError::FetchTranscript { source })
 }
 
 fn decode_receipt_envelope(
@@ -1349,5 +1336,78 @@ fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
         quote_req.huggingface_model_id.clone()
     } else {
         format!("{}@{revision}", quote_req.huggingface_model_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::fetch::{build_input_events, build_output_events};
+    use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
+
+    fn key(byte: u8) -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
+    }
+
+    fn fetch_request(
+        caller: &ProducerSigningKey,
+        service: &str,
+        method: &str,
+        payload: &[u8],
+    ) -> PbFetchRequest {
+        let events = build_input_events(service, method, payload, caller).unwrap();
+        PbFetchRequest {
+            service: service.to_string(),
+            method: method.to_string(),
+            input: events.iter().map(input_event_to_pb).collect(),
+        }
+    }
+
+    fn fetch_finished(
+        request: &PbFetchRequest,
+        producer: &ProducerSigningKey,
+        output: &[u8],
+    ) -> WorkFinished {
+        let input = verified_fetch_input(request).unwrap().input_commitment;
+        let events = build_output_events(input, output, producer).unwrap();
+        WorkFinished {
+            output: output.to_vec(),
+            receipt: None,
+            status: FinishStatus::EndOfSequence as i32,
+            total_units: output.len() as u64,
+            output_events: events.iter().map(output_event_to_pb).collect(),
+        }
+    }
+
+    #[test]
+    fn fetch_finished_verifies_signed_output_transcript() {
+        let caller = key(1);
+        let producer = key(2);
+        let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
+        let finished = fetch_finished(&request, &producer, br#"{"x":1}"#);
+
+        let outcome = parse_fetch_finished(finished, &request).unwrap();
+
+        assert_eq!(
+            outcome,
+            FetchOutcome::Completed {
+                output: br#"{"x":1}"#.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn fetch_finished_rejects_unsigned_terminal_output_change() {
+        let caller = key(1);
+        let producer = key(2);
+        let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
+        let mut finished = fetch_finished(&request, &producer, br#"{"x":1}"#);
+        finished.output = br#"{"x":2}"#.to_vec();
+
+        assert!(matches!(
+            parse_fetch_finished(finished, &request).unwrap_err(),
+            ExecutionError::Protocol(_)
+        ));
     }
 }

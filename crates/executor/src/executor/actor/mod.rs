@@ -3,6 +3,7 @@ mod quote;
 
 use crate::artifacts::{ArtifactStoreConfig, SymbolicArtifactStore};
 use crate::backend;
+use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
 use crate::metrics::ExecutorMetrics;
 use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
@@ -28,6 +29,7 @@ pub struct Executor {
     pub(super) execute_policy: ExecutePolicy,
     pub(super) metrics: Arc<ExecutorMetrics>,
     pub(super) producer_key: Arc<ProducerSigningKey>,
+    pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
     /// Dtypes this executor will accept. The first entry is the *preferred*
     /// dtype, used whenever the executor itself constructs a program.
     pub(super) supported_dtypes: Vec<Dtype>,
@@ -96,8 +98,10 @@ impl Executor {
             queue_capacity,
             supported_dtypes,
             metrics,
-            producer_key,
+            producer_key.clone(),
+            FetchCallerPolicy::single(producer_key.public_key()),
             SymbolicArtifactStore::memory(),
+            FetchTranscriptStoreBackend::memory(),
         )
     }
 
@@ -110,6 +114,31 @@ impl Executor {
         producer_key: Arc<ProducerSigningKey>,
         artifact_store: ArtifactStoreConfig,
     ) -> Result<ExecutorHandle, ExecutorError> {
+        let fetch_store = fetch_store_from_artifact_config(&artifact_store);
+        let artifacts = SymbolicArtifactStore::open(artifact_store).await?;
+        Self::spawn_with_metrics_producer_key_and_artifacts(
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            metrics,
+            producer_key.clone(),
+            FetchCallerPolicy::single(producer_key.public_key()),
+            artifacts,
+            fetch_store,
+        )
+    }
+
+    pub async fn spawn_with_metrics_producer_key_callers_and_artifact_store(
+        _download_policy: DownloadPolicy,
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        metrics: Arc<ExecutorMetrics>,
+        producer_key: Arc<ProducerSigningKey>,
+        fetch_caller_policy: FetchCallerPolicy,
+        artifact_store: ArtifactStoreConfig,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        let fetch_store = fetch_store_from_artifact_config(&artifact_store);
         let artifacts = SymbolicArtifactStore::open(artifact_store).await?;
         Self::spawn_with_metrics_producer_key_and_artifacts(
             execute_policy,
@@ -117,7 +146,9 @@ impl Executor {
             supported_dtypes,
             metrics,
             producer_key,
+            fetch_caller_policy,
             artifacts,
+            fetch_store,
         )
     }
 
@@ -127,7 +158,9 @@ impl Executor {
         supported_dtypes: Vec<Dtype>,
         metrics: Arc<ExecutorMetrics>,
         producer_key: Arc<ProducerSigningKey>,
+        fetch_caller_policy: FetchCallerPolicy,
         artifacts: SymbolicArtifactStore,
+        fetch_store: FetchTranscriptStoreBackend,
     ) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
             !supported_dtypes.is_empty(),
@@ -147,6 +180,7 @@ impl Executor {
             execute_policy,
             metrics,
             producer_key,
+            fetch_state: FetchStateMachine::new(fetch_store, fetch_caller_policy),
             supported_dtypes,
         };
         tokio::spawn(executor.run());
@@ -168,8 +202,8 @@ impl Executor {
                 ExecutorMessage::QuoteSymbolic { request, reply } => {
                     let _ = reply.send(self.handle_quote_symbolic(request).await);
                 }
-                ExecutorMessage::QuoteOpaque { request, reply } => {
-                    let _ = reply.send(self.handle_quote_opaque(request).await);
+                ExecutorMessage::QuoteFetch { request, reply } => {
+                    let _ = reply.send(self.handle_quote_fetch(request).await);
                 }
                 ExecutorMessage::QuotePrompt { request, reply } => {
                     let _ = reply.send(self.handle_quote_prompt(request).await);
@@ -220,6 +254,15 @@ impl Executor {
                     }));
                 }
             }
+        }
+    }
+}
+
+fn fetch_store_from_artifact_config(config: &ArtifactStoreConfig) -> FetchTranscriptStoreBackend {
+    match config {
+        ArtifactStoreConfig::Memory => FetchTranscriptStoreBackend::memory(),
+        ArtifactStoreConfig::Fs(path) => {
+            FetchTranscriptStoreBackend::fs(path.join("fetch-transcripts"))
         }
     }
 }

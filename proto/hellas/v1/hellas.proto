@@ -4,7 +4,7 @@ package hellas.v1;
 
 // Core Hellas work protocol. This file owns the generic ticket and execution
 // surface plus transport-neutral event/receipt shapes. Scheme-specific ticket
-// creation lives in symbolic.proto / opaque.proto; non-core helper APIs live in
+// creation lives in symbolic.proto / fetch.proto; non-core helper APIs live in
 // courtesy.proto; p2p/node discovery lives in swarm.proto.
 
 service Execute {
@@ -19,6 +19,52 @@ message Ticket {
 
 message RunTicketRequest {
   bytes request_commitment = 1; // exactly 32 bytes
+}
+
+message PublicKey {
+  uint32 kind = 1;
+  bytes bytes = 2;
+}
+
+message Signature {
+  uint32 kind = 1;
+  bytes bytes = 2;
+}
+
+message InputEventBody {
+  uint32 scheme = 1;
+  uint64 sequence = 2;
+  bytes previous_event = 3;
+  string kind = 4;
+  bytes payload_commitment = 5;
+  bytes signer = 6;
+  bytes canonicalization_id = 7;
+}
+
+message OutputEventBody {
+  uint32 scheme = 1;
+  bytes input_commitment = 2;
+  bytes stream_id = 3;
+  uint64 sequence = 4;
+  bytes previous_event = 5;
+  string kind = 6;
+  bytes payload_commitment = 7;
+  bytes signer = 8;
+  bytes canonicalization_id = 9;
+}
+
+message InputEventEnvelope {
+  InputEventBody body = 1;
+  Signature signature = 2;
+  PublicKey public_key = 3;
+  bytes payload = 4;
+}
+
+message OutputEventEnvelope {
+  OutputEventBody body = 1;
+  Signature signature = 2;
+  PublicKey public_key = 3;
+  bytes payload = 4;
 }
 
 // Wire protocol: zero or more WorkChunk events, terminated by exactly one
@@ -37,19 +83,21 @@ message WorkChunk {
   // Cumulative position AFTER this chunk.
   uint64 position = 1;
   bytes bytes = 2;
+  OutputEventEnvelope output_event = 3;
 }
 
 message WorkFinished {
   // Complete output object. Symbolic text uses little-endian u32 token IDs.
-  // Opaque uses exact UTF-8 JSON bytes.
+  // Fetch uses exact UTF-8 JSON bytes.
   bytes output = 1;
   ReceiptEnvelope receipt = 2;
   FinishStatus status = 3;
   uint64 total_units = 4;
+  repeated OutputEventEnvelope output_events = 5;
 }
 
 message WorkFailed {
-  // Units emitted before failure (tokens for symbolic text, bytes for opaque).
+  // Units emitted before failure (tokens for symbolic text, bytes for fetch).
   uint64 position = 1;
   string error = 2;
 }

@@ -2,10 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::signature::verify_digest_signature;
 use crate::{
-    CommitmentScheme, DagCborEncoder, JsonBytes, Opaque, OpaqueRequest, ProducerId,
-    ProducerSigningKey, PublicKey, ReceiptCommitment, RequestCommitment, ResultCommitment,
-    SchemeId, Signature, SignatureError, Symbolic, SymbolicOutput, SymbolicRequest, hash_tuple,
-    tags,
+    CommitmentScheme, DagCborEncoder, ProducerId, ProducerSigningKey, PublicKey, ReceiptCommitment,
+    RequestCommitment, ResultCommitment, SchemeId, Signature, SignatureError, Symbolic,
+    SymbolicOutput, SymbolicRequest, hash_tuple, tags,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,12 +149,10 @@ impl SignedReceipt {
 
 pub enum DeliveryRequest<'a> {
     Symbolic(&'a SymbolicRequest),
-    Opaque(&'a OpaqueRequest),
 }
 
 pub enum DeliveryOutput<'a> {
     Symbolic(&'a SymbolicOutput),
-    Opaque(&'a JsonBytes),
 }
 
 pub fn verify_receipt(receipt: &SignedReceipt) -> Result<(), VerifyError> {
@@ -183,15 +180,6 @@ pub fn verify_delivery(
             }
             Ok(())
         }
-        (DeliveryRequest::Opaque(request), DeliveryOutput::Opaque(output), SchemeId::Opaque) => {
-            if receipt.body.request != Opaque::commit_request(request) {
-                return Err(VerifyError::RequestCommitmentMismatch);
-            }
-            if receipt.body.result != Opaque::commit_output(output) {
-                return Err(VerifyError::ResultCommitmentMismatch);
-            }
-            Ok(())
-        }
         _ => Err(VerifyError::SchemeMismatch),
     }
 }
@@ -213,7 +201,7 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Digest, JsonBytes};
+    use crate::Digest;
 
     fn symbolic_request() -> SymbolicRequest {
         SymbolicRequest {
@@ -225,26 +213,6 @@ mod tests {
         SymbolicOutput {
             text_artifact_cid: Digest::from_bytes([9; 32]),
         }
-    }
-
-    #[test]
-    fn opaque_receipt_verifies_delivery() {
-        let key = ProducerSigningKey::deterministic_for_tests();
-        let request = OpaqueRequest {
-            service: "vllm".to_string(),
-            method: "generate".to_string(),
-            payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
-        };
-        let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
-        let envelope = receipt;
-
-        verify_delivery(
-            DeliveryRequest::Opaque(&request),
-            DeliveryOutput::Opaque(&output),
-            &envelope,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -266,20 +234,18 @@ mod tests {
     #[test]
     fn verify_delivery_rejects_wrong_output() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = OpaqueRequest {
-            service: "vllm".to_string(),
-            method: "generate".to_string(),
-            payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
+        let request = symbolic_request();
+        let output = symbolic_output();
+        let wrong = SymbolicOutput {
+            text_artifact_cid: Digest::from_bytes([8; 32]),
         };
-        let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let wrong = JsonBytes::new(br#"{"text":"bye"}"#.to_vec());
-        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
         let envelope = receipt;
 
         assert_eq!(
             verify_delivery(
-                DeliveryRequest::Opaque(&request),
-                DeliveryOutput::Opaque(&wrong),
+                DeliveryRequest::Symbolic(&request),
+                DeliveryOutput::Symbolic(&wrong),
                 &envelope,
             )
             .unwrap_err(),
@@ -290,13 +256,9 @@ mod tests {
     #[test]
     fn receipt_commitment_excludes_signature() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = OpaqueRequest {
-            service: "vllm".to_string(),
-            method: "generate".to_string(),
-            payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
-        };
-        let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
+        let request = symbolic_request();
+        let output = symbolic_output();
+        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
 
         let body_commitment = receipt.body().receipt_commitment().unwrap();
         let mut changed_signature = *receipt.signature();
@@ -319,13 +281,9 @@ mod tests {
     #[test]
     fn receipt_envelope_round_trips_through_dag_cbor() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = OpaqueRequest {
-            service: "vllm".to_string(),
-            method: "generate".to_string(),
-            payload: JsonBytes::new(br#"{"prompt":"hi"}"#.to_vec()),
-        };
-        let output = JsonBytes::new(br#"{"text":"hello"}"#.to_vec());
-        let receipt = SignedReceipt::sign::<Opaque>(&request, &output, &key).unwrap();
+        let request = symbolic_request();
+        let output = symbolic_output();
+        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
         let envelope = receipt;
 
         let bytes = crate::canonical_dag_cbor(&envelope).unwrap();

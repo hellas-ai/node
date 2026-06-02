@@ -30,7 +30,7 @@ directions update the same peer record.
 │ application: CLI commands, gateway, executor handlers       │
 ├──────────────────────────────────────────────────────────────┤
 │ generated clients & dispatchers (per service)               │
-│   Courtesy / Execute / Symbolic / Opaque / Node             │
+│   Courtesy / Execute / Symbolic / Fetch / Node              │
 │   each → ServiceMarker, MethodMarker, ClientImpl,           │
 │           Handler trait, Server dispatcher.                 │
 ├──────────────────────────────────────────────────────────────┤
@@ -66,7 +66,7 @@ message types, and emits hand-rolled service code via `quote!` +
   parameterized by `MethodMarker`.
 - `pub trait XHandler` — server-side handler trait. One concrete impl per
   application (`ExecutorHandle` in-tree for Courtesy/Execute/Symbolic/
-  Opaque; `NodeHandlerImpl` for Node).
+  Fetch; `NodeHandlerImpl` for Node).
 - `pub struct XServer<H>(pub H)` + `impl<T: StreamTransport, H: XHandler>
   Dispatcher<T> for XServer<H>` — routes inbound substreams by
   `method_id` and invokes the right handler method.
@@ -163,7 +163,7 @@ The important crate features are:
 - `iroh` / `iroh-client` / `iroh-server` — enable the iroh transport
   binding and its codegen.
 - `discovery` — peer-exchange + mDNS + DHT.
-- Per-service (`execute`, `symbolic`, `opaque`, `courtesy`, `swarm`,
+- Per-service (`execute`, `symbolic`, `fetch`, `courtesy`, `swarm`,
   `all-protocols`) — gate the codegen for one proto package each.
 - `node` — binary-side bundle pulling in catgrad/chatgrad/tokenizers.
 

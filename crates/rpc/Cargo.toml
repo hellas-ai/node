@@ -15,16 +15,16 @@ default = []
 # unconditionally (no `compile` feature anymore), but generated items are
 # `#[cfg(feature = ...)]`-gated by package, so downstream binary size scales
 # with the protocols you actually use.
-# `execute` is the foundation — symbolic, opaque, and courtesy all reference
+# `execute` is the foundation — symbolic, fetch, and courtesy all reference
 # `hellas.v1.Ticket` and related types.
 execute = []
 symbolic = ["execute"]
-opaque = ["execute"]
+fetch = ["execute", "dep:serde_json"]
 # Courtesy proto imports hellas.v1 (Ticket) and hellas.symbolic.v1
 # (SymbolicRequest), so the feature must pull both forward.
 courtesy = ["execute", "symbolic"]
 swarm = []
-all-protocols = ["swarm", "courtesy", "execute", "symbolic", "opaque"]
+all-protocols = ["swarm", "courtesy", "execute", "symbolic", "fetch"]
 
 # === Other knobs ===========================================================
 # Server-side dispatchers.
@@ -63,6 +63,7 @@ chatgrad = { workspace = true, default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+hellas-core = { workspace = true }
 hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
     "ureq",

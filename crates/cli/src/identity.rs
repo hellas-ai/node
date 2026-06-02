@@ -30,7 +30,6 @@ pub fn load_or_create(path: Option<&Path>) -> anyhow::Result<SecretKey> {
     }
 }
 
-#[cfg(feature = "hellas-executor")]
 pub fn load_or_create_producer_key(path: Option<&Path>) -> anyhow::Result<ProducerSigningKey> {
     let path = match path {
         Some(p) => p.to_owned(),
@@ -163,7 +162,6 @@ fn load_producer_key_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<Pro
     Ok(key)
 }
 
-#[cfg(feature = "hellas-executor")]
 fn create_new_producer_key(path: &Path) -> anyhow::Result<ProducerSigningKey> {
     let dir = path
         .parent()

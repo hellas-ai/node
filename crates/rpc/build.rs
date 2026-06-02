@@ -941,7 +941,7 @@ fn feature_for_package(package: &str) -> &'static str {
     match package {
         "hellas.v1" => "execute",
         "hellas.courtesy.v1" => "courtesy",
-        "hellas.opaque.v1" => "opaque",
+        "hellas.fetch.v1" => "fetch",
         "hellas.swarm.v1" => "swarm",
         "hellas.symbolic.v1" => "symbolic",
         _ => panic!("no rpc-crate feature defined for protobuf package {package}"),

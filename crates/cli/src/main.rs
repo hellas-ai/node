@@ -24,6 +24,26 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
     }
 }
 
+#[cfg(feature = "hellas-executor")]
+fn parse_public_key_hex(s: &str) -> Result<hellas_core::PublicKey, String> {
+    let bytes = parse_hex_array::<{ hellas_core::PublicKey::LEN }>(s)?;
+    Ok(hellas_core::PublicKey::from_compressed_sec1(bytes))
+}
+
+#[cfg(feature = "hellas-executor")]
+fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    if s.len() != N * 2 {
+        return Err(format!("expected {} hex chars, got {}", N * 2, s.len()));
+    }
+    let mut out = [0u8; N];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        *byte = u8::from_str_radix(&s[start..start + 2], 16)
+            .map_err(|err| format!("invalid hex at byte {idx}: {err}"))?;
+    }
+    Ok(out)
+}
+
 /// Default dtype per build configuration. CUDA / Metal builds assume modern
 /// hardware (Ampere+, M2+) where `bf16` matches the dtype most current models
 /// are trained at and gives a real perf/VRAM win. CPU / unspecified-backend
@@ -155,6 +175,10 @@ enum Commands {
             value_parser = parse_model_dtype
         )]
         dtype: Vec<Dtype>,
+        /// Caller/gateway public keys allowed to create Fetch tickets.
+        /// Repeat or comma-separate compressed secp256k1 keys as hex.
+        #[arg(long = "trusted-caller-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
+        trusted_caller_public_keys: Vec<hellas_core::PublicKey>,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -296,17 +320,17 @@ enum Commands {
         #[arg(long = "dtype", value_delimiter = ',', value_parser = parse_model_dtype)]
         dtype: Vec<Dtype>,
     },
-    /// Run trust-based opaque JSON work
-    Opaque {
+    /// Run trust-based fetch JSON work
+    Fetch {
         /// Node ID to run on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        /// Opaque service label. The protocol records it but does not interpret it.
+        /// Fetch service label. The protocol records it but does not interpret it.
         #[arg(long)]
         service: String,
-        /// Opaque method label. The protocol records it but does not interpret it.
+        /// Fetch method label. The protocol records it but does not interpret it.
         #[arg(long)]
         method: String,
         /// Exact UTF-8 JSON payload bytes.
@@ -401,6 +425,7 @@ async fn main() {
             metrics_port,
             graffiti,
             dtype,
+            trusted_caller_public_keys,
         } => {
             let producer_key =
                 match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
@@ -420,6 +445,7 @@ async fn main() {
                 metrics_port,
                 graffiti,
                 dtype,
+                trusted_caller_public_keys,
                 secret_key,
                 producer_key,
             })
@@ -525,7 +551,7 @@ async fn main() {
             )
             .await
         }
-        Commands::Opaque {
+        Commands::Fetch {
             node_id,
             node_addrs,
             service,
@@ -546,8 +572,8 @@ async fn main() {
             };
             match payload {
                 Ok(payload) => {
-                    commands::opaque::run(
-                        commands::opaque::ExecuteOptions {
+                    commands::fetch::run(
+                        commands::fetch::ExecuteOptions {
                             node_id,
                             node_addrs,
                             service,
@@ -556,7 +582,6 @@ async fn main() {
                             retries,
                             #[cfg(feature = "hellas-executor")]
                             local,
-                            #[cfg(feature = "hellas-executor")]
                             producer_key_path: producer_key_path.clone(),
                         },
                         secret_key,
@@ -699,10 +724,10 @@ mod tests {
     }
 
     #[test]
-    fn opaque_accepts_payload() {
+    fn fetch_accepts_payload() {
         let cli = Cli::try_parse_from([
             "hellas",
-            "opaque",
+            "fetch",
             "--service",
             "echo",
             "--method",
@@ -712,7 +737,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Opaque {
+            Commands::Fetch {
                 service,
                 method,
                 payload,
@@ -722,15 +747,15 @@ mod tests {
                 assert_eq!(method, "run");
                 assert_eq!(payload.as_deref(), Some(r#"{"x":1}"#));
             }
-            _ => panic!("expected opaque command"),
+            _ => panic!("expected fetch command"),
         }
     }
 
     #[test]
-    fn opaque_rejects_node_addr_without_node_id() {
+    fn fetch_rejects_node_addr_without_node_id() {
         let result = Cli::try_parse_from([
             "hellas",
-            "opaque",
+            "fetch",
             "--service",
             "echo",
             "--method",
@@ -745,9 +770,9 @@ mod tests {
     }
 
     #[test]
-    fn opaque_rejects_missing_payload() {
+    fn fetch_rejects_missing_payload() {
         let result =
-            Cli::try_parse_from(["hellas", "opaque", "--service", "echo", "--method", "run"]);
+            Cli::try_parse_from(["hellas", "fetch", "--service", "echo", "--method", "run"]);
 
         assert!(result.is_err());
     }

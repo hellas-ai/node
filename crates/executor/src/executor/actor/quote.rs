@@ -5,8 +5,9 @@ use crate::state::{
 };
 use catgrad::prelude::Dtype;
 use chatgrad::types;
-use hellas_core::{CommitmentScheme, Digest, JsonBytes, Opaque, OpaqueRequest, Symbolic};
+use hellas_core::{CommitmentScheme, Digest, RequestCommitment, Symbolic};
 use hellas_rpc::ExecutorError;
+use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
@@ -14,10 +15,11 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::execute::Ticket;
-use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::spec::ModelSpec;
+use hellas_rpc::stream::input_event_from_pb;
 use std::time::{Duration, Instant};
 
 use super::Executor;
@@ -119,43 +121,45 @@ impl Executor {
         })
     }
 
-    pub(super) async fn handle_quote_opaque(
+    pub(super) async fn handle_quote_fetch(
         &mut self,
-        request: PbOpaqueRequest,
+        request: PbFetchRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.store.prune_expired_quotes(Instant::now());
 
         let service = request.service;
-        if service.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "opaque service must not be empty".to_string(),
-            ));
-        }
         let method = request.method;
-        if method.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "opaque method must not be empty".to_string(),
-            ));
-        }
-        serde_json::from_slice::<serde_json::Value>(&request.payload).map_err(|err| {
-            ExecutorError::InvalidQuoteRequest(format!("opaque payload must be UTF-8 JSON: {err}"))
+        let input = request
+            .input
+            .into_iter()
+            .map(input_event_from_pb)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                ExecutorError::InvalidQuoteRequest(format!(
+                    "fetch input event decode failed: {err}"
+                ))
+            })?;
+        let verified = verify_input_events(&service, &method, &input).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!(
+                "fetch input transcript verification failed: {err}"
+            ))
         })?;
+        let quote = self
+            .fetch_state
+            .quote_input(verified.caller_key, input)
+            .map_err(|err| {
+                ExecutorError::InvalidQuoteRequest(format!(
+                    "fetch input transcript verification failed: {err}"
+                ))
+            })?;
+        let output = verified.body;
 
-        let opaque_request = OpaqueRequest {
-            service: service.clone(),
-            method: method.clone(),
-            payload: JsonBytes::new(request.payload),
-        };
-        let output = opaque_request.payload.clone();
-        let request_commitment = Opaque::commit_request(&opaque_request);
+        let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
-            model_id: format!("opaque:{service}/{method}"),
-            kind: QuoteKind::Opaque {
-                request: opaque_request,
-                output,
-            },
+            model_id: format!("fetch:{service}/{method}"),
+            kind: QuoteKind::Fetch { output },
         });
 
         info!(
@@ -163,7 +167,7 @@ impl Executor {
             service,
             method,
             amount = STATIC_QUOTE_AMOUNT,
-            "quoted opaque execution"
+            "quoted fetch execution"
         );
 
         Ok(TicketOutcome {

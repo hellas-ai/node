@@ -4,9 +4,9 @@ use hellas_rpc::services::courtesy::Courtesy;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::services::execute::Execute;
 #[cfg(feature = "hellas-executor")]
-use hellas_rpc::services::node::Node;
+use hellas_rpc::services::fetch::Fetch;
 #[cfg(feature = "hellas-executor")]
-use hellas_rpc::services::opaque::Opaque;
+use hellas_rpc::services::node::Node;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::services::symbolic::Symbolic;
 #[cfg(feature = "hellas-executor")]
@@ -54,7 +54,7 @@ pub(crate) fn served_alpns() -> Vec<Vec<u8>> {
     vec![
         Execute::ALPN.as_bytes().to_vec(),
         Symbolic::ALPN.as_bytes().to_vec(),
-        Opaque::ALPN.as_bytes().to_vec(),
+        Fetch::ALPN.as_bytes().to_vec(),
         Courtesy::ALPN.as_bytes().to_vec(),
         Node::ALPN.as_bytes().to_vec(),
     ]

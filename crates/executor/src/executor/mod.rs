@@ -10,7 +10,7 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
-use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire::WireStatus;
@@ -50,8 +50,8 @@ pub(crate) enum ExecutorMessage {
         request: PbSymbolicRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
-    QuoteOpaque {
-        request: PbOpaqueRequest,
+    QuoteFetch {
+        request: PbFetchRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
     QuotePrompt {
