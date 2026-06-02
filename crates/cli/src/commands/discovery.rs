@@ -30,6 +30,7 @@ pub(crate) struct DiscoveryRegistry {
 
 #[cfg(feature = "hellas-executor")]
 pub(crate) struct DiscoveryAdvertiser {
+    mdns: MdnsAddressLookup,
     shutdown: broadcast::Sender<()>,
     task: JoinHandle<()>,
 }
@@ -37,8 +38,14 @@ pub(crate) struct DiscoveryAdvertiser {
 #[cfg(feature = "hellas-executor")]
 impl DiscoveryAdvertiser {
     pub(crate) async fn shutdown(self) {
-        let _ = self.shutdown.send(());
-        let _ = self.task.await;
+        let Self {
+            mdns,
+            shutdown,
+            task,
+        } = self;
+        let _ = shutdown.send(());
+        let _ = task.await;
+        drop(mdns);
     }
 }
 
@@ -95,7 +102,7 @@ pub(crate) fn start_server_advertising(
     endpoint
         .address_lookup()
         .context("iroh endpoint has no address lookup registry")?
-        .add(mdns);
+        .add(mdns.clone());
 
     let dht = DhtBackend::new(endpoint).context("failed to start DHT publisher")?;
     let mut publisher = dht.create_publisher(DhtPublisherConfig::default());
@@ -105,5 +112,9 @@ pub(crate) fn start_server_advertising(
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(publisher.run(shutdown_rx));
 
-    Ok(DiscoveryAdvertiser { shutdown, task })
+    Ok(DiscoveryAdvertiser {
+        mdns,
+        shutdown,
+        task,
+    })
 }
