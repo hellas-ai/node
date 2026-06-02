@@ -99,6 +99,7 @@ let
 
   devShellPackages = with pkgs; [
     rustToolchain
+    perl
     pkg-config
     protobuf
     llvmPackages.lld
@@ -107,11 +108,22 @@ let
     cargo-watch
     gh
     cargo-audit
+    cargo-deny
+    cargo-fuzz
+    cargo-llvm-cov
+    cargo-mutants
+    cargo-nextest
     cargo-outdated
     cargo-sort
     cargo-machete
     cargo-udeps
+    jq
+    just
+    nodejs_24
     skopeo
+    stdenv.cc.cc.lib
+    taplo
+    temurin-bin
     pi-coding-agent
     piShim
     hellasRunDev
@@ -128,6 +140,8 @@ let
   defaultDevShell = pkgs.mkShell {
     packages = devShellPackages;
     shellHook = envShellHook;
+    # Quint's Apalache backend dlopens libstdc++ through its bundled Z3.
+    LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
   };
 
   ci = import ./ci.nix {
@@ -243,6 +257,42 @@ let
         doCheck = false;
       }
     );
+
+  mkKernelModelApp =
+    {
+      name,
+      npmScript,
+      needsJvm ? false,
+    }:
+    pkgs.writeShellApplication {
+      inherit name;
+      runtimeInputs = [
+        pkgs.coreutils
+        pkgs.git
+        pkgs.nodejs_24
+      ]
+      ++ lib.optionals needsJvm [ pkgs.temurin-bin ];
+      text = ''
+        repo_root="$(git rev-parse --show-toplevel)"
+        cd "$repo_root/crates/kernel"
+        npm ci
+        ${lib.optionalString needsJvm ''
+          export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
+        ''}
+        npm run ${npmScript}
+      '';
+    };
+
+  kernelModelTest = mkKernelModelApp {
+    name = "hellas-kernel-model-test";
+    npmScript = "quint:test";
+  };
+
+  kernelModelVerify = mkKernelModelApp {
+    name = "hellas-kernel-model-verify";
+    npmScript = "quint:verify";
+    needsJvm = true;
+  };
 
   linuxOutputs = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
     let
@@ -408,6 +458,16 @@ in
       type = "app";
       program = lib.getExe ci.fixAll;
       meta.description = "Apply auto-fixes (fmt, sort, clippy)";
+    };
+    "check-kernel-models" = {
+      type = "app";
+      program = lib.getExe kernelModelTest;
+      meta.description = "Run hellas-kernel Quint model tests";
+    };
+    "check-kernel-model-verify" = {
+      type = "app";
+      program = lib.getExe kernelModelVerify;
+      meta.description = "Run hellas-kernel Quint model verification";
     };
   }
   // (lib.mapAttrs' (

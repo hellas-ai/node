@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/core",
     "crates/executor",
+    "crates/kernel",
     "crates/rpc",
     "crates/wire",
     "crates/wire-adaptors",
@@ -30,6 +31,7 @@ chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/fea
 half = "2.7.1"
 hellas-core = { path = "crates/core", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
+hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
 hellas-wire-adaptors = { path = "crates/wire-adaptors", default-features = false }
