@@ -1,6 +1,6 @@
 use super::backend::GatewayBackend;
 use super::state::GatewayState;
-use super::wire_adaptor::{backend_response, backend_stream_response, parse_backend_request};
+use super::wire_adaptor::{backend_wire_response, parse_backend_request};
 use super::{next_id, now_unix};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -23,18 +23,8 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     }
 
     if let Some(proxy) = state.responses_proxy.as_ref() {
-        if stream {
-            return backend_stream_response(
-                adaptor,
-                parsed,
-                proxy.as_ref().clone(),
-                request,
-                render_context(),
-                "OpenAI Responses",
-            )
-            .await;
-        }
-        return backend_response(
+        return backend_wire_response(
+            stream,
             adaptor,
             parsed,
             proxy.as_ref().clone(),
@@ -46,27 +36,16 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
     }
 
     let backend = GatewayBackend::new(state);
-    if stream {
-        backend_stream_response(
-            adaptor,
-            parsed,
-            backend,
-            request,
-            render_context(),
-            "OpenAI Responses",
-        )
-        .await
-    } else {
-        backend_response(
-            adaptor,
-            parsed,
-            backend,
-            request,
-            render_context(),
-            "OpenAI Responses",
-        )
-        .await
-    }
+    backend_wire_response(
+        stream,
+        adaptor,
+        parsed,
+        backend,
+        request,
+        render_context(),
+        "OpenAI Responses",
+    )
+    .await
 }
 
 fn apply_model_override(
