@@ -39,7 +39,11 @@ where
     A: WireAdaptor,
     B: ExecutionBackend,
 {
-    let result = match backend.execute(request).await {
+    let backend_stream = match backend.stream(request).await {
+        Ok(stream) => stream,
+        Err(err) => return backend_error(surface, err),
+    };
+    let result = match backend_stream.collect().await {
         Ok(result) => result,
         Err(err) => return backend_error(surface, err),
     };

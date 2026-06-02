@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use hellas_wire_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, ExecutionResult,
+    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
 };
 
 mod generation;
 mod provenance;
 mod text;
 
-use self::text::{execute_text, text_events};
+use self::text::text_events;
 use super::state::{GatewayState, PreparedGeneration};
 
 #[derive(Clone)]
@@ -36,13 +36,6 @@ impl GatewayBackend {
 }
 
 impl ExecutionBackend for GatewayBackend {
-    fn execute<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, ExecutionResult> {
-        Box::pin(async move {
-            let prepared = self.prepare(&request).await?;
-            execute_text(prepared).await
-        })
-    }
-
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let prepared = self.prepare(&request).await?;
