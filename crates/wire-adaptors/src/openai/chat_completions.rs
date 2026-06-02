@@ -45,12 +45,6 @@ pub struct ChatCompletionsStreamState {
     provenance: Option<crate::Provenance>,
 }
 
-impl ParsedChatCompletionRequest {
-    pub fn include_usage(&self) -> bool {
-        self.include_usage
-    }
-}
-
 impl WireAdaptor for OpenAiChatCompletionsAdaptor {
     type ParsedRequest = ParsedChatCompletionRequest;
     type StreamState = ChatCompletionsStreamState;
@@ -824,7 +818,7 @@ mod tests {
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(request.stream, Some(true));
-        assert!(request.include_usage());
+        assert!(request.include_usage);
         assert_eq!(request.raw.value()["metadata"]["trace"], "abc");
         assert_eq!(request.raw.value()["seed"], 7);
     }

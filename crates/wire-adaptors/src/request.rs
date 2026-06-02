@@ -30,10 +30,6 @@ impl RawRequest {
     pub fn value(&self) -> &JsonValue {
         &self.value
     }
-
-    pub fn into_parts(self) -> (Vec<u8>, JsonValue) {
-        (self.bytes, self.value)
-    }
 }
 
 #[cfg(test)]
