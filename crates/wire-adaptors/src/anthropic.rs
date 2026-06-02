@@ -273,18 +273,11 @@ impl ParsedAnthropicMessageRequest {
 
         let mut canonical =
             CanonicalExecution::new(ModelRef::new(self.model.clone()), Input::Items(items));
-        canonical.commit_field("model");
-        canonical.commit_field("messages");
         canonical.sampling.max_output_tokens = Some(self.max_tokens);
-        canonical.commit_field("max_tokens");
-        if self.system.is_some() {
-            canonical.commit_field("system");
-        }
         if let Some(thinking) = &self.thinking {
             canonical.reasoning = Some(ReasoningOptions {
                 value: thinking.clone(),
             });
-            canonical.commit_field("thinking");
         }
 
         Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
@@ -721,16 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn projection_commits_messages_system_tokens_and_thinking() {
+    fn projection_sets_messages_system_tokens_and_thinking() {
         let execution = adaptor()
             .to_execution_request(&sample_request())
             .expect("request projects");
         assert_eq!(execution.canonical.model.name, "claude-3-5-sonnet");
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(32));
-        assert_eq!(
-            execution.canonical.committed_fields,
-            field_set(["model", "messages", "max_tokens", "system", "thinking"])
-        );
+        assert!(execution.canonical.reasoning.is_some());
         let Input::Items(items) = execution.canonical.input else {
             panic!("expected raw input items");
         };

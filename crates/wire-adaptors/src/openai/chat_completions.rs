@@ -37,28 +37,12 @@ pub struct ParsedChatCompletionRequest {
     pub tools: Vec<JsonValue>,
     pub tool_choice: Option<JsonValue>,
     pub max_tokens: Option<u32>,
-    pub max_tokens_field: Option<ChatTokenLimitField>,
     pub stream: Option<bool>,
     pub include_usage: bool,
     pub reasoning_effort: Option<String>,
     pub response_format: Option<JsonValue>,
     pub sampling: ChatSampling,
     pub passthrough: PassthroughBag,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChatTokenLimitField {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-impl ChatTokenLimitField {
-    fn wire_name(self) -> &'static str {
-        match self {
-            Self::MaxTokens => "max_tokens",
-            Self::MaxCompletionTokens => "max_completion_tokens",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -289,7 +273,7 @@ impl ParsedChatCompletionRequest {
 
         let tools = optional_array(object, "tools")?.unwrap_or_default();
         let tool_choice = object.get("tool_choice").cloned();
-        let (max_tokens, max_tokens_field) = max_tokens(object)?;
+        let max_tokens = max_tokens(object)?;
         let stream = optional_bool(object, "stream")?;
         let include_usage = stream_include_usage(object)?;
         let reasoning_effort = optional_string(object, "reasoning_effort")?;
@@ -313,7 +297,6 @@ impl ParsedChatCompletionRequest {
             tools,
             tool_choice,
             max_tokens,
-            max_tokens_field,
             stream,
             include_usage,
             reasoning_effort,
@@ -334,8 +317,6 @@ impl ParsedChatCompletionRequest {
                     .collect::<Vec<_>>(),
             ),
         );
-        canonical.commit_field("model");
-        canonical.commit_field("messages");
         apply_sampling(&mut canonical, self);
 
         canonical.tools = self
@@ -343,23 +324,17 @@ impl ParsedChatCompletionRequest {
             .iter()
             .map(project_tool)
             .collect::<AdaptorResult<Vec<_>>>()?;
-        if !canonical.tools.is_empty() {
-            canonical.commit_field("tools");
-        }
 
         if let Some(tool_choice) = &self.tool_choice {
             canonical.tool_choice = project_tool_choice(tool_choice);
-            canonical.commit_field("tool_choice");
         }
         if let Some(response_format) = &self.response_format {
             canonical.response_format = Some(project_response_format(response_format));
-            canonical.commit_field("response_format");
         }
         if let Some(reasoning_effort) = &self.reasoning_effort {
             canonical.reasoning = Some(ReasoningOptions {
                 value: JsonValue::String(reasoning_effort.clone()),
             });
-            canonical.commit_field("reasoning_effort");
         }
 
         Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
@@ -369,30 +344,21 @@ impl ParsedChatCompletionRequest {
 fn apply_sampling(canonical: &mut CanonicalExecution, request: &ParsedChatCompletionRequest) {
     if let Some(max_tokens) = request.max_tokens {
         canonical.sampling.max_output_tokens = Some(max_tokens);
-        let field = request
-            .max_tokens_field
-            .unwrap_or(ChatTokenLimitField::MaxTokens);
-        canonical.commit_field(field.wire_name());
     }
     if let Some(temperature) = request.sampling.temperature {
         canonical.sampling.temperature = Some(temperature);
-        canonical.commit_field("temperature");
     }
     if let Some(top_p) = request.sampling.top_p {
         canonical.sampling.top_p = Some(top_p);
-        canonical.commit_field("top_p");
     }
     if let Some(top_logprobs) = request.sampling.top_logprobs {
         canonical.sampling.top_logprobs = Some(top_logprobs);
-        canonical.commit_field("top_logprobs");
     }
     if let Some(parallel_tool_calls) = request.sampling.parallel_tool_calls {
         canonical.sampling.parallel_tool_calls = Some(parallel_tool_calls);
-        canonical.commit_field("parallel_tool_calls");
     }
     if !request.sampling.stop.is_empty() {
         canonical.sampling.stop = request.sampling.stop.clone();
-        canonical.commit_field("stop");
     }
 }
 
@@ -735,18 +701,15 @@ fn stream_include_usage(object: &JsonMap<String, JsonValue>) -> AdaptorResult<bo
     optional_bool(options, "include_usage").map(|value| value.unwrap_or(false))
 }
 
-fn max_tokens(
-    object: &JsonMap<String, JsonValue>,
-) -> AdaptorResult<(Option<u32>, Option<ChatTokenLimitField>)> {
+fn max_tokens(object: &JsonMap<String, JsonValue>) -> AdaptorResult<Option<u32>> {
     let max_tokens = optional_u32(object, "max_tokens")?;
     let max_completion_tokens = optional_u32(object, "max_completion_tokens")?;
     match (max_tokens, max_completion_tokens) {
         (Some(_), Some(_)) => Err(AdaptorError::invalid_request(
             "`max_tokens` and `max_completion_tokens` cannot both be set",
         )),
-        (Some(value), None) => Ok((Some(value), Some(ChatTokenLimitField::MaxTokens))),
-        (None, Some(value)) => Ok((Some(value), Some(ChatTokenLimitField::MaxCompletionTokens))),
-        (None, None) => Ok((None, None)),
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -917,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_commits_chat_execution_fields() {
+    fn projection_sets_chat_execution_fields() {
         let execution = adaptor()
             .to_execution_request(&sample_request())
             .expect("chat request projects");
@@ -932,23 +895,7 @@ mod tests {
             execution.canonical.response_format,
             Some(ResponseFormat::JsonObject)
         ));
-        assert_eq!(
-            execution.canonical.committed_fields,
-            field_set([
-                "model",
-                "messages",
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "top_logprobs",
-                "parallel_tool_calls",
-                "stop",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "reasoning_effort",
-            ])
-        );
+        assert!(execution.canonical.reasoning.is_some());
         assert!(matches!(execution.canonical.input, Input::Items(_)));
     }
 
@@ -963,10 +910,6 @@ mod tests {
             .unwrap();
         let execution = adaptor().to_execution_request(&request).unwrap();
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(12));
-        assert_eq!(
-            execution.canonical.committed_fields,
-            field_set(["model", "messages", "max_completion_tokens"])
-        );
     }
 
     #[test]
