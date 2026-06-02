@@ -1,21 +1,4 @@
-//! Synchronous block working set bridging alto's async `UtxoDb` and the
-//! sync `hellas-kernel` apply path.
-//!
-//! The kernel's [`Store`] / [`Batch`] traits are synchronous; alto's UTXO
-//! database is async behind an `AsyncRwLock`. Rather than fighting that
-//! impedance mismatch op-by-op, every kernel-bound block walks its
-//! transactions to enumerate the [`CoinId`]s and [`EdgeId`]s it will
-//! touch, pre-loads the corresponding slots from `UtxoDb`, and hands the
-//! resulting in-memory [`BlockWorkingSet`] to the kernel.
-//!
-//! After the kernel commits, alto replays the working set's writes back
-//! into the async [`commonware_glue::stateful::db::DatabaseSet::Unmerkleized`]
-//! batch so the merkleized state root advances normally.
-//!
-//! Phase 1 scope: this module defines the sync working set + `Store` /
-//! `Batch` trait impls and a load-mutate-replay unit test. Wiring the
-//! pre-load and post-commit replay into the async path is a follow-up
-//! step; the kernel-facing contract is fully established here.
+//! Synchronous block working set for kernel block application.
 
 use std::collections::HashMap;
 
@@ -163,18 +146,16 @@ mod tests {
     use super::*;
     use hellas_kernel::{
         CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-        Payout, ProtocolCode, SealPublicInputs, SealVerifier, Sig, SigVerifier, State, Terms, Tx,
+        PayloadHash, Payout, ProtocolCode, SealPublicInputs, SealVerifier, Sig, SigVerifier, State,
+        Terms, Tx,
     };
 
     const MAKER: Key = Key::from_bytes([0xaa; Key::LENGTH]);
     const TAKER: Key = Key::from_bytes([0xbb; Key::LENGTH]);
 
-    /// Placeholder-accepting verifier: mirrors the kernel's test
-    /// `FakeVerifier`. Real alto wires `Secp256k1Verifier` (which impls
-    /// both traits) or a custom `UserVerifier`.
     struct FakeVerifier;
     impl SigVerifier for FakeVerifier {
-        fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::CloseHash) -> bool {
+        fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
             sig == Sig::placeholder(key, hash)
         }
     }
@@ -207,7 +188,7 @@ mod tests {
         let terms = Terms::basic(
             ProtocolCode::new(1),
             Parties::new(MAKER, TAKER),
-            hellas_kernel::BlockHeight::new(1),
+            hellas_kernel::BlockHeight::new(2),
             payouts(10, 5),
         );
         let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
@@ -278,6 +259,7 @@ mod tests {
         // edge was consumed by the close).
         assert_eq!(live_coins.len(), 2, "expected two payout coins");
         assert_eq!(live_edges.len(), 0, "expected no live edges");
+        assert!(final_set.edge(edge).is_none(), "edge should be consumed");
 
         // Input coins are gone.
         assert!(

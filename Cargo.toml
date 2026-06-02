@@ -29,12 +29,7 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-hellas-kernel = { path = "../../hellas-kernel" }
-# Hellas-wire / hellas-rpc cutover: chain now consumes the new transport-
-# agnostic wire layer and the per-service RPC codegen from `node/crates/*`.
-# These overrides intentionally bypass the workspace `hellas-rpc` dep
-# (which still points at alto's tonic-based `rpc/` crate) so the rest of the
-# alto workspace can finish migrating piecemeal.
+hellas-kernel = { workspace = true }
 hellas-wire = { path = "../../node/crates/wire" }
 hellas-rpc = { path = "../../node/crates/rpc", default-features = false }
 hellas-types = { workspace = true, features = ["consensus"] }
@@ -53,11 +48,6 @@ serde = { workspace = true }
 sha2 = { version = "0.10", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-# tokio-stream, tokio-tungstenite, tonic, and ws-mux were dropped as part of
-# the hellas-wire cutover; the new transports live under
-# `hellas_wire::{iroh, ws}` and the codegen-emitted dispatchers in
-# `hellas_rpc::services::*` (LightClient codegen pending — see
-# CUTOVER_FINDINGS #5).
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
