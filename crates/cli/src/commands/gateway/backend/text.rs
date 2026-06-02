@@ -52,11 +52,11 @@ pub(super) fn text_events(
                     return;
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Failed { error, .. })))) => {
-                    Err(BackendError::execution(format!("Inference error: {error}")))?;
+                    Err(BackendError::failed(format!("Inference error: {error}")))?;
                 }
-                Ok(Some(Err(err))) => Err(BackendError::execution(format!("Inference error: {err:#}")))?,
-                Ok(None) => Err(BackendError::execution("execution stream ended without terminal outcome"))?,
-                Err(_) => Err(BackendError::execution(format!(
+                Ok(Some(Err(err))) => Err(err)?,
+                Ok(None) => Err(BackendError::failed("execution stream ended without terminal outcome"))?,
+                Err(_) => Err(BackendError::failed(format!(
                     "inference timed out after {}s",
                     super::super::timeout_secs_until(deadline)
                 )))?,

@@ -72,10 +72,10 @@ impl ExecutionBackend for ResponsesProxy {
             let upstream = self
                 .send_raw(forwarded_body(&request).map_err(BackendError::rejected)?)
                 .await
-                .map_err(|err| BackendError::execution(err.message))?;
+                .map_err(|err| BackendError::failed(err.message))?;
             let status = upstream.status();
             if !status.is_success() {
-                return Err(BackendError::execution(format!(
+                return Err(BackendError::failed(format!(
                     "Responses proxy returned HTTP {status}"
                 )));
             }
@@ -120,14 +120,14 @@ fn responses_event_stream(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(source) => {
-                    yield Err(BackendError::stream(format!("Responses proxy stream failed: {source}")));
+                    yield Err(BackendError::failed(format!("Responses proxy stream failed: {source}")));
                     return;
                 }
             };
             let frames = match decoder.push(&chunk) {
                 Ok(frames) => decode_sse_frames(&adaptor, &parsed, &mut state, frames),
                 Err(err) => {
-                    yield Err(BackendError::stream(err.to_string()));
+                    yield Err(BackendError::failed(err.to_string()));
                     return;
                 }
             };
@@ -146,7 +146,7 @@ fn responses_event_stream(
         let frames = match decoder.finish() {
             Ok(frames) => decode_sse_frames(&adaptor, &parsed, &mut state, frames),
             Err(err) => {
-                yield Err(BackendError::stream(err.to_string()));
+                yield Err(BackendError::failed(err.to_string()));
                 return;
             }
         };
@@ -174,7 +174,7 @@ fn decode_sse_frames(
         output.extend(
             adaptor
                 .decode_stream_event(parsed, state, frame)
-                .map_err(|err| BackendError::stream(err.to_string()))?,
+                .map_err(|err| BackendError::failed(err.to_string()))?,
         );
     }
     Ok(output)

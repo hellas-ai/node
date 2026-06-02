@@ -68,7 +68,7 @@ impl BackendStream {
                 OutputEvent::Usage(next) => usage = Some(next),
                 OutputEvent::Provenance(next) => merge_provenance(&mut provenance, next),
                 OutputEvent::Error { message, code } => {
-                    return Err(BackendError::stream(match code {
+                    return Err(BackendError::failed(match code {
                         Some(code) => format!("{code}: {message}"),
                         None => message,
                     }));
@@ -87,7 +87,7 @@ impl BackendStream {
             }
         }
 
-        Err(BackendError::stream(
+        Err(BackendError::failed(
             "backend stream ended without terminal event",
         ))
     }
@@ -324,10 +324,8 @@ mod tests {
 pub enum BackendError {
     #[error("backend rejected request: {message}")]
     Rejected { message: String },
-    #[error("backend execution failed: {message}")]
-    Execution { message: String },
-    #[error("backend stream failed: {message}")]
-    Stream { message: String },
+    #[error("backend failed: {message}")]
+    Failed { message: String },
 }
 
 impl BackendError {
@@ -337,14 +335,8 @@ impl BackendError {
         }
     }
 
-    pub fn execution(message: impl Into<String>) -> Self {
-        Self::Execution {
-            message: message.into(),
-        }
-    }
-
-    pub fn stream(message: impl Into<String>) -> Self {
-        Self::Stream {
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
             message: message.into(),
         }
     }

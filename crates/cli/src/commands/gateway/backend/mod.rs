@@ -29,7 +29,7 @@ impl GatewayBackend {
                 if err.status.is_client_error() {
                     BackendError::rejected(err.message)
                 } else {
-                    BackendError::execution(err.message)
+                    BackendError::failed(err.message)
                 }
             })
     }
