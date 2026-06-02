@@ -4,6 +4,7 @@ mod quote;
 use crate::artifacts::{ArtifactStoreConfig, SymbolicArtifactStore};
 use crate::backend;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
+use crate::fetch_provider::{FetchProvider, RejectingFetchProvider};
 use crate::metrics::ExecutorMetrics;
 use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
 use crate::worker::{ExecuteJob, ExecuteWorker};
@@ -20,6 +21,7 @@ use super::{ExecutorHandle, ExecutorMessage};
 
 pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
+    pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
     pub(super) store: ExecutorState,
     pub(super) artifacts: SymbolicArtifactStore,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
@@ -30,6 +32,7 @@ pub struct Executor {
     pub(super) metrics: Arc<ExecutorMetrics>,
     pub(super) producer_key: Arc<ProducerSigningKey>,
     pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
+    pub(super) fetch_provider: Arc<dyn FetchProvider>,
     /// Dtypes this executor will accept. The first entry is the *preferred*
     /// dtype, used whenever the executor itself constructs a program.
     pub(super) supported_dtypes: Vec<Dtype>,
@@ -42,6 +45,7 @@ pub struct ExecutorSpawnConfig {
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
     pub fetch_caller_policy: FetchCallerPolicy,
+    pub fetch_provider: Arc<dyn FetchProvider>,
     pub artifact_store: ArtifactStoreConfig,
 }
 
@@ -52,6 +56,7 @@ struct ExecutorRuntimeConfig {
     metrics: Arc<ExecutorMetrics>,
     producer_key: Arc<ProducerSigningKey>,
     fetch_caller_policy: FetchCallerPolicy,
+    fetch_provider: Arc<dyn FetchProvider>,
     artifacts: SymbolicArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
 }
@@ -71,6 +76,28 @@ impl Executor {
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: producer_key.clone(),
             fetch_caller_policy: FetchCallerPolicy::single(producer_key.public_key()),
+            fetch_provider: Arc::new(RejectingFetchProvider),
+            artifacts: SymbolicArtifactStore::memory(),
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+        })
+    }
+
+    pub fn spawn_with_fetch_provider(
+        execute_policy: ExecutePolicy,
+        queue_capacity: usize,
+        supported_dtypes: Vec<Dtype>,
+        producer_key: ProducerSigningKey,
+        fetch_provider: Arc<dyn FetchProvider>,
+    ) -> Result<ExecutorHandle, ExecutorError> {
+        let producer_key = Arc::new(producer_key);
+        Self::spawn_runtime(ExecutorRuntimeConfig {
+            execute_policy,
+            queue_capacity,
+            supported_dtypes,
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: producer_key.clone(),
+            fetch_caller_policy: FetchCallerPolicy::single(producer_key.public_key()),
+            fetch_provider,
             artifacts: SymbolicArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
         })
@@ -88,6 +115,7 @@ impl Executor {
             metrics: config.metrics,
             producer_key: config.producer_key,
             fetch_caller_policy: config.fetch_caller_policy,
+            fetch_provider: config.fetch_provider,
             artifacts,
             fetch_store,
         })
@@ -103,6 +131,7 @@ impl Executor {
         backend::create_backend()?;
         let executor = Self {
             rx,
+            tx: tx.clone(),
             store: ExecutorState::new(),
             artifacts: config.artifacts,
             pending_executions: VecDeque::new(),
@@ -113,6 +142,7 @@ impl Executor {
             metrics: config.metrics,
             producer_key: config.producer_key,
             fetch_state: FetchStateMachine::new(config.fetch_store, config.fetch_caller_policy),
+            fetch_provider: config.fetch_provider,
             supported_dtypes: config.supported_dtypes,
         };
         tokio::spawn(executor.run());
@@ -160,6 +190,9 @@ impl Executor {
                 }
                 ExecutorMessage::WorkerFinished(completion) => {
                     self.handle_worker_finished(completion).await;
+                }
+                ExecutorMessage::FetchFinished(completion) => {
+                    self.handle_fetch_finished(completion).await;
                 }
                 ExecutorMessage::ListModels { reply } => {
                     let _ = reply.send(Ok(self.handle_list_models().await));

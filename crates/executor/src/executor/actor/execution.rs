@@ -1,7 +1,9 @@
-use crate::executor::ExecuteOutcome;
+use crate::executor::{ExecuteOutcome, ExecutorMessage, FetchCompletion, FetchProviderFailure};
 use crate::fetch::{FetchStateError, FetchTranscript};
+use crate::fetch_provider::{FetchProvider, FetchProviderRequest};
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
+use futures_util::StreamExt;
 use hellas_core::{
     Digest, InputCommitment, OutputEventEnvelope, SignedReceipt, canonical_dag_cbor,
 };
@@ -10,10 +12,11 @@ use hellas_rpc::ExecutorError;
 use hellas_rpc::error::StateError;
 use hellas_rpc::fetch::{build_output_events, output_body};
 use hellas_rpc::pb::execute::{
-    FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
+    FinishStatus, RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
 };
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::stream::output_event_to_pb;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -118,7 +121,7 @@ impl Executor {
                     events: receiver,
                 })
             }
-            QuoteKind::Fetch { output } => {
+            QuoteKind::Fetch { request } => {
                 let provenance = ExecutionProvenance {
                     commitment_id: request_commitment_id,
                 };
@@ -137,48 +140,34 @@ impl Executor {
                 };
                 let model_id = quote.model_id.clone();
                 let execution_id = new_execution_id();
-                let total_units = output.as_bytes().len() as u64;
-                let output_events =
-                    build_output_events(input_commitment, output.as_bytes(), &self.producer_key)
-                        .map_err(|err| {
-                            ExecutorError::WeightsError(format!(
-                                "fetch output transcript failed: {err}"
-                            ))
-                        })?;
-                let transcript = match self.fetch_state.complete_output(
+                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+                spawn_fetch_provider(
+                    self.tx.clone(),
+                    Arc::clone(&self.fetch_provider),
+                    request,
                     input_commitment,
-                    output_events,
-                    &self.producer_key.public_key(),
-                ) {
-                    Ok(transcript) => transcript,
-                    Err(err) => {
-                        let _ = self.fetch_state.fail(input_commitment, err.to_string());
-                        return Err(fetch_execute_error(err));
-                    }
-                };
-                let outcome = fetch_finished_outcome(
-                    provenance,
-                    transcript.output_events(),
-                    FinishStatus::EndOfSequence,
-                )
-                .await?;
+                    request_commitment_id,
+                    execution_id.clone(),
+                    model_id.clone(),
+                    sender,
+                );
 
                 self.metrics.record_execution_started(
                     &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
                     /* cached_output= */ 0, /* prefill= */ 0,
                 );
-                self.metrics
-                    .record_execution_completed(&model_id, total_units);
                 let _ = self.store.remove_quote(&request_commitment);
 
                 info!(
                     %execution_id,
                     request_commitment = %format_request_commitment(&request_commitment),
-                    total_units,
                     "accepted fetch execution"
                 );
 
-                Ok(outcome)
+                Ok(ExecuteOutcome {
+                    provenance,
+                    events: receiver,
+                })
             }
         }
     }
@@ -295,6 +284,82 @@ impl Executor {
         })
     }
 
+    pub(super) async fn handle_fetch_finished(&mut self, completion: FetchCompletion) {
+        let FetchCompletion {
+            input_commitment,
+            request_commitment_id,
+            execution_id,
+            model_id,
+            sender,
+            result,
+        } = completion;
+
+        let output = match result {
+            Ok(output) => output,
+            Err(failure) => {
+                let error = failure.error.to_string();
+                let _ = self.fetch_state.fail(input_commitment, error.clone());
+                self.metrics
+                    .record_execution_failed(&model_id, failure.position);
+                send_fetch_failed(sender, failure.position, error).await;
+                return;
+            }
+        };
+
+        let output_events = match build_output_events(input_commitment, &output, &self.producer_key)
+        {
+            Ok(events) => events,
+            Err(err) => {
+                let error = format!("fetch output transcript failed: {err}");
+                let _ = self.fetch_state.fail(input_commitment, error.clone());
+                self.metrics
+                    .record_execution_failed(&model_id, output.len() as u64);
+                send_fetch_failed(sender, output.len() as u64, error).await;
+                return;
+            }
+        };
+
+        let transcript = match self.fetch_state.complete_output(
+            input_commitment,
+            output_events,
+            &self.producer_key.public_key(),
+        ) {
+            Ok(transcript) => transcript,
+            Err(err) => {
+                let error = fetch_execute_error(err).to_string();
+                let _ = self.fetch_state.fail(input_commitment, error.clone());
+                self.metrics
+                    .record_execution_failed(&model_id, output.len() as u64);
+                send_fetch_failed(sender, output.len() as u64, error).await;
+                return;
+            }
+        };
+
+        let event =
+            match fetch_finished_event(transcript.output_events(), FinishStatus::EndOfSequence) {
+                Ok(event) => event,
+                Err(err) => {
+                    let error = err.to_string();
+                    let _ = self.fetch_state.fail(input_commitment, error.clone());
+                    self.metrics
+                        .record_execution_failed(&model_id, output.len() as u64);
+                    send_fetch_failed(sender, output.len() as u64, error).await;
+                    return;
+                }
+            };
+
+        self.metrics
+            .record_execution_completed(&model_id, output.len() as u64);
+        let _ = sender.send(Ok(event)).await;
+
+        info!(
+            %execution_id,
+            request_commitment = %format_request_commitment(&request_commitment_id),
+            total_units = output.len(),
+            "completed fetch execution"
+        );
+    }
+
     /// Pop pending jobs and dispatch the first one whose consumer is still
     /// listening. Stale entries (consumer dropped while queued) are discarded
     /// silently — the consumer already lost interest.
@@ -327,6 +392,74 @@ fn format_request_commitment(bytes: &[u8]) -> String {
         .unwrap_or_else(|_| format!("invalid:{}bytes", bytes.len()))
 }
 
+fn spawn_fetch_provider(
+    tx: mpsc::UnboundedSender<ExecutorMessage>,
+    provider: Arc<dyn FetchProvider>,
+    request: FetchProviderRequest,
+    input_commitment: InputCommitment,
+    request_commitment_id: [u8; 32],
+    execution_id: String,
+    model_id: String,
+    sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
+) {
+    tokio::spawn(async move {
+        let result = run_fetch_provider(provider, request, sender.clone()).await;
+        let _ = tx.send(ExecutorMessage::FetchFinished(FetchCompletion {
+            input_commitment,
+            request_commitment_id,
+            execution_id,
+            model_id,
+            sender,
+            result,
+        }));
+    });
+}
+
+async fn run_fetch_provider(
+    provider: Arc<dyn FetchProvider>,
+    request: FetchProviderRequest,
+    sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
+) -> Result<Vec<u8>, FetchProviderFailure> {
+    let mut output = Vec::new();
+    let mut position = 0_u64;
+    let mut stream = provider
+        .run(request)
+        .await
+        .map_err(|error| FetchProviderFailure { position, error })?;
+
+    while let Some(next) = stream.next().await {
+        let chunk = next.map_err(|error| FetchProviderFailure { position, error })?;
+        if chunk.is_empty() {
+            continue;
+        }
+        position = position.saturating_add(chunk.len() as u64);
+        output.extend_from_slice(&chunk);
+        let _ = sender
+            .send(Ok(WorkEvent {
+                kind: Some(work_event::Kind::Chunk(WorkChunk {
+                    position,
+                    bytes: chunk,
+                    output_event: None,
+                })),
+            }))
+            .await;
+    }
+
+    Ok(output)
+}
+
+async fn send_fetch_failed(
+    sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
+    position: u64,
+    error: String,
+) {
+    let _ = sender
+        .send(Ok(WorkEvent {
+            kind: Some(work_event::Kind::Failed(WorkFailed { position, error })),
+        }))
+        .await;
+}
+
 async fn fetch_transcript_outcome(
     request_commitment_id: [u8; 32],
     transcript: &FetchTranscript,
@@ -346,28 +479,36 @@ async fn fetch_finished_outcome(
     output_events: &[OutputEventEnvelope],
     status: FinishStatus,
 ) -> Result<ExecuteOutcome, ExecutorError> {
-    let output = output_body(output_events).map_err(|err| {
-        ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
-    })?;
-    let total_units = output.as_bytes().len() as u64;
-    let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
+    let event = fetch_finished_event(output_events, status)?;
     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
     sender
-        .send(Ok(WorkEvent {
-            kind: Some(work_event::Kind::Finished(WorkFinished {
-                output: output.into_bytes(),
-                receipt: None,
-                status: status as i32,
-                total_units,
-                output_events: pb_output_events,
-            })),
-        }))
+        .send(Ok(event))
         .await
         .map_err(|_| ExecutorError::ChannelClosed)?;
 
     Ok(ExecuteOutcome {
         provenance,
         events: receiver,
+    })
+}
+
+fn fetch_finished_event(
+    output_events: &[OutputEventEnvelope],
+    status: FinishStatus,
+) -> Result<WorkEvent, ExecutorError> {
+    let output = output_body(output_events).map_err(|err| {
+        ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
+    })?;
+    let total_units = output.as_bytes().len() as u64;
+    let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
+    Ok(WorkEvent {
+        kind: Some(work_event::Kind::Finished(WorkFinished {
+            output: output.into_bytes(),
+            receipt: None,
+            status: status as i32,
+            total_units,
+            output_events: pb_output_events,
+        })),
     })
 }
 
@@ -404,7 +545,7 @@ enum StartExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Executor;
+    use crate::{Executor, MockFetchProvider};
     use catgrad::prelude::Dtype;
     use hellas_core::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;
@@ -416,40 +557,111 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
     }
 
-    fn fetch_request(key: &ProducerSigningKey, body: &[u8]) -> FetchRequest {
-        let events = build_input_events("echo", "run", body, key).unwrap();
+    fn fetch_request(
+        key: &ProducerSigningKey,
+        service: &str,
+        method: &str,
+        body: &[u8],
+    ) -> FetchRequest {
+        let events = build_input_events(service, method, body, key).unwrap();
         FetchRequest {
             input: events.iter().map(input_event_to_pb).collect(),
         }
     }
 
-    async fn run_one(handle: &crate::ExecutorHandle, request_commitment: Vec<u8>) -> WorkFinished {
+    async fn run_one(
+        handle: &crate::ExecutorHandle,
+        request_commitment: Vec<u8>,
+    ) -> (Vec<Vec<u8>>, WorkFinished) {
         let mut outcome = handle
             .run_ticket_handle(RunTicketRequest { request_commitment })
             .await
             .unwrap()
             .events;
-        let event = outcome.recv().await.unwrap().unwrap();
-        match event.kind.unwrap() {
-            work_event::Kind::Finished(finished) => finished,
-            other => panic!("expected finished event, got {other:?}"),
+        let mut chunks = Vec::new();
+        loop {
+            let event = outcome.recv().await.unwrap().unwrap();
+            match event.kind.unwrap() {
+                work_event::Kind::Chunk(chunk) => chunks.push(chunk.bytes),
+                work_event::Kind::Finished(finished) => return (chunks, finished),
+                work_event::Kind::Failed(failed) => {
+                    panic!("expected finished event, got failure: {failed:?}")
+                }
+            }
+        }
+    }
+
+    async fn run_failed(handle: &crate::ExecutorHandle, request_commitment: Vec<u8>) -> WorkFailed {
+        let mut outcome = handle
+            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .await
+            .unwrap()
+            .events;
+        loop {
+            let event = outcome.recv().await.unwrap().unwrap();
+            match event.kind.unwrap() {
+                work_event::Kind::Chunk(_) => {}
+                work_event::Kind::Finished(finished) => {
+                    panic!("expected failed event, got finished: {finished:?}")
+                }
+                work_event::Kind::Failed(failed) => return failed,
+            }
         }
     }
 
     #[tokio::test]
-    async fn fetch_execution_replays_completed_transcript() {
+    async fn fetch_execution_streams_mock_provider_and_replays_completed_transcript() {
         let signing_key = key();
-        let request = fetch_request(&signing_key, br#"{"hello":"world"}"#);
-        let handle =
-            Executor::spawn_with_producer_key(ExecutePolicy::Eager, 1, vec![Dtype::F32], key())
-                .unwrap();
+        let input = br#"{"hello":"world"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"{\"answer\":\"".to_vec(), b"ok\"}".to_vec()],
+        );
+        let request = fetch_request(&signing_key, "echo", "run", input);
+        let handle = Executor::spawn_with_fetch_provider(
+            ExecutePolicy::Eager,
+            1,
+            vec![Dtype::F32],
+            key(),
+            Arc::new(provider.clone()),
+        )
+        .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
-        let first = run_one(&handle, ticket.request_commitment.clone()).await;
-        let replayed = run_one(&handle, ticket.request_commitment).await;
+        let (chunks, first) = run_one(&handle, ticket.request_commitment.clone()).await;
+        let (replay_chunks, replayed) = run_one(&handle, ticket.request_commitment).await;
 
-        assert_eq!(first.output, br#"{"hello":"world"}"#);
+        assert_eq!(chunks, vec![b"{\"answer\":\"".to_vec(), b"ok\"}".to_vec()]);
+        assert!(replay_chunks.is_empty());
+        assert_eq!(first.output, br#"{"answer":"ok"}"#);
         assert_eq!(replayed.output, first.output);
         assert_eq!(replayed.output_events, first.output_events);
+        assert_eq!(provider.calls("echo", "run", input), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_execution_reports_unprogrammed_mock_provider_failure() {
+        let signing_key = key();
+        let input = br#"{"hello":"world"}"#;
+        let provider = MockFetchProvider::new();
+        let request = fetch_request(&signing_key, "echo", "run", input);
+        let handle = Executor::spawn_with_fetch_provider(
+            ExecutePolicy::Eager,
+            1,
+            vec![Dtype::F32],
+            key(),
+            Arc::new(provider.clone()),
+        )
+        .unwrap();
+        let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+
+        let failed = run_failed(&handle, ticket.request_commitment).await;
+
+        assert_eq!(failed.position, 0);
+        assert!(failed.error.contains("mock fetch response not programmed"));
+        assert_eq!(provider.calls("echo", "run", input), 1);
     }
 }

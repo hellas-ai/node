@@ -16,7 +16,7 @@ use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics,
-    ExecutorSpawnConfig, FetchCallerPolicy, FetchServer, SymbolicServer,
+    ExecutorSpawnConfig, FetchCallerPolicy, FetchServer, RejectingFetchProvider, SymbolicServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
@@ -89,6 +89,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         metrics: config.metrics.clone(),
         producer_key: Arc::new(config.producer_key),
         fetch_caller_policy: FetchCallerPolicy::new(config.trusted_caller_public_keys),
+        fetch_provider: Arc::new(RejectingFetchProvider),
         artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
     })
     .await

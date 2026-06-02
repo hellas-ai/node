@@ -3,8 +3,9 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use crate::DEFAULT_MAX_SEQ;
+use crate::fetch_provider::FetchProviderRequest;
 use catgrad::prelude::Dtype;
-use hellas_core::{Digest, JsonBytes, RequestCommitment, SymbolicRequest};
+use hellas_core::{Digest, RequestCommitment, SymbolicRequest};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::courtesy::{
@@ -211,7 +212,7 @@ pub enum QuoteKind {
         invocation: Invocation,
     },
     Fetch {
-        output: JsonBytes,
+        request: FetchProviderRequest,
     },
 }
 
