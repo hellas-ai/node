@@ -322,22 +322,18 @@ mod tests {
 
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("backend rejected request: {message}")]
-    Rejected { message: String },
-    #[error("backend failed: {message}")]
-    Failed { message: String },
+    #[error("backend rejected request: {0}")]
+    Rejected(String),
+    #[error("backend failed: {0}")]
+    Failed(String),
 }
 
 impl BackendError {
     pub fn rejected(message: impl Into<String>) -> Self {
-        Self::Rejected {
-            message: message.into(),
-        }
+        Self::Rejected(message.into())
     }
 
     pub fn failed(message: impl Into<String>) -> Self {
-        Self::Failed {
-            message: message.into(),
-        }
+        Self::Failed(message.into())
     }
 }
