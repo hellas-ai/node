@@ -512,6 +512,7 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                         println!("height {}", block.height);
                         println!("payload {}", hex::encode(block.payload));
                         println!("state_root {}", hex::encode(block.state_root));
+                        println!("finalization {}", hex::encode(block.finalization));
                     }
                     None => println!("none"),
                 }
@@ -550,12 +551,27 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                 let owner = owner.parse::<Address>().map_err(|err| {
                     ValidatorError::InvalidSetup(format!("invalid owner address: {err}"))
                 })?;
-                for (object_id, value) in client
+                match client
                     .get_coins_by_owner(owner)
                     .await
                     .map_err(query_error)?
                 {
-                    println!("{} {}", hex::encode(object_id), value);
+                    Some(owner_coins) => {
+                        println!("height {}", owner_coins.snapshot.height);
+                        println!("payload {}", hex::encode(owner_coins.snapshot.payload));
+                        println!(
+                            "state_root {}",
+                            hex::encode(owner_coins.snapshot.state_root)
+                        );
+                        println!(
+                            "finalization {}",
+                            hex::encode(owner_coins.snapshot.finalization)
+                        );
+                        for (object_id, value) in owner_coins.coins {
+                            println!("{} {}", hex::encode(object_id), value);
+                        }
+                    }
+                    None => println!("none"),
                 }
                 Ok(())
             }

@@ -42,12 +42,19 @@ pub enum ConsensusActivity {
     },
 }
 
-/// Summary of the latest persisted block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Summary of the latest finalized block.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestBlock {
     pub height: u64,
     pub payload: Digest,
     pub state_root: Digest,
+    pub finalization: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerCoins {
+    pub snapshot: LatestBlock,
+    pub coins: Vec<(ObjectId, u64)>,
 }
 
 /// Errors returned by light-client queries.
@@ -116,5 +123,5 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_coins_by_owner(
         &self,
         owner: Address,
-    ) -> impl Future<Output = Result<Vec<(ObjectId, u64)>, QueryError>> + Send;
+    ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send;
 }

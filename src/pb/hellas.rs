@@ -120,6 +120,27 @@ impl ::prost::Name for GetFinalizationResponse {
         "/hellas.GetFinalizationResponse".into()
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FinalizedSnapshot {
+    #[prost(uint64, tag = "1")]
+    pub height: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub state_root: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub finalization: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for FinalizedSnapshot {
+    const NAME: &'static str = "FinalizedSnapshot";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.FinalizedSnapshot".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.FinalizedSnapshot".into()
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetLatestBlockRequest {}
 impl ::prost::Name for GetLatestBlockRequest {
@@ -134,12 +155,8 @@ impl ::prost::Name for GetLatestBlockRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetLatestBlockResponse {
-    #[prost(uint64, optional, tag = "1")]
-    pub height: ::core::option::Option<u64>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    pub payload: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub state_root: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, optional, tag = "1")]
+    pub latest: ::core::option::Option<FinalizedSnapshot>,
 }
 impl ::prost::Name for GetLatestBlockResponse {
     const NAME: &'static str = "GetLatestBlockResponse";
@@ -327,7 +344,9 @@ impl ::prost::Name for CoinEntry {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetCoinsByOwnerResponse {
-    #[prost(message, repeated, tag = "1")]
+    #[prost(message, optional, tag = "1")]
+    pub snapshot: ::core::option::Option<FinalizedSnapshot>,
+    #[prost(message, repeated, tag = "2")]
     pub coins: ::prost::alloc::vec::Vec<CoinEntry>,
 }
 impl ::prost::Name for GetCoinsByOwnerResponse {

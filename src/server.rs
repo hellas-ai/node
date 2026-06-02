@@ -2,11 +2,11 @@ use crate::{
     ConsensusActivity, LatestBlock, LightClient as LightClientApi, ProposalInfo,
     methods::LIGHT_CLIENT_METHODS,
     pb::hellas::{
-        self as pb, ActivityEvent, CoinEntry, FinalizationEvent, GetCoinResponse,
-        GetCoinsByOwnerResponse, GetFinalizationResponse, GetLatestBlockResponse, GetProofResponse,
-        GetRelayInfoResponse, GetStateRootResponse, GetValidatorsResponse, MergeCoinTx,
-        NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent, SubmitTxResponse,
-        TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event,
+        self as pb, ActivityEvent, CoinEntry, FinalizationEvent, FinalizedSnapshot,
+        GetCoinResponse, GetCoinsByOwnerResponse, GetFinalizationResponse, GetLatestBlockResponse,
+        GetProofResponse, GetRelayInfoResponse, GetStateRootResponse, GetValidatorsResponse,
+        MergeCoinTx, NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent,
+        SubmitTxResponse, TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event,
         light_client_server, submit_tx_request,
     },
 };
@@ -259,18 +259,29 @@ where
         request: Request<pb::GetCoinsByOwnerRequest>,
     ) -> Result<Response<GetCoinsByOwnerResponse>, Status> {
         let owner = address_from_bytes(request.into_inner().owner, "owner")?;
-        let coins = self
+        let response = match self
             .client
             .get_coins_by_owner(owner)
             .await
             .map_err(Status::from)?
-            .into_iter()
-            .map(|(object_id, value)| CoinEntry {
-                object_id: object_id.to_vec(),
-                value,
-            })
-            .collect();
-        Ok(Response::new(GetCoinsByOwnerResponse { coins }))
+        {
+            Some(owner_coins) => GetCoinsByOwnerResponse {
+                snapshot: Some(latest_block_to_proto(owner_coins.snapshot)),
+                coins: owner_coins
+                    .coins
+                    .into_iter()
+                    .map(|(object_id, value)| CoinEntry {
+                        object_id: object_id.to_vec(),
+                        value,
+                    })
+                    .collect(),
+            },
+            None => GetCoinsByOwnerResponse {
+                snapshot: None,
+                coins: Vec::new(),
+            },
+        };
+        Ok(Response::new(response))
     }
 
     async fn get_relay_info(
@@ -377,17 +388,17 @@ fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
 }
 
 fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
-    match latest {
-        Some(latest) => GetLatestBlockResponse {
-            height: Some(latest.height),
-            payload: Some(latest.payload.to_vec()),
-            state_root: Some(latest.state_root.to_vec()),
-        },
-        None => GetLatestBlockResponse {
-            height: None,
-            payload: None,
-            state_root: None,
-        },
+    GetLatestBlockResponse {
+        latest: latest.map(latest_block_to_proto),
+    }
+}
+
+fn latest_block_to_proto(latest: LatestBlock) -> FinalizedSnapshot {
+    FinalizedSnapshot {
+        height: latest.height,
+        payload: latest.payload.to_vec(),
+        state_root: latest.state_root.to_vec(),
+        finalization: latest.finalization,
     }
 }
 

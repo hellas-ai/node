@@ -5,7 +5,7 @@ use crate::pb::hellas::light_client_client::LightClientClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::*;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{LatestBlock, LightClient, QueryError};
+use crate::{LatestBlock, LightClient, OwnerCoins, QueryError};
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_kernel::domain::{
     Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
@@ -148,27 +148,7 @@ impl LightClient for RemoteLightClient {
                 .await
                 .map_err(QueryError::from)?
                 .into_inner();
-            let (height, payload_bytes, root_bytes) =
-                match (response.height, response.payload, response.state_root) {
-                    (None, None, None) => return Ok(None),
-                    (Some(h), Some(p), Some(r)) => (h, p, r),
-                    _ => {
-                        return Err(QueryError::Remote(
-                            "partial GetLatestBlockResponse: expected all or no fields".to_string(),
-                        ));
-                    }
-                };
-            let payload: [u8; 32] = payload_bytes
-                .try_into()
-                .map_err(|_| QueryError::Remote("payload was not 32 bytes".to_string()))?;
-            let state_root: [u8; 32] = root_bytes
-                .try_into()
-                .map_err(|_| QueryError::Remote("state_root was not 32 bytes".to_string()))?;
-            Ok(Some(LatestBlock {
-                height,
-                payload: Digest::from(payload),
-                state_root: Digest::from(state_root),
-            }))
+            response.latest.map(latest_block_from_proto).transpose()
         }
     }
 
@@ -196,7 +176,7 @@ impl LightClient for RemoteLightClient {
     fn get_coins_by_owner(
         &self,
         owner: Address,
-    ) -> impl Future<Output = Result<Vec<(ObjectId, u64)>, QueryError>> + Send {
+    ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
         let mut client = self.client.clone();
         async move {
             let resp = client
@@ -206,6 +186,15 @@ impl LightClient for RemoteLightClient {
                 .await
                 .map_err(QueryError::from)?
                 .into_inner();
+            let Some(snapshot) = resp.snapshot else {
+                if resp.coins.is_empty() {
+                    return Ok(None);
+                }
+                return Err(QueryError::Remote(
+                    "GetCoinsByOwnerResponse had coins without a snapshot".to_string(),
+                ));
+            };
+            let snapshot = latest_block_from_proto(snapshot)?;
             let coins = resp
                 .coins
                 .into_iter()
@@ -216,9 +205,30 @@ impl LightClient for RemoteLightClient {
                     Ok((Digest::from(arr), entry.value))
                 })
                 .collect::<Result<Vec<_>, QueryError>>()?;
-            Ok(coins)
+            Ok(Some(OwnerCoins { snapshot, coins }))
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, QueryError> {
+    let payload: [u8; 32] = snapshot
+        .payload
+        .try_into()
+        .map_err(|_| QueryError::Remote("payload was not 32 bytes".to_string()))?;
+    let state_root: [u8; 32] = snapshot
+        .state_root
+        .try_into()
+        .map_err(|_| QueryError::Remote("state_root was not 32 bytes".to_string()))?;
+    if snapshot.finalization.is_empty() {
+        return Err(QueryError::Remote("finalization was empty".to_string()));
+    }
+    Ok(LatestBlock {
+        height: snapshot.height,
+        payload: Digest::from(payload),
+        state_root: Digest::from(state_root),
+        finalization: snapshot.finalization,
+    })
 }
 
 impl RemoteLightClient {

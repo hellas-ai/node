@@ -4,7 +4,7 @@ use crate::{
     app::{MarshalMailbox, Mempool},
     execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
     indexer::Indexer,
-    light_client::{LatestBlock, LightClient, QueryError},
+    light_client::{LatestBlock, LightClient, OwnerCoins, QueryError},
 };
 use commonware_consensus::{Heightable, marshal::Identifier as MarshalIdentifier};
 use commonware_cryptography::{Digestible, sha256::Digest};
@@ -79,11 +79,22 @@ impl LightClient for LocalLightClient {
     }
 
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
-        let block = self.marshal.get_block(MarshalIdentifier::Latest).await;
-        Ok(block.map(|block| LatestBlock {
+        let Some(block) = self.marshal.get_block(MarshalIdentifier::Latest).await else {
+            return Ok(None);
+        };
+        let finalization = self
+            .marshal
+            .get_finalization(block.height())
+            .await
+            .map(|finalization| finalization.encode().to_vec())
+            .ok_or_else(|| {
+                QueryError::StateUnavailable("latest block has no finalization".to_string())
+            })?;
+        Ok(Some(LatestBlock {
             height: block.height().get(),
             payload: block.digest(),
             state_root: block.state_root(),
+            finalization,
         }))
     }
 
@@ -96,10 +107,10 @@ impl LightClient for LocalLightClient {
         Ok(self.validators.clone())
     }
 
-    async fn get_coins_by_owner(&self, owner: Address) -> Result<Vec<(ObjectId, u64)>, QueryError> {
+    async fn get_coins_by_owner(&self, owner: Address) -> Result<Option<OwnerCoins>, QueryError> {
         let latest = self.get_latest_block().await?;
         let Some(latest) = latest else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let cursor = self.indexer.cursor();
         if cursor.payload != latest.payload {
@@ -107,6 +118,9 @@ impl LightClient for LocalLightClient {
                 "owner index has not reached latest payload".to_string(),
             ));
         }
-        Ok(self.indexer.get_coins_by_owner(&owner))
+        Ok(Some(OwnerCoins {
+            snapshot: latest,
+            coins: self.indexer.get_coins_by_owner(&owner),
+        }))
     }
 }

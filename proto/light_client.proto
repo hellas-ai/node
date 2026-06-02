@@ -42,11 +42,16 @@ message GetFinalizationResponse {
   optional bytes certificate = 1;
 }
 
+message FinalizedSnapshot {
+  uint64 height = 1;
+  bytes payload = 2;
+  bytes state_root = 3;
+  bytes finalization = 4;
+}
+
 message GetLatestBlockRequest {}
 message GetLatestBlockResponse {
-  optional uint64 height = 1;
-  optional bytes payload = 2;
-  optional bytes state_root = 3;
+  FinalizedSnapshot latest = 1;
 }
 
 message SubmitTxRequest {
@@ -110,7 +115,8 @@ message CoinEntry {
 }
 
 message GetCoinsByOwnerResponse {
-  repeated CoinEntry coins = 1;
+  FinalizedSnapshot snapshot = 1;
+  repeated CoinEntry coins = 2;
 }
 
 message ProposalInfo {
