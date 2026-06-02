@@ -14,27 +14,30 @@ use tracing::warn;
 mod node;
 mod node_handler;
 
-pub async fn run(
-    port: Option<u16>,
-    download_policy: DownloadPolicy,
-    execute_policy: ExecutePolicy,
-    queue_size: usize,
-    preload_models: Vec<String>,
-    artifact_store_path: Option<PathBuf>,
-    metrics_port: Option<u16>,
-    graffiti: String,
-    dtype: Vec<Dtype>,
-    secret_key: SecretKey,
-    producer_key: ProducerSigningKey,
-) -> CliResult<()> {
-    let preload_models = dedupe_preload_models(preload_models);
-    let artifact_store_path = artifact_store_path
+pub struct ServeOptions {
+    pub port: Option<u16>,
+    pub download_policy: DownloadPolicy,
+    pub execute_policy: ExecutePolicy,
+    pub queue_size: usize,
+    pub preload_models: Vec<String>,
+    pub artifact_store_path: Option<PathBuf>,
+    pub metrics_port: Option<u16>,
+    pub graffiti: String,
+    pub dtype: Vec<Dtype>,
+    pub secret_key: SecretKey,
+    pub producer_key: ProducerSigningKey,
+}
+
+pub async fn run(options: ServeOptions) -> CliResult<()> {
+    let preload_models = dedupe_preload_models(options.preload_models);
+    let artifact_store_path = options
+        .artifact_store_path
         .map(Ok)
         .unwrap_or_else(crate::identity::default_artifact_store_path)?;
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
         let mut buf = [0u8; 16];
-        let src = graffiti.as_bytes();
+        let src = options.graffiti.as_bytes();
         let len = src.len().min(16);
         buf[..len].copy_from_slice(&src[..len]);
         buf.to_vec()
@@ -44,23 +47,23 @@ pub async fn run(
     // underlying state.
     let metrics = Arc::new(ExecutorMetrics::default());
     let node = node::spawn_node(
-        port,
-        download_policy.clone(),
-        execute_policy.clone(),
-        queue_size,
+        options.port,
+        options.download_policy.clone(),
+        options.execute_policy.clone(),
+        options.queue_size,
         &preload_models,
         build,
         graffiti,
-        dtype,
+        options.dtype,
         artifact_store_path,
-        secret_key,
-        producer_key,
+        options.secret_key,
+        options.producer_key,
         metrics.clone(),
     )
     .await
     .context("failed to start node server")?;
 
-    if let Some(metrics_port) = metrics_port {
+    if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();
         metrics.register_with(&mut registry);
         let bundle = crate::metrics::MetricsBundle::new(Arc::new(registry));
@@ -80,16 +83,16 @@ pub async fn run(
         info!("Loaded model metadata: {}", preload_models.join(", "));
     }
 
-    if matches!(download_policy, DownloadPolicy::Skip)
-        && matches!(execute_policy, ExecutePolicy::Skip)
+    if matches!(options.download_policy, DownloadPolicy::Skip)
+        && matches!(options.execute_policy, ExecutePolicy::Skip)
     {
         warn!(
             "Node is running in deny-by-default mode. Pass explicit policies to allow remote downloads or execution."
         );
     } else {
         warn!(
-            %download_policy,
-            %execute_policy,
+            download_policy = %options.download_policy,
+            execute_policy = %options.execute_policy,
             "node is permitting remote downloads and/or execution; only run this on trusted networks"
         );
         warn!("warning: current policies allow remote peers to trigger downloads and/or execution");

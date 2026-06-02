@@ -593,6 +593,43 @@ in
     ];
   };
 
+  discovery-monitor = pkgs.testers.runNixOSTest {
+    name = "hellas-discovery-monitor";
+    nodes.machine = _: {
+      imports = [ hellasModule ];
+      config = lib.mkMerge [
+        (mkBaseNode package)
+        {
+          services.hellas = {
+            enable = true;
+            inherit package;
+            port = executorPort;
+            openFirewall = true;
+            downloadPolicy = "skip";
+            executePolicy = "skip";
+            queueSize = 2;
+            graffiti = "e2e-discovery";
+          };
+          virtualisation.cores = 2;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+    testScript = ''
+      start_all()
+      machine.wait_for_unit("hellas.service")
+
+      machine.wait_until_succeeds(
+          "${package}/bin/hellas-cli monitor --timeout-secs 5 > /tmp/hellas-monitor.log 2>&1"
+          " && grep -q 'event=discovered service=node' /tmp/hellas-monitor.log"
+          " && grep -q 'event=node-info' /tmp/hellas-monitor.log"
+      )
+      monitor_output = machine.succeed("cat /tmp/hellas-monitor.log")
+      print(monitor_output)
+      assert "graffiti=e2e-discovery" in monitor_output
+    '';
+  };
+
   gateway-proxy-responses = pkgs.testers.runNixOSTest {
     name = "hellas-gateway-proxy-responses";
     nodes.gateway = _: {

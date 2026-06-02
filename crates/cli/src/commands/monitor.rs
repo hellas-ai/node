@@ -18,16 +18,14 @@ use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInf
 use hellas_rpc::peers::{DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity};
 use hellas_rpc::services::node::{Node, NodeClientImpl};
 use hellas_wire::iroh::pool::PoolOptions;
-use hellas_wire::iroh::swarm::{
-    DhtBackend, MdnsBackend, Peer, PeerExchangeBackend, ServiceRegistry,
-};
+use hellas_wire::iroh::swarm::{Peer, ServiceRegistry};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointId, SecretKey};
-use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::commands::CliResult;
+use crate::commands::discovery;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -58,7 +56,6 @@ pub async fn run(
     // mDNS here because the discovery feed only needs subscribe()
     // semantics — peers in turn discover us via the endpoint's
     // default-preset N0 discovery path.
-    let endpoint_id = secret_key.public();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![Node::ALPN.as_bytes().to_vec()])
@@ -66,21 +63,13 @@ pub async fn run(
         .await
         .context("failed to bind iroh endpoint")?;
 
-    let mdns = MdnsAddressLookup::builder()
-        .build(endpoint_id)
-        .context("failed to start mDNS address lookup")?;
-
-    // -- Discovery registry: DHT + mDNS + peer-exchange.
-    let dht_backend = DhtBackend::new(&endpoint).context("failed to start DHT client")?;
-    let peer_exchange = PeerExchangeBackend::new();
-    let mut registry = ServiceRegistry::new(&endpoint);
+    let discovery = discovery::build_client_registry(&endpoint)?;
+    let mut registry = discovery.registry;
     registry.with_pool_options(PoolOptions {
         connect_timeout: CONNECT_TIMEOUT,
         ..PoolOptions::default()
     });
-    registry.add(MdnsBackend::new(mdns));
-    registry.add(dht_backend);
-    registry.add(peer_exchange.clone());
+    let peer_exchange = discovery.peer_exchange;
 
     let peer_manager = PeerManager::default();
     let mut node_discovery = Box::pin(registry.discover::<Node>());
@@ -228,6 +217,7 @@ pub async fn run(
         hinted_peers
     );
 
+    endpoint.close().await;
     Ok(())
 }
 
@@ -241,7 +231,10 @@ fn handle_discovery_event<S: RpcService>(
         .peer_manager
         .peer(PeerId::from(*peer_id.as_bytes()))
         .service::<S>()
-        .observe_discovered(DiscoverySource::Mdns, TransportSecurity::Untrusted)
+        .observe_discovered(
+            discovery_source(peer.source()),
+            TransportSecurity::Untrusted,
+        )
         .map_or(true, |observation| observation.service_inserted);
     if !service_inserted {
         return;
@@ -264,6 +257,15 @@ fn handle_discovery_event<S: RpcService>(
             let result = interrogate_peer(registry, peer_id).await;
             (peer_id, result)
         });
+    }
+}
+
+fn discovery_source(source: &str) -> DiscoverySource {
+    match source {
+        "dht" => DiscoverySource::Dht,
+        "peer-exchange" => DiscoverySource::PeerExchange,
+        "mdns" => DiscoverySource::Mdns,
+        _ => DiscoverySource::Transport("discovery"),
     }
 }
 

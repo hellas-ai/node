@@ -410,7 +410,7 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            commands::serve::run(
+            commands::serve::run(commands::serve::ServeOptions {
                 port,
                 download_policy,
                 execute_policy,
@@ -422,7 +422,7 @@ async fn main() {
                 dtype,
                 secret_key,
                 producer_key,
-            )
+            })
             .await
         }
         Commands::Gateway {
