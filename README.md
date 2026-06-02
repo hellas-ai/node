@@ -40,20 +40,19 @@ cargo install --git https://github.com/hellas-ai/node --features serve
 Run server:
 
 ```bash
-hellas-cli serve --download-policy=eager --execute-policy=eager
+hellas-cli serve --execute-policy=eager
 Node Address: bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
 RPC server running. Press Ctrl+C to stop
 ```
 
 `hellas-cli serve` without policy flags now starts in deny-by-default mode
-(`--download-policy=skip --execute-policy=skip`). Only pass eager or allow-list
-policies when you intentionally want a node to serve remote work.
+(`--execute-policy=skip`). Only pass eager or allow-list policies when you
+intentionally want a node to serve remote work.
 
 Preload weights on startup:
 
 ```bash
 hellas-cli serve \
-  --download-policy=eager \
   --execute-policy=eager \
   --preload HuggingFaceTB/SmolLM2-135M-Instruct
 ```
@@ -106,7 +105,7 @@ docker run --rm -it \
   -v ~/.cache/huggingface:/home/hellas/.cache/huggingface \
   -e OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://jaeger:4318/v1/traces \
   ghcr.io/hellas-ai/node:cuda12-sm89 \
-  --download-policy=eager --execute-policy=eager \
+  --execute-policy=eager \
   --metrics-port=9090 \
   --preload HuggingFaceTB/SmolLM2-135M-Instruct
 ```

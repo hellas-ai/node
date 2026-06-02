@@ -108,21 +108,6 @@ rec {
         default = pkgs.hellasLib.executorPort;
         description = "Port for the Hellas node to listen on. Null lets the CLI auto-select.";
       };
-      downloadPolicy = mkOption {
-        type = types.nullOr (types.either types.str (types.listOf types.str));
-        default = null;
-        example = [
-          "Qwen3/*"
-          "meta-llama/*"
-        ];
-        description = ''
-          Model download policy.
-          "skip" (CLI default) never downloads,
-          "eager" downloads any requested model,
-          and "allow(pattern,...)" downloads only matching Hugging Face models.
-          A list of patterns is shorthand for "allow(p1,p2,...)".
-        '';
-      };
       executePolicy = mkOption {
         type = types.nullOr (types.either types.str (types.listOf types.str));
         default = null;
@@ -338,7 +323,6 @@ rec {
     in
     [ "serve" ]
     ++ optArg "--port" serve.port
-    ++ optArg "--download-policy" (renderPolicy serve.downloadPolicy)
     ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
     ++ optArg "--metrics-port" serve.metricsPort

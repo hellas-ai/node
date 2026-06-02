@@ -3,7 +3,7 @@ use anyhow::Context;
 use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::ExecutorMetrics;
-use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
+use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,7 +16,6 @@ mod node_handler;
 
 pub struct ServeOptions {
     pub port: Option<u16>,
-    pub download_policy: DownloadPolicy,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
     pub preload_models: Vec<String>,
@@ -89,19 +88,15 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         info!("Loaded model metadata: {}", preload_models.join(", "));
     }
 
-    if matches!(options.download_policy, DownloadPolicy::Skip)
-        && matches!(options.execute_policy, ExecutePolicy::Skip)
-    {
+    if matches!(options.execute_policy, ExecutePolicy::Skip) {
         warn!(
-            "Node is running in deny-by-default mode. Pass explicit policies to allow remote downloads or execution."
+            "node is running in deny-by-default mode; pass an execute policy to serve remote work"
         );
     } else {
         warn!(
-            download_policy = %options.download_policy,
             execute_policy = %options.execute_policy,
-            "node is permitting remote downloads and/or execution; only run this on trusted networks"
+            "node is permitting remote execution; only run this on trusted networks"
         );
-        warn!("warning: current policies allow remote peers to trigger downloads and/or execution");
     }
 
     println!("RPC server running. Press Ctrl+C to stop.");

@@ -1,8 +1,6 @@
-mod download;
 mod execute;
 mod glob;
 
-pub use download::DownloadPolicy;
 pub use execute::{ExecutePattern, ExecutePolicy};
 
 fn parse_allow_patterns(policy: &str) -> Result<Vec<String>, String> {
