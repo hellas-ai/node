@@ -49,6 +49,7 @@ pub(super) struct GatewayState {
     pub(super) dtype: Dtype,
     runtime: ExecutionRuntime,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
+    pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -80,6 +81,7 @@ impl GatewayState {
                 &options.responses_proxy_url,
                 &options.responses_proxy_api_key_env,
             )?)),
+            ResponsesBackend::Fetch => None,
         };
 
         #[cfg(feature = "hellas-executor")]
@@ -103,6 +105,25 @@ impl GatewayState {
         #[cfg(not(feature = "hellas-executor"))]
         let runtime = ExecutionRuntime::remote(options.secret_key.clone()).await?;
 
+        let responses_fetch = match options.responses_backend {
+            ResponsesBackend::Fetch => {
+                Some(Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
+                    runtime.clone(),
+                    ExecutionRoute::remote(
+                        options.node_id,
+                        options.node_addrs.clone(),
+                        options.retries,
+                    ),
+                    &options.responses_fetch_service,
+                    &options.responses_fetch_method,
+                    crate::identity::load_or_create_producer_key(
+                        options.producer_key_path.as_deref(),
+                    )?,
+                )))
+            }
+            ResponsesBackend::Hellas | ResponsesBackend::Proxy => None,
+        };
+
         Ok(Self {
             node_id: options.node_id,
             node_addrs: options.node_addrs.clone(),
@@ -118,6 +139,7 @@ impl GatewayState {
             dtype: options.dtype,
             runtime,
             responses_proxy,
+            responses_fetch,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -458,6 +480,7 @@ mod tests {
             dtype: Dtype::F32,
             runtime: ExecutionRuntime::default(),
             responses_proxy: None,
+            responses_fetch: None,
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),
         }

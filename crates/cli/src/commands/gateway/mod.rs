@@ -1,5 +1,6 @@
 mod anthropic;
 mod backend;
+mod fetch_backend;
 mod openai;
 mod plain;
 mod provenance_layer;
@@ -23,7 +24,6 @@ use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-#[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,7 +55,8 @@ pub struct GatewayOptions {
     pub responses_backend: ResponsesBackend,
     pub responses_proxy_url: String,
     pub responses_proxy_api_key_env: String,
-    #[cfg(feature = "hellas-executor")]
+    pub responses_fetch_service: String,
+    pub responses_fetch_method: String,
     pub producer_key_path: Option<PathBuf>,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
@@ -66,6 +67,7 @@ pub struct GatewayOptions {
 pub enum ResponsesBackend {
     Hellas,
     Proxy,
+    Fetch,
 }
 
 pub async fn run(options: GatewayOptions) -> CliResult<()> {

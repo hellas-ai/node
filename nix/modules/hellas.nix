@@ -133,6 +133,11 @@ rec {
         default = [ ];
         description = "Model identifiers to preload on startup.";
       };
+      trustedCallerPublicKeys = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Compressed secp256k1 public keys allowed to create Fetch tickets.";
+      };
       fetchOpenaiResponses = mkOption {
         type = types.bool;
         default = false;
@@ -361,6 +366,10 @@ rec {
       "--preload"
       model
     ]) serve.preloadWeights
+    ++ lib.concatMap (key: [
+      "--trusted-caller-public-key"
+      key
+    ]) serve.trustedCallerPublicKeys
     ++ lib.optionals serve.fetchOpenaiResponses (
       [ "--fetch-openai-responses" ]
       ++ optArg "--fetch-openai-responses-url" serve.fetchOpenaiResponsesUrl

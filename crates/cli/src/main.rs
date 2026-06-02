@@ -59,6 +59,7 @@ const DEFAULT_DTYPE_STR: &str = "f32";
 enum GatewayResponsesBackend {
     Hellas,
     Proxy,
+    Fetch,
 }
 
 impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
@@ -66,6 +67,7 @@ impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
         match value {
             GatewayResponsesBackend::Hellas => Self::Hellas,
             GatewayResponsesBackend::Proxy => Self::Proxy,
+            GatewayResponsesBackend::Fetch => Self::Fetch,
         }
     }
 }
@@ -299,6 +301,12 @@ enum Commands {
         /// Environment variable holding the bearer token for --responses-backend=proxy.
         #[arg(long = "responses-proxy-api-key-env", default_value = "OPENAI_API_KEY")]
         responses_proxy_api_key_env: String,
+        /// Fetch service used when --responses-backend=fetch.
+        #[arg(long = "responses-fetch-service", default_value = "codex")]
+        responses_fetch_service: String,
+        /// Fetch method used when --responses-backend=fetch.
+        #[arg(long = "responses-fetch-method", default_value = "responses")]
+        responses_fetch_method: String,
         /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
         #[arg(long = "wrap")]
         wrap: Option<String>,
@@ -553,6 +561,8 @@ async fn main() {
             responses_backend,
             responses_proxy_url,
             responses_proxy_api_key_env,
+            responses_fetch_service,
+            responses_fetch_method,
             wrap,
             wrap_args,
         } => {
@@ -576,7 +586,8 @@ async fn main() {
                 responses_backend: responses_backend.into(),
                 responses_proxy_url,
                 responses_proxy_api_key_env,
-                #[cfg(feature = "hellas-executor")]
+                responses_fetch_service,
+                responses_fetch_method,
                 producer_key_path: producer_key_path.clone(),
                 secret_key,
                 wrap,
@@ -1013,6 +1024,34 @@ mod tests {
     fn gateway_wrap_args_require_wrap() {
         let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
         assert!(result.is_err(), "trailing args without --wrap should error");
+    }
+
+    #[test]
+    fn gateway_accepts_responses_fetch_backend() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "gateway",
+            "--responses-backend",
+            "fetch",
+            "--responses-fetch-service",
+            "codex",
+            "--responses-fetch-method",
+            "responses",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Gateway {
+                responses_backend,
+                responses_fetch_service,
+                responses_fetch_method,
+                ..
+            } => {
+                assert_eq!(responses_backend, GatewayResponsesBackend::Fetch);
+                assert_eq!(responses_fetch_service, "codex");
+                assert_eq!(responses_fetch_method, "responses");
+            }
+            _ => panic!("expected gateway command"),
+        }
     }
 
     #[test]
