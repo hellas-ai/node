@@ -134,11 +134,6 @@ enum Commands {
         /// Port to listen on (auto-selects if not specified or if in use)
         #[arg(long)]
         port: Option<u16>,
-        /// Download policy: 'skip' (default, cache-only, never download),
-        /// 'eager' (download freely),
-        /// or 'allow(pattern,...)' (download only matching HF models)
-        #[arg(long = "download-policy", default_value = "skip")]
-        download_policy: hellas_rpc::policy::DownloadPolicy,
         /// Execute policy: 'skip' (default, refuse all executions),
         /// 'eager' (execute any graph),
         /// or 'allow(hf/pattern,...,graph/pattern,...)' (execute only matching)
@@ -417,7 +412,6 @@ async fn main() {
         #[cfg(feature = "hellas-executor")]
         Commands::Serve {
             port,
-            download_policy,
             execute_policy,
             queue_size,
             preload_models,
@@ -437,7 +431,6 @@ async fn main() {
                 };
             commands::serve::run(commands::serve::ServeOptions {
                 port,
-                download_policy,
                 execute_policy,
                 queue_size,
                 preload_models,
