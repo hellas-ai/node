@@ -201,7 +201,10 @@ impl NodeConfig {
         for (name, field) in [
             (CREDENTIAL_PRIVATE_KEY, &mut self.private_key),
             (CREDENTIAL_THRESHOLD_SHARE, &mut self.threshold_share),
-            (CREDENTIAL_THRESHOLD_POLYNOMIAL, &mut self.threshold_polynomial),
+            (
+                CREDENTIAL_THRESHOLD_POLYNOMIAL,
+                &mut self.threshold_polynomial,
+            ),
         ] {
             let path = dir.join(name);
             let raw = std::fs::read_to_string(&path)

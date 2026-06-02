@@ -1,0 +1,320 @@
+//! Synchronous block working set bridging alto's async `UtxoDb` and the
+//! sync `hellas-kernel` apply path.
+//!
+//! The kernel's [`Store`] / [`Batch`] traits are synchronous; alto's UTXO
+//! database is async behind an `AsyncRwLock`. Rather than fighting that
+//! impedance mismatch op-by-op, every kernel-bound block walks its
+//! transactions to enumerate the [`CoinId`]s and [`EdgeId`]s it will
+//! touch, pre-loads the corresponding slots from `UtxoDb`, and hands the
+//! resulting in-memory [`BlockWorkingSet`] to the kernel.
+//!
+//! After the kernel commits, alto replays the working set's writes back
+//! into the async [`commonware_glue::stateful::db::DatabaseSet::Unmerkleized`]
+//! batch so the merkleized state root advances normally.
+//!
+//! Phase 1 scope: this module defines the sync working set + `Store` /
+//! `Batch` trait impls and a load-mutate-replay unit test. Wiring the
+//! pre-load and post-commit replay into the async path is a follow-up
+//! step; the kernel-facing contract is fully established here.
+
+use std::collections::HashMap;
+
+use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, Store};
+
+/// Synchronous staging area for one block's apply pass.
+///
+/// Holds one entry per `(CoinId | EdgeId)` the block references, with
+/// `None` representing "slot is currently empty" (e.g. an output coin id
+/// the block will create) and `Some(_)` representing "slot is currently
+/// occupied". The kernel reads through [`Batch::coin`] / [`Batch::edge`]
+/// and writes through [`Batch::insert_coin`] / [`Batch::remove_coin`]
+/// (analogous for edges).
+///
+/// **Pre-load required.** Inserts and removes only operate on slots
+/// declared in advance via [`Self::insert_coin_slot`] /
+/// [`Self::insert_edge_slot`]. A kernel write to an unknown slot returns
+/// [`InsertError::Unavailable`] — the parallel-execution safety
+/// property: the host has to surface every id it intends to mutate.
+#[derive(Debug, Clone, Default)]
+pub struct BlockWorkingSet {
+    coins: HashMap<CoinId, Option<Coin>>,
+    edges: HashMap<EdgeId, Option<Edge>>,
+}
+
+impl BlockWorkingSet {
+    /// Creates an empty working set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declares a coin slot. `coin` is `Some(_)` if the slot is currently
+    /// occupied in the backing store, `None` if it's empty (e.g. an
+    /// output id the block will produce).
+    pub fn insert_coin_slot(&mut self, id: CoinId, coin: Option<Coin>) {
+        self.coins.insert(id, coin);
+    }
+
+    /// Declares an edge slot. Same semantics as [`Self::insert_coin_slot`].
+    pub fn insert_edge_slot(&mut self, id: EdgeId, edge: Option<Edge>) {
+        self.edges.insert(id, edge);
+    }
+
+    /// Reads the current coin at `id`, ignoring pre-load tracking.
+    #[must_use]
+    pub fn coin(&self, id: CoinId) -> Option<Coin> {
+        self.coins.get(&id).copied().flatten()
+    }
+
+    /// Reads the current edge at `id`.
+    #[must_use]
+    pub fn edge(&self, id: EdgeId) -> Option<Edge> {
+        self.edges.get(&id).copied().flatten()
+    }
+
+    /// Iterates over every declared coin slot and its current state.
+    /// Used after the kernel commits to replay diffs back into the
+    /// async store.
+    pub fn coin_slots(&self) -> impl Iterator<Item = (CoinId, Option<Coin>)> + '_ {
+        self.coins.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// Iterates over every declared edge slot and its current state.
+    pub fn edge_slots(&self) -> impl Iterator<Item = (EdgeId, Option<Edge>)> + '_ {
+        self.edges.iter().map(|(k, v)| (*k, *v))
+    }
+}
+
+impl Store for BlockWorkingSet {
+    type Batch<'a>
+        = WorkingBatch<'a>
+    where
+        Self: 'a;
+
+    fn begin(&mut self) -> Self::Batch<'_> {
+        WorkingBatch {
+            coins: self.coins.clone(),
+            edges: self.edges.clone(),
+            parent: self,
+        }
+    }
+}
+
+/// Staged transaction over a [`BlockWorkingSet`].
+///
+/// Reads observe the working copy; writes mutate the working copy;
+/// [`Batch::commit`] copies the working copy back into the parent
+/// `BlockWorkingSet`. A dropped (uncommitted) batch rolls back.
+pub struct WorkingBatch<'a> {
+    coins: HashMap<CoinId, Option<Coin>>,
+    edges: HashMap<EdgeId, Option<Edge>>,
+    parent: &'a mut BlockWorkingSet,
+}
+
+impl Batch for WorkingBatch<'_> {
+    fn coin(&self, id: CoinId) -> Option<Coin> {
+        self.coins.get(&id).copied().flatten()
+    }
+
+    fn insert_coin(&mut self, id: CoinId, coin: Coin) -> KernelResult<(), InsertError> {
+        match self.coins.get(&id) {
+            None => Err(InsertError::Unavailable),
+            Some(Some(_)) => Err(InsertError::Exists),
+            Some(None) => {
+                self.coins.insert(id, Some(coin));
+                Ok(())
+            }
+        }
+    }
+
+    fn remove_coin(&mut self, id: CoinId) -> Option<Coin> {
+        let slot = self.coins.get_mut(&id)?;
+        slot.take()
+    }
+
+    fn edge(&self, id: EdgeId) -> Option<Edge> {
+        self.edges.get(&id).copied().flatten()
+    }
+
+    fn insert_edge(&mut self, id: EdgeId, edge: Edge) -> KernelResult<(), InsertError> {
+        match self.edges.get(&id) {
+            None => Err(InsertError::Unavailable),
+            Some(Some(_)) => Err(InsertError::Exists),
+            Some(None) => {
+                self.edges.insert(id, Some(edge));
+                Ok(())
+            }
+        }
+    }
+
+    fn remove_edge(&mut self, id: EdgeId) -> Option<Edge> {
+        let slot = self.edges.get_mut(&id)?;
+        slot.take()
+    }
+
+    fn commit(self) {
+        self.parent.coins = self.coins;
+        self.parent.edges = self.edges;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_kernel::{
+        CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+        Payout, ProtocolCode, SealPublicInputs, SealVerifier, Sig, SigVerifier, State, Terms, Tx,
+    };
+
+    const MAKER: Key = Key::from_bytes([0xaa; Key::LENGTH]);
+    const TAKER: Key = Key::from_bytes([0xbb; Key::LENGTH]);
+
+    /// Placeholder-accepting verifier: mirrors the kernel's test
+    /// `FakeVerifier`. Real alto wires `Secp256k1Verifier` (which impls
+    /// both traits) or a custom `UserVerifier`.
+    struct FakeVerifier;
+    impl SigVerifier for FakeVerifier {
+        fn verify_sig(&self, sig: Sig, key: Key, hash: hellas_kernel::CloseHash) -> bool {
+            sig == Sig::placeholder(key, hash)
+        }
+    }
+    impl SealVerifier for FakeVerifier {
+        fn verify_seal(&self, _seal: hellas_kernel::Seal, _public: &SealPublicInputs<'_>) -> bool {
+            false
+        }
+    }
+
+    fn party_one(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
+        List::new([id; MAX_PARTY_INPUTS], 1).expect("one-coin party")
+    }
+
+    fn payouts(maker_value: u64, taker_value: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
+        let payout = Payout::new(MAKER, maker_value);
+        let mut buf = [payout; MAX_EDGE_OUTPUTS];
+        buf[1] = Payout::new(TAKER, taker_value);
+        List::new(buf, 2).expect("two payouts")
+    }
+
+    #[test]
+    fn load_apply_replay_round_trip() {
+        // -- 1. Genesis: two coins in the durable store, conceptually.
+        let maker_coin = CoinId::from_bytes([0x01; CoinId::LENGTH]);
+        let taker_coin = CoinId::from_bytes([0x02; CoinId::LENGTH]);
+
+        // -- 2. Build a block: open the edge, immediately mutual-close
+        // back to the same parties. Walk the block to enumerate every
+        // id it touches; pre-load each into the working set.
+        let terms = Terms::basic(
+            ProtocolCode::new(1),
+            Parties::new(MAKER, TAKER),
+            hellas_kernel::BlockHeight::new(1),
+            payouts(10, 5),
+        );
+        let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
+        let edge = Tx::edge_id_of(&funding, &terms);
+
+        let open_hash = Tx::open_hash(&funding, &terms);
+        let open = Tx::open(
+            funding,
+            terms.clone(),
+            Sig::placeholder(MAKER, open_hash),
+            Sig::placeholder(TAKER, open_hash),
+        );
+
+        let close_outputs = payouts(10, 5);
+        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &close_outputs);
+        let close_output_ids = Tx::close_output_ids(edge, &close_outputs);
+        let close = Tx::close(
+            edge,
+            hellas_kernel::Proof::mutual(
+                Sig::placeholder(MAKER, close_hash),
+                Sig::placeholder(TAKER, close_hash),
+            ),
+            close_outputs,
+        );
+
+        let mut working = BlockWorkingSet::new();
+        working.insert_coin_slot(maker_coin, None);
+        working.insert_coin_slot(taker_coin, None);
+        working.insert_edge_slot(edge, None);
+        for id in close_output_ids.iter() {
+            working.insert_coin_slot(*id, None);
+        }
+
+        // -- 3. Seed genesis into the working set, then drive the
+        // kernel against the resulting state.
+        let mut state = State::genesis(
+            working,
+            &[
+                Genesis::coin(maker_coin, MAKER, 10),
+                Genesis::coin(taker_coin, TAKER, 5),
+            ],
+        )
+        .expect("genesis seeds the working set");
+        let ctx = hellas_kernel::Context::new(
+            hellas_kernel::BlockHeight::new(1),
+            hellas_kernel::BlockHash::from_bytes([0; hellas_kernel::BlockHash::LENGTH]),
+        );
+        state
+            .apply(ctx, &FakeVerifier, &open)
+            .expect("open accepted");
+        state
+            .apply(ctx, &FakeVerifier, &close)
+            .expect("close accepted");
+
+        // -- 5. Drain the working set; this is what alto would replay
+        // back into the async store.
+        let final_set = state.into_store();
+        let live_coins: Vec<_> = final_set
+            .coin_slots()
+            .filter_map(|(id, c)| c.map(|coin| (id, coin)))
+            .collect();
+        let live_edges: Vec<_> = final_set
+            .edge_slots()
+            .filter_map(|(id, e)| e.map(|edge| (id, edge)))
+            .collect();
+
+        // Two output coins (one per party); no live edges (the open
+        // edge was consumed by the close).
+        assert_eq!(live_coins.len(), 2, "expected two payout coins");
+        assert_eq!(live_edges.len(), 0, "expected no live edges");
+
+        // Input coins are gone.
+        assert!(
+            final_set.coin(maker_coin).is_none(),
+            "maker_coin should be consumed"
+        );
+        assert!(
+            final_set.coin(taker_coin).is_none(),
+            "taker_coin should be consumed"
+        );
+    }
+
+    #[test]
+    fn dropped_batch_rolls_back() {
+        // Seed one coin into the working set via genesis, then start
+        // a batch, remove the coin, and drop the batch without
+        // committing. The slot should still hold the original coin.
+        let id = CoinId::from_bytes([0x42; CoinId::LENGTH]);
+        let mut working = BlockWorkingSet::new();
+        working.insert_coin_slot(id, None);
+        let state = State::genesis(working, &[Genesis::coin(id, MAKER, 100)])
+            .expect("genesis seeds the working set");
+        let mut working = state.into_store();
+        assert!(
+            working.coin(id).is_some(),
+            "post-genesis slot must hold a coin"
+        );
+
+        {
+            let mut batch = working.begin();
+            let _ = batch.remove_coin(id);
+            // Drop without committing.
+        }
+
+        assert!(
+            working.coin(id).is_some(),
+            "uncommitted remove must roll back"
+        );
+    }
+}

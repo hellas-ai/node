@@ -6,10 +6,10 @@ use crate::execution::{
     execute_all, execute_proposal,
     store::{UtxoDatabase, UtxoSyncTarget, empty_state},
 };
+use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
     CertifiableBlock, Heightable, Reporter,
-    marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::{Activity as SimplexActivity, Context, Proposal},
     types::Height,
 };
@@ -19,9 +19,9 @@ use commonware_glue::stateful::{
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
-use commonware_storage::qmdb::sync::Target;
+use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::{SystemTimeExt, non_empty_range};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use hellas_types::rpc::{ConsensusActivity, ProposalInfo};
 use hellas_types::{Address, MAX_TXS_PER_BLOCK, PublicKey, Scheme, Transaction};
 use rand::Rng;
@@ -77,6 +77,10 @@ pub struct Application {
 }
 
 impl Application {
+    pub fn genesis_block(&self) -> HellasBlock {
+        self.genesis.clone()
+    }
+
     pub async fn new<E>(
         context: E,
         genesis_leader: PublicKey,
@@ -107,9 +111,10 @@ fn sync_target_from_merkleized<E>(
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
 {
+    let bounds = merkleized.bounds();
     Target {
-        root: merkleized.sync_root(),
-        range: non_empty_range!(merkleized.inactivity_floor(), merkleized.size()),
+        root: merkleized.root(),
+        range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
     }
 }
 
@@ -131,15 +136,16 @@ where
         self.genesis.clone()
     }
 
-    async fn propose<A: BlockProvider<Block = Self::Block>>(
+    async fn propose(
         &mut self,
         context: (E, Self::Context),
-        ancestry: AncestorStream<A, Self::Block>,
+        ancestry: impl Stream<Item = Self::Block> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
         let (runtime, consensus_context) = context;
-        let parent = ancestry.peek()?.clone();
+        let mut ancestry = Box::pin(ancestry);
+        let parent = ancestry.next().await?;
         let candidates = input.snapshot().await;
         let snapshot_len = candidates.len();
         let (batches, txs, retained) = match execute_proposal(
@@ -173,13 +179,14 @@ where
         Some(Proposed { block, merkleized })
     }
 
-    async fn verify<A: BlockProvider<Block = Self::Block>>(
+    async fn verify(
         &mut self,
         context: (E, Self::Context),
-        mut ancestry: AncestorStream<A, Self::Block>,
+        ancestry: impl Stream<Item = Self::Block> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let (runtime, consensus_context) = context;
+        let mut ancestry = Box::pin(ancestry);
         let block = ancestry.next().await?;
         let parent = ancestry.next().await?;
         if let Err(err) = block.validate(
@@ -279,11 +286,11 @@ where
 {
     type Activity = hellas_types::Activity;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let Some(converted) = convert_activity(&activity) {
             let _ = self.activity_tx.send(converted);
         }
-        self.inner.report(activity).await;
+        self.inner.report(activity)
     }
 }
 

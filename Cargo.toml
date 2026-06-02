@@ -16,6 +16,7 @@ bytes = { workspace = true }
 axum = { workspace = true }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
 clap = { workspace = true }
+commonware-actor = { workspace = true }
 commonware-broadcast = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }
@@ -28,7 +29,14 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-hellas-rpc = { workspace = true, features = ["server", "mux-client", "mux-server"] }
+hellas-kernel = { path = "../../hellas-kernel" }
+# Hellas-wire / hellas-rpc cutover: chain now consumes the new transport-
+# agnostic wire layer and the per-service RPC codegen from `node/crates/*`.
+# These overrides intentionally bypass the workspace `hellas-rpc` dep
+# (which still points at alto's tonic-based `rpc/` crate) so the rest of the
+# alto workspace can finish migrating piecemeal.
+hellas-wire = { path = "../../node/crates/wire" }
+hellas-rpc = { path = "../../node/crates/rpc", default-features = false }
 hellas-types = { workspace = true, features = ["consensus"] }
 hex = { workspace = true }
 http = "1"
@@ -45,10 +53,11 @@ serde = { workspace = true }
 sha2 = { version = "0.10", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
-tonic = { version = "0.14", features = ["server", "channel"] }
-ws-mux = { workspace = true, features = ["native-client", "server"] }
+# tokio-stream, tokio-tungstenite, tonic, and ws-mux were dropped as part of
+# the hellas-wire cutover; the new transports live under
+# `hellas_wire::{iroh, ws}` and the codegen-emitted dispatchers in
+# `hellas_rpc::services::*` (LightClient codegen pending — see
+# CUTOVER_FINDINGS #5).
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
@@ -58,7 +67,5 @@ tracing-opentelemetry = { workspace = true }
 commonware-consensus = { workspace = true, features = [ "mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-types = { workspace = true, features = ["consensus", "test-support"] }
-hellas-rpc = { workspace = true, features = ["server", "mux-client"] }
 proptest = "1.6"
 test-log = { version = "0.2", features = ["trace"] }
-tonic = { version = "0.14", features = ["server", "channel", "router"] }

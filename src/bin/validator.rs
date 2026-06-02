@@ -12,16 +12,16 @@ use commonware_consensus::{
     simplex::{self, config::ForwardingPolicy, elector::RoundRobin},
     types::{Epoch, FixedEpocher, ViewDelta},
 };
-use commonware_cryptography::bls12381::dkg::deal;
+use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
 use commonware_cryptography::certificate::{ConstantProvider, Scheme as _};
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::{Digestible as _, Signer, ed25519};
 use commonware_glue::stateful::{
-    Config as StatefulConfig, StartupMode, Stateful as StatefulActor,
-    db::{SyncEngineConfig, p2p as qmdb_resolver},
+    Config as StatefulConfig, Stateful as StatefulActor, SyncPlan,
+    db::{SyncEngineConfig, p2p::standard as qmdb_resolver},
 };
 use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Clock, Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
+use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
 use commonware_storage::{archive::immutable, mmr};
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
@@ -498,199 +498,17 @@ fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError
 }
 
 fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
-    let rt = ::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| ValidatorError::InvalidSetup(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let client = hellas_rpc::client::RemoteLightClient::connect(rpc)
-            .await
-            .map_err(|e| ValidatorError::InvalidSetup(format!("failed to connect: {e}")))?;
-
-        use hellas_types::rpc::LightClient;
-        match query {
-            QueryCommand::LatestBlock => {
-                let block = client
-                    .get_latest_block()
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                match block {
-                    Some(b) => {
-                        println!("height:     {}", b.height);
-                        println!("payload:    {}", hex::encode(b.payload));
-                        println!("state_root: {}", hex::encode(b.state_root));
-                    }
-                    None => println!("no block persisted yet"),
-                }
-            }
-            QueryCommand::StateRoot => {
-                let root = client
-                    .get_state_root()
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                match root {
-                    Some(r) => println!("{}", hex::encode(r)),
-                    None => println!("no state root available"),
-                }
-            }
-            QueryCommand::Proof { object_id } => {
-                let digest = parse_hex_digest(&object_id, "object_id")?;
-                let proof = client
-                    .get_proof(digest)
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                match proof {
-                    Some(p) => println!("{}", hex::encode(p)),
-                    None => println!("no proof found"),
-                }
-            }
-            QueryCommand::Finalization { payload } => {
-                let digest = parse_hex_digest(&payload, "payload")?;
-                let cert = client
-                    .get_finalization(digest)
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                match cert {
-                    Some(c) => println!("{}", hex::encode(c)),
-                    None => println!("no finalization certificate found"),
-                }
-            }
-            QueryCommand::Coin { object_id } => {
-                let digest = parse_hex_digest(&object_id, "object_id")?;
-                let block = client
-                    .get_latest_block()
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                let Some(block) = block else {
-                    println!("no block finalized yet");
-                    return Ok(());
-                };
-                let coin = client
-                    .get_coin(block.payload, digest)
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                match coin {
-                    Some(c) => {
-                        println!("owner: {}", c.owner);
-                        println!("value: {}", c.value);
-                    }
-                    None => println!("coin not found"),
-                }
-            }
-            QueryCommand::Transfer {
-                key,
-                input,
-                recipient,
-                amount,
-                origin,
-            } => {
-                let private_key = parse_hex_private_key(&key)?;
-                let input_digest = parse_hex_digest(&input, "input")?;
-                let recipient_addr: hellas_types::Address =
-                    recipient.parse().map_err(|e: hellas_types::AddressError| {
-                        ValidatorError::InvalidSetup(format!("bad recipient: {e}"))
-                    })?;
-                let challenge =
-                    hellas_types::transfer_challenge(&input_digest, &recipient_addr, amount);
-                let signature = mock_webauthn_sign(&private_key, &challenge, &origin)?;
-                let tx = hellas_types::Transaction::Transfer {
-                    input: input_digest,
-                    recipient: recipient_addr,
-                    amount,
-                    signature,
-                };
-                client
-                    .submit_tx(tx)
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                println!("transaction submitted");
-            }
-            QueryCommand::MergeCoin {
-                key,
-                inputs,
-                origin,
-            } => {
-                let private_key = parse_hex_private_key(&key)?;
-                let mut input_digests: Vec<commonware_cryptography::sha256::Digest> = inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, hex_str)| parse_hex_digest(hex_str, &format!("inputs[{i}]")))
-                    .collect::<Result<_, _>>()?;
-                input_digests.sort();
-                let challenge = hellas_types::merge_challenge(&input_digests);
-                let signature = mock_webauthn_sign(&private_key, &challenge, &origin)?;
-                let tx = hellas_types::Transaction::MergeCoin {
-                    inputs: input_digests,
-                    signature,
-                };
-                client
-                    .submit_tx(tx)
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                println!("transaction submitted");
-            }
-            QueryCommand::Validators => {
-                let validators = client
-                    .get_validators()
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                for v in &validators {
-                    println!("{v}");
-                }
-            }
-            QueryCommand::Activity => {
-                use hellas_rpc::pb::hellas::{ActivityEvent, activity_event::Event};
-                let mut stream = client
-                    .subscribe_activity(Vec::new())
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?;
-                while let Some(event) = stream
-                    .message::<ActivityEvent>()
-                    .await
-                    .map_err(|e| ValidatorError::InvalidSetup(e.to_string()))?
-                {
-                    let Some(inner) = event.event else { continue };
-                    match inner {
-                        Event::Notarize(e) => {
-                            let p = e.proposal.unwrap_or_default();
-                            println!(
-                                "notarize: epoch={} view={} signer={}",
-                                p.epoch, p.view, e.signer
-                            );
-                        }
-                        Event::Notarization(e) => {
-                            let p = e.proposal.unwrap_or_default();
-                            println!(
-                                "notarization: epoch={} view={} signers={:?}",
-                                p.epoch, p.view, e.signers
-                            );
-                        }
-                        Event::Nullify(e) => {
-                            println!(
-                                "nullify: epoch={} view={} signer={}",
-                                e.epoch, e.view, e.signer
-                            );
-                        }
-                        Event::Nullification(e) => {
-                            println!(
-                                "nullification: epoch={} view={} signers={:?}",
-                                e.epoch, e.view, e.signers
-                            );
-                        }
-                        Event::Finalization(e) => {
-                            let p = e.proposal.unwrap_or_default();
-                            println!(
-                                "finalization: epoch={} view={} signers={:?}",
-                                p.epoch, p.view, e.signers
-                            );
-                        }
-                    }
-                }
-                println!("activity stream ended");
-            }
-        }
-        Ok(())
-    })
+    // The remote LightClient client used to be implemented in
+    // `hellas_rpc::client::RemoteLightClient` (alto's tonic-based crate).
+    // The hellas-wire / hellas-rpc cutover has not yet ported the
+    // LightClient service into the new codegen, so the CLI `query`
+    // subcommand is temporarily disabled. See CUTOVER_FINDINGS #5.
+    let _ = (rpc, query);
+    Err(ValidatorError::InvalidSetup(
+        "the `validator query` subcommand is temporarily disabled while the \
+         LightClient service is migrated onto hellas-wire/hellas-rpc"
+            .to_string(),
+    ))
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -933,23 +751,23 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-/// Open a WebSocket to `url` and serve LightClient RPCs via ws-mux.
+/// Open a WebSocket to `url` and serve LightClient RPCs.
 ///
-/// The relay DO acts as ws-mux client and calls the validator's LightClient
-/// RPCs (including `subscribe_activity` for the event stream).
+/// Historically built on top of `ws-mux`; the hellas-wire / hellas-rpc
+/// cutover replaces that with `hellas_wire::ws` substreams plus a
+/// codegen-emitted `LightClientServer<H>` dispatcher. Neither half is in
+/// place yet (the new `hellas-rpc` doesn't ship a LightClient service),
+/// so this function panics on call. The validator's `run` path skips
+/// invoking it via the same stubbing pattern.
 async fn serve_relay(
     url: &str,
-    svc: impl ws_mux::ServiceDispatch + Clone,
+    svc: hellas_chain::rpc::LightClientServerStub,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use futures::StreamExt;
-
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
-    let (write, read) = ws_stream.split();
-    let sink = ws_mux::NativeWsSink::new(write);
-    let recv = ws_mux::NativeWsRecv::new(read);
-
-    ws_mux::serve(svc, recv, sink).await?;
-    Ok(())
+    let _ = (url, svc);
+    unimplemented!(
+        "relay serving over the new hellas-wire WS transport is pending the \
+         LightClient service codegen; see CUTOVER_FINDINGS #5"
+    )
 }
 
 type Finalization = commonware_consensus::simplex::types::Finalization<
@@ -1133,8 +951,8 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
         // Register all validators with the oracle, then allow address refreshes
         // without introducing a new peer-set epoch.
-        oracle.track(0, peer_map.clone()).await;
-        oracle.overwrite(peer_map).await;
+        oracle.track(0, peer_map.clone());
+        oracle.overwrite(peer_map);
 
         // Register consensus, marshal resolver, and block broadcast channels.
         let quota = Quota::per_second(NonZeroU32::MAX);
@@ -1184,12 +1002,45 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         )
         .await;
 
+        let mailbox_size =
+            NonZeroUsize::new(chain_config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
+        let fetch_concurrent =
+            NonZeroUsize::new(chain_config.fetch_concurrent).unwrap_or(NonZeroUsize::MIN);
+        let max_pending_acks = NZUsize!(1);
+        let mempool = Mempool::default();
+        let genesis_leader = scheme
+            .participants()
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| me.clone());
+        let application = Application::new(
+            context.child("app"),
+            genesis_leader,
+            genesis_allocations.clone(),
+            &partition_prefix,
+            ApplicationConfig {
+                page_cache_size: chain_config.page_cache_size,
+                page_cache_count: chain_config.page_cache_count,
+            },
+        )
+        .await;
+        let genesis_block = application.genesis_block();
+        let stateful_startup_context = context.child("stateful_startup");
+        let plan = SyncPlan::<_, Scheme, Standard<hellas_chain::HellasBlock>>::init(
+            &stateful_startup_context,
+            partition_prefix.clone(),
+        )
+        .await;
+        let sync_floor = plan.floor().cloned();
+
         let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
         let marshal_config = marshal::Config {
             provider: ConstantProvider::new(scheme.clone()),
             epocher: epocher.clone(),
+            start: plan.marshal_start(genesis_block.clone()),
             partition_prefix: partition_prefix.clone(),
-            mailbox_size: chain_config.mailbox_size,
+            mailbox_size,
             view_retention_timeout: ViewDelta::new(chain_config.activity_timeout),
             prunable_items_per_section: NZU64!(256),
             page_cache: page_cache.clone(),
@@ -1201,7 +1052,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 .unwrap_or(NonZeroUsize::MIN),
             block_codec_config: (),
             max_repair: NonZeroUsize::new(chain_config.max_repair).unwrap_or(NonZeroUsize::MIN),
-            max_pending_acks: NZUsize!(1),
+            max_pending_acks,
             strategy: Sequential,
         };
         let (marshal_actor, marshal_mailbox, _last_height) =
@@ -1215,7 +1066,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
         let broadcast_config = buffered::Config {
             public_key: me.clone(),
-            mailbox_size: chain_config.mailbox_size,
+            mailbox_size,
             deque_size: chain_config.broadcast_cache_per_peer,
             priority: false,
             codec_config: (),
@@ -1229,7 +1080,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             public_key: me.clone(),
             peer_provider: oracle.clone(),
             blocker: oracle.clone(),
-            mailbox_size: chain_config.mailbox_size,
+            mailbox_size,
             initial: Duration::from_secs(1),
             timeout: chain_config.fetch_timeout,
             fetch_retry_timeout: Duration::from_millis(100),
@@ -1249,7 +1100,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                     peer_provider: oracle.clone(),
                     blocker: oracle.clone(),
                     database: None,
-                    mailbox_size: chain_config.mailbox_size,
+                    mailbox_size,
                     me: Some(me.clone()),
                     initial: Duration::from_secs(1),
                     timeout: chain_config.fetch_timeout,
@@ -1261,24 +1112,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             );
         let qmdb_resolver_handle = qmdb_resolver_actor.start(qmdb_resolver_network);
 
-        let mempool = Mempool::default();
-        let genesis_leader = scheme
-            .participants()
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| me.clone());
-        let application = Application::new(
-            context.child("app"),
-            genesis_leader,
-            genesis_allocations.clone(),
-            &partition_prefix,
-            ApplicationConfig {
-                page_cache_size: chain_config.page_cache_size,
-                page_cache_count: chain_config.page_cache_count,
-            },
-        )
-        .await;
         let db_config = utxo_db_config(
             &context,
             &partition_prefix,
@@ -1288,13 +1121,13 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let (stateful_actor, stateful_mailbox) = StatefulActor::init(
             context.child("stateful"),
             StatefulConfig {
-                app: application,
+                application,
                 db_config,
                 input_provider: mempool.clone(),
                 marshal: marshal_mailbox.clone(),
-                mailbox_size: chain_config.mailbox_size,
-                partition_prefix: partition_prefix.clone(),
-                startup: StartupMode::MarshalSync,
+                max_pending_acks,
+                mailbox_size,
+                plan,
                 resolvers: qmdb_sync_resolver.clone(),
                 sync_config: SyncEngineConfig {
                     fetch_batch_size: NZU64!(64),
@@ -1322,8 +1155,12 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             reporter: ActivityReporter::new(marshal_mailbox.clone(), activity_tx.clone()),
             strategy: Sequential,
             partition: format!("{partition_prefix}-simplex"),
-            mailbox_size: chain_config.mailbox_size,
+            mailbox_size,
             epoch: Epoch::zero(),
+            floor: sync_floor.map_or_else(
+                || simplex::config::Floor::Genesis(genesis_block.digest()),
+                simplex::config::Floor::Finalized,
+            ),
             replay_buffer: NonZeroUsize::new(chain_config.replay_buffer)
                 .unwrap_or(NonZeroUsize::MIN),
             write_buffer: NonZeroUsize::new(chain_config.write_buffer).unwrap_or(NonZeroUsize::MIN),
@@ -1334,7 +1171,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             activity_timeout: ViewDelta::new(chain_config.activity_timeout),
             skip_timeout: ViewDelta::new(chain_config.skip_timeout),
             fetch_timeout: chain_config.fetch_timeout,
-            fetch_concurrent: chain_config.fetch_concurrent,
+            fetch_concurrent,
             forwarding: ForwardingPolicy::Disabled,
         };
         let simplex_engine = simplex::Engine::new(context.child("simplex"), simplex_config);
@@ -1353,49 +1190,36 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             validators,
         );
 
-        // Start light-client gRPC server over WebSocket (if configured)
+        // Light-client gRPC server over WebSocket: temporarily disabled
+        // during the hellas-wire / hellas-rpc cutover. The new RPC stack
+        // doesn't yet codegen a LightClient service, and the legacy
+        // `tonic::transport::Server` / `hellas_rpc::ws::ws_incoming`
+        // / `ws-mux` paths are gone. See CUTOVER_FINDINGS #5.
+        // `LocalLightClient` is still constructed because future cutover
+        // work will plug it into the new dispatcher; we silence the unused
+        // warning explicitly.
+        let _ = (&light_client, &activity_tx);
         if let Some(ws_bind) = &node_config.ws_bind {
-            let addr: SocketAddr = ws_bind.parse().expect("ws_bind address should be valid");
-            let svc = hellas_chain::rpc::LightClientGrpcServer::new(
-                light_client.clone(),
-                activity_tx.clone(),
-            )
-            .into_service();
-            let listener = ::tokio::net::TcpListener::bind(addr)
-                .await
-                .expect("failed to bind WebSocket listener");
-            let incoming = hellas_rpc::ws::ws_incoming(listener);
-            context.child("ws_server").spawn(|_| async move {
-                tonic::transport::Server::builder()
-                    .add_service(svc)
-                    .serve_with_incoming(incoming)
-                    .await
-                    .unwrap();
-            });
-            info!(%addr, "light client WebSocket gRPC server started");
+            warn!(
+                addr = %ws_bind,
+                "ws_bind set in config but the LightClient WebSocket server is \
+                 temporarily disabled during the hellas-wire cutover",
+            );
         }
 
         // Connect to explorer relay DO (if configured).
-        // Single outbound WebSocket: the validator serves LightClient RPCs
-        // (including subscribe_activity) and the relay DO acts as ws-mux client.
+        // Single outbound WebSocket: historically the validator served
+        // LightClient RPCs (including subscribe_activity) via ws-mux and the
+        // relay DO acted as ws-mux client. The replacement is the
+        // hellas-wire WS transport plus the codegen-emitted dispatcher; both
+        // halves are pending. See CUTOVER_FINDINGS #5.
         if let Some(explorer_url) = &node_config.explorer_url {
-            let validator_name = hex::encode(&me.encode()[..8]);
-            let relay_url = format!("{explorer_url}/relay/{validator_name}");
-            let relay_svc = hellas_rpc::mux::MuxServiceDispatch::new(
-                hellas_chain::rpc::LightClientGrpcServer::new(light_client, activity_tx)
-                    .into_service(),
+            warn!(
+                %explorer_url,
+                "explorer_url set in config but the relay connection is \
+                 temporarily disabled during the hellas-wire cutover",
             );
-            context.child("relay").spawn(|ctx| async move {
-                loop {
-                    match serve_relay(&relay_url, relay_svc.clone()).await {
-                        Ok(()) => info!("relay connection closed normally"),
-                        Err(e) => warn!(%e, "relay connection failed"),
-                    }
-                    ctx.sleep(Duration::from_secs(5)).await;
-                }
-            });
-
-            info!(%explorer_url, "relay connection started");
+            let _ = &me; // pulled in by the original `validator_name` derivation
         }
 
         // Start networking only after the app + consensus engine are initialized.
