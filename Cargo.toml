@@ -28,10 +28,8 @@ commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-hellas-kernel = { workspace = true }
-hellas-rpc = { path = "../../node/crates/rpc", default-features = false }
-hellas-types = { workspace = true, features = ["consensus"] }
-hellas-wire = { path = "../../node/crates/wire" }
+hellas-kernel = { workspace = true, features = ["consensus"] }
+hellas-rpc = { workspace = true, features = ["client-core"] }
 hex = { workspace = true }
 http = "1"
 indexmap = { workspace = true }
@@ -54,6 +52,6 @@ tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"
 [dev-dependencies]
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-hellas-types = { workspace = true, features = ["consensus", "test-support"] }
+hellas-kernel = { workspace = true, features = ["consensus", "test-support"] }
 proptest = "1.11"
 test-log = { version = "0.2", features = ["trace"] }

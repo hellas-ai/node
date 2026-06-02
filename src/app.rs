@@ -18,12 +18,15 @@ use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::metrics::Registered,
+};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::{SystemTimeExt, non_empty_range};
 use futures::{Stream, StreamExt};
-use hellas_types::rpc::{ConsensusActivity, ProposalInfo};
-use hellas_types::{Address, MAX_TXS_PER_BLOCK, PublicKey, Scheme, Transaction};
+use hellas_kernel::domain::{Activity, Address, MAX_TXS_PER_BLOCK, PublicKey, Scheme, Transaction};
+use hellas_rpc::{ConsensusActivity, ProposalInfo};
+use prometheus_client::metrics::gauge::Gauge;
 use rand::Rng;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{Mutex, broadcast};
@@ -74,6 +77,7 @@ impl Mempool {
 pub struct Application {
     genesis: HellasBlock,
     genesis_allocations: Arc<Vec<(Address, u64)>>,
+    finalized_height: Registered<Gauge>,
 }
 
 impl Application {
@@ -91,6 +95,11 @@ impl Application {
     where
         E: Storage + Clock + Metrics + BufferPooler,
     {
+        let finalized_height = context.register(
+            "finalized_height",
+            "Highest finalized block height",
+            Gauge::default(),
+        );
         let (state_root, sync_target) = empty_state(
             context,
             partition_prefix,
@@ -101,6 +110,7 @@ impl Application {
         Self {
             genesis: HellasBlock::genesis(genesis_leader, state_root, sync_target),
             genesis_allocations: Arc::new(genesis_allocations),
+            finalized_height,
         }
     }
 }
@@ -258,6 +268,8 @@ where
         block: &Self::Block,
         _databases: &Self::Databases,
     ) {
+        self.finalized_height
+            .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
         info!(
             name: "app.finalized",
             height = %block.height(),
@@ -282,9 +294,9 @@ impl<R> ActivityReporter<R> {
 
 impl<R> Reporter for ActivityReporter<R>
 where
-    R: Reporter<Activity = hellas_types::Activity> + Send,
+    R: Reporter<Activity = Activity> + Send,
 {
-    type Activity = hellas_types::Activity;
+    type Activity = Activity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let Some(converted) = convert_activity(&activity) {
@@ -308,7 +320,7 @@ fn certificate_signers() -> Vec<u32> {
     Vec::new()
 }
 
-fn convert_activity(activity: &hellas_types::Activity) -> Option<ConsensusActivity> {
+fn convert_activity(activity: &Activity) -> Option<ConsensusActivity> {
     match activity {
         SimplexActivity::Notarize(n) => Some(ConsensusActivity::Notarize {
             proposal: proposal_info(&n.proposal),

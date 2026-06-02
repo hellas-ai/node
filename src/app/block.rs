@@ -9,9 +9,9 @@ use commonware_consensus::{
     types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Digest as _, Digestible, Hasher, Sha256, sha256::Digest};
-use hellas_types::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
+use hellas_kernel::domain::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
 
-pub(crate) const SYNCHRONY_BOUND: u64 = 500;
+pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ValidationError {
@@ -205,5 +205,77 @@ impl Read for HellasBlock {
             sync_target,
             txs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::{Signer as _, ed25519};
+    use commonware_storage::{merkle::Location, mmr};
+    use commonware_utils::non_empty_range;
+
+    fn context() -> Context<Digest, PublicKey> {
+        Context {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: ed25519::PrivateKey::from_seed(0).public_key(),
+            parent: (View::zero(), Digest::EMPTY),
+        }
+    }
+
+    fn block(timestamp: u64) -> HellasBlock {
+        let context = context();
+        let sync_target = UtxoSyncTarget::new(
+            Digest::EMPTY,
+            non_empty_range!(
+                Location::<mmr::Family>::new(0),
+                Location::<mmr::Family>::new(1)
+            ),
+        );
+        HellasBlock::new(
+            context,
+            Digest::EMPTY,
+            Height::new(1),
+            timestamp,
+            Digest::EMPTY,
+            sync_target,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn validate_accepts_timestamp_at_synchrony_bound() {
+        let context = context();
+
+        let result = block(10_000 + SYNCHRONY_BOUND).validate(
+            &context,
+            Height::new(1),
+            Digest::EMPTY,
+            10_000,
+            0,
+        );
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_timestamp_beyond_synchrony_bound() {
+        let context = context();
+
+        let result = block(10_000 + SYNCHRONY_BOUND + 1).validate(
+            &context,
+            Height::new(1),
+            Digest::EMPTY,
+            10_000,
+            0,
+        );
+
+        assert_eq!(
+            result,
+            Err(ValidationError::FutureTimestamp {
+                timestamp: 10_000 + SYNCHRONY_BOUND + 1,
+                now: 10_000,
+            })
+        );
     }
 }

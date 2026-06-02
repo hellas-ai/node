@@ -12,7 +12,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::sync::AsyncRwLock;
-use hellas_types::{Coin, ObjectId};
+use hellas_kernel::domain::{Coin, ObjectId};
 use std::{
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::Arc,

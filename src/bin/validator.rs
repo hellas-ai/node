@@ -31,7 +31,10 @@ use hellas_chain::config::{
 use hellas_chain::{
     ActivityReporter, Application, ApplicationConfig, Mempool, UtxoDb, utxo_db_config,
 };
-use hellas_types::{PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant};
+use hellas_kernel::domain::{
+    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
+    UserPublicKey,
+};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use p256::ecdsa::SigningKey as UserSigningKey;
@@ -102,10 +105,8 @@ fn random_user_private_key() -> UserSigningKey {
         .expect("decoding 32 random bytes as a secp256r1 private key should succeed")
 }
 
-fn wallet_address_from_signing_key(key: &UserSigningKey) -> hellas_types::Address {
-    hellas_types::Address::from(hellas_types::UserPublicKey::from(
-        key.verifying_key().to_owned(),
-    ))
+fn wallet_address_from_signing_key(key: &UserSigningKey) -> Address {
+    Address::from(UserPublicKey::from(key.verifying_key().to_owned()))
 }
 
 #[derive(Debug, Error)]
@@ -1013,7 +1014,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         );
 
         let (qmdb_resolver_actor, qmdb_sync_resolver) =
-            qmdb_resolver::Actor::<_, hellas_types::PublicKey, _, _, mmr::Family, UtxoDb<_>>::new(
+            qmdb_resolver::Actor::<_, PublicKey, _, _, mmr::Family, UtxoDb<_>>::new(
                 context.child("qmdb_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: oracle.clone(),

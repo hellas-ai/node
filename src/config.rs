@@ -4,7 +4,9 @@ use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-use hellas_types::{Address as UserAddress, PublicKey, ThresholdPolynomial, ThresholdShare};
+use hellas_kernel::domain::{
+    Address as UserAddress, AddressError, PublicKey, ThresholdPolynomial, ThresholdShare,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -29,7 +31,7 @@ pub enum ConfigError {
     #[error("duplicate keys in peer address map")]
     DuplicatePeerAddressKeys,
     #[error("invalid genesis address: {0}")]
-    InvalidGenesisAddress(#[from] hellas_types::AddressError),
+    InvalidGenesisAddress(#[from] AddressError),
     #[error("duplicate addresses in genesis allocations")]
     DuplicateGenesisAddresses,
     #[error("failed to read credential {path}: {source}")]

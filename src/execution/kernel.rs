@@ -4,7 +4,9 @@ use commonware_consensus::types::Height;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::{Clock, Metrics, Storage};
-use hellas_types::{Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id};
+use hellas_kernel::domain::{
+    Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id,
+};
 use thiserror::Error;
 
 type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;
@@ -242,7 +244,7 @@ where
             if inputs.len() < 2 {
                 return Err((batches, ExecutionError::TooFewMergeInputs));
             }
-            for pair in inputs.windows(2) {
+            for pair in inputs.as_slice().windows(2) {
                 if pair[0] == pair[1] {
                     return Err((batches, ExecutionError::DuplicateInput { id: pair[0] }));
                 }
