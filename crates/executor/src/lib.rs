@@ -14,8 +14,8 @@ pub use artifacts::ArtifactStoreConfig;
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch::FetchCallerPolicy;
 pub use fetch_provider::{
-    FetchProvider, FetchProviderError, FetchProviderRequest, MockFetchProvider,
-    RejectingFetchProvider,
+    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
+    FetchProviderStream, MockFetchProvider, RejectingFetchProvider,
 };
 pub use hellas_rpc::services::courtesy::CourtesyServer;
 pub use hellas_rpc::services::execute::ExecuteServer;

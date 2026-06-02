@@ -2,7 +2,7 @@ use crate::commands::CliResult;
 use anyhow::Context;
 use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
-use hellas_executor::ExecutorMetrics;
+use hellas_executor::{ExecutorMetrics, FetchProvider, RejectingFetchProvider};
 use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;
 use std::collections::HashSet;
@@ -13,6 +13,7 @@ use tracing::warn;
 
 mod node;
 mod node_handler;
+mod openai_provider;
 
 pub struct ServeOptions {
     pub port: Option<u16>,
@@ -24,6 +25,9 @@ pub struct ServeOptions {
     pub graffiti: String,
     pub dtype: Vec<Dtype>,
     pub trusted_caller_public_keys: Vec<PublicKey>,
+    pub fetch_openai_responses: bool,
+    pub fetch_openai_responses_url: String,
+    pub fetch_openai_api_key_env: String,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
 }
@@ -47,6 +51,14 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     } else {
         options.trusted_caller_public_keys
     };
+    let fetch_provider: Arc<dyn FetchProvider> = if options.fetch_openai_responses {
+        Arc::new(openai_provider::OpenAiResponsesFetchProvider::new(
+            &options.fetch_openai_responses_url,
+            &options.fetch_openai_api_key_env,
+        )?)
+    } else {
+        Arc::new(RejectingFetchProvider)
+    };
     // Counters live in the executor and are mutated inline; cloning the
     // counter handles into a registry just adds a scrape view on the same
     // underlying state.
@@ -61,6 +73,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         supported_dtypes: options.dtype,
         trusted_caller_public_keys,
         artifact_store_path,
+        fetch_provider,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         metrics: metrics.clone(),
