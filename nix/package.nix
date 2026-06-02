@@ -76,6 +76,8 @@ let
     auditable = false;
     RUST_MIN_STACK = "16777216";
     GIT_REV = builtins.substring 0 12 rev;
+    SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+    NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     buildInputs = workspaceBuildInputs;
     nativeBuildInputs = workspaceNativeBuildInputs;
     checkInputs = with pkgs; [ cargo-outdated ];

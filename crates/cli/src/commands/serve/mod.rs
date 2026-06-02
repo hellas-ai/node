@@ -2,7 +2,10 @@ use crate::commands::CliResult;
 use anyhow::Context;
 use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
-use hellas_executor::{ExecutorMetrics, FetchProvider, RejectingFetchProvider};
+use hellas_executor::{
+    ExecutorMetrics, FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
+    RejectingFetchProvider,
+};
 use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;
 use std::collections::HashSet;
@@ -11,9 +14,13 @@ use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
+mod codex_provider;
 mod node;
 mod node_handler;
 mod openai_provider;
+mod responses_fetch;
+
+pub(crate) const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 pub struct ServeOptions {
     pub port: Option<u16>,
@@ -28,6 +35,9 @@ pub struct ServeOptions {
     pub fetch_openai_responses: bool,
     pub fetch_openai_responses_url: String,
     pub fetch_openai_api_key_env: String,
+    pub fetch_codex_responses: bool,
+    pub fetch_codex_base_url: String,
+    pub fetch_codex_auth_path: Option<PathBuf>,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
 }
@@ -51,13 +61,25 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     } else {
         options.trusted_caller_public_keys
     };
-    let fetch_provider: Arc<dyn FetchProvider> = if options.fetch_openai_responses {
-        Arc::new(openai_provider::OpenAiResponsesFetchProvider::new(
-            &options.fetch_openai_responses_url,
-            &options.fetch_openai_api_key_env,
-        )?)
-    } else {
-        Arc::new(RejectingFetchProvider)
+    let mut providers: Vec<Arc<dyn FetchProvider>> = Vec::new();
+    if options.fetch_openai_responses {
+        providers.push(Arc::new(
+            openai_provider::OpenAiResponsesFetchProvider::new(
+                &options.fetch_openai_responses_url,
+                &options.fetch_openai_api_key_env,
+            )?,
+        ));
+    }
+    if options.fetch_codex_responses {
+        providers.push(Arc::new(codex_provider::CodexResponsesFetchProvider::new(
+            &options.fetch_codex_base_url,
+            options.fetch_codex_auth_path.as_deref(),
+        )?));
+    }
+    let fetch_provider: Arc<dyn FetchProvider> = match providers.len() {
+        0 => Arc::new(RejectingFetchProvider),
+        1 => providers.remove(0),
+        _ => Arc::new(RoutingFetchProvider { providers }),
     };
     // Counters live in the executor and are mutated inline; cloning the
     // counter handles into a registry just adds a scrape view on the same
@@ -128,6 +150,33 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+struct RoutingFetchProvider {
+    providers: Vec<Arc<dyn FetchProvider>>,
+}
+
+impl FetchProvider for RoutingFetchProvider {
+    fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
+        Box::pin(async move {
+            let mut rejection = None;
+            for provider in &self.providers {
+                match provider.run(request.clone()).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(FetchProviderError::Rejected(message)) => rejection = Some(message),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(FetchProviderError::Rejected(rejection.unwrap_or_else(
+                || {
+                    format!(
+                        "no fetch provider configured for {}/{}",
+                        request.service, request.method
+                    )
+                },
+            )))
+        })
+    }
 }
 
 /// Print a QR code to stderr using Unicode half-block characters.

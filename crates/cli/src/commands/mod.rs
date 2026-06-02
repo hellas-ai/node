@@ -1,6 +1,7 @@
 pub type CliResult<T = ()> = anyhow::Result<T>;
 
 pub mod artifact;
+pub(crate) mod codex_auth;
 pub(crate) mod discovery;
 pub mod fetch;
 pub mod gateway;

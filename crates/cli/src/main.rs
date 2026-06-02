@@ -127,6 +127,31 @@ enum ProducerKeyCommand {
 }
 
 #[derive(Subcommand)]
+enum CodexAuthCommand {
+    /// Sign in to Codex with device-code OAuth and store credentials locally
+    Login {
+        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
+        #[arg(long = "auth-path")]
+        auth_path: Option<PathBuf>,
+    },
+    /// Import credentials from an existing Codex CLI auth file
+    Import {
+        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
+        #[arg(long = "auth-path")]
+        auth_path: Option<PathBuf>,
+        /// Source auth file (default: $HOME/.codex/auth.json)
+        #[arg(long = "from")]
+        source_path: Option<PathBuf>,
+    },
+    /// Show whether local Codex credentials are configured
+    Status {
+        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
+        #[arg(long = "auth-path")]
+        auth_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     #[cfg(feature = "hellas-executor")]
     /// Run the RPC server
@@ -186,6 +211,18 @@ enum Commands {
         /// Environment variable containing the OpenAI API key for Fetch execution.
         #[arg(long = "fetch-openai-api-key-env", default_value = "OPENAI_API_KEY")]
         fetch_openai_api_key_env: String,
+        /// Enable Codex OAuth Responses Fetch execution over the node's p2p Fetch service.
+        #[arg(long = "fetch-codex-responses")]
+        fetch_codex_responses: bool,
+        /// Codex backend base URL used by Fetch execution.
+        #[arg(
+            long = "fetch-codex-base-url",
+            default_value = commands::serve::DEFAULT_CODEX_BASE_URL
+        )]
+        fetch_codex_base_url: String,
+        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
+        #[arg(long = "fetch-codex-auth-path")]
+        fetch_codex_auth_path: Option<PathBuf>,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -368,6 +405,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProducerKeyCommand,
     },
+    /// Manage Codex OAuth credentials
+    CodexAuth {
+        #[command(subcommand)]
+        command: CodexAuthCommand,
+    },
     /// Discover peers and log network events
     Monitor {
         /// Stop monitoring after N seconds (default: run until Ctrl+C)
@@ -396,6 +438,29 @@ async fn main() {
     {
         let result = identity::load_existing_producer_key(producer_key_path.as_deref())
             .and_then(|key| commands::identity::show_producer_key(&key));
+        tracer_provider.shutdown();
+        if let Err(err) = result {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Commands::CodexAuth { command } = &cli.command {
+        let result = match command {
+            CodexAuthCommand::Login { auth_path } => {
+                commands::codex_auth::login(auth_path.as_deref()).await
+            }
+            CodexAuthCommand::Import {
+                auth_path,
+                source_path,
+            } => {
+                commands::codex_auth::import_codex_cli(auth_path.as_deref(), source_path.as_deref())
+            }
+            CodexAuthCommand::Status { auth_path } => {
+                commands::codex_auth::status(auth_path.as_deref())
+            }
+        };
         tracer_provider.shutdown();
         if let Err(err) = result {
             eprintln!("error: {err:#}");
@@ -435,6 +500,9 @@ async fn main() {
             fetch_openai_responses,
             fetch_openai_responses_url,
             fetch_openai_api_key_env,
+            fetch_codex_responses,
+            fetch_codex_base_url,
+            fetch_codex_auth_path,
         } => {
             let producer_key =
                 match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
@@ -457,6 +525,9 @@ async fn main() {
                 fetch_openai_responses,
                 fetch_openai_responses_url,
                 fetch_openai_api_key_env,
+                fetch_codex_responses,
+                fetch_codex_base_url,
+                fetch_codex_auth_path,
                 secret_key,
                 producer_key,
             })
@@ -606,6 +677,7 @@ async fn main() {
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
         },
         Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
+        Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
         Commands::Monitor {
             timeout_secs,
             no_interrogate,
@@ -1025,6 +1097,94 @@ mod tests {
                 assert_eq!(fetch_openai_api_key_env, "TEST_OPENAI_KEY");
             }
             _ => panic!("expected serve command"),
+        }
+    }
+
+    #[cfg(feature = "hellas-executor")]
+    #[test]
+    fn serve_accepts_codex_fetch_config() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "serve",
+            "--fetch-codex-responses",
+            "--fetch-codex-base-url",
+            "https://example.test/backend-api/codex",
+            "--fetch-codex-auth-path",
+            "/tmp/codex-auth.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve {
+                fetch_codex_responses,
+                fetch_codex_base_url,
+                fetch_codex_auth_path,
+                ..
+            } => {
+                assert!(fetch_codex_responses);
+                assert_eq!(
+                    fetch_codex_base_url,
+                    "https://example.test/backend-api/codex"
+                );
+                assert_eq!(
+                    fetch_codex_auth_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/codex-auth.json"))
+                );
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn codex_auth_status_accepts_auth_path() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "codex-auth",
+            "status",
+            "--auth-path",
+            "/tmp/codex-auth.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodexAuth {
+                command: CodexAuthCommand::Status { auth_path },
+            } => assert_eq!(
+                auth_path.as_deref(),
+                Some(std::path::Path::new("/tmp/codex-auth.json"))
+            ),
+            _ => panic!("expected codex-auth status command"),
+        }
+    }
+
+    #[test]
+    fn codex_auth_import_accepts_paths() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "codex-auth",
+            "import",
+            "--auth-path",
+            "/tmp/hellas-codex-auth.json",
+            "--from",
+            "/tmp/codex-auth.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodexAuth {
+                command:
+                    CodexAuthCommand::Import {
+                        auth_path,
+                        source_path,
+                    },
+            } => {
+                assert_eq!(
+                    auth_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/hellas-codex-auth.json"))
+                );
+                assert_eq!(
+                    source_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/codex-auth.json"))
+                );
+            }
+            _ => panic!("expected codex-auth import command"),
         }
     }
 
