@@ -1,5 +1,4 @@
 use axum::body::Bytes;
-use axum::http::StatusCode;
 use futures::StreamExt;
 use hellas_wire_adaptors::openai::responses::{
     OpenAiResponsesAdaptor, ParsedResponseRequest, ResponsesIngressState,
@@ -11,8 +10,6 @@ use hellas_wire_adaptors::{
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-
-use super::state::HttpError;
 
 #[derive(Clone)]
 pub(super) struct ResponsesProxy {
@@ -43,7 +40,7 @@ impl ResponsesProxy {
         }
     }
 
-    async fn send_raw(&self, body: Bytes) -> Result<reqwest::Response, HttpError> {
+    async fn send_raw(&self, body: Bytes) -> Result<reqwest::Response, BackendError> {
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -54,9 +51,8 @@ impl ResponsesProxy {
             request = request.header(AUTHORIZATION, format!("Bearer {token}"));
         }
 
-        let upstream = request.send().await.map_err(|source| HttpError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("Responses proxy request failed: {source}"),
+        let upstream = request.send().await.map_err(|source| {
+            BackendError::failed(format!("Responses proxy request failed: {source}"))
         })?;
         Ok(upstream)
     }
@@ -69,10 +65,7 @@ impl ExecutionBackend for ResponsesProxy {
             let parsed = adaptor
                 .parse(request.raw.clone())
                 .map_err(|err| BackendError::rejected(err.to_string()))?;
-            let upstream = self
-                .send_raw(forwarded_body(&request).map_err(BackendError::rejected)?)
-                .await
-                .map_err(|err| BackendError::failed(err.message))?;
+            let upstream = self.send_raw(forwarded_body(&request)?).await?;
             let status = upstream.status();
             if !status.is_success() {
                 return Err(BackendError::failed(format!(
@@ -87,10 +80,12 @@ impl ExecutionBackend for ResponsesProxy {
     }
 }
 
-fn forwarded_body(request: &BackendRequest) -> Result<Bytes, String> {
+fn forwarded_body(request: &BackendRequest) -> Result<Bytes, BackendError> {
     let upstream_model = request.execution.canonical.model.name.as_str();
     let JsonValue::Object(mut object) = request.raw.value().clone() else {
-        return Err("Responses proxy request body must be a JSON object".to_string());
+        return Err(BackendError::rejected(
+            "Responses proxy request body must be a JSON object",
+        ));
     };
     object.insert(
         "model".to_string(),
@@ -100,10 +95,14 @@ fn forwarded_body(request: &BackendRequest) -> Result<Bytes, String> {
     encode_json_object(object)
 }
 
-fn encode_json_object(object: JsonMap<String, JsonValue>) -> Result<Bytes, String> {
+fn encode_json_object(object: JsonMap<String, JsonValue>) -> Result<Bytes, BackendError> {
     serde_json::to_vec(&JsonValue::Object(object))
         .map(Bytes::from)
-        .map_err(|source| format!("failed to encode Responses proxy request: {source}"))
+        .map_err(|source| {
+            BackendError::failed(format!(
+                "failed to encode Responses proxy request: {source}"
+            ))
+        })
 }
 
 fn responses_event_stream(
