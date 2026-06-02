@@ -1,0 +1,177 @@
+syntax = "proto3";
+package hellas;
+
+service LightClient {
+  rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
+  rpc GetProof(GetProofRequest) returns (GetProofResponse);
+  rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);
+  rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
+  rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
+  rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
+  rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
+  rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
+  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsByOwnerResponse);
+  rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
+}
+
+message GetStateRootRequest {}
+message GetStateRootResponse {
+  optional bytes state_root = 1;
+}
+
+message GetProofRequest {
+  bytes object_id = 1;
+}
+message GetProofResponse {
+  optional bytes proof = 1;
+}
+
+message GetCoinRequest {
+  bytes payload = 1;
+  bytes object_id = 2;
+}
+message GetCoinResponse {
+  optional bytes owner = 1;
+  optional uint64 value = 2;
+}
+
+message GetFinalizationRequest {
+  bytes payload = 1;
+}
+message GetFinalizationResponse {
+  optional bytes certificate = 1;
+}
+
+message GetLatestBlockRequest {}
+message GetLatestBlockResponse {
+  optional uint64 height = 1;
+  optional bytes payload = 2;
+  optional bytes state_root = 3;
+}
+
+message SubmitTxRequest {
+  oneof tx {
+    TransferTx transfer = 1;
+    MergeCoinTx merge_coin = 2;
+  }
+}
+
+message WebAuthnSignature {
+  // ASN.1 DER-encoded ECDSA(P-256) signature from WebAuthn assertion response.
+  bytes ecdsa_signature = 1;
+  bytes authenticator_data = 2;
+  bytes client_data_json = 3;
+}
+
+message TransferTx {
+  bytes input = 1;
+  bytes recipient = 2;
+  uint64 amount = 3;
+  WebAuthnSignature signature = 4;
+}
+
+message MergeCoinTx {
+  repeated bytes inputs = 1;
+  WebAuthnSignature signature = 2;
+}
+
+message SubmitTxResponse {}
+
+// Identifies the variant of `ActivityEvent.event`. Numbering matches the
+// oneof tags so callers can map field numbers <-> enum values directly.
+enum ActivityEventKind {
+  ACTIVITY_EVENT_KIND_UNKNOWN = 0;
+  ACTIVITY_EVENT_KIND_NOTARIZE = 1;
+  ACTIVITY_EVENT_KIND_NOTARIZATION = 2;
+  ACTIVITY_EVENT_KIND_NULLIFY = 3;
+  ACTIVITY_EVENT_KIND_NULLIFICATION = 4;
+  ACTIVITY_EVENT_KIND_FINALIZATION = 5;
+}
+
+message SubscribeActivityRequest {
+  // Event kinds the relay should deliver immediately. Anything not listed may
+  // be batched by the relay (flushed on a short timer or when its buffer fills).
+  // Empty (default): every event is urgent.
+  repeated ActivityEventKind urgent_events = 1;
+}
+
+message GetValidatorsRequest {}
+message GetValidatorsResponse {
+  repeated string validators = 1;
+}
+
+message GetCoinsByOwnerRequest {
+  bytes owner = 1; // 33-byte compressed secp256r1 public key
+}
+
+message CoinEntry {
+  bytes object_id = 1; // 32-byte ObjectId
+  uint64 value = 2;
+}
+
+message GetCoinsByOwnerResponse {
+  repeated CoinEntry coins = 1;
+}
+
+message ProposalInfo {
+  uint64 epoch = 1;
+  uint64 view = 2;
+  uint64 parent_view = 3;
+  bytes parent_payload = 4;
+  bytes payload = 5;
+}
+
+message NotarizeEvent {
+  ProposalInfo proposal = 1;
+  uint32 signer = 2;
+  bytes signature = 3;
+}
+
+message NotarizationEvent {
+  ProposalInfo proposal = 1;
+  repeated uint32 signers = 2;
+  bytes certificate = 3;
+}
+
+message NullifyEvent {
+  uint64 epoch = 1;
+  uint64 view = 2;
+  uint32 signer = 3;
+  bytes signature = 4;
+}
+
+message NullificationEvent {
+  uint64 epoch = 1;
+  uint64 view = 2;
+  repeated uint32 signers = 3;
+  bytes certificate = 4;
+}
+
+message FinalizationEvent {
+  ProposalInfo proposal = 1;
+  repeated uint32 signers = 2;
+  bytes certificate = 3;
+}
+
+message GetRelayInfoRequest {}
+message GetRelayInfoResponse {
+  string relay_version = 1;
+  string relay_rev = 2;
+  string node_rpc_version = 3;
+  string node_rpc_rev = 4;
+}
+
+message ActivityEvent {
+  oneof event {
+    NotarizeEvent notarize = 1;
+    NotarizationEvent notarization = 2;
+    NullifyEvent nullify = 3;
+    NullificationEvent nullification = 4;
+    FinalizationEvent finalization = 5;
+  }
+  // Relay hop timestamps in unix milliseconds.
+  // [0] validator emit time, [1] durable-object relay receive time.
+  repeated uint64 relay_timestamps = 7;
+  // Cloudflare edge colo code (e.g. "FRA"), injected by the relay.
+  string edge_colo = 8;
+}
