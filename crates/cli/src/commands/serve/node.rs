@@ -32,12 +32,15 @@ use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::pres
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
+
 use super::node_handler::NodeHandlerImpl;
 
 pub(super) struct NodeHandle {
     node_id: EndpointId,
     accept_task: Option<JoinHandle<()>>,
     endpoint: Endpoint,
+    discovery: Option<DiscoveryAdvertiser>,
 }
 
 impl NodeHandle {
@@ -54,6 +57,9 @@ impl NodeHandle {
         if let Some(handle) = self.accept_task.take() {
             handle.abort();
             let _ = handle.await;
+        }
+        if let Some(discovery) = self.discovery.take() {
+            discovery.shutdown().await;
         }
         self.endpoint.close().await;
         Ok(())
@@ -94,18 +100,10 @@ pub(super) async fn spawn_node(
             .with_context(|| format!("failed to load model metadata for {model}"))?;
     }
 
-    // -- Bind iroh Endpoint with one ALPN per service we serve.
-    let alpns: Vec<Vec<u8>> = vec![
-        <Execute as ServiceMarker>::ALPN.as_bytes().to_vec(),
-        <Symbolic as ServiceMarker>::ALPN.as_bytes().to_vec(),
-        <Opaque as ServiceMarker>::ALPN.as_bytes().to_vec(),
-        <Courtesy as ServiceMarker>::ALPN.as_bytes().to_vec(),
-        <Node as ServiceMarker>::ALPN.as_bytes().to_vec(),
-    ];
-
+    let alpns = served_alpns();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(alpns);
+        .alpns(alpns.clone());
     if let Some(port) = port {
         builder = builder
             .bind_addr(format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?)
@@ -116,6 +114,8 @@ pub(super) async fn spawn_node(
         .await
         .context("failed to bind iroh endpoint")?;
     let node_id = endpoint.id();
+    let discovery = start_server_advertising(&endpoint, &alpns)
+        .context("failed to start service discovery advertising")?;
 
     // -- Construct a shared peer directory.
     //
@@ -183,6 +183,7 @@ pub(super) async fn spawn_node(
         node_id,
         accept_task: Some(accept_task),
         endpoint,
+        discovery: Some(discovery),
     })
 }
 

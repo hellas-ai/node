@@ -1,6 +1,7 @@
 pub type CliResult<T = ()> = anyhow::Result<T>;
 
 pub mod artifact;
+pub(crate) mod discovery;
 pub mod gateway;
 pub mod identity;
 pub mod llm;

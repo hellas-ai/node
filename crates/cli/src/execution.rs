@@ -64,6 +64,8 @@ use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
 
+use crate::commands::discovery;
+
 pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
 #[derive(Debug, Error)]
@@ -383,10 +385,12 @@ impl ExecutionRuntime {
             .bind()
             .await
             .exec_context("failed to bind iroh endpoint for ExecutionRuntime")?;
-        let registry = ServiceRegistry::new(&endpoint);
+        let discovery = discovery::build_client_registry(&endpoint).map_err(|source| {
+            ExecutionError::protocol(format!("failed to configure service discovery: {source:#}"))
+        })?;
         self.remote = Some(RemoteRpc {
             _endpoint: endpoint,
-            registry,
+            registry: discovery.registry,
         });
         Ok(self)
     }
