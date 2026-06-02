@@ -23,6 +23,9 @@ pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(any(feature = "client", feature = "node"))]
+pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
+
 #[cfg(feature = "node")]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
 #[cfg(feature = "node")]
@@ -31,7 +34,8 @@ pub use execution::store::{UtxoDb, utxo_db_config};
 pub use indexer::{ApplyOutcome, Cursor as IndexCursor, IndexError, Indexer};
 #[cfg(any(feature = "client", feature = "server"))]
 pub use light_client::{
-    ConsensusActivity, LatestBlock, LightClient, OwnerCoins, ProposalInfo, QueryError,
+    ConsensusActivity, ConsensusInfo, LatestBlock, LightClient, OwnerCoins, ProposalInfo,
+    QueryError,
 };
 #[cfg(feature = "server")]
 pub use server::spawn_light_client_server;

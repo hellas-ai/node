@@ -5,17 +5,31 @@ use crate::pb::hellas::light_client_client::LightClientClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::*;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{LatestBlock, LightClient, OwnerCoins, QueryError};
+use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, LightClient, OwnerCoins, QueryError};
+#[cfg(not(target_arch = "wasm32"))]
+use commonware_codec::Decode;
+#[cfg(not(target_arch = "wasm32"))]
+use commonware_consensus::simplex::types::Finalization as ConsensusFinalization;
+#[cfg(not(target_arch = "wasm32"))]
+use commonware_cryptography::certificate::Scheme as _;
+#[cfg(not(target_arch = "wasm32"))]
+use commonware_parallel::Sequential;
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_kernel::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
-    WebAuthnSignature as DomainWebAuthnSignature,
+    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Scheme as ConsensusScheme,
+    ThresholdVariant, Transaction, UserPublicKey, WebAuthnSignature as DomainWebAuthnSignature,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_rpc::mux::MuxGrpcService;
 use hellas_rpc::ws_mux;
 #[cfg(not(target_arch = "wasm32"))]
 use p256::ecdsa::Signature as P256Signature;
+#[cfg(not(target_arch = "wasm32"))]
+use rand::rngs::OsRng;
+
+#[cfg(not(target_arch = "wasm32"))]
+type ConsensusIdentity =
+    <ThresholdVariant as commonware_cryptography::bls12381::primitives::variant::Variant>::Public;
 
 /// ws-mux backed light client that connects to a remote validator or mux relay.
 #[derive(Clone)]
@@ -24,6 +38,50 @@ pub struct RemoteLightClient {
     client: LightClientClient<MuxGrpcService>,
     #[cfg(not(target_arch = "wasm32"))]
     channel: ws_mux::MuxChannel,
+    #[cfg(not(target_arch = "wasm32"))]
+    verifier: Option<ConsensusVerifier>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct ConsensusVerifier {
+    scheme: ConsensusScheme,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ConsensusVerifier {
+    fn new(info: &ConsensusInfo) -> Result<Self, QueryError> {
+        if info.threshold_identity.is_empty() {
+            return Err(QueryError::Remote(
+                "threshold identity was empty".to_string(),
+            ));
+        }
+        let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
+            .map_err(|_| QueryError::Remote("invalid threshold identity".to_string()))?;
+        Ok(Self {
+            scheme: ConsensusScheme::certificate_verifier(CONSENSUS_NAMESPACE, identity),
+        })
+    }
+
+    fn verify_snapshot(&self, snapshot: &LatestBlock) -> Result<(), QueryError> {
+        let finalization = ConsensusFinalization::<ConsensusScheme, Digest>::decode_cfg(
+            snapshot.finalization.as_slice(),
+            &ConsensusScheme::certificate_codec_config_unbounded(),
+        )
+        .map_err(|_| QueryError::Remote("invalid finalization".to_string()))?;
+        if finalization.proposal.payload != snapshot.payload {
+            return Err(QueryError::Remote(
+                "finalization payload did not match snapshot".to_string(),
+            ));
+        }
+        let mut rng = OsRng;
+        if !finalization.verify(&mut rng, &self.scheme, &Sequential) {
+            return Err(QueryError::Remote(
+                "finalization verification failed".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RemoteLightClient {
@@ -34,6 +92,7 @@ impl RemoteLightClient {
         Self {
             client: LightClientClient::new(svc),
             channel,
+            verifier: None,
         }
     }
 
@@ -50,6 +109,13 @@ impl RemoteLightClient {
             .await
             .map_err(|e| QueryError::Connect(e.to_string()))?;
         Ok(Self::new(channel))
+    }
+
+    /// Configure this native client to verify finalized snapshots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_consensus_info(mut self, info: &ConsensusInfo) -> Result<Self, QueryError> {
+        self.verifier = Some(ConsensusVerifier::new(info)?);
+        Ok(self)
     }
 }
 
@@ -142,13 +208,17 @@ impl LightClient for RemoteLightClient {
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
         let mut client = self.client.clone();
+        let verifier = self.verifier.clone();
         async move {
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
                 .await
                 .map_err(QueryError::from)?
                 .into_inner();
-            response.latest.map(latest_block_from_proto).transpose()
+            response
+                .latest
+                .map(|snapshot| verified_latest_block_from_proto(snapshot, verifier.as_ref()))
+                .transpose()
         }
     }
 
@@ -173,11 +243,32 @@ impl LightClient for RemoteLightClient {
         }
     }
 
+    fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send {
+        let mut client = self.client.clone();
+        async move {
+            let resp = client
+                .get_consensus_info(GetConsensusInfoRequest {})
+                .await
+                .map_err(QueryError::from)?
+                .into_inner();
+            if resp.threshold_identity.is_empty() {
+                return Err(QueryError::Remote(
+                    "threshold identity was empty".to_string(),
+                ));
+            }
+            Ok(ConsensusInfo {
+                validators: resp.validators,
+                threshold_identity: resp.threshold_identity,
+            })
+        }
+    }
+
     fn get_coins_by_owner(
         &self,
         owner: Address,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
         let mut client = self.client.clone();
+        let verifier = self.verifier.clone();
         async move {
             let resp = client
                 .get_coins_by_owner(GetCoinsByOwnerRequest {
@@ -194,7 +285,7 @@ impl LightClient for RemoteLightClient {
                     "GetCoinsByOwnerResponse had coins without a snapshot".to_string(),
                 ));
             };
-            let snapshot = latest_block_from_proto(snapshot)?;
+            let snapshot = verified_latest_block_from_proto(snapshot, verifier.as_ref())?;
             let coins = resp
                 .coins
                 .into_iter()
@@ -208,6 +299,18 @@ impl LightClient for RemoteLightClient {
             Ok(Some(OwnerCoins { snapshot, coins }))
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verified_latest_block_from_proto(
+    snapshot: FinalizedSnapshot,
+    verifier: Option<&ConsensusVerifier>,
+) -> Result<LatestBlock, QueryError> {
+    let latest = latest_block_from_proto(snapshot)?;
+    if let Some(verifier) = verifier {
+        verifier.verify_snapshot(&latest)?;
+    }
+    Ok(latest)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

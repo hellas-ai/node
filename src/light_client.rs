@@ -57,6 +57,12 @@ pub struct OwnerCoins {
     pub coins: Vec<(ObjectId, u64)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsensusInfo {
+    pub validators: Vec<String>,
+    pub threshold_identity: Vec<u8>,
+}
+
 /// Errors returned by light-client queries.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum QueryError {
@@ -119,6 +125,8 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send;
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send;
+
+    fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send;
 
     fn get_coins_by_owner(
         &self,

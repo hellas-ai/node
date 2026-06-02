@@ -1,13 +1,14 @@
 use crate::{
-    ConsensusActivity, LatestBlock, LightClient as LightClientApi, ProposalInfo,
+    ConsensusActivity, ConsensusInfo, LatestBlock, LightClient as LightClientApi, ProposalInfo,
     methods::LIGHT_CLIENT_METHODS,
     pb::hellas::{
         self as pb, ActivityEvent, CoinEntry, FinalizationEvent, FinalizedSnapshot,
-        GetCoinResponse, GetCoinsByOwnerResponse, GetFinalizationResponse, GetLatestBlockResponse,
-        GetProofResponse, GetRelayInfoResponse, GetStateRootResponse, GetValidatorsResponse,
-        MergeCoinTx, NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent,
-        SubmitTxResponse, TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event,
-        light_client_server, submit_tx_request,
+        GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse,
+        GetFinalizationResponse, GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse,
+        GetStateRootResponse, GetValidatorsResponse, MergeCoinTx, NotarizationEvent, NotarizeEvent,
+        NullificationEvent, NullifyEvent, SubmitTxResponse, TransferTx,
+        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, light_client_server,
+        submit_tx_request,
     },
 };
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -284,6 +285,18 @@ where
         Ok(Response::new(response))
     }
 
+    async fn get_consensus_info(
+        &self,
+        _request: Request<pb::GetConsensusInfoRequest>,
+    ) -> Result<Response<GetConsensusInfoResponse>, Status> {
+        let info = self
+            .client
+            .get_consensus_info()
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(consensus_info_response(info)))
+    }
+
     async fn get_relay_info(
         &self,
         _request: Request<pb::GetRelayInfoRequest>,
@@ -294,6 +307,13 @@ where
             node_rpc_version: env!("CARGO_PKG_VERSION").to_string(),
             node_rpc_rev: option_env!("GIT_REV").unwrap_or("unknown").to_string(),
         }))
+    }
+}
+
+fn consensus_info_response(info: ConsensusInfo) -> GetConsensusInfoResponse {
+    GetConsensusInfoResponse {
+        validators: info.validators,
+        threshold_identity: info.threshold_identity,
     }
 }
 

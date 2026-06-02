@@ -14,10 +14,16 @@ default = ["node"]
 api = ["dep:prost", "dep:tonic", "dep:tonic-prost"]
 client = [
     "api",
+    "dep:commonware-codec",
+    "dep:commonware-consensus",
+    "dep:commonware-cryptography",
+    "dep:commonware-parallel",
     "dep:hellas-kernel",
     "dep:hellas-rpc",
     "dep:p256",
+    "dep:rand",
     "dep:thiserror",
+    "hellas-kernel/consensus",
     "hellas-kernel/domain",
     "hellas-rpc/mux-client",
 ]

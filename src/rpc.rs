@@ -4,7 +4,7 @@ use crate::{
     app::{MarshalMailbox, Mempool},
     execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
     indexer::Indexer,
-    light_client::{LatestBlock, LightClient, OwnerCoins, QueryError},
+    light_client::{ConsensusInfo, LatestBlock, LightClient, OwnerCoins, QueryError},
 };
 use commonware_consensus::{Heightable, marshal::Identifier as MarshalIdentifier};
 use commonware_cryptography::{Digestible, sha256::Digest};
@@ -17,7 +17,7 @@ pub struct LocalLightClient {
     indexer: Indexer,
     mempool: Mempool,
     marshal: MarshalMailbox,
-    validators: Vec<String>,
+    consensus_info: ConsensusInfo,
 }
 
 impl LocalLightClient {
@@ -26,14 +26,14 @@ impl LocalLightClient {
         indexer: Indexer,
         mempool: Mempool,
         marshal: MarshalMailbox,
-        validators: Vec<String>,
+        consensus_info: ConsensusInfo,
     ) -> Self {
         Self {
             databases,
             indexer,
             mempool,
             marshal,
-            validators,
+            consensus_info,
         }
     }
 }
@@ -104,7 +104,11 @@ impl LightClient for LocalLightClient {
     }
 
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
-        Ok(self.validators.clone())
+        Ok(self.consensus_info.validators.clone())
+    }
+
+    async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
+        Ok(self.consensus_info.clone())
     }
 
     async fn get_coins_by_owner(&self, owner: Address) -> Result<Option<OwnerCoins>, QueryError> {

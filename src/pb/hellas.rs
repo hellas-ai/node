@@ -308,6 +308,35 @@ impl ::prost::Name for GetValidatorsResponse {
         "/hellas.GetValidatorsResponse".into()
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetConsensusInfoRequest {}
+impl ::prost::Name for GetConsensusInfoRequest {
+    const NAME: &'static str = "GetConsensusInfoRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetConsensusInfoRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetConsensusInfoRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetConsensusInfoResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub validators: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub threshold_identity: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for GetConsensusInfoResponse {
+    const NAME: &'static str = "GetConsensusInfoResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetConsensusInfoResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetConsensusInfoResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetCoinsByOwnerRequest {
     /// 33-byte compressed secp256r1 public key
@@ -913,6 +942,30 @@ pub mod light_client_client {
                 .insert(GrpcMethod::new("hellas.LightClient", "GetRelayInfo"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_consensus_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetConsensusInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetConsensusInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.LightClient/GetConsensusInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.LightClient", "GetConsensusInfo"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1000,6 +1053,13 @@ pub mod light_client_server {
             request: tonic::Request<super::GetRelayInfoRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetRelayInfoResponse>,
+            tonic::Status,
+        >;
+        async fn get_consensus_info(
+            &self,
+            request: tonic::Request<super::GetConsensusInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetConsensusInfoResponse>,
             tonic::Status,
         >;
     }
@@ -1518,6 +1578,52 @@ pub mod light_client_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetRelayInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.LightClient/GetConsensusInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetConsensusInfoSvc<T: LightClient>(pub Arc<T>);
+                    impl<
+                        T: LightClient,
+                    > tonic::server::UnaryService<super::GetConsensusInfoRequest>
+                    for GetConsensusInfoSvc<T> {
+                        type Response = super::GetConsensusInfoResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetConsensusInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LightClient>::get_consensus_info(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetConsensusInfoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

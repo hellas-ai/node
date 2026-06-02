@@ -10,8 +10,9 @@ pub const METHOD_SUBSCRIBE_ACTIVITY: u8 = 6;
 pub const METHOD_GET_VALIDATORS: u8 = 7;
 pub const METHOD_GET_COINS_BY_OWNER: u8 = 8;
 pub const METHOD_GET_RELAY_INFO: u8 = 9;
+pub const METHOD_GET_CONSENSUS_INFO: u8 = 10;
 
-pub const METHOD_PATHS: [&str; 10] = [
+pub const METHOD_PATHS: [&str; 11] = [
     "/hellas.LightClient/GetStateRoot",
     "/hellas.LightClient/GetProof",
     "/hellas.LightClient/GetCoin",
@@ -22,6 +23,7 @@ pub const METHOD_PATHS: [&str; 10] = [
     "/hellas.LightClient/GetValidators",
     "/hellas.LightClient/GetCoinsByOwner",
     "/hellas.LightClient/GetRelayInfo",
+    "/hellas.LightClient/GetConsensusInfo",
 ];
 
 pub const STREAMING_METHODS: [u8; 1] = [METHOD_SUBSCRIBE_ACTIVITY];

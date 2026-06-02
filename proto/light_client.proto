@@ -12,6 +12,7 @@ service LightClient {
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
   rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsByOwnerResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
+  rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
 }
 
 message GetStateRootRequest {}
@@ -103,6 +104,12 @@ message SubscribeActivityRequest {
 message GetValidatorsRequest {}
 message GetValidatorsResponse {
   repeated string validators = 1;
+}
+
+message GetConsensusInfoRequest {}
+message GetConsensusInfoResponse {
+  repeated string validators = 1;
+  bytes threshold_identity = 2;
 }
 
 message GetCoinsByOwnerRequest {

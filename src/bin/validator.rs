@@ -34,8 +34,8 @@ use hellas_chain::config::{
 };
 use hellas_chain::rpc::LocalLightClient;
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, Indexer, LightClient as _, Mempool, UtxoDb,
-    spawn_light_client_server, utxo_db_config,
+    ActivityReporter, Application, ApplicationConfig, ConsensusInfo, Indexer, LightClient as _,
+    Mempool, UtxoDb, spawn_light_client_server, utxo_db_config,
 };
 use hellas_kernel::domain::{
     Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
@@ -505,6 +505,10 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
         let client = RemoteLightClient::connect(rpc)
             .await
             .map_err(|err| ValidatorError::InvalidSetup(format!("failed to connect: {err}")))?;
+        let consensus_info = client.get_consensus_info().await.map_err(query_error)?;
+        let client = client
+            .with_consensus_info(&consensus_info)
+            .map_err(query_error)?;
         match query {
             QueryCommand::LatestBlock => {
                 match client.get_latest_block().await.map_err(query_error)? {
@@ -1017,11 +1021,14 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ));
         }
     };
-    let validator_names = scheme
-        .participants()
-        .iter()
-        .map(|public_key| hex::encode(public_key.encode()))
-        .collect::<Vec<_>>();
+    let consensus_info = ConsensusInfo {
+        validators: scheme
+            .participants()
+            .iter()
+            .map(|public_key| hex::encode(public_key.encode()))
+            .collect(),
+        threshold_identity: scheme.identity().encode().to_vec(),
+    };
 
     // Configure tokio runtime
     let storage_dir = node_config.storage_directory()?;
@@ -1310,7 +1317,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 owner_index.clone(),
                 mempool.clone(),
                 marshal_mailbox.clone(),
-                validator_names.clone(),
+                consensus_info.clone(),
             );
             Some(
                 spawn_light_client_server(addr, light_client, activity_tx.clone())
