@@ -1,4 +1,5 @@
 use crate::executor::TicketOutcome;
+use crate::fetch_provider::FetchProviderRequest;
 use crate::state::{
     LocalModelStatus, ModelLocator, QuoteKind, QuotePlan, QuoteRecord, model_spec,
     resolve_accept_dtypes, symbolic_request_from_pb, symbolic_request_to_pb,
@@ -144,16 +145,19 @@ impl Executor {
         let hellas_rpc::fetch::FetchInput {
             service,
             method,
-            body: output,
+            body,
             ..
         } = verified;
+        let provider_request = FetchProviderRequest::new(service.clone(), method.clone(), body);
 
         let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: format!("fetch:{service}/{method}"),
-            kind: QuoteKind::Fetch { output },
+            kind: QuoteKind::Fetch {
+                request: provider_request,
+            },
         });
 
         info!(

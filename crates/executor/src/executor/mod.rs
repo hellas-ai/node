@@ -2,6 +2,7 @@ mod actor;
 mod handle;
 
 use catgrad::prelude::Dtype;
+use hellas_core::InputCommitment;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
@@ -16,6 +17,7 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire::WireStatus;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::fetch_provider::FetchProviderError;
 use crate::worker::WorkerCompletion;
 pub use actor::{Executor, ExecutorSpawnConfig};
 
@@ -89,6 +91,7 @@ pub(crate) enum ExecutorMessage {
     /// terminal artifacts, signs the receipt, sends the final event, and
     /// advances the pending queue.
     WorkerFinished(WorkerCompletion),
+    FetchFinished(FetchCompletion),
     ListModels {
         reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
     },
@@ -99,6 +102,22 @@ pub(crate) enum ExecutorMessage {
         request: GetModelStatsRequest,
         reply: oneshot::Sender<Result<GetModelStatsResponse, ExecutorError>>,
     },
+}
+
+pub(crate) struct FetchCompletion {
+    pub input_commitment: InputCommitment,
+    pub request_commitment_id: [u8; 32],
+    pub execution_id: String,
+    pub model_id: String,
+    pub sender: ExecuteEventReceiverSender,
+    pub result: Result<Vec<u8>, FetchProviderFailure>,
+}
+
+pub(crate) type ExecuteEventReceiverSender = mpsc::Sender<Result<WorkEvent, WireStatus>>;
+
+pub(crate) struct FetchProviderFailure {
+    pub position: u64,
+    pub error: FetchProviderError,
 }
 
 #[derive(Clone)]
