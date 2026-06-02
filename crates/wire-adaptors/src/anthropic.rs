@@ -713,7 +713,7 @@ mod tests {
             .render_response(
                 &sample_request(),
                 result,
-                RenderContext::new("msg-test", "unused", 0),
+                RenderContext::new("msg-test", "msg-test", 0),
             )
             .unwrap();
         assert_eq!(response.status, 200);
@@ -744,7 +744,7 @@ mod tests {
                     stop_reason: StopReason::EndOfText,
                     provenance: None,
                 },
-                RenderContext::new("msg-test", "unused", 0),
+                RenderContext::new("msg-test", "msg-test", 0),
             )
             .unwrap();
         let WireBody::Json(body) = response.body else {
@@ -758,7 +758,7 @@ mod tests {
     fn stream_finish_renders_delta_and_stop() {
         let request = sample_request();
         let mut state =
-            adaptor().initial_state(&request, RenderContext::new("msg-test", "unused", 0));
+            adaptor().initial_state(&request, RenderContext::new("msg-test", "msg-test", 0));
         let events = adaptor()
             .render_stream_event(
                 &request,
@@ -782,7 +782,7 @@ mod tests {
     fn stream_text_delta_opens_and_finish_closes_content_block() {
         let request = sample_request();
         let mut state =
-            adaptor().initial_state(&request, RenderContext::new("msg-test", "unused", 0));
+            adaptor().initial_state(&request, RenderContext::new("msg-test", "msg-test", 0));
 
         let text = adaptor()
             .render_stream_event(
@@ -828,7 +828,7 @@ mod tests {
     fn stream_tool_call_events_render_anthropic_blocks() {
         let request = sample_request();
         let mut state =
-            adaptor().initial_state(&request, RenderContext::new("msg-test", "unused", 0));
+            adaptor().initial_state(&request, RenderContext::new("msg-test", "msg-test", 0));
 
         let start = adaptor()
             .render_stream_event(

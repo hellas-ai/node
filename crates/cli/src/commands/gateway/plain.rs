@@ -35,5 +35,6 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
 }
 
 fn render_context() -> RenderContext {
-    RenderContext::new(next_id("cmpl"), next_id("unused"), now_unix())
+    let id = next_id("cmpl");
+    RenderContext::new(id.clone(), id, now_unix())
 }
