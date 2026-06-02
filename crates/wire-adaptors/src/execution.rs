@@ -1,9 +1,7 @@
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::{FieldPath, PassthroughBag};
+use crate::PassthroughBag;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRef {
@@ -48,7 +46,6 @@ pub struct CanonicalExecution {
     pub response_format: Option<ResponseFormat>,
     pub reasoning: Option<ReasoningOptions>,
     pub previous_response_id: Option<String>,
-    pub committed_fields: BTreeSet<FieldPath>,
 }
 
 impl CanonicalExecution {
@@ -63,12 +60,7 @@ impl CanonicalExecution {
             response_format: None,
             reasoning: None,
             previous_response_id: None,
-            committed_fields: BTreeSet::new(),
         }
-    }
-
-    pub fn commit_field(&mut self, path: impl Into<FieldPath>) {
-        self.committed_fields.insert(path.into());
     }
 }
 
@@ -289,26 +281,20 @@ mod tests {
 
     #[test]
     fn execution_request_keeps_canonical_and_passthrough_separate() {
-        let mut canonical =
+        let canonical =
             CanonicalExecution::new(ModelRef::new("model-a"), Input::Text("hello".to_string()));
-        canonical.commit_field("model");
-        canonical.commit_field("input");
 
         let mut passthrough = PassthroughBag::new();
         passthrough.push("metadata", json!({"trace_id": "abc"}));
 
         let request = ExecutionRequest::new(canonical, passthrough);
 
-        assert!(
-            request
-                .canonical
-                .committed_fields
-                .contains(&FieldPath::from("model"))
-        );
+        assert_eq!(request.canonical.model.name, "model-a");
+        assert_eq!(request.canonical.input, Input::Text("hello".to_string()));
         assert_eq!(request.passthrough.fields().len(), 1);
         assert_eq!(
             request.passthrough.fields()[0].path,
-            FieldPath::from("metadata")
+            crate::FieldPath::from("metadata")
         );
     }
 

@@ -165,11 +165,8 @@ impl ParsedCompletionRequest {
             ModelRef::new(self.model.clone()),
             Input::Text(self.prompt.clone()),
         );
-        canonical.commit_field("model");
-        canonical.commit_field("prompt");
         if let Some(max_tokens) = self.max_tokens {
             canonical.sampling.max_output_tokens = Some(max_tokens);
-            canonical.commit_field("max_tokens");
         }
         Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
     }
@@ -347,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_commits_model_prompt_and_limit() {
+    fn projection_sets_model_prompt_and_limit() {
         let request = adaptor()
             .parse(raw(json!({
                 "model": "gpt-3.5-turbo-instruct",
@@ -359,10 +356,6 @@ mod tests {
         assert_eq!(execution.canonical.model.name, "gpt-3.5-turbo-instruct");
         assert_eq!(execution.canonical.input, Input::Text("Hello".to_string()));
         assert_eq!(execution.canonical.sampling.max_output_tokens, Some(16));
-        assert_eq!(
-            execution.canonical.committed_fields,
-            field_set(["model", "prompt", "max_tokens"])
-        );
     }
 
     #[test]

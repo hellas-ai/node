@@ -462,36 +462,27 @@ impl ParsedResponseRequest {
             ModelRef::new(self.model.clone()),
             project_input(&self.input)?,
         );
-        canonical.commit_field("model");
-        canonical.commit_field("input");
 
         if let Some(instructions) = &self.instructions {
             canonical.instructions = Some(instructions.clone());
-            canonical.commit_field("instructions");
         }
         if let Some(max_output_tokens) = self.max_output_tokens {
             canonical.sampling.max_output_tokens = Some(max_output_tokens);
-            canonical.commit_field("max_output_tokens");
         }
         if let Some(temperature) = self.sampling.temperature {
             canonical.sampling.temperature = Some(temperature);
-            canonical.commit_field("temperature");
         }
         if let Some(top_p) = self.sampling.top_p {
             canonical.sampling.top_p = Some(top_p);
-            canonical.commit_field("top_p");
         }
         if let Some(top_logprobs) = self.sampling.top_logprobs {
             canonical.sampling.top_logprobs = Some(top_logprobs);
-            canonical.commit_field("top_logprobs");
         }
         if let Some(parallel_tool_calls) = self.sampling.parallel_tool_calls {
             canonical.sampling.parallel_tool_calls = Some(parallel_tool_calls);
-            canonical.commit_field("parallel_tool_calls");
         }
         if let Some(truncation) = &self.sampling.truncation {
             canonical.sampling.truncation = Some(truncation.clone());
-            canonical.commit_field("truncation");
         }
 
         canonical.tools = self
@@ -499,31 +490,20 @@ impl ParsedResponseRequest {
             .iter()
             .map(project_tool)
             .collect::<AdaptorResult<Vec<_>>>()?;
-        if !canonical.tools.is_empty() {
-            canonical.commit_field("tools");
-        }
 
         if let Some(tool_choice) = &self.tool_choice {
             canonical.tool_choice = project_tool_choice(tool_choice);
-            canonical.commit_field("tool_choice");
         }
         if let Some(response_format) = &self.response_format {
             canonical.response_format = Some(project_response_format(response_format));
-            canonical.commit_field(if self.raw.value().get("text").is_some() {
-                "text"
-            } else {
-                "response_format"
-            });
         }
         if let Some(reasoning) = &self.reasoning {
             canonical.reasoning = Some(ReasoningOptions {
                 value: reasoning.clone(),
             });
-            canonical.commit_field("reasoning");
         }
         if let Some(previous_response_id) = &self.previous_response_id {
             canonical.previous_response_id = Some(previous_response_id.clone());
-            canonical.commit_field("previous_response_id");
         }
 
         Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
@@ -1487,28 +1467,20 @@ mod tests {
     }
 
     #[test]
-    fn projection_separates_committed_fields_from_passthrough() {
+    fn projection_sets_responses_execution_fields() {
         let parsed = sample_request();
         let execution = adaptor().to_execution_request(&parsed).unwrap();
         assert_eq!(execution.canonical.model.name, "gpt-4.1-mini");
         assert_eq!(
-            execution.canonical.committed_fields,
-            field_set([
-                "model",
-                "input",
-                "instructions",
-                "max_output_tokens",
-                "temperature",
-                "top_p",
-                "top_logprobs",
-                "parallel_tool_calls",
-                "truncation",
-                "tools",
-                "tool_choice",
-                "text",
-                "reasoning",
-                "previous_response_id",
-            ])
+            execution.canonical.instructions.as_deref(),
+            Some("Be brief.")
+        );
+        assert_eq!(execution.canonical.sampling.max_output_tokens, Some(64));
+        assert_eq!(execution.canonical.tools.len(), 1);
+        assert!(execution.canonical.reasoning.is_some());
+        assert_eq!(
+            execution.canonical.previous_response_id.as_deref(),
+            Some("resp_prev")
         );
         assert_eq!(execution.passthrough.fields().len(), 3);
     }
