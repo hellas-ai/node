@@ -330,10 +330,8 @@ impl SchemaIndex {
         msg: &IndexedMessage,
         visiting: &mut Vec<String>,
     ) -> OwnedMessageSchema {
-        // Self-referential / mutually-recursive messages would diverge
-        // here. We rely on the proto layer to keep service-facing trees
-        // acyclic for now; emit a panic if violated so it surfaces
-        // immediately rather than blowing the stack.
+        // Method-id derivation requires acyclic service-facing message trees.
+        // Panic at the cycle boundary instead of recursing until stack overflow.
         if visiting.contains(&fqn.to_string()) {
             panic!("cyclic message schema at {fqn}; method-id derivation requires acyclic trees");
         }

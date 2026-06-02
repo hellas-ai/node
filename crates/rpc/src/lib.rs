@@ -27,14 +27,13 @@ pub mod provenance;
 
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is
-/// doc-hidden; downstream consumers should reach for the per-service
-/// re-exports under `pb::{courtesy, swarm, execute, fetch, symbolic}` or
-/// the per-service marker/trait modules under `pb::services::*`.
+/// doc-hidden; use the per-service re-exports under
+/// `pb::{courtesy, swarm, execute, fetch, symbolic}` or the marker and
+/// handler modules under `pb::services::*`.
 #[doc(hidden)]
 pub mod pb;
 
-/// Convenience re-export — same as `pb::services`, surfaced at the crate
-/// root because that's where downstream code expects service markers.
+/// Service marker and handler modules.
 pub use crate::pb::services;
 
 #[cfg(feature = "node")]

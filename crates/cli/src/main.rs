@@ -82,8 +82,8 @@ impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
 ///   hardware mismatch the operator should fix, not something we paper over.
 /// - **Local-ish mode on a cpu / unspecified build**: `[f32, f16]`. Skips
 ///   bf16 because CPU bf16 throughput is rarely a win and we want a default
-///   that loads on every backend including older GPUs an operator might
-///   bring in via a non-standard build.
+///   that loads on every backend, including GPUs without native bf16
+///   support in non-standard builds.
 fn default_llm_dtypes(is_local_mode: bool) -> Vec<Dtype> {
     let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
     if is_local_mode && !cuda_or_metal {
