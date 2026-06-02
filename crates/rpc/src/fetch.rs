@@ -13,6 +13,8 @@ const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v1";
 pub struct FetchInput {
     pub input_commitment: InputCommitment,
     pub caller_key: PublicKey,
+    pub service: String,
+    pub method: String,
     pub body: JsonBytes,
 }
 
@@ -62,22 +64,22 @@ pub fn build_output_events(
 }
 
 pub fn verify_input_events(
-    service: &str,
-    method: &str,
     events: &[InputEventEnvelope],
 ) -> Result<FetchInput, FetchProtocolError> {
-    validate_non_empty_service_method(service, method)?;
     let caller_key = *events
         .first()
         .ok_or(FetchProtocolError::EmptyInputTranscript)?
         .event()
         .public_key();
     let input_commitment = verify_input_event_envelopes(SchemeId::Fetch, &caller_key, events)?;
-    let body = input_body(service, method, events)?;
+    let (service, method, body) = input_parts(events)?;
+    validate_non_empty_service_method(&service, &method)?;
     validate_json("request.body", body.as_bytes())?;
     Ok(FetchInput {
         input_commitment,
         caller_key,
+        service,
+        method,
         body,
     })
 }
@@ -111,11 +113,9 @@ pub fn output_body(events: &[OutputEventEnvelope]) -> Result<JsonBytes, FetchPro
     Ok(JsonBytes::new(events[0].payload().to_vec()))
 }
 
-fn input_body(
-    service: &str,
-    method: &str,
+fn input_parts(
     events: &[InputEventEnvelope],
-) -> Result<JsonBytes, FetchProtocolError> {
+) -> Result<(String, String, JsonBytes), FetchProtocolError> {
     if events.len() != 4 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
@@ -128,23 +128,21 @@ fn input_body(
     if !events[3].payload().is_empty() {
         return Err(FetchProtocolError::NonEmptyInputEnd);
     }
-    let transcript_service =
+    let service =
         str::from_utf8(events[0].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "service",
             source,
         })?;
-    let transcript_method =
+    let method =
         str::from_utf8(events[1].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "method",
             source,
         })?;
-    if transcript_service != service {
-        return Err(FetchProtocolError::ServiceMismatch);
-    }
-    if transcript_method != method {
-        return Err(FetchProtocolError::MethodMismatch);
-    }
-    Ok(JsonBytes::new(events[2].payload().to_vec()))
+    Ok((
+        service.to_string(),
+        method.to_string(),
+        JsonBytes::new(events[2].payload().to_vec()),
+    ))
 }
 
 fn validate_non_empty_service_method(
@@ -246,10 +244,6 @@ pub enum FetchProtocolError {
         #[source]
         source: str::Utf8Error,
     },
-    #[error("fetch service field does not match signed input transcript")]
-    ServiceMismatch,
-    #[error("fetch method field does not match signed input transcript")]
-    MethodMismatch,
     #[error("fetch {field} must be UTF-8 JSON: {source}")]
     Json {
         field: &'static str,
@@ -274,9 +268,11 @@ mod tests {
         let events =
             build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap();
 
-        let input = verify_input_events("openai", "responses", &events).unwrap();
+        let input = verify_input_events(&events).unwrap();
 
         assert_eq!(input.caller_key, caller.public_key());
+        assert_eq!(input.service, "openai");
+        assert_eq!(input.method, "responses");
         assert_eq!(input.body.as_bytes(), br#"{"model":"gpt"}"#);
     }
 
@@ -285,8 +281,6 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            "openai",
-            "responses",
             &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
         )
         .unwrap()
@@ -300,13 +294,19 @@ mod tests {
     }
 
     #[test]
-    fn input_rejects_mismatched_service() {
+    fn input_rejects_empty_service() {
         let caller = key(1);
-        let events = build_input_events("openai", "responses", br#"{}"#, &caller).unwrap();
+        let mut builder =
+            InputTranscriptBuilder::new(SchemeId::Fetch, &caller, input_canonicalization());
+        builder.push("service", Vec::new()).unwrap();
+        builder.push("method", b"responses".to_vec()).unwrap();
+        builder.push("request.body", br#"{}"#.to_vec()).unwrap();
+        builder.push("input.end", Vec::new()).unwrap();
+        let (events, _) = builder.finish().unwrap();
 
         assert!(matches!(
-            verify_input_events("other", "responses", &events).unwrap_err(),
-            FetchProtocolError::ServiceMismatch
+            verify_input_events(&events).unwrap_err(),
+            FetchProtocolError::EmptyService
         ));
     }
 
@@ -325,7 +325,7 @@ mod tests {
         let (events, _) = builder.finish().unwrap();
 
         assert!(matches!(
-            verify_input_events("openai", "responses", &events).unwrap_err(),
+            verify_input_events(&events).unwrap_err(),
             FetchProtocolError::InputCanonicalizationMismatch { index: 0 }
         ));
     }
@@ -335,8 +335,6 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            "openai",
-            "responses",
             &build_input_events("openai", "responses", br#"{}"#, &caller).unwrap(),
         )
         .unwrap()
@@ -355,8 +353,6 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            "openai",
-            "responses",
             &build_input_events("openai", "responses", br#"{}"#, &caller).unwrap(),
         )
         .unwrap()

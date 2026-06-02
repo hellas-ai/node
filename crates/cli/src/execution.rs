@@ -34,8 +34,8 @@ use futures::stream::{BoxStream, Stream};
 #[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
-    DagCborDecodeError, Digest, SchemeId, SignedReceipt as CoreSignedReceipt, VerifyError,
-    decode_dag_cbor, verify_receipt,
+    DagCborDecodeError, Digest, InputCommitment, SchemeId, SignedReceipt as CoreSignedReceipt,
+    VerifyError, decode_dag_cbor, verify_receipt,
 };
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
@@ -819,12 +819,12 @@ enum FetchPreparedRoute {
     #[cfg(feature = "hellas-executor")]
     Local {
         handle: ExecutorHandle,
-        request: PbFetchRequest,
+        input_commitment: InputCommitment,
         request_commitment: Vec<u8>,
     },
     RemoteDirect {
         transport: IrohTransport,
-        request: PbFetchRequest,
+        input_commitment: InputCommitment,
         request_commitment: Vec<u8>,
     },
 }
@@ -835,6 +835,7 @@ impl FetchPreparedRoute {
         request: &PbFetchRequest,
         route: &ExecutionRoute,
     ) -> ExecutionResult<Self> {
+        let input_commitment = verified_fetch_input(request)?.input_commitment;
         match route {
             #[cfg(feature = "hellas-executor")]
             ExecutionRoute::Local => {
@@ -843,10 +844,12 @@ impl FetchPreparedRoute {
                     .create_fetch_ticket(request.clone())
                     .await
                     .exec_context("local create_fetch_ticket failed")?;
+                let request_commitment =
+                    validate_fetch_ticket(&outcome.response, input_commitment)?;
                 Ok(Self::Local {
                     handle,
-                    request: request.clone(),
-                    request_commitment: outcome.response.request_commitment,
+                    input_commitment,
+                    request_commitment,
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
@@ -861,11 +864,12 @@ impl FetchPreparedRoute {
                             status,
                         )
                     })?;
+                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
                 let execute_transport = runtime.remote_transport::<Execute>(target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
-                    request: request.clone(),
-                    request_commitment: ticket.request_commitment,
+                    input_commitment,
+                    request_commitment,
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
@@ -875,11 +879,12 @@ impl FetchPreparedRoute {
                     )
                 })?;
                 let (target, request_commitment) =
-                    discover_and_fetch_quote(&remote.registry, request, *retries).await?;
+                    discover_and_fetch_quote(&remote.registry, request, input_commitment, *retries)
+                        .await?;
                 let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
-                    request: request.clone(),
+                    input_commitment,
                     request_commitment,
                 })
             }
@@ -891,14 +896,16 @@ impl FetchPreparedRoute {
             #[cfg(feature = "hellas-executor")]
             Self::Local {
                 handle,
-                request,
+                input_commitment,
                 request_commitment,
-            } => local_execute_fetch_stream(handle, request_commitment, request).boxed(),
+            } => local_execute_fetch_stream(handle, request_commitment, input_commitment).boxed(),
             Self::RemoteDirect {
                 transport,
-                request,
+                input_commitment,
                 request_commitment,
-            } => remote_execute_fetch_stream(transport, request_commitment, request).boxed(),
+            } => {
+                remote_execute_fetch_stream(transport, request_commitment, input_commitment).boxed()
+            }
         }
     }
 }
@@ -1007,6 +1014,7 @@ async fn discover_and_quote(
 async fn discover_and_fetch_quote(
     registry: &ServiceRegistry,
     request: &PbFetchRequest,
+    input_commitment: InputCommitment,
     retries: usize,
 ) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>)> {
     use hellas_rpc::services::fetch::FetchClientImpl;
@@ -1044,7 +1052,8 @@ async fn discover_and_fetch_quote(
         let client = FetchClientImpl::new(transport);
         match client.create_ticket(request.clone()).await {
             Ok(ticket) => {
-                return Ok((RemoteNodeTarget::from(peer_id), ticket.request_commitment));
+                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
+                return Ok((RemoteNodeTarget::from(peer_id), request_commitment));
             }
             Err(status) => {
                 last_error = Some(ExecutionError::wire(
@@ -1062,6 +1071,29 @@ async fn discover_and_fetch_quote(
     Err(last_error.unwrap_or_else(|| {
         ExecutionError::protocol("discovery stream exhausted without a successful fetch quote")
     }))
+}
+
+fn validate_fetch_ticket(
+    ticket: &pb::Ticket,
+    input_commitment: InputCommitment,
+) -> ExecutionResult<Vec<u8>> {
+    let request_commitment: [u8; 32] =
+        ticket
+            .request_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                ExecutionError::protocol(format!(
+                    "fetch ticket request_commitment must be 32 bytes, got {}",
+                    ticket.request_commitment.len()
+                ))
+            })?;
+    if request_commitment != *input_commitment.as_bytes() {
+        return Err(ExecutionError::protocol(
+            "fetch ticket request_commitment does not match signed input transcript",
+        ));
+    }
+    Ok(ticket.request_commitment.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1138,7 @@ fn local_execute_stream(
 fn local_execute_fetch_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
-    request: PbFetchRequest,
+    input_commitment: InputCommitment,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let outcome = handle
@@ -1119,7 +1151,7 @@ fn local_execute_fetch_stream(
         while let Some(item) = events.next().await {
             let wire = item
                 .map_err(|status: WireStatus| ExecutionError::wire("local fetch execution stream failed", status))?;
-            let event = convert_fetch_wire_event(wire, &request)?;
+            let event = convert_fetch_wire_event(wire, input_commitment)?;
             let is_done = matches!(event, FetchExecutionEvent::Done(_));
             yield event;
             if is_done {
@@ -1177,7 +1209,7 @@ fn remote_execute_stream(
 fn remote_execute_fetch_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
-    request: PbFetchRequest,
+    input_commitment: InputCommitment,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
@@ -1191,7 +1223,7 @@ fn remote_execute_fetch_stream(
                 item.map_err(|status: WireStatus| {
                     ExecutionError::wire("remote fetch execute stream failed", status)
                 })?,
-                &request,
+                input_commitment,
             )?;
             let is_done = matches!(event, FetchExecutionEvent::Done(_));
             yield event;
@@ -1236,7 +1268,7 @@ fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
 
 fn convert_fetch_wire_event(
     event: WorkEvent,
-    request: &PbFetchRequest,
+    input_commitment: InputCommitment,
 ) -> ExecutionResult<FetchExecutionEvent> {
     let Some(event) = event.kind else {
         return Err(ExecutionError::protocol("wire event with no body"));
@@ -1247,7 +1279,7 @@ fn convert_fetch_wire_event(
             bytes: chunk.bytes,
         }),
         work_event::Kind::Finished(finished) => Ok(FetchExecutionEvent::Done(
-            parse_fetch_finished(finished, request)?,
+            parse_fetch_finished(finished, input_commitment)?,
         )),
         work_event::Kind::Failed(failed) => Ok(FetchExecutionEvent::Done(FetchOutcome::Failed {
             position: failed.position,
@@ -1271,17 +1303,16 @@ fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
 
 fn parse_fetch_finished(
     finished: WorkFinished,
-    request: &PbFetchRequest,
+    input_commitment: InputCommitment,
 ) -> ExecutionResult<FetchOutcome> {
     stop_reason_from_pb(finished.status)?;
-    let input = verified_fetch_input(request)?;
     let output_events = finished
         .output_events
         .into_iter()
         .map(output_event_from_pb)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
-    let output = verify_output_events(input.input_commitment, &output_events)
+    let output = verify_output_events(input_commitment, &output_events)
         .map_err(|source| ExecutionError::FetchTranscript { source })?;
     if finished.output != output.body.as_bytes() {
         return Err(ExecutionError::protocol(
@@ -1316,8 +1347,7 @@ fn verified_fetch_input(request: &PbFetchRequest) -> ExecutionResult<FetchInput>
         .map(input_event_from_pb)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
-    verify_input_events(&request.service, &request.method, &input)
-        .map_err(|source| ExecutionError::FetchTranscript { source })
+    verify_input_events(&input).map_err(|source| ExecutionError::FetchTranscript { source })
 }
 
 fn decode_receipt_envelope(
@@ -1358,8 +1388,6 @@ mod tests {
     ) -> PbFetchRequest {
         let events = build_input_events(service, method, payload, caller).unwrap();
         PbFetchRequest {
-            service: service.to_string(),
-            method: method.to_string(),
             input: events.iter().map(input_event_to_pb).collect(),
         }
     }
@@ -1387,7 +1415,8 @@ mod tests {
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let finished = fetch_finished(&request, &producer, br#"{"x":1}"#);
 
-        let outcome = parse_fetch_finished(finished, &request).unwrap();
+        let input = verified_fetch_input(&request).unwrap().input_commitment;
+        let outcome = parse_fetch_finished(finished, input).unwrap();
 
         assert_eq!(
             outcome,
@@ -1406,7 +1435,11 @@ mod tests {
         finished.output = br#"{"x":2}"#.to_vec();
 
         assert!(matches!(
-            parse_fetch_finished(finished, &request).unwrap_err(),
+            parse_fetch_finished(
+                finished,
+                verified_fetch_input(&request).unwrap().input_commitment
+            )
+            .unwrap_err(),
             ExecutionError::Protocol(_)
         ));
     }

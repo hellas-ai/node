@@ -419,8 +419,6 @@ mod tests {
     fn fetch_request(key: &ProducerSigningKey, body: &[u8]) -> FetchRequest {
         let events = build_input_events("echo", "run", body, key).unwrap();
         FetchRequest {
-            service: "echo".to_string(),
-            method: "run".to_string(),
             input: events.iter().map(input_event_to_pb).collect(),
         }
     }

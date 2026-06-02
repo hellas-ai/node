@@ -66,8 +66,6 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             &options.payload,
             &caller_key,
         )?,
-        service: options.service,
-        method: options.method,
     };
     let execution = FetchExecutionRequest::new(runtime, request, route);
     let uses_remote = execution.uses_remote_transport();

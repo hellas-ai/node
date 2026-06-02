@@ -9,7 +9,5 @@ service Fetch {
 }
 
 message FetchRequest {
-  string service = 1;
-  string method = 2;
-  repeated .hellas.v1.InputEventEnvelope input = 3;
+  repeated .hellas.v1.InputEventEnvelope input = 1;
 }
