@@ -362,7 +362,7 @@ mod tests {
             .render_response(
                 &request,
                 result,
-                RenderContext::new("cmpl-test", "unused", 123),
+                RenderContext::new("cmpl-test", "cmpl-test", 123),
             )
             .unwrap();
         assert_eq!(response.status, 200);
@@ -400,7 +400,7 @@ mod tests {
                     stop_reason: StopReason::EndOfText,
                     provenance: None,
                 },
-                RenderContext::new("cmpl-test", "unused", 123),
+                RenderContext::new("cmpl-test", "cmpl-test", 123),
             )
             .unwrap();
         let WireBody::Json(body) = response.body else {
@@ -420,7 +420,7 @@ mod tests {
             })))
             .unwrap();
         let mut state =
-            adaptor().initial_state(&request, RenderContext::new("cmpl-test", "unused", 123));
+            adaptor().initial_state(&request, RenderContext::new("cmpl-test", "cmpl-test", 123));
 
         adaptor()
             .render_stream_event(
