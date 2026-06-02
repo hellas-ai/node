@@ -168,19 +168,19 @@ where
 pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
     let status = match error {
         AdaptorError::InvalidJson(_)
-        | AdaptorError::InvalidRequest { .. }
-        | AdaptorError::Unsupported { .. }
-        | AdaptorError::Projection { .. } => StatusCode::BAD_REQUEST,
-        AdaptorError::InvalidResponse { .. } => StatusCode::BAD_GATEWAY,
-        AdaptorError::Render { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        | AdaptorError::InvalidRequest(_)
+        | AdaptorError::Unsupported(_)
+        | AdaptorError::Projection(_) => StatusCode::BAD_REQUEST,
+        AdaptorError::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
+        AdaptorError::Render(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, format!("{surface}: {error}"))
 }
 
 fn backend_error(surface: &str, error: BackendError) -> Response {
     let status = match error {
-        BackendError::Rejected { .. } => StatusCode::BAD_REQUEST,
-        BackendError::Failed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        BackendError::Rejected(_) => StatusCode::BAD_REQUEST,
+        BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, format!("{surface}: {error}"))
 }
