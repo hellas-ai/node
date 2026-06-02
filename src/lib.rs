@@ -12,10 +12,14 @@ pub mod config;
 mod execution;
 #[cfg(feature = "node")]
 pub mod indexer;
+#[cfg(any(feature = "client", feature = "server", feature = "wasm-client"))]
+pub mod methods;
 #[cfg(feature = "api")]
 pub mod pb;
 #[cfg(feature = "node")]
 pub mod rpc;
+#[cfg(feature = "server")]
+pub mod server;
 
 #[cfg(feature = "node")]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
@@ -23,3 +27,5 @@ pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mem
 pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "node")]
 pub use indexer::{ApplyOutcome, Cursor as IndexCursor, IndexError, Indexer};
+#[cfg(feature = "server")]
+pub use server::spawn_light_client_server;

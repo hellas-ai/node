@@ -27,17 +27,21 @@ use commonware_storage::{
 };
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
+use hellas_chain::client::RemoteLightClient;
 use hellas_chain::config::{
-    Config, ConfigError, NodeConfig, PeerEntry, encode_private_key, encode_threshold_polynomial,
-    encode_threshold_share,
+    Config, ConfigError, GenesisEntry, NodeConfig, PeerEntry, encode_private_key,
+    encode_threshold_polynomial, encode_threshold_share,
 };
+use hellas_chain::rpc::LocalLightClient;
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, Indexer, Mempool, UtxoDb, utxo_db_config,
+    ActivityReporter, Application, ApplicationConfig, Indexer, Mempool, UtxoDb,
+    spawn_light_client_server, utxo_db_config,
 };
 use hellas_kernel::domain::{
-    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
+    Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
     UserPublicKey,
 };
+use hellas_rpc::LightClient as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use p256::ecdsa::SigningKey as UserSigningKey;
@@ -132,6 +136,8 @@ enum ValidatorError {
     NonUtf8StorageDirectory(PathBuf),
     #[error("failed to replay owner index: {0}")]
     OwnerIndex(String),
+    #[error("failed to bind RPC server at {addr}: {source}")]
+    RpcBind { addr: SocketAddr, source: io::Error },
 }
 
 #[derive(Parser)]
@@ -170,6 +176,9 @@ enum Command {
         /// Prometheus metrics port (defaults to 9090 + node index)
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// Genesis allocation as address:balance. May be repeated.
+        #[arg(long = "genesis-allocation")]
+        genesis_allocations: Vec<String>,
     },
     /// Run a validator node
     Run {
@@ -263,6 +272,12 @@ enum QueryCommand {
     Activity,
     /// List all known validators
     Validators,
+    /// List coins owned by an address
+    CoinsByOwner {
+        /// Base58-encoded secp256r1 public key address
+        #[arg(long)]
+        owner: String,
+    },
 }
 
 fn main() {
@@ -277,6 +292,7 @@ fn main() {
             ws_bind,
             ws_push,
             metrics_port,
+            genesis_allocations,
         } => setup(SetupArgs {
             validators,
             node,
@@ -286,6 +302,7 @@ fn main() {
             ws_bind,
             ws_push,
             metrics_port,
+            genesis_allocations,
         }),
         Command::Run { config } => run(config),
         Command::CheckConfig { config } => check_config(config),
@@ -354,6 +371,7 @@ struct SetupArgs {
     ws_bind: Option<String>,
     ws_push: Option<String>,
     metrics_port: Option<u16>,
+    genesis_allocations: Vec<String>,
 }
 
 fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
@@ -366,6 +384,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         ws_bind,
         ws_push,
         metrics_port,
+        genesis_allocations,
     } = args;
 
     if validators == 0 {
@@ -429,6 +448,10 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
             }
         })
         .collect();
+    let genesis_allocations = genesis_allocations
+        .iter()
+        .map(|raw| parse_genesis_allocation(raw))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let config = NodeConfig {
         private_key: encode_private_key(my_key),
@@ -438,13 +461,32 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
         ws_bind,
         explorer_url: ws_push,
-        genesis_allocations: Vec::new(),
+        genesis_allocations,
         peers,
     };
+    config.genesis_allocations()?;
 
     let rendered = toml::to_string_pretty(&config)?;
     println!("{rendered}");
     Ok(())
+}
+
+fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
+    let (address, balance) = raw.rsplit_once(':').ok_or_else(|| {
+        ValidatorError::InvalidSetup(
+            "genesis allocation must have the form address:balance".to_string(),
+        )
+    })?;
+    let address = address.parse::<Address>().map_err(|err| {
+        ValidatorError::InvalidSetup(format!("invalid genesis allocation address: {err}"))
+    })?;
+    let balance = balance.parse::<u64>().map_err(|err| {
+        ValidatorError::InvalidSetup(format!("invalid genesis allocation balance: {err}"))
+    })?;
+    Ok(GenesisEntry {
+        address: address.to_string(),
+        balance,
+    })
 }
 
 fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError> {
@@ -456,10 +498,91 @@ fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError
 }
 
 fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
-    let _ = (rpc, query);
-    Err(ValidatorError::InvalidSetup(
-        "the `validator query` subcommand is not implemented".to_string(),
-    ))
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| ValidatorError::InvalidSetup(format!("failed to start runtime: {err}")))?;
+    runtime.block_on(async move {
+        let client = RemoteLightClient::connect(rpc)
+            .await
+            .map_err(|err| ValidatorError::InvalidSetup(format!("failed to connect: {err}")))?;
+        match query {
+            QueryCommand::LatestBlock => {
+                match client.get_latest_block().await.map_err(query_error)? {
+                    Some(block) => {
+                        println!("height {}", block.height);
+                        println!("payload {}", hex::encode(block.payload));
+                        println!("state_root {}", hex::encode(block.state_root));
+                    }
+                    None => println!("none"),
+                }
+                Ok(())
+            }
+            QueryCommand::StateRoot => {
+                match client.get_state_root().await.map_err(query_error)? {
+                    Some(root) => println!("{}", hex::encode(root)),
+                    None => println!("none"),
+                }
+                Ok(())
+            }
+            QueryCommand::Coin { object_id } => {
+                let object_id = parse_hex_digest(&object_id, "object_id")?;
+                let Some(latest) = client.get_latest_block().await.map_err(query_error)? else {
+                    println!("none");
+                    return Ok(());
+                };
+                match client
+                    .get_coin(latest.payload, object_id)
+                    .await
+                    .map_err(query_error)?
+                {
+                    Some(coin) => println!("{} {}", coin.owner, coin.value),
+                    None => println!("none"),
+                }
+                Ok(())
+            }
+            QueryCommand::Validators => {
+                for validator in client.get_validators().await.map_err(query_error)? {
+                    println!("{validator}");
+                }
+                Ok(())
+            }
+            QueryCommand::CoinsByOwner { owner } => {
+                let owner = owner.parse::<Address>().map_err(|err| {
+                    ValidatorError::InvalidSetup(format!("invalid owner address: {err}"))
+                })?;
+                for (object_id, value) in client
+                    .get_coins_by_owner(owner)
+                    .await
+                    .map_err(query_error)?
+                {
+                    println!("{} {}", hex::encode(object_id), value);
+                }
+                Ok(())
+            }
+            QueryCommand::Proof { .. }
+            | QueryCommand::Finalization { .. }
+            | QueryCommand::Transfer { .. }
+            | QueryCommand::MergeCoin { .. }
+            | QueryCommand::Activity => Err(ValidatorError::InvalidSetup(
+                "query command is not implemented".to_string(),
+            )),
+        }
+    })
+}
+
+fn parse_hex_digest(raw: &str, field: &'static str) -> Result<Digest, ValidatorError> {
+    let bytes = hex::decode(raw)
+        .map_err(|err| ValidatorError::InvalidSetup(format!("bad hex for {field}: {err}")))?;
+    let len = bytes.len();
+    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
+        ValidatorError::InvalidSetup(format!("{field} must be 32 bytes, got {len}"))
+    })?;
+    Ok(Digest::from(raw))
+}
+
+fn query_error(err: impl std::fmt::Display) -> ValidatorError {
+    ValidatorError::InvalidSetup(format!("query failed: {err}"))
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -675,6 +798,7 @@ enum ShutdownTrigger {
     Signal(&'static str),
     NetworkExited,
     EngineExited,
+    RpcExited,
 }
 
 async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
@@ -828,6 +952,11 @@ fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     node_config.participants()?;
     node_config.peer_address_map()?;
     node_config.genesis_allocations()?;
+    if let Some(ws_bind) = &node_config.ws_bind {
+        ws_bind.parse::<SocketAddr>().map_err(|err| {
+            ValidatorError::InvalidSetup(format!("invalid ws_bind address: {err}"))
+        })?;
+    }
     println!("ok");
     Ok(())
 }
@@ -873,6 +1002,11 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ));
         }
     };
+    let validator_names = scheme
+        .participants()
+        .iter()
+        .map(|public_key| hex::encode(public_key.encode()))
+        .collect::<Vec<_>>();
 
     // Configure tokio runtime
     let storage_dir = node_config.storage_directory()?;
@@ -882,6 +1016,15 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let metrics_addr = node_config
         .metrics_port
         .map(|metrics_port| format!("0.0.0.0:{metrics_port}").parse())
+        .transpose()?;
+    let ws_bind_addr = node_config
+        .ws_bind
+        .as_ref()
+        .map(|addr| {
+            addr.parse::<SocketAddr>().map_err(|err| {
+                ValidatorError::InvalidSetup(format!("invalid ws_bind address: {err}"))
+            })
+        })
         .transpose()?;
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)
@@ -1146,12 +1289,24 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let databases = stateful_mailbox.subscribe_databases().await;
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
-        if let Some(ws_bind) = &node_config.ws_bind {
-            warn!(
-                addr = %ws_bind,
-                "ws_bind is not implemented",
+        let rpc_handle = if let Some(addr) = ws_bind_addr {
+            let light_client = LocalLightClient::new(
+                databases.clone(),
+                owner_index.clone(),
+                mempool.clone(),
+                marshal_mailbox.clone(),
+                validator_names.clone(),
             );
-        }
+            Some(
+                spawn_light_client_server(addr, light_client, activity_tx.clone())
+                    .await
+                    .unwrap_or_else(|source| {
+                        panic!("{}", ValidatorError::RpcBind { addr, source })
+                    }),
+            )
+        } else {
+            None
+        };
 
         if let Some(explorer_url) = &node_config.explorer_url {
             warn!(
@@ -1182,8 +1337,10 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
+        let rpc_waiter =
+            rpc_handle.map(|handle| handle.map(|_| ShutdownTrigger::RpcExited).boxed());
 
-        let (trigger, _, _) = futures::future::select_all(vec![
+        let mut waiters = vec![
             signal_waiter,
             network_waiter,
             engine_waiter,
@@ -1191,8 +1348,12 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             broadcast_waiter,
             stateful_waiter,
             qmdb_resolver_waiter,
-        ])
-        .await;
+        ];
+        if let Some(rpc_waiter) = rpc_waiter {
+            waiters.push(rpc_waiter);
+        }
+
+        let (trigger, _, _) = futures::future::select_all(waiters).await;
 
         let signal_triggered = matches!(trigger, ShutdownTrigger::Signal(_));
         match trigger {
@@ -1204,6 +1365,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");
+            }
+            ShutdownTrigger::RpcExited => {
+                warn!("RPC task exited unexpectedly; triggering shutdown");
             }
         }
 

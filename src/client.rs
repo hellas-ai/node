@@ -1,4 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
+use crate::methods::{LIGHT_CLIENT_METHODS, METHOD_SUBSCRIBE_ACTIVITY};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::light_client_client::LightClientClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::*;
@@ -9,38 +11,11 @@ use hellas_kernel::domain::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_rpc::mux::MuxGrpcService;
+use hellas_rpc::ws_mux;
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_rpc::{LatestBlock, LightClient, QueryError};
-use hellas_rpc::{mux::MethodSet, ws_mux};
 #[cfg(not(target_arch = "wasm32"))]
 use p256::ecdsa::Signature as P256Signature;
-
-pub const METHOD_GET_STATE_ROOT: u8 = 0;
-pub const METHOD_GET_PROOF: u8 = 1;
-pub const METHOD_GET_COIN: u8 = 2;
-pub const METHOD_GET_FINALIZATION: u8 = 3;
-pub const METHOD_GET_LATEST_BLOCK: u8 = 4;
-pub const METHOD_SUBMIT_TX: u8 = 5;
-pub const METHOD_SUBSCRIBE_ACTIVITY: u8 = 6;
-pub const METHOD_GET_VALIDATORS: u8 = 7;
-pub const METHOD_GET_COINS_BY_OWNER: u8 = 8;
-pub const METHOD_GET_RELAY_INFO: u8 = 9;
-
-pub const METHOD_PATHS: [&str; 10] = [
-    "/hellas.LightClient/GetStateRoot",
-    "/hellas.LightClient/GetProof",
-    "/hellas.LightClient/GetCoin",
-    "/hellas.LightClient/GetFinalization",
-    "/hellas.LightClient/GetLatestBlock",
-    "/hellas.LightClient/SubmitTx",
-    "/hellas.LightClient/SubscribeActivity",
-    "/hellas.LightClient/GetValidators",
-    "/hellas.LightClient/GetCoinsByOwner",
-    "/hellas.LightClient/GetRelayInfo",
-];
-
-pub const STREAMING_METHODS: [u8; 1] = [METHOD_SUBSCRIBE_ACTIVITY];
-pub const LIGHT_CLIENT_METHODS: MethodSet = MethodSet::new(&METHOD_PATHS, &STREAMING_METHODS);
 
 /// ws-mux backed light client that connects to a remote validator or mux relay.
 #[derive(Clone)]

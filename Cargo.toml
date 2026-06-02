@@ -23,6 +23,7 @@ client = [
 ]
 compile = ["dep:tonic-prost-build"]
 node = [
+    "client",
     "server",
     "dep:axum",
     "dep:bytes",
@@ -58,7 +59,26 @@ node = [
     "hellas-kernel/consensus",
     "hellas-rpc/light-client",
 ]
-server = ["api", "dep:hellas-rpc", "hellas-rpc/mux-server", "tonic/server"]
+server = [
+    "api",
+    "dep:futures-util",
+    "dep:hellas-kernel",
+    "dep:hellas-rpc",
+    "dep:p256",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tokio-tungstenite",
+    "dep:tracing",
+    "hellas-kernel/domain",
+    "hellas-rpc/light-client",
+    "hellas-rpc/mux-server",
+    "tokio/net",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "tokio-stream/sync",
+    "tonic/server",
+]
 wasm-client = ["api", "dep:hellas-rpc", "hellas-rpc/mux-client"]
 
 [dependencies]
@@ -78,6 +98,7 @@ commonware-storage = { workspace = true, optional = true }
 commonware-utils = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink"] }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-rpc = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -90,7 +111,9 @@ prost = { version = "0.14", optional = true }
 rand = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["net", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+tokio-tungstenite = { version = "0.29", optional = true }
 toml = { workspace = true, optional = true }
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen"] }
 tonic-prost = { version = "0.14", optional = true }
