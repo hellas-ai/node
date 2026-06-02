@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hellas_core::{
-    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey, SchemeId,
-    StreamId, StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, verify_input_event_envelopes,
-    verify_output_event_envelopes,
+    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey, StreamId,
+    canonical_dag_cbor, decode_dag_cbor,
+};
+use hellas_rpc::fetch::{
+    FetchInput, FetchProtocolError, verify_input_events, verify_output_events,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -42,10 +44,6 @@ impl FetchTranscript {
         self.stream_id
     }
 
-    pub fn input_events(&self) -> &[InputEventEnvelope] {
-        &self.input
-    }
-
     pub fn output_events(&self) -> &[OutputEventEnvelope] {
         &self.output
     }
@@ -54,21 +52,20 @@ impl FetchTranscript {
         Self::new(quote.input_commitment, quote.input.clone(), output)
     }
 
-    pub fn verify(
-        &self,
-        caller_key: &PublicKey,
-        producer_key: &PublicKey,
-    ) -> Result<(), FetchTranscriptError> {
-        let input = verify_input_event_envelopes(SchemeId::Fetch, caller_key, &self.input)?;
-        if input != self.input_commitment {
+    pub fn verify(&self, producer_key: &PublicKey) -> Result<FetchInput, FetchTranscriptError> {
+        let input = verify_input_events(&self.input)?;
+        if input.input_commitment != self.input_commitment {
             return Err(FetchTranscriptError::InputCommitmentMismatch);
         }
-        let expected_stream = StreamId::from_input_commitment(input);
+        let expected_stream = StreamId::from_input_commitment(input.input_commitment);
         if expected_stream != self.stream_id {
             return Err(FetchTranscriptError::StreamIdMismatch);
         }
-        verify_output_event_envelopes(SchemeId::Fetch, input, producer_key, &self.output)?;
-        Ok(())
+        let output = verify_output_events(input.input_commitment, &self.output)?;
+        if output.producer_key != *producer_key {
+            return Err(FetchTranscriptError::ProducerKeyMismatch);
+        }
+        Ok(input)
     }
 }
 
@@ -81,17 +78,13 @@ pub struct FetchQuote {
 }
 
 impl FetchQuote {
-    pub fn from_input(
-        caller_key: PublicKey,
-        input: Vec<InputEventEnvelope>,
-    ) -> Result<Self, StreamVerifyError> {
-        let input_commitment = verify_input_event_envelopes(SchemeId::Fetch, &caller_key, &input)?;
-        Ok(Self {
-            input_commitment,
-            stream_id: StreamId::from_input_commitment(input_commitment),
-            caller_key,
+    pub fn from_verified(verified: &FetchInput, input: Vec<InputEventEnvelope>) -> Self {
+        Self {
+            input_commitment: verified.input_commitment,
+            stream_id: StreamId::from_input_commitment(verified.input_commitment),
+            caller_key: verified.caller_key,
             input,
-        })
+        }
     }
 }
 
@@ -335,18 +328,18 @@ where
 
     pub fn quote_input(
         &mut self,
-        caller_key: PublicKey,
         input: Vec<InputEventEnvelope>,
-    ) -> Result<FetchQuote, FetchStateError> {
-        let quote = FetchQuote::from_input(caller_key, input)?;
+    ) -> Result<(FetchQuote, FetchInput), FetchStateError> {
+        let verified = verify_input_events(&input)?;
+        let quote = FetchQuote::from_verified(&verified, input);
         if !self.caller_policy.is_authorized(&quote.caller_key) {
             return Err(FetchStateError::UnauthorizedCaller);
         }
         if self.store.get_completed(quote.input_commitment)?.is_some() {
-            return Ok(quote);
+            return Ok((quote, verified));
         }
         self.insert_quote(quote.clone())?;
-        Ok(quote)
+        Ok((quote, verified))
     }
 
     pub fn start(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
@@ -403,7 +396,10 @@ where
         if transcript.input != quote.input || transcript.stream_id() != quote.stream_id {
             return Err(FetchStateError::QuoteMismatch);
         }
-        transcript.verify(&quote.caller_key, producer_key)?;
+        let verified = transcript.verify(producer_key)?;
+        if verified.caller_key != quote.caller_key {
+            return Err(FetchStateError::QuoteMismatch);
+        }
 
         self.store.put_completed(&transcript)?;
         self.tickets
@@ -449,16 +445,10 @@ where
         if transcript.input_commitment() != input {
             return Err(FetchStateError::QuoteMismatch);
         }
-        let caller_key = *transcript
-            .input_events()
-            .first()
-            .ok_or(StreamVerifyError::EmptyTranscript)?
-            .event()
-            .public_key();
-        if !self.caller_policy.is_authorized(&caller_key) {
+        let verified = transcript.verify(producer_key)?;
+        if !self.caller_policy.is_authorized(&verified.caller_key) {
             return Err(FetchStateError::UnauthorizedCaller);
         }
-        transcript.verify(&caller_key, producer_key)?;
         Ok(transcript)
     }
 }
@@ -469,8 +459,10 @@ pub enum FetchTranscriptError {
     InputCommitmentMismatch,
     #[error("stored stream id does not match input transcript")]
     StreamIdMismatch,
-    #[error("stream verification failed: {0}")]
-    Verify(#[from] StreamVerifyError),
+    #[error("producer key does not match output transcript signer")]
+    ProducerKeyMismatch,
+    #[error("fetch protocol error: {0}")]
+    Protocol(#[from] FetchProtocolError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -498,7 +490,7 @@ pub enum FetchStateError {
     #[error("fetch transcript verification failed: {0}")]
     Verify(#[from] FetchTranscriptError),
     #[error("fetch input verification failed: {0}")]
-    Input(#[from] StreamVerifyError),
+    Input(#[from] FetchProtocolError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -520,9 +512,8 @@ pub enum FetchStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::{
-        CanonicalizationId, InputTranscriptBuilder, OutputTranscriptBuilder, ProducerSigningKey,
-    };
+    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::fetch::{build_input_events, build_output_events, verify_input_events};
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
@@ -535,33 +526,22 @@ mod tests {
         ))
     }
 
-    fn canon() -> CanonicalizationId {
-        CanonicalizationId::from_bytes(b"openai.responses.v1")
-    }
-
     fn sample_transcript() -> (FetchQuote, FetchTranscript, PublicKey, PublicKey) {
         let caller = key(1);
         let producer = key(2);
-        let caller_key = caller.public_key();
         let producer_key = producer.public_key();
 
-        let mut input_builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
-        input_builder
-            .push("request.body", br#"{"model":"gpt-test"}"#.to_vec())
-            .unwrap();
-        input_builder.push("input.end", b"end".to_vec()).unwrap();
-        let (input_events, input_commitment) = input_builder.finish().unwrap();
-        let quote = FetchQuote::from_input(caller_key, input_events.clone()).unwrap();
-
-        let mut output_builder =
-            OutputTranscriptBuilder::new(SchemeId::Fetch, input_commitment, &producer, canon());
-        output_builder
-            .push("response.delta", br#"{"delta":"ok"}"#.to_vec())
-            .unwrap();
-        output_builder
-            .push("response.completed", br#"{"status":"completed"}"#.to_vec())
-            .unwrap();
-        let (output_events, _) = output_builder.finish().unwrap();
+        let input_events =
+            build_input_events("openai", "responses", br#"{"model":"gpt-test"}"#, &caller).unwrap();
+        let verified = verify_input_events(&input_events).unwrap();
+        let caller_key = verified.caller_key;
+        let quote = FetchQuote::from_verified(&verified, input_events);
+        let output_events = build_output_events(
+            verified.input_commitment,
+            br#"{"status":"completed"}"#,
+            &producer,
+        )
+        .unwrap();
         let transcript = FetchTranscript::from_quote(&quote, output_events);
         (quote, transcript, caller_key, producer_key)
     }
@@ -584,7 +564,9 @@ mod tests {
     fn transcript_verifies_both_directions() {
         let (_quote, transcript, caller, producer) = sample_transcript();
 
-        transcript.verify(&caller, &producer).unwrap();
+        let verified = transcript.verify(&producer).unwrap();
+
+        assert_eq!(verified.caller_key, caller);
     }
 
     #[test]
@@ -594,7 +576,7 @@ mod tests {
         let (quote, _transcript, caller, _producer) = sample_transcript();
         let input = quote.input_commitment;
         let mut state = trusted_state(store, caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
 
         state.start(input).unwrap();
         assert!(matches!(
@@ -611,7 +593,7 @@ mod tests {
         let (quote, _transcript, caller, _producer) = sample_transcript();
         let mut state = trusted_state(store, caller);
 
-        let stored = state.quote_input(caller, quote.input.clone()).unwrap();
+        let (stored, _verified) = state.quote_input(quote.input.clone()).unwrap();
 
         assert_eq!(stored.input_commitment, quote.input_commitment);
         assert_eq!(
@@ -628,12 +610,12 @@ mod tests {
     fn quote_input_rejects_untrusted_caller() {
         let dir = root("unauthorized-caller");
         let store = FsFetchTranscriptStore::new(&dir);
-        let (quote, _transcript, caller, _producer) = sample_transcript();
+        let (quote, _transcript, _caller, _producer) = sample_transcript();
         let untrusted = key(9).public_key();
         let mut state = FetchStateMachine::new(store, FetchCallerPolicy::single(untrusted));
 
         assert!(matches!(
-            state.quote_input(caller, quote.input.clone()).unwrap_err(),
+            state.quote_input(quote.input.clone()).unwrap_err(),
             FetchStateError::UnauthorizedCaller
         ));
         let _ = fs::remove_dir_all(dir);
@@ -646,7 +628,7 @@ mod tests {
         let (quote, transcript, caller, producer) = sample_transcript();
         let input = quote.input_commitment;
         let mut state = trusted_state(store, caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
         state.start(input).unwrap();
         let completed = state
             .complete_output(input, transcript.output_events().to_vec(), &producer)
@@ -665,13 +647,13 @@ mod tests {
         let (quote, transcript, caller, producer) = sample_transcript();
         let input = quote.input_commitment;
         let mut state = trusted_memory_state(caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
         state.start(input).unwrap();
         state
             .complete_output(input, transcript.output_events().to_vec(), &producer)
             .unwrap();
 
-        let repeated = state.quote_input(caller, quote.input.clone()).unwrap();
+        let (repeated, _verified) = state.quote_input(quote.input.clone()).unwrap();
 
         assert_eq!(repeated.input_commitment, input);
         assert_eq!(
@@ -703,16 +685,14 @@ mod tests {
         let wrong_producer = key(9).public_key();
         let input = quote.input_commitment;
         let mut state = trusted_state(store, caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
         state.start(input).unwrap();
 
         assert!(matches!(
             state
                 .complete_output(input, transcript.output_events().to_vec(), &wrong_producer)
                 .unwrap_err(),
-            FetchStateError::Verify(FetchTranscriptError::Verify(
-                StreamVerifyError::UnexpectedSigner
-            ))
+            FetchStateError::Verify(FetchTranscriptError::ProducerKeyMismatch)
         ));
         let _ = fs::remove_dir_all(dir);
     }
@@ -725,7 +705,7 @@ mod tests {
         let input = quote.input_commitment;
         transcript.input.clear();
         let mut state = trusted_state(store, caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
         state.start(input).unwrap();
 
         assert!(matches!(
@@ -744,7 +724,7 @@ mod tests {
         let (quote, _transcript, caller, _producer) = sample_transcript();
         let input = quote.input_commitment;
         let mut state = trusted_state(store, caller);
-        state.quote_input(caller, quote.input.clone()).unwrap();
+        state.quote_input(quote.input.clone()).unwrap();
         state.start(input).unwrap();
         state.fail(input, "provider failed").unwrap();
 

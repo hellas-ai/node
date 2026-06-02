@@ -7,7 +7,6 @@ use catgrad::prelude::Dtype;
 use chatgrad::types;
 use hellas_core::{CommitmentScheme, Digest, RequestCommitment, Symbolic};
 use hellas_rpc::ExecutorError;
-use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
@@ -137,22 +136,17 @@ impl Executor {
                     "fetch input event decode failed: {err}"
                 ))
             })?;
-        let verified = verify_input_events(&input).map_err(|err| {
+        let (quote, verified) = self.fetch_state.quote_input(input).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!(
                 "fetch input transcript verification failed: {err}"
             ))
         })?;
-        let service = verified.service.clone();
-        let method = verified.method.clone();
-        let quote = self
-            .fetch_state
-            .quote_input(verified.caller_key, input)
-            .map_err(|err| {
-                ExecutorError::InvalidQuoteRequest(format!(
-                    "fetch input transcript verification failed: {err}"
-                ))
-            })?;
-        let output = verified.body;
+        let hellas_rpc::fetch::FetchInput {
+            service,
+            method,
+            body: output,
+            ..
+        } = verified;
 
         let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
