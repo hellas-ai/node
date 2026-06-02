@@ -9,7 +9,7 @@ use hellas_wire_adaptors::{
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 #[derive(Clone)]
 pub(super) struct ResponsesProxy {
@@ -25,11 +25,11 @@ impl ResponsesProxy {
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
-        Ok(Self::from_parts(endpoint, bearer_token))
-    }
-
-    fn from_parts(endpoint: Url, bearer_token: Option<String>) -> Self {
-        Self::with_client(reqwest::Client::new(), endpoint, bearer_token)
+        Ok(Self::with_client(
+            reqwest::Client::new(),
+            endpoint,
+            bearer_token,
+        ))
     }
 
     fn with_client(client: reqwest::Client, endpoint: Url, bearer_token: Option<String>) -> Self {
@@ -92,10 +92,6 @@ fn forwarded_body(request: &BackendRequest) -> Result<Bytes, BackendError> {
         JsonValue::String(upstream_model.to_string()),
     );
     object.insert("stream".to_string(), JsonValue::Bool(true));
-    encode_json_object(object)
-}
-
-fn encode_json_object(object: JsonMap<String, JsonValue>) -> Result<Bytes, BackendError> {
     serde_json::to_vec(&JsonValue::Object(object))
         .map(Bytes::from)
         .map_err(|source| {
