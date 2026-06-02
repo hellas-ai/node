@@ -127,8 +127,6 @@ impl Executor {
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.store.prune_expired_quotes(Instant::now());
 
-        let service = request.service;
-        let method = request.method;
         let input = request
             .input
             .into_iter()
@@ -139,11 +137,13 @@ impl Executor {
                     "fetch input event decode failed: {err}"
                 ))
             })?;
-        let verified = verify_input_events(&service, &method, &input).map_err(|err| {
+        let verified = verify_input_events(&input).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!(
                 "fetch input transcript verification failed: {err}"
             ))
         })?;
+        let service = verified.service.clone();
+        let method = verified.method.clone();
         let quote = self
             .fetch_state
             .quote_input(verified.caller_key, input)
