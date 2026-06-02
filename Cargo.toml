@@ -12,9 +12,9 @@ path = "src/bin/validator.rs"
 default = []
 
 [dependencies]
-bytes = { workspace = true }
 axum = { workspace = true }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
+bytes = { workspace = true }
 clap = { workspace = true }
 commonware-actor = { workspace = true }
 commonware-broadcast = { workspace = true }
@@ -30,31 +30,31 @@ commonware-utils = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 hellas-kernel = { workspace = true }
-hellas-wire = { path = "../../node/crates/wire" }
 hellas-rpc = { path = "../../node/crates/rpc", default-features = false }
 hellas-types = { workspace = true, features = ["consensus"] }
+hellas-wire = { path = "../../node/crates/wire" }
 hex = { workspace = true }
 http = "1"
 indexmap = { workspace = true }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 prometheus-client = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 rand = { workspace = true }
 rand_core = { workspace = true }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 serde = { workspace = true }
 sha2 = { version = "0.10", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 
 [dev-dependencies]
-commonware-consensus = { workspace = true, features = [ "mocks"] }
+commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-types = { workspace = true, features = ["consensus", "test-support"] }
 proptest = "1.6"
