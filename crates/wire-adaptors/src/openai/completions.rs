@@ -2,11 +2,9 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
-    ModelRef, OutputEvent, OutputItem, PassthroughBag, RawRequest, RenderContext, StopReason,
-    TextChannel, WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
+    ModelRef, OutputEvent, OutputItem, RawRequest, RenderContext, StopReason, TextChannel,
+    WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
 };
-
-const KNOWN_TOP_LEVEL_FIELDS: &[&str] = &["model", "prompt", "max_tokens", "stream"];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenAiCompletionsAdaptor;
@@ -18,7 +16,6 @@ pub struct ParsedCompletionRequest {
     pub prompt: String,
     pub max_tokens: Option<u32>,
     pub stream: Option<bool>,
-    pub passthrough: PassthroughBag,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,14 +146,12 @@ impl ParsedCompletionRequest {
         let prompt = required_string(object, "prompt")?;
         let max_tokens = optional_u32(object, "max_tokens")?;
         let stream = optional_bool(object, "stream")?;
-        let passthrough = passthrough_fields(object);
         Ok(Self {
             raw,
             model,
             prompt,
             max_tokens,
             stream,
-            passthrough,
         })
     }
 
@@ -168,21 +163,8 @@ impl ParsedCompletionRequest {
         if let Some(max_tokens) = self.max_tokens {
             canonical.sampling.max_output_tokens = Some(max_tokens);
         }
-        Ok(ExecutionRequest::new(canonical, self.passthrough.clone()))
+        Ok(ExecutionRequest::new(canonical))
     }
-}
-
-fn passthrough_fields(object: &JsonMap<String, JsonValue>) -> PassthroughBag {
-    let mut bag = PassthroughBag::new();
-    for (key, value) in object {
-        if !KNOWN_TOP_LEVEL_FIELDS.contains(&key.as_str()) {
-            bag.push(key.as_str(), value.clone());
-        }
-    }
-    if let Some(value) = object.get("stream") {
-        bag.push("stream", value.clone());
-    }
-    bag
 }
 
 fn output_text(output: &[OutputItem]) -> String {
@@ -309,7 +291,7 @@ fn optional_u32(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldPath, Provenance, Usage, WireBody, WireEventData};
+    use crate::{Provenance, Usage, WireBody, WireEventData};
 
     fn adaptor() -> OpenAiCompletionsAdaptor {
         OpenAiCompletionsAdaptor
@@ -320,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_preserves_passthrough() {
+    fn parse_preserves_raw_request() {
         let request = adaptor()
             .parse(raw(json!({
                 "model": "gpt-3.5-turbo-instruct",
@@ -334,13 +316,7 @@ mod tests {
         assert_eq!(request.prompt, "Hello");
         assert_eq!(request.max_tokens, Some(16));
         assert_eq!(request.stream, Some(true));
-        let paths = request
-            .passthrough
-            .fields()
-            .iter()
-            .map(|field| field.path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(paths, field_set(["stream", "temperature"]));
+        assert_eq!(request.raw.value()["temperature"], 0.7);
     }
 
     #[test]
@@ -401,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_project_render_keeps_passthrough_available() {
+    fn parse_project_render_uses_projected_request() {
         let request = adaptor()
             .parse(raw(json!({
                 "model": "gpt-3.5-turbo-instruct",
@@ -410,8 +386,7 @@ mod tests {
                 "temperature": 0.7
             })))
             .unwrap();
-        let execution = adaptor().to_execution_request(&request).unwrap();
-        assert_eq!(execution.passthrough, request.passthrough);
+        adaptor().to_execution_request(&request).unwrap();
 
         let response = adaptor()
             .render_response(
@@ -500,9 +475,5 @@ mod tests {
         assert_eq!(done_json["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(done_json["hellas"]["receipt"], "bb".repeat(32));
         assert!(matches!(finished[1].data, WireEventData::Text(ref text) if text == "[DONE]"));
-    }
-
-    fn field_set<const N: usize>(fields: [&str; N]) -> std::collections::BTreeSet<FieldPath> {
-        fields.into_iter().map(FieldPath::from).collect()
     }
 }
