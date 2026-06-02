@@ -256,6 +256,7 @@ fn make_on_progress(
             kind: Some(PbEvent::Chunk(PbChunk {
                 position: progress,
                 bytes: chunk.to_vec(),
+                output_event: None,
             })),
         };
         if sender.blocking_send(Ok(event)).is_err() {

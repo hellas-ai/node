@@ -221,6 +221,10 @@ impl ProducerId {
         ))
     }
 
+    pub const fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
     pub const fn digest(&self) -> Digest {
         self.0
     }

@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package hellas.fetch.v1;
+
+import "hellas/v1/hellas.proto";
+
+service Fetch {
+  rpc CreateTicket(FetchRequest) returns (.hellas.v1.Ticket);
+}
+
+message FetchRequest {
+  string service = 1;
+  string method = 2;
+  repeated .hellas.v1.InputEventEnvelope input = 3;
+}

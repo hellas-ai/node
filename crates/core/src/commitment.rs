@@ -9,7 +9,7 @@ use crate::tags;
 #[repr(u8)]
 pub enum SchemeId {
     Symbolic = tags::SCHEME_SYMBOLIC,
-    Opaque = tags::SCHEME_OPAQUE,
+    Fetch = tags::SCHEME_FETCH,
     ZkTls = tags::SCHEME_ZKTLS,
 }
 
@@ -21,7 +21,7 @@ impl SchemeId {
     pub fn from_byte(byte: u8) -> Result<Self, TagError> {
         match byte {
             tags::SCHEME_SYMBOLIC => Ok(Self::Symbolic),
-            tags::SCHEME_OPAQUE => Ok(Self::Opaque),
+            tags::SCHEME_FETCH => Ok(Self::Fetch),
             tags::SCHEME_ZKTLS => Ok(Self::ZkTls),
             _ => Err(TagError::UnknownScheme(byte)),
         }

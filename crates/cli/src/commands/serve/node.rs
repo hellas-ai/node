@@ -13,18 +13,18 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use catgrad::prelude::Dtype;
-use hellas_core::ProducerSigningKey;
+use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::{
-    ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, OpaqueServer,
-    SymbolicServer,
+    ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics,
+    FetchCallerPolicy, FetchServer, SymbolicServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::Execute;
+use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::services::node::{Node, NodeServer};
-use hellas_rpc::services::opaque::Opaque;
 use hellas_rpc::services::symbolic::Symbolic;
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
@@ -76,19 +76,21 @@ pub(super) async fn spawn_node(
     build: String,
     graffiti: Vec<u8>,
     supported_dtypes: Vec<Dtype>,
+    trusted_caller_public_keys: Vec<PublicKey>,
     artifact_store_path: PathBuf,
     secret_key: SecretKey,
     producer_key: ProducerSigningKey,
     metrics: Arc<ExecutorMetrics>,
 ) -> anyhow::Result<NodeHandle> {
     // -- Spawn the executor (the local handler that backs all four RPC services).
-    let handle = Executor::spawn_with_metrics_and_producer_key_and_artifact_store(
+    let handle = Executor::spawn_with_metrics_producer_key_callers_and_artifact_store(
         download_policy,
         execute_policy,
         queue_size,
         supported_dtypes,
         metrics.clone(),
         Arc::new(producer_key),
+        FetchCallerPolicy::new(trusted_caller_public_keys),
         ArtifactStoreConfig::Fs(artifact_store_path),
     )
     .await
@@ -211,8 +213,8 @@ async fn serve_connection(
     } else if alpn == <Symbolic as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(SymbolicServer(handle), manager);
         serve_loop(&transport, &server).await
-    } else if alpn == <Opaque as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(OpaqueServer(handle), manager);
+    } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(FetchServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(CourtesyServer(handle), manager);

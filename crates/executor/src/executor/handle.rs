@@ -1,7 +1,7 @@
 //! Server-side handler implementations.
 //!
 //! `ExecutorHandle` implements one Handler trait per service (Execute,
-//! Symbolic, Opaque, Courtesy) — the codegen-emitted dispatcher routes
+//! Symbolic, Fetch, Courtesy) — the codegen-emitted dispatcher routes
 //! inbound RPCs here.
 
 use std::pin::Pin;
@@ -21,12 +21,12 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
-use hellas_rpc::pb::opaque::OpaqueRequest as PbOpaqueRequest;
+use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
 use hellas_rpc::services::execute::ExecuteHandler;
-use hellas_rpc::services::opaque::OpaqueHandler;
+use hellas_rpc::services::fetch::FetchHandler;
 use hellas_rpc::services::symbolic::SymbolicHandler;
 use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
@@ -62,11 +62,11 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn create_opaque_ticket(
+    pub async fn create_fetch_ticket(
         &self,
-        request: PbOpaqueRequest,
+        request: PbFetchRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteOpaque { request, reply })
+        self.send(|reply| ExecutorMessage::QuoteFetch { request, reply })
             .await
     }
 
@@ -156,20 +156,16 @@ impl ExecuteHandler for ExecutorHandle {
     async fn run_ticket(&self, request: RunTicketRequest) -> Result<ExecuteStream, WireStatus> {
         let outcome = self.run_ticket_handle(request).await?;
         let stream: ExecuteStream = Box::pin(ReceiverStream::new(outcome.events));
-        // Provenance metadata loss: the new wire layer doesn't expose
-        // per-response trailer plumbing through the codegen-emitted
-        // server traits yet. Callers that need provenance read it
-        // off the terminal `WorkEvent::Finished` payload directly.
-        let _ = outcome.provenance;
+        drop(outcome.provenance);
         Ok(stream)
     }
 }
 
-// -- SymbolicHandler / OpaqueHandler -----------------------------------------
+// -- SymbolicHandler / FetchHandler -----------------------------------------
 
 // The generated trait method declares `impl Into<WithTrailer<T>> + Send`
 // as its return; we provide `WithTrailer<T>` directly. The refinement is
-// intentional — handler-emitted trailers are concrete, not opaque.
+// intentional: handler-emitted trailers are concrete.
 #[allow(refining_impl_trait)]
 impl SymbolicHandler for ExecutorHandle {
     async fn create_ticket(
@@ -183,12 +179,12 @@ impl SymbolicHandler for ExecutorHandle {
 }
 
 #[allow(refining_impl_trait)]
-impl OpaqueHandler for ExecutorHandle {
+impl FetchHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
-        request: PbOpaqueRequest,
+        request: PbFetchRequest,
     ) -> Result<WithTrailer<Ticket>, WireStatus> {
-        let outcome = self.create_opaque_ticket(request).await?;
+        let outcome = self.create_fetch_ticket(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
     }

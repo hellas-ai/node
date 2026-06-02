@@ -1,7 +1,7 @@
 use crate::commands::CliResult;
 use anyhow::Context;
 use catgrad::prelude::Dtype;
-use hellas_core::ProducerSigningKey;
+use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::ExecutorMetrics;
 use hellas_rpc::policy::{DownloadPolicy, ExecutePolicy};
 use iroh::SecretKey;
@@ -24,6 +24,7 @@ pub struct ServeOptions {
     pub metrics_port: Option<u16>,
     pub graffiti: String,
     pub dtype: Vec<Dtype>,
+    pub trusted_caller_public_keys: Vec<PublicKey>,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
 }
@@ -42,6 +43,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         buf[..len].copy_from_slice(&src[..len]);
         buf.to_vec()
     };
+    let trusted_caller_public_keys = if options.trusted_caller_public_keys.is_empty() {
+        vec![options.producer_key.public_key()]
+    } else {
+        options.trusted_caller_public_keys
+    };
     // Counters live in the executor and are mutated inline; cloning the
     // counter handles into a registry just adds a scrape view on the same
     // underlying state.
@@ -55,6 +61,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         build,
         graffiti,
         options.dtype,
+        trusted_caller_public_keys,
         artifact_store_path,
         options.secret_key,
         options.producer_key,

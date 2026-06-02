@@ -28,7 +28,7 @@ hellas-rpc = { workspace = true, features = [
     "node",
     "execute",
     "symbolic",
-    "opaque",
+    "fetch",
     "courtesy",
 ] }
 hellas-wire = { workspace = true }
