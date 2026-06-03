@@ -7,6 +7,7 @@ service LightClient {
   rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
+  rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
   rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
@@ -53,6 +54,22 @@ message FinalizedSnapshot {
 message GetLatestBlockRequest {}
 message GetLatestBlockResponse {
   FinalizedSnapshot latest = 1;
+}
+
+message GetFinalizedBlockRequest {
+  oneof query {
+    uint64 height = 1;
+    bytes payload = 2;
+  }
+}
+
+message FinalizedBlock {
+  FinalizedSnapshot snapshot = 1;
+  bytes block = 2;
+}
+
+message GetFinalizedBlockResponse {
+  FinalizedBlock block = 1;
 }
 
 message SubmitTxRequest {

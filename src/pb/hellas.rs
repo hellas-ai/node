@@ -169,6 +169,63 @@ impl ::prost::Name for GetLatestBlockResponse {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetFinalizedBlockRequest {
+    #[prost(oneof = "get_finalized_block_request::Query", tags = "1, 2")]
+    pub query: ::core::option::Option<get_finalized_block_request::Query>,
+}
+/// Nested message and enum types in `GetFinalizedBlockRequest`.
+pub mod get_finalized_block_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Query {
+        #[prost(uint64, tag = "1")]
+        Height(u64),
+        #[prost(bytes, tag = "2")]
+        Payload(::prost::alloc::vec::Vec<u8>),
+    }
+}
+impl ::prost::Name for GetFinalizedBlockRequest {
+    const NAME: &'static str = "GetFinalizedBlockRequest";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetFinalizedBlockRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetFinalizedBlockRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FinalizedBlock {
+    #[prost(message, optional, tag = "1")]
+    pub snapshot: ::core::option::Option<FinalizedSnapshot>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub block: ::prost::alloc::vec::Vec<u8>,
+}
+impl ::prost::Name for FinalizedBlock {
+    const NAME: &'static str = "FinalizedBlock";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.FinalizedBlock".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.FinalizedBlock".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetFinalizedBlockResponse {
+    #[prost(message, optional, tag = "1")]
+    pub block: ::core::option::Option<FinalizedBlock>,
+}
+impl ::prost::Name for GetFinalizedBlockResponse {
+    const NAME: &'static str = "GetFinalizedBlockResponse";
+    const PACKAGE: &'static str = "hellas";
+    fn full_name() -> ::prost::alloc::string::String {
+        "hellas.GetFinalizedBlockResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/hellas.GetFinalizedBlockResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubmitTxRequest {
     #[prost(oneof = "submit_tx_request::Tx", tags = "1, 2")]
     pub tx: ::core::option::Option<submit_tx_request::Tx>,
@@ -822,6 +879,30 @@ pub mod light_client_client {
                 .insert(GrpcMethod::new("hellas.LightClient", "GetLatestBlock"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_finalized_block(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetFinalizedBlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetFinalizedBlockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/hellas.LightClient/GetFinalizedBlock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("hellas.LightClient", "GetFinalizedBlock"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn submit_tx(
             &mut self,
             request: impl tonic::IntoRequest<super::SubmitTxRequest>,
@@ -1012,6 +1093,13 @@ pub mod light_client_server {
             request: tonic::Request<super::GetLatestBlockRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetLatestBlockResponse>,
+            tonic::Status,
+        >;
+        async fn get_finalized_block(
+            &self,
+            request: tonic::Request<super::GetFinalizedBlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetFinalizedBlockResponse>,
             tonic::Status,
         >;
         async fn submit_tx(
@@ -1349,6 +1437,52 @@ pub mod light_client_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetLatestBlockSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/hellas.LightClient/GetFinalizedBlock" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetFinalizedBlockSvc<T: LightClient>(pub Arc<T>);
+                    impl<
+                        T: LightClient,
+                    > tonic::server::UnaryService<super::GetFinalizedBlockRequest>
+                    for GetFinalizedBlockSvc<T> {
+                        type Response = super::GetFinalizedBlockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetFinalizedBlockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LightClient>::get_finalized_block(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetFinalizedBlockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

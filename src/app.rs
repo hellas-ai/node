@@ -6,8 +6,8 @@ use crate::execution::{
     execute_all, execute_proposal,
     store::{UtxoDatabase, UtxoSyncTarget, empty_state},
 };
-use crate::indexer::Indexer;
 use crate::light_client::{ConsensusActivity, ProposalInfo};
+use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
@@ -79,7 +79,7 @@ pub struct Application {
     genesis: HellasBlock,
     genesis_allocations: Arc<Vec<(Address, u64)>>,
     finalized_height: Registered<Gauge>,
-    indexer: Indexer,
+    owner_index: OwnerIndex,
 }
 
 impl Application {
@@ -87,8 +87,8 @@ impl Application {
         self.genesis.clone()
     }
 
-    pub fn indexer(&self) -> Indexer {
-        self.indexer.clone()
+    pub fn owner_index(&self) -> OwnerIndex {
+        self.owner_index.clone()
     }
 
     pub async fn new<E>(
@@ -114,12 +114,12 @@ impl Application {
         )
         .await;
         let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
-        let indexer = Indexer::new(&genesis, genesis_allocations.clone());
+        let owner_index = OwnerIndex::new(&genesis, genesis_allocations.clone());
         Self {
             genesis,
             genesis_allocations: Arc::new(genesis_allocations),
             finalized_height,
-            indexer,
+            owner_index,
         }
     }
 }
@@ -279,7 +279,7 @@ where
     ) {
         self.finalized_height
             .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
-        self.indexer
+        self.owner_index
             .apply_finalized(block)
             .expect("finalized block indexing failed");
         info!(

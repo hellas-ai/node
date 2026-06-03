@@ -52,6 +52,19 @@ pub struct LatestBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedBlock {
+    pub snapshot: LatestBlock,
+    pub block: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizedBlockQuery {
+    Latest,
+    Height(u64),
+    Payload(Digest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerCoins {
     pub snapshot: LatestBlock,
     pub coins: Vec<(ObjectId, u64)>,
@@ -121,6 +134,11 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_latest_block(
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send;
+
+    fn get_finalized_block(
+        &self,
+        query: FinalizedBlockQuery,
+    ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send;
 
     fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send;
 

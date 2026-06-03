@@ -16,6 +16,8 @@ pub mod indexer;
 pub mod light_client;
 #[cfg(any(feature = "client", feature = "server", feature = "wasm-client"))]
 pub mod methods;
+#[cfg(feature = "node")]
+pub mod owner_index;
 #[cfg(feature = "api")]
 pub mod pb;
 #[cfg(feature = "node")]
@@ -31,11 +33,13 @@ pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mem
 #[cfg(feature = "node")]
 pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "node")]
-pub use indexer::{ApplyOutcome, Cursor as IndexCursor, IndexError, Indexer};
+pub use indexer::ChainIndexer;
 #[cfg(any(feature = "client", feature = "server"))]
 pub use light_client::{
-    ConsensusActivity, ConsensusInfo, LatestBlock, LightClient, OwnerCoins, ProposalInfo,
-    QueryError,
+    ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
+    LightClient, OwnerCoins, ProposalInfo, QueryError,
 };
+#[cfg(feature = "node")]
+pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 #[cfg(feature = "server")]
 pub use server::spawn_light_client_server;

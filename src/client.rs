@@ -5,13 +5,16 @@ use crate::pb::hellas::light_client_client::LightClientClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pb::hellas::*;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, LightClient, OwnerCoins, QueryError};
+use crate::{
+    CONSENSUS_NAMESPACE, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
+    LightClient, OwnerCoins, QueryError,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use commonware_codec::Decode;
 #[cfg(not(target_arch = "wasm32"))]
 use commonware_consensus::simplex::types::Finalization as ConsensusFinalization;
 #[cfg(not(target_arch = "wasm32"))]
-use commonware_cryptography::certificate::Scheme as _;
+use commonware_cryptography::{Hasher, Sha256, certificate::Scheme as _};
 #[cfg(not(target_arch = "wasm32"))]
 use commonware_parallel::Sequential;
 #[cfg(not(target_arch = "wasm32"))]
@@ -222,6 +225,25 @@ impl LightClient for RemoteLightClient {
         }
     }
 
+    fn get_finalized_block(
+        &self,
+        query: FinalizedBlockQuery,
+    ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
+        let mut client = self.client.clone();
+        let verifier = self.verifier.clone();
+        async move {
+            let response = client
+                .get_finalized_block(finalized_block_query_to_proto(query))
+                .await
+                .map_err(QueryError::from)?
+                .into_inner();
+            response
+                .block
+                .map(|block| verified_finalized_block_from_proto(block, verifier.as_ref()))
+                .transpose()
+        }
+    }
+
     fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send {
         let mut client = self.client.clone();
         async move {
@@ -314,6 +336,42 @@ fn verified_latest_block_from_proto(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn verified_finalized_block_from_proto(
+    block: crate::pb::hellas::FinalizedBlock,
+    verifier: Option<&ConsensusVerifier>,
+) -> Result<FinalizedBlock, QueryError> {
+    let Some(snapshot) = block.snapshot else {
+        return Err(QueryError::Remote(
+            "FinalizedBlock had no snapshot".to_string(),
+        ));
+    };
+    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    if Sha256::hash(&block.block) != snapshot.payload {
+        return Err(QueryError::Remote(
+            "block bytes did not match finalized payload".to_string(),
+        ));
+    }
+    Ok(FinalizedBlock {
+        snapshot,
+        block: block.block,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finalized_block_query_to_proto(query: FinalizedBlockQuery) -> GetFinalizedBlockRequest {
+    let query = match query {
+        FinalizedBlockQuery::Latest => None,
+        FinalizedBlockQuery::Height(height) => {
+            Some(get_finalized_block_request::Query::Height(height))
+        }
+        FinalizedBlockQuery::Payload(payload) => Some(get_finalized_block_request::Query::Payload(
+            payload.to_vec(),
+        )),
+    };
+    GetFinalizedBlockRequest { query }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, QueryError> {
     let payload: [u8; 32] = snapshot
         .payload
@@ -395,4 +453,43 @@ fn transaction_to_proto(tx: Transaction) -> SubmitTxRequest {
         }
     };
     SubmitTxRequest { tx: Some(tx_oneof) }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn proto_block(block: Vec<u8>, payload: Digest) -> crate::pb::hellas::FinalizedBlock {
+        crate::pb::hellas::FinalizedBlock {
+            snapshot: Some(FinalizedSnapshot {
+                height: 7,
+                payload: payload.to_vec(),
+                state_root: Digest::from([1u8; 32]).to_vec(),
+                finalization: vec![1],
+            }),
+            block,
+        }
+    }
+
+    #[test]
+    fn finalized_block_verification_checks_block_bytes() {
+        let block = b"encoded-block".to_vec();
+        let payload = Sha256::hash(&block);
+
+        let verified =
+            verified_finalized_block_from_proto(proto_block(block.clone(), payload), None).expect(
+                "matching block bytes should verify without a configured certificate verifier",
+            );
+        assert_eq!(verified.snapshot.payload, payload);
+        assert_eq!(verified.block, block);
+
+        let mismatched_payload = Sha256::hash(b"different-block");
+        assert!(
+            verified_finalized_block_from_proto(
+                proto_block(b"encoded-block".to_vec(), mismatched_payload),
+                None
+            )
+            .is_err()
+        );
+    }
 }

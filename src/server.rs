@@ -1,10 +1,12 @@
 use crate::{
-    ConsensusActivity, ConsensusInfo, LatestBlock, LightClient as LightClientApi, ProposalInfo,
+    ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
+    LightClient as LightClientApi, ProposalInfo,
     methods::LIGHT_CLIENT_METHODS,
     pb::hellas::{
-        self as pb, ActivityEvent, CoinEntry, FinalizationEvent, FinalizedSnapshot,
-        GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse,
-        GetFinalizationResponse, GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse,
+        self as pb, ActivityEvent, CoinEntry, FinalizationEvent,
+        FinalizedBlock as ProtoFinalizedBlock, FinalizedSnapshot, GetCoinResponse,
+        GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetFinalizationResponse,
+        GetFinalizedBlockResponse, GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse,
         GetStateRootResponse, GetValidatorsResponse, MergeCoinTx, NotarizationEvent, NotarizeEvent,
         NullificationEvent, NullifyEvent, SubmitTxResponse, TransferTx,
         WebAuthnSignature as ProtoWebAuthnSignature, activity_event, light_client_server,
@@ -214,6 +216,19 @@ where
         Ok(Response::new(latest_block_response(latest)))
     }
 
+    async fn get_finalized_block(
+        &self,
+        request: Request<pb::GetFinalizedBlockRequest>,
+    ) -> Result<Response<GetFinalizedBlockResponse>, Status> {
+        let query = finalized_block_query_from_proto(request.into_inner())?;
+        let block = self
+            .client
+            .get_finalized_block(query)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(finalized_block_response(block)))
+    }
+
     async fn submit_tx(
         &self,
         request: Request<pb::SubmitTxRequest>,
@@ -410,6 +425,33 @@ fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
 fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
     GetLatestBlockResponse {
         latest: latest.map(latest_block_to_proto),
+    }
+}
+
+fn finalized_block_query_from_proto(
+    request: pb::GetFinalizedBlockRequest,
+) -> Result<FinalizedBlockQuery, Status> {
+    match request.query {
+        Some(pb::get_finalized_block_request::Query::Height(height)) => {
+            Ok(FinalizedBlockQuery::Height(height))
+        }
+        Some(pb::get_finalized_block_request::Query::Payload(payload)) => Ok(
+            FinalizedBlockQuery::Payload(digest_from_bytes(payload, "payload")?),
+        ),
+        None => Ok(FinalizedBlockQuery::Latest),
+    }
+}
+
+fn finalized_block_response(block: Option<FinalizedBlock>) -> GetFinalizedBlockResponse {
+    GetFinalizedBlockResponse {
+        block: block.map(finalized_block_to_proto),
+    }
+}
+
+fn finalized_block_to_proto(block: FinalizedBlock) -> ProtoFinalizedBlock {
+    ProtoFinalizedBlock {
+        snapshot: Some(latest_block_to_proto(block.snapshot)),
+        block: block.block,
     }
 }
 

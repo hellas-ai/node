@@ -34,8 +34,9 @@ use hellas_chain::config::{
 };
 use hellas_chain::rpc::LocalLightClient;
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, ConsensusInfo, Indexer, LightClient as _,
-    Mempool, UtxoDb, spawn_light_client_server, utxo_db_config,
+    ActivityReporter, Application, ApplicationConfig, ChainIndexer, ConsensusInfo,
+    FinalizedBlockQuery, LightClient as _, Mempool, OwnerIndex, UtxoDb, spawn_light_client_server,
+    utxo_db_config,
 };
 use hellas_kernel::domain::{
     Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
@@ -230,6 +231,15 @@ enum QueryCommand {
         /// Hex-encoded 32-byte payload digest
         #[arg(long)]
         payload: String,
+    },
+    /// Get a finalized block by height, payload, or latest when neither is set
+    FinalizedBlock {
+        /// Finalized block height
+        #[arg(long)]
+        height: Option<u64>,
+        /// Hex-encoded 32-byte payload digest
+        #[arg(long)]
+        payload: Option<String>,
     },
     /// Look up a coin by object ID in the latest finalized state
     Coin {
@@ -551,6 +561,36 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                 }
                 Ok(())
             }
+            QueryCommand::Finalization { payload } => {
+                let payload = parse_hex_digest(&payload, "payload")?;
+                match client
+                    .get_finalization(payload)
+                    .await
+                    .map_err(query_error)?
+                {
+                    Some(finalization) => println!("{}", hex::encode(finalization)),
+                    None => println!("none"),
+                }
+                Ok(())
+            }
+            QueryCommand::FinalizedBlock { height, payload } => {
+                let query = finalized_block_query(height, payload)?;
+                match client
+                    .get_finalized_block(query)
+                    .await
+                    .map_err(query_error)?
+                {
+                    Some(block) => {
+                        println!("height {}", block.snapshot.height);
+                        println!("payload {}", hex::encode(block.snapshot.payload));
+                        println!("state_root {}", hex::encode(block.snapshot.state_root));
+                        println!("finalization {}", hex::encode(block.snapshot.finalization));
+                        println!("block {}", hex::encode(block.block));
+                    }
+                    None => println!("none"),
+                }
+                Ok(())
+            }
             QueryCommand::CoinsByOwner { owner } => {
                 let owner = owner.parse::<Address>().map_err(|err| {
                     ValidatorError::InvalidSetup(format!("invalid owner address: {err}"))
@@ -580,7 +620,6 @@ fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
                 Ok(())
             }
             QueryCommand::Proof { .. }
-            | QueryCommand::Finalization { .. }
             | QueryCommand::Transfer { .. }
             | QueryCommand::MergeCoin { .. }
             | QueryCommand::Activity => Err(ValidatorError::InvalidSetup(
@@ -598,6 +637,22 @@ fn parse_hex_digest(raw: &str, field: &'static str) -> Result<Digest, ValidatorE
         ValidatorError::InvalidSetup(format!("{field} must be 32 bytes, got {len}"))
     })?;
     Ok(Digest::from(raw))
+}
+
+fn finalized_block_query(
+    height: Option<u64>,
+    payload: Option<String>,
+) -> Result<FinalizedBlockQuery, ValidatorError> {
+    match (height, payload) {
+        (Some(height), None) => Ok(FinalizedBlockQuery::Height(height)),
+        (None, Some(payload)) => Ok(FinalizedBlockQuery::Payload(parse_hex_digest(
+            &payload, "payload",
+        )?)),
+        (None, None) => Ok(FinalizedBlockQuery::Latest),
+        (Some(_), Some(_)) => Err(ValidatorError::InvalidSetup(
+            "--height and --payload are mutually exclusive".to_string(),
+        )),
+    }
 }
 
 fn query_error(err: impl std::fmt::Display) -> ValidatorError {
@@ -934,7 +989,7 @@ async fn init_block_store(
 }
 
 async fn replay_owner_index(
-    indexer: &Indexer,
+    indexer: &OwnerIndex,
     finalized_blocks: &BlockStore,
 ) -> Result<(), ValidatorError> {
     for (start, end) in finalized_blocks.ranges() {
@@ -1142,7 +1197,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             },
         )
         .await;
-        let owner_index = application.indexer();
+        let owner_index = application.owner_index();
         if let Err(err) = replay_owner_index(&owner_index, &finalized_blocks).await {
             error!(?err, "owner index replay failed");
             panic!("{err}");
@@ -1316,7 +1371,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 databases.clone(),
                 owner_index.clone(),
                 mempool.clone(),
-                marshal_mailbox.clone(),
+                ChainIndexer::new(marshal_mailbox.clone()),
                 consensus_info.clone(),
             );
             Some(
