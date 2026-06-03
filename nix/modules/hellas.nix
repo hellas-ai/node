@@ -268,6 +268,7 @@ rec {
         type = types.enum [
           "hellas"
           "proxy"
+          "fetch"
         ];
         default = "hellas";
         description = "Backend used by the OpenAI Responses endpoint.";
@@ -281,6 +282,16 @@ rec {
         type = types.str;
         default = "OPENAI_API_KEY";
         description = "Environment variable containing the Responses proxy bearer token.";
+      };
+      responsesFetchService = mkOption {
+        type = types.str;
+        default = "codex";
+        description = "Fetch service name used when responsesBackend is fetch.";
+      };
+      responsesFetchMethod = mkOption {
+        type = types.str;
+        default = "responses";
+        description = "Fetch method name used when responsesBackend is fetch.";
       };
       identityPath = mkOption {
         type = types.str;
@@ -428,6 +439,10 @@ rec {
       gateway.responsesProxyUrl
       "--responses-proxy-api-key-env"
       gateway.responsesProxyApiKeyEnv
+      "--responses-fetch-service"
+      gateway.responsesFetchService
+      "--responses-fetch-method"
+      gateway.responsesFetchMethod
     ]
     ++ gateway.extraArgs;
 }
