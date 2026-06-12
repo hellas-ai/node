@@ -3,8 +3,6 @@ use crate::execution::{
     ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, ProducerTrust,
     fetch_execution_stream,
 };
-#[cfg(feature = "hellas-executor")]
-use catgrad::prelude::Dtype;
 use futures::StreamExt;
 use hellas_core::ProducerSigningKey;
 use hellas_rpc::fetch::build_input_events;
@@ -23,8 +21,6 @@ pub struct ExecuteOptions {
     pub method: String,
     pub payload: Vec<u8>,
     pub retries: usize,
-    #[cfg(feature = "hellas-executor")]
-    pub local: bool,
     pub producer_key_path: Option<PathBuf>,
     pub trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
 }
@@ -44,29 +40,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
     };
 
-    #[cfg(feature = "hellas-executor")]
-    let route = if options.local {
-        ExecutionRoute::Local
-    } else {
-        ExecutionRoute::remote(options.node_id, options.node_addrs.clone(), options.retries)
-    };
-    #[cfg(not(feature = "hellas-executor"))]
     let route =
         ExecutionRoute::remote(options.node_id, options.node_addrs.clone(), options.retries);
-
-    #[cfg(feature = "hellas-executor")]
-    let runtime = if options.local {
-        ExecutionRuntime::spawn_default_local_with_producer_key(
-            hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
-            vec![Dtype::F32],
-            ProducerSigningKey::from_secret_bytes(caller_key.to_secret_bytes())?,
-        )?
-        .with_remote(secret_key)
-        .await?
-    } else {
-        ExecutionRuntime::remote(secret_key).await?
-    };
-    #[cfg(not(feature = "hellas-executor"))]
     let runtime = ExecutionRuntime::remote(secret_key).await?;
 
     let request = FetchRequest {
@@ -77,10 +52,6 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             &caller_key,
         )?,
     };
-    #[cfg(feature = "hellas-executor")]
-    let uses_remote = !matches!(route, ExecutionRoute::Local);
-    #[cfg(not(feature = "hellas-executor"))]
-    let uses_remote = true;
     let stream = fetch_execution_stream(runtime, request, route, trust);
     tokio::pin!(stream);
 
@@ -111,9 +82,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         anyhow::bail!("fetch execution stream ended without terminal outcome");
     }
 
-    if uses_remote {
-        crate::tracing_config::suppress_execute_tail_logs();
-    }
+    crate::tracing_config::suppress_execute_tail_logs();
     Ok(())
 }
 

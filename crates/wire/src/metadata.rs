@@ -13,14 +13,6 @@ pub enum MetadataValue {
 }
 
 impl MetadataValue {
-    pub fn text(value: impl Into<SmolStr>) -> Self {
-        Self::Text(value.into())
-    }
-
-    pub fn binary(value: impl Into<Bytes>) -> Self {
-        Self::Bytes(value.into())
-    }
-
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(s) => Some(s),
@@ -66,13 +58,6 @@ impl Metadata {
 
     pub fn get(&self, key: &str) -> Option<&MetadataValue> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a MetadataValue> + 'a {
-        self.entries
-            .iter()
-            .filter(move |(k, _)| k == key)
-            .map(|(_, v)| v)
     }
 
     pub fn remove(&mut self, key: &str) {

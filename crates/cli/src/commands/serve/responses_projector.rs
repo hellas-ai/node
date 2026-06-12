@@ -159,6 +159,7 @@ mod tests {
                 br#"{"model":"gpt-5.5-codex","input":"hi","stream":true,"max_output_tokens":8}"#
                     .to_vec(),
             ),
+            hellas_core::InputCommitment::from_digest(hellas_core::Digest::from_bytes([7; 32])),
         )
     }
 

@@ -922,6 +922,197 @@ mod tests {
         );
     }
 
+    type Mutations<P> = Vec<(&'static str, Box<dyn Fn(&mut P)>)>;
+
+    fn flipped(digest: Digest) -> Digest {
+        let mut bytes = digest.into_bytes();
+        bytes[0] ^= 0x80;
+        Digest::from_bytes(bytes)
+    }
+
+    fn rebuild_input_envelope(
+        envelope: &InputEventEnvelope,
+        mutate: &dyn Fn(&mut InputEventBodyParts),
+    ) -> InputEventEnvelope {
+        let body = envelope.event().body();
+        let mut parts = InputEventBodyParts {
+            scheme: body.scheme(),
+            sequence: body.sequence(),
+            previous_event: body.previous_event(),
+            kind: body.kind().to_string(),
+            payload: body.payload(),
+            signer: body.signer(),
+            canonicalization: body.canonicalization(),
+        };
+        mutate(&mut parts);
+        let event = SignedInputEvent::from_parts(
+            InputEventBody::from_parts(parts),
+            *envelope.event().signature(),
+            *envelope.event().public_key(),
+        )
+        .expect("signer unchanged");
+        InputEventEnvelope::new(event, envelope.payload().to_vec())
+            .expect("payload digest unchanged")
+    }
+
+    fn rebuild_output_envelope(
+        envelope: &OutputEventEnvelope,
+        mutate: &dyn Fn(&mut OutputEventBodyParts),
+    ) -> OutputEventEnvelope {
+        let body = envelope.event().body();
+        let mut parts = OutputEventBodyParts {
+            scheme: body.scheme(),
+            input: body.input(),
+            stream_id: body.stream_id(),
+            sequence: body.sequence(),
+            previous_event: body.previous_event(),
+            kind: body.kind().to_string(),
+            payload: body.payload(),
+            signer: body.signer(),
+            canonicalization: body.canonicalization(),
+        };
+        mutate(&mut parts);
+        let event = SignedOutputEvent::from_parts(
+            OutputEventBody::from_parts(parts),
+            *envelope.event().signature(),
+            *envelope.event().public_key(),
+        )
+        .expect("signer unchanged");
+        OutputEventEnvelope::new(event, envelope.payload().to_vec())
+            .expect("payload digest unchanged")
+    }
+
+    /// Every signed field of an input event, mutated in isolation with the
+    /// original signature kept, must fail verification.
+    #[test]
+    fn input_event_field_mutations_are_rejected() {
+        let caller = key(1);
+        let (events, _) = input_transcript(&caller);
+        let envelope = &events[0];
+        envelope.verify(&caller.public_key()).unwrap();
+
+        let mutations: Mutations<InputEventBodyParts> = vec![
+            ("scheme", Box::new(|p| p.scheme = SchemeId::Symbolic)),
+            ("sequence", Box::new(|p| p.sequence += 1)),
+            (
+                "previous_event",
+                Box::new(|p| {
+                    p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")
+                }),
+            ),
+            ("kind", Box::new(|p| p.kind.push('x'))),
+            (
+                "canonicalization",
+                Box::new(|p| p.canonicalization = canon("other.canonicalizer")),
+            ),
+        ];
+        for (field, mutate) in mutations {
+            let tampered = rebuild_input_envelope(envelope, mutate.as_ref());
+            assert!(
+                tampered.verify(&caller.public_key()).is_err(),
+                "input event with mutated {field} must not verify"
+            );
+        }
+    }
+
+    /// Every signed field of an output event, mutated in isolation with the
+    /// original signature kept, must fail verification.
+    #[test]
+    fn output_event_field_mutations_are_rejected() {
+        let caller = key(1);
+        let producer = key(2);
+        let (_, input) = input_transcript(&caller);
+        let (events, _) = output_transcript(&producer, input);
+        let envelope = &events[0];
+        envelope.verify(&producer.public_key()).unwrap();
+
+        let mutations: Mutations<OutputEventBodyParts> = vec![
+            ("scheme", Box::new(|p| p.scheme = SchemeId::Symbolic)),
+            (
+                "input",
+                Box::new(|p| p.input = InputCommitment::from_digest(flipped(p.input.digest()))),
+            ),
+            (
+                "stream_id",
+                Box::new(|p| p.stream_id = StreamId::from_digest(flipped(p.stream_id.digest()))),
+            ),
+            ("sequence", Box::new(|p| p.sequence += 1)),
+            (
+                "previous_event",
+                Box::new(|p| {
+                    p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")
+                }),
+            ),
+            ("kind", Box::new(|p| p.kind.push('x'))),
+            (
+                "canonicalization",
+                Box::new(|p| p.canonicalization = canon("other.canonicalizer")),
+            ),
+        ];
+        for (field, mutate) in mutations {
+            let tampered = rebuild_output_envelope(envelope, mutate.as_ref());
+            assert!(
+                tampered.verify(&producer.public_key()).is_err(),
+                "output event with mutated {field} must not verify"
+            );
+        }
+    }
+
+    /// The fields the signature cannot cover are guarded structurally:
+    /// payload bytes and the payload digest are cross-checked, the signer
+    /// is pinned to the public key at construction, and a flipped signature
+    /// byte fails outright.
+    #[test]
+    fn output_event_structural_mutations_are_rejected() {
+        let caller = key(1);
+        let producer = key(2);
+        let other = key(3);
+        let (_, input) = input_transcript(&caller);
+        let (events, _) = output_transcript(&producer, input);
+        let envelope = &events[0];
+
+        // Substituted payload bytes are rejected at construction.
+        assert_eq!(
+            OutputEventEnvelope::new(envelope.event().clone(), b"forged".to_vec()).unwrap_err(),
+            StreamVerifyError::PayloadMismatch
+        );
+
+        // A signer field claiming a different producer cannot be wrapped
+        // around this public key.
+        let body = envelope.event().body();
+        let forged_signer = OutputEventBody::from_parts(OutputEventBodyParts {
+            scheme: body.scheme(),
+            input: body.input(),
+            stream_id: body.stream_id(),
+            sequence: body.sequence(),
+            previous_event: body.previous_event(),
+            kind: body.kind().to_string(),
+            payload: body.payload(),
+            signer: ProducerId::from_public_key(&other.public_key()),
+            canonicalization: body.canonicalization(),
+        });
+        assert_eq!(
+            SignedOutputEvent::from_parts(
+                forged_signer,
+                *envelope.event().signature(),
+                *envelope.event().public_key(),
+            )
+            .unwrap_err(),
+            StreamVerifyError::SignerMismatch
+        );
+
+        // A flipped signature byte fails verification.
+        let mut signature_bytes = *envelope.event().signature().bytes();
+        signature_bytes[7] ^= 0x01;
+        let tampered = SignedOutputEvent::from_parts(
+            envelope.event().body().clone(),
+            Signature::from_compact_secp256k1(signature_bytes),
+            *envelope.event().public_key(),
+        )
+        .unwrap();
+        assert!(tampered.verify(&producer.public_key()).is_err());
+    }
+
     #[test]
     fn output_transcript_cannot_splice_to_different_input() {
         let caller = key(1);

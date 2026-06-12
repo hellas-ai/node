@@ -1,7 +1,7 @@
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use catgrad::prelude::Dtype;
-use hellas_core::{ProducerSigningKey, PublicKey};
+use hellas_core::ProducerSigningKey;
 use hellas_executor::{
     CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
@@ -36,7 +36,6 @@ pub struct ServeOptions {
     pub metrics_port: Option<u16>,
     pub graffiti: String,
     pub dtype: Vec<Dtype>,
-    pub trusted_caller_public_keys: Vec<PublicKey>,
     pub fetch_config_file: Option<PathBuf>,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_size: usize,
@@ -58,20 +57,12 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         buf[..len].copy_from_slice(&src[..len]);
         buf.to_vec()
     };
-    let trusted_caller_public_keys = if options.trusted_caller_public_keys.is_empty() {
-        vec![options.producer_key.public_key()]
-    } else {
-        options.trusted_caller_public_keys
-    };
     let (fetch_routes, fetch_access_policy) = match options.fetch_config_file.as_deref() {
         // The config file is the single source of fetch truth: routes,
         // capabilities, and caller access, cross-validated at load. No file
-        // means this node serves no fetch routes.
+        // means this node serves no fetch routes and admits no fetch callers.
         Some(path) => load_fetch_config(path)?,
-        None => (
-            FetchRouteRegistry::default(),
-            FetchAccessPolicy::trusted_callers(trusted_caller_public_keys),
-        ),
+        None => (FetchRouteRegistry::default(), FetchAccessPolicy::new([])),
     };
     // Counters live in the executor and are mutated inline; cloning the
     // counter handles into a registry just adds a scrape view on the same

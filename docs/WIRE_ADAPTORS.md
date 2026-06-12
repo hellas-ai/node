@@ -21,15 +21,15 @@ For Hellas-backed execution there is another layer below this:
 
 ```text
 ExecutionRequest
-  -> Hellas settlement adaptor projection
-Call
+  -> scheme projection (Evaluate program, or Fetch input transcript)
+ticket
   -> executor
-CallResult + Receipt
+signed transcript / receipt
   -> ExecutionResult
 ```
 
 The wire adaptor is not a settlement boundary. It is selected by the HTTP
-route and owns provider compatibility. The settlement adaptor owns canonical
+route and owns provider compatibility. The scheme layer owns canonical
 commitment bytes.
 
 ## Crate Boundary
@@ -49,31 +49,35 @@ The crate must not depend on:
 
 Backend implementations live elsewhere and consume `ExecutionRequest`.
 
-## Canonical Versus Passthrough
+## Canonical Versus Raw
 
 Every parsed request projects to:
 
 ```rust
 pub struct ExecutionRequest {
     pub canonical: CanonicalExecution,
-    pub passthrough: PassthroughBag,
 }
 ```
 
-`canonical` contains fields a backend may commit to. For a Hellas backend,
-these fields are eligible to affect the settlement `Call`.
+and travels alongside the original wire body:
 
-`passthrough` contains fields preserved for compatibility but not witnessed by
-the Hellas receipt. A proxy backend may forward them unchanged. A Hellas
-backend must not silently treat passthrough fields as committed behavior.
+```rust
+pub struct BackendRequest {
+    pub execution: ExecutionRequest,
+    pub raw: RawRequest, // original wire JSON
+}
+```
 
-The split is semantic, not just storage. If a wire field changes execution
-behavior, it belongs in `canonical`. If it is retained only to round-trip or
-forward to another service, it belongs in `passthrough`.
+`canonical` is the semantic, provider-neutral view: what local execution,
+policy, and rendering understand. `raw` is the byte-faithful wire body: what
+proxy and Fetch backends forward (Fetch commits to the canonical request
+bytes inside the signed input transcript — the field-level view is never
+receipt material).
 
-`CanonicalExecution::committed_fields` records the wire field paths that the
-adaptor projected into canonical execution state. Tests for each adaptor should
-pin this set for representative requests.
+The split is semantic: if code needs to understand a field, it is parsed into
+`canonical`; if a field only needs to survive the trip to a provider, it rides
+in `raw` untouched. There is no field-level commitment set; a future
+field-level Evaluate scheme would have to introduce one explicitly.
 
 ## Request Shape
 
@@ -88,8 +92,8 @@ pin this set for representative requests.
 - reasoning controls
 - previous response reference
 
-Provider-specific fields that have no canonical execution meaning stay in
-`PassthroughBag`.
+Provider-specific fields that have no canonical execution meaning stay in the
+raw wire body.
 
 `RawRequest` stores both original bytes and parsed JSON. Adaptors should parse
 from `RawRequest` so lossless behavior can be tested.
@@ -149,5 +153,5 @@ Anthropic Messages keep exact provider message JSON in canonical input items so
 tool-call history, tool results, and provider block formats survive projection
 without gateway-specific parsing.
 
-Adaptor tests should pin both wire compatibility and the
-canonical-versus-passthrough split for representative requests.
+Adaptor tests should pin both wire compatibility and the canonical projection
+for representative requests.

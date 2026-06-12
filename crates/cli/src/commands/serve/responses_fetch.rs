@@ -8,12 +8,17 @@ pub(super) async fn execute_responses_request(
     endpoint: Url,
     bearer_token: &str,
     body: Vec<u8>,
+    // Derived from the input transcript commitment, so a re-issued call for
+    // the same ticket dedupes at the provider billing boundary where the
+    // provider honors the header.
+    idempotency_key: &str,
     label: &str,
 ) -> Result<FetchProviderStream, FetchProviderError> {
     let upstream = client
         .post(endpoint)
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
+        .header("Idempotency-Key", idempotency_key)
         .body(body)
         .send()
         .await

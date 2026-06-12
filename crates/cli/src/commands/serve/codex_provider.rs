@@ -59,6 +59,7 @@ impl CodexResponsesFetchProvider {
             endpoint,
             &access_token,
             request.body.as_bytes().to_vec(),
+            &request.idempotency_key(),
             "Codex Responses",
         )
         .await
@@ -95,7 +96,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
-    type CapturedRequest = (Option<String>, Bytes);
+    type CapturedRequest = (Option<String>, Option<String>, Bytes);
 
     #[derive(Clone)]
     struct Capture {
@@ -111,8 +112,12 @@ mod tests {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        let idempotency_key = headers
+            .get("Idempotency-Key")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         if let Some(tx) = capture.tx.lock().await.take() {
-            let _ = tx.send((auth, body));
+            let _ = tx.send((auth, idempotency_key, body));
         }
         Response::builder()
             .body(Body::from(
@@ -134,7 +139,12 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
     }
 
     fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new("codex", "responses", JsonBytes::new(body.to_vec()))
+        FetchProviderRequest::new(
+            "codex",
+            "responses",
+            JsonBytes::new(body.to_vec()),
+            hellas_core::InputCommitment::from_digest(hellas_core::Digest::from_bytes([7; 32])),
+        )
     }
 
     #[tokio::test]
@@ -174,9 +184,10 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
         while let Some(event) = stream.next().await {
             output.push(event.unwrap());
         }
-        let (auth, forwarded_body) = rx.await.unwrap();
+        let (auth, idempotency_key, forwarded_body) = rx.await.unwrap();
 
         assert_eq!(auth, Some(format!("Bearer {access_token}")));
+        assert_eq!(idempotency_key, Some(request(body).idempotency_key()));
         assert_eq!(forwarded_body.as_ref(), body);
         let joined = String::from_utf8(output.concat()).unwrap();
         assert!(joined.contains("event: response.created"));

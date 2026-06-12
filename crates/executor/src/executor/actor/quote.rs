@@ -152,12 +152,16 @@ impl Executor {
         if !self.fetch_routes.contains(&route) {
             return Err(super::execution::no_fetch_route_error(&route));
         }
-        let (quote, _) = self.fetch_state.quote_input(input).map_err(|err| {
-            ExecutorError::InvalidQuoteRequest(format!(
-                "fetch input transcript verification failed: {err}"
-            ))
-        })?;
-        let provider_request = FetchProviderRequest::new(service.clone(), method.clone(), body);
+        let (quote, _) = self
+            .fetch_state
+            .quote_input(input)
+            .map_err(super::execution::fetch_execute_error)?;
+        let provider_request = FetchProviderRequest::new(
+            service.clone(),
+            method.clone(),
+            body,
+            quote.input_commitment,
+        );
 
         let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
