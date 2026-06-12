@@ -159,6 +159,9 @@ enum CodexAuthCommand {
     },
 }
 
+// Parsed once at startup and immediately destructured; boxing the large
+// variants would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     #[cfg(feature = "hellas-executor")]
@@ -203,10 +206,6 @@ enum Commands {
             value_parser = parse_model_dtype
         )]
         dtype: Vec<Dtype>,
-        /// Caller/gateway public keys allowed to create Fetch tickets.
-        /// Repeat or comma-separate compressed secp256k1 keys as hex.
-        #[arg(long = "trusted-caller-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
-        trusted_caller_public_keys: Vec<hellas_core::PublicKey>,
         /// Unified Fetch configuration file: routes (provider upstreams,
         /// protocols, capabilities) and caller access policy. No file means
         /// this node serves no Fetch routes.
@@ -407,10 +406,6 @@ enum Commands {
         /// Max execution retries on failure (discovery path only)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
-        /// Run locally with the in-process executor instead of the Hellas network
-        #[cfg(feature = "hellas-executor")]
-        #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
-        local: bool,
         /// Producer public keys trusted to sign Fetch output. Repeat or
         /// comma-separate compressed secp256k1 keys as hex (see
         /// `producer-key show`). Defaults to this node's own producer key.
@@ -518,7 +513,6 @@ async fn main() {
             metrics_port,
             graffiti,
             dtype,
-            trusted_caller_public_keys,
             fetch_config_file,
             fetch_max_in_flight,
             fetch_queue_size,
@@ -540,7 +534,6 @@ async fn main() {
                 metrics_port,
                 graffiti,
                 dtype,
-                trusted_caller_public_keys,
                 fetch_config_file,
                 fetch_max_in_flight,
                 fetch_queue_size,
@@ -665,8 +658,6 @@ async fn main() {
             payload,
             payload_file,
             retries,
-            #[cfg(feature = "hellas-executor")]
-            local,
             trusted_producer_public_keys,
         } => {
             let payload = match (payload, payload_file) {
@@ -687,8 +678,6 @@ async fn main() {
                             method,
                             payload,
                             retries,
-                            #[cfg(feature = "hellas-executor")]
-                            local,
                             producer_key_path: producer_key_path.clone(),
                             trusted_producer_public_keys,
                         },

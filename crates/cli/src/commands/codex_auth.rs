@@ -473,6 +473,12 @@ async fn refresh_tokens(
             message: format!("body read failed: {err}"),
             terminal: false,
         })?;
+    // Deliberately non-terminal: a 2xx with an unparseable or incomplete
+    // body means the *response* was bad, not the refresh token. Terminal
+    // would persist `refresh_token_blocked` and brick a likely-valid
+    // credential until a human re-logs-in; non-terminal retries at the
+    // caller's pace and self-heals when the server recovers. Only the
+    // explicit auth-error codes and 401/403 in `refresh_error` are terminal.
     let value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|err| CodexAuthError::RefreshFailed {
             message: format!("invalid JSON: {err}"),
@@ -703,6 +709,8 @@ impl FileLock {
                 .read(true)
                 .write(true)
                 .create(true)
+                // Lock files carry no content; never clobber what's there.
+                .truncate(false)
                 .mode(0o600)
                 .open(lock_path)
                 .map_err(CodexAuthError::Io)?;

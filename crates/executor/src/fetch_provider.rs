@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_core::Stream;
 use futures_util::stream;
-use hellas_core::JsonBytes;
+use hellas_core::{Digest, InputCommitment, JsonBytes};
 
 pub type FetchProviderResult<T> = Result<T, FetchProviderError>;
 pub type FetchProviderStream =
@@ -23,18 +23,36 @@ pub struct FetchProviderRequest {
     pub service: String,
     pub method: String,
     pub body: JsonBytes,
+    /// Commitment over the caller-signed input transcript. Providers derive
+    /// the upstream `Idempotency-Key` from it so retries of the same ticket
+    /// dedupe at the provider billing boundary.
+    pub input_commitment: InputCommitment,
 }
 
 impl FetchProviderRequest {
-    pub fn new(service: impl Into<String>, method: impl Into<String>, body: JsonBytes) -> Self {
+    pub fn new(
+        service: impl Into<String>,
+        method: impl Into<String>,
+        body: JsonBytes,
+        input_commitment: InputCommitment,
+    ) -> Self {
         Self {
             service: service.into(),
             method: method.into(),
             body,
+            input_commitment,
         }
+    }
+
+    pub fn idempotency_key(&self) -> String {
+        self.input_commitment.digest().to_string()
     }
 }
 
+// Identity is the call content. `input_commitment` is derived metadata over
+// the signed transcript (which includes the caller key and signatures), so
+// including it would make identical provider calls from different callers
+// unequal — wrong for the mock store and for call-content dedup.
 impl PartialEq for FetchProviderRequest {
     fn eq(&self, other: &Self) -> bool {
         self.service == other.service && self.method == other.method && self.body == other.body
@@ -67,7 +85,7 @@ impl MockFetchProvider {
         body: impl Into<Vec<u8>>,
         chunks: impl IntoIterator<Item = Vec<u8>>,
     ) {
-        let request = FetchProviderRequest::new(service, method, JsonBytes::new(body.into()));
+        let request = mock_key(service, method, body);
         let chunks = chunks.into_iter().collect();
         self.responses
             .lock()
@@ -81,7 +99,7 @@ impl MockFetchProvider {
         method: impl Into<String>,
         body: impl Into<Vec<u8>>,
     ) -> usize {
-        let request = FetchProviderRequest::new(service, method, JsonBytes::new(body.into()));
+        let request = mock_key(service, method, body);
         *self
             .calls
             .lock()
@@ -89,6 +107,20 @@ impl MockFetchProvider {
             .get(&request)
             .unwrap_or(&0)
     }
+}
+
+// Eq/Hash ignore the commitment, so any value works as a lookup key.
+fn mock_key(
+    service: impl Into<String>,
+    method: impl Into<String>,
+    body: impl Into<Vec<u8>>,
+) -> FetchProviderRequest {
+    FetchProviderRequest::new(
+        service,
+        method,
+        JsonBytes::new(body.into()),
+        InputCommitment::from_digest(Digest::from_bytes([0; 32])),
+    )
 }
 
 impl FetchProvider for MockFetchProvider {

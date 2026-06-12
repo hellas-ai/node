@@ -150,6 +150,11 @@ impl Executor {
         let preferred_dtype = config.supported_dtypes[0];
         let (tx, rx) = mpsc::unbounded_channel();
         backend::create_backend()?;
+        // Make the fetch store root durable before any ticket can run, so
+        // running markers always link into an already-durable directory.
+        config.fetch_store.init().map_err(|err| {
+            ExecutorError::ArtifactStore(format!("fetch transcript store init failed: {err}"))
+        })?;
         let fetch_caller_policy = FetchCallerPolicy::new(config.fetch_access_policy.caller_keys());
         let executor = Self {
             rx,

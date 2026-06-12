@@ -58,10 +58,21 @@ impl Executor {
         }
         let stream_batch_size = 1;
         self.store.prune_expired_quotes(Instant::now());
-        let quote = self
-            .store
-            .get_quote(&request_commitment, Instant::now())?
-            .clone();
+        let quote = match self.store.get_quote(&request_commitment, Instant::now()) {
+            Ok(quote) => quote.clone(),
+            Err(err) => {
+                // The quote store is transient; after a restart a caller
+                // retrying a ticket whose run may have reached the provider
+                // must hear "indeterminate", not "quote not found". If the
+                // check itself fails, that store error is the truth — not
+                // the quote-store miss.
+                return Err(match self.fetch_state.is_indeterminate(input_commitment) {
+                    Ok(true) => fetch_execute_error(FetchStateError::Indeterminate),
+                    Ok(false) => err.into(),
+                    Err(state_err) => fetch_execute_error(state_err),
+                });
+            }
+        };
         match quote.kind {
             QuoteKind::Symbolic {
                 symbolic_request,
@@ -500,10 +511,23 @@ impl Executor {
                 return;
             };
             if pending.sender.is_closed() {
-                let _ = self
+                if let Err(err) = self
                     .fetch_access_policy
-                    .cancel_reservation(pending.quota_reservation.as_ref());
-                let _ = self.fetch_state.cancel_queued(pending.input_commitment);
+                    .cancel_reservation(pending.quota_reservation.as_ref())
+                {
+                    warn!(
+                        execution_id = %pending.execution_id,
+                        quota_error = %err,
+                        "failed to cancel quota reservation for disconnected fetch"
+                    );
+                }
+                if let Err(err) = self.fetch_state.cancel_queued(pending.input_commitment) {
+                    warn!(
+                        execution_id = %pending.execution_id,
+                        state_error = %err,
+                        "queued fetch was not cancellable; ticket state is inconsistent"
+                    );
+                }
                 debug!(
                     execution_id = %pending.execution_id,
                     "dropping queued fetch execution: consumer disconnected before dispatch"
@@ -760,7 +784,7 @@ fn fetch_finished_event(
     })
 }
 
-fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
+pub(super) fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
     match err {
         FetchStateError::NotFound => {
             ExecutorError::State(StateError::QuoteNotFound(err.to_string()))
@@ -771,6 +795,7 @@ fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
         | FetchStateError::NotRunning
         | FetchStateError::NotCompleted
         | FetchStateError::AlreadyCompleted
+        | FetchStateError::Indeterminate
         | FetchStateError::Failed => {
             ExecutorError::State(StateError::QuoteExpired(err.to_string()))
         }
@@ -1142,6 +1167,72 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, ExecutorError::PolicyDenied(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn run_ticket_with_recovered_running_marker_reports_indeterminate() {
+        use crate::fetch::{FetchRunningRecord, FetchTranscriptStore, FsFetchTranscriptStore};
+
+        let dir = std::env::temp_dir().join(format!(
+            "hellas-fetch-actor-indeterminate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let signing_key = key();
+        let events = build_input_events("echo", "run", br#"{"hello":"crash"}"#, &signing_key)
+            .unwrap();
+        let input = hellas_rpc::fetch::verify_input_events(&events)
+            .unwrap()
+            .input_commitment;
+
+        // Simulate a previous process that crashed mid-run: only the durable
+        // running marker survives; the transient quote store is empty.
+        let marker_store = FsFetchTranscriptStore::new(dir.join("fetch-transcripts"));
+        marker_store.init().unwrap();
+        marker_store
+            .put_running(
+                input,
+                &FetchRunningRecord {
+                    service: "echo".to_string(),
+                    method: "run".to_string(),
+                    caller_public_key: String::new(),
+                    started_at_unix_ms: 0,
+                    idempotency_key: input.digest().to_string(),
+                },
+            )
+            .unwrap();
+
+        let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+            execute_policy: ExecutePolicy::Eager,
+            queue_capacity: 1,
+            supported_dtypes: vec![Dtype::F32],
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: Arc::new(key()),
+            fetch_access_policy: FetchAccessPolicy::trusted_callers([signing_key.public_key()]),
+            fetch_routes: test_routes(
+                "echo",
+                "run",
+                Arc::new(MockFetchProvider::new()),
+                Arc::new(TestFetchProjectorFactory),
+            ),
+            fetch_max_in_flight: 1,
+            fetch_queue_capacity: 1,
+            artifact_store: ArtifactStoreConfig::Fs(dir.clone()),
+        })
+        .await
+        .unwrap();
+
+        let err = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: input.digest().as_bytes().to_vec(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("indeterminate"),
+            "expected indeterminate, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

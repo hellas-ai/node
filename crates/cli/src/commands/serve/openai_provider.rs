@@ -52,6 +52,7 @@ impl OpenAiResponsesFetchProvider {
             self.endpoint.clone(),
             &self.bearer_token,
             request.body.as_bytes().to_vec(),
+            &request.idempotency_key(),
             "OpenAI Responses",
         )
         .await
@@ -74,12 +75,12 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use futures::StreamExt;
-    use hellas_core::JsonBytes;
+    use hellas_core::{Digest, InputCommitment, JsonBytes};
     use reqwest::header::AUTHORIZATION;
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
-    type CapturedRequest = (Option<String>, Bytes);
+    type CapturedRequest = (Option<String>, Option<String>, Bytes);
     type CaptureSender = oneshot::Sender<CapturedRequest>;
     type SharedCaptureSender = Arc<tokio::sync::Mutex<Option<CaptureSender>>>;
 
@@ -97,8 +98,12 @@ mod tests {
             .get(AUTHORIZATION.as_str())
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        let idempotency_key = headers
+            .get("Idempotency-Key")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         if let Some(tx) = capture.tx.lock().await.take() {
-            let _ = tx.send((auth, body));
+            let _ = tx.send((auth, idempotency_key, body));
         }
         Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -131,8 +136,17 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
         )
     }
 
+    fn test_commitment() -> InputCommitment {
+        InputCommitment::from_digest(Digest::from_bytes([7; 32]))
+    }
+
     fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new("openai", "responses", JsonBytes::new(body.to_vec()))
+        FetchProviderRequest::new(
+            "openai",
+            "responses",
+            JsonBytes::new(body.to_vec()),
+            test_commitment(),
+        )
     }
 
     async fn collect(provider: &OpenAiResponsesFetchProvider, body: &[u8]) -> Vec<Vec<u8>> {
@@ -161,8 +175,12 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
         let body = br#"{"model":"m","input":"hello","stream":true,"metadata":{"trace":"abc"}}"#;
         let output = collect(&provider(addr), body).await;
 
-        let (auth, forwarded_body) = rx.await.unwrap();
+        let (auth, idempotency_key, forwarded_body) = rx.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
+        assert_eq!(
+            idempotency_key,
+            Some(test_commitment().digest().to_string())
+        );
         assert_eq!(forwarded_body.as_ref(), body);
 
         let joined = String::from_utf8(output.concat()).unwrap();

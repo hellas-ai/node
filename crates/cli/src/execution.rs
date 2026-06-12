@@ -340,6 +340,9 @@ pub enum StopReason {
     Cancelled,
 }
 
+// Stream items moved once per chunk; boxing the envelope would trade a
+// 448-byte move for a per-chunk allocation with no call-site benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FetchExecutionEvent {
     Chunk {
