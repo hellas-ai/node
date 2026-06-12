@@ -21,7 +21,7 @@ use catgrad::prelude::Dtype;
 use futures::Stream;
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -55,8 +55,10 @@ pub struct GatewayOptions {
     pub responses_backend: ResponsesBackend,
     pub responses_proxy_url: String,
     pub responses_proxy_api_key_env: String,
-    pub responses_fetch_service: String,
-    pub responses_fetch_method: String,
+    pub responses_fetch_route_service: String,
+    pub responses_fetch_route_method: String,
+    pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
+    pub trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
     pub producer_key_path: Option<PathBuf>,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,

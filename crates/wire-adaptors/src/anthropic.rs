@@ -89,6 +89,21 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
         result: ExecutionResult,
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
+        if let Some(error) = result.error {
+            return Ok(WireResponse::json(
+                500,
+                attach_hellas(
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": error.code.unwrap_or_else(|| "api_error".to_string()),
+                            "message": error.message,
+                        }
+                    }),
+                    result.provenance.as_ref(),
+                ),
+            ));
+        }
         let mut body = json!({
             "id": context.response_id,
             "type": "message",
@@ -708,6 +723,7 @@ mod tests {
                 call_commitment: Some("aa".repeat(32)),
                 receipt: Some("bb".repeat(32)),
             }),
+            error: None,
         };
         let response = adaptor()
             .render_response(
@@ -743,6 +759,7 @@ mod tests {
                     usage: None,
                     stop_reason: StopReason::EndOfText,
                     provenance: None,
+                    error: None,
                 },
                 RenderContext::new("msg-test", "msg-test", 0),
             )

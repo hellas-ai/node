@@ -138,35 +138,46 @@ rec {
         default = [ ];
         description = "Compressed secp256k1 public keys allowed to create Fetch tickets.";
       };
-      fetchOpenaiResponses = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Enable OpenAI Responses Fetch execution.";
-      };
-      fetchOpenaiResponsesUrl = mkOption {
-        type = types.str;
-        default = "https://api.openai.com/v1/responses";
-        description = "OpenAI-compatible Responses endpoint used by Fetch execution.";
-      };
-      fetchOpenaiApiKeyEnv = mkOption {
-        type = types.str;
-        default = "OPENAI_API_KEY";
-        description = "Environment variable containing the OpenAI Responses Fetch bearer token.";
-      };
-      fetchCodexResponses = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Enable Codex OAuth Responses Fetch execution.";
-      };
-      fetchCodexBaseUrl = mkOption {
-        type = types.str;
-        default = "https://chatgpt.com/backend-api/codex";
-        description = "Codex backend base URL used by Fetch execution.";
-      };
-      fetchCodexAuthPath = mkOption {
-        type = types.nullOr types.str;
+      fetchConfig = mkOption {
+        type = types.nullOr types.attrs;
         default = null;
-        description = "Codex auth store path.";
+        example = {
+          routes = [
+            {
+              service = "codex";
+              method = "responses";
+              protocol = "openai-responses";
+              upstream.type = "codex-oauth";
+              capabilities = {
+                models = [ "gpt-5.5-codex" ];
+                max_output_tokens = 131072;
+              };
+            }
+          ];
+          callers = [
+            {
+              public_key = "<compressed secp256k1 hex>";
+              routes = [
+                {
+                  service = "codex";
+                  method = "responses";
+                  max_output_tokens = 65536;
+                }
+              ];
+            }
+          ];
+        };
+        description = "Unified Fetch configuration: routes (provider upstreams, protocols, capabilities) and caller access policy. Rendered to JSON and passed as --fetch-config. Null disables Fetch serving.";
+      };
+      fetchMaxInFlight = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum number of Fetch provider streams running at once.";
+      };
+      fetchQueueSize = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Maximum number of Fetch executions waiting behind active provider streams.";
       };
       metricsPort = mkOption {
         type = types.nullOr types.port;
@@ -283,15 +294,25 @@ rec {
         default = "OPENAI_API_KEY";
         description = "Environment variable containing the Responses proxy bearer token.";
       };
-      responsesFetchService = mkOption {
+      responsesFetchRouteService = mkOption {
         type = types.str;
         default = "codex";
-        description = "Fetch service name used when responsesBackend is fetch.";
+        description = "Fetch route service used when responsesBackend is fetch.";
       };
-      responsesFetchMethod = mkOption {
+      responsesFetchRouteMethod = mkOption {
         type = types.str;
         default = "responses";
-        description = "Fetch method name used when responsesBackend is fetch.";
+        description = "Fetch route method used when responsesBackend is fetch.";
+      };
+      responsesFetchRequestOverrides = mkOption {
+        type = types.attrsOf types.anything;
+        default = { };
+        description = "JSON object merged into OpenAI Responses requests before signing and sending them through Fetch.";
+      };
+      trustedProducerPublicKeys = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Compressed secp256k1 producer public keys trusted to sign Fetch output when responsesBackend is fetch. Empty trusts only the gateway's own producer key.";
       };
       identityPath = mkOption {
         type = types.str;
@@ -381,16 +402,12 @@ rec {
       "--trusted-caller-public-key"
       key
     ]) serve.trustedCallerPublicKeys
-    ++ lib.optionals serve.fetchOpenaiResponses (
-      [ "--fetch-openai-responses" ]
-      ++ optArg "--fetch-openai-responses-url" serve.fetchOpenaiResponsesUrl
-      ++ optArg "--fetch-openai-api-key-env" serve.fetchOpenaiApiKeyEnv
-    )
-    ++ lib.optionals serve.fetchCodexResponses (
-      [ "--fetch-codex-responses" ]
-      ++ optArg "--fetch-codex-base-url" serve.fetchCodexBaseUrl
-      ++ optArg "--fetch-codex-auth-path" serve.fetchCodexAuthPath
-    )
+    ++ lib.optionals (serve.fetchConfig != null) [
+      "--fetch-config"
+      (builtins.toFile "hellas-fetch-config.json" (builtins.toJSON serve.fetchConfig))
+    ]
+    ++ optArg "--fetch-max-in-flight" serve.fetchMaxInFlight
+    ++ optArg "--fetch-queue-size" serve.fetchQueueSize
     ++ serve.extraArgs;
 
   mkGatewayArgs =
@@ -439,10 +456,18 @@ rec {
       gateway.responsesProxyUrl
       "--responses-proxy-api-key-env"
       gateway.responsesProxyApiKeyEnv
-      "--responses-fetch-service"
-      gateway.responsesFetchService
-      "--responses-fetch-method"
-      gateway.responsesFetchMethod
+      "--responses-fetch-route-service"
+      gateway.responsesFetchRouteService
+      "--responses-fetch-route-method"
+      gateway.responsesFetchRouteMethod
     ]
+    ++ lib.optionals (gateway.responsesFetchRequestOverrides != { }) [
+      "--responses-fetch-request-overrides"
+      (builtins.toJSON gateway.responsesFetchRequestOverrides)
+    ]
+    ++ lib.concatMap (key: [
+      "--trusted-producer-public-key"
+      key
+    ]) gateway.trustedProducerPublicKeys
     ++ gateway.extraArgs;
 }

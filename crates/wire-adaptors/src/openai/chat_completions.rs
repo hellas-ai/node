@@ -82,6 +82,21 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
         result: ExecutionResult,
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
+        if let Some(error) = result.error {
+            return Ok(WireResponse::json(
+                500,
+                attach_hellas(
+                    json!({
+                        "error": {
+                            "message": error.message,
+                            "type": "server_error",
+                            "code": error.code.unwrap_or_else(|| "server_error".to_string()),
+                        }
+                    }),
+                    result.provenance.as_ref(),
+                ),
+            ));
+        }
         let message = output_message_json(&result.output)?;
         let finish_reason = finish_reason_json(result.stop_reason);
         let mut body = json!({
@@ -873,6 +888,7 @@ mod tests {
                 call_commitment: Some("aa".repeat(32)),
                 receipt: Some("bb".repeat(32)),
             }),
+            error: None,
         };
         let response = adaptor()
             .render_response(
@@ -908,6 +924,7 @@ mod tests {
                     usage: None,
                     stop_reason: StopReason::EndOfText,
                     provenance: None,
+                    error: None,
                 },
                 RenderContext::new("chatcmpl-test", "msg-test", 123),
             )

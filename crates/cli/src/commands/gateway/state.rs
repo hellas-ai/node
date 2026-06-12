@@ -107,6 +107,19 @@ impl GatewayState {
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
+                let caller_key = crate::identity::load_or_create_producer_key(
+                    options.producer_key_path.as_deref(),
+                )?;
+                // Mirrors the producer-side default for trusted callers: with
+                // no keys configured, only output signed by this gateway's own
+                // producer key verifies.
+                let producer_trust = if options.trusted_producer_public_keys.is_empty() {
+                    crate::execution::ProducerTrust::keys([caller_key.public_key()])
+                } else {
+                    crate::execution::ProducerTrust::keys(
+                        options.trusted_producer_public_keys.iter().copied(),
+                    )
+                };
                 Some(Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
                     runtime.clone(),
                     ExecutionRoute::remote(
@@ -114,11 +127,11 @@ impl GatewayState {
                         options.node_addrs.clone(),
                         options.retries,
                     ),
-                    &options.responses_fetch_service,
-                    &options.responses_fetch_method,
-                    crate::identity::load_or_create_producer_key(
-                        options.producer_key_path.as_deref(),
-                    )?,
+                    &options.responses_fetch_route_service,
+                    &options.responses_fetch_route_method,
+                    caller_key,
+                    producer_trust,
+                    options.responses_fetch_request_overrides.clone(),
                 )))
             }
             ResponsesBackend::Hellas | ResponsesBackend::Proxy => None,

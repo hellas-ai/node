@@ -1,21 +1,15 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
-use futures::stream;
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
     FetchProviderStream,
 };
-use hellas_wire_adaptors::RenderContext;
 use reqwest::Url;
 
-use super::responses_fetch::{execute_responses_request, parsed_streaming_request};
+use crate::commands::http_client;
 
-const SERVICE_OPENAI: &str = "openai";
-const METHOD_RESPONSES: &str = "responses";
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+use super::responses_fetch::execute_responses_request;
 
 #[derive(Clone)]
 pub(super) struct OpenAiResponsesFetchProvider {
@@ -35,7 +29,7 @@ impl OpenAiResponsesFetchProvider {
             bail!("environment variable {api_key_env} is empty");
         }
         Ok(Self::with_client(
-            reqwest::Client::new(),
+            http_client(Duration::from_secs(20 * 60)),
             endpoint,
             bearer_token,
         ))
@@ -49,22 +43,15 @@ impl OpenAiResponsesFetchProvider {
         }
     }
 
-    async fn execute(&self, request: FetchProviderRequest) -> Result<Vec<u8>, FetchProviderError> {
-        if request.service != SERVICE_OPENAI || request.method != METHOD_RESPONSES {
-            return Err(FetchProviderError::Rejected(format!(
-                "unsupported fetch route {}/{}",
-                request.service, request.method
-            )));
-        }
-
-        let parsed = parsed_streaming_request(&request)?;
+    async fn execute(
+        &self,
+        request: FetchProviderRequest,
+    ) -> Result<FetchProviderStream, FetchProviderError> {
         execute_responses_request(
             &self.client,
             self.endpoint.clone(),
             &self.bearer_token,
             request.body.as_bytes().to_vec(),
-            parsed,
-            render_context(),
             "OpenAI Responses",
         )
         .await
@@ -73,27 +60,8 @@ impl OpenAiResponsesFetchProvider {
 
 impl FetchProvider for OpenAiResponsesFetchProvider {
     fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
-        Box::pin(async move {
-            let body = self.execute(request).await?;
-            Ok(Box::pin(stream::once(async move { Ok(body) })) as FetchProviderStream)
-        })
+        Box::pin(async move { self.execute(request).await })
     }
-}
-
-fn render_context() -> RenderContext {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    RenderContext::new(
-        format!("resp_fetch_{id}"),
-        format!("msg_fetch_{id}"),
-        now_unix(),
-    )
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -108,7 +76,6 @@ mod tests {
     use futures::StreamExt;
     use hellas_core::JsonBytes;
     use reqwest::header::AUTHORIZATION;
-    use serde_json::Value as JsonValue;
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
@@ -165,24 +132,20 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
     }
 
     fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new(
-            SERVICE_OPENAI,
-            METHOD_RESPONSES,
-            JsonBytes::new(body.to_vec()),
-        )
+        FetchProviderRequest::new("openai", "responses", JsonBytes::new(body.to_vec()))
     }
 
-    async fn collect(provider: &OpenAiResponsesFetchProvider, body: &[u8]) -> Vec<u8> {
+    async fn collect(provider: &OpenAiResponsesFetchProvider, body: &[u8]) -> Vec<Vec<u8>> {
         let mut stream = provider.run(request(body)).await.unwrap();
         let mut output = Vec::new();
         while let Some(chunk) = stream.next().await {
-            output.extend(chunk.unwrap());
+            output.push(chunk.unwrap());
         }
         output
     }
 
     #[tokio::test]
-    async fn forwards_streaming_request_and_projects_terminal_json() {
+    async fn forwards_streaming_request_and_streams_raw_sse_chunks() {
         let (tx, rx) = oneshot::channel();
         let app = Router::new()
             .route("/v1/responses", post(capture_responses_sse))
@@ -202,29 +165,11 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
         assert_eq!(forwarded_body.as_ref(), body);
 
-        let json: JsonValue = serde_json::from_slice(&output).unwrap();
-        assert_eq!(json["id"], "resp_up");
-        assert_eq!(json["created_at"], 42);
-        assert_eq!(json["model"], "m");
-        assert_eq!(json["metadata"]["trace"], "abc");
-        assert_eq!(json["usage"]["total_tokens"], 5);
-        assert_eq!(json["output"][0]["id"], "msg_up");
-        assert_eq!(json["output"][0]["content"][0]["text"], "hello");
-    }
-
-    #[tokio::test]
-    async fn rejects_non_streaming_responses_requests() {
-        let provider = OpenAiResponsesFetchProvider::with_client(
-            reqwest::Client::new(),
-            Url::parse("http://127.0.0.1:9/v1/responses").unwrap(),
-            "test-key".to_string(),
-        );
-        let result = provider
-            .run(request(br#"{"model":"m","input":"hello"}"#))
-            .await;
-        let Err(FetchProviderError::Rejected(message)) = result else {
-            panic!("expected rejection");
-        };
-        assert!(message.contains("stream=true"));
+        let joined = String::from_utf8(output.concat()).unwrap();
+        assert!(joined.contains("event: response.created"));
+        assert!(joined.contains(r#""id":"resp_up""#));
+        assert!(joined.contains(r#""delta":"hel""#));
+        assert!(joined.contains(r#""delta":"lo""#));
+        assert!(joined.contains("event: response.completed"));
     }
 }

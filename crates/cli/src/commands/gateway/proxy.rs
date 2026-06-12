@@ -1,3 +1,4 @@
+use crate::commands::http_client;
 use crate::commands::openai_responses_stream::ResponsesSseProjector;
 use axum::body::Bytes;
 use futures::StreamExt;
@@ -9,6 +10,7 @@ use hellas_wire_adaptors::{
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(super) struct ResponsesProxy {
@@ -25,7 +27,7 @@ impl ResponsesProxy {
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
         Ok(Self::with_client(
-            reqwest::Client::new(),
+            http_client(Duration::from_secs(20 * 60)),
             endpoint,
             bearer_token,
         ))

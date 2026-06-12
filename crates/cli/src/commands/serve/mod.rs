@@ -1,14 +1,18 @@
 use crate::commands::CliResult;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use catgrad::prelude::Dtype;
 use hellas_core::{ProducerSigningKey, PublicKey};
 use hellas_executor::{
-    ExecutorMetrics, FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
-    RejectingFetchProvider,
+    CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
+    FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
+    RequestRateLimit, SpendLimit,
 };
 use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;
+use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
@@ -19,6 +23,7 @@ mod node;
 mod node_handler;
 mod openai_provider;
 mod responses_fetch;
+mod responses_projector;
 
 pub(crate) const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -32,12 +37,9 @@ pub struct ServeOptions {
     pub graffiti: String,
     pub dtype: Vec<Dtype>,
     pub trusted_caller_public_keys: Vec<PublicKey>,
-    pub fetch_openai_responses: bool,
-    pub fetch_openai_responses_url: String,
-    pub fetch_openai_api_key_env: String,
-    pub fetch_codex_responses: bool,
-    pub fetch_codex_base_url: String,
-    pub fetch_codex_auth_path: Option<PathBuf>,
+    pub fetch_config_file: Option<PathBuf>,
+    pub fetch_max_in_flight: usize,
+    pub fetch_queue_size: usize,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
 }
@@ -61,25 +63,15 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     } else {
         options.trusted_caller_public_keys
     };
-    let mut providers: Vec<Arc<dyn FetchProvider>> = Vec::new();
-    if options.fetch_openai_responses {
-        providers.push(Arc::new(
-            openai_provider::OpenAiResponsesFetchProvider::new(
-                &options.fetch_openai_responses_url,
-                &options.fetch_openai_api_key_env,
-            )?,
-        ));
-    }
-    if options.fetch_codex_responses {
-        providers.push(Arc::new(codex_provider::CodexResponsesFetchProvider::new(
-            &options.fetch_codex_base_url,
-            options.fetch_codex_auth_path.as_deref(),
-        )?));
-    }
-    let fetch_provider: Arc<dyn FetchProvider> = match providers.len() {
-        0 => Arc::new(RejectingFetchProvider),
-        1 => providers.remove(0),
-        _ => Arc::new(RoutingFetchProvider { providers }),
+    let (fetch_routes, fetch_access_policy) = match options.fetch_config_file.as_deref() {
+        // The config file is the single source of fetch truth: routes,
+        // capabilities, and caller access, cross-validated at load. No file
+        // means this node serves no fetch routes.
+        Some(path) => load_fetch_config(path)?,
+        None => (
+            FetchRouteRegistry::default(),
+            FetchAccessPolicy::trusted_callers(trusted_caller_public_keys),
+        ),
     };
     // Counters live in the executor and are mutated inline; cloning the
     // counter handles into a registry just adds a scrape view on the same
@@ -93,9 +85,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         build,
         graffiti,
         supported_dtypes: options.dtype,
-        trusted_caller_public_keys,
+        fetch_access_policy,
         artifact_store_path,
-        fetch_provider,
+        fetch_routes,
+        fetch_max_in_flight: options.fetch_max_in_flight,
+        fetch_queue_size: options.fetch_queue_size,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         metrics: metrics.clone(),
@@ -152,29 +146,243 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     Ok(())
 }
 
-struct RoutingFetchProvider {
-    providers: Vec<Arc<dyn FetchProvider>>,
-}
+/// Load the unified fetch configuration: the route table (providers,
+/// protocols, capabilities) and the caller access policy, cross-validated so
+/// a caller grant naming an undefined route is a load error rather than a
+/// silent dead entry.
+fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, FetchAccessPolicy)> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file: FetchConfigFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
 
-impl FetchProvider for RoutingFetchProvider {
-    fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
-        Box::pin(async move {
-            let mut rejection = None;
-            for provider in &self.providers {
-                match provider.run(request.clone()).await {
-                    Ok(stream) => return Ok(stream),
-                    Err(FetchProviderError::Rejected(message)) => rejection = Some(message),
-                    Err(err) => return Err(err),
+    let mut registry = FetchRouteRegistry::new();
+    let responses_projector: Arc<dyn FetchProjectorFactory> =
+        Arc::new(responses_projector::ResponsesFetchProjectorFactory);
+    for route in file.routes {
+        if route.service.trim().is_empty() || route.method.trim().is_empty() {
+            bail!("fetch config route service and method must be non-empty");
+        }
+        let projector_factory = match route.protocol {
+            FetchRouteProtocol::OpenaiResponses => responses_projector.clone(),
+        };
+        registry
+            .register(
+                FetchRoute::new(route.service, route.method),
+                FetchRouteEntry {
+                    provider: route.upstream.into_provider()?,
+                    projector_factory,
+                    capabilities: route.capabilities.into_policy()?,
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("invalid fetch config: {err}"))?;
+    }
+
+    let callers = file
+        .callers
+        .into_iter()
+        .map(FetchPolicyCaller::into_access)
+        .collect::<CliResult<Vec<_>>>()?;
+    for caller in &callers {
+        if let hellas_executor::RouteSet::Explicit(routes) = &caller.routes {
+            for route in routes.keys() {
+                if !registry.contains(route) {
+                    bail!(
+                        "fetch config grants caller access to undefined route {}/{}",
+                        route.service,
+                        route.method
+                    );
                 }
             }
-            Err(FetchProviderError::Rejected(rejection.unwrap_or_else(
-                || {
-                    format!(
-                        "no fetch provider configured for {}/{}",
-                        request.service, request.method
-                    )
-                },
-            )))
+        }
+    }
+    Ok((registry, FetchAccessPolicy::new(callers)))
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchConfigFile {
+    #[serde(default)]
+    routes: Vec<FetchConfigRoute>,
+    #[serde(default)]
+    callers: Vec<FetchPolicyCaller>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchConfigRoute {
+    service: String,
+    method: String,
+    /// The wire contract this route speaks; selects the output projector and
+    /// event canonicalizer. Explicit because it is consensus-relevant.
+    protocol: FetchRouteProtocol,
+    upstream: FetchUpstream,
+    #[serde(default)]
+    capabilities: FetchPolicyLimits,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FetchRouteProtocol {
+    OpenaiResponses,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum FetchUpstream {
+    /// Any OpenAI-Responses-compatible HTTP endpoint with bearer auth from
+    /// an environment variable.
+    OpenaiCompatible {
+        url: String,
+        #[serde(default = "default_openai_api_key_env")]
+        api_key_env: String,
+    },
+    CodexOauth {
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        auth_path: Option<PathBuf>,
+    },
+}
+
+fn default_openai_api_key_env() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+impl FetchUpstream {
+    fn into_provider(self) -> CliResult<Arc<dyn FetchProvider>> {
+        Ok(match self {
+            Self::OpenaiCompatible { url, api_key_env } => Arc::new(
+                openai_provider::OpenAiResponsesFetchProvider::new(&url, &api_key_env)?,
+            ),
+            Self::CodexOauth {
+                base_url,
+                auth_path,
+            } => Arc::new(codex_provider::CodexResponsesFetchProvider::new(
+                base_url.as_deref().unwrap_or(DEFAULT_CODEX_BASE_URL),
+                auth_path.as_deref(),
+            )?),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchPolicyCaller {
+    public_key: String,
+    routes: Vec<FetchPolicyRoute>,
+    #[serde(default)]
+    request_rate: Option<FetchPolicyRate>,
+    #[serde(default)]
+    spend: Option<FetchPolicySpend>,
+}
+
+impl FetchPolicyCaller {
+    fn into_access(self) -> CliResult<CallerAccess> {
+        let public_key = crate::parse_public_key_hex(&self.public_key)
+            .map_err(|err| anyhow::anyhow!("invalid fetch policy public_key: {err}"))?;
+        let routes = self
+            .routes
+            .into_iter()
+            .map(FetchPolicyRoute::into_grant)
+            .collect::<CliResult<Vec<_>>>()?;
+        let mut access = CallerAccess::explicit(public_key, routes);
+        access.request_rate = self
+            .request_rate
+            .map(FetchPolicyRate::into_limit)
+            .transpose()?;
+        access.spend = self.spend.map(FetchPolicySpend::into_limit).transpose()?;
+        Ok(access)
+    }
+}
+
+/// Model/output limits — the same shape serves as a route-wide capability
+/// (on `routes`) and as a per-caller grant (on `callers`); admission
+/// validates against their intersection.
+#[derive(Debug, Default, Deserialize)]
+struct FetchPolicyLimits {
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default, alias = "max_output_units")]
+    max_output_tokens: Option<u64>,
+}
+
+impl FetchPolicyLimits {
+    fn into_policy(self) -> CliResult<FetchRoutePolicy> {
+        let allowed_models = if self.models.is_empty() {
+            None
+        } else {
+            let mut models = BTreeSet::new();
+            for model in self.models {
+                let model = model.trim();
+                if model.is_empty() {
+                    bail!("fetch config model names must be non-empty");
+                }
+                models.insert(model.to_string());
+            }
+            Some(models)
+        };
+        Ok(FetchRoutePolicy {
+            allowed_models,
+            max_output_units: self.max_output_tokens,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchPolicyRoute {
+    service: String,
+    method: String,
+    #[serde(flatten)]
+    limits: FetchPolicyLimits,
+}
+
+impl FetchPolicyRoute {
+    fn into_grant(self) -> CliResult<FetchRouteGrant> {
+        if self.service.trim().is_empty() || self.method.trim().is_empty() {
+            bail!("fetch config route service and method must be non-empty");
+        }
+        Ok(FetchRouteGrant {
+            route: FetchRoute::new(self.service, self.method),
+            policy: self.limits.into_policy()?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchPolicyRate {
+    capacity: f64,
+    refill_per_sec: f64,
+}
+
+impl FetchPolicyRate {
+    fn into_limit(self) -> CliResult<RequestRateLimit> {
+        if !self.capacity.is_finite() || self.capacity <= 0.0 {
+            bail!("fetch policy request_rate.capacity must be finite and greater than zero");
+        }
+        if !self.refill_per_sec.is_finite() || self.refill_per_sec < 0.0 {
+            bail!("fetch policy request_rate.refill_per_sec must be finite and non-negative");
+        }
+        Ok(RequestRateLimit {
+            capacity: self.capacity,
+            refill_per_sec: self.refill_per_sec,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchPolicySpend {
+    max_units: u64,
+    window_seconds: u64,
+}
+
+impl FetchPolicySpend {
+    fn into_limit(self) -> CliResult<SpendLimit> {
+        if self.max_units == 0 {
+            bail!("fetch policy spend.max_units must be greater than zero");
+        }
+        if self.window_seconds == 0 {
+            bail!("fetch policy spend.window_seconds must be greater than zero");
+        }
+        Ok(SpendLimit {
+            max_units: self.max_units,
+            window: Duration::from_secs(self.window_seconds),
         })
     }
 }
@@ -227,6 +435,18 @@ fn dedupe_preload_models(mut models: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_core::ProducerSigningKey;
+    use hellas_executor::{FetchAccessError, FetchRequestView};
+
+    fn public_key_hex(byte: u8) -> String {
+        let key = ProducerSigningKey::from_secret_bytes([byte; 32])
+            .unwrap()
+            .public_key();
+        key.bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 
     #[test]
     fn dedupe_preload_models_preserves_first_occurrence() {
@@ -248,5 +468,147 @@ mod tests {
             "baz/qux@rev".to_string(),
         ]);
         assert_eq!(models, vec!["foo/bar", "baz/qux@rev"]);
+    }
+
+    fn write_config(dir: &tempfile::TempDir, config: serde_json::Value) -> PathBuf {
+        let path = dir.path().join("fetch-config.json");
+        fs::write(&path, config.to_string()).unwrap();
+        path
+    }
+
+    fn codex_route(capabilities: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "service": "codex",
+            "method": "responses",
+            "protocol": "openai-responses",
+            // Keep this fixture independent of the process-global HOME.
+            "upstream": { "type": "codex-oauth", "auth_path": "/tmp/hellas-test-codex-auth.json" },
+            "capabilities": capabilities,
+        })
+    }
+
+    #[test]
+    fn load_fetch_config_parses_routes_limits_and_quotas() {
+        let dir = tempfile::tempdir().unwrap();
+        let public_key = public_key_hex(1);
+        let path = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [codex_route(serde_json::json!({}))],
+                "callers": [{
+                    "public_key": public_key,
+                    "routes": [{
+                        "service": "codex",
+                        "method": "responses",
+                        "models": ["gpt-5.5-codex"],
+                        "max_output_tokens": 32
+                    }],
+                    "request_rate": { "capacity": 2.0, "refill_per_sec": 1.0 },
+                    "spend": { "max_units": 64, "window_seconds": 60 }
+                }]
+            }),
+        );
+        let caller = ProducerSigningKey::from_secret_bytes([1; 32])
+            .unwrap()
+            .public_key();
+        let (registry, mut policy) = load_fetch_config(&path).unwrap();
+
+        let route = FetchRoute::new("codex", "responses");
+        let capabilities = registry.entry(&route).unwrap().capabilities.clone();
+        policy
+            .authorize_admission(
+                &caller,
+                &FetchRequestView {
+                    service: "codex".to_string(),
+                    method: "responses".to_string(),
+                    model: Some("gpt-5.5-codex".to_string()),
+                    max_output_units: Some(32),
+                },
+                1_000,
+                "r1".to_string(),
+                &capabilities,
+            )
+            .unwrap();
+        let denied = policy
+            .authorize_admission(
+                &caller,
+                &FetchRequestView {
+                    service: "codex".to_string(),
+                    method: "responses".to_string(),
+                    model: Some("other".to_string()),
+                    max_output_units: Some(1),
+                },
+                1_000,
+                "r2".to_string(),
+                &capabilities,
+            )
+            .unwrap_err();
+        assert!(matches!(denied, FetchAccessError::Denied(_)));
+    }
+
+    #[test]
+    fn load_fetch_config_parses_route_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [codex_route(serde_json::json!({
+                    "models": ["gpt-5.5-codex"],
+                    "max_output_tokens": 4096
+                }))],
+            }),
+        );
+
+        let (registry, _) = load_fetch_config(&path).unwrap();
+
+        let capabilities = &registry
+            .entry(&FetchRoute::new("codex", "responses"))
+            .unwrap()
+            .capabilities;
+        assert_eq!(capabilities.max_output_units, Some(4096));
+        assert!(
+            capabilities
+                .allowed_models
+                .as_ref()
+                .unwrap()
+                .contains("gpt-5.5-codex")
+        );
+    }
+
+    #[test]
+    fn load_fetch_config_rejects_grant_for_undefined_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [codex_route(serde_json::json!({}))],
+                "callers": [{
+                    "public_key": public_key_hex(1),
+                    "routes": [{ "service": "openai", "method": "responses" }]
+                }]
+            }),
+        );
+
+        let err = load_fetch_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("undefined route openai/responses"));
+    }
+
+    #[test]
+    fn load_fetch_config_rejects_duplicate_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [
+                    codex_route(serde_json::json!({})),
+                    codex_route(serde_json::json!({})),
+                ],
+            }),
+        );
+
+        let err = load_fetch_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("registered twice"));
     }
 }

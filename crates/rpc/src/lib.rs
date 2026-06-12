@@ -46,6 +46,14 @@ pub use model::ModelAssetsError;
 #[cfg(feature = "node")]
 pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
+/// Default maximum number of Fetch provider streams running at once.
+#[cfg(feature = "node")]
+pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
+
+/// Default bound on Fetch executions waiting behind active provider streams.
+#[cfg(feature = "node")]
+pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
+
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

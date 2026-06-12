@@ -153,13 +153,13 @@ impl fmt::Display for AcquireDenied {
 impl std::error::Error for AcquireDenied {}
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TokenBucket {
+pub struct TokenBucket {
     tokens: f64,
     last_refill_ms: u64,
 }
 
 impl TokenBucket {
-    pub(super) fn new(now_ms: u64, capacity: f64) -> Self {
+    pub fn new(now_ms: u64, capacity: f64) -> Self {
         Self {
             tokens: capacity,
             last_refill_ms: now_ms,
@@ -169,7 +169,7 @@ impl TokenBucket {
     /// Try to consume one token. Returns `Err(retry_after_ms)` when empty —
     /// `None` retry-after means "never" (either refill rate is zero, or the
     /// bucket's capacity is below one token so it can never admit at all).
-    pub(super) fn try_take(
+    pub fn try_take(
         &mut self,
         now_ms: u64,
         capacity: f64,

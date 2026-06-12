@@ -7,7 +7,9 @@ use hellas_core::{
 };
 
 const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v1";
-const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v1";
+const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
+const OUTPUT_EVENT_KIND: &str = "response.event";
+const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchInput {
@@ -21,7 +23,14 @@ pub struct FetchInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchOutput {
     pub producer_key: PublicKey,
-    pub body: JsonBytes,
+    event_payloads: Vec<Vec<u8>>,
+    terminal_payload: Vec<u8>,
+}
+
+impl FetchOutput {
+    pub fn output_event_payloads(&self) -> (&[Vec<u8>], &[u8]) {
+        (&self.event_payloads, &self.terminal_payload)
+    }
 }
 
 pub fn input_canonicalization() -> CanonicalizationId {
@@ -54,13 +63,44 @@ pub fn build_output_events(
     payload: &[u8],
     key: &ProducerSigningKey,
 ) -> Result<Vec<OutputEventEnvelope>, FetchProtocolError> {
-    validate_json("response.body", payload)?;
     let mut builder =
         OutputTranscriptBuilder::new(SchemeId::Fetch, input, key, output_canonicalization());
-    builder.push("response.body", payload.to_vec())?;
-    builder.push("response.completed", Vec::new())?;
+    builder.push(OUTPUT_TERMINAL_KIND, payload.to_vec())?;
     let (events, _) = builder.finish()?;
     Ok(events)
+}
+
+pub struct FetchOutputTranscriptBuilder<'a> {
+    inner: OutputTranscriptBuilder<'a>,
+}
+
+impl<'a> FetchOutputTranscriptBuilder<'a> {
+    pub fn new(input: InputCommitment, key: &'a ProducerSigningKey) -> Self {
+        Self {
+            inner: OutputTranscriptBuilder::new(
+                SchemeId::Fetch,
+                input,
+                key,
+                output_canonicalization(),
+            ),
+        }
+    }
+
+    pub fn push_event(
+        &mut self,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<OutputEventEnvelope, FetchProtocolError> {
+        Ok(self.inner.push_envelope(OUTPUT_EVENT_KIND, payload)?)
+    }
+
+    pub fn finish(
+        mut self,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<Vec<OutputEventEnvelope>, FetchProtocolError> {
+        self.inner.push(OUTPUT_TERMINAL_KIND, payload)?;
+        let (events, _) = self.inner.finish()?;
+        Ok(events)
+    }
 }
 
 pub fn verify_input_events(
@@ -94,23 +134,65 @@ pub fn verify_output_events(
         .event()
         .public_key();
     verify_output_event_envelopes(SchemeId::Fetch, input, &producer_key, events)?;
-    let body = output_body(events)?;
-    Ok(FetchOutput { producer_key, body })
+    let (event_payloads, terminal_payload) = output_payloads(events)?;
+    Ok(FetchOutput {
+        producer_key,
+        event_payloads,
+        terminal_payload,
+    })
 }
 
-pub fn output_body(events: &[OutputEventEnvelope]) -> Result<JsonBytes, FetchProtocolError> {
-    if events.len() != 2 {
+pub fn verify_terminal_continuation(
+    streamed_prefix: &[OutputEventEnvelope],
+    finished: &[OutputEventEnvelope],
+) -> Result<(), FetchProtocolError> {
+    if finished.is_empty() {
+        return Err(FetchProtocolError::EmptyOutputTranscript);
+    }
+    if finished.len() < streamed_prefix.len() {
         return Err(FetchProtocolError::WrongOutputEventCount {
-            actual: events.len(),
+            actual: finished.len(),
         });
     }
-    expect_output_event(&events[0], 0, "response.body")?;
-    expect_output_event(&events[1], 1, "response.completed")?;
-    if !events[1].payload().is_empty() {
-        return Err(FetchProtocolError::NonEmptyOutputCompleted);
+    let first = finished
+        .first()
+        .ok_or(FetchProtocolError::EmptyOutputTranscript)?;
+    let input = first.event().body().input();
+    let producer_key = *first.event().public_key();
+    verify_output_event_envelopes(SchemeId::Fetch, input, &producer_key, finished)?;
+    output_payloads(finished)?;
+    for (index, streamed) in streamed_prefix.iter().enumerate() {
+        expect_output_event(streamed, index, OUTPUT_EVENT_KIND)?;
+        let Some(finished_event) = finished.get(index) else {
+            return Err(FetchProtocolError::WrongOutputEventCount {
+                actual: finished.len(),
+            });
+        };
+        if finished_event != streamed {
+            return Err(FetchProtocolError::OutputPrefixMismatch { index });
+        }
     }
-    validate_json("response.body", events[0].payload())?;
-    Ok(JsonBytes::new(events[0].payload().to_vec()))
+    Ok(())
+}
+
+fn output_payloads(
+    events: &[OutputEventEnvelope],
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), FetchProtocolError> {
+    if events.is_empty() {
+        return Err(FetchProtocolError::EmptyOutputTranscript);
+    }
+    let terminal_index = events.len() - 1;
+    let mut payloads = Vec::with_capacity(terminal_index);
+    for (index, event) in events[..terminal_index].iter().enumerate() {
+        expect_output_event(event, index, OUTPUT_EVENT_KIND)?;
+        payloads.push(event.payload().to_vec());
+    }
+    expect_output_event(
+        &events[terminal_index],
+        terminal_index,
+        OUTPUT_TERMINAL_KIND,
+    )?;
+    Ok((payloads, events[terminal_index].payload().to_vec()))
 }
 
 fn input_parts(
@@ -216,7 +298,7 @@ pub enum FetchProtocolError {
     EmptyOutputTranscript,
     #[error("fetch input transcript must contain exactly 4 events, got {actual}")]
     WrongInputEventCount { actual: usize },
-    #[error("fetch output transcript must contain exactly 2 events, got {actual}")]
+    #[error("fetch output transcript must contain exactly one terminal event, got {actual} events")]
     WrongOutputEventCount { actual: usize },
     #[error("fetch input event {index} must be {expected}, got {actual}")]
     UnexpectedInputEvent {
@@ -236,8 +318,8 @@ pub enum FetchProtocolError {
     OutputCanonicalizationMismatch { index: usize },
     #[error("fetch input.end payload must be empty")]
     NonEmptyInputEnd,
-    #[error("fetch response.completed payload must be empty")]
-    NonEmptyOutputCompleted,
+    #[error("fetch streamed output event {index} does not match finished transcript")]
+    OutputPrefixMismatch { index: usize },
     #[error("fetch {field} event is not UTF-8: {source}")]
     Utf8 {
         field: &'static str,
@@ -288,9 +370,72 @@ mod tests {
         let events = build_output_events(input, br#"{"id":"resp"}"#, &producer).unwrap();
 
         let output = verify_output_events(input, &events).unwrap();
+        let (payloads, terminal) = output.output_event_payloads();
 
         assert_eq!(output.producer_key, producer.public_key());
-        assert_eq!(output.body.as_bytes(), br#"{"id":"resp"}"#);
+        assert!(payloads.is_empty());
+        assert_eq!(terminal, br#"{"id":"resp"}"#);
+    }
+
+    #[test]
+    fn streaming_output_events_round_trip_through_shape_verifier() {
+        let caller = key(1);
+        let producer = key(2);
+        let input = verify_input_events(
+            &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
+        )
+        .unwrap()
+        .input_commitment;
+        let mut builder = FetchOutputTranscriptBuilder::new(input, &producer);
+        let first = builder
+            .push_event(b"semantic-output-event-1".to_vec())
+            .unwrap();
+        let second = builder
+            .push_event(b"semantic-output-event-2".to_vec())
+            .unwrap();
+        let events = builder.finish(b"semantic-terminal".to_vec()).unwrap();
+
+        assert_eq!(events[0], first);
+        assert_eq!(events[1], second);
+        let output = verify_output_events(input, &events).unwrap();
+        let (payloads, terminal) = output.output_event_payloads();
+
+        assert_eq!(output.producer_key, producer.public_key());
+        assert_eq!(
+            payloads,
+            &[
+                b"semantic-output-event-1".to_vec(),
+                b"semantic-output-event-2".to_vec()
+            ]
+        );
+        assert_eq!(terminal, b"semantic-terminal");
+        verify_terminal_continuation(&events[..2], &events).unwrap();
+    }
+
+    #[test]
+    fn terminal_continuation_rejects_divergent_valid_chain() {
+        let caller = key(1);
+        let producer = key(2);
+        let input = verify_input_events(
+            &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
+        )
+        .unwrap()
+        .input_commitment;
+
+        let mut streamed = FetchOutputTranscriptBuilder::new(input, &producer);
+        let first_streamed = streamed.push_event(b"live-event".to_vec()).unwrap();
+        let _streamed_finished = streamed.finish(b"terminal".to_vec()).unwrap();
+
+        let mut divergent = FetchOutputTranscriptBuilder::new(input, &producer);
+        divergent
+            .push_event(b"different-live-event".to_vec())
+            .unwrap();
+        let divergent_finished = divergent.finish(b"terminal".to_vec()).unwrap();
+
+        assert!(matches!(
+            verify_terminal_continuation(&[first_streamed], &divergent_finished).unwrap_err(),
+            FetchProtocolError::OutputPrefixMismatch { index: 0 }
+        ));
     }
 
     #[test]
@@ -363,8 +508,9 @@ mod tests {
             &producer,
             CanonicalizationId::from_bytes(b"wrong.output.v1"),
         );
-        builder.push("response.body", br#"{}"#.to_vec()).unwrap();
-        builder.push("response.completed", Vec::new()).unwrap();
+        builder
+            .push("response.terminal", br#"{}"#.to_vec())
+            .unwrap();
         let (events, _) = builder.finish().unwrap();
 
         assert!(matches!(
