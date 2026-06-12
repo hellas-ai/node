@@ -2,7 +2,7 @@ mod actor;
 mod handle;
 
 use catgrad::prelude::Dtype;
-use hellas_core::InputCommitment;
+use hellas_core::{InputCommitment, OutputEventEnvelope};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
@@ -15,9 +15,12 @@ use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire::WireStatus;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::fetch_provider::FetchProviderError;
+use crate::fetch_policy::FetchQuotaReservation;
+use crate::fetch_projection::{FetchProjector, FetchUsage};
+use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
 use crate::worker::WorkerCompletion;
 pub use actor::{Executor, ExecutorSpawnConfig};
 
@@ -107,17 +110,35 @@ pub(crate) enum ExecutorMessage {
 pub(crate) struct FetchCompletion {
     pub input_commitment: InputCommitment,
     pub request_commitment_id: [u8; 32],
+    pub quota_reservation: Option<FetchQuotaReservation>,
     pub execution_id: String,
     pub model_id: String,
     pub sender: ExecuteEventReceiverSender,
-    pub result: Result<Vec<u8>, FetchProviderFailure>,
+    pub result: Result<FetchProviderRun, FetchProviderFailure>,
 }
 
 pub(crate) type ExecuteEventReceiverSender = mpsc::Sender<Result<WorkEvent, WireStatus>>;
 
+pub(crate) struct FetchProviderRun {
+    pub output_events: Vec<OutputEventEnvelope>,
+    pub usage: FetchUsage,
+}
+
 pub(crate) struct FetchProviderFailure {
     pub position: u64,
     pub error: FetchProviderError,
+}
+
+pub(crate) struct PendingFetch {
+    pub request: FetchProviderRequest,
+    pub provider: Arc<dyn FetchProvider>,
+    pub projector: Box<dyn FetchProjector>,
+    pub quota_reservation: Option<FetchQuotaReservation>,
+    pub input_commitment: InputCommitment,
+    pub request_commitment_id: [u8; 32],
+    pub execution_id: String,
+    pub model_id: String,
+    pub sender: ExecuteEventReceiverSender,
 }
 
 #[derive(Clone)]

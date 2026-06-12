@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use catgrad::prelude::Dtype;
-use hellas_core::{ProducerSigningKey, PublicKey};
+use hellas_core::ProducerSigningKey;
 use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics,
-    ExecutorSpawnConfig, FetchCallerPolicy, FetchProvider, FetchServer, SymbolicServer,
+    ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer, SymbolicServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
@@ -74,9 +74,11 @@ pub(super) struct NodeConfig {
     pub(super) build: String,
     pub(super) graffiti: Vec<u8>,
     pub(super) supported_dtypes: Vec<Dtype>,
-    pub(super) trusted_caller_public_keys: Vec<PublicKey>,
+    pub(super) fetch_access_policy: FetchAccessPolicy,
     pub(super) artifact_store_path: PathBuf,
-    pub(super) fetch_provider: Arc<dyn FetchProvider>,
+    pub(super) fetch_routes: FetchRouteRegistry,
+    pub(super) fetch_max_in_flight: usize,
+    pub(super) fetch_queue_size: usize,
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
     pub(super) metrics: Arc<ExecutorMetrics>,
@@ -89,8 +91,10 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         supported_dtypes: config.supported_dtypes,
         metrics: config.metrics.clone(),
         producer_key: Arc::new(config.producer_key),
-        fetch_caller_policy: FetchCallerPolicy::new(config.trusted_caller_public_keys),
-        fetch_provider: config.fetch_provider,
+        fetch_access_policy: config.fetch_access_policy,
+        fetch_routes: config.fetch_routes,
+        fetch_max_in_flight: config.fetch_max_in_flight,
+        fetch_queue_capacity: config.fetch_queue_size,
         artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
     })
     .await

@@ -53,6 +53,11 @@ pub enum ExecutorError {
     ArtifactStore(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
+    #[error("{message}")]
+    QuotaExceeded {
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
     #[error("invalid token payload: {0}")]
     InvalidTokenPayload(String),
     #[error(transparent)]
@@ -83,7 +88,9 @@ fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
 
 fn executor_wire_code(err: &ExecutorError) -> WireCode {
     match err {
-        ExecutorError::QueueFull { .. } => WireCode::ResourceExhausted,
+        ExecutorError::QueueFull { .. } | ExecutorError::QuotaExceeded { .. } => {
+            WireCode::ResourceExhausted
+        }
         ExecutorError::InvalidQuoteRequest(_)
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,

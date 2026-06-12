@@ -8,6 +8,7 @@ use catgrad::prelude::Dtype;
 use chatgrad::types;
 use hellas_core::{CommitmentScheme, Digest, RequestCommitment, Symbolic};
 use hellas_rpc::ExecutorError;
+use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
@@ -137,17 +138,25 @@ impl Executor {
                     "fetch input event decode failed: {err}"
                 ))
             })?;
-        let (quote, verified) = self.fetch_state.quote_input(input).map_err(|err| {
-            ExecutorError::InvalidQuoteRequest(format!(
-                "fetch input transcript verification failed: {err}"
-            ))
-        })?;
         let hellas_rpc::fetch::FetchInput {
             service,
             method,
             body,
             ..
-        } = verified;
+        } = verify_input_events(&input).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!(
+                "fetch input transcript verification failed: {err}"
+            ))
+        })?;
+        let route = crate::fetch_policy::FetchRoute::new(service.clone(), method.clone());
+        if !self.fetch_routes.contains(&route) {
+            return Err(super::execution::no_fetch_route_error(&route));
+        }
+        let (quote, _) = self.fetch_state.quote_input(input).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!(
+                "fetch input transcript verification failed: {err}"
+            ))
+        })?;
         let provider_request = FetchProviderRequest::new(service.clone(), method.clone(), body);
 
         let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());

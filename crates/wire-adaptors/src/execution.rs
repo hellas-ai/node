@@ -173,6 +173,13 @@ pub struct ExecutionResult {
     pub usage: Option<Usage>,
     pub stop_reason: StopReason,
     pub provenance: Option<Provenance>,
+    pub error: Option<ExecutionErrorInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionErrorInfo {
+    pub message: String,
+    pub code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

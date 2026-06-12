@@ -2877,6 +2877,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "serde",
+ "serde_ipld_dagcbor",
  "serde_json",
  "thiserror 2.0.18",
 ]

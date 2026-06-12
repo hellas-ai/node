@@ -60,6 +60,21 @@ impl WireAdaptor for OpenAiCompletionsAdaptor {
         result: ExecutionResult,
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
+        if let Some(error) = result.error {
+            return Ok(WireResponse::json(
+                500,
+                attach_hellas(
+                    json!({
+                        "error": {
+                            "message": error.message,
+                            "type": "server_error",
+                            "code": error.code.unwrap_or_else(|| "server_error".to_string()),
+                        }
+                    }),
+                    result.provenance.as_ref(),
+                ),
+            ));
+        }
         let mut body = json!({
             "id": context.response_id,
             "object": "text_completion",
@@ -357,6 +372,7 @@ mod tests {
                 call_commitment: Some("aa".repeat(32)),
                 receipt: Some("bb".repeat(32)),
             }),
+            error: None,
         };
         let response = adaptor()
             .render_response(
@@ -399,6 +415,7 @@ mod tests {
                     usage: None,
                     stop_reason: StopReason::EndOfText,
                     provenance: None,
+                    error: None,
                 },
                 RenderContext::new("cmpl-test", "cmpl-test", 123),
             )

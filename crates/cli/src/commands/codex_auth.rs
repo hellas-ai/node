@@ -11,9 +11,12 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::commands::http_client;
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "hellas-executor")]
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
@@ -130,7 +133,7 @@ impl CodexAuthStore {
             return Err(CodexAuthError::RefreshBlocked(blocked.message.clone()));
         }
         if access_token_expiring(&state.tokens.access_token, REFRESH_SKEW_SECONDS) {
-            let client = reqwest::Client::new();
+            let client = http_client(AUTH_HTTP_TIMEOUT);
             let refreshed = refresh_tokens(&client, self.token_url.clone(), &state.tokens).await;
             match refreshed {
                 Ok(tokens) => {
@@ -276,7 +279,7 @@ struct CodexAuthClient {
 impl CodexAuthClient {
     fn new(issuer: Url, token_url: Url) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(AUTH_HTTP_TIMEOUT),
             issuer,
             token_url,
         }
@@ -473,12 +476,12 @@ async fn refresh_tokens(
     let value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|err| CodexAuthError::RefreshFailed {
             message: format!("invalid JSON: {err}"),
-            terminal: true,
+            terminal: false,
         })?;
     let access_token =
         required_string(&value, "access_token").ok_or_else(|| CodexAuthError::RefreshFailed {
             message: "missing access_token".to_string(),
-            terminal: true,
+            terminal: false,
         })?;
     let refresh_token =
         required_string(&value, "refresh_token").unwrap_or_else(|| tokens.refresh_token.clone());
@@ -887,7 +890,7 @@ mod tests {
 
     #[cfg(feature = "hellas-executor")]
     #[tokio::test]
-    async fn malformed_refresh_success_blocks_token() {
+    async fn malformed_refresh_success_is_retryable() {
         async fn token() -> axum::Json<JsonValue> {
             axum::Json(json!({"refresh_token":"new-refresh"}))
         }
@@ -915,6 +918,6 @@ mod tests {
             .unwrap();
 
         assert!(store.access_token().await.is_err());
-        assert!(store.load().unwrap().refresh_token_blocked.is_some());
+        assert!(store.load().unwrap().refresh_token_blocked.is_none());
     }
 }

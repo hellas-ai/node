@@ -1,25 +1,18 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
-use futures::stream;
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
     FetchProviderStream,
 };
-use hellas_wire_adaptors::RenderContext;
 use reqwest::Url;
 
 use crate::commands::codex_auth::CodexAuthStore;
+use crate::commands::http_client;
 
 use super::DEFAULT_CODEX_BASE_URL;
-use super::responses_fetch::{execute_responses_request, parsed_streaming_request};
-
-const SERVICE_CODEX: &str = "codex";
-const METHOD_RESPONSES: &str = "responses";
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+use super::responses_fetch::execute_responses_request;
 
 #[derive(Clone)]
 pub(super) struct CodexResponsesFetchProvider {
@@ -38,7 +31,7 @@ impl CodexResponsesFetchProvider {
         let base_url = Url::parse(base_url)
             .with_context(|| format!("invalid Codex Responses base URL: {base_url}"))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: http_client(Duration::from_secs(20 * 60)),
             auth: CodexAuthStore::new(auth_path)?,
             base_url,
         })
@@ -53,17 +46,12 @@ impl CodexResponsesFetchProvider {
         }
     }
 
-    async fn execute(&self, request: FetchProviderRequest) -> Result<Vec<u8>, FetchProviderError> {
-        if request.service != SERVICE_CODEX || request.method != METHOD_RESPONSES {
-            return Err(FetchProviderError::Rejected(format!(
-                "unsupported fetch route {}/{}",
-                request.service, request.method
-            )));
-        }
-
-        let parsed = parsed_streaming_request(&request)?;
+    async fn execute(
+        &self,
+        request: FetchProviderRequest,
+    ) -> Result<FetchProviderStream, FetchProviderError> {
         let access_token = self.auth.access_token().await.map_err(|err| {
-            FetchProviderError::Rejected(format!("Codex authentication failed: {err}"))
+            FetchProviderError::failed(format!("Codex authentication failed: {err}"))
         })?;
         let endpoint = responses_endpoint(&self.base_url);
         execute_responses_request(
@@ -71,8 +59,6 @@ impl CodexResponsesFetchProvider {
             endpoint,
             &access_token,
             request.body.as_bytes().to_vec(),
-            parsed,
-            render_context(),
             "Codex Responses",
         )
         .await
@@ -81,10 +67,7 @@ impl CodexResponsesFetchProvider {
 
 impl FetchProvider for CodexResponsesFetchProvider {
     fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
-        Box::pin(async move {
-            let body = self.execute(request).await?;
-            Ok(Box::pin(stream::once(async move { Ok(body) })) as FetchProviderStream)
-        })
+        Box::pin(async move { self.execute(request).await })
     }
 }
 
@@ -95,22 +78,6 @@ fn responses_endpoint(base_url: &Url) -> Url {
         base.set_path(&path);
     }
     base.join("responses").expect("valid Codex Responses URL")
-}
-
-fn render_context() -> RenderContext {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    RenderContext::new(
-        format!("resp_codex_{id}"),
-        format!("msg_codex_{id}"),
-        now_unix(),
-    )
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -125,7 +92,6 @@ mod tests {
     use base64::Engine;
     use futures::StreamExt;
     use hellas_core::JsonBytes;
-    use serde_json::Value as JsonValue;
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
@@ -168,11 +134,7 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
     }
 
     fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new(
-            SERVICE_CODEX,
-            METHOD_RESPONSES,
-            JsonBytes::new(body.to_vec()),
-        )
+        FetchProviderRequest::new("codex", "responses", JsonBytes::new(body.to_vec()))
     }
 
     #[tokio::test]
@@ -208,15 +170,19 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
 
         let body = br#"{"model":"gpt-5.5-codex","input":"hello","stream":true}"#;
         let mut stream = provider.run(request(body)).await.unwrap();
-        let output = stream.next().await.unwrap().unwrap();
+        let mut output = Vec::new();
+        while let Some(event) = stream.next().await {
+            output.push(event.unwrap());
+        }
         let (auth, forwarded_body) = rx.await.unwrap();
 
         assert_eq!(auth, Some(format!("Bearer {access_token}")));
         assert_eq!(forwarded_body.as_ref(), body);
-        let json: JsonValue = serde_json::from_slice(&output).unwrap();
-        assert_eq!(json["id"], "resp_codex_up");
-        assert_eq!(json["output"][0]["id"], "msg_codex_up");
-        assert_eq!(json["output"][0]["content"][0]["text"], "ok");
+        let joined = String::from_utf8(output.concat()).unwrap();
+        assert!(joined.contains("event: response.created"));
+        assert!(joined.contains(r#""id":"resp_codex_up""#));
+        assert!(joined.contains(r#""delta":"ok""#));
+        assert!(joined.contains("event: response.completed"));
     }
 
     #[test]

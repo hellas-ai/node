@@ -24,13 +24,11 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
     }
 }
 
-#[cfg(feature = "hellas-executor")]
 fn parse_public_key_hex(s: &str) -> Result<hellas_core::PublicKey, String> {
     let bytes = parse_hex_array::<{ hellas_core::PublicKey::LEN }>(s)?;
     Ok(hellas_core::PublicKey::from_compressed_sec1(bytes))
 }
 
-#[cfg(feature = "hellas-executor")]
 fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
     if s.len() != N * 2 {
         return Err(format!("expected {} hex chars, got {}", N * 2, s.len()));
@@ -42,6 +40,14 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
             .map_err(|err| format!("invalid hex at byte {idx}: {err}"))?;
     }
     Ok(out)
+}
+
+fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(serde_json::Value::Object(object)) => Ok(object),
+        Ok(_) => Err("expected a JSON object".to_string()),
+        Err(err) => Err(format!("invalid JSON object: {err}")),
+    }
 }
 
 /// Default dtype per build configuration. CUDA / Metal builds assume modern
@@ -201,30 +207,23 @@ enum Commands {
         /// Repeat or comma-separate compressed secp256k1 keys as hex.
         #[arg(long = "trusted-caller-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
         trusted_caller_public_keys: Vec<hellas_core::PublicKey>,
-        /// Enable OpenAI Responses Fetch execution over the node's p2p Fetch service.
-        #[arg(long = "fetch-openai-responses")]
-        fetch_openai_responses: bool,
-        /// OpenAI-compatible Responses endpoint used by Fetch execution.
+        /// Unified Fetch configuration file: routes (provider upstreams,
+        /// protocols, capabilities) and caller access policy. No file means
+        /// this node serves no Fetch routes.
+        #[arg(long = "fetch-config")]
+        fetch_config_file: Option<PathBuf>,
+        /// Maximum number of Fetch provider streams running at once.
         #[arg(
-            long = "fetch-openai-responses-url",
-            default_value = "https://api.openai.com/v1/responses"
+            long = "fetch-max-in-flight",
+            default_value_t = hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT
         )]
-        fetch_openai_responses_url: String,
-        /// Environment variable containing the OpenAI API key for Fetch execution.
-        #[arg(long = "fetch-openai-api-key-env", default_value = "OPENAI_API_KEY")]
-        fetch_openai_api_key_env: String,
-        /// Enable Codex OAuth Responses Fetch execution over the node's p2p Fetch service.
-        #[arg(long = "fetch-codex-responses")]
-        fetch_codex_responses: bool,
-        /// Codex backend base URL used by Fetch execution.
+        fetch_max_in_flight: usize,
+        /// Maximum number of Fetch executions waiting behind active provider streams.
         #[arg(
-            long = "fetch-codex-base-url",
-            default_value = commands::serve::DEFAULT_CODEX_BASE_URL
+            long = "fetch-queue-size",
+            default_value_t = hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY
         )]
-        fetch_codex_base_url: String,
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "fetch-codex-auth-path")]
-        fetch_codex_auth_path: Option<PathBuf>,
+        fetch_queue_size: usize,
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
@@ -301,12 +300,22 @@ enum Commands {
         /// Environment variable holding the bearer token for --responses-backend=proxy.
         #[arg(long = "responses-proxy-api-key-env", default_value = "OPENAI_API_KEY")]
         responses_proxy_api_key_env: String,
-        /// Fetch service used when --responses-backend=fetch.
-        #[arg(long = "responses-fetch-service", default_value = "codex")]
-        responses_fetch_service: String,
-        /// Fetch method used when --responses-backend=fetch.
-        #[arg(long = "responses-fetch-method", default_value = "responses")]
-        responses_fetch_method: String,
+        /// Fetch route service used when --responses-backend=fetch.
+        #[arg(long = "responses-fetch-route-service", default_value = "codex")]
+        responses_fetch_route_service: String,
+        /// Fetch route method used when --responses-backend=fetch.
+        #[arg(long = "responses-fetch-route-method", default_value = "responses")]
+        responses_fetch_route_method: String,
+        /// JSON object merged into OpenAI Responses requests before signing
+        /// and sending them through Fetch.
+        #[arg(long = "responses-fetch-request-overrides", value_parser = parse_json_object)]
+        responses_fetch_request_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Producer public keys trusted to sign Fetch output when
+        /// --responses-backend=fetch. Repeat or comma-separate compressed
+        /// secp256k1 keys as hex (see `producer-key show`). Defaults to this
+        /// gateway's own producer key.
+        #[arg(long = "trusted-producer-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
+        trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
         /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
         #[arg(long = "wrap")]
         wrap: Option<String>,
@@ -402,6 +411,11 @@ enum Commands {
         #[cfg(feature = "hellas-executor")]
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
         local: bool,
+        /// Producer public keys trusted to sign Fetch output. Repeat or
+        /// comma-separate compressed secp256k1 keys as hex (see
+        /// `producer-key show`). Defaults to this node's own producer key.
+        #[arg(long = "trusted-producer-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
+        trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
     },
     /// Inspect the local identity file
     Identity {
@@ -505,12 +519,9 @@ async fn main() {
             graffiti,
             dtype,
             trusted_caller_public_keys,
-            fetch_openai_responses,
-            fetch_openai_responses_url,
-            fetch_openai_api_key_env,
-            fetch_codex_responses,
-            fetch_codex_base_url,
-            fetch_codex_auth_path,
+            fetch_config_file,
+            fetch_max_in_flight,
+            fetch_queue_size,
         } => {
             let producer_key =
                 match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
@@ -530,12 +541,9 @@ async fn main() {
                 graffiti,
                 dtype,
                 trusted_caller_public_keys,
-                fetch_openai_responses,
-                fetch_openai_responses_url,
-                fetch_openai_api_key_env,
-                fetch_codex_responses,
-                fetch_codex_base_url,
-                fetch_codex_auth_path,
+                fetch_config_file,
+                fetch_max_in_flight,
+                fetch_queue_size,
                 secret_key,
                 producer_key,
             })
@@ -561,8 +569,10 @@ async fn main() {
             responses_backend,
             responses_proxy_url,
             responses_proxy_api_key_env,
-            responses_fetch_service,
-            responses_fetch_method,
+            responses_fetch_route_service,
+            responses_fetch_route_method,
+            responses_fetch_request_overrides,
+            trusted_producer_public_keys,
             wrap,
             wrap_args,
         } => {
@@ -586,8 +596,11 @@ async fn main() {
                 responses_backend: responses_backend.into(),
                 responses_proxy_url,
                 responses_proxy_api_key_env,
-                responses_fetch_service,
-                responses_fetch_method,
+                responses_fetch_route_service,
+                responses_fetch_route_method,
+                responses_fetch_request_overrides: responses_fetch_request_overrides
+                    .unwrap_or_default(),
+                trusted_producer_public_keys,
                 producer_key_path: producer_key_path.clone(),
                 secret_key,
                 wrap,
@@ -654,6 +667,7 @@ async fn main() {
             retries,
             #[cfg(feature = "hellas-executor")]
             local,
+            trusted_producer_public_keys,
         } => {
             let payload = match (payload, payload_file) {
                 (Some(payload), None) => Ok(payload.into_bytes()),
@@ -676,6 +690,7 @@ async fn main() {
                             #[cfg(feature = "hellas-executor")]
                             local,
                             producer_key_path: producer_key_path.clone(),
+                            trusted_producer_public_keys,
                         },
                         secret_key,
                     )
@@ -1033,22 +1048,26 @@ mod tests {
             "gateway",
             "--responses-backend",
             "fetch",
-            "--responses-fetch-service",
+            "--responses-fetch-route-service",
             "codex",
-            "--responses-fetch-method",
+            "--responses-fetch-route-method",
             "responses",
+            "--responses-fetch-request-overrides",
+            r#"{"store":false}"#,
         ])
         .unwrap();
         match cli.command {
             Commands::Gateway {
                 responses_backend,
-                responses_fetch_service,
-                responses_fetch_method,
+                responses_fetch_route_service,
+                responses_fetch_route_method,
+                responses_fetch_request_overrides,
                 ..
             } => {
                 assert_eq!(responses_backend, GatewayResponsesBackend::Fetch);
-                assert_eq!(responses_fetch_service, "codex");
-                assert_eq!(responses_fetch_method, "responses");
+                assert_eq!(responses_fetch_route_service, "codex");
+                assert_eq!(responses_fetch_route_method, "responses");
+                assert_eq!(responses_fetch_request_overrides.unwrap()["store"], false);
             }
             _ => panic!("expected gateway command"),
         }
@@ -1110,63 +1129,30 @@ mod tests {
 
     #[cfg(feature = "hellas-executor")]
     #[test]
-    fn serve_accepts_openai_fetch_config() {
+    fn serve_accepts_fetch_config() {
         let cli = Cli::try_parse_from([
             "hellas",
             "serve",
-            "--fetch-openai-responses",
-            "--fetch-openai-responses-url",
-            "https://example.test/v1/responses",
-            "--fetch-openai-api-key-env",
-            "TEST_OPENAI_KEY",
+            "--fetch-max-in-flight",
+            "3",
+            "--fetch-queue-size",
+            "0",
+            "--fetch-config",
+            "/tmp/fetch-config.json",
         ])
         .unwrap();
         match cli.command {
             Commands::Serve {
-                fetch_openai_responses,
-                fetch_openai_responses_url,
-                fetch_openai_api_key_env,
+                fetch_max_in_flight,
+                fetch_queue_size,
+                fetch_config_file,
                 ..
             } => {
-                assert!(fetch_openai_responses);
+                assert_eq!(fetch_max_in_flight, 3);
+                assert_eq!(fetch_queue_size, 0);
                 assert_eq!(
-                    fetch_openai_responses_url,
-                    "https://example.test/v1/responses"
-                );
-                assert_eq!(fetch_openai_api_key_env, "TEST_OPENAI_KEY");
-            }
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[cfg(feature = "hellas-executor")]
-    #[test]
-    fn serve_accepts_codex_fetch_config() {
-        let cli = Cli::try_parse_from([
-            "hellas",
-            "serve",
-            "--fetch-codex-responses",
-            "--fetch-codex-base-url",
-            "https://example.test/backend-api/codex",
-            "--fetch-codex-auth-path",
-            "/tmp/codex-auth.json",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Serve {
-                fetch_codex_responses,
-                fetch_codex_base_url,
-                fetch_codex_auth_path,
-                ..
-            } => {
-                assert!(fetch_codex_responses);
-                assert_eq!(
-                    fetch_codex_base_url,
-                    "https://example.test/backend-api/codex"
-                );
-                assert_eq!(
-                    fetch_codex_auth_path.as_deref(),
-                    Some(std::path::Path::new("/tmp/codex-auth.json"))
+                    fetch_config_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/fetch-config.json"))
                 );
             }
             _ => panic!("expected serve command"),

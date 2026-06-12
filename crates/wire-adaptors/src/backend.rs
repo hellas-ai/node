@@ -7,8 +7,8 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use crate::{
-    ExecutionRequest, ExecutionResult, OutputEvent, OutputItem, Provenance, RawRequest,
-    StructuredDelta, TextChannel, ToolCallStart,
+    ExecutionErrorInfo, ExecutionRequest, ExecutionResult, OutputEvent, OutputItem, Provenance,
+    RawRequest, StructuredDelta, TextChannel, ToolCallStart,
 };
 
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -68,10 +68,13 @@ impl BackendStream {
                 OutputEvent::Usage(next) => usage = Some(next),
                 OutputEvent::Provenance(next) => merge_provenance(&mut provenance, next),
                 OutputEvent::Error { message, code } => {
-                    return Err(BackendError::failed(match code {
-                        Some(code) => format!("{code}: {message}"),
-                        None => message,
-                    }));
+                    return Ok(ExecutionResult {
+                        output: output.finish(),
+                        usage,
+                        stop_reason: crate::StopReason::Cancelled,
+                        provenance,
+                        error: Some(ExecutionErrorInfo { message, code }),
+                    });
                 }
                 OutputEvent::Finished {
                     stop_reason,
@@ -82,6 +85,7 @@ impl BackendStream {
                         usage: final_usage.or(usage),
                         stop_reason,
                         provenance,
+                        error: None,
                     });
                 }
             }
@@ -315,6 +319,52 @@ mod tests {
                 input_tokens: Some(3),
                 output_tokens: Some(2),
                 total_tokens: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn collect_returns_failed_result_on_error_event() {
+        let stream = BackendStream::new(
+            stream::iter([
+                Ok(OutputEvent::TextDelta {
+                    index: 0,
+                    delta: "partial".to_string(),
+                    channel: TextChannel::Output,
+                }),
+                Ok(OutputEvent::Error {
+                    message: "provider failed".to_string(),
+                    code: Some("upstream_error".to_string()),
+                }),
+            ]),
+            Some(Provenance {
+                call_commitment: Some("call".to_string()),
+                receipt: None,
+            }),
+        );
+
+        let result = futures_executor::block_on(stream.collect()).unwrap();
+
+        assert_eq!(result.stop_reason, crate::StopReason::Cancelled);
+        assert_eq!(
+            result.error,
+            Some(ExecutionErrorInfo {
+                message: "provider failed".to_string(),
+                code: Some("upstream_error".to_string()),
+            })
+        );
+        assert_eq!(
+            result.output,
+            vec![OutputItem::Text {
+                text: "partial".to_string(),
+                channel: TextChannel::Output,
+            }]
+        );
+        assert_eq!(
+            result.provenance,
+            Some(Provenance {
+                call_commitment: Some("call".to_string()),
+                receipt: None,
             })
         );
     }

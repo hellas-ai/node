@@ -50,20 +50,6 @@ impl Hash for FetchProviderRequest {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RejectingFetchProvider;
-
-impl FetchProvider for RejectingFetchProvider {
-    fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
-        Box::pin(async move {
-            Err(FetchProviderError::Rejected(format!(
-                "no fetch provider configured for {}/{}",
-                request.service, request.method
-            )))
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
 pub struct MockFetchProvider {
     responses: Arc<Mutex<HashMap<FetchProviderRequest, Vec<Vec<u8>>>>>,
     calls: Arc<Mutex<HashMap<FetchProviderRequest, usize>>>,
@@ -79,10 +65,10 @@ impl MockFetchProvider {
         service: impl Into<String>,
         method: impl Into<String>,
         body: impl Into<Vec<u8>>,
-        chunks: impl IntoIterator<Item = impl Into<Vec<u8>>>,
+        chunks: impl IntoIterator<Item = Vec<u8>>,
     ) {
         let request = FetchProviderRequest::new(service, method, JsonBytes::new(body.into()));
-        let chunks = chunks.into_iter().map(Into::into).collect();
+        let chunks = chunks.into_iter().collect();
         self.responses
             .lock()
             .expect("mock fetch responses lock poisoned")
@@ -112,18 +98,18 @@ impl FetchProvider for MockFetchProvider {
                 let mut calls = self
                     .calls
                     .lock()
-                    .map_err(|_| FetchProviderError::Failed("mock calls lock poisoned".into()))?;
+                    .map_err(|_| FetchProviderError::failed("mock calls lock poisoned"))?;
                 *calls.entry(request.clone()).or_default() += 1;
 
                 self.responses
                     .lock()
-                    .map_err(|_| FetchProviderError::Failed("mock responses lock poisoned".into()))?
+                    .map_err(|_| FetchProviderError::failed("mock responses lock poisoned"))?
                     .get(&request)
                     .cloned()
             };
 
             let chunks = chunks.ok_or_else(|| {
-                FetchProviderError::Rejected(format!(
+                FetchProviderError::failed(format!(
                     "mock fetch response not programmed for {}/{}",
                     request.service, request.method
                 ))
@@ -133,10 +119,15 @@ impl FetchProvider for MockFetchProvider {
     }
 }
 
+/// A provider error always means the provider actually failed. Routing
+/// happens in [`crate::FetchRouteRegistry`] before a provider is invoked,
+/// so there is no "not my route" rejection variant.
 #[derive(Debug, thiserror::Error)]
-pub enum FetchProviderError {
-    #[error("fetch request rejected: {0}")]
-    Rejected(String),
-    #[error("fetch request failed: {0}")]
-    Failed(String),
+#[error("fetch provider failed: {0}")]
+pub struct FetchProviderError(String);
+
+impl FetchProviderError {
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
 }

@@ -41,12 +41,15 @@ pub struct ResponseSampling {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponsesStreamState {
     response_id: String,
+    reasoning_id: String,
     message_id: String,
     created_at: i64,
     sequence_number: u64,
+    reasoning_text: String,
     text: String,
     started: bool,
     next_output_index: usize,
+    reasoning_output_index: Option<usize>,
     message_output_index: Option<usize>,
     usage: Option<Usage>,
     provenance: Option<crate::Provenance>,
@@ -83,13 +86,16 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         context: RenderContext,
     ) -> Self::StreamState {
         ResponsesStreamState {
+            reasoning_id: format!("{}_reasoning", context.response_id),
             response_id: context.response_id,
             message_id: context.message_id,
             created_at: context.created_at,
             sequence_number: 0,
+            reasoning_text: String::new(),
             text: String::new(),
             started: false,
             next_output_index: 0,
+            reasoning_output_index: None,
             message_output_index: None,
             usage: None,
             provenance: None,
@@ -103,16 +109,39 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         result: ExecutionResult,
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
+        let failed = result.error.as_ref();
         let body = response_json(ResponseJsonParts {
             response_id: &context.response_id,
             created_at: context.created_at,
             model: &request.model,
-            status: "completed",
-            output: output_items_json(&context.message_id, &result.output)?,
+            status: if failed.is_some() {
+                "failed"
+            } else {
+                "completed"
+            },
+            output: output_items_json(
+                &context.message_id,
+                &result.output,
+                if failed.is_some() {
+                    "incomplete"
+                } else {
+                    "completed"
+                },
+            )?,
             usage: result.usage,
             metadata: request_metadata(request),
             provenance: result.provenance.as_ref(),
         });
+        let body = if let Some(error) = failed {
+            let mut body = body;
+            body["error"] = json!({
+                "code": error.code.clone().unwrap_or_else(|| "server_error".to_string()),
+                "message": error.message.clone(),
+            });
+            body
+        } else {
+            body
+        };
         Ok(WireResponse::json(200, body))
     }
 
@@ -186,14 +215,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 delta,
                 channel: TextChannel::Reasoning,
                 ..
-            } => Ok(vec![response_event(
-                "response.reasoning_text.delta",
-                json!({
-                    "type": "response.reasoning_text.delta",
-                    "sequence_number": next_sequence(state),
-                    "delta": delta,
-                }),
-            )]),
+            } => Ok(render_reasoning_delta(state, delta)),
             OutputEvent::ToolCallStart(start) => render_tool_call_start(state, start),
             OutputEvent::ToolCallArgumentsDelta(delta) => {
                 render_tool_call_arguments_delta(state, delta.index, delta.delta)
@@ -208,36 +230,56 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 state.provenance = Some(provenance);
                 Ok(Vec::new())
             }
-            OutputEvent::Error { message, code } => Ok(vec![response_event(
-                "error",
-                json!({
-                    "error": {
-                        "message": message,
-                        "code": code,
-                    }
-                }),
-            )]),
-            OutputEvent::Finished { usage, .. } => {
+            OutputEvent::Error { message, code } => {
+                let mut events = finish_open_items(state, "incomplete");
+                let mut response = response_json(ResponseJsonParts {
+                    response_id: &state.response_id,
+                    created_at: state.created_at,
+                    model: &request.model,
+                    status: "failed",
+                    output: completed_output_items(state, "incomplete"),
+                    usage: state.usage,
+                    metadata: request_metadata(request),
+                    provenance: state.provenance.as_ref(),
+                });
+                response["error"] = json!({
+                    "code": code.unwrap_or_else(|| "server_error".to_string()),
+                    "message": message,
+                });
+                events.push(response_event(
+                    "response.failed",
+                    json!({
+                        "type": "response.failed",
+                        "sequence_number": next_sequence(state),
+                        "response": response,
+                    }),
+                ));
+                Ok(events)
+            }
+            OutputEvent::Finished { usage, stop_reason } => {
                 if let Some(usage) = usage {
                     state.usage = Some(usage);
                 }
-                let mut events = finish_message_item(state);
-                let output = completed_output_items(state);
+                let item_status = terminal_item_status(stop_reason);
+                let mut events = finish_open_items(state, item_status);
+                let output = completed_output_items(state, item_status);
+                let mut response = response_json(ResponseJsonParts {
+                    response_id: &state.response_id,
+                    created_at: state.created_at,
+                    model: &request.model,
+                    status: terminal_response_status(stop_reason),
+                    output,
+                    usage: state.usage,
+                    metadata: request_metadata(request),
+                    provenance: state.provenance.as_ref(),
+                });
+                apply_terminal_details(&mut response, stop_reason);
                 let completed = response_event(
-                    "response.completed",
+                    terminal_response_event(stop_reason),
                     json!({
-                        "type": "response.completed",
+                        "type": terminal_response_event(stop_reason),
                         "sequence_number": next_sequence(state),
-                        "response": response_json(ResponseJsonParts {
-                            response_id: &state.response_id,
-                            created_at: state.created_at,
-                            model: &request.model,
-                            status: "completed",
-                            output,
-                            usage: state.usage,
-                            metadata: request_metadata(request),
-                            provenance: state.provenance.as_ref(),
-                        }),
+                        "response": response,
                     }),
                 );
                 events.push(completed);
@@ -252,6 +294,7 @@ pub struct ResponsesIngressState {
     item_to_tool_index: HashMap<String, usize>,
     next_tool_index: usize,
     saw_text_delta: bool,
+    saw_reasoning_delta: bool,
     saw_tool_call: bool,
 }
 
@@ -288,6 +331,7 @@ impl WireIngress for OpenAiResponsesAdaptor {
             usage: value.get("usage").map(decode_usage),
             stop_reason: decode_stop_reason(&value),
             provenance: None,
+            error: decode_response_error(&value),
         })
     }
 
@@ -322,13 +366,24 @@ impl WireIngress for OpenAiResponsesAdaptor {
                     channel: TextChannel::Output,
                 }])
             }
-            "response.reasoning_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 let Some(delta) = data.get("delta").and_then(JsonValue::as_str) else {
+                    return Ok(Vec::new());
+                };
+                state.saw_reasoning_delta = true;
+                Ok(vec![OutputEvent::TextDelta {
+                    index: output_index(&data),
+                    delta: delta.to_string(),
+                    channel: TextChannel::Reasoning,
+                }])
+            }
+            "response.reasoning_summary_text.done" if !state.saw_reasoning_delta => {
+                let Some(text) = data.get("text").and_then(JsonValue::as_str) else {
                     return Ok(Vec::new());
                 };
                 Ok(vec![OutputEvent::TextDelta {
                     index: output_index(&data),
-                    delta: delta.to_string(),
+                    delta: text.to_string(),
                     channel: TextChannel::Reasoning,
                 }])
             }
@@ -364,6 +419,13 @@ impl WireIngress for OpenAiResponsesAdaptor {
                 let response = data.get("response").unwrap_or(&data);
                 Ok(vec![OutputEvent::Finished {
                     stop_reason: decode_stream_stop_reason(response, state),
+                    usage: response.get("usage").map(decode_usage),
+                }])
+            }
+            "response.incomplete" => {
+                let response = data.get("response").unwrap_or(&data);
+                Ok(vec![OutputEvent::Finished {
+                    stop_reason: decode_stop_reason(response),
                     usage: response.get("usage").map(decode_usage),
                 }])
             }
@@ -659,7 +721,11 @@ fn project_response_format(value: &JsonValue) -> ResponseFormat {
     }
 }
 
-fn output_items_json(message_id: &str, output: &[OutputItem]) -> AdaptorResult<Vec<JsonValue>> {
+fn output_items_json(
+    message_id: &str,
+    output: &[OutputItem],
+    status: &str,
+) -> AdaptorResult<Vec<JsonValue>> {
     let mut text = String::new();
     let mut items = Vec::new();
     for item in output {
@@ -687,7 +753,7 @@ fn output_items_json(message_id: &str, output: &[OutputItem]) -> AdaptorResult<V
                 "call_id": id,
                 "name": name,
                 "arguments": json_to_output_string(arguments),
-                "status": "completed",
+                "status": status,
             })),
             OutputItem::StructuredJson(value) => text.push_str(&json_to_output_string(value)),
             OutputItem::Raw(value) => items.push(value.clone()),
@@ -696,7 +762,7 @@ fn output_items_json(message_id: &str, output: &[OutputItem]) -> AdaptorResult<V
     if !text.is_empty() || items.is_empty() {
         items.insert(
             0,
-            message_item_json(message_id, "completed", vec![output_text_json(&text)]),
+            message_item_json(message_id, status, vec![output_text_json(&text)]),
         );
     }
     Ok(items)
@@ -727,8 +793,27 @@ fn decode_output_item(item: &JsonValue) -> Vec<OutputItem> {
                 .to_string(),
             arguments: decode_arguments(item.get("arguments")),
         }],
+        Some("reasoning") => decode_reasoning_item(item),
         _ => vec![OutputItem::Raw(item.clone())],
     }
+}
+
+fn decode_reasoning_item(item: &JsonValue) -> Vec<OutputItem> {
+    item.get("summary")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            let text = part
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .filter(|text| !text.is_empty())?;
+            Some(OutputItem::Text {
+                text: text.to_string(),
+                channel: TextChannel::Reasoning,
+            })
+        })
+        .collect()
 }
 
 fn decode_message_content_part(part: &JsonValue) -> OutputItem {
@@ -778,13 +863,44 @@ fn decode_stop_reason(value: &JsonValue) -> StopReason {
                 .get("incomplete_details")
                 .and_then(|details| details.get("reason"))
                 .and_then(JsonValue::as_str)
-                == Some("max_output_tokens") =>
+                .is_some_and(|reason| matches!(reason, "max_output_tokens" | "max_tokens")) =>
         {
             StopReason::MaxOutputTokens
+        }
+        Some("incomplete")
+            if value
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(JsonValue::as_str)
+                == Some("cancelled") =>
+        {
+            StopReason::Cancelled
         }
         Some("cancelled") => StopReason::Cancelled,
         _ => StopReason::EndOfText,
     }
+}
+
+fn decode_response_error(value: &JsonValue) -> Option<crate::ExecutionErrorInfo> {
+    let failed = value
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|status| status == "failed");
+    let error = value.get("error");
+    if !failed && error.is_none() {
+        return None;
+    }
+    Some(crate::ExecutionErrorInfo {
+        message: error
+            .and_then(|error| error.get("message"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("response failed")
+            .to_string(),
+        code: error
+            .and_then(|error| error.get("code"))
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string),
+    })
 }
 
 fn event_json(event: WireStreamEvent) -> AdaptorResult<JsonValue> {
@@ -971,12 +1087,119 @@ fn ensure_message_item_started(state: &mut ResponsesStreamState) -> Vec<WireStre
     ]
 }
 
-fn finish_message_item(state: &mut ResponsesStreamState) -> Vec<WireStreamEvent> {
+fn render_reasoning_delta(state: &mut ResponsesStreamState, delta: String) -> Vec<WireStreamEvent> {
+    let mut events = ensure_reasoning_item_started(state);
+    let output_index = state
+        .reasoning_output_index
+        .expect("reasoning item is started before reasoning deltas");
+    state.reasoning_text.push_str(&delta);
+    events.push(response_event(
+        "response.reasoning_summary_text.delta",
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "sequence_number": next_sequence(state),
+            "item_id": state.reasoning_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "delta": delta,
+        }),
+    ));
+    events
+}
+
+fn ensure_reasoning_item_started(state: &mut ResponsesStreamState) -> Vec<WireStreamEvent> {
+    if state.reasoning_output_index.is_some() {
+        return Vec::new();
+    }
+    let output_index = next_output_index(state);
+    state.reasoning_output_index = Some(output_index);
+    vec![
+        response_event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": next_sequence(state),
+                "output_index": output_index,
+                "item": reasoning_item_json(&state.reasoning_id, "in_progress", &state.reasoning_text),
+            }),
+        ),
+        response_event(
+            "response.reasoning_summary_part.added",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "sequence_number": next_sequence(state),
+                "item_id": state.reasoning_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": "",
+                },
+            }),
+        ),
+    ]
+}
+
+fn finish_open_items(state: &mut ResponsesStreamState, item_status: &str) -> Vec<WireStreamEvent> {
+    let mut events = finish_reasoning_item(state, item_status);
+    events.extend(finish_message_item(state, item_status));
+    events
+}
+
+fn finish_reasoning_item(
+    state: &mut ResponsesStreamState,
+    item_status: &str,
+) -> Vec<WireStreamEvent> {
+    let Some(output_index) = state.reasoning_output_index else {
+        return Vec::new();
+    };
+    vec![
+        response_event(
+            "response.reasoning_summary_text.done",
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "sequence_number": next_sequence(state),
+                "item_id": state.reasoning_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "text": state.reasoning_text,
+            }),
+        ),
+        response_event(
+            "response.reasoning_summary_part.done",
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "sequence_number": next_sequence(state),
+                "item_id": state.reasoning_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": state.reasoning_text,
+                },
+            }),
+        ),
+        response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": next_sequence(state),
+                "output_index": output_index,
+                "item": reasoning_item_json(&state.reasoning_id, item_status, &state.reasoning_text),
+            }),
+        ),
+    ]
+}
+
+fn finish_message_item(
+    state: &mut ResponsesStreamState,
+    item_status: &str,
+) -> Vec<WireStreamEvent> {
     let Some(output_index) = state.message_output_index else {
         return Vec::new();
     };
     let completed_text = output_text_json(&state.text);
-    let item = message_item_json(&state.message_id, "completed", vec![completed_text.clone()]);
+    let item = message_item_json(&state.message_id, item_status, vec![completed_text.clone()]);
     vec![
         response_event(
             "response.output_text.done",
@@ -1012,24 +1235,30 @@ fn finish_message_item(state: &mut ResponsesStreamState) -> Vec<WireStreamEvent>
     ]
 }
 
-fn completed_output_items(state: &ResponsesStreamState) -> Vec<JsonValue> {
-    let mut items = Vec::with_capacity(state.tool_calls.len() + 1);
+fn completed_output_items(state: &ResponsesStreamState, item_status: &str) -> Vec<JsonValue> {
+    let mut items = Vec::with_capacity(state.tool_calls.len() + 2);
+    if let Some(output_index) = state.reasoning_output_index {
+        items.push((
+            output_index,
+            reasoning_item_json(&state.reasoning_id, item_status, &state.reasoning_text),
+        ));
+    }
     if let Some(output_index) = state.message_output_index {
         items.push((
             output_index,
             message_item_json(
                 &state.message_id,
-                "completed",
+                item_status,
                 vec![output_text_json(&state.text)],
             ),
         ));
     }
-    items.extend(
-        state
-            .tool_calls
-            .iter()
-            .map(|call| (call.output_index, response_tool_call_item(call))),
-    );
+    items.extend(state.tool_calls.iter().map(|call| {
+        (
+            call.output_index,
+            response_tool_call_item(call, item_status),
+        )
+    }));
     items.sort_by_key(|(output_index, _)| *output_index);
     items.into_iter().map(|(_, item)| item).collect()
 }
@@ -1068,7 +1297,7 @@ fn render_tool_call_end(
         (
             call.id.clone(),
             call.output_index,
-            response_tool_call_item(call),
+            response_tool_call_item(call, "completed"),
             call.arguments.clone(),
         )
     };
@@ -1106,14 +1335,14 @@ fn response_tool_call_mut(
         .ok_or_else(|| AdaptorError::render(format!("unknown tool call index {parser_index}")))
 }
 
-fn response_tool_call_item(call: &ResponseToolCallState) -> JsonValue {
+fn response_tool_call_item(call: &ResponseToolCallState, status: &str) -> JsonValue {
     json!({
         "id": call.id,
         "type": "function_call",
         "call_id": call.id,
         "name": call.name,
         "arguments": call.arguments,
-        "status": "completed",
+        "status": status,
     })
 }
 
@@ -1215,12 +1444,64 @@ fn message_item_json(message_id: &str, status: &str, content: Vec<JsonValue>) ->
     })
 }
 
+fn reasoning_item_json(reasoning_id: &str, status: &str, text: &str) -> JsonValue {
+    let summary = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({
+            "type": "summary_text",
+            "text": text,
+        })]
+    };
+    json!({
+        "id": reasoning_id,
+        "type": "reasoning",
+        "status": status,
+        "summary": summary,
+    })
+}
+
 fn output_text_json(text: &str) -> JsonValue {
     json!({
         "type": "output_text",
         "text": text,
         "annotations": [],
     })
+}
+
+fn terminal_item_status(stop_reason: StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::MaxOutputTokens | StopReason::Cancelled => "incomplete",
+        StopReason::EndOfText | StopReason::StopSequence | StopReason::ToolCall => "completed",
+    }
+}
+
+fn terminal_response_status(stop_reason: StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::MaxOutputTokens | StopReason::Cancelled => "incomplete",
+        StopReason::EndOfText | StopReason::StopSequence | StopReason::ToolCall => "completed",
+    }
+}
+
+fn terminal_response_event(stop_reason: StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::MaxOutputTokens | StopReason::Cancelled => "response.incomplete",
+        StopReason::EndOfText | StopReason::StopSequence | StopReason::ToolCall => {
+            "response.completed"
+        }
+    }
+}
+
+fn apply_terminal_details(response: &mut JsonValue, stop_reason: StopReason) {
+    match stop_reason {
+        StopReason::MaxOutputTokens => {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        StopReason::Cancelled => {
+            response["incomplete_details"] = json!({"reason": "cancelled"});
+        }
+        StopReason::EndOfText | StopReason::StopSequence | StopReason::ToolCall => {}
+    }
 }
 
 fn usage_json(usage: Usage) -> JsonValue {
@@ -1481,6 +1762,7 @@ mod tests {
                         call_commitment: Some("aa".repeat(32)),
                         receipt: Some("bb".repeat(32)),
                     }),
+                    error: None,
                 },
                 RenderContext::new("resp_1", "msg_1", 123),
             )
@@ -1494,6 +1776,46 @@ mod tests {
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["output"][0]["content"][0]["text"], "hello");
         assert_eq!(body["metadata"]["request_id"], "r1");
+        assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
+        assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn render_non_streaming_failed_response() {
+        let parsed = sample_request();
+        let response = adaptor()
+            .render_response(
+                &parsed,
+                ExecutionResult {
+                    output: vec![OutputItem::Text {
+                        text: "partial".to_string(),
+                        channel: TextChannel::Output,
+                    }],
+                    usage: None,
+                    stop_reason: StopReason::Cancelled,
+                    provenance: Some(Provenance {
+                        call_commitment: Some("aa".repeat(32)),
+                        receipt: Some("bb".repeat(32)),
+                    }),
+                    error: Some(crate::ExecutionErrorInfo {
+                        message: "provider failed".to_string(),
+                        code: Some("upstream_error".to_string()),
+                    }),
+                },
+                RenderContext::new("resp_1", "msg_1", 123),
+            )
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        let body = match response.body {
+            crate::WireBody::Json(body) => body,
+            crate::WireBody::Bytes(_) => panic!("expected JSON response"),
+        };
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "upstream_error");
+        assert_eq!(body["error"]["message"], "provider failed");
+        assert_eq!(body["output"][0]["status"], "incomplete");
+        assert_eq!(body["output"][0]["content"][0]["text"], "partial");
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
         assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
     }
@@ -1513,6 +1835,7 @@ mod tests {
                     usage: None,
                     stop_reason: StopReason::ToolCall,
                     provenance: None,
+                    error: None,
                 },
                 RenderContext::new("resp_1", "msg_1", 123),
             )
@@ -1576,6 +1899,51 @@ mod tests {
         );
         assert_eq!(result.usage.unwrap().total_tokens, Some(5));
         assert_eq!(result.stop_reason, StopReason::EndOfText);
+    }
+
+    #[test]
+    fn decode_non_streaming_reasoning_item_as_reasoning_text() {
+        let parsed = sample_request();
+        let result = adaptor()
+            .decode_response(
+                &parsed,
+                br#"{
+                    "id": "resp_test",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "rs_1",
+                            "type": "reasoning",
+                            "status": "completed",
+                            "summary": [
+                                {"type": "summary_text", "text": "thinking"}
+                            ]
+                        },
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "done"}
+                            ]
+                        }
+                    ]
+                }"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.output,
+            vec![
+                OutputItem::Text {
+                    text: "thinking".to_string(),
+                    channel: TextChannel::Reasoning,
+                },
+                OutputItem::Text {
+                    text: "done".to_string(),
+                    channel: TextChannel::Output,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1688,6 +2056,48 @@ mod tests {
     }
 
     #[test]
+    fn decode_stream_accepts_ds4_reasoning_and_incomplete_reason() {
+        let parsed = sample_request();
+        let mut state = adaptor().initial_ingress_state(&parsed);
+        let mut events = Vec::new();
+        for event in [
+            WireStreamEvent::text(
+                Some("response.reasoning_summary_text.delta".to_string()),
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"thinking"}"#,
+            ),
+            WireStreamEvent::text(
+                Some("response.incomplete".to_string()),
+                r#"{"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","incomplete_details":{"reason":"max_tokens"},"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}"#,
+            ),
+        ] {
+            events.extend(
+                adaptor()
+                    .decode_stream_event(&parsed, &mut state, event)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                OutputEvent::TextDelta {
+                    index: 0,
+                    delta: "thinking".to_string(),
+                    channel: TextChannel::Reasoning,
+                },
+                OutputEvent::Finished {
+                    stop_reason: StopReason::MaxOutputTokens,
+                    usage: Some(Usage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(4),
+                        total_tokens: Some(7),
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn render_stream_text_sequence() {
         let parsed = sample_request();
         let mut state =
@@ -1764,6 +2174,171 @@ mod tests {
             "hello"
         );
         assert_eq!(completed["response"]["usage"]["total_tokens"], 6);
+    }
+
+    #[test]
+    fn render_stream_max_output_emits_incomplete_response() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::TextDelta {
+                        index: 0,
+                        delta: "hel".to_string(),
+                        channel: TextChannel::Output,
+                    },
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Finished {
+                        stop_reason: StopReason::MaxOutputTokens,
+                        usage: None,
+                    },
+                )
+                .unwrap(),
+        );
+
+        let names = events
+            .iter()
+            .map(|event| event.name.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(names.last().copied(), Some("response.incomplete"));
+        let incomplete = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected JSON event"),
+        };
+        assert_eq!(incomplete["type"], "response.incomplete");
+        assert_eq!(incomplete["response"]["status"], "incomplete");
+        assert_eq!(
+            incomplete["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(incomplete["response"]["output"][0]["status"], "incomplete");
+    }
+
+    #[test]
+    fn render_stream_error_emits_failed_response() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::TextDelta {
+                        index: 0,
+                        delta: "hel".to_string(),
+                        channel: TextChannel::Output,
+                    },
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Error {
+                        message: "provider failed".to_string(),
+                        code: Some("upstream_error".to_string()),
+                    },
+                )
+                .unwrap(),
+        );
+
+        let failed = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected JSON event"),
+        };
+        assert_eq!(
+            events.last().unwrap().name.as_deref(),
+            Some("response.failed")
+        );
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["code"], "upstream_error");
+        assert_eq!(failed["response"]["error"]["message"], "provider failed");
+        assert_eq!(failed["response"]["output"][0]["status"], "incomplete");
+    }
+
+    #[test]
+    fn render_stream_reasoning_sequence() {
+        let parsed = sample_request();
+        let mut state =
+            adaptor().initial_state(&parsed, RenderContext::new("resp_1", "msg_1", 123));
+        let mut events = adaptor().render_stream_start(&parsed, &mut state).unwrap();
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::TextDelta {
+                        index: 0,
+                        delta: "thinking".to_string(),
+                        channel: TextChannel::Reasoning,
+                    },
+                )
+                .unwrap(),
+        );
+        events.extend(
+            adaptor()
+                .render_stream_event(
+                    &parsed,
+                    &mut state,
+                    OutputEvent::Finished {
+                        stop_reason: StopReason::EndOfText,
+                        usage: None,
+                    },
+                )
+                .unwrap(),
+        );
+
+        let names = events
+            .iter()
+            .map(|event| event.name.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let added = match &events[2].data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected reasoning added event"),
+        };
+        assert_eq!(added["output_index"], 0);
+        assert_eq!(added["item"]["type"], "reasoning");
+
+        let completed = match &events.last().unwrap().data {
+            WireEventData::Json(value) => value,
+            _ => panic!("expected completed event"),
+        };
+        assert_eq!(completed["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(
+            completed["response"]["output"][0]["summary"][0]["text"],
+            "thinking"
+        );
     }
 
     #[test]

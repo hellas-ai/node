@@ -131,6 +131,8 @@ in
             openFirewall = true;
             executePolicy = "skip";
             queueSize = 2;
+            fetchMaxInFlight = 2;
+            fetchQueueSize = 3;
             graffiti = "e2e-discovery";
           };
           virtualisation.cores = 2;

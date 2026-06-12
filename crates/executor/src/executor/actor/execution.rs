@@ -1,23 +1,29 @@
-use crate::executor::{ExecuteOutcome, ExecutorMessage, FetchCompletion, FetchProviderFailure};
+use crate::executor::{
+    ExecuteOutcome, ExecutorMessage, FetchCompletion, FetchProviderFailure, FetchProviderRun,
+    PendingFetch,
+};
 use crate::fetch::{FetchStateError, FetchTranscript};
-use crate::fetch_provider::{FetchProvider, FetchProviderRequest};
+use crate::fetch_policy::{FetchAccessError, FetchRoute};
+use crate::fetch_projection::{FetchProjector, ProjectedFetch};
+use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use futures_util::StreamExt;
 use hellas_core::{
-    Digest, InputCommitment, OutputEventEnvelope, SignedReceipt, canonical_dag_cbor,
+    Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey, SignedReceipt,
+    canonical_dag_cbor,
 };
 use hellas_core::{Symbolic, SymbolicOutput};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::error::StateError;
-use hellas_rpc::fetch::{build_output_events, output_body};
+use hellas_rpc::fetch::FetchOutputTranscriptBuilder;
 use hellas_rpc::pb::execute::{
     FinishStatus, RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
 };
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::stream::output_event_to_pb;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -125,32 +131,107 @@ impl Executor {
                 let provenance = ExecutionProvenance {
                     commitment_id: request_commitment_id,
                 };
-                let _fetch_quote = match self.fetch_state.start(input_commitment) {
-                    Ok(quote) => quote,
-                    Err(FetchStateError::AlreadyCompleted) => {
-                        if let Some(outcome) = self
-                            .replay_fetch_execution(input_commitment, request_commitment_id)
-                            .await?
-                        {
-                            return Ok(outcome);
-                        }
-                        return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
-                    }
-                    Err(err) => return Err(fetch_execute_error(err)),
-                };
-                let model_id = quote.model_id.clone();
+                if self.active_fetches >= self.fetch_max_in_flight
+                    && self.pending_fetches.len() >= self.fetch_queue_capacity
+                {
+                    return Err(ExecutorError::QueueFull {
+                        capacity: self.fetch_queue_capacity,
+                    });
+                }
+                let route = FetchRoute::new(request.service.clone(), request.method.clone());
+                let entry = self
+                    .fetch_routes
+                    .entry(&route)
+                    .cloned()
+                    .ok_or_else(|| no_fetch_route_error(&route))?;
+                let projection = entry
+                    .projector_factory
+                    .create(&request)
+                    .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
+                let fetch_quote = self
+                    .fetch_state
+                    .quoted(input_commitment)
+                    .map_err(fetch_execute_error)?;
                 let execution_id = new_execution_id();
+                let admission = self
+                    .fetch_access_policy
+                    .authorize_admission(
+                        &fetch_quote.caller_key,
+                        &projection.request_view,
+                        now_ms(),
+                        execution_id.clone(),
+                        &entry.capabilities,
+                    )
+                    .map_err(fetch_access_error)?;
+                let model_id = projection
+                    .request_view
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| quote.model_id.clone());
                 let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
-                spawn_fetch_provider(
-                    self.tx.clone(),
-                    Arc::clone(&self.fetch_provider),
+                let pending = PendingFetch {
                     request,
+                    provider: entry.provider,
                     input_commitment,
                     request_commitment_id,
-                    execution_id.clone(),
-                    model_id.clone(),
+                    quota_reservation: admission.reservation,
+                    execution_id: execution_id.clone(),
+                    model_id: model_id.clone(),
                     sender,
-                );
+                    projector: projection.projector,
+                };
+
+                let queued = if self.active_fetches < self.fetch_max_in_flight {
+                    match self.fetch_state.start(input_commitment) {
+                        Ok(_) => {
+                            self.start_fetch_execution(pending);
+                            false
+                        }
+                        Err(FetchStateError::AlreadyCompleted) => {
+                            let _ = self
+                                .fetch_access_policy
+                                .cancel_reservation(pending.quota_reservation.as_ref());
+                            if let Some(outcome) = self
+                                .replay_fetch_execution(input_commitment, request_commitment_id)
+                                .await?
+                            {
+                                return Ok(outcome);
+                            }
+                            return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                        }
+                        Err(err) => {
+                            let _ = self
+                                .fetch_access_policy
+                                .cancel_reservation(pending.quota_reservation.as_ref());
+                            return Err(fetch_execute_error(err));
+                        }
+                    }
+                } else {
+                    match self.fetch_state.queue(input_commitment) {
+                        Ok(_) => {
+                            self.pending_fetches.push_back(pending);
+                            true
+                        }
+                        Err(FetchStateError::AlreadyCompleted) => {
+                            let _ = self
+                                .fetch_access_policy
+                                .cancel_reservation(pending.quota_reservation.as_ref());
+                            if let Some(outcome) = self
+                                .replay_fetch_execution(input_commitment, request_commitment_id)
+                                .await?
+                            {
+                                return Ok(outcome);
+                            }
+                            return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                        }
+                        Err(err) => {
+                            let _ = self
+                                .fetch_access_policy
+                                .cancel_reservation(pending.quota_reservation.as_ref());
+                            return Err(fetch_execute_error(err));
+                        }
+                    }
+                };
 
                 self.metrics.record_execution_started(
                     &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
@@ -161,6 +242,9 @@ impl Executor {
                 info!(
                     %execution_id,
                     request_commitment = %format_request_commitment(&request_commitment),
+                    queued,
+                    active_fetches = self.active_fetches,
+                    fetch_queue_len = self.pending_fetches.len(),
                     "accepted fetch execution"
                 );
 
@@ -200,6 +284,16 @@ impl Executor {
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
             Err(EnqueueError::Stopped(_job)) => Err(StartExecutionError::Closed),
         }
+    }
+
+    fn start_fetch_execution(&mut self, pending: PendingFetch) {
+        self.active_fetches = self.active_fetches.saturating_add(1);
+        spawn_fetch_provider(self.tx.clone(), Arc::clone(&self.producer_key), pending);
+    }
+
+    fn finish_fetch_slot(&mut self) {
+        self.active_fetches = self.active_fetches.saturating_sub(1);
+        self.dispatch_next_fetch();
     }
 
     pub(super) async fn handle_worker_finished(&mut self, completion: WorkerCompletion) {
@@ -288,76 +382,91 @@ impl Executor {
         let FetchCompletion {
             input_commitment,
             request_commitment_id,
+            quota_reservation,
             execution_id,
             model_id,
             sender,
             result,
         } = completion;
 
-        let output = match result {
-            Ok(output) => output,
+        let run = match result {
+            Ok(run) => run,
             Err(failure) => {
                 let error = failure.error.to_string();
+                if let Err(err) = self
+                    .fetch_access_policy
+                    .reconcile_reservation(quota_reservation.as_ref(), None)
+                {
+                    warn!(
+                        %execution_id,
+                        quota_error = %err,
+                        "failed to reconcile fetch quota after provider failure"
+                    );
+                }
                 let _ = self.fetch_state.fail(input_commitment, error.clone());
                 self.metrics
                     .record_execution_failed(&model_id, failure.position);
                 send_fetch_failed(sender, failure.position, error).await;
-                return;
-            }
-        };
-
-        let output_events = match build_output_events(input_commitment, &output, &self.producer_key)
-        {
-            Ok(events) => events,
-            Err(err) => {
-                let error = format!("fetch output transcript failed: {err}");
-                let _ = self.fetch_state.fail(input_commitment, error.clone());
-                self.metrics
-                    .record_execution_failed(&model_id, output.len() as u64);
-                send_fetch_failed(sender, output.len() as u64, error).await;
+                self.finish_fetch_slot();
                 return;
             }
         };
 
         let transcript = match self.fetch_state.complete_output(
             input_commitment,
-            output_events,
+            run.output_events,
             &self.producer_key.public_key(),
         ) {
             Ok(transcript) => transcript,
             Err(err) => {
                 let error = fetch_execute_error(err).to_string();
                 let _ = self.fetch_state.fail(input_commitment, error.clone());
-                self.metrics
-                    .record_execution_failed(&model_id, output.len() as u64);
-                send_fetch_failed(sender, output.len() as u64, error).await;
+                let total_units = run.usage.total_or_output();
+                self.metrics.record_execution_failed(&model_id, total_units);
+                send_fetch_failed(sender, total_units, error).await;
+                self.finish_fetch_slot();
                 return;
             }
         };
 
-        let event =
-            match fetch_finished_event(transcript.output_events(), FinishStatus::EndOfSequence) {
-                Ok(event) => event,
-                Err(err) => {
-                    let error = err.to_string();
-                    let _ = self.fetch_state.fail(input_commitment, error.clone());
-                    self.metrics
-                        .record_execution_failed(&model_id, output.len() as u64);
-                    send_fetch_failed(sender, output.len() as u64, error).await;
-                    return;
-                }
-            };
+        let total_units = run.usage.total_or_output();
+        if let Err(err) = self
+            .fetch_access_policy
+            .reconcile_reservation(quota_reservation.as_ref(), Some(run.usage))
+        {
+            warn!(
+                %execution_id,
+                quota_error = %err,
+                "failed to reconcile fetch quota after provider completion"
+            );
+        }
+        let event = match fetch_finished_event(
+            transcript.output_events(),
+            FinishStatus::EndOfSequence,
+            total_units,
+        ) {
+            Ok(event) => event,
+            Err(err) => {
+                let error = err.to_string();
+                let _ = self.fetch_state.fail(input_commitment, error.clone());
+                self.metrics.record_execution_failed(&model_id, total_units);
+                send_fetch_failed(sender, total_units, error).await;
+                self.finish_fetch_slot();
+                return;
+            }
+        };
 
         self.metrics
-            .record_execution_completed(&model_id, output.len() as u64);
+            .record_execution_completed(&model_id, total_units);
         let _ = sender.send(Ok(event)).await;
 
         info!(
             %execution_id,
             request_commitment = %format_request_commitment(&request_commitment_id),
-            total_units = output.len(),
+            total_units,
             "completed fetch execution"
         );
+        self.finish_fetch_slot();
     }
 
     /// Pop pending jobs and dispatch the first one whose consumer is still
@@ -384,6 +493,41 @@ impl Executor {
             }
         }
     }
+
+    fn dispatch_next_fetch(&mut self) {
+        while self.active_fetches < self.fetch_max_in_flight {
+            let Some(pending) = self.pending_fetches.pop_front() else {
+                return;
+            };
+            if pending.sender.is_closed() {
+                let _ = self
+                    .fetch_access_policy
+                    .cancel_reservation(pending.quota_reservation.as_ref());
+                let _ = self.fetch_state.cancel_queued(pending.input_commitment);
+                debug!(
+                    execution_id = %pending.execution_id,
+                    "dropping queued fetch execution: consumer disconnected before dispatch"
+                );
+                continue;
+            }
+            match self.fetch_state.start(pending.input_commitment) {
+                Ok(_) => {
+                    self.start_fetch_execution(pending);
+                    return;
+                }
+                Err(err) => {
+                    let _ = self
+                        .fetch_access_policy
+                        .cancel_reservation(pending.quota_reservation.as_ref());
+                    let position = 0;
+                    let error = fetch_execute_error(err).to_string();
+                    let _ = pending.sender.try_send(Ok(WorkEvent {
+                        kind: Some(work_event::Kind::Failed(WorkFailed { position, error })),
+                    }));
+                }
+            }
+        }
+    }
 }
 
 fn format_request_commitment(bytes: &[u8]) -> String {
@@ -394,19 +538,34 @@ fn format_request_commitment(bytes: &[u8]) -> String {
 
 fn spawn_fetch_provider(
     tx: mpsc::UnboundedSender<ExecutorMessage>,
-    provider: Arc<dyn FetchProvider>,
-    request: FetchProviderRequest,
-    input_commitment: InputCommitment,
-    request_commitment_id: [u8; 32],
-    execution_id: String,
-    model_id: String,
-    sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
+    producer_key: Arc<ProducerSigningKey>,
+    pending: PendingFetch,
 ) {
     tokio::spawn(async move {
-        let result = run_fetch_provider(provider, request, sender.clone()).await;
+        let PendingFetch {
+            request,
+            provider,
+            projector,
+            quota_reservation,
+            input_commitment,
+            request_commitment_id,
+            execution_id,
+            model_id,
+            sender,
+        } = pending;
+        let result = run_fetch_provider(
+            provider,
+            request,
+            projector,
+            input_commitment,
+            &producer_key,
+            sender.clone(),
+        )
+        .await;
         let _ = tx.send(ExecutorMessage::FetchFinished(FetchCompletion {
             input_commitment,
             request_commitment_id,
+            quota_reservation,
             execution_id,
             model_id,
             sender,
@@ -418,10 +577,14 @@ fn spawn_fetch_provider(
 async fn run_fetch_provider(
     provider: Arc<dyn FetchProvider>,
     request: FetchProviderRequest,
+    mut projector: Box<dyn FetchProjector>,
+    input_commitment: InputCommitment,
+    producer_key: &ProducerSigningKey,
     sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
-) -> Result<Vec<u8>, FetchProviderFailure> {
-    let mut output = Vec::new();
+) -> Result<FetchProviderRun, FetchProviderFailure> {
+    let mut builder = FetchOutputTranscriptBuilder::new(input_commitment, producer_key);
     let mut position = 0_u64;
+    let mut terminal_payload = None;
     let mut stream = provider
         .run(request)
         .await
@@ -429,23 +592,109 @@ async fn run_fetch_provider(
 
     while let Some(next) = stream.next().await {
         let chunk = next.map_err(|error| FetchProviderFailure { position, error })?;
-        if chunk.is_empty() {
-            continue;
-        }
-        position = position.saturating_add(chunk.len() as u64);
-        output.extend_from_slice(&chunk);
-        let _ = sender
-            .send(Ok(WorkEvent {
-                kind: Some(work_event::Kind::Chunk(WorkChunk {
-                    position,
-                    bytes: chunk,
-                    output_event: None,
-                })),
-            }))
-            .await;
+        let projected = projector
+            .project(&chunk)
+            .map_err(|err| FetchProviderFailure {
+                position,
+                error: FetchProviderError::failed(format!("fetch projection failed: {err}")),
+            })?;
+        process_projected_fetch(
+            projected,
+            &mut builder,
+            &mut terminal_payload,
+            &mut position,
+            &sender,
+        )
+        .await?;
     }
 
-    Ok(output)
+    let projected = projector.finish().map_err(|err| FetchProviderFailure {
+        position,
+        error: FetchProviderError::failed(format!("fetch projection failed: {err}")),
+    })?;
+    process_projected_fetch(
+        projected,
+        &mut builder,
+        &mut terminal_payload,
+        &mut position,
+        &sender,
+    )
+    .await?;
+    let terminal_payload = terminal_payload.ok_or_else(|| FetchProviderFailure {
+        position,
+        error: FetchProviderError::failed(
+            "fetch provider ended without terminal event".to_string(),
+        ),
+    })?;
+    let output_events = builder
+        .finish(terminal_payload)
+        .map_err(|err| FetchProviderFailure {
+            position,
+            error: FetchProviderError::failed(format!("fetch output transcript failed: {err}")),
+        })?;
+    Ok(FetchProviderRun {
+        output_events,
+        usage: projector.usage().unwrap_or_default(),
+    })
+}
+
+async fn process_projected_fetch(
+    projected: Vec<ProjectedFetch>,
+    builder: &mut FetchOutputTranscriptBuilder<'_>,
+    terminal_payload: &mut Option<Vec<u8>>,
+    position: &mut u64,
+    sender: &mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
+) -> Result<(), FetchProviderFailure> {
+    for item in projected {
+        match item {
+            ProjectedFetch::Event(payload) => {
+                if terminal_payload.is_some() {
+                    return Err(FetchProviderFailure {
+                        position: *position,
+                        error: FetchProviderError::failed(
+                            "fetch projection emitted an event after terminal".to_string(),
+                        ),
+                    });
+                }
+                let output_event =
+                    builder
+                        .push_event(payload.clone())
+                        .map_err(|err| FetchProviderFailure {
+                            position: *position,
+                            error: FetchProviderError::failed(format!(
+                                "fetch output event transcript failed: {err}"
+                            )),
+                        })?;
+                *position = (*position).saturating_add(payload.len() as u64);
+                sender
+                    .send(Ok(WorkEvent {
+                        kind: Some(work_event::Kind::Chunk(WorkChunk {
+                            position: *position,
+                            bytes: payload,
+                            output_event: Some(output_event_to_pb(&output_event)),
+                        })),
+                    }))
+                    .await
+                    .map_err(|_| FetchProviderFailure {
+                        position: *position,
+                        error: FetchProviderError::failed(
+                            "fetch stream consumer disconnected".to_string(),
+                        ),
+                    })?;
+            }
+            ProjectedFetch::Terminal(payload) => {
+                if terminal_payload.replace(payload).is_some() {
+                    return Err(FetchProviderFailure {
+                        position: *position,
+                        error: FetchProviderError::failed(
+                            "fetch projection emitted multiple terminal events".to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn send_fetch_failed(
@@ -470,6 +719,7 @@ async fn fetch_transcript_outcome(
         },
         transcript.output_events(),
         FinishStatus::EndOfSequence,
+        0,
     )
     .await
 }
@@ -478,8 +728,9 @@ async fn fetch_finished_outcome(
     provenance: ExecutionProvenance,
     output_events: &[OutputEventEnvelope],
     status: FinishStatus,
+    total_units: u64,
 ) -> Result<ExecuteOutcome, ExecutorError> {
-    let event = fetch_finished_event(output_events, status)?;
+    let event = fetch_finished_event(output_events, status, total_units)?;
     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
     sender
         .send(Ok(event))
@@ -495,15 +746,12 @@ async fn fetch_finished_outcome(
 fn fetch_finished_event(
     output_events: &[OutputEventEnvelope],
     status: FinishStatus,
+    total_units: u64,
 ) -> Result<WorkEvent, ExecutorError> {
-    let output = output_body(output_events).map_err(|err| {
-        ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
-    })?;
-    let total_units = output.as_bytes().len() as u64;
     let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
     Ok(WorkEvent {
         kind: Some(work_event::Kind::Finished(WorkFinished {
-            output: output.into_bytes(),
+            output: Vec::new(),
             receipt: None,
             status: status as i32,
             total_units,
@@ -518,6 +766,7 @@ fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
             ExecutorError::State(StateError::QuoteNotFound(err.to_string()))
         }
         FetchStateError::AlreadyExists
+        | FetchStateError::AlreadyQueued
         | FetchStateError::AlreadyRunning
         | FetchStateError::NotRunning
         | FetchStateError::NotCompleted
@@ -537,6 +786,40 @@ fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
     }
 }
 
+pub(super) fn no_fetch_route_error(route: &FetchRoute) -> ExecutorError {
+    ExecutorError::PolicyDenied(format!(
+        "no fetch route configured for {}/{}",
+        route.service, route.method
+    ))
+}
+
+fn fetch_access_error(err: FetchAccessError) -> ExecutorError {
+    match err {
+        FetchAccessError::Denied(message) => ExecutorError::PolicyDenied(message),
+        FetchAccessError::QuotaExceeded {
+            retry_after_ms,
+            message,
+        } => ExecutorError::QuotaExceeded {
+            retry_after_ms,
+            message,
+        },
+        FetchAccessError::Store(message) => {
+            ExecutorError::ArtifactStore(format!("fetch quota store error: {message}"))
+        }
+        FetchAccessError::Io(err) => {
+            ExecutorError::ArtifactStore(format!("fetch quota store I/O error: {err}"))
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
 enum StartExecutionError {
     Busy(Box<ExecuteJob>),
     Closed,
@@ -545,13 +828,127 @@ enum StartExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Executor, MockFetchProvider};
+    use crate::{
+        ArtifactStoreConfig, CallerAccess, Executor, ExecutorMetrics, ExecutorSpawnConfig,
+        FetchAccessPolicy, FetchProjectionError, FetchProjectionSession, FetchProjector,
+        FetchProjectorFactory, FetchProvider, FetchProviderFuture, FetchProviderRequest,
+        FetchProviderStream, FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
+        FetchUsage, MockFetchProvider, ProjectedFetch,
+    };
     use catgrad::prelude::Dtype;
+    use futures_util::stream;
     use hellas_core::ProducerSigningKey;
+    use hellas_rpc::ExecutorError;
     use hellas_rpc::fetch::build_input_events;
     use hellas_rpc::pb::fetch::FetchRequest;
     use hellas_rpc::policy::ExecutePolicy;
     use hellas_rpc::stream::input_event_to_pb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::{Duration, timeout};
+
+    #[derive(Clone, Debug, Default)]
+    struct TestFetchProjectorFactory;
+
+    impl FetchProjectorFactory for TestFetchProjectorFactory {
+        fn create(
+            &self,
+            request: &crate::FetchProviderRequest,
+        ) -> Result<FetchProjectionSession, FetchProjectionError> {
+            Ok(FetchProjectionSession {
+                request_view: FetchRequestView::from_provider_request(request),
+                projector: Box::new(TestFetchProjector {
+                    terminal_seen: false,
+                }),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixedViewFetchProjectorFactory {
+        view: FetchRequestView,
+    }
+
+    impl FetchProjectorFactory for FixedViewFetchProjectorFactory {
+        fn create(
+            &self,
+            _request: &crate::FetchProviderRequest,
+        ) -> Result<FetchProjectionSession, FetchProjectionError> {
+            Ok(FetchProjectionSession {
+                request_view: self.view.clone(),
+                projector: Box::new(TestFetchProjector {
+                    terminal_seen: false,
+                }),
+            })
+        }
+    }
+
+    struct TestFetchProjector {
+        terminal_seen: bool,
+    }
+
+    impl FetchProjector for TestFetchProjector {
+        fn project(&mut self, bytes: &[u8]) -> Result<Vec<ProjectedFetch>, FetchProjectionError> {
+            if let Some(terminal) = bytes.strip_prefix(b"terminal:") {
+                self.terminal_seen = true;
+                Ok(vec![ProjectedFetch::Terminal(terminal.to_vec())])
+            } else {
+                Ok(vec![ProjectedFetch::Event(bytes.to_vec())])
+            }
+        }
+
+        fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchProjectionError> {
+            if self.terminal_seen {
+                Ok(Vec::new())
+            } else {
+                Err(FetchProjectionError::failed(
+                    "test stream ended without terminal".to_string(),
+                ))
+            }
+        }
+
+        fn usage(&self) -> Option<FetchUsage> {
+            None
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ReleasableFetchProvider {
+        released: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ReleasableFetchProvider {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FetchProvider for ReleasableFetchProvider {
+        fn run(&self, _request: FetchProviderRequest) -> FetchProviderFuture<'_> {
+            let released = Arc::clone(&self.released);
+            let notify = Arc::clone(&self.notify);
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                while !released.load(Ordering::SeqCst) {
+                    notify.notified().await;
+                }
+                Ok(Box::pin(stream::iter([
+                    Ok(b"event:ok".to_vec()),
+                    Ok(b"terminal:done".to_vec()),
+                ])) as FetchProviderStream)
+            })
+        }
+    }
 
     fn key() -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
@@ -572,23 +969,71 @@ mod tests {
     async fn run_one(
         handle: &crate::ExecutorHandle,
         request_commitment: Vec<u8>,
-    ) -> (Vec<Vec<u8>>, WorkFinished) {
-        let mut outcome = handle
+    ) -> (Vec<WorkChunk>, WorkFinished) {
+        let outcome = handle
             .run_ticket_handle(RunTicketRequest { request_commitment })
             .await
-            .unwrap()
-            .events;
+            .unwrap();
+        drain_outcome(outcome.events).await
+    }
+
+    async fn drain_outcome(
+        mut outcome: crate::executor::ExecuteEventReceiver,
+    ) -> (Vec<WorkChunk>, WorkFinished) {
         let mut chunks = Vec::new();
         loop {
             let event = outcome.recv().await.unwrap().unwrap();
             match event.kind.unwrap() {
-                work_event::Kind::Chunk(chunk) => chunks.push(chunk.bytes),
+                work_event::Kind::Chunk(chunk) => chunks.push(chunk),
                 work_event::Kind::Finished(finished) => return (chunks, finished),
                 work_event::Kind::Failed(failed) => {
                     panic!("expected finished event, got failure: {failed:?}")
                 }
             }
         }
+    }
+
+    fn test_routes(
+        service: &str,
+        method: &str,
+        provider: Arc<dyn FetchProvider>,
+        projector_factory: Arc<dyn FetchProjectorFactory>,
+    ) -> crate::FetchRouteRegistry {
+        let mut registry = crate::FetchRouteRegistry::new();
+        registry
+            .register(
+                FetchRoute::new(service, method),
+                crate::FetchRouteEntry {
+                    provider,
+                    projector_factory,
+                    capabilities: FetchRoutePolicy::default(),
+                },
+            )
+            .unwrap();
+        registry
+    }
+
+    async fn spawn_fetch_executor(
+        provider: Arc<dyn FetchProvider>,
+        fetch_max_in_flight: usize,
+        fetch_queue_capacity: usize,
+    ) -> crate::ExecutorHandle {
+        let producer_key = key();
+        let caller_key = producer_key.public_key();
+        Executor::spawn_configured(ExecutorSpawnConfig {
+            execute_policy: ExecutePolicy::Eager,
+            queue_capacity: 1,
+            supported_dtypes: vec![Dtype::F32],
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: Arc::new(producer_key),
+            fetch_access_policy: FetchAccessPolicy::trusted_callers([caller_key]),
+            fetch_routes: test_routes("echo", "run", provider, Arc::new(TestFetchProjectorFactory)),
+            fetch_max_in_flight,
+            fetch_queue_capacity,
+            artifact_store: ArtifactStoreConfig::Memory,
+        })
+        .await
+        .unwrap()
     }
 
     async fn run_failed(handle: &crate::ExecutorHandle, request_commitment: Vec<u8>) -> WorkFailed {
@@ -618,15 +1063,20 @@ mod tests {
             "echo",
             "run",
             input,
-            [b"{\"answer\":\"".to_vec(), b"ok\"}".to_vec()],
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
         );
         let request = fetch_request(&signing_key, "echo", "run", input);
-        let handle = Executor::spawn_with_fetch_provider(
+        let handle = Executor::spawn_with_fetch_routes(
             ExecutePolicy::Eager,
             1,
             vec![Dtype::F32],
             key(),
-            Arc::new(provider.clone()),
+            test_routes(
+                "echo",
+                "run",
+                Arc::new(provider.clone()),
+                Arc::new(TestFetchProjectorFactory),
+            ),
         )
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
@@ -634,9 +1084,17 @@ mod tests {
         let (chunks, first) = run_one(&handle, ticket.request_commitment.clone()).await;
         let (replay_chunks, replayed) = run_one(&handle, ticket.request_commitment).await;
 
-        assert_eq!(chunks, vec![b"{\"answer\":\"".to_vec(), b"ok\"}".to_vec()]);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].bytes, b"event:ok");
+        let chunk_event = chunks[0]
+            .output_event
+            .as_ref()
+            .expect("fetch chunk should carry signed output event");
+        assert_eq!(chunk_event.payload, chunks[0].bytes);
         assert!(replay_chunks.is_empty());
-        assert_eq!(first.output, br#"{"answer":"ok"}"#);
+        assert!(first.output.is_empty());
+        assert_eq!(first.output_events[0], *chunk_event);
+        assert_eq!(first.output_events[1].payload, b"done");
         assert_eq!(replayed.output, first.output);
         assert_eq!(replayed.output_events, first.output_events);
         assert_eq!(provider.calls("echo", "run", input), 1);
@@ -648,12 +1106,17 @@ mod tests {
         let input = br#"{"hello":"world"}"#;
         let provider = MockFetchProvider::new();
         let request = fetch_request(&signing_key, "echo", "run", input);
-        let handle = Executor::spawn_with_fetch_provider(
+        let handle = Executor::spawn_with_fetch_routes(
             ExecutePolicy::Eager,
             1,
             vec![Dtype::F32],
             key(),
-            Arc::new(provider.clone()),
+            test_routes(
+                "echo",
+                "run",
+                Arc::new(provider.clone()),
+                Arc::new(TestFetchProjectorFactory),
+            ),
         )
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
@@ -663,5 +1126,158 @@ mod tests {
         assert_eq!(failed.position, 0);
         assert!(failed.error.contains("mock fetch response not programmed"));
         assert_eq!(provider.calls("echo", "run", input), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_quote_missing_route_does_not_poison_ticket_state() {
+        let signing_key = key();
+        let provider = MockFetchProvider::new();
+        let handle = spawn_fetch_executor(Arc::new(provider), 1, 1).await;
+        let request = fetch_request(&signing_key, "missing", "run", br#"{"hello":"world"}"#);
+
+        for _ in 0..2 {
+            let err = handle
+                .create_fetch_ticket(request.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ExecutorError::PolicyDenied(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_policy_denial_does_not_start_provider() {
+        let signing_key = key();
+        let caller_key = signing_key.public_key();
+        let provider = ReleasableFetchProvider::default();
+        let policy = FetchAccessPolicy::new([CallerAccess::explicit(
+            caller_key,
+            [FetchRouteGrant {
+                route: FetchRoute::new("codex", "responses"),
+                policy: FetchRoutePolicy {
+                    allowed_models: Some(BTreeSet::from(["allowed-model".to_string()])),
+                    max_output_units: Some(8),
+                },
+            }],
+        )]);
+        let projector = FixedViewFetchProjectorFactory {
+            view: FetchRequestView {
+                service: "codex".to_string(),
+                method: "responses".to_string(),
+                model: Some("denied-model".to_string()),
+                max_output_units: Some(4),
+            },
+        };
+        let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+            execute_policy: ExecutePolicy::Eager,
+            queue_capacity: 1,
+            supported_dtypes: vec![Dtype::F32],
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: Arc::new(key()),
+            fetch_access_policy: policy,
+            fetch_routes: test_routes(
+                "codex",
+                "responses",
+                Arc::new(provider.clone()),
+                Arc::new(projector),
+            ),
+            fetch_max_in_flight: 1,
+            fetch_queue_capacity: 1,
+            artifact_store: ArtifactStoreConfig::Memory,
+        })
+        .await
+        .unwrap();
+        let request = fetch_request(&signing_key, "codex", "responses", br#"{"model":"x"}"#);
+        let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+
+        let err = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: ticket.request_commitment,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ExecutorError::PolicyDenied(_)));
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_full_leaves_ticket_retryable() {
+        let signing_key = key();
+        let provider = ReleasableFetchProvider::default();
+        let handle = spawn_fetch_executor(Arc::new(provider.clone()), 1, 0).await;
+        let first = fetch_request(&signing_key, "echo", "run", br#"{"n":1}"#);
+        let second = fetch_request(&signing_key, "echo", "run", br#"{"n":2}"#);
+        let first_ticket = handle.create_fetch_ticket(first).await.unwrap().response;
+        let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
+
+        let first_outcome = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: first_ticket.request_commitment,
+            })
+            .await
+            .unwrap();
+        let error = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: second_ticket.request_commitment.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecutorError::QueueFull { capacity: 0 }));
+
+        provider.release();
+        let (_, first_finished) =
+            timeout(Duration::from_secs(2), drain_outcome(first_outcome.events))
+                .await
+                .unwrap();
+        assert!(first_finished.output.is_empty());
+
+        let (chunks, second_finished) = timeout(
+            Duration::from_secs(2),
+            run_one(&handle, second_ticket.request_commitment),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(second_finished.output.is_empty());
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_dispatches_after_active_completion() {
+        let signing_key = key();
+        let provider = ReleasableFetchProvider::default();
+        let handle = spawn_fetch_executor(Arc::new(provider.clone()), 1, 1).await;
+        let first = fetch_request(&signing_key, "echo", "run", br#"{"n":1}"#);
+        let second = fetch_request(&signing_key, "echo", "run", br#"{"n":2}"#);
+        let first_ticket = handle.create_fetch_ticket(first).await.unwrap().response;
+        let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
+
+        let first_outcome = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: first_ticket.request_commitment,
+            })
+            .await
+            .unwrap();
+        let second_outcome = handle
+            .run_ticket_handle(RunTicketRequest {
+                request_commitment: second_ticket.request_commitment,
+            })
+            .await
+            .unwrap();
+
+        provider.release();
+        let (_, first_finished) =
+            timeout(Duration::from_secs(2), drain_outcome(first_outcome.events))
+                .await
+                .unwrap();
+        let (second_chunks, second_finished) =
+            timeout(Duration::from_secs(2), drain_outcome(second_outcome.events))
+                .await
+                .unwrap();
+
+        assert!(first_finished.output.is_empty());
+        assert_eq!(second_chunks.len(), 1);
+        assert!(second_finished.output.is_empty());
+        assert_eq!(provider.calls(), 2);
     }
 }

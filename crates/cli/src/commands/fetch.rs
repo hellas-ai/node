@@ -1,6 +1,7 @@
 use crate::commands::CliResult;
 use crate::execution::{
-    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, fetch_execution_stream,
+    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, ProducerTrust,
+    fetch_execution_stream,
 };
 #[cfg(feature = "hellas-executor")]
 use catgrad::prelude::Dtype;
@@ -25,6 +26,7 @@ pub struct ExecuteOptions {
     #[cfg(feature = "hellas-executor")]
     pub local: bool,
     pub producer_key_path: Option<PathBuf>,
+    pub trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
@@ -33,6 +35,14 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     let caller_key =
         crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
+
+    // Mirrors the producer-side default for trusted callers: with no keys
+    // configured, only output signed by our own producer key verifies.
+    let trust = if options.trusted_producer_public_keys.is_empty() {
+        ProducerTrust::keys([caller_key.public_key()])
+    } else {
+        ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
+    };
 
     #[cfg(feature = "hellas-executor")]
     let route = if options.local {
@@ -71,24 +81,24 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let uses_remote = !matches!(route, ExecutionRoute::Local);
     #[cfg(not(feature = "hellas-executor"))]
     let uses_remote = true;
-    let stream = fetch_execution_stream(runtime, request, route);
+    let stream = fetch_execution_stream(runtime, request, route, trust);
     tokio::pin!(stream);
 
-    let mut wrote_chunks = false;
     let mut completed = false;
     while let Some(event) = stream.next().await {
         match event? {
-            FetchExecutionEvent::Chunk { position, bytes } => {
-                trace!(position, bytes = bytes.len(), "fetch output chunk");
-                wrote_chunks = true;
-                io::stdout().write_all(&bytes)?;
+            FetchExecutionEvent::Chunk {
+                position, event, ..
+            } => {
+                trace!(position, "fetch output event");
+                serde_json::to_writer(&mut io::stdout(), &event)?;
+                io::stdout().write_all(b"\n")?;
                 io::stdout().flush()?;
             }
-            FetchExecutionEvent::Done(FetchOutcome::Completed { output, .. }) => {
-                if !wrote_chunks {
-                    io::stdout().write_all(&output)?;
-                    io::stdout().flush()?;
-                }
+            FetchExecutionEvent::Done(FetchOutcome::Completed { terminal, .. }) => {
+                serde_json::to_writer(&mut io::stdout(), &terminal.to_output_event())?;
+                io::stdout().write_all(b"\n")?;
+                io::stdout().flush()?;
                 completed = true;
                 break;
             }

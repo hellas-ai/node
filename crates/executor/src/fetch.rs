@@ -79,6 +79,7 @@ impl FetchQuote {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchTicketState {
     Quoted(FetchQuote),
+    Queued(FetchQuote),
     Running(FetchQuote),
     Completed(FetchTranscript),
     Failed(String),
@@ -175,10 +176,6 @@ impl FetchCallerPolicy {
                 .map(|key| (ProducerId::from_public_key(&key), key))
                 .collect(),
         }
-    }
-
-    pub fn single(key: PublicKey) -> Self {
-        Self::new([key])
     }
 
     pub fn is_authorized(&self, key: &PublicKey) -> bool {
@@ -302,9 +299,9 @@ where
         }
         let input = quote.input_commitment;
         match self.tickets.get(&input) {
-            Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Running(_)) => {
-                Err(FetchStateError::AlreadyExists)
-            }
+            Some(FetchTicketState::Quoted(_))
+            | Some(FetchTicketState::Queued(_))
+            | Some(FetchTicketState::Running(_)) => Err(FetchStateError::AlreadyExists),
             Some(FetchTicketState::Completed(_)) => Err(FetchStateError::AlreadyCompleted),
             Some(FetchTicketState::Failed(_)) => Err(FetchStateError::Failed),
             None => {
@@ -330,7 +327,7 @@ where
         Ok((quote, verified))
     }
 
-    pub fn start(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
+    pub fn queue(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
         if self.store.get_completed(input)?.is_some() {
             return Err(FetchStateError::AlreadyCompleted);
         }
@@ -340,6 +337,55 @@ where
             .ok_or(FetchStateError::NotFound)?;
         match state {
             FetchTicketState::Quoted(quote) => {
+                let quote = quote.clone();
+                *state = FetchTicketState::Queued(quote.clone());
+                Ok(quote)
+            }
+            FetchTicketState::Queued(_) => Err(FetchStateError::AlreadyQueued),
+            FetchTicketState::Running(_) => Err(FetchStateError::AlreadyRunning),
+            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
+            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
+        }
+    }
+
+    pub fn quoted(&self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
+        match self.tickets.get(&input) {
+            Some(FetchTicketState::Quoted(quote)) => Ok(quote.clone()),
+            Some(FetchTicketState::Queued(_)) => Err(FetchStateError::AlreadyQueued),
+            Some(FetchTicketState::Running(_)) => Err(FetchStateError::AlreadyRunning),
+            Some(FetchTicketState::Completed(_)) => Err(FetchStateError::AlreadyCompleted),
+            Some(FetchTicketState::Failed(_)) => Err(FetchStateError::Failed),
+            None => Err(FetchStateError::NotFound),
+        }
+    }
+
+    pub fn cancel_queued(&mut self, input: InputCommitment) -> Result<(), FetchStateError> {
+        let state = self
+            .tickets
+            .get_mut(&input)
+            .ok_or(FetchStateError::NotFound)?;
+        match state {
+            FetchTicketState::Queued(quote) => {
+                *state = FetchTicketState::Quoted(quote.clone());
+                Ok(())
+            }
+            FetchTicketState::Quoted(_) => Ok(()),
+            FetchTicketState::Running(_) => Err(FetchStateError::AlreadyRunning),
+            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
+            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
+        }
+    }
+
+    pub fn start(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
+        if self.store.get_completed(input)?.is_some() {
+            return Err(FetchStateError::AlreadyCompleted);
+        }
+        let state = self
+            .tickets
+            .get_mut(&input)
+            .ok_or(FetchStateError::NotFound)?;
+        match state {
+            FetchTicketState::Quoted(quote) | FetchTicketState::Queued(quote) => {
                 let quote = quote.clone();
                 *state = FetchTicketState::Running(quote.clone());
                 Ok(quote)
@@ -358,7 +404,9 @@ where
     ) -> Result<FetchTranscript, FetchStateError> {
         let quote = match self.tickets.get(&input) {
             Some(FetchTicketState::Running(quote)) => quote.clone(),
-            Some(FetchTicketState::Quoted(_)) => return Err(FetchStateError::NotRunning),
+            Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Queued(_)) => {
+                return Err(FetchStateError::NotRunning);
+            }
             Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
             Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
             None => return Err(FetchStateError::NotFound),
@@ -376,7 +424,9 @@ where
         let input = transcript.input_commitment();
         let quote = match self.tickets.get(&input) {
             Some(FetchTicketState::Running(quote)) => quote,
-            Some(FetchTicketState::Quoted(_)) => return Err(FetchStateError::NotRunning),
+            Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Queued(_)) => {
+                return Err(FetchStateError::NotRunning);
+            }
             Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
             Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
             None => return Err(FetchStateError::NotFound),
@@ -405,7 +455,9 @@ where
             .get_mut(&input)
             .ok_or(FetchStateError::NotFound)?;
         match state {
-            FetchTicketState::Running(_) | FetchTicketState::Quoted(_) => {
+            FetchTicketState::Running(_)
+            | FetchTicketState::Queued(_)
+            | FetchTicketState::Quoted(_) => {
                 *state = FetchTicketState::Failed(reason.into());
                 Ok(())
             }
@@ -424,9 +476,9 @@ where
             None => match self.tickets.get(&input) {
                 Some(FetchTicketState::Completed(transcript)) => transcript.clone(),
                 Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
-                Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Running(_)) => {
-                    return Err(FetchStateError::NotCompleted);
-                }
+                Some(FetchTicketState::Quoted(_))
+                | Some(FetchTicketState::Queued(_))
+                | Some(FetchTicketState::Running(_)) => return Err(FetchStateError::NotCompleted),
                 None => return Err(FetchStateError::NotFound),
             },
         };
@@ -457,6 +509,8 @@ pub enum FetchStateError {
     NotFound,
     #[error("fetch ticket already exists")]
     AlreadyExists,
+    #[error("fetch ticket already queued")]
+    AlreadyQueued,
     #[error("fetch ticket already running")]
     AlreadyRunning,
     #[error("fetch ticket is not running")]
@@ -536,13 +590,13 @@ mod tests {
         store: FsFetchTranscriptStore,
         caller: PublicKey,
     ) -> FetchStateMachine<FsFetchTranscriptStore> {
-        FetchStateMachine::new(store, FetchCallerPolicy::single(caller))
+        FetchStateMachine::new(store, FetchCallerPolicy::new([caller]))
     }
 
     fn trusted_memory_state(caller: PublicKey) -> FetchStateMachine<MemoryFetchTranscriptStore> {
         FetchStateMachine::new(
             MemoryFetchTranscriptStore::default(),
-            FetchCallerPolicy::single(caller),
+            FetchCallerPolicy::new([caller]),
         )
     }
 
@@ -598,7 +652,7 @@ mod tests {
         let store = FsFetchTranscriptStore::new(&dir);
         let (quote, _transcript, _caller, _producer) = sample_transcript();
         let untrusted = key(9).public_key();
-        let mut state = FetchStateMachine::new(store, FetchCallerPolicy::single(untrusted));
+        let mut state = FetchStateMachine::new(store, FetchCallerPolicy::new([untrusted]));
 
         assert!(matches!(
             state.quote_input(quote.input.clone()).unwrap_err(),

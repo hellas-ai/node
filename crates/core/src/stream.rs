@@ -587,6 +587,15 @@ impl<'a> OutputTranscriptBuilder<'a> {
         kind: impl Into<String>,
         payload: impl Into<Vec<u8>>,
     ) -> Result<EventCommitment, StreamVerifyError> {
+        self.push_envelope(kind, payload)
+            .map(|envelope| envelope.event_commitment())
+    }
+
+    pub fn push_envelope(
+        &mut self,
+        kind: impl Into<String>,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<OutputEventEnvelope, StreamVerifyError> {
         let payload = payload.into();
         let sequence = self.next_sequence;
         let next_sequence = sequence
@@ -609,8 +618,8 @@ impl<'a> OutputTranscriptBuilder<'a> {
         let commitment = envelope.event_commitment();
         self.previous_event = commitment;
         self.next_sequence = next_sequence;
-        self.events.push(envelope);
-        Ok(commitment)
+        self.events.push(envelope.clone());
+        Ok(envelope)
     }
 
     pub fn finish(self) -> Result<(Vec<OutputEventEnvelope>, EventCommitment), StreamVerifyError> {
