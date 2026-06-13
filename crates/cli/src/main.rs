@@ -643,7 +643,6 @@ async fn main() {
                     #[cfg(feature = "hellas-executor")]
                     verify_local,
                     dtype,
-                    #[cfg(feature = "hellas-executor")]
                     producer_key_path: producer_key_path.clone(),
                 },
                 secret_key,

@@ -1,12 +1,12 @@
 use crate::executor::TicketOutcome;
 use crate::fetch_provider::FetchProviderRequest;
 use crate::state::{
-    LocalModelStatus, ModelLocator, QuoteKind, QuotePlan, QuoteRecord, model_spec,
-    resolve_accept_dtypes, symbolic_request_from_pb, symbolic_request_to_pb,
+    LocalModelStatus, ModelLocator, QuoteKind, QuotePlan, QuoteRecord, evaluate_request_from_pb,
+    evaluate_request_to_pb, model_spec, resolve_accept_dtypes,
 };
 use catgrad::prelude::Dtype;
 use chatgrad::types;
-use hellas_core::{CommitmentScheme, Digest, RequestCommitment, Symbolic};
+use hellas_core::{CommitmentScheme, Digest, Evaluate, PublicKey, RequestCommitment};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::model::ModelAssets;
@@ -15,10 +15,11 @@ use hellas_rpc::pb::courtesy::{
     PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
     QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
-use hellas_rpc::pb::execute::Ticket;
+use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
+use hellas_rpc::pb::execute::{PublicKey as PbPublicKey, Ticket};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
-use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::run_ticket::public_key_from_pb;
 use hellas_rpc::spec::ModelSpec;
 use hellas_rpc::stream::input_event_from_pb;
 use std::time::{Duration, Instant};
@@ -36,6 +37,15 @@ fn dtype_to_wire(dtype: Dtype) -> String {
         Dtype::F8 => "f8".to_string(),
         Dtype::U32 => "u32".to_string(),
     }
+}
+
+fn parse_runner_public_key(key: Option<PbPublicKey>) -> Result<PublicKey, ExecutorError> {
+    key.ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string()))
+        .and_then(|key| {
+            public_key_from_pb(key).map_err(|err| {
+                ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
+            })
+        })
 }
 
 impl Executor {
@@ -73,15 +83,15 @@ impl Executor {
         }
     }
 
-    pub(super) async fn handle_quote_symbolic(
+    pub(super) async fn handle_quote_evaluate(
         &mut self,
-        request: PbSymbolicRequest,
+        request: PbEvaluateRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         self.store.prune_expired_quotes(Instant::now());
-        let symbolic_request = symbolic_request_from_pb(request)?;
+        let evaluate_request = evaluate_request_from_pb(request)?;
         let resolved = self
             .artifacts
-            .resolve_symbolic_request(symbolic_request.clone())
+            .resolve_evaluate_request(evaluate_request.clone())
             .await?;
         if !self.supported_dtypes.contains(&resolved.locator.dtype) {
             return Err(ExecutorError::DtypeNotSupported {
@@ -98,13 +108,14 @@ impl Executor {
                 resolved.locator.spec()
             )));
         }
-        let request_commitment = Symbolic::commit_request(&symbolic_request);
+        let request_commitment = Evaluate::commit_request(&evaluate_request);
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: resolved.locator.spec(),
-            kind: QuoteKind::Symbolic {
-                symbolic_request,
+            runner_public_key: evaluate_request.runner_public_key,
+            kind: QuoteKind::Evaluate {
+                evaluate_request,
                 locator: resolved.locator,
                 invocation: resolved.invocation,
             },
@@ -142,6 +153,7 @@ impl Executor {
             service,
             method,
             body,
+            caller_key,
             ..
         } = verify_input_events(&input).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!(
@@ -168,6 +180,7 @@ impl Executor {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: format!("fetch:{service}/{method}"),
+            runner_public_key: caller_key,
             kind: QuoteKind::Fetch {
                 request: provider_request,
             },
@@ -212,16 +225,17 @@ impl Executor {
         }
 
         let resolved = self.artifacts.record_prepared_text(&plan).await?;
-        let symbolic_request = resolved.symbolic_request.clone();
-        let symbolic_request_pb = symbolic_request_to_pb(&symbolic_request);
-        let request_commitment = Symbolic::commit_request(&symbolic_request);
+        let evaluate_request = resolved.evaluate_request.clone();
+        let evaluate_request_pb = evaluate_request_to_pb(&evaluate_request);
+        let request_commitment = Evaluate::commit_request(&evaluate_request);
         let commitment_id = request_commitment.digest();
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             request_commitment,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: plan.locator.spec(),
-            kind: QuoteKind::Symbolic {
-                symbolic_request,
+            runner_public_key: evaluate_request.runner_public_key,
+            kind: QuoteKind::Evaluate {
+                evaluate_request,
                 locator: resolved.locator,
                 invocation: resolved.invocation,
             },
@@ -237,7 +251,7 @@ impl Executor {
             max_new_tokens = plan.invocation.max_new_tokens,
             amount = STATIC_QUOTE_AMOUNT,
             total_ms = total_start.elapsed().as_millis(),
-            "quoted prepared symbolic text execution"
+            "quoted prepared evaluate text execution"
         );
 
         Ok(TicketOutcome {
@@ -249,7 +263,7 @@ impl Executor {
                 }),
                 prompt_tokens: plan.invocation.input_ids.len() as u32,
                 dtype: dtype_to_wire(plan.locator.dtype),
-                symbolic_request: Some(symbolic_request_pb),
+                evaluate_request: Some(evaluate_request_pb),
             },
             provenance: ExecutionProvenance {
                 commitment_id: *commitment_id.as_bytes(),
@@ -269,8 +283,12 @@ impl Executor {
         )?;
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
-        let mut prepared_request =
-            assets.build_quote_prepared_text_request(&prepared, request.max_new_tokens)?;
+        let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
+        let mut prepared_request = assets.build_quote_prepared_text_request(
+            &prepared,
+            request.max_new_tokens,
+            &runner_public_key,
+        )?;
         prepared_request.accept_dtypes = vec![dtype_to_wire(dtype)];
         let inner = self.handle_quote_prepared_text(prepared_request).await?;
 
@@ -279,7 +297,7 @@ impl Executor {
                 ticket: inner.response.ticket,
                 prompt_tokens,
                 dtype: inner.response.dtype,
-                symbolic_request: inner.response.symbolic_request,
+                evaluate_request: inner.response.evaluate_request,
             },
             provenance: inner.provenance,
         })
@@ -311,8 +329,12 @@ impl Executor {
         }
         let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
-        let mut prepared_request =
-            assets.build_quote_prepared_text_request(&prepared, request.max_new_tokens)?;
+        let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
+        let mut prepared_request = assets.build_quote_prepared_text_request(
+            &prepared,
+            request.max_new_tokens,
+            &runner_public_key,
+        )?;
         prepared_request.accept_dtypes = vec![dtype_to_wire(dtype)];
         let inner = self.handle_quote_prepared_text(prepared_request).await?;
 
@@ -321,7 +343,7 @@ impl Executor {
                 ticket: inner.response.ticket,
                 prompt_tokens,
                 dtype: inner.response.dtype,
-                symbolic_request: inner.response.symbolic_request,
+                evaluate_request: inner.response.evaluate_request,
             },
             provenance: inner.provenance,
         })

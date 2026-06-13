@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use catnix::{Canonical, CanonicalDecode, InputAddressed, OutputAddressed};
-use hellas_core::{Digest, SymbolicRequest, hash_tuple};
+use hellas_core::{Digest, EvaluateRequest, hash_tuple};
 use hellas_rpc::ExecutorError;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{Invocation, ModelLocator, QuotePlan};
 
-const SYMBOLIC_INDEX_FILE: &str = "symbolic-index.json";
+const EVALUATE_INDEX_FILE: &str = "evaluate-index.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactStoreConfig {
@@ -121,13 +121,13 @@ impl ArtifactBlobStore {
 }
 
 #[derive(Default)]
-struct SymbolicIndexData {
+struct EvaluateIndexData {
     bound_terms: HashMap<catnix::BoundTermId, ModelLocator>,
     outputs_by_execution: HashMap<catnix::TextExecutionId, catnix::TextArtifactId>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct PersistedSymbolicIndex {
+struct PersistedEvaluateIndex {
     #[serde(default)]
     bound_terms: Vec<PersistedBoundTerm>,
     #[serde(default)]
@@ -149,13 +149,13 @@ struct PersistedExecutionOutput {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedSymbolicExecution {
-    pub symbolic_request: SymbolicRequest,
+pub(crate) struct ResolvedEvaluateExecution {
+    pub evaluate_request: EvaluateRequest,
     pub locator: ModelLocator,
     pub invocation: Invocation,
 }
 
-pub(crate) struct SymbolicArtifactStore {
+pub(crate) struct EvaluateArtifactStore {
     blob_store: ArtifactBlobStore,
     index_path: Option<PathBuf>,
     canonical_blobs: HashMap<catnix::Digest, Vec<u8>>,
@@ -173,13 +173,13 @@ struct MaterializedTextSource {
     tokens: Vec<u32>,
 }
 
-impl Default for SymbolicArtifactStore {
+impl Default for EvaluateArtifactStore {
     fn default() -> Self {
         Self::memory()
     }
 }
 
-impl SymbolicArtifactStore {
+impl EvaluateArtifactStore {
     pub(crate) fn memory() -> Self {
         Self::new(ArtifactBlobStore::memory())
     }
@@ -188,8 +188,8 @@ impl SymbolicArtifactStore {
         match config {
             ArtifactStoreConfig::Memory => Ok(Self::memory()),
             ArtifactStoreConfig::Fs(path) => {
-                let index_path = path.join(SYMBOLIC_INDEX_FILE);
-                let index = load_symbolic_index(&index_path)?;
+                let index_path = path.join(EVALUATE_INDEX_FILE);
+                let index = load_evaluate_index(&index_path)?;
                 Ok(Self::with_index(
                     ArtifactBlobStore::fs(path).await?,
                     Some(index_path),
@@ -200,13 +200,13 @@ impl SymbolicArtifactStore {
     }
 
     fn new(blob_store: ArtifactBlobStore) -> Self {
-        Self::with_index(blob_store, None, SymbolicIndexData::default())
+        Self::with_index(blob_store, None, EvaluateIndexData::default())
     }
 
     fn with_index(
         blob_store: ArtifactBlobStore,
         index_path: Option<PathBuf>,
-        index: SymbolicIndexData,
+        index: EvaluateIndexData,
     ) -> Self {
         Self {
             blob_store,
@@ -225,12 +225,12 @@ impl SymbolicArtifactStore {
     pub async fn record_prepared_text(
         &mut self,
         plan: &QuotePlan,
-    ) -> Result<ResolvedSymbolicExecution, ExecutorError> {
+    ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let bound_term_id =
             catnix::BoundTermId::from_digest(to_catnix_digest(binding_digest(&plan.locator)));
         if let Entry::Vacant(entry) = self.bound_terms.entry(bound_term_id) {
             entry.insert(plan.locator.clone());
-            self.persist_symbolic_index()?;
+            self.persist_evaluate_index()?;
         }
 
         let from = match plan.initial_artifact_id {
@@ -254,23 +254,24 @@ impl SymbolicArtifactStore {
         let policy_id = self.insert_policy(policy).await?;
         let execution = catnix::TextExecution::new(from, prompt_tokens_id, policy_id);
         let execution_id = self.insert_text_execution(execution).await?;
-        let symbolic_request = SymbolicRequest {
+        let evaluate_request = EvaluateRequest {
             text_execution: from_catnix_digest(execution_id.digest()),
+            runner_public_key: plan.runner_public_key,
         };
 
-        Ok(ResolvedSymbolicExecution {
-            symbolic_request,
+        Ok(ResolvedEvaluateExecution {
+            evaluate_request,
             locator: plan.locator.clone(),
             invocation: plan.invocation.clone(),
         })
     }
 
-    pub async fn resolve_symbolic_request(
+    pub async fn resolve_evaluate_request(
         &mut self,
-        symbolic_request: SymbolicRequest,
-    ) -> Result<ResolvedSymbolicExecution, ExecutorError> {
+        evaluate_request: EvaluateRequest,
+    ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let execution_id =
-            catnix::TextExecutionId::from_digest(to_catnix_digest(symbolic_request.text_execution));
+            catnix::TextExecutionId::from_digest(to_catnix_digest(evaluate_request.text_execution));
         let execution = self.text_execution(execution_id).await?;
         let source = self.materialize_source(execution.from()).await?;
         let prompt_tokens = self.token_ids(execution.prompt_tokens()).await?;
@@ -290,8 +291,8 @@ impl SymbolicArtifactStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ResolvedSymbolicExecution {
-            symbolic_request,
+        Ok(ResolvedEvaluateExecution {
+            evaluate_request,
             locator: source.locator,
             invocation: Invocation {
                 input_ids,
@@ -329,12 +330,12 @@ impl SymbolicArtifactStore {
 
     pub async fn record_completed_text(
         &mut self,
-        symbolic_request: &SymbolicRequest,
+        evaluate_request: &EvaluateRequest,
         invocation: &Invocation,
         output_tokens: &[u32],
     ) -> Result<Digest, ExecutorError> {
         let execution_id =
-            catnix::TextExecutionId::from_digest(to_catnix_digest(symbolic_request.text_execution));
+            catnix::TextExecutionId::from_digest(to_catnix_digest(evaluate_request.text_execution));
         let _ = self.text_execution(execution_id).await?;
 
         let generated_tokens_id = self
@@ -357,7 +358,7 @@ impl SymbolicArtifactStore {
         let artifact_id = self.insert_text_artifact(artifact).await?;
         if let Entry::Vacant(entry) = self.outputs_by_execution.entry(execution_id) {
             entry.insert(artifact_id);
-            self.persist_symbolic_index()?;
+            self.persist_evaluate_index()?;
         }
         Ok(from_catnix_digest(artifact_id.digest()))
     }
@@ -466,7 +467,7 @@ impl SymbolicArtifactStore {
             .copied()
             .ok_or_else(|| {
                 ExecutorError::InvalidQuoteRequest(format!(
-                    "lazy symbolic source {execution_id} has no cached output artifact"
+                    "lazy evaluate source {execution_id} has no cached output artifact"
                 ))
             })
     }
@@ -651,11 +652,11 @@ impl SymbolicArtifactStore {
         Ok(())
     }
 
-    fn persist_symbolic_index(&self) -> Result<(), ExecutorError> {
+    fn persist_evaluate_index(&self) -> Result<(), ExecutorError> {
         let Some(path) = &self.index_path else {
             return Ok(());
         };
-        persist_symbolic_index(path, self)
+        persist_evaluate_index(path, self)
     }
 
     #[cfg(test)]
@@ -678,76 +679,76 @@ fn validate_execution_output_mapping(
     match artifact {
         catnix::TextArtifact::Output(output) if output.execution() == execution_id => Ok(()),
         catnix::TextArtifact::Output(output) => Err(ExecutorError::InvalidQuoteRequest(format!(
-            "lazy symbolic source {execution_id} maps to artifact {artifact_id}, but that artifact realizes {}",
+            "lazy evaluate source {execution_id} maps to artifact {artifact_id}, but that artifact realizes {}",
             output.execution()
         ))),
         catnix::TextArtifact::Identity { .. } => Err(ExecutorError::InvalidQuoteRequest(format!(
-            "lazy symbolic source {execution_id} maps to identity artifact {artifact_id}"
+            "lazy evaluate source {execution_id} maps to identity artifact {artifact_id}"
         ))),
     }
 }
 
-fn load_symbolic_index(path: &Path) -> Result<SymbolicIndexData, ExecutorError> {
+fn load_evaluate_index(path: &Path) -> Result<EvaluateIndexData, ExecutorError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SymbolicIndexData::default());
+            return Ok(EvaluateIndexData::default());
         }
         Err(err) => {
             return Err(ExecutorError::ArtifactStore(format!(
-                "failed to read symbolic artifact index {}: {err}",
+                "failed to read evaluate artifact index {}: {err}",
                 path.display()
             )));
         }
     };
-    let persisted: PersistedSymbolicIndex = serde_json::from_slice(&bytes).map_err(|err| {
+    let persisted: PersistedEvaluateIndex = serde_json::from_slice(&bytes).map_err(|err| {
         ExecutorError::ArtifactStore(format!(
-            "failed to decode symbolic artifact index {}: {err}",
+            "failed to decode evaluate artifact index {}: {err}",
             path.display()
         ))
     })?;
     persisted.try_into_index()
 }
 
-fn persist_symbolic_index(path: &Path, store: &SymbolicArtifactStore) -> Result<(), ExecutorError> {
-    let persisted = PersistedSymbolicIndex::from_store(store);
+fn persist_evaluate_index(path: &Path, store: &EvaluateArtifactStore) -> Result<(), ExecutorError> {
+    let persisted = PersistedEvaluateIndex::from_store(store);
     let bytes = serde_json::to_vec_pretty(&persisted).map_err(|err| {
-        ExecutorError::ArtifactStore(format!("failed to encode symbolic artifact index: {err}"))
+        ExecutorError::ArtifactStore(format!("failed to encode evaluate artifact index: {err}"))
     })?;
     let parent = path.parent().ok_or_else(|| {
         ExecutorError::ArtifactStore(format!(
-            "symbolic artifact index path {} has no parent",
+            "evaluate artifact index path {} has no parent",
             path.display()
         ))
     })?;
     fs::create_dir_all(parent).map_err(|err| {
         ExecutorError::ArtifactStore(format!(
-            "failed to create symbolic artifact index directory {}: {err}",
+            "failed to create evaluate artifact index directory {}: {err}",
             parent.display()
         ))
     })?;
     let tmp = path.with_file_name(format!(
         ".{}.tmp.{}",
-        SYMBOLIC_INDEX_FILE,
+        EVALUATE_INDEX_FILE,
         std::process::id()
     ));
     fs::write(&tmp, bytes).map_err(|err| {
         ExecutorError::ArtifactStore(format!(
-            "failed to write symbolic artifact index temp file {}: {err}",
+            "failed to write evaluate artifact index temp file {}: {err}",
             tmp.display()
         ))
     })?;
     fs::rename(&tmp, path).map_err(|err| {
         let _ = fs::remove_file(&tmp);
         ExecutorError::ArtifactStore(format!(
-            "failed to persist symbolic artifact index {}: {err}",
+            "failed to persist evaluate artifact index {}: {err}",
             path.display()
         ))
     })
 }
 
-impl PersistedSymbolicIndex {
-    fn from_store(store: &SymbolicArtifactStore) -> Self {
+impl PersistedEvaluateIndex {
+    fn from_store(store: &EvaluateArtifactStore) -> Self {
         let mut bound_terms: Vec<_> = store
             .bound_terms
             .iter()
@@ -776,8 +777,8 @@ impl PersistedSymbolicIndex {
         }
     }
 
-    fn try_into_index(self) -> Result<SymbolicIndexData, ExecutorError> {
-        let mut index = SymbolicIndexData::default();
+    fn try_into_index(self) -> Result<EvaluateIndexData, ExecutorError> {
+        let mut index = EvaluateIndexData::default();
         for entry in self.bound_terms {
             let bound_term = catnix::BoundTermId::from_digest(parse_catnix_digest(
                 &entry.bound_term,
@@ -785,7 +786,7 @@ impl PersistedSymbolicIndex {
             )?);
             let dtype = catgrad::prelude::Dtype::from_str(&entry.dtype).map_err(|err| {
                 ExecutorError::ArtifactStore(format!(
-                    "invalid dtype {:?} in symbolic artifact index: {err}",
+                    "invalid dtype {:?} in evaluate artifact index: {err}",
                     entry.dtype
                 ))
             })?;
@@ -904,6 +905,19 @@ mod tests {
     use super::*;
     use catgrad::prelude::Dtype;
 
+    fn runner_public_key() -> hellas_core::PublicKey {
+        hellas_core::ProducerSigningKey::from_secret_bytes([8; 32])
+            .expect("valid test key")
+            .public_key()
+    }
+
+    fn evaluate_request(text_execution: Digest) -> EvaluateRequest {
+        EvaluateRequest {
+            text_execution,
+            runner_public_key: runner_public_key(),
+        }
+    }
+
     fn plan() -> QuotePlan {
         QuotePlan {
             locator: ModelLocator {
@@ -917,19 +931,20 @@ mod tests {
                 stop_token_ids: vec![4, 5],
             },
             initial_artifact_id: None,
+            runner_public_key: runner_public_key(),
         }
     }
 
     #[tokio::test]
     async fn prepared_text_round_trips_through_store() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let recorded = store.record_prepared_text(&plan()).await.unwrap();
         let resolved = store
-            .resolve_symbolic_request(recorded.symbolic_request.clone())
+            .resolve_evaluate_request(recorded.evaluate_request.clone())
             .await
             .unwrap();
 
-        assert_eq!(resolved.symbolic_request, recorded.symbolic_request);
+        assert_eq!(resolved.evaluate_request, recorded.evaluate_request);
         assert_eq!(resolved.locator, recorded.locator);
         assert_eq!(resolved.invocation.input_ids, recorded.invocation.input_ids);
         assert_eq!(
@@ -944,10 +959,10 @@ mod tests {
 
     #[tokio::test]
     async fn completed_text_artifact_can_start_a_followup() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let first = store.record_prepared_text(&plan()).await.unwrap();
         let first_artifact = store
-            .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+            .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
             .await
             .unwrap();
         let mut next_plan = plan();
@@ -955,7 +970,7 @@ mod tests {
         next_plan.initial_artifact_id = Some(first_artifact);
         let next = store.record_prepared_text(&next_plan).await.unwrap();
         let resolved = store
-            .resolve_symbolic_request(next.symbolic_request)
+            .resolve_evaluate_request(next.evaluate_request)
             .await
             .unwrap();
 
@@ -964,14 +979,14 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_input_source_uses_cached_output_artifact() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let first = store.record_prepared_text(&plan()).await.unwrap();
         store
-            .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+            .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
             .await
             .unwrap();
         let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            first.symbolic_request.text_execution,
+            first.evaluate_request.text_execution,
         ));
         let prompt_tokens = store
             .insert_token_ids(catnix::TokenIds::from([20]))
@@ -988,9 +1003,7 @@ mod tests {
         );
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let resolved = store
-            .resolve_symbolic_request(SymbolicRequest {
-                text_execution: from_catnix_digest(lazy_id.digest()),
-            })
+            .resolve_evaluate_request(evaluate_request(from_catnix_digest(lazy_id.digest())))
             .await
             .unwrap();
 
@@ -999,10 +1012,10 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_input_rejects_metadata_that_does_not_realize_execution() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let first = store.record_prepared_text(&plan()).await.unwrap();
         let first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-            first.symbolic_request.text_execution,
+            first.evaluate_request.text_execution,
         ));
         let first_execution_value = store.text_execution(first_execution).await.unwrap();
         let identity_id = match first_execution_value.from() {
@@ -1027,9 +1040,7 @@ mod tests {
         );
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let err = store
-            .resolve_symbolic_request(SymbolicRequest {
-                text_execution: from_catnix_digest(lazy_id.digest()),
-            })
+            .resolve_evaluate_request(evaluate_request(from_catnix_digest(lazy_id.digest())))
             .await
             .unwrap_err();
 
@@ -1038,11 +1049,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_text_execution_is_rejected() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let err = store
-            .resolve_symbolic_request(SymbolicRequest {
-                text_execution: Digest::from_bytes([7; 32]),
-            })
+            .resolve_evaluate_request(evaluate_request(Digest::from_bytes([7; 32])))
             .await
             .unwrap_err();
 
@@ -1051,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_artifact_bytes_can_be_published_and_fetched() {
-        let mut store = SymbolicArtifactStore::default();
+        let mut store = EvaluateArtifactStore::default();
         let tokens = catnix::TokenIds::from([1, 2, 3]);
         let bytes = tokens.canonical_bytes();
         let digest = store.publish_canonical_bytes(bytes.clone()).await.unwrap();
@@ -1068,23 +1077,23 @@ mod tests {
         let first_artifact;
         let first_request;
         {
-            let mut store = SymbolicArtifactStore::open(ArtifactStoreConfig::fs(&path))
+            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
                 .await
                 .unwrap();
             let first = store.record_prepared_text(&plan()).await.unwrap();
             first_artifact = store
-                .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+                .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
                 .await
                 .unwrap();
-            first_request = first.symbolic_request;
+            first_request = first.evaluate_request;
             store.shutdown().await.unwrap();
         }
 
         {
-            let mut store = SymbolicArtifactStore::open(ArtifactStoreConfig::fs(&path))
+            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
                 .await
                 .unwrap();
-            let resolved = store.resolve_symbolic_request(first_request).await.unwrap();
+            let resolved = store.resolve_evaluate_request(first_request).await.unwrap();
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3]);
 
             let mut next_plan = plan();
@@ -1092,7 +1101,7 @@ mod tests {
             next_plan.initial_artifact_id = Some(first_artifact);
             let next = store.record_prepared_text(&next_plan).await.unwrap();
             let resolved = store
-                .resolve_symbolic_request(next.symbolic_request)
+                .resolve_evaluate_request(next.evaluate_request)
                 .await
                 .unwrap();
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
@@ -1109,22 +1118,22 @@ mod tests {
 
         let first_execution;
         {
-            let mut store = SymbolicArtifactStore::open(ArtifactStoreConfig::fs(&path))
+            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
                 .await
                 .unwrap();
             let first = store.record_prepared_text(&plan()).await.unwrap();
             store
-                .record_completed_text(&first.symbolic_request, &first.invocation, &[10, 11])
+                .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
                 .await
                 .unwrap();
             first_execution = catnix::TextExecutionId::from_digest(to_catnix_digest(
-                first.symbolic_request.text_execution,
+                first.evaluate_request.text_execution,
             ));
             store.shutdown().await.unwrap();
         }
 
         {
-            let mut store = SymbolicArtifactStore::open(ArtifactStoreConfig::fs(&path))
+            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
                 .await
                 .unwrap();
             let prompt_tokens = store
@@ -1142,9 +1151,7 @@ mod tests {
             );
             let lazy_id = store.insert_text_execution(lazy).await.unwrap();
             let resolved = store
-                .resolve_symbolic_request(SymbolicRequest {
-                    text_execution: from_catnix_digest(lazy_id.digest()),
-                })
+                .resolve_evaluate_request(evaluate_request(from_catnix_digest(lazy_id.digest())))
                 .await
                 .unwrap();
 

@@ -13,7 +13,7 @@ use hellas_core::{
     Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey, SignedReceipt,
     canonical_dag_cbor,
 };
-use hellas_core::{Symbolic, SymbolicOutput};
+use hellas_core::{Evaluate, EvaluateOutput};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::error::StateError;
 use hellas_rpc::fetch::FetchOutputTranscriptBuilder;
@@ -21,6 +21,7 @@ use hellas_rpc::pb::execute::{
     FinishStatus, RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
 };
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::run_ticket::{VerifiedRunTicket, verify_run_ticket};
 use hellas_rpc::stream::output_event_to_pb;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -40,18 +41,15 @@ impl Executor {
         &mut self,
         request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        let request_commitment = request.request_commitment;
-        let request_commitment_id: [u8; 32] =
-            request_commitment.as_slice().try_into().map_err(|_| {
-                ExecutorError::State(hellas_rpc::error::StateError::QuoteNotFound(format!(
-                    "invalid request_commitment length {}",
-                    request_commitment.len()
-                )))
-            })?;
+        let verified_run = verify_run_ticket(&request).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!("invalid run ticket: {err}"))
+        })?;
+        let request_commitment_id = verified_run.request_commitment;
+        let request_commitment = request_commitment_id.to_vec();
         let input_commitment =
             InputCommitment::from_digest(Digest::from_bytes(request_commitment_id));
         if let Some(outcome) = self
-            .replay_fetch_execution(input_commitment, request_commitment_id)
+            .replay_fetch_execution(input_commitment, request_commitment_id, &verified_run)
             .await?
         {
             return Ok(outcome);
@@ -73,9 +71,10 @@ impl Executor {
                 });
             }
         };
+        ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
         match quote.kind {
-            QuoteKind::Symbolic {
-                symbolic_request,
+            QuoteKind::Evaluate {
+                evaluate_request,
                 locator,
                 invocation,
             } => {
@@ -92,7 +91,7 @@ impl Executor {
                 let job = ExecuteJob {
                     execution_id: execution_id.clone(),
                     model_id: model_id.clone(),
-                    symbolic_request,
+                    evaluate_request,
                     locator,
                     invocation,
                     stream_batch_size,
@@ -130,7 +129,7 @@ impl Executor {
                     request_commitment = %format_request_commitment(&request_commitment),
                     queued,
                     queue_len = self.pending_executions.len(),
-                    "accepted symbolic execution"
+                    "accepted evaluate execution"
                 );
 
                 Ok(ExecuteOutcome {
@@ -203,7 +202,11 @@ impl Executor {
                                 .fetch_access_policy
                                 .cancel_reservation(pending.quota_reservation.as_ref());
                             if let Some(outcome) = self
-                                .replay_fetch_execution(input_commitment, request_commitment_id)
+                                .replay_fetch_execution(
+                                    input_commitment,
+                                    request_commitment_id,
+                                    &verified_run,
+                                )
                                 .await?
                             {
                                 return Ok(outcome);
@@ -228,7 +231,11 @@ impl Executor {
                                 .fetch_access_policy
                                 .cancel_reservation(pending.quota_reservation.as_ref());
                             if let Some(outcome) = self
-                                .replay_fetch_execution(input_commitment, request_commitment_id)
+                                .replay_fetch_execution(
+                                    input_commitment,
+                                    request_commitment_id,
+                                    &verified_run,
+                                )
                                 .await?
                             {
                                 return Ok(outcome);
@@ -271,6 +278,7 @@ impl Executor {
         &self,
         input_commitment: InputCommitment,
         request_commitment_id: [u8; 32],
+        verified_run: &VerifiedRunTicket,
     ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
         let producer_key = self.producer_key.public_key();
         let transcript = match self
@@ -281,6 +289,10 @@ impl Executor {
             Err(FetchStateError::NotFound | FetchStateError::NotCompleted) => return Ok(None),
             Err(err) => return Err(fetch_execute_error(err)),
         };
+        let verified_input = transcript.verify(&producer_key).map_err(|err| {
+            ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
+        })?;
+        ensure_authorized_runner(&verified_input.caller_key, &verified_run.public_key)?;
         let outcome = fetch_transcript_outcome(request_commitment_id, &transcript).await?;
         info!(
             request_commitment = %format_request_commitment(input_commitment.as_bytes()),
@@ -311,7 +323,7 @@ impl Executor {
         let WorkerCompletion {
             execution_id,
             model_id,
-            symbolic_request,
+            evaluate_request,
             invocation,
             sender,
             result,
@@ -324,8 +336,8 @@ impl Executor {
                 output_tokens,
             } => {
                 match self
-                    .completed_symbolic_termination(
-                        &symbolic_request,
+                    .completed_evaluate_termination(
+                        &evaluate_request,
                         &invocation,
                         stop_reason,
                         output_tokens,
@@ -361,20 +373,20 @@ impl Executor {
         self.dispatch_next_execution();
     }
 
-    async fn completed_symbolic_termination(
+    async fn completed_evaluate_termination(
         &mut self,
-        symbolic_request: &hellas_core::SymbolicRequest,
+        evaluate_request: &hellas_core::EvaluateRequest,
         invocation: &crate::state::Invocation,
         stop_reason: crate::state::StopReason,
         output_tokens: Vec<u32>,
     ) -> Result<crate::state::Termination, ExecutorError> {
         let text_artifact = self
             .artifacts
-            .record_completed_text(symbolic_request, invocation, &output_tokens)
+            .record_completed_text(evaluate_request, invocation, &output_tokens)
             .await?;
-        let symbolic_output = SymbolicOutput { text_artifact };
+        let evaluate_output = EvaluateOutput { text_artifact };
         let receipt =
-            SignedReceipt::sign::<Symbolic>(symbolic_request, &symbolic_output, &self.producer_key)
+            SignedReceipt::sign::<Evaluate>(evaluate_request, &evaluate_output, &self.producer_key)
                 .map_err(|err| {
                     ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
                 })?;
@@ -551,6 +563,19 @@ impl Executor {
                 }
             }
         }
+    }
+}
+
+fn ensure_authorized_runner(
+    expected: &hellas_core::PublicKey,
+    actual: &hellas_core::PublicKey,
+) -> Result<(), ExecutorError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(ExecutorError::PolicyDenied(
+            "run ticket signer is not authorized for this ticket".to_string(),
+        ))
     }
 }
 
@@ -991,12 +1016,21 @@ mod tests {
         }
     }
 
+    fn run_ticket_request(request_commitment: &[u8], key: &ProducerSigningKey) -> RunTicketRequest {
+        let request_commitment: [u8; 32] = request_commitment
+            .try_into()
+            .expect("test request commitment is 32 bytes");
+        hellas_rpc::run_ticket::sign_run_ticket(request_commitment, key)
+            .expect("test run ticket signs")
+    }
+
     async fn run_one(
         handle: &crate::ExecutorHandle,
         request_commitment: Vec<u8>,
+        key: &ProducerSigningKey,
     ) -> (Vec<WorkChunk>, WorkFinished) {
         let outcome = handle
-            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .run_ticket_handle(run_ticket_request(&request_commitment, key))
             .await
             .unwrap();
         drain_outcome(outcome.events).await
@@ -1061,9 +1095,13 @@ mod tests {
         .unwrap()
     }
 
-    async fn run_failed(handle: &crate::ExecutorHandle, request_commitment: Vec<u8>) -> WorkFailed {
+    async fn run_failed(
+        handle: &crate::ExecutorHandle,
+        request_commitment: Vec<u8>,
+        key: &ProducerSigningKey,
+    ) -> WorkFailed {
         let mut outcome = handle
-            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .run_ticket_handle(run_ticket_request(&request_commitment, key))
             .await
             .unwrap()
             .events;
@@ -1106,8 +1144,10 @@ mod tests {
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
-        let (chunks, first) = run_one(&handle, ticket.request_commitment.clone()).await;
-        let (replay_chunks, replayed) = run_one(&handle, ticket.request_commitment).await;
+        let (chunks, first) =
+            run_one(&handle, ticket.request_commitment.clone(), &signing_key).await;
+        let (replay_chunks, replayed) =
+            run_one(&handle, ticket.request_commitment, &signing_key).await;
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].bytes, b"event:ok");
@@ -1146,7 +1186,7 @@ mod tests {
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
-        let failed = run_failed(&handle, ticket.request_commitment).await;
+        let failed = run_failed(&handle, ticket.request_commitment, &signing_key).await;
 
         assert_eq!(failed.position, 0);
         assert!(failed.error.contains("mock fetch response not programmed"));
@@ -1178,8 +1218,8 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let signing_key = key();
-        let events = build_input_events("echo", "run", br#"{"hello":"crash"}"#, &signing_key)
-            .unwrap();
+        let events =
+            build_input_events("echo", "run", br#"{"hello":"crash"}"#, &signing_key).unwrap();
         let input = hellas_rpc::fetch::verify_input_events(&events)
             .unwrap()
             .input_commitment;
@@ -1222,9 +1262,7 @@ mod tests {
         .unwrap();
 
         let err = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: input.digest().as_bytes().to_vec(),
-            })
+            .run_ticket_handle(run_ticket_request(input.digest().as_bytes(), &signing_key))
             .await
             .unwrap_err();
 
@@ -1281,9 +1319,7 @@ mod tests {
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
         let err = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: ticket.request_commitment,
-            })
+            .run_ticket_handle(run_ticket_request(&ticket.request_commitment, &signing_key))
             .await
             .unwrap_err();
 
@@ -1302,15 +1338,17 @@ mod tests {
         let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
 
         let first_outcome = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: first_ticket.request_commitment,
-            })
+            .run_ticket_handle(run_ticket_request(
+                &first_ticket.request_commitment,
+                &signing_key,
+            ))
             .await
             .unwrap();
         let error = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: second_ticket.request_commitment.clone(),
-            })
+            .run_ticket_handle(run_ticket_request(
+                &second_ticket.request_commitment,
+                &signing_key,
+            ))
             .await
             .unwrap_err();
         assert!(matches!(error, ExecutorError::QueueFull { capacity: 0 }));
@@ -1324,7 +1362,7 @@ mod tests {
 
         let (chunks, second_finished) = timeout(
             Duration::from_secs(2),
-            run_one(&handle, second_ticket.request_commitment),
+            run_one(&handle, second_ticket.request_commitment, &signing_key),
         )
         .await
         .unwrap();
@@ -1344,15 +1382,17 @@ mod tests {
         let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
 
         let first_outcome = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: first_ticket.request_commitment,
-            })
+            .run_ticket_handle(run_ticket_request(
+                &first_ticket.request_commitment,
+                &signing_key,
+            ))
             .await
             .unwrap();
         let second_outcome = handle
-            .run_ticket_handle(RunTicketRequest {
-                request_commitment: second_ticket.request_commitment,
-            })
+            .run_ticket_handle(run_ticket_request(
+                &second_ticket.request_commitment,
+                &signing_key,
+            ))
             .await
             .unwrap();
 

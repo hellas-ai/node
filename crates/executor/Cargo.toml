@@ -24,7 +24,7 @@ hellas-core.workspace = true
 hellas-rpc = { workspace = true, features = [
     "node",
     "execute",
-    "symbolic",
+    "evaluate",
     "fetch",
     "courtesy",
 ] }

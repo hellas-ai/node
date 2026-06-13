@@ -10,14 +10,16 @@ pub mod stream;
 pub mod tags;
 pub mod value;
 
-pub use commitment::{ReceiptCommitment, RequestCommitment, ResultCommitment, SchemeId};
+pub use commitment::{
+    AssuranceStrategy, ReceiptCommitment, RequestCommitment, ResultCommitment, SchemeId,
+};
 pub use digest::{Digest, hash_tuple};
 pub use receipt::{
     DeliveryOutput, DeliveryRequest, ReceiptBody, SignedReceipt, VerifyError, verify_delivery,
     verify_receipt,
 };
 pub use scheme::CommitmentScheme;
-pub use schemes::symbolic::{Symbolic, SymbolicOutput, SymbolicRequest};
+pub use schemes::evaluate::{Evaluate, EvaluateOutput, EvaluateRequest};
 pub use signature::{
     ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,
 };

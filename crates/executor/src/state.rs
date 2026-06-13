@@ -5,17 +5,18 @@ use std::time::Instant;
 use crate::DEFAULT_MAX_SEQ;
 use crate::fetch_provider::FetchProviderRequest;
 use catgrad::prelude::Dtype;
-use hellas_core::{Digest, RequestCommitment, SymbolicRequest};
+use hellas_core::{Digest, EvaluateRequest, PublicKey, RequestCommitment};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::encode_token_ids;
 use hellas_rpc::pb::courtesy::{
-    QuotePreparedTextRequest, SymbolicStart as PbSymbolicStart, symbolic_start,
+    EvaluateStart as PbEvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
+use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{
     FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
     WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
 };
-use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
+use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 use uuid::Uuid;
 
@@ -45,6 +46,7 @@ pub(crate) struct QuotePlan {
     pub locator: ModelLocator,
     pub invocation: Invocation,
     pub initial_artifact_id: Option<Digest>,
+    pub runner_public_key: PublicKey,
 }
 
 impl QuotePlan {
@@ -92,7 +94,17 @@ impl QuotePlan {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let initial_artifact_id = parse_symbolic_start(request.start)?;
+        let initial_artifact_id = parse_evaluate_start(request.start)?;
+        let runner_public_key = request
+            .runner_public_key
+            .ok_or_else(|| {
+                ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string())
+            })
+            .and_then(|key| {
+                public_key_from_pb(key).map_err(|err| {
+                    ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
+                })
+            })?;
 
         Ok(Self {
             locator: ModelLocator {
@@ -106,6 +118,7 @@ impl QuotePlan {
                 stop_token_ids,
             },
             initial_artifact_id,
+            runner_public_key,
         })
     }
 }
@@ -145,27 +158,38 @@ pub(crate) fn resolve_accept_dtypes(
     })
 }
 
-pub(crate) fn symbolic_request_to_pb(request: &SymbolicRequest) -> PbSymbolicRequest {
-    PbSymbolicRequest {
+pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateRequest {
+    PbEvaluateRequest {
         text_execution: request.text_execution.as_bytes().to_vec(),
+        runner_public_key: Some(public_key_to_pb(&request.runner_public_key)),
     }
 }
 
-pub(crate) fn symbolic_request_from_pb(
-    request: PbSymbolicRequest,
-) -> Result<SymbolicRequest, ExecutorError> {
-    Ok(SymbolicRequest {
+pub(crate) fn evaluate_request_from_pb(
+    request: PbEvaluateRequest,
+) -> Result<EvaluateRequest, ExecutorError> {
+    Ok(EvaluateRequest {
         text_execution: Digest::from_bytes(bytes32(&request.text_execution, "text_execution")?),
+        runner_public_key: request
+            .runner_public_key
+            .ok_or_else(|| {
+                ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string())
+            })
+            .and_then(|key| {
+                public_key_from_pb(key).map_err(|err| {
+                    ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
+                })
+            })?,
     })
 }
 
-fn parse_symbolic_start(start: Option<PbSymbolicStart>) -> Result<Option<Digest>, ExecutorError> {
+fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>, ExecutorError> {
     let start = start
         .and_then(|start| start.kind)
-        .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing symbolic start".to_string()))?;
+        .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing evaluate start".to_string()))?;
     match start {
-        symbolic_start::Kind::Genesis(_) => Ok(None),
-        symbolic_start::Kind::Artifact(artifact) => Ok(Some(Digest::from_bytes(bytes32(
+        evaluate_start::Kind::Genesis(_) => Ok(None),
+        evaluate_start::Kind::Artifact(artifact) => Ok(Some(Digest::from_bytes(bytes32(
             &artifact.artifact,
             "artifact",
         )?))),
@@ -201,13 +225,14 @@ pub struct QuoteRecord {
     pub request_commitment: RequestCommitment,
     pub expires_at: Instant,
     pub model_id: String,
+    pub runner_public_key: PublicKey,
     pub kind: QuoteKind,
 }
 
 #[derive(Clone)]
 pub enum QuoteKind {
-    Symbolic {
-        symbolic_request: SymbolicRequest,
+    Evaluate {
+        evaluate_request: EvaluateRequest,
         locator: ModelLocator,
         invocation: Invocation,
     },

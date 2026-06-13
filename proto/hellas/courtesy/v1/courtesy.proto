@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hellas.courtesy.v1;
 
-import "hellas/symbolic/v1/symbolic.proto";
+import "hellas/evaluate/v1/evaluate.proto";
 import "hellas/v1/hellas.proto";
 
 // Non-core provider conveniences. These APIs are not settlement/protocol
@@ -21,16 +21,16 @@ service Courtesy {
   rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
 }
 
-message SymbolicStart {
+message EvaluateStart {
   oneof kind {
-    SymbolicGenesisStart genesis = 1;
-    SymbolicArtifactStart artifact = 2;
+    EvaluateGenesisStart genesis = 1;
+    EvaluateArtifactStart artifact = 2;
   }
 }
 
-message SymbolicGenesisStart {}
+message EvaluateGenesisStart {}
 
-message SymbolicArtifactStart {
+message EvaluateArtifactStart {
   // catnix OutputId<TextArtifact>; exactly 32 bytes.
   bytes artifact = 1;
 }
@@ -41,13 +41,14 @@ message QuotePreparedTextRequest {
   repeated uint32 prompt_token_ids = 3;
   uint32 max_new_tokens = 4;
   repeated uint32 stop_token_ids = 5;
-  SymbolicStart start = 6;
+  EvaluateStart start = 6;
   // Ordered preference list (each one of "f32", "f16", "bf16"). The server
   // picks the first entry it supports. Empty list lets the server pick its
   // preferred dtype freely. None of the entries supported -> request is
   // refused with FailedPrecondition. The chosen dtype is reported back in
   // QuotePreparedTextResponse.dtype.
   repeated string accept_dtypes = 7;
+  .hellas.v1.PublicKey runner_public_key = 8;
 }
 
 message QuotePreparedTextResponse {
@@ -55,10 +56,10 @@ message QuotePreparedTextResponse {
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
 }
 
-// Convenience RPC: the server handles tokenization and symbolic request
+// Convenience RPC: the server handles tokenization and evaluate request
 // construction. Intended for lightweight clients (browsers) that don't have
 // the tokenizer.
 message QuotePromptRequest {
@@ -72,6 +73,7 @@ message QuotePromptRequest {
   // refused with FailedPrecondition. The chosen dtype is reported back in
   // QuotePromptResponse.dtype.
   repeated string accept_dtypes = 5;
+  .hellas.v1.PublicKey runner_public_key = 6;
 }
 
 message QuotePromptResponse {
@@ -79,7 +81,7 @@ message QuotePromptResponse {
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
 }
 
 // Convenience RPC: chat-style prompt quoting.
@@ -102,6 +104,7 @@ message QuoteChatPromptRequest {
   // refused with FailedPrecondition. The chosen dtype is reported back in
   // QuoteChatPromptResponse.dtype.
   repeated string accept_dtypes = 6;
+  .hellas.v1.PublicKey runner_public_key = 7;
 }
 
 message QuoteChatPromptResponse {
@@ -109,11 +112,11 @@ message QuoteChatPromptResponse {
   uint32 prompt_tokens = 2;
   // The dtype the server actually committed to running this quote at.
   string dtype = 3;
-  .hellas.symbolic.v1.SymbolicRequest symbolic_request = 4;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
 }
 
 // Store one canonical catnix artifact by its BLAKE3 digest. This API does not
-// publish symbolic metadata such as model locators or lazy substitutions; those
+// publish evaluate metadata such as model locators or lazy substitutions; those
 // are separate provider-local interpretation state.
 message PutArtifactRequest {
   bytes canonical_artifact = 1;
@@ -163,7 +166,7 @@ message ListModelsResponse {
 message DecodeTokensRequest {
   string huggingface_model_id = 1;
   string huggingface_revision = 2;
-  // Raw token bytes (little-endian u32 token IDs, same format as Symbolic output).
+  // Raw token bytes (little-endian u32 token IDs, same format as Evaluate output).
   bytes token_bytes = 3;
 }
 

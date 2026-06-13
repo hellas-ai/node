@@ -1,7 +1,6 @@
-# Execution Model Proposal
+# Execution Model
 
-This document proposes the next execution architecture for Hellas nodes. The
-goal is to separate node hosting, execution schemes, and concrete backends so
+The goal is to separate node hosting, execution schemes, and concrete backends so
 local catgrad work and remote provider calls can share the same p2p runtime
 without mixing trust boundaries.
 
@@ -21,9 +20,9 @@ transport and accounting pieces already exist in `hellas-wire` and
 `hellas-rpc`; the missing layer is the orchestration that hosts a set of
 services on an iroh node.
 
-The current `hellas-executor` crate also combines several concepts:
+The `hellas-executor` crate currently combines several concepts:
 
-- catgrad-backed symbolic text execution;
+- catgrad-backed evaluate text execution;
 - helper APIs for tokenization, chat templating, token decoding, model listing,
   and stats;
 - the Fetch provider executor.
@@ -224,10 +223,6 @@ message FetchRequest {
 }
 ```
 
-Until the protocol bump, this semantic input transcript may be encoded through
-the current opaque `bytes payload` field. That is a wire encoding detail, not
-the Fetch model.
-
 Initial OpenAI Responses mapping (the current wire shape — see Fetch Routes
 And Configuration for the naming rule):
 
@@ -253,10 +248,8 @@ because the full input transcript commitment is not known before execution
 starts. The v1 Fetch shape is streaming-only, but its input stream is finite at
 ticket creation time.
 
-During the implementation phase, this can use the current opaque proto, ALPN,
-tags, and scheme id. In that phase the tag alone is not a behavioral guarantee;
-the route's trusted producer key set decides which producers are allowed to
-perform real provider Fetch work.
+The route's trusted producer key set decides which producers are allowed to
+perform provider Fetch work.
 
 ## Stream Commitment Law
 
@@ -420,16 +413,12 @@ That is weaker than an independently checkable `Evaluate` scheme. A future
 zkTLS-backed provider scheme can improve assurance, but that should be modeled
 as a strategy for Fetch, not as a peer scheme alongside Fetch.
 
-Current `SchemeId` mixes scheme and assurance strategy. A later protocol bump
-should separate:
+Receipts carry both axes explicitly:
 
 ```text
 scheme:   Fetch | Evaluate
-strategy: ProducerSignature | ZkTls | ...
+strategy: ProducerAttested | ZkTls | ...
 ```
-
-Until that bump, the OpenAI provider executor should be documented as
-producer-signature Fetch.
 
 ## Producer Identity And Verification
 
@@ -720,29 +709,20 @@ This is not a semantic conflict. `CreateTicket` quotes committed work.
 `client.fetch(...).await?` can create a ticket, run it, verify the transcript,
 and return the folded output stream.
 
-## Naming And Protocol Bump
+## Protocol Names
 
-The desired names are:
+The protocol names are:
 
-| Current | Desired | Meaning |
-| --- | --- | --- |
-| `Opaque` | `Fetch` | Effectful external call: input stream in, attested output stream out. |
-| `Symbolic` | `Evaluate` | Computation over committed inputs with a scheme-defined validity model. |
-| `Courtesy` | keep for now | Helper APIs that are explicitly outside settlement. |
-| `Execute` | keep for now | Generic ticket runner shared by schemes. |
+| Name | Meaning |
+| --- | --- |
+| `Fetch` | Effectful external call: input stream in, attested output stream out. |
+| `Evaluate` | Computation over committed inputs with a scheme-defined validity model. |
+| `Courtesy` | Helper APIs that are explicitly outside settlement. |
+| `Execute` | Generic ticket runner shared by schemes. |
 
-Renaming is wire-breaking:
-
-- proto package/service names affect generated ALPNs;
-- commitment tags and `SchemeId` bytes are part of signed receipt identity;
-- existing receipts cannot verify under new scheme ids.
-
-Therefore renaming must be a deliberate protocol version bump, not an early
-refactor.
-
-Do not rename `Execute` to `Run` now. The value is small and the blast radius is
-large. If we want a nicer high-level API, expose `client.run_ticket(...)` or
-`client.fetch(...)` wrappers without changing the core service name.
+`Execute` remains the core ticket runner. Higher-level clients can expose
+`client.fetch(...)` or `client.run_ticket(...)` wrappers without changing the
+settlement service.
 
 `Courtesy` should not automatically become `Prepare`. The code already uses
 "prepare" for tokenization and chat templating, and `Courtesy` carries a useful
@@ -755,7 +735,7 @@ bump is acceptable.
 The OpenAI-backed p2p node should:
 
 - listen on iroh only;
-- advertise the existing opaque/fetch ticket service, `Execute`, and `Node`;
+- advertise `Fetch`, `Execute`, and `Node`;
 - not advertise catgrad evaluate or courtesy/prepare services;
 - keep separate identity and producer signing key material;
 - read the OpenAI API key from a secret-backed environment file;
@@ -781,9 +761,8 @@ producer key set.
    matched centrally.
 5. Feature-gate `hellas-executor` so catgrad is optional and a fetch-only build
    is possible.
-6. Build the real Fetch core under the current opaque proto/ALPN/tags. Reuse
-   provider parsing for OpenAI policy; commit attested input and output
-   transcripts for settlement. *(done)*
+6. Build the real Fetch core. Reuse provider parsing for OpenAI policy; commit
+   attested input and output transcripts for settlement. *(done)*
 7. Add `fetch::openai` as a streaming-only executor. HTTP Responses requests
    lower to finite input streams; provider streaming stays streaming. *(done,
    plus a Codex OAuth provider)*
@@ -793,9 +772,6 @@ producer key set.
    *(done)*
 10. Verify a real attested transcript end-to-end from HTTP request through p2p
    Fetch execution.
-11. Only after behavior is proven, perform one protocol version bump for naming:
-   `Opaque -> Fetch`, `Symbolic -> Evaluate`, decide `Courtesy`, and resolve
-   `ZkTls` as an assurance strategy rather than a scheme.
-
-This keeps the wire stable while the behavior is being built. The rename should
-be the final cleanup once the new execution semantics are known-good.
+11. Keep the protocol surface direct: `Fetch`, `Evaluate`, `Courtesy`, and
+   `Execute`. Add new schemes or assurance strategies only when they introduce
+   a distinct settlement contract.

@@ -1,7 +1,7 @@
 mod execution;
 mod quote;
 
-use crate::artifacts::{ArtifactStoreConfig, SymbolicArtifactStore};
+use crate::artifacts::{ArtifactStoreConfig, EvaluateArtifactStore};
 use crate::backend;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
 use crate::fetch_policy::{FetchAccessPolicy, FetchQuotaStoreBackend};
@@ -24,7 +24,7 @@ pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
     pub(super) store: ExecutorState,
-    pub(super) artifacts: SymbolicArtifactStore,
+    pub(super) artifacts: EvaluateArtifactStore,
     pub(super) pending_executions: VecDeque<ExecuteJob>,
     pub(super) queue_capacity: usize,
     pub(super) models: HashMap<ModelLocator, LocalModelStatus>,
@@ -67,7 +67,7 @@ struct ExecutorRuntimeConfig {
     fetch_routes: FetchRouteRegistry,
     fetch_max_in_flight: usize,
     fetch_queue_capacity: usize,
-    artifacts: SymbolicArtifactStore,
+    artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
 }
 
@@ -89,7 +89,7 @@ impl Executor {
             fetch_routes: FetchRouteRegistry::default(),
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
-            artifacts: SymbolicArtifactStore::memory(),
+            artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
         })
     }
@@ -112,7 +112,7 @@ impl Executor {
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
-            artifacts: SymbolicArtifactStore::memory(),
+            artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
         })
     }
@@ -122,7 +122,7 @@ impl Executor {
     ) -> Result<ExecutorHandle, ExecutorError> {
         let fetch_store = fetch_store_from_artifact_config(&config.artifact_store);
         let fetch_quota_store = fetch_quota_store_from_artifact_config(&config.artifact_store);
-        let artifacts = SymbolicArtifactStore::open(config.artifact_store).await?;
+        let artifacts = EvaluateArtifactStore::open(config.artifact_store).await?;
         Self::spawn_runtime(ExecutorRuntimeConfig {
             execute_policy: config.execute_policy,
             queue_capacity: config.queue_capacity,
@@ -193,8 +193,8 @@ impl Executor {
     async fn run(mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
-                ExecutorMessage::QuoteSymbolic { request, reply } => {
-                    let _ = reply.send(self.handle_quote_symbolic(request).await);
+                ExecutorMessage::QuoteEvaluate { request, reply } => {
+                    let _ = reply.send(self.handle_quote_evaluate(request).await);
                 }
                 ExecutorMessage::QuoteFetch { request, reply } => {
                     let _ = reply.send(self.handle_quote_fetch(request).await);

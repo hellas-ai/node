@@ -70,6 +70,7 @@ impl ExecutionBackend for ResponsesFetchBackend {
                     self.route.clone(),
                     fetch_request,
                     self.producer_trust.clone(),
+                    self.caller_key.clone(),
                     payload,
                 ),
                 Some(Provenance {
@@ -100,10 +101,11 @@ fn fetch_events(
     route: ExecutionRoute,
     request: FetchRequest,
     trust: ProducerTrust,
+    runner_key: Arc<ProducerSigningKey>,
     _provider_payload: Bytes,
 ) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send {
     try_stream! {
-        let stream = fetch_execution_stream(runtime, request, route, trust);
+        let stream = fetch_execution_stream(runtime, request, route, trust, runner_key);
         tokio::pin!(stream);
 
         while let Some(event) = stream.next().await {
