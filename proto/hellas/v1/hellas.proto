@@ -4,7 +4,7 @@ package hellas.v1;
 
 // Core Hellas work protocol. This file owns the generic ticket and execution
 // surface plus transport-neutral event/receipt shapes. Scheme-specific ticket
-// creation lives in symbolic.proto / fetch.proto; non-core helper APIs live in
+// creation lives in evaluate.proto / fetch.proto; non-core helper APIs live in
 // courtesy.proto; p2p/node discovery lives in swarm.proto.
 
 service Execute {
@@ -19,6 +19,8 @@ message Ticket {
 
 message RunTicketRequest {
   bytes request_commitment = 1; // exactly 32 bytes
+  Signature signature = 2;
+  PublicKey public_key = 3;
 }
 
 message PublicKey {
@@ -87,7 +89,7 @@ message WorkChunk {
 }
 
 message WorkFinished {
-  // Complete output object. Symbolic text uses little-endian u32 token IDs.
+  // Complete output object. Evaluate text uses little-endian u32 token IDs.
   // Fetch uses exact UTF-8 JSON bytes.
   bytes output = 1;
   ReceiptEnvelope receipt = 2;
@@ -97,7 +99,7 @@ message WorkFinished {
 }
 
 message WorkFailed {
-  // Units emitted before failure (tokens for symbolic text, bytes for fetch).
+  // Units emitted before failure (tokens for evaluate text, bytes for fetch).
   uint64 position = 1;
   string error = 2;
 }

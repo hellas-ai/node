@@ -1,7 +1,7 @@
 //! Server-side handler implementations.
 //!
 //! `ExecutorHandle` implements one Handler trait per service (Execute,
-//! Symbolic, Fetch, Courtesy) — the codegen-emitted dispatcher routes
+//! Evaluate, Fetch, Courtesy) — the codegen-emitted dispatcher routes
 //! inbound RPCs here.
 
 use std::pin::Pin;
@@ -20,14 +20,14 @@ use hellas_rpc::pb::courtesy::{
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
-use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
+use hellas_rpc::services::evaluate::EvaluateHandler;
 use hellas_rpc::services::execute::ExecuteHandler;
 use hellas_rpc::services::fetch::FetchHandler;
-use hellas_rpc::services::symbolic::SymbolicHandler;
 use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -54,11 +54,11 @@ impl ExecutorHandle {
         reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
     }
 
-    pub async fn create_symbolic_ticket(
+    pub async fn create_evaluate_ticket(
         &self,
-        request: PbSymbolicRequest,
+        request: PbEvaluateRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteSymbolic { request, reply })
+        self.send(|reply| ExecutorMessage::QuoteEvaluate { request, reply })
             .await
     }
 
@@ -164,18 +164,18 @@ impl ExecuteHandler for ExecutorHandle {
     }
 }
 
-// -- SymbolicHandler / FetchHandler -----------------------------------------
+// -- EvaluateHandler / FetchHandler -----------------------------------------
 
 // The generated trait method declares `impl Into<WithTrailer<T>> + Send`
 // as its return; we provide `WithTrailer<T>` directly. The refinement is
 // intentional: handler-emitted trailers are concrete.
 #[allow(refining_impl_trait)]
-impl SymbolicHandler for ExecutorHandle {
+impl EvaluateHandler for ExecutorHandle {
     async fn create_ticket(
         &self,
-        request: PbSymbolicRequest,
+        request: PbEvaluateRequest,
     ) -> Result<WithTrailer<Ticket>, WireStatus> {
-        let outcome = self.create_symbolic_ticket(request).await?;
+        let outcome = self.create_evaluate_ticket(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
     }

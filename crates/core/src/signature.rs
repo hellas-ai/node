@@ -240,6 +240,7 @@ impl fmt::Debug for ProducerId {
     }
 }
 
+#[derive(Clone)]
 pub struct ProducerSigningKey {
     inner: SigningKey,
 }

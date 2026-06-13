@@ -31,7 +31,6 @@ use catgrad::prelude::Dtype;
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, Stream};
-#[cfg(feature = "hellas-executor")]
 use hellas_core::ProducerSigningKey;
 use hellas_core::{
     DagCborDecodeError, Digest, EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey,
@@ -53,6 +52,7 @@ use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "hellas-executor")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::run_ticket::sign_run_ticket;
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::Fetch;
@@ -111,8 +111,8 @@ pub enum ExecutionError {
     UnknownFinishStatus { value: i32 },
     #[error("wire finish status is unspecified")]
     UnspecifiedFinishStatus,
-    #[error("symbolic execution returned a fetch receipt")]
-    SymbolicReceiptExpected,
+    #[error("evaluate execution returned a fetch receipt")]
+    EvaluateReceiptExpected,
     #[error("fetch stream envelope decode failed: {source}")]
     FetchStreamEnvelope {
         #[source]
@@ -285,14 +285,14 @@ pub enum Outcome {
 
 /// Verified signed receipt envelope bytes as delivered by the executor.
 ///
-/// The gateway exposes these bytes directly as `hellas.receipt`. Symbolic
-/// callers that need the symbolic result artifact digest can project it from
+/// The gateway exposes these bytes directly as `hellas.receipt`. Evaluate
+/// callers that need the result artifact digest can project it from
 /// the verified envelope, but that digest is not the universal receipt
 /// identity.
 #[derive(Debug, Clone)]
 pub struct ReceiptArtifact {
     dag_cbor: Vec<u8>,
-    symbolic_text_artifact: Option<Digest>,
+    evaluate_text_artifact: Option<Digest>,
 }
 
 impl ReceiptArtifact {
@@ -306,18 +306,18 @@ impl ReceiptArtifact {
         URL_SAFE_NO_PAD.encode(&self.dag_cbor)
     }
 
-    pub fn symbolic_text_artifact(&self) -> Option<Digest> {
-        self.symbolic_text_artifact
+    pub fn evaluate_text_artifact(&self) -> Option<Digest> {
+        self.evaluate_text_artifact
     }
 
     fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreSignedReceipt) -> Self {
-        let symbolic_text_artifact = match core.body().scheme() {
-            SchemeId::Symbolic => Some(core.body().result().digest()),
+        let evaluate_text_artifact = match core.body().scheme() {
+            SchemeId::Evaluate => Some(core.body().result().digest()),
             _ => None,
         };
         Self {
             dag_cbor,
-            symbolic_text_artifact,
+            evaluate_text_artifact,
         }
     }
 }
@@ -610,6 +610,7 @@ pub struct ExecutionRequest {
     runtime: ExecutionRuntime,
     quote_req: QuotePreparedTextRequest,
     strategy: ExecutionStrategy,
+    runner_key: Arc<ProducerSigningKey>,
 }
 
 impl ExecutionRequest {
@@ -619,11 +620,18 @@ impl ExecutionRequest {
         prepared_prompt: PreparedPrompt,
         max_seq: u32,
         strategy: ExecutionStrategy,
+        runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
+        let quote_req = assets.build_quote_prepared_text_request(
+            &prepared_prompt,
+            max_seq,
+            &runner_key.public_key(),
+        )?;
         Ok(Self {
             runtime,
-            quote_req: assets.build_quote_prepared_text_request(&prepared_prompt, max_seq)?,
+            quote_req,
             strategy,
+            runner_key: Arc::new(runner_key),
         })
     }
 
@@ -649,13 +657,31 @@ impl ExecutionRequest {
     pub async fn prepare(self) -> ExecutionResult<PreparedExecution> {
         match self.strategy {
             ExecutionStrategy::Run(route) => Ok(PreparedExecution {
-                primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, &route).await?,
+                primary: PreparedRoute::prepare(
+                    &self.runtime,
+                    &self.quote_req,
+                    &route,
+                    self.runner_key.clone(),
+                )
+                .await?,
                 shadow: None,
             }),
             ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
-                primary: PreparedRoute::prepare(&self.runtime, &self.quote_req, &primary).await?,
+                primary: PreparedRoute::prepare(
+                    &self.runtime,
+                    &self.quote_req,
+                    &primary,
+                    self.runner_key.clone(),
+                )
+                .await?,
                 shadow: Some(
-                    PreparedRoute::prepare(&self.runtime, &self.quote_req, &shadow).await?,
+                    PreparedRoute::prepare(
+                        &self.runtime,
+                        &self.quote_req,
+                        &shadow,
+                        self.runner_key.clone(),
+                    )
+                    .await?,
                 ),
             }),
         }
@@ -683,6 +709,7 @@ pub fn fetch_execution_stream(
     request: PbFetchRequest,
     route: ExecutionRoute,
     trust: ProducerTrust,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let input_commitment = verified_fetch_input(&request)?.input_commitment;
@@ -701,6 +728,7 @@ pub fn fetch_execution_stream(
                     request_commitment,
                     input_commitment,
                     trust,
+                    runner_key.clone(),
                 );
                 tokio::pin!(inner);
                 while let Some(event) = inner.next().await {
@@ -726,6 +754,7 @@ pub fn fetch_execution_stream(
                     request_commitment,
                     input_commitment,
                     trust,
+                    runner_key.clone(),
                 );
                 tokio::pin!(inner);
                 while let Some(event) = inner.next().await {
@@ -747,6 +776,7 @@ pub fn fetch_execution_stream(
                     request_commitment,
                     input_commitment,
                     trust,
+                    runner_key.clone(),
                 );
                 tokio::pin!(inner);
                 while let Some(event) = inner.next().await {
@@ -814,9 +844,9 @@ impl PreparedExecution {
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { receipt, .. } => {
-            receipt.symbolic_text_artifact().ok_or_else(|| {
+            receipt.evaluate_text_artifact().ok_or_else(|| {
                 ExecutionError::protocol(
-                    "primary symbolic execution did not produce symbolic artifact digest",
+                    "primary evaluate execution did not produce artifact digest",
                 )
             })?
         }
@@ -829,9 +859,9 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResu
             receipt: shadow_receipt,
             ..
         } => {
-            let shadow_digest = shadow_receipt.symbolic_text_artifact().ok_or_else(|| {
+            let shadow_digest = shadow_receipt.evaluate_text_artifact().ok_or_else(|| {
                 ExecutionError::protocol(
-                    "shadow symbolic execution did not produce symbolic artifact digest",
+                    "shadow evaluate execution did not produce artifact digest",
                 )
             })?;
             if primary_digest == shadow_digest {
@@ -840,7 +870,7 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResu
                 Ok(Outcome::Failed {
                     position: primary.position(),
                     error: format!(
-                        "verify mismatch: primary symbolic artifact {primary_digest} != shadow symbolic artifact {shadow_digest}"
+                        "verify mismatch: primary evaluate artifact {primary_digest} != shadow evaluate artifact {shadow_digest}"
                     ),
                 })
             }
@@ -881,11 +911,13 @@ enum PreparedRoute {
         handle: ExecutorHandle,
         request_commitment: Vec<u8>,
         provenance: ExecutionProvenance,
+        runner_key: Arc<ProducerSigningKey>,
     },
     RemoteDirect {
         transport: IrohTransport,
         request_commitment: Vec<u8>,
         provenance: ExecutionProvenance,
+        runner_key: Arc<ProducerSigningKey>,
     },
 }
 
@@ -903,6 +935,7 @@ impl PreparedRoute {
         runtime: &ExecutionRuntime,
         quote_req: &QuotePreparedTextRequest,
         route: &ExecutionRoute,
+        runner_key: Arc<ProducerSigningKey>,
     ) -> ExecutionResult<Self> {
         match route {
             #[cfg(feature = "hellas-executor")]
@@ -923,6 +956,7 @@ impl PreparedRoute {
                     handle,
                     request_commitment: ticket.request_commitment,
                     provenance: outcome.provenance,
+                    runner_key,
                 })
             }
             ExecutionRoute::RemoteDirect(target) => {
@@ -966,6 +1000,7 @@ impl PreparedRoute {
                     transport: execute_transport,
                     request_commitment: ticket.request_commitment,
                     provenance,
+                    runner_key,
                 })
             }
             ExecutionRoute::RemoteDiscovery { retries } => {
@@ -981,6 +1016,7 @@ impl PreparedRoute {
                     transport: execute_transport,
                     request_commitment,
                     provenance,
+                    runner_key,
                 })
             }
         }
@@ -993,12 +1029,14 @@ impl PreparedRoute {
                 handle,
                 request_commitment,
                 provenance: _,
-            } => local_execute_stream(handle, request_commitment).boxed(),
+                runner_key,
+            } => local_execute_stream(handle, request_commitment, runner_key).boxed(),
             PreparedRoute::RemoteDirect {
                 transport,
                 request_commitment,
                 provenance: _,
-            } => remote_execute_stream(transport, request_commitment).boxed(),
+                runner_key,
+            } => remote_execute_stream(transport, request_commitment, runner_key).boxed(),
         }
     }
 }
@@ -1188,6 +1226,20 @@ fn validate_fetch_ticket(
     Ok(ticket.request_commitment.clone())
 }
 
+fn signed_run_ticket_request(
+    request_commitment: &[u8],
+    key: &ProducerSigningKey,
+) -> ExecutionResult<RunTicketRequest> {
+    let request_commitment: [u8; 32] = request_commitment.try_into().map_err(|_| {
+        ExecutionError::protocol(format!(
+            "ticket request_commitment must be 32 bytes, got {}",
+            request_commitment.len()
+        ))
+    })?;
+    sign_run_ticket(request_commitment, key)
+        .map_err(|source| ExecutionError::source("failed to sign run ticket", source))
+}
+
 // ---------------------------------------------------------------------------
 // Local execute streams — talk directly to `ExecutorHandle`
 // ---------------------------------------------------------------------------
@@ -1196,10 +1248,12 @@ fn validate_fetch_ticket(
 fn local_execute_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
+        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
         let outcome = handle
-            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .run_ticket_handle(run_ticket)
             .await
             .exec_context("failed to start local execution stream")?;
         let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
@@ -1232,10 +1286,12 @@ fn local_execute_fetch_stream(
     request_commitment: Vec<u8>,
     input_commitment: InputCommitment,
     trust: ProducerTrust,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
+        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
         let outcome = handle
-            .run_ticket_handle(RunTicketRequest { request_commitment })
+            .run_ticket_handle(run_ticket)
             .await
             .exec_context("failed to start local fetch execution stream")?;
         let _provenance = outcome.provenance;
@@ -1272,11 +1328,13 @@ fn local_execute_fetch_stream(
 fn remote_execute_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
+        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
         let mut wire = client
-            .run_ticket(RunTicketRequest { request_commitment })
+            .run_ticket(run_ticket)
             .await
             .map_err(|status| ExecutionError::wire("failed to start remote execute stream", status))?;
         let mut got_terminal = false;
@@ -1308,11 +1366,13 @@ fn remote_execute_fetch_stream(
     request_commitment: Vec<u8>,
     input_commitment: InputCommitment,
     trust: ProducerTrust,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
+        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
         let mut wire = client
-            .run_ticket(RunTicketRequest { request_commitment })
+            .run_ticket(run_ticket)
             .await
             .map_err(|status| ExecutionError::wire("failed to start remote fetch execute stream", status))?;
         let mut got_terminal = false;
@@ -1429,8 +1489,8 @@ fn convert_fetch_wire_event(
 
 fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
     let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
-    if receipt.symbolic_text_artifact().is_none() {
-        return Err(ExecutionError::SymbolicReceiptExpected);
+    if receipt.evaluate_text_artifact().is_none() {
+        return Err(ExecutionError::EvaluateReceiptExpected);
     }
     let stop_reason = stop_reason_from_pb(finished.status)?;
     Ok(Outcome::Completed {

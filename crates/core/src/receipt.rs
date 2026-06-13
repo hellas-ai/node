@@ -2,14 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::signature::verify_digest_signature;
 use crate::{
-    CommitmentScheme, DagCborEncoder, ProducerId, ProducerSigningKey, PublicKey, ReceiptCommitment,
-    RequestCommitment, ResultCommitment, SchemeId, Signature, SignatureError, Symbolic,
-    SymbolicOutput, SymbolicRequest, hash_tuple, tags,
+    AssuranceStrategy, CommitmentScheme, DagCborEncoder, Evaluate, EvaluateOutput, EvaluateRequest,
+    ProducerId, ProducerSigningKey, PublicKey, ReceiptCommitment, RequestCommitment,
+    ResultCommitment, SchemeId, Signature, SignatureError, hash_tuple, tags,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptBody {
     scheme: SchemeId,
+    strategy: AssuranceStrategy,
     request: RequestCommitment,
     result: ResultCommitment,
     producer: ProducerId,
@@ -18,12 +19,14 @@ pub struct ReceiptBody {
 impl ReceiptBody {
     pub fn new(
         scheme: SchemeId,
+        strategy: AssuranceStrategy,
         request: RequestCommitment,
         result: ResultCommitment,
         producer: ProducerId,
     ) -> Self {
         Self {
             scheme,
+            strategy,
             request,
             result,
             producer,
@@ -32,6 +35,10 @@ impl ReceiptBody {
 
     pub const fn scheme(&self) -> SchemeId {
         self.scheme
+    }
+
+    pub const fn strategy(&self) -> AssuranceStrategy {
+        self.strategy
     }
 
     pub const fn request(&self) -> RequestCommitment {
@@ -48,9 +55,10 @@ impl ReceiptBody {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, VerifyError> {
         let mut encoder = DagCborEncoder::new();
-        encoder.array(5);
-        encoder.str(tags::RECEIPT_BODY_V1);
+        encoder.array(6);
+        encoder.str(tags::RECEIPT_BODY_V2);
         encoder.u64(self.scheme.to_byte() as u64);
+        encoder.u64(self.strategy.to_byte() as u64);
         encoder.bytes(self.request.as_bytes());
         encoder.bytes(self.result.as_bytes());
         encoder.bytes(self.producer.as_bytes());
@@ -90,6 +98,7 @@ impl SignedReceipt {
         let public_key = key.public_key();
         let body = ReceiptBody::new(
             S::SCHEME,
+            AssuranceStrategy::ProducerAttested,
             S::commit_request(request),
             S::commit_output(output),
             ProducerId::from_public_key(&public_key),
@@ -148,11 +157,11 @@ impl SignedReceipt {
 }
 
 pub enum DeliveryRequest<'a> {
-    Symbolic(&'a SymbolicRequest),
+    Evaluate(&'a EvaluateRequest),
 }
 
 pub enum DeliveryOutput<'a> {
-    Symbolic(&'a SymbolicOutput),
+    Evaluate(&'a EvaluateOutput),
 }
 
 pub fn verify_receipt(receipt: &SignedReceipt) -> Result<(), VerifyError> {
@@ -166,16 +175,17 @@ pub fn verify_delivery(
 ) -> Result<(), VerifyError> {
     verify_receipt(receipt)?;
 
-    match (request, output, receipt.body.scheme) {
+    match (request, output, receipt.body.scheme, receipt.body.strategy) {
         (
-            DeliveryRequest::Symbolic(request),
-            DeliveryOutput::Symbolic(output),
-            SchemeId::Symbolic,
+            DeliveryRequest::Evaluate(request),
+            DeliveryOutput::Evaluate(output),
+            SchemeId::Evaluate,
+            AssuranceStrategy::ProducerAttested,
         ) => {
-            if receipt.body.request != Symbolic::commit_request(request) {
+            if receipt.body.request != Evaluate::commit_request(request) {
                 return Err(VerifyError::RequestCommitmentMismatch);
             }
-            if receipt.body.result != Symbolic::commit_output(output) {
+            if receipt.body.result != Evaluate::commit_output(output) {
                 return Err(VerifyError::ResultCommitmentMismatch);
             }
             Ok(())
@@ -203,29 +213,31 @@ mod tests {
     use super::*;
     use crate::Digest;
 
-    fn symbolic_request() -> SymbolicRequest {
-        SymbolicRequest {
+    fn evaluate_request() -> EvaluateRequest {
+        let key = ProducerSigningKey::deterministic_for_tests();
+        EvaluateRequest {
             text_execution: Digest::from_bytes([4; 32]),
+            runner_public_key: key.public_key(),
         }
     }
 
-    fn symbolic_output() -> SymbolicOutput {
-        SymbolicOutput {
+    fn evaluate_output() -> EvaluateOutput {
+        EvaluateOutput {
             text_artifact: Digest::from_bytes([9; 32]),
         }
     }
 
     #[test]
-    fn symbolic_receipt_verifies_delivery() {
+    fn evaluate_receipt_verifies_delivery() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = symbolic_request();
-        let output = symbolic_output();
-        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
+        let request = evaluate_request();
+        let output = evaluate_output();
+        let receipt = SignedReceipt::sign::<Evaluate>(&request, &output, &key).unwrap();
         let envelope = receipt;
 
         verify_delivery(
-            DeliveryRequest::Symbolic(&request),
-            DeliveryOutput::Symbolic(&output),
+            DeliveryRequest::Evaluate(&request),
+            DeliveryOutput::Evaluate(&output),
             &envelope,
         )
         .unwrap();
@@ -234,18 +246,18 @@ mod tests {
     #[test]
     fn verify_delivery_rejects_wrong_output() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = symbolic_request();
-        let output = symbolic_output();
-        let wrong = SymbolicOutput {
+        let request = evaluate_request();
+        let output = evaluate_output();
+        let wrong = EvaluateOutput {
             text_artifact: Digest::from_bytes([8; 32]),
         };
-        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
+        let receipt = SignedReceipt::sign::<Evaluate>(&request, &output, &key).unwrap();
         let envelope = receipt;
 
         assert_eq!(
             verify_delivery(
-                DeliveryRequest::Symbolic(&request),
-                DeliveryOutput::Symbolic(&wrong),
+                DeliveryRequest::Evaluate(&request),
+                DeliveryOutput::Evaluate(&wrong),
                 &envelope,
             )
             .unwrap_err(),
@@ -256,9 +268,9 @@ mod tests {
     #[test]
     fn receipt_commitment_excludes_signature() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = symbolic_request();
-        let output = symbolic_output();
-        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
+        let request = evaluate_request();
+        let output = evaluate_output();
+        let receipt = SignedReceipt::sign::<Evaluate>(&request, &output, &key).unwrap();
 
         let body_commitment = receipt.body().receipt_commitment().unwrap();
         let mut changed_signature = *receipt.signature();
@@ -281,9 +293,9 @@ mod tests {
     #[test]
     fn receipt_envelope_round_trips_through_dag_cbor() {
         let key = ProducerSigningKey::deterministic_for_tests();
-        let request = symbolic_request();
-        let output = symbolic_output();
-        let receipt = SignedReceipt::sign::<Symbolic>(&request, &output, &key).unwrap();
+        let request = evaluate_request();
+        let output = evaluate_output();
+        let receipt = SignedReceipt::sign::<Evaluate>(&request, &output, &key).unwrap();
         let envelope = receipt;
 
         let bytes = crate::canonical_dag_cbor(&envelope).unwrap();

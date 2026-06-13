@@ -50,6 +50,7 @@ pub(super) struct GatewayState {
     runtime: ExecutionRuntime,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
+    runner_key: Arc<hellas_core::ProducerSigningKey>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -75,6 +76,9 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+        let runner_key = Arc::new(crate::identity::load_or_create_producer_key(
+            options.producer_key_path.as_deref(),
+        )?);
         let responses_proxy = match options.responses_backend {
             ResponsesBackend::Hellas => None,
             ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
@@ -86,14 +90,12 @@ impl GatewayState {
 
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
-            let producer_key =
-                crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
             ExecutionRuntime::local(
                 Executor::spawn_with_producer_key(
                     ExecutePolicy::Eager,
                     options.queue_size,
                     vec![options.dtype],
-                    producer_key,
+                    runner_key.as_ref().clone(),
                 )
                 .context("failed to initialize local execution backend")?,
             )
@@ -107,14 +109,11 @@ impl GatewayState {
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
-                let caller_key = crate::identity::load_or_create_producer_key(
-                    options.producer_key_path.as_deref(),
-                )?;
                 // Mirrors the producer-side default for trusted callers: with
                 // no keys configured, only output signed by this gateway's own
                 // producer key verifies.
                 let producer_trust = if options.trusted_producer_public_keys.is_empty() {
-                    crate::execution::ProducerTrust::keys([caller_key.public_key()])
+                    crate::execution::ProducerTrust::keys([runner_key.public_key()])
                 } else {
                     crate::execution::ProducerTrust::keys(
                         options.trusted_producer_public_keys.iter().copied(),
@@ -129,7 +128,7 @@ impl GatewayState {
                     ),
                     &options.responses_fetch_route_service,
                     &options.responses_fetch_route_method,
-                    caller_key,
+                    runner_key.as_ref().clone(),
                     producer_trust,
                     options.responses_fetch_request_overrides.clone(),
                 )))
@@ -153,6 +152,7 @@ impl GatewayState {
             runtime,
             responses_proxy,
             responses_fetch,
+            runner_key,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -246,6 +246,7 @@ impl GatewayState {
             prepared_prompt,
             max_tokens,
             self.execution_strategy(),
+            self.runner_key.as_ref().clone(),
         )
         .map_err(|err| HttpError {
             status: StatusCode::BAD_REQUEST,
@@ -494,6 +495,10 @@ mod tests {
             runtime: ExecutionRuntime::default(),
             responses_proxy: None,
             responses_fetch: None,
+            runner_key: Arc::new(
+                hellas_core::ProducerSigningKey::from_secret_bytes([3; 32])
+                    .expect("valid test key"),
+            ),
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),
         }

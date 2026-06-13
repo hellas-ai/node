@@ -2,7 +2,7 @@ use crate::executor::ExecutorMessage;
 use crate::state::{Invocation, ModelLocator, StopReason};
 use chatgrad::PreparedPrompt;
 use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
-use hellas_core::SymbolicRequest;
+use hellas_core::EvaluateRequest;
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
@@ -28,7 +28,7 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
     pub model_id: String,
-    pub symbolic_request: SymbolicRequest,
+    pub evaluate_request: EvaluateRequest,
     pub locator: ModelLocator,
     pub invocation: Invocation,
     pub stream_batch_size: u32,
@@ -45,7 +45,7 @@ struct DecodeOutcome {
 pub(crate) struct WorkerCompletion {
     pub execution_id: String,
     pub model_id: String,
-    pub symbolic_request: SymbolicRequest,
+    pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub result: WorkerCompletionResult,
@@ -100,7 +100,7 @@ fn worker_loop(
         let model_id = job.model_id.clone();
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
-        let symbolic_request = job.symbolic_request.clone();
+        let evaluate_request = job.evaluate_request.clone();
         let invocation = job.invocation.clone();
 
         let position = Arc::new(AtomicU64::new(0));
@@ -139,7 +139,7 @@ fn worker_loop(
         let _ = executor_tx.send(ExecutorMessage::WorkerFinished(WorkerCompletion {
             execution_id,
             model_id,
-            symbolic_request,
+            evaluate_request,
             invocation,
             sender,
             result: termination,

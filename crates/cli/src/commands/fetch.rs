@@ -39,6 +39,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     } else {
         ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
     };
+    let caller_key = std::sync::Arc::new(caller_key);
 
     let route =
         ExecutionRoute::remote(options.node_id, options.node_addrs.clone(), options.retries);
@@ -52,7 +53,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             &caller_key,
         )?,
     };
-    let stream = fetch_execution_stream(runtime, request, route, trust);
+    let stream = fetch_execution_stream(runtime, request, route, trust, caller_key);
     tokio::pin!(stream);
 
     let mut completed = false;

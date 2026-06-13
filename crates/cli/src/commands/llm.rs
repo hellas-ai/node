@@ -10,7 +10,6 @@ use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-#[cfg(feature = "hellas-executor")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,7 +24,6 @@ pub struct ExecuteOptions {
     pub local: bool,
     #[cfg(feature = "hellas-executor")]
     pub verify_local: bool,
-    #[cfg(feature = "hellas-executor")]
     pub producer_key_path: Option<PathBuf>,
     pub raw: bool,
     /// Ordered preference list. The first entry is what the client *first*
@@ -78,6 +76,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         bootstrap_assets.prepare_chat(&messages)?
     };
     let mut decoder = TextOutputDecoder::new(bootstrap_assets.clone(), &prepared.stop_token_ids);
+    let runner_key =
+        crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
 
     let last_index = options.dtype.len() - 1;
     for (idx, &dtype) in options.dtype.iter().enumerate() {
@@ -91,15 +91,13 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
         #[cfg(feature = "hellas-executor")]
         let runtime = if options.local || options.verify_local {
-            let producer_key =
-                crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
             // the program at the first acceptable entry.
             ExecutionRuntime::spawn_default_local_with_producer_key(
                 hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
                 options.dtype.clone(),
-                producer_key,
+                runner_key.clone(),
             )?
             .with_remote(secret_key.clone())
             .await?
@@ -141,8 +139,14 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             options.retries,
         ));
 
-        let request =
-            ExecutionRequest::new(runtime, assets, prepared.clone(), options.max_seq, strategy)?;
+        let request = ExecutionRequest::new(
+            runtime,
+            assets,
+            prepared.clone(),
+            options.max_seq,
+            strategy,
+            runner_key.clone(),
+        )?;
         let uses_remote = request.uses_remote_transport();
 
         let result: anyhow::Result<()> = async {

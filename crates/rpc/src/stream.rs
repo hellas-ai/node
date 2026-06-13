@@ -297,7 +297,7 @@ mod tests {
         let (events, _) = builder.finish().unwrap();
         let mut pb = input_event_to_pb(&events[0]);
         pb.body.as_mut().unwrap().previous_event =
-            input_genesis(SchemeId::Symbolic, &caller.public_key())
+            input_genesis(SchemeId::Evaluate, &caller.public_key())
                 .as_bytes()
                 .to_vec();
 
@@ -305,7 +305,7 @@ mod tests {
 
         assert_eq!(
             decoded.event().body().previous_event(),
-            input_genesis(SchemeId::Symbolic, &caller.public_key())
+            input_genesis(SchemeId::Evaluate, &caller.public_key())
         );
     }
 }

@@ -15,17 +15,17 @@ use anyhow::Context;
 use catgrad::prelude::Dtype;
 use hellas_core::ProducerSigningKey;
 use hellas_executor::{
-    ArtifactStoreConfig, CourtesyServer, ExecuteServer, Executor, ExecutorMetrics,
-    ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer, SymbolicServer,
+    ArtifactStoreConfig, CourtesyServer, EvaluateServer, ExecuteServer, Executor, ExecutorMetrics,
+    ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::courtesy::Courtesy;
+use hellas_rpc::services::evaluate::Evaluate;
 use hellas_rpc::services::execute::Execute;
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::services::node::{Node, NodeServer};
-use hellas_rpc::services::symbolic::Symbolic;
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
@@ -215,8 +215,8 @@ async fn serve_connection(
     if alpn == <Execute as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(ExecuteServer(handle), manager);
         serve_loop(&transport, &server).await
-    } else if alpn == <Symbolic as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(SymbolicServer(handle), manager);
+    } else if alpn == <Evaluate as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(EvaluateServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(FetchServer(handle), manager);

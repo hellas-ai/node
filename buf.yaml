@@ -12,7 +12,7 @@ lint:
     # generic WorkEvent. Both are intentional reusable protocol shapes.
     - RPC_RESPONSE_STANDARD_NAME
     # Scheme services intentionally accept the scheme request itself. Wrapping
-    # SymbolicRequest/OpaqueRequest in one-field *CreateTicketRequest messages
+    # FetchRequest/EvaluateRequest in one-field *CreateTicketRequest messages
     # would add wire ceremony without adding protocol state.
     - RPC_REQUEST_STANDARD_NAME
     # Ticket is the single reusable protocol object returned by every

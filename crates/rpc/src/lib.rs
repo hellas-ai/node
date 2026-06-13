@@ -14,6 +14,8 @@ pub mod call;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod peers;
+#[cfg(feature = "execute")]
+pub mod run_ticket;
 pub mod serve;
 pub mod spec;
 #[cfg(feature = "execute")]
@@ -28,7 +30,7 @@ pub mod provenance;
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is
 /// doc-hidden; use the per-service re-exports under
-/// `pb::{courtesy, swarm, execute, fetch, symbolic}` or the marker and
+/// `pb::{courtesy, swarm, execute, fetch, evaluate}` or the marker and
 /// handler modules under `pb::services::*`.
 #[doc(hidden)]
 pub mod pb;

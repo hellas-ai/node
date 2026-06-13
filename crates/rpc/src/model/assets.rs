@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use crate::pb::courtesy::{
-    QuotePreparedTextRequest, SymbolicGenesisStart, SymbolicStart, symbolic_start,
+    EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
+use crate::run_ticket::public_key_to_pb;
 use catgrad::prelude::Dtype;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
+use hellas_core::PublicKey;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -77,6 +79,7 @@ impl ModelAssets {
         &self,
         prepared_prompt: &PreparedPrompt,
         max_seq: u32,
+        runner_public_key: &PublicKey,
     ) -> Result<QuotePreparedTextRequest> {
         let input_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
             ModelAssetsError::NegativePromptTokenId { token }
@@ -91,10 +94,11 @@ impl ModelAssets {
             prompt_token_ids: input_ids,
             max_new_tokens: max_seq,
             stop_token_ids,
-            start: Some(SymbolicStart {
-                kind: Some(symbolic_start::Kind::Genesis(SymbolicGenesisStart {})),
+            start: Some(EvaluateStart {
+                kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
             accept_dtypes: vec![dtype_to_wire(self.dtype).to_string()],
+            runner_public_key: Some(public_key_to_pb(runner_public_key)),
         })
     }
 

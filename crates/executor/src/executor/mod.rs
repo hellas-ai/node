@@ -10,9 +10,9 @@ use hellas_rpc::pb::courtesy::{
     QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
+use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
-use hellas_rpc::pb::symbolic::SymbolicRequest as PbSymbolicRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire::WireStatus;
 use std::sync::Arc;
@@ -51,8 +51,8 @@ pub struct ExecuteOutcome {
 }
 
 pub(crate) enum ExecutorMessage {
-    QuoteSymbolic {
-        request: PbSymbolicRequest,
+    QuoteEvaluate {
+        request: PbEvaluateRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
     QuoteFetch {

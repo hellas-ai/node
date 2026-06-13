@@ -992,13 +992,11 @@ mod tests {
         envelope.verify(&caller.public_key()).unwrap();
 
         let mutations: Mutations<InputEventBodyParts> = vec![
-            ("scheme", Box::new(|p| p.scheme = SchemeId::Symbolic)),
+            ("scheme", Box::new(|p| p.scheme = SchemeId::Evaluate)),
             ("sequence", Box::new(|p| p.sequence += 1)),
             (
                 "previous_event",
-                Box::new(|p| {
-                    p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")
-                }),
+                Box::new(|p| p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")),
             ),
             ("kind", Box::new(|p| p.kind.push('x'))),
             (
@@ -1027,7 +1025,7 @@ mod tests {
         envelope.verify(&producer.public_key()).unwrap();
 
         let mutations: Mutations<OutputEventBodyParts> = vec![
-            ("scheme", Box::new(|p| p.scheme = SchemeId::Symbolic)),
+            ("scheme", Box::new(|p| p.scheme = SchemeId::Evaluate)),
             (
                 "input",
                 Box::new(|p| p.input = InputCommitment::from_digest(flipped(p.input.digest()))),
@@ -1039,9 +1037,7 @@ mod tests {
             ("sequence", Box::new(|p| p.sequence += 1)),
             (
                 "previous_event",
-                Box::new(|p| {
-                    p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")
-                }),
+                Box::new(|p| p.previous_event = EventCommitment::from_canonical_bytes(b"spliced")),
             ),
             ("kind", Box::new(|p| p.kind.push('x'))),
             (
