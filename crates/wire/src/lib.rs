@@ -1,6 +1,4 @@
 //! `hellas-wire` — transport-agnostic RPC wire layer.
-//!
-//! See `HELLAS_WIRE_PLAN_v2.md` for the architecture.
 
 pub mod canonical;
 pub mod clock;

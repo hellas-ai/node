@@ -15,10 +15,6 @@
 //! - [`serialize_mux`] / [`deserialize_mux`] round-trip the
 //!   `Multiplexer`'s slot table + free mask + pending-write into a flat
 //!   byte buffer suitable for `ws.serialize_attachment(...)`.
-//!
-//! Caller-side concerns (acceptWebSocket registration, attachment
-//! load/store, dispatch on per-WS tag) live in the DO worker; see
-//! `HELLAS_WIRE_PLAN_v2.md` "CF Durable Object specifics".
 
 use bytes::Bytes;
 use worker::{WebSocket, WebSocketIncomingMessage};
@@ -136,8 +132,7 @@ pub fn handle_websocket_message<const N: usize, C: Clock>(
 // Hibernation snapshot
 // ---------------------------------------------------------------------------
 //
-// Wire format (see HELLAS_WIRE_PLAN_v2.md, "CF Durable Object specifics"
-// + Mux hibernation invariants):
+// Hibernation snapshot wire format:
 //
 //   [magic: u8 = 0xA1]           // version tag; bumpable
 //   [role: u8]                   // 0 = Client, 1 = Server
