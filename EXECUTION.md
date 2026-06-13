@@ -607,8 +607,7 @@ node sees caller keys, not users.
 Routes and access live in one configuration file so they can be
 cross-validated at load: a caller grant naming an undefined route is a
 configuration error, not a silent dead entry. The Nix module exposes typed
-route/access options and renders this file; per-provider top-level toggles
-(`fetchCodexResponses`-style booleans) should not exist.
+route/access options and renders this file.
 
 ## Idempotency And Billing
 

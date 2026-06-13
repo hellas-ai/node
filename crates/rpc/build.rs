@@ -864,8 +864,7 @@ fn build_method_schema(
     let request_msg = index.message_schema(&method.request_proto_type);
     let response_msg = index.message_schema(&method.response_proto_type);
     OwnedMethodSchema {
-        // FQN matches HELLAS_WIRE_PLAN_v2.md's "Service/Method"
-        // convention used by the generated service directory.
+        // FQN matches the generated service directory convention.
         fqn: format!("{service_fqn}/{}", method.proto_name),
         request: OwnedTypeSchema::Message(request_msg),
         response: OwnedTypeSchema::Message(response_msg),
