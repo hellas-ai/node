@@ -6,33 +6,21 @@ use crate::pb::hellas::light_client_client::LightClientClient;
 use crate::pb::hellas::*;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    CONSENSUS_NAMESPACE, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
+    ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
     LightClient, OwnerCoins, QueryError,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use commonware_codec::Decode;
-#[cfg(not(target_arch = "wasm32"))]
-use commonware_consensus::simplex::types::Finalization as ConsensusFinalization;
-#[cfg(not(target_arch = "wasm32"))]
-use commonware_cryptography::{Hasher, Sha256, certificate::Scheme as _};
-#[cfg(not(target_arch = "wasm32"))]
-use commonware_parallel::Sequential;
+use commonware_cryptography::{Hasher, Sha256};
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_kernel::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Scheme as ConsensusScheme,
-    ThresholdVariant, Transaction, UserPublicKey, WebAuthnSignature as DomainWebAuthnSignature,
+    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
+    WebAuthnSignature as DomainWebAuthnSignature,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use hellas_rpc::mux::MuxGrpcService;
 use hellas_rpc::ws_mux;
 #[cfg(not(target_arch = "wasm32"))]
 use p256::ecdsa::Signature as P256Signature;
-#[cfg(not(target_arch = "wasm32"))]
-use rand::rngs::OsRng;
-
-#[cfg(not(target_arch = "wasm32"))]
-type ConsensusIdentity =
-    <ThresholdVariant as commonware_cryptography::bls12381::primitives::variant::Variant>::Public;
 
 /// ws-mux backed light client that connects to a remote validator or mux relay.
 #[derive(Clone)]
@@ -43,48 +31,6 @@ pub struct RemoteLightClient {
     channel: ws_mux::MuxChannel,
     #[cfg(not(target_arch = "wasm32"))]
     verifier: Option<ConsensusVerifier>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
-struct ConsensusVerifier {
-    scheme: ConsensusScheme,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl ConsensusVerifier {
-    fn new(info: &ConsensusInfo) -> Result<Self, QueryError> {
-        if info.threshold_identity.is_empty() {
-            return Err(QueryError::Remote(
-                "threshold identity was empty".to_string(),
-            ));
-        }
-        let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
-            .map_err(|_| QueryError::Remote("invalid threshold identity".to_string()))?;
-        Ok(Self {
-            scheme: ConsensusScheme::certificate_verifier(CONSENSUS_NAMESPACE, identity),
-        })
-    }
-
-    fn verify_snapshot(&self, snapshot: &LatestBlock) -> Result<(), QueryError> {
-        let finalization = ConsensusFinalization::<ConsensusScheme, Digest>::decode_cfg(
-            snapshot.finalization.as_slice(),
-            &ConsensusScheme::certificate_codec_config_unbounded(),
-        )
-        .map_err(|_| QueryError::Remote("invalid finalization".to_string()))?;
-        if finalization.proposal.payload != snapshot.payload {
-            return Err(QueryError::Remote(
-                "finalization payload did not match snapshot".to_string(),
-            ));
-        }
-        let mut rng = OsRng;
-        if !finalization.verify(&mut rng, &self.scheme, &Sequential) {
-            return Err(QueryError::Remote(
-                "finalization verification failed".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl RemoteLightClient {
@@ -117,7 +63,7 @@ impl RemoteLightClient {
     /// Configure this native client to verify finalized snapshots.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_consensus_info(mut self, info: &ConsensusInfo) -> Result<Self, QueryError> {
-        self.verifier = Some(ConsensusVerifier::new(info)?);
+        self.verifier = Some(ConsensusVerifier::new(info).map_err(QueryError::from)?);
         Ok(self)
     }
 }
@@ -330,7 +276,9 @@ fn verified_latest_block_from_proto(
 ) -> Result<LatestBlock, QueryError> {
     let latest = latest_block_from_proto(snapshot)?;
     if let Some(verifier) = verifier {
-        verifier.verify_snapshot(&latest)?;
+        verifier
+            .verify_snapshot(&latest)
+            .map_err(QueryError::from)?;
     }
     Ok(latest)
 }

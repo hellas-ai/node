@@ -8,6 +8,8 @@ mod app;
 pub mod client;
 #[cfg(feature = "node")]
 pub mod config;
+#[cfg(any(feature = "client", feature = "node"))]
+mod consensus;
 #[cfg(feature = "node")]
 mod execution;
 #[cfg(feature = "node")]
@@ -30,12 +32,14 @@ pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
 #[cfg(feature = "node")]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
+#[cfg(any(feature = "client", feature = "node"))]
+pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
 #[cfg(feature = "node")]
 pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "node")]
 pub use indexer::{
-    BlockStore, ChainIndexer, Finalization, FinalizationStore, init_block_store,
-    init_finalization_store,
+    BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,
+    init_finalization_store, spawn_follower_indexer,
 };
 #[cfg(any(feature = "client", feature = "server"))]
 pub use light_client::{

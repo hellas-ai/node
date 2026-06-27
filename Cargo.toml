@@ -9,6 +9,11 @@ name = "validator"
 path = "src/bin/validator.rs"
 required-features = ["node"]
 
+[[bin]]
+name = "follower"
+path = "src/bin/follower.rs"
+required-features = ["node"]
+
 [features]
 default = ["node"]
 api = ["dep:prost", "dep:tonic", "dep:tonic-prost"]
@@ -42,6 +47,7 @@ node = [
     "dep:commonware-glue",
     "dep:commonware-p2p",
     "dep:commonware-parallel",
+    "dep:commonware-resolver",
     "dep:commonware-runtime",
     "dep:commonware-storage",
     "dep:commonware-utils",
@@ -54,6 +60,7 @@ node = [
     "dep:p256",
     "dep:prometheus-client",
     "dep:rand",
+    "dep:rand_core",
     "dep:serde",
     "dep:thiserror",
     "dep:tokio",
@@ -98,6 +105,7 @@ commonware-cryptography = { workspace = true, optional = true, features = ["std"
 commonware-glue = { workspace = true, optional = true }
 commonware-p2p = { workspace = true, optional = true }
 commonware-parallel = { workspace = true, optional = true }
+commonware-resolver = { workspace = true, optional = true }
 commonware-runtime = { workspace = true, optional = true }
 commonware-storage = { workspace = true, optional = true }
 commonware-utils = { workspace = true, optional = true }
@@ -114,6 +122,7 @@ p256 = { version = "0.13", optional = true, default-features = false, features =
 prometheus-client = { workspace = true, optional = true }
 prost = { version = "0.14", optional = true }
 rand = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt", "sync", "time"] }
