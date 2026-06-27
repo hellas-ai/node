@@ -12,7 +12,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
-use commonware_cryptography::certificate::{ConstantProvider, Scheme as _};
+use commonware_cryptography::certificate::ConstantProvider;
 use commonware_cryptography::{Digestible as _, Signer, ed25519};
 use commonware_glue::stateful::{
     Config as StatefulConfig, Stateful as StatefulActor, SyncPlan,
@@ -22,7 +22,7 @@ use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
 use commonware_storage::{
-    archive::{Archive as _, Identifier as ArchiveIdentifier, immutable},
+    archive::{Archive as _, Identifier as ArchiveIdentifier},
     mmr,
 };
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
@@ -34,9 +34,9 @@ use hellas_chain::config::{
 };
 use hellas_chain::rpc::LocalLightClient;
 use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, ChainIndexer, ConsensusInfo,
-    FinalizedBlockQuery, LightClient as _, Mempool, OwnerIndex, UtxoDb, spawn_light_client_server,
-    utxo_db_config,
+    ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
+    FinalizedBlockQuery, LightClient as _, Mempool, OwnerIndex, UtxoDb, init_block_store,
+    init_finalization_store, spawn_light_client_server, utxo_db_config,
 };
 use hellas_kernel::domain::{
     Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
@@ -898,94 +898,6 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     if let Err(err) = context.stop(0, Some(SHUTDOWN_TIMEOUT)).await {
         warn!(?err, "runtime stop failed or timed out");
     }
-}
-
-type Finalization = commonware_consensus::simplex::types::Finalization<
-    Scheme,
-    commonware_cryptography::sha256::Digest,
->;
-type FinalizationStore =
-    immutable::Archive<tokio::Context, commonware_cryptography::sha256::Digest, Finalization>;
-type BlockStore = immutable::Archive<
-    tokio::Context,
-    commonware_cryptography::sha256::Digest,
-    hellas_chain::HellasBlock,
->;
-
-async fn init_finalization_store(
-    context: tokio::Context,
-    partition_prefix: &str,
-    config: &Config,
-) -> FinalizationStore {
-    let page_cache = config.page_cache(&context);
-    immutable::Archive::init(
-        context,
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
-            freezer_table_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-table"
-            ),
-            freezer_table_initial_size: 64,
-            freezer_table_resize_frequency: 10,
-            freezer_table_resize_chunk_size: 10,
-            freezer_key_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-key"
-            ),
-            freezer_key_page_cache: page_cache,
-            freezer_value_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-value"
-            ),
-            freezer_value_target_size: 65536,
-            freezer_value_compression: None,
-            ordinal_partition: format!("{partition_prefix}-finalizations-by-height-ordinal"),
-            items_per_section: NZU64!(256),
-            codec_config: Scheme::certificate_codec_config_unbounded(),
-            replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-        },
-    )
-    .await
-    .expect("failed to initialize finalizations archive")
-}
-
-async fn init_block_store(
-    context: tokio::Context,
-    partition_prefix: &str,
-    config: &Config,
-) -> BlockStore {
-    let page_cache = config.page_cache(&context);
-    immutable::Archive::init(
-        context,
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalized-blocks-metadata"),
-            freezer_table_partition: format!("{partition_prefix}-finalized-blocks-freezer-table"),
-            freezer_table_initial_size: 64,
-            freezer_table_resize_frequency: 10,
-            freezer_table_resize_chunk_size: 10,
-            freezer_key_partition: format!("{partition_prefix}-finalized-blocks-freezer-key"),
-            freezer_key_page_cache: page_cache,
-            freezer_value_partition: format!("{partition_prefix}-finalized-blocks-freezer-value"),
-            freezer_value_target_size: 65536,
-            freezer_value_compression: None,
-            ordinal_partition: format!("{partition_prefix}-finalized-blocks-ordinal"),
-            items_per_section: NZU64!(256),
-            codec_config: (),
-            replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-        },
-    )
-    .await
-    .expect("failed to initialize finalized blocks archive")
 }
 
 async fn replay_owner_index(

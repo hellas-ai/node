@@ -33,7 +33,10 @@ pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mem
 #[cfg(feature = "node")]
 pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "node")]
-pub use indexer::ChainIndexer;
+pub use indexer::{
+    BlockStore, ChainIndexer, Finalization, FinalizationStore, init_block_store,
+    init_finalization_store,
+};
 #[cfg(any(feature = "client", feature = "server"))]
 pub use light_client::{
     ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
