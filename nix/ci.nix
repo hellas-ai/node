@@ -41,7 +41,7 @@ let
     nixfmt = mk "check-nixfmt" ''
       shopt -s globstar
       nixfmt --check flake.nix nix/**/*.nix
-    '' [ pkgs.nixfmt-rfc-style ];
+    '' [ pkgs.nixfmt ];
     flake-check = mk "check-flake-check" "nix flake check --no-build" [ pkgs.nix ];
     wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })

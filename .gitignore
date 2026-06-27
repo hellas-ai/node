@@ -4,6 +4,11 @@
 .envrc
 .claude
 .env
+crates/kernel/node_modules/
+crates/kernel/target/
+crates/kernel/ref/
+crates/kernel/_apalache-out/
+crates/kernel/.notes/
 *.swp
 *.swo
 *~

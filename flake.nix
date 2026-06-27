@@ -61,6 +61,7 @@
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
       hydraJobs = forHydraSystems (system: perSystem.${system}.hydraJobs);
+      formatter = forAllSystems (system: perSystem.${system}.formatter);
 
       overlays.default = final: _prev: {
         hellas = self.packages.${final.system};

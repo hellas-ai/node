@@ -86,6 +86,22 @@ POST /v1/messages
 POST /v1/completions
 ```
 
+## Nix
+
+Enter the default Rust development shell:
+
+```bash
+nix develop
+```
+
+Work on the kernel Quint models:
+
+```bash
+nix develop .#kernel
+nix run .#check-kernel-models
+nix run .#check-kernel-model-verify
+```
+
 ## Docker
 
 Docker images: `.#docker-cpu`, `.#docker-cuda12-sm89`, etc. They stream to stdout.
