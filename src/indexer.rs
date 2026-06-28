@@ -23,10 +23,10 @@ use commonware_cryptography::{
 use commonware_resolver::{Fetch, Resolver, TargetedResolver};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, tokio};
 use commonware_storage::archive::immutable;
-use commonware_utils::{Acknowledgement, NZU64, vec::NonEmptyVec};
+use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVec};
 use hellas_kernel::domain::{PublicKey, Scheme};
 use rand_core::CryptoRngCore;
-use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize};
+use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
 
 pub type FinalizationStore<E = tokio::Context> = immutable::Archive<E, Digest, Finalization>;
@@ -118,6 +118,7 @@ where
 pub struct ChainIndexer {
     marshal: MarshalMailbox,
     verifier: Option<ConsensusVerifier>,
+    ingest_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +160,7 @@ impl ChainIndexer {
         Self {
             marshal,
             verifier: None,
+            ingest_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -188,6 +190,7 @@ impl ChainIndexer {
         block: HellasBlock,
         finalization: Finalization,
     ) -> Result<IngestOutcome, IngestError> {
+        let _guard = self.ingest_lock.lock().await;
         let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
         let height = block.height();
         let payload = block.digest();

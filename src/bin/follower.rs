@@ -1,12 +1,13 @@
 use clap::Parser;
 use commonware_codec::DecodeExt;
+use commonware_consensus::Heightable;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use hellas_chain::{
     Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
     FinalizedBlockQuery, IngestError, LightClient as _, QueryError, spawn_follower_indexer,
 };
 use hellas_chain::{client::RemoteLightClient, config::Config};
-use hellas_kernel::domain::{Address, PublicKey};
+use hellas_kernel::domain::PublicKey;
 use std::{path::PathBuf, time::Duration};
 use thiserror::Error;
 
@@ -16,10 +17,18 @@ enum FollowerError {
     MissingDataDirectory,
     #[error("storage directory is not valid UTF-8: {0}")]
     NonUtf8StorageDirectory(PathBuf),
-    #[error("invalid genesis allocation: {0}")]
-    InvalidGenesisAllocation(String),
     #[error("invalid validator key data")]
     InvalidValidatorKey,
+    #[error("remote latest is {remote_latest}, but finalized block at height {height} was absent")]
+    MissingFinalizedBlock { height: u64, remote_latest: u64 },
+    #[error(
+        "requested finalized height {requested}, but snapshot height was {snapshot} and block height was {block}"
+    )]
+    FinalizedBlockHeightMismatch {
+        requested: u64,
+        snapshot: u64,
+        block: u64,
+    },
     #[error("{0}")]
     Query(#[from] QueryError),
     #[error("{0}")]
@@ -37,8 +46,6 @@ struct Cli {
     storage_dir: Option<PathBuf>,
     #[arg(long, default_value = "hellas-follower")]
     partition_prefix: String,
-    #[arg(long = "genesis-allocation")]
-    genesis_allocations: Vec<String>,
     #[arg(long)]
     once: bool,
     #[arg(long, default_value = "500")]
@@ -62,11 +69,6 @@ fn main() -> Result<(), FollowerError> {
 }
 
 async fn follow(context: tokio::Context, cli: Cli) -> Result<(), FollowerError> {
-    let genesis_allocations = cli
-        .genesis_allocations
-        .iter()
-        .map(|raw| parse_genesis_allocation(raw))
-        .collect::<Result<Vec<_>, _>>()?;
     let client = RemoteLightClient::connect(cli.rpc).await?;
     let consensus_info = client.get_consensus_info().await?;
     let verifier = ConsensusVerifier::new(&consensus_info)?;
@@ -75,7 +77,7 @@ async fn follow(context: tokio::Context, cli: Cli) -> Result<(), FollowerError> 
     let application = Application::new(
         context.child("app"),
         genesis_leader,
-        genesis_allocations,
+        Vec::new(),
         &format!("{}-genesis", cli.partition_prefix),
         ApplicationConfig::default(),
     )
@@ -120,12 +122,23 @@ async fn sync_loop(
                 .get_finalized_block(FinalizedBlockQuery::Height(next_height))
                 .await?
             else {
-                break;
+                return Err(FollowerError::MissingFinalizedBlock {
+                    height: next_height,
+                    remote_latest: remote_latest.height,
+                });
             };
             let block = ChainIndexer::decode_block(&finalized.block)?;
+            let block_height = block.height().get();
+            if finalized.snapshot.height != next_height || block_height != next_height {
+                return Err(FollowerError::FinalizedBlockHeightMismatch {
+                    requested: next_height,
+                    snapshot: finalized.snapshot.height,
+                    block: block_height,
+                });
+            }
             let finalization = ChainIndexer::decode_finalization(&finalized.snapshot.finalization)?;
             let outcome = indexer.ingest_finalized(block, finalization).await?;
-            println!("height {} {outcome:?}", next_height);
+            println!("height {block_height} {outcome:?}");
             next_height = next_height.saturating_add(1);
         }
         if once {
@@ -140,19 +153,6 @@ fn default_storage_dir() -> Result<PathBuf, FollowerError> {
         .ok_or(FollowerError::MissingDataDirectory)?
         .join("hellas")
         .join("follower"))
-}
-
-fn parse_genesis_allocation(raw: &str) -> Result<(Address, u64), FollowerError> {
-    let (address, balance) = raw.rsplit_once(':').ok_or_else(|| {
-        FollowerError::InvalidGenesisAllocation("expected address:balance".to_string())
-    })?;
-    let address = address.parse::<Address>().map_err(|err| {
-        FollowerError::InvalidGenesisAllocation(format!("invalid address: {err}"))
-    })?;
-    let balance = balance.parse::<u64>().map_err(|err| {
-        FollowerError::InvalidGenesisAllocation(format!("invalid balance: {err}"))
-    })?;
-    Ok((address, balance))
 }
 
 fn genesis_leader(info: &ConsensusInfo) -> Result<PublicKey, FollowerError> {
