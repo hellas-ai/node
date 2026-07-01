@@ -5,7 +5,7 @@ use commonware_cryptography::Digestible;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use hellas_chain::pb::hellas::{ActivityEvent, ActivityEventKind, activity_event};
 use hellas_chain::{
-    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier, FinalizedBlock,
+    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
     FinalizedBlockQuery, IngestError, LightClient as _, QueryError, spawn_follower_indexer,
 };
 use hellas_chain::{client::RemoteLightClient, config::Config};
@@ -49,14 +49,6 @@ enum FollowerError {
         requested: u64,
         snapshot: u64,
         block: u64,
-    },
-    #[error(
-        "requested finalized payload {requested:?}, but snapshot payload was {snapshot:?} and block payload was {block:?}"
-    )]
-    FinalizedBlockPayloadMismatch {
-        requested: Digest,
-        snapshot: Digest,
-        block: Digest,
     },
     #[error("finalized snapshot height {snapshot} did not match block height {block}")]
     SnapshotBlockHeightMismatch { snapshot: u64, block: u64 },
@@ -166,6 +158,7 @@ async fn follow_connection(
     let mut stream = client
         .subscribe_activity(vec![ActivityEventKind::Finalization])
         .await?;
+    catch_up(indexer, &client).await?;
 
     loop {
         let event = stream
@@ -173,10 +166,15 @@ async fn follow_connection(
             .await
             .map_err(|err| FollowerError::ActivityStream(err.to_string()))?
             .ok_or(FollowerError::ActivityStreamEnded)?;
-        let Some(payload) = finalized_payload(event)? else {
-            continue;
+        let payload = match finalized_payload(event) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(error = %err, "skipping malformed activity event");
+                continue;
+            }
         };
-        ingest_announced_block(indexer, &client, payload).await?;
+        catch_up_announced_payload(indexer, &client, payload).await?;
     }
 }
 
@@ -204,44 +202,43 @@ async fn catch_up(indexer: &ChainIndexer, client: &RemoteLightClient) -> Result<
                 remote_latest: remote_latest.height,
             });
         };
-        ingest_finalized_block(indexer, finalized, ExpectedBlock::Height(next_height)).await?;
+        ingest_finalized_block(indexer, finalized, next_height).await?;
         next_height = next_height.saturating_add(1);
     }
     Ok(())
 }
 
-async fn ingest_announced_block(
+async fn catch_up_announced_payload(
     indexer: &ChainIndexer,
     client: &RemoteLightClient,
     payload: Digest,
 ) -> Result<(), FollowerError> {
     for _ in 0..ANNOUNCED_BLOCK_RETRIES {
-        match client
-            .get_finalized_block(FinalizedBlockQuery::Payload(payload))
-            .await
-        {
-            Ok(Some(finalized)) => {
-                ingest_finalized_block(indexer, finalized, ExpectedBlock::Payload(payload)).await?;
-                return Ok(());
-            }
-            Ok(None) | Err(QueryError::StateUnavailable(_)) => {}
-            Err(err) => return Err(FollowerError::Query(err)),
+        match catch_up(indexer, client).await {
+            Ok(()) if has_local_payload(indexer, payload).await? => return Ok(()),
+            Ok(()) | Err(FollowerError::MissingFinalizedBlock { .. }) => {}
+            Err(err) => return Err(err),
         }
         ::tokio::time::sleep(ANNOUNCED_BLOCK_RETRY_DELAY).await;
     }
     Err(FollowerError::AnnouncedBlockUnavailable { payload })
 }
 
-#[derive(Clone, Copy)]
-enum ExpectedBlock {
-    Height(u64),
-    Payload(Digest),
+async fn has_local_payload(indexer: &ChainIndexer, payload: Digest) -> Result<bool, FollowerError> {
+    match indexer
+        .get_finalized_block(FinalizedBlockQuery::Payload(payload))
+        .await
+    {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) | Err(QueryError::StateUnavailable(_)) => Ok(false),
+        Err(err) => Err(FollowerError::Query(err)),
+    }
 }
 
 async fn ingest_finalized_block(
     indexer: &ChainIndexer,
-    finalized: FinalizedBlock,
-    expected: ExpectedBlock,
+    finalized: hellas_chain::FinalizedBlock,
+    requested: u64,
 ) -> Result<(), FollowerError> {
     let block = ChainIndexer::decode_block(&finalized.block)?;
     let block_height = block.height().get();
@@ -258,22 +255,12 @@ async fn ingest_finalized_block(
             block: block_payload,
         });
     }
-    match expected {
-        ExpectedBlock::Height(requested) if requested != block_height => {
-            return Err(FollowerError::FinalizedBlockHeightMismatch {
-                requested,
-                snapshot: finalized.snapshot.height,
-                block: block_height,
-            });
-        }
-        ExpectedBlock::Payload(requested) if requested != finalized.snapshot.payload => {
-            return Err(FollowerError::FinalizedBlockPayloadMismatch {
-                requested,
-                snapshot: finalized.snapshot.payload,
-                block: block_payload,
-            });
-        }
-        ExpectedBlock::Height(_) | ExpectedBlock::Payload(_) => {}
+    if requested != block_height {
+        return Err(FollowerError::FinalizedBlockHeightMismatch {
+            requested,
+            snapshot: finalized.snapshot.height,
+            block: block_height,
+        });
     }
 
     let finalization = ChainIndexer::decode_finalization(&finalized.snapshot.finalization)?;
