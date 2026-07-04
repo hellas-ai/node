@@ -8,12 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = [
-    "blake3",
-    "prost-build",
-    "prost-types",
-    "protox",
-]
+ignored = ["blake3", "prost-build", "prost-types", "protox"]
 
 [features]
 default = []
@@ -46,20 +41,20 @@ iroh-server = ["iroh"]
 
 # Binary-side bundle for the node binary (executor / model deps).
 node = [
-    "server",
-    "all-protocols",
-    "dep:catgrad",
-    "dep:catgrad-llm",
-    "dep:chatgrad",
-    "dep:serde_json",
-    "dep:tokenizers",
-    "dep:hf-hub",
+  "server",
+  "all-protocols",
+  "dep:catgrad",
+  "dep:catgrad-llm",
+  "dep:chatgrad",
+  "dep:serde_json",
+  "dep:tokenizers",
+  "dep:hf-hub",
 ]
 
 [dependencies]
 bytes = "1"
 catgrad = { workspace = true, default-features = false, features = [
-    "serde",
+  "serde",
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
@@ -68,7 +63,7 @@ futures-util = { version = "0.3", default-features = false }
 hellas-core = { workspace = true }
 hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
-    "ureq",
+  "ureq",
 ], optional = true }
 iroh = { workspace = true, optional = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
@@ -76,8 +71,8 @@ serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = [
-    "progressbar",
-    "fancy-regex",
+  "progressbar",
+  "fancy-regex",
 ], optional = true }
 # `web-time` provides `std::time::Instant` / `SystemTime` equivalents so the
 # peer registry's monotonic clock works under wasm (where `Instant::now` panics with
@@ -86,8 +81,8 @@ web-time = "1"
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
 tokenizers = { version = "0.21", features = [
-    "onig",
-    "esaxx_fast",
+  "onig",
+  "esaxx_fast",
 ], optional = true }
 
 [build-dependencies]
