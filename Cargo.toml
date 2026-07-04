@@ -22,12 +22,16 @@ documentation = "https://docs.rs"
 [workspace.dependencies]
 base64 = "0.22"
 blake3 = "1"
+bytes = "1"
 catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false, features = [
     "serde",
 ] }
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 catnix = { path = "crates/catnix", default-features = false }
 chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", branch = "main", default-features = false }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", branch = "main", default-features = false }
 half = "2.7.1"
 hellas-core = { path = "crates/core", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
