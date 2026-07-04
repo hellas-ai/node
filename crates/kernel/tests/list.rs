@@ -59,7 +59,7 @@ fn map_preserves_zero_length() {
     let mapped: List<u32, 4> = list.map(0, |x| x + 1);
 
     assert!(mapped.is_empty());
-    assert_eq!(mapped.as_slice(), &[]);
+    assert!(mapped.as_slice().is_empty());
 }
 
 #[test]
