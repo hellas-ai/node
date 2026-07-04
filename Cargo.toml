@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/catnix",
-    "crates/cli",
-    "crates/core",
-    "crates/executor",
-    "crates/kernel",
-    "crates/rpc",
-    "crates/wire",
-    "crates/wire-adaptors",
+  "crates/catnix",
+  "crates/cli",
+  "crates/core",
+  "crates/executor",
+  "crates/kernel",
+  "crates/rpc",
+  "crates/wire",
+  "crates/wire-adaptors",
 ]
 default-members = ["crates/cli"]
 resolver = "2"
@@ -24,7 +24,7 @@ base64 = "0.22"
 blake3 = "1"
 bytes = "1"
 catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false, features = [
-    "serde",
+  "serde",
 ] }
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 catnix = { path = "crates/catnix", default-features = false }
@@ -46,16 +46,16 @@ iroh-blobs = { version = "=0.101.0", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
-    "http-proto",
-    "trace",
-    "reqwest-blocking-client",
-    "reqwest-rustls-webpki-roots",
+  "http-proto",
+  "trace",
+  "reqwest-blocking-client",
+  "reqwest-rustls-webpki-roots",
 ] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
-    "webpki-roots",
-    "stream",
+  "rustls",
+  "webpki-roots",
+  "stream",
 ] }
 rustls-webpki = "0.103.9"
 serde = { version = "1", features = ["derive"] }
@@ -64,12 +64,12 @@ serde_ipld_dagcbor = "=0.6.4"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = [
-    "rt-multi-thread",
-    "macros",
-    "signal",
-    "sync",
-    "time",
-    "process",
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "sync",
+  "time",
+  "process",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"

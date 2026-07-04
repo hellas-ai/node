@@ -22,11 +22,11 @@ candle-metal = ["candle", "hellas-executor/candle-metal"]
 # `execution.rs` / `serve/node.rs` collapse to identity, and iroh's metrics
 # module is not built.
 otel = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-    "dep:iroh-metrics",
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+  "dep:iroh-metrics",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -45,19 +45,19 @@ futures = "0.3"
 hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
-    "node",
-    "all-protocols",
+  "node",
+  "all-protocols",
 ] }
 hellas-wire = { workspace = true, features = [
-    "iroh",
-    "discovery-dht",
-    "discovery-mdns",
+  "iroh",
+  "discovery-dht",
+  "discovery-mdns",
 ] }
 hellas-wire-adaptors.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.2"
 iroh-metrics = { version = "1.0.0-rc.0", default-features = false, features = [
-    "metrics",
+  "metrics",
 ], optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

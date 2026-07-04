@@ -22,11 +22,11 @@ futures-core = "0.3"
 futures-util = "0.3"
 hellas-core.workspace = true
 hellas-rpc = { workspace = true, features = [
-    "node",
-    "execute",
-    "evaluate",
-    "fetch",
-    "courtesy",
+  "node",
+  "execute",
+  "evaluate",
+  "fetch",
+  "courtesy",
 ] }
 hellas-wire = { workspace = true }
 iroh-blobs = { workspace = true, features = ["fs-store"] }
