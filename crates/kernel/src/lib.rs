@@ -54,13 +54,14 @@
 //! };
 //! ```
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "domain")]
 extern crate alloc;
 
 mod block;
 mod canonical;
 pub(crate) mod consts;
 mod context;
+#[cfg(feature = "domain")]
 pub mod domain;
 mod error;
 mod event;
