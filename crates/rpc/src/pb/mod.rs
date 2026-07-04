@@ -48,6 +48,14 @@ pub mod hellas {
             include!(concat!(env!("OUT_DIR"), "/hellas.evaluate.v1.rs"));
         }
     }
+
+    #[cfg(feature = "chain")]
+    #[allow(dead_code)]
+    pub mod chain {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.chain.v1.rs"));
+        }
+    }
 }
 
 /// Re-exports of the Hellas core execution types (`hellas.v1`).
@@ -78,6 +86,12 @@ pub mod courtesy {
 #[cfg(feature = "swarm")]
 pub mod swarm {
     pub use crate::pb::hellas::swarm::v1::*;
+}
+
+/// Re-exports of `hellas.chain.v1`.
+#[cfg(feature = "chain")]
+pub mod chain {
+    pub use crate::pb::hellas::chain::v1::*;
 }
 
 /// Service / method markers, typed client traits, and server dispatchers.
