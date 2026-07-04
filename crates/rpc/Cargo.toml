@@ -26,11 +26,12 @@ default = []
 execute = []
 evaluate = ["execute"]
 fetch = ["execute", "dep:serde_json"]
+chain = []
 # Courtesy proto imports hellas.v1 (Ticket) and hellas.evaluate.v1
 # (EvaluateRequest), so the feature must pull both forward.
 courtesy = ["execute", "evaluate"]
 swarm = []
-all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch"]
+all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 
 # === Other knobs ===========================================================
 # Server-side dispatchers.
