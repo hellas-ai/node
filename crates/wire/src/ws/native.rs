@@ -106,7 +106,7 @@ pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
 /// `WsTransport`. The caller is responsible for performing the
 /// HTTP/1.1 → WebSocket handshake (e.g. via `hyper`'s upgrade machinery
 /// + `tokio_tungstenite::WebSocketStream::from_raw_socket(_, Server, _)`
-/// or by accepting on a listener with `tokio_tungstenite::accept_async`).
+///   or by accepting on a listener with `tokio_tungstenite::accept_async`).
 ///
 /// `peer` is the optional transport-vouched identity (e.g. extracted
 /// from a TLS client cert or an upstream auth header); pass `None` if

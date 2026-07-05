@@ -3,13 +3,14 @@ use commonware_codec::DecodeExt;
 use commonware_consensus::Heightable;
 use commonware_cryptography::Digestible;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
-use hellas_chain::pb::hellas::{ActivityEvent, ActivityEventKind, activity_event};
+use futures_util::StreamExt as _;
 use hellas_chain::{
     Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
     FinalizedBlockQuery, IngestError, LightClient as _, QueryError, spawn_follower_indexer,
 };
 use hellas_chain::{client::RemoteLightClient, config::Config};
 use hellas_kernel::domain::{Digest, PublicKey};
+use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
 use std::{path::PathBuf, time::Duration};
 use thiserror::Error;
 use tracing::warn;
@@ -162,10 +163,10 @@ async fn follow_connection(
 
     loop {
         let event = stream
-            .message::<ActivityEvent>()
+            .next()
             .await
-            .map_err(|err| FollowerError::ActivityStream(err.to_string()))?
-            .ok_or(FollowerError::ActivityStreamEnded)?;
+            .ok_or(FollowerError::ActivityStreamEnded)?
+            .map_err(|err| FollowerError::ActivityStream(err.to_string()))?;
         let payload = match finalized_payload(event) {
             Ok(Some(payload)) => payload,
             Ok(None) => continue,

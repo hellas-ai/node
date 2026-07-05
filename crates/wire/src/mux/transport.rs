@@ -57,6 +57,7 @@ pub(crate) enum Command {
     },
 }
 
+#[derive(Clone)]
 pub struct MuxTransport {
     cmd_tx: mpsc::UnboundedSender<Command>,
     inbound_rx: Arc<Mutex<mpsc::UnboundedReceiver<Inbound<MuxStream>>>>,
@@ -267,7 +268,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                     headers,
                     stream,
                     context: TransportContext {
-                        peer: self.peer.clone(),
+                        peer: self.peer,
                         rtt_ms: None,
                         auth_level: if self.peer.is_some() {
                             AuthLevel::Vouched
@@ -284,17 +285,17 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 }
             }
             Event::EndStream { slot, trailer } => {
-                if let Some(mut chans) = self.slot_to_chans.remove(&slot) {
-                    if let Some(t) = chans.trailer_tx.take() {
-                        let _ = t.send(trailer);
-                    }
+                if let Some(mut chans) = self.slot_to_chans.remove(&slot)
+                    && let Some(t) = chans.trailer_tx.take()
+                {
+                    let _ = t.send(trailer);
                 }
             }
             Event::ResetStream { slot, code } => {
-                if let Some(mut chans) = self.slot_to_chans.remove(&slot) {
-                    if let Some(t) = chans.trailer_tx.take() {
-                        let _ = t.send(crate::metadata::Trailer::from_status(code, "reset"));
-                    }
+                if let Some(mut chans) = self.slot_to_chans.remove(&slot)
+                    && let Some(t) = chans.trailer_tx.take()
+                {
+                    let _ = t.send(crate::metadata::Trailer::from_status(code, "reset"));
                 }
             }
             Event::PeerCredit { .. } => {

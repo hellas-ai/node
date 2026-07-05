@@ -146,10 +146,10 @@ impl FuturesStream for MuxRecvHalf {
             Poll::Ready(None) => {
                 // Channel closed — trailer should arrive on trailer_rx.
                 this.done = true;
-                if let Some(mut rx) = this.trailer_rx.take() {
-                    if let Ok(t) = rx.try_recv() {
-                        this.trailer = Some(t);
-                    }
+                if let Some(mut rx) = this.trailer_rx.take()
+                    && let Ok(t) = rx.try_recv()
+                {
+                    this.trailer = Some(t);
                 }
                 Poll::Ready(None)
             }

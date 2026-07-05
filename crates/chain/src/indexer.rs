@@ -18,7 +18,7 @@ use commonware_consensus::{
     types::{FixedEpocher, Height, ViewDelta},
 };
 use commonware_cryptography::{
-    Digestible, certificate::ConstantProvider, certificate::Scheme as _, sha256::Digest,
+    Digestible, certificate::ConstantProvider, certificate::Verifier as _, sha256::Digest,
 };
 use commonware_resolver::{Fetch, Resolver, TargetedResolver};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, tokio};

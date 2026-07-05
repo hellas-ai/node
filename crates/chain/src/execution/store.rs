@@ -1,5 +1,5 @@
 use commonware_cryptography::{Sha256, sha256::Digest};
-use commonware_glue::stateful::db::ManagedDb;
+use commonware_glue::stateful::db::{ManagedDb, Shared};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Storage, buffer::paged::CacheRef};
 use commonware_storage::{
@@ -11,15 +11,11 @@ use commonware_storage::{
     },
     translator::EightCap,
 };
-use commonware_utils::sync::AsyncRwLock;
 use hellas_kernel::domain::{Coin, ObjectId};
-use std::{
-    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Coin, Sha256, EightCap, Sequential>;
-pub type UtxoDatabase<E> = Arc<AsyncRwLock<UtxoDb<E>>>;
+pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
@@ -69,6 +65,7 @@ pub fn utxo_db_config(
             write_buffer: WRITE_BUFFER,
         },
         translator: EightCap,
+        init_cache_size: None,
     }
 }
 

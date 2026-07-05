@@ -1220,7 +1220,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 db_config,
                 input_provider: mempool.clone(),
                 marshal: marshal_mailbox.clone(),
-                max_pending_acks,
                 mailbox_size,
                 plan,
                 resolvers: qmdb_sync_resolver.clone(),
@@ -1231,6 +1230,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                     update_channel_size: NZUsize!(256),
                     max_retained_roots: 8,
                 },
+                prune_config: None,
             },
         );
 
