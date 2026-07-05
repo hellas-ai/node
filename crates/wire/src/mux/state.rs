@@ -108,7 +108,7 @@ pub struct Multiplexer<const N: usize, C: Clock> {
 // needs cross-task access.
 impl<const N: usize, C: Clock> Multiplexer<N, C> {
     pub fn new(role: Role, clock: C, config: MuxConfig) -> Self {
-        let mut free_mask = vec![0u64; (N + 63) / 64];
+        let mut free_mask = vec![0u64; N.div_ceil(64)];
         // Mark all parity-owned slots free, others as not-our-domain.
         // We track ALL slots; just keep peer-owned slots out of the
         // free mask (we never allocate them; peer does).
@@ -413,12 +413,12 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     ///      tore down the stream on their side.
     fn clean_up_after_remote_free(&mut self, idx: SlotIndex) {
         self.pending_terminal_free.retain(|&i| i != idx);
-        if let Some(bytes) = &self.pending_write {
-            if bytes.len() >= 4 {
-                let stream_id = u16::from_be_bytes([bytes[0], bytes[1]]);
-                if stream_id == idx {
-                    self.pending_write = None;
-                }
+        if let Some(bytes) = &self.pending_write
+            && bytes.len() >= 4
+        {
+            let stream_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+            if stream_id == idx {
+                self.pending_write = None;
             }
         }
     }
@@ -649,11 +649,13 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     // `deserialize_mux` instead.
 
     /// The free-mask backing store. Each `u64` covers 64 slot indices.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn free_mask_words(&self) -> &[u64] {
         &self.free_mask
     }
 
     /// Overwrite the free mask in-place during restore.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn set_free_mask_words(&mut self, words: &[u64]) {
         let len = self.free_mask.len().min(words.len());
         self.free_mask[..len].copy_from_slice(&words[..len]);
@@ -662,11 +664,13 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// Current pending wire write (`Some` iff a write was prepared but not
     /// yet handed to the transport, or a previously-handed write reported
     /// backpressure and was re-stashed).
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn pending_write_ref(&self) -> Option<&bytes::Bytes> {
         self.pending_write.as_ref()
     }
 
     /// Replace `pending_write`. Used by the CF DO restore path.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn set_pending_write(&mut self, pending: Option<bytes::Bytes>) {
         self.pending_write = pending;
     }
@@ -676,6 +680,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// confirmed shipped by the transport — we keep them occupied
     /// so a snapshot's `pending_write` can still resolve back to a
     /// known slot on restore.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn pending_terminal_free_slice(&self) -> &[SlotIndex] {
         &self.pending_terminal_free
     }
@@ -683,6 +688,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// Re-populate the deferred terminal-free list during restore.
     /// Caller (snapshot reader) is expected to have validated each
     /// entry against the occupied slot table.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn set_pending_terminal_free(&mut self, slots: Vec<SlotIndex>) {
         self.pending_terminal_free = slots;
     }
@@ -690,11 +696,13 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// Sample the mux's clock. Snapshot serializers use this to capture a
     /// single consistent `now` against which `opened_at`/`deadline` are
     /// converted to durations.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn clock_now(&self) -> web_time::Instant {
         self.clock.now()
     }
 
     /// Iterate occupied slots so the transport can snapshot them.
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn iter_occupied_slots(
         &self,
     ) -> impl Iterator<Item = (SlotIndex, &StreamSlot)> + '_ {
@@ -727,6 +735,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// each slot restored here will additionally mark the slot busy in the
     /// free mask if owned by our parity (peer-owned slots are tracked but
     /// the peer's free mask is implicit).
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn restore_slot(&mut self, idx: SlotIndex, slot: StreamSlot) {
         if (idx as usize) >= N {
             return;
@@ -742,6 +751,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// `recv_trailer` always reset — inbound-side buffered state is not
     /// part of the hibernation contract (peer will retransmit or surface
     /// a transport-level failure).
+    #[cfg(feature = "ws-cf-do")]
     pub(crate) fn make_restored_slot(
         generation: u16,
         state: SlotState,

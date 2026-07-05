@@ -1,4 +1,5 @@
 use hellas_kernel::domain::{Address, Coin, Digest, ObjectId, Transaction};
+use hellas_wire::{WireCode, WireStatus};
 
 /// Flattened proposal metadata for the activity stream.
 #[derive(Clone, Debug)]
@@ -89,21 +90,25 @@ pub enum QueryError {
     Connect(String),
 }
 
-impl From<QueryError> for tonic::Status {
+impl From<QueryError> for WireStatus {
     fn from(err: QueryError) -> Self {
         match err {
-            QueryError::ChannelClosed => tonic::Status::unavailable("query channel closed"),
-            QueryError::StateUnavailable(message) => tonic::Status::failed_precondition(message),
-            QueryError::Remote(message) => tonic::Status::unavailable(message),
-            QueryError::Connect(message) => tonic::Status::unavailable(message),
+            QueryError::ChannelClosed => {
+                WireStatus::new(WireCode::Unavailable, "query channel closed")
+            }
+            QueryError::StateUnavailable(message) => {
+                WireStatus::new(WireCode::FailedPrecondition, message)
+            }
+            QueryError::Remote(message) => WireStatus::new(WireCode::Unavailable, message),
+            QueryError::Connect(message) => WireStatus::new(WireCode::Unavailable, message),
         }
     }
 }
 
-impl From<tonic::Status> for QueryError {
-    fn from(status: tonic::Status) -> Self {
+impl From<WireStatus> for QueryError {
+    fn from(status: WireStatus) -> Self {
         match status.code() {
-            tonic::Code::FailedPrecondition | tonic::Code::OutOfRange => {
+            WireCode::FailedPrecondition | WireCode::OutOfRange => {
                 QueryError::StateUnavailable(status.message().to_string())
             }
             _ => QueryError::Remote(status.to_string()),

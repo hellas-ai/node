@@ -1,83 +1,76 @@
-#[cfg(not(target_arch = "wasm32"))]
-use crate::methods::{LIGHT_CLIENT_METHODS, METHOD_SUBSCRIBE_ACTIVITY};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::pb::hellas::light_client_client::LightClientClient;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::pb::hellas::*;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::{
     ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
     LightClient, OwnerCoins, QueryError,
 };
-#[cfg(not(target_arch = "wasm32"))]
 use commonware_cryptography::{Hasher, Sha256};
-#[cfg(not(target_arch = "wasm32"))]
 use hellas_kernel::domain::{
     Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
     WebAuthnSignature as DomainWebAuthnSignature,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use hellas_rpc::mux::MuxGrpcService;
-use hellas_rpc::ws_mux;
-#[cfg(not(target_arch = "wasm32"))]
+use hellas_rpc::{
+    call::StreamingCall,
+    pb::{chain::*, services::light_client::LightClientClientImpl},
+};
+use hellas_wire::mux::MuxTransport;
 use p256::ecdsa::Signature as P256Signature;
 
-/// ws-mux backed light client that connects to a remote validator or mux relay.
+/// Wire-backed light client that connects to a remote validator or relay.
 #[derive(Clone)]
 pub struct RemoteLightClient {
-    #[cfg(not(target_arch = "wasm32"))]
-    client: LightClientClient<MuxGrpcService>,
-    #[cfg(not(target_arch = "wasm32"))]
-    channel: ws_mux::MuxChannel,
-    #[cfg(not(target_arch = "wasm32"))]
+    client: LightClientClientImpl<MuxTransport>,
     verifier: Option<ConsensusVerifier>,
 }
 
 impl RemoteLightClient {
-    /// Create a client from a pre-built [`ws_mux::MuxChannel`].
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn new(channel: ws_mux::MuxChannel) -> Self {
-        let svc = MuxGrpcService::new(channel.clone(), LIGHT_CLIENT_METHODS);
+    pub fn new(transport: MuxTransport) -> Self {
         Self {
-            client: LightClientClient::new(svc),
-            channel,
+            client: LightClientClientImpl::new(transport),
             verifier: None,
         }
     }
 
-    /// wasm builds don't expose the native tonic-backed client API.
-    #[cfg(target_arch = "wasm32")]
-    pub fn new(_channel: ws_mux::MuxChannel) -> Self {
-        Self {}
-    }
-
-    /// Connect to a ws-mux endpoint over WebSocket.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Connect to a WebSocket endpoint.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, QueryError> {
-        let channel = ws_mux::MuxChannel::connect(&addr.into())
+        let addr = addr.into();
+        #[cfg(not(target_family = "wasm"))]
+        let transport = hellas_wire::ws::connect(&addr)
             .await
             .map_err(|e| QueryError::Connect(e.to_string()))?;
-        Ok(Self::new(channel))
+        #[cfg(target_family = "wasm")]
+        let transport = hellas_wire::ws::wasm::connect(&addr)
+            .await
+            .map_err(|e| QueryError::Connect(e.to_string()))?;
+        Ok(Self::new(transport))
     }
 
-    /// Configure this native client to verify finalized snapshots.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Configure this client to verify finalized snapshots.
     pub fn with_consensus_info(mut self, info: &ConsensusInfo) -> Result<Self, QueryError> {
         self.verifier = Some(ConsensusVerifier::new(info).map_err(QueryError::from)?);
         Ok(self)
     }
+
+    /// Subscribe to the consensus activity stream.
+    pub async fn subscribe_activity(
+        &self,
+        urgent_events: Vec<ActivityEventKind>,
+    ) -> Result<StreamingCall<ActivityEvent>, QueryError> {
+        self.client
+            .subscribe_activity(SubscribeActivityRequest {
+                urgent_events: urgent_events.into_iter().map(|k| k as i32).collect(),
+            })
+            .await
+            .map_err(QueryError::from)
+    }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl LightClient for RemoteLightClient {
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let response = client
                 .get_state_root(GetStateRootRequest {})
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             match response.state_root {
                 Some(bytes) => {
                     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -94,15 +87,14 @@ impl LightClient for RemoteLightClient {
         &self,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let response = client
                 .get_proof(GetProofRequest {
                     object_id: object_id.to_vec(),
                 })
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             Ok(response.proof)
         }
     }
@@ -112,7 +104,7 @@ impl LightClient for RemoteLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Coin>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let response = client
                 .get_coin(GetCoinRequest {
@@ -120,8 +112,7 @@ impl LightClient for RemoteLightClient {
                     object_id: object_id.to_vec(),
                 })
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             match (response.owner, response.value) {
                 (Some(owner_bytes), Some(value)) => {
                     let pk = UserPublicKey::decode(owner_bytes.as_slice())
@@ -140,15 +131,14 @@ impl LightClient for RemoteLightClient {
         &self,
         payload: Digest,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let response = client
                 .get_finalization(GetFinalizationRequest {
                     payload: payload.to_vec(),
                 })
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             Ok(response.certificate)
         }
     }
@@ -156,14 +146,13 @@ impl LightClient for RemoteLightClient {
     fn get_latest_block(
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let verifier = self.verifier.clone();
         async move {
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             response
                 .latest
                 .map(|snapshot| verified_latest_block_from_proto(snapshot, verifier.as_ref()))
@@ -175,14 +164,13 @@ impl LightClient for RemoteLightClient {
         &self,
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let verifier = self.verifier.clone();
         async move {
             let response = client
                 .get_finalized_block(finalized_block_query_to_proto(query))
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             response
                 .block
                 .map(|block| verified_finalized_block_from_proto(block, verifier.as_ref()))
@@ -191,7 +179,7 @@ impl LightClient for RemoteLightClient {
     }
 
     fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let req = transaction_to_proto(tx);
             client.submit_tx(req).await.map_err(QueryError::from)?;
@@ -200,25 +188,23 @@ impl LightClient for RemoteLightClient {
     }
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let resp = client
                 .get_validators(GetValidatorsRequest {})
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             Ok(resp.validators)
         }
     }
 
     fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         async move {
             let resp = client
                 .get_consensus_info(GetConsensusInfoRequest {})
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             if resp.threshold_identity.is_empty() {
                 return Err(QueryError::Remote(
                     "threshold identity was empty".to_string(),
@@ -235,7 +221,7 @@ impl LightClient for RemoteLightClient {
         &self,
         owner: Address,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let verifier = self.verifier.clone();
         async move {
             let resp = client
@@ -243,8 +229,7 @@ impl LightClient for RemoteLightClient {
                     owner: owner.public_key().encode().to_vec(),
                 })
                 .await
-                .map_err(QueryError::from)?
-                .into_inner();
+                .map_err(QueryError::from)?;
             let Some(snapshot) = resp.snapshot else {
                 if resp.coins.is_empty() {
                     return Ok(None);
@@ -269,7 +254,6 @@ impl LightClient for RemoteLightClient {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn verified_latest_block_from_proto(
     snapshot: FinalizedSnapshot,
     verifier: Option<&ConsensusVerifier>,
@@ -283,9 +267,8 @@ fn verified_latest_block_from_proto(
     Ok(latest)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn verified_finalized_block_from_proto(
-    block: crate::pb::hellas::FinalizedBlock,
+    block: hellas_rpc::pb::chain::FinalizedBlock,
     verifier: Option<&ConsensusVerifier>,
 ) -> Result<FinalizedBlock, QueryError> {
     let Some(snapshot) = block.snapshot else {
@@ -305,7 +288,6 @@ fn verified_finalized_block_from_proto(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn finalized_block_query_to_proto(query: FinalizedBlockQuery) -> GetFinalizedBlockRequest {
     let query = match query {
         FinalizedBlockQuery::Latest => None,
@@ -319,7 +301,6 @@ fn finalized_block_query_to_proto(query: FinalizedBlockQuery) -> GetFinalizedBlo
     GetFinalizedBlockRequest { query }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, QueryError> {
     let payload: [u8; 32] = snapshot
         .payload
@@ -340,31 +321,6 @@ fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, Q
     })
 }
 
-impl RemoteLightClient {
-    /// Subscribe to the consensus activity stream.
-    ///
-    /// Uses the underlying ws-mux channel directly since server-streaming
-    /// RPCs bypass the tonic client for simplicity.
-    /// `urgent_events` lists kinds the relay should forward immediately. Empty means every event is
-    /// urgent.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn subscribe_activity(
-        &self,
-        urgent_events: Vec<ActivityEventKind>,
-    ) -> Result<ws_mux::Streaming, QueryError> {
-        self.channel
-            .server_streaming(
-                METHOD_SUBSCRIBE_ACTIVITY,
-                &SubscribeActivityRequest {
-                    urgent_events: urgent_events.into_iter().map(|k| k as i32).collect(),
-                },
-            )
-            .await
-            .map_err(|e| QueryError::Remote(e.to_string()))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn transaction_to_proto(tx: Transaction) -> SubmitTxRequest {
     let signature_to_der = |signature: &DomainWebAuthnSignature| {
         let raw = signature.signature.encode();
@@ -403,12 +359,12 @@ fn transaction_to_proto(tx: Transaction) -> SubmitTxRequest {
     SubmitTxRequest { tx: Some(tx_oneof) }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn proto_block(block: Vec<u8>, payload: Digest) -> crate::pb::hellas::FinalizedBlock {
-        crate::pb::hellas::FinalizedBlock {
+    fn proto_block(block: Vec<u8>, payload: Digest) -> hellas_rpc::pb::chain::FinalizedBlock {
+        hellas_rpc::pb::chain::FinalizedBlock {
             snapshot: Some(FinalizedSnapshot {
                 height: 7,
                 payload: payload.to_vec(),

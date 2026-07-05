@@ -46,6 +46,10 @@ let
     wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
+    wasm-chain =
+      mk "check-wasm-chain"
+        "cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown"
+        ((cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })) ++ [ pkgs.clang ]);
   };
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).

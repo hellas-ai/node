@@ -54,7 +54,7 @@
 //! };
 //! ```
 
-#[cfg(feature = "domain")]
+#[cfg(any(test, feature = "test-support"))]
 extern crate alloc;
 
 mod block;

@@ -16,23 +16,20 @@ required-features = ["node"]
 
 [features]
 default = ["node"]
-api = ["dep:prost", "dep:tonic", "dep:tonic-prost"]
-client = [
+api = ["dep:hellas-rpc", "hellas-rpc/chain"]
+client = ["client-core", "hellas-wire/ws"]
+client-core = [
   "api",
   "dep:commonware-codec",
-  "dep:commonware-consensus",
   "dep:commonware-cryptography",
   "dep:commonware-parallel",
+  "dep:hellas-wire",
   "dep:hellas-kernel",
-  "dep:hellas-rpc",
   "dep:p256",
   "dep:rand",
   "dep:thiserror",
-  "hellas-kernel/consensus",
   "hellas-kernel/domain",
-  "hellas-rpc/mux-client",
 ]
-compile = ["dep:tonic-prost-build"]
 node = [
   "client",
   "server",
@@ -74,24 +71,23 @@ node = [
 server = [
   "api",
   "dep:futures-util",
+  "dep:hellas-wire",
   "dep:hellas-kernel",
-  "dep:hellas-rpc",
   "dep:p256",
   "dep:thiserror",
   "dep:tokio",
   "dep:tokio-stream",
   "dep:tokio-tungstenite",
   "dep:tracing",
+  "hellas-wire/ws",
   "hellas-kernel/domain",
-  "hellas-rpc/mux-server",
   "tokio/net",
   "tokio/rt",
   "tokio/sync",
   "tokio/time",
   "tokio-stream/sync",
-  "tonic/server",
 ]
-wasm-client = ["api", "dep:hellas-rpc", "hellas-rpc/mux-client"]
+wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -117,22 +113,16 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
   "sink",
 ] }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
-hellas-rpc = { workspace = true, optional = true }
+hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
+hellas-wire = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-opentelemetry = { version = "0.32", optional = true }
-opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = [
-  "http-proto",
-  "trace",
-  "reqwest-blocking-client",
-] }
-opentelemetry_sdk = { version = "0.32", optional = true, features = [
-  "rt-tokio",
-] }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 p256 = { version = "0.13", optional = true, default-features = false, features = [
   "ecdsa",
 ] }
 prometheus-client = { workspace = true, optional = true }
-prost = { version = "0.14", optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -144,12 +134,8 @@ tokio = { workspace = true, optional = true, features = [
   "time",
 ] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
-tokio-tungstenite = { version = "0.29", optional = true }
+tokio-tungstenite = { version = "0.27", optional = true }
 toml = { workspace = true, optional = true }
-tonic = { version = "0.14", optional = true, default-features = false, features = [
-  "codegen",
-] }
-tonic-prost = { version = "0.14", optional = true }
 tracing = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true, features = [
@@ -157,9 +143,6 @@ tracing-subscriber = { workspace = true, optional = true, features = [
   "json",
   "env-filter",
 ] }
-
-[build-dependencies]
-tonic-prost-build = { version = "0.14", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 commonware-consensus = { workspace = true, features = ["mocks"] }
