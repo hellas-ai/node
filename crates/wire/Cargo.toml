@@ -1,0 +1,95 @@
+[package]
+name = "hellas-wire"
+description = "Transport-agnostic RPC wire layer for the Hellas protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+
+# Transports
+iroh = ["dep:iroh", "dep:n0-future", "dep:portable-atomic", "dep:tokio-stream"]
+# Discovery backends. `discovery-dht` pulls in `mainline` for the shared shard
+# buckets, plus crypto/encoding deps shared with `discovery-mdns`.
+discovery-dht = [
+    "iroh",
+    "dep:mainline",
+    "dep:async-stream",
+    "dep:postcard",
+    "dep:serde",
+    "dep:sha2",
+]
+discovery-mdns = [
+    "iroh",
+    "dep:async-stream",
+    "dep:data-encoding",
+    "dep:iroh-mdns-address-lookup",
+    "dep:postcard",
+]
+# Mux is shared infrastructure for transports without native substreams.
+mux = []
+ws = ["mux", "dep:tokio-tungstenite"]
+ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
+ws-cf-do = ["mux", "dep:worker"]
+
+# Server role (accept side; non-wasm)
+server = []
+
+[dependencies]
+
+# Discovery backend deps (gated behind discovery-{dht,mdns}).
+async-stream = { version = "0.3", optional = true }
+blake3 = { workspace = true }
+bytes = "1"
+data-encoding = { version = "2", optional = true }
+futures = "0.3"
+futures-core = "0.3"
+
+# Optional transport deps
+iroh = { workspace = true, optional = true }
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
+mainline = { version = "7", optional = true }
+n0-future = { version = "0.3", default-features = false, optional = true }
+
+# Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic
+# provides a mutex-fallback `AtomicU64` so the iroh ConnectionPool's
+# generation counter compiles on embedded targets.
+portable-atomic = { version = "1", default-features = false, features = [
+    "fallback",
+], optional = true }
+postcard = { version = "1", default-features = false, features = [
+    "alloc",
+], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.11", optional = true }
+smol_str = "0.3"
+thiserror = { workspace = true }
+tokio-stream = { workspace = true, optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
+tracing = { workspace = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-time = "1"
+worker = { version = "0.8", optional = true, default-features = false }
+ws_stream_wasm = { version = "0.7", optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = [
+    "io-util",
+    "sync",
+    "macros",
+    "rt",
+    "time",
+] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "macros",
+] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["full"] }

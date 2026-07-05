@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package hellas.swarm.v1;
+
+// P2P/node-facing service. This is transport/discovery metadata, not the core
+// execution protocol.
+
+service Node {
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+  rpc GetKnownPeers(GetKnownPeersRequest) returns (GetKnownPeersResponse);
+}
+
+message GetNodeInfoRequest {}
+
+message GetNodeInfoResponse {
+  string node_id = 1;
+  uint64 uptime_seconds = 2;
+  // Semver string, e.g. "0.1.0". Self-reported; treat as untrusted.
+  string version = 3;
+  // Build commit hash (short hex). Self-reported; treat as untrusted.
+  string build = 4;
+  // Platform triple, e.g. "x86_64-linux". Self-reported; treat as untrusted.
+  string os = 5;
+  // Operator-chosen tag, exactly 16 bytes. Self-reported; treat as untrusted.
+  bytes graffiti = 6;
+}
+
+message GetKnownPeersRequest {
+  string service_alpn = 1;
+}
+
+message GetKnownPeersResponse {
+  repeated bytes peer_ids = 1;
+}
+
+message Presence {
+  string hf_id = 1;
+  string req_id = 2;
+  string peer_id = 3;
+  uint64 ttl_ms = 4;
+  bool is_executor = 5;
+}
