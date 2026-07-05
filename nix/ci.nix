@@ -30,9 +30,20 @@ let
     clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
       cargoEnv rustToolchain
     );
-    sort = mk "check-sort" "cargo-sort --workspace --check" [ pkgs.cargo-sort ];
-    taplo = mk "check-taplo" "taplo fmt --check '*.toml' 'crates/**/Cargo.toml'" [ pkgs.taplo ];
+    sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
+    taplo =
+      mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"
+        [
+          pkgs.taplo
+        ];
     buf = mk "check-buf" "buf lint" [ pkgs.buf ];
+    deny = mk "check-deny" "cargo deny check" (
+      (cargoEnv rustToolchain)
+      ++ [
+        pkgs.cargo-deny
+        pkgs.git
+      ]
+    );
     deadnix = mk "check-deadnix" ''
       shopt -s globstar
       deadnix --fail flake.nix nix/**/*.nix
@@ -42,7 +53,9 @@ let
       shopt -s globstar
       nixfmt --check flake.nix nix/**/*.nix
     '' [ pkgs.nixfmt ];
-    flake-check = mk "check-flake-check" "nix flake check --no-build" [ pkgs.nix ];
+    flake-check = mk "check-flake-check" "nix flake check --accept-flake-config --no-build" [
+      pkgs.nix
+    ];
     wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
@@ -58,46 +71,10 @@ let
     clippy =
       mk "fix-clippy" "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
-    sort = mk "fix-sort" "cargo-sort --workspace" [ pkgs.cargo-sort ];
+    sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };
 
-  # Heuristic — noisy enough to keep out of CI. Surfaced only via
-  # `nix run .#check` for occasional dev use.
-  outdatedCheck =
-    mk "check-outdated"
-      ''
-        report="$(cargo outdated --workspace --root-deps-only --format json)"
-        breaking_updates="$(
-          echo "$report" | jq -r '
-            . as $pkg
-            | .dependencies[]?
-            | select(
-                .kind != "Development"
-                and .latest != "Removed"
-                and .latest != "---"
-                and .compat == "---"
-              )
-            | "\($pkg.crate_name)\t\(.name)\t\(.project)\t\(.latest)"
-          '
-        )"
-        if [ -n "$breaking_updates" ]; then
-          echo "Semver-breaking root dependency updates available:"
-          printf "crate\tdependency\tcurrent\tlatest\n"
-          echo "$breaking_updates"
-          exit 1
-        fi
-        echo "No semver-breaking root dependency updates detected."
-      ''
-      (
-        with pkgs;
-        [
-          rustToolchain
-          cargo-outdated
-          jq
-        ]
-      );
-
-  # `nix run .#check` runs every gating check plus outdated.
+  # `nix run .#check` runs every gating check.
   # `nix run .#fix`   runs the auto-fix variants.
   mkAggregate =
     name: pkgList:
@@ -122,6 +99,6 @@ in
 {
   inherit checks fixes;
   builds = ciBuilds;
-  checkAll = mkAggregate "check-all" ((lib.attrValues checks) ++ [ outdatedCheck ]);
+  checkAll = mkAggregate "check-all" (lib.attrValues checks);
   fixAll = mkAggregate "fix-all" (lib.attrValues fixes);
 }

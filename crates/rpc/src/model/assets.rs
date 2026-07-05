@@ -113,7 +113,7 @@ impl ModelAssets {
             }
         })?;
         PreparedPrompt::from_messages(
-            &self.tokenizer,
+            self.tokenizer.as_ref(),
             template,
             &self.tokenizer_config,
             messages,
@@ -134,7 +134,7 @@ impl ModelAssets {
             }
         })?;
         PreparedPrompt::from_messages_with_options(
-            &self.tokenizer,
+            self.tokenizer.as_ref(),
             template,
             &self.tokenizer_config,
             messages,
@@ -148,7 +148,7 @@ impl ModelAssets {
     }
 
     pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
-        PreparedPrompt::from_prompt(&self.tokenizer, prompt, &self.stop_token_ids)
+        PreparedPrompt::from_prompt(self.tokenizer.as_ref(), prompt, &self.stop_token_ids)
             .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
     }
 

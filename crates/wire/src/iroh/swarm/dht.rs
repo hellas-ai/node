@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::discovery::{DiscoveredPeer, Discovery};
 use super::peers::{FeedError, FeedResult, PeerFeedSpec, Scope};
@@ -596,10 +596,8 @@ async fn publish_shard(
             Some(&salt),
         );
 
-        let dht = Arc::clone(dht);
-        let put_result = tokio::task::spawn_blocking(move || dht.put_mutable(item, latest_seq))
-            .await
-            .map_err(|e| format!("publish task panicked: {e}"))?;
+        let dht = dht.as_ref().clone().as_async();
+        let put_result = dht.put_mutable(item, latest_seq).await;
 
         match put_result {
             Ok(_) => return Ok(()),
@@ -625,21 +623,13 @@ async fn read_shard_state(
     let signing_key = derive_signing_key(alpn, minute, shard);
     let public_key = *signing_key.verifying_key().as_bytes();
     let salt = derive_salt(alpn, minute, shard);
-    let dht = Arc::clone(dht);
+    let dht = dht.as_ref().clone().as_async();
     let alpn_display = String::from_utf8_lossy(alpn).to_string();
 
-    let items = match tokio::task::spawn_blocking(move || {
-        dht.get_mutable(&public_key, Some(salt.as_slice()), None)
-            .collect::<Vec<_>>()
-    })
-    .await
-    {
-        Ok(items) => items,
-        Err(e) => {
-            error!(alpn = %alpn_display, shard, error = %e, "DHT shard read task panicked");
-            return (Vec::new(), None);
-        }
-    };
+    let items = dht
+        .get_mutable(&public_key, Some(salt.as_slice()), None)
+        .collect::<Vec<_>>()
+        .await;
 
     let latest_seq = items.iter().map(mainline::MutableItem::seq).max();
     let buckets = items
