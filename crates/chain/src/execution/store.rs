@@ -19,6 +19,7 @@ pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
+#[cfg(feature = "validator")]
 pub async fn root<E>(database: &UtxoDatabase<E>) -> Digest
 where
     E: Storage + Clock + Metrics + 'static,
@@ -26,6 +27,7 @@ where
     database.read().await.root()
 }
 
+#[cfg(feature = "validator")]
 pub async fn get<E>(database: &UtxoDatabase<E>, object: &ObjectId) -> Option<Coin>
 where
     E: Storage + Clock + Metrics + 'static,

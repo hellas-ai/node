@@ -89,6 +89,7 @@ let
   ciBuilds = {
     cli = "cli";
     cli-candle = "cli-candle";
+    cli-validator = "cli-validator";
     static-x86_64 = "cross-x86_64-linux-musl-cli";
     static-aarch64 = "cross-aarch64-linux-musl-cli";
     static-windows = "cross-x86_64-windows-cli";

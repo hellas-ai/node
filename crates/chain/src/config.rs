@@ -94,7 +94,7 @@ impl Config {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct NodeConfig {
+pub struct ValidatorConfig {
     pub private_key: String,
     pub threshold_share: String,
     pub threshold_polynomial: String,
@@ -122,7 +122,7 @@ pub struct GenesisEntry {
     pub balance: u64,
 }
 
-impl NodeConfig {
+impl ValidatorConfig {
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
         let bytes = hex::decode(&self.private_key)?;
         Ok(ed25519::PrivateKey::decode(bytes.as_slice())?)

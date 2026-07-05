@@ -4,18 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "validator"
-path = "src/bin/validator.rs"
-required-features = ["node"]
-
-[[bin]]
-name = "follower"
-path = "src/bin/follower.rs"
-required-features = ["node"]
-
 [features]
-default = ["node"]
+default = []
 api = ["dep:hellas-rpc", "hellas-rpc/chain"]
 client = ["client-core", "hellas-wire/ws"]
 client-core = [
@@ -30,14 +20,10 @@ client-core = [
     "dep:thiserror",
     "hellas-kernel/domain",
 ]
-node = [
+indexer = [
     "client",
-    "server",
-    "dep:axum",
     "dep:bytes",
-    "dep:clap",
     "dep:commonware-actor",
-    "dep:commonware-broadcast",
     "dep:commonware-codec",
     "dep:commonware-consensus",
     "dep:commonware-cryptography",
@@ -50,10 +36,8 @@ node = [
     "dep:commonware-utils",
     "dep:dirs",
     "dep:futures",
+    "dep:futures-util",
     "dep:hex",
-    "dep:opentelemetry",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry_sdk",
     "dep:p256",
     "dep:prometheus-client",
     "dep:rand",
@@ -61,10 +45,7 @@ node = [
     "dep:serde",
     "dep:thiserror",
     "dep:tokio",
-    "dep:toml",
     "dep:tracing",
-    "dep:tracing-opentelemetry",
-    "dep:tracing-subscriber",
     "dep:hellas-kernel",
     "hellas-kernel/consensus",
 ]
@@ -87,12 +68,24 @@ server = [
     "tokio/time",
     "tokio-stream/sync",
 ]
+validator = [
+    "indexer",
+    "server",
+    "dep:axum",
+    "dep:commonware-broadcast",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:rand_core",
+    "dep:toml",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
 commonware-actor = { workspace = true, optional = true }
 commonware-broadcast = { workspace = true, optional = true }
 commonware-codec = { workspace = true, optional = true }

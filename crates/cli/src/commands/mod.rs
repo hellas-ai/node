@@ -3,6 +3,8 @@ pub type CliResult<T = ()> = anyhow::Result<T>;
 use std::time::Duration;
 
 pub mod artifact;
+#[cfg(feature = "chain")]
+pub mod chain;
 pub(crate) mod codex_auth;
 pub(crate) mod discovery;
 pub mod fetch;

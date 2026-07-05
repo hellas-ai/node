@@ -1,4 +1,14 @@
-use clap::{Parser, Subcommand};
+use crate::{
+    ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
+    Mempool, OwnerIndex, UtxoDb,
+    config::{
+        Config, ConfigError, GenesisEntry, PeerEntry, ValidatorConfig, encode_private_key,
+        encode_threshold_polynomial, encode_threshold_share,
+    },
+    init_block_store, init_finalization_store,
+    rpc::LocalLightClient,
+    spawn_light_client_server, utxo_db_config,
+};
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
@@ -27,24 +37,11 @@ use commonware_storage::{
 };
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
-use hellas_chain::client::RemoteLightClient;
-use hellas_chain::config::{
-    Config, ConfigError, GenesisEntry, NodeConfig, PeerEntry, encode_private_key,
-    encode_threshold_polynomial, encode_threshold_share,
-};
-use hellas_chain::rpc::LocalLightClient;
-use hellas_chain::{
-    ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
-    FinalizedBlockQuery, LightClient as _, Mempool, OwnerIndex, UtxoDb, init_block_store,
-    init_finalization_store, spawn_light_client_server, utxo_db_config,
-};
 use hellas_kernel::domain::{
-    Address, Digest, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
-    UserPublicKey,
+    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
 };
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
-use p256::ecdsa::SigningKey as UserSigningKey;
 use prometheus_client::metrics::gauge::Gauge;
 use rand::{
     RngCore, SeedableRng,
@@ -105,19 +102,8 @@ fn deal_threshold_shares(
     Ok((output.public().clone(), shares))
 }
 
-fn random_user_private_key() -> UserSigningKey {
-    let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
-    UserSigningKey::from_slice(&raw)
-        .expect("decoding 32 random bytes as a secp256r1 private key should succeed")
-}
-
-fn wallet_address_from_signing_key(key: &UserSigningKey) -> Address {
-    Address::from(UserPublicKey::from(key.verifying_key().to_owned()))
-}
-
 #[derive(Debug, Error)]
-enum ValidatorError {
+pub enum ValidatorError {
     #[error("invalid setup args: {0}")]
     InvalidSetup(String),
     #[error("failed to serialize config")]
@@ -126,7 +112,7 @@ enum ValidatorError {
     ReadConfig(#[from] io::Error),
     #[error("failed to parse config file")]
     ParseConfig(#[from] toml::de::Error),
-    #[error("invalid node configuration")]
+    #[error("invalid validator configuration")]
     Config(#[from] ConfigError),
     #[error("invalid listen address")]
     InvalidListenAddress(#[from] std::net::AddrParseError),
@@ -140,161 +126,32 @@ enum ValidatorError {
     RpcBind { addr: SocketAddr, source: io::Error },
 }
 
-#[derive(Parser)]
-#[command(name = "validator")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Generate a TOML config for a single validator node
+#[derive(Debug)]
+pub enum Command {
     Config {
-        /// Total number of validators in the network
-        #[arg(short = 'n', long)]
         validators: u32,
-        /// This node's index (0-based)
-        #[arg(short = 'i', long, default_value = "0")]
-        node: u32,
-        /// Starting port number (node i listens on start_port + i)
-        #[arg(long, default_value = "3000")]
+        validator: u32,
         start_port: u16,
-        /// Deterministic seed for key generation (required for multi-node local setup)
-        #[arg(long)]
         seed: Option<u64>,
-        /// Comma-separated list of addresses for each validator (one per validator,
-        /// in index order). When omitted, all peers default to 127.0.0.1.
-        #[arg(long, value_delimiter = ',')]
         addresses: Option<Vec<String>>,
-        /// WebSocket gRPC bind address (e.g. [::]:31130). Baked into the TOML.
-        #[arg(long)]
         ws_bind: Option<String>,
-        /// Explorer WebSocket URL for pushing activity events and serving queries
-        #[arg(long)]
         ws_push: Option<String>,
-        /// Prometheus metrics port (defaults to 9090 + node index)
-        #[arg(long)]
         metrics_port: Option<u16>,
-        /// Genesis allocation as address:balance. May be repeated.
-        #[arg(long = "genesis-allocation")]
         genesis_allocations: Vec<String>,
     },
-    /// Run a validator node
     Run {
-        /// Path to the TOML config file
-        #[arg(long)]
         config: PathBuf,
     },
-    /// Validate a TOML config without running the node
     CheckConfig {
-        #[arg(long)]
         config: PathBuf,
     },
-    /// Query a running validator via RPC
-    Query {
-        /// RPC endpoint (e.g. http://127.0.0.1:9000)
-        #[arg(long)]
-        rpc: String,
-        #[command(subcommand)]
-        query: QueryCommand,
-    },
-    /// Manage wallet keys
-    Wallet {
-        #[command(subcommand)]
-        wallet: WalletCommand,
-    },
 }
 
-#[derive(Subcommand)]
-enum WalletCommand {
-    /// Generate a new keypair and save to disk
-    Create,
-    /// Display the address for the stored key
-    View,
-}
-
-#[derive(Subcommand)]
-enum QueryCommand {
-    /// Get the latest finalized block
-    LatestBlock,
-    /// Get the current state root
-    StateRoot,
-    /// Get a Merkle inclusion proof for an object
-    Proof {
-        /// Hex-encoded 32-byte object ID
-        #[arg(long)]
-        object_id: String,
-    },
-    /// Get the finalization certificate for a payload
-    Finalization {
-        /// Hex-encoded 32-byte payload digest
-        #[arg(long)]
-        payload: String,
-    },
-    /// Get a finalized block by height, payload, or latest when neither is set
-    FinalizedBlock {
-        /// Finalized block height
-        #[arg(long)]
-        height: Option<u64>,
-        /// Hex-encoded 32-byte payload digest
-        #[arg(long)]
-        payload: Option<String>,
-    },
-    /// Look up a coin by object ID in the latest finalized state
-    Coin {
-        /// Hex-encoded 32-byte object ID
-        #[arg(long)]
-        object_id: String,
-    },
-    /// Submit a transfer transaction
-    Transfer {
-        /// Hex-encoded 32-byte secp256r1 private key (sender)
-        #[arg(long)]
-        key: String,
-        /// Hex-encoded 32-byte object ID of the input coin
-        #[arg(long)]
-        input: String,
-        /// Base58-encoded secp256r1 public key of the recipient
-        #[arg(long)]
-        recipient: String,
-        /// Amount to transfer
-        #[arg(long)]
-        amount: u64,
-        /// WebAuthn origin embedded in clientDataJSON
-        #[arg(long, default_value = "https://wallet.hellas.ai")]
-        origin: String,
-    },
-    /// Submit a merge-coin transaction
-    MergeCoin {
-        /// Hex-encoded 32-byte secp256r1 private key (owner)
-        #[arg(long)]
-        key: String,
-        /// Comma-separated hex-encoded 32-byte object IDs to merge
-        #[arg(long, value_delimiter = ',')]
-        inputs: Vec<String>,
-        /// WebAuthn origin embedded in clientDataJSON
-        #[arg(long, default_value = "https://wallet.hellas.ai")]
-        origin: String,
-    },
-    /// Subscribe to consensus activity events
-    Activity,
-    /// List all known validators
-    Validators,
-    /// List coins owned by an address
-    CoinsByOwner {
-        /// Base58-encoded secp256r1 public key address
-        #[arg(long)]
-        owner: String,
-    },
-}
-
-fn main() {
-    let cli = Cli::parse();
-    let result = match cli.command {
+pub fn run_command(command: Command) -> Result<(), ValidatorError> {
+    match command {
         Command::Config {
             validators,
-            node,
+            validator,
             start_port,
             seed,
             addresses,
@@ -304,7 +161,7 @@ fn main() {
             genesis_allocations,
         } => setup(SetupArgs {
             validators,
-            node,
+            validator,
             start_port,
             seed,
             addresses,
@@ -315,65 +172,12 @@ fn main() {
         }),
         Command::Run { config } => run(config),
         Command::CheckConfig { config } => check_config(config),
-        Command::Query { rpc, query } => do_query(rpc, query),
-        Command::Wallet { wallet } => do_wallet(wallet),
-    };
-
-    if let Err(err) = result {
-        eprintln!("error: {err}");
-        std::process::exit(1);
-    }
-}
-
-fn wallet_key_path() -> Result<PathBuf, ValidatorError> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| ValidatorError::InvalidSetup("cannot determine data directory".into()))?;
-    Ok(base.join("hellas").join("wallet.key"))
-}
-
-fn do_wallet(cmd: WalletCommand) -> Result<(), ValidatorError> {
-    let path = wallet_key_path()?;
-    match cmd {
-        WalletCommand::Create => {
-            if path.exists() {
-                return Err(ValidatorError::InvalidSetup(format!(
-                    "wallet already exists at {}; remove it first to create a new one",
-                    path.display()
-                )));
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    ValidatorError::InvalidSetup(format!("failed to create directory: {e}"))
-                })?;
-            }
-            let key = random_user_private_key();
-            let addr = wallet_address_from_signing_key(&key);
-            let hex_key = hex::encode(key.to_bytes());
-            std::fs::write(&path, &hex_key).map_err(|e| {
-                ValidatorError::InvalidSetup(format!("failed to write wallet key: {e}"))
-            })?;
-            println!("address: {addr}");
-            println!("saved to: {}", path.display());
-            Ok(())
-        }
-        WalletCommand::View => {
-            let hex_key = std::fs::read_to_string(&path).map_err(|e| {
-                ValidatorError::InvalidSetup(format!(
-                    "failed to read wallet key from {}: {e}",
-                    path.display()
-                ))
-            })?;
-            let key = parse_hex_private_key(hex_key.trim())?;
-            let addr = wallet_address_from_signing_key(&key);
-            println!("address: {addr}");
-            Ok(())
-        }
     }
 }
 
 struct SetupArgs {
     validators: u32,
-    node: u32,
+    validator: u32,
     start_port: u16,
     seed: Option<u64>,
     addresses: Option<Vec<String>>,
@@ -386,7 +190,7 @@ struct SetupArgs {
 fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
     let SetupArgs {
         validators,
-        node,
+        validator,
         start_port,
         seed,
         addresses,
@@ -401,9 +205,9 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
             "need at least one validator".to_string(),
         ));
     }
-    if node >= validators {
+    if validator >= validators {
         return Err(ValidatorError::InvalidSetup(
-            "node index must be less than validators".to_string(),
+            "validator index must be less than validators".to_string(),
         ));
     }
     if let Some(ref addrs) = addresses
@@ -437,7 +241,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
     let (threshold_polynomial, threshold_shares) =
         deal_threshold_shares(seed, threshold_participants)?;
 
-    let my_key = &keys[node as usize];
+    let my_key = &keys[validator as usize];
     let my_public_key = my_key.public_key();
     let my_threshold_share = threshold_shares.get_value(&my_public_key).ok_or_else(|| {
         ValidatorError::InvalidSetup("missing threshold share for generated validator".to_string())
@@ -445,7 +249,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
     let peers: Vec<PeerEntry> = keys
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i != node as usize)
+        .filter(|(i, _)| *i != validator as usize)
         .map(|(i, k)| {
             let host = addresses
                 .as_ref()
@@ -462,12 +266,12 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         .map(|raw| parse_genesis_allocation(raw))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let config = NodeConfig {
+    let config = ValidatorConfig {
         private_key: encode_private_key(my_key),
         threshold_share: encode_threshold_share(my_threshold_share),
         threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
-        listen_port: start_port + node as u16,
-        metrics_port: Some(metrics_port.unwrap_or(9090 + node as u16)),
+        listen_port: start_port + validator as u16,
+        metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
         ws_bind,
         explorer_url: ws_push,
         genesis_allocations,
@@ -496,167 +300,6 @@ fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
         address: address.to_string(),
         balance,
     })
-}
-
-fn parse_hex_private_key(hex_str: &str) -> Result<UserSigningKey, ValidatorError> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| ValidatorError::InvalidSetup(format!("bad hex for key: {e}")))?;
-    UserSigningKey::from_slice(bytes.as_slice()).map_err(|_| {
-        ValidatorError::InvalidSetup("key must be a valid secp256r1 private key".into())
-    })
-}
-
-fn do_query(rpc: String, query: QueryCommand) -> Result<(), ValidatorError> {
-    let runtime = ::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| ValidatorError::InvalidSetup(format!("failed to start runtime: {err}")))?;
-    runtime.block_on(async move {
-        let client = RemoteLightClient::connect(rpc)
-            .await
-            .map_err(|err| ValidatorError::InvalidSetup(format!("failed to connect: {err}")))?;
-        let consensus_info = client.get_consensus_info().await.map_err(query_error)?;
-        let client = client
-            .with_consensus_info(&consensus_info)
-            .map_err(query_error)?;
-        match query {
-            QueryCommand::LatestBlock => {
-                match client.get_latest_block().await.map_err(query_error)? {
-                    Some(block) => {
-                        println!("height {}", block.height);
-                        println!("payload {}", hex::encode(block.payload));
-                        println!("state_root {}", hex::encode(block.state_root));
-                        println!("finalization {}", hex::encode(block.finalization));
-                    }
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::StateRoot => {
-                match client.get_state_root().await.map_err(query_error)? {
-                    Some(root) => println!("{}", hex::encode(root)),
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::Coin { object_id } => {
-                let object_id = parse_hex_digest(&object_id, "object_id")?;
-                let Some(latest) = client.get_latest_block().await.map_err(query_error)? else {
-                    println!("none");
-                    return Ok(());
-                };
-                match client
-                    .get_coin(latest.payload, object_id)
-                    .await
-                    .map_err(query_error)?
-                {
-                    Some(coin) => println!("{} {}", coin.owner, coin.value),
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::Validators => {
-                for validator in client.get_validators().await.map_err(query_error)? {
-                    println!("{validator}");
-                }
-                Ok(())
-            }
-            QueryCommand::Finalization { payload } => {
-                let payload = parse_hex_digest(&payload, "payload")?;
-                match client
-                    .get_finalization(payload)
-                    .await
-                    .map_err(query_error)?
-                {
-                    Some(finalization) => println!("{}", hex::encode(finalization)),
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::FinalizedBlock { height, payload } => {
-                let query = finalized_block_query(height, payload)?;
-                match client
-                    .get_finalized_block(query)
-                    .await
-                    .map_err(query_error)?
-                {
-                    Some(block) => {
-                        println!("height {}", block.snapshot.height);
-                        println!("payload {}", hex::encode(block.snapshot.payload));
-                        println!("state_root {}", hex::encode(block.snapshot.state_root));
-                        println!("finalization {}", hex::encode(block.snapshot.finalization));
-                        println!("block {}", hex::encode(block.block));
-                    }
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::CoinsByOwner { owner } => {
-                let owner = owner.parse::<Address>().map_err(|err| {
-                    ValidatorError::InvalidSetup(format!("invalid owner address: {err}"))
-                })?;
-                match client
-                    .get_coins_by_owner(owner)
-                    .await
-                    .map_err(query_error)?
-                {
-                    Some(owner_coins) => {
-                        println!("height {}", owner_coins.snapshot.height);
-                        println!("payload {}", hex::encode(owner_coins.snapshot.payload));
-                        println!(
-                            "state_root {}",
-                            hex::encode(owner_coins.snapshot.state_root)
-                        );
-                        println!(
-                            "finalization {}",
-                            hex::encode(owner_coins.snapshot.finalization)
-                        );
-                        for (object_id, value) in owner_coins.coins {
-                            println!("{} {}", hex::encode(object_id), value);
-                        }
-                    }
-                    None => println!("none"),
-                }
-                Ok(())
-            }
-            QueryCommand::Proof { .. }
-            | QueryCommand::Transfer { .. }
-            | QueryCommand::MergeCoin { .. }
-            | QueryCommand::Activity => Err(ValidatorError::InvalidSetup(
-                "query command is not implemented".to_string(),
-            )),
-        }
-    })
-}
-
-fn parse_hex_digest(raw: &str, field: &'static str) -> Result<Digest, ValidatorError> {
-    let bytes = hex::decode(raw)
-        .map_err(|err| ValidatorError::InvalidSetup(format!("bad hex for {field}: {err}")))?;
-    let len = bytes.len();
-    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
-        ValidatorError::InvalidSetup(format!("{field} must be 32 bytes, got {len}"))
-    })?;
-    Ok(Digest::from(raw))
-}
-
-fn finalized_block_query(
-    height: Option<u64>,
-    payload: Option<String>,
-) -> Result<FinalizedBlockQuery, ValidatorError> {
-    match (height, payload) {
-        (Some(height), None) => Ok(FinalizedBlockQuery::Height(height)),
-        (None, Some(payload)) => Ok(FinalizedBlockQuery::Payload(parse_hex_digest(
-            &payload, "payload",
-        )?)),
-        (None, None) => Ok(FinalizedBlockQuery::Latest),
-        (Some(_), Some(_)) => Err(ValidatorError::InvalidSetup(
-            "--height and --payload are mutually exclusive".to_string(),
-        )),
-    }
-}
-
-fn query_error(err: impl std::fmt::Display) -> ValidatorError {
-    ValidatorError::InvalidSetup(format!("query failed: {err}"))
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -927,18 +570,18 @@ async fn replay_owner_index(
     Ok(())
 }
 
-/// Run all `NodeConfig` validations the runtime would perform at startup.
+/// Run all `ValidatorConfig` validations the runtime would perform at startup.
 /// Used by `validator check-config` and by `nix build` via runCommand.
 fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
-    let node_config: NodeConfig = toml::from_str(&config_str)?;
-    node_config.decode_private_key()?;
-    node_config.decode_threshold_share()?;
-    node_config.decode_threshold_polynomial()?;
-    node_config.participants()?;
-    node_config.peer_address_map()?;
-    node_config.genesis_allocations()?;
-    if let Some(ws_bind) = &node_config.ws_bind {
+    let validator_config: ValidatorConfig = toml::from_str(&config_str)?;
+    validator_config.decode_private_key()?;
+    validator_config.decode_threshold_share()?;
+    validator_config.decode_threshold_polynomial()?;
+    validator_config.participants()?;
+    validator_config.peer_address_map()?;
+    validator_config.genesis_allocations()?;
+    if let Some(ws_bind) = &validator_config.ws_bind {
         ws_bind.parse::<SocketAddr>().map_err(|err| {
             ValidatorError::InvalidSetup(format!("invalid ws_bind address: {err}"))
         })?;
@@ -949,11 +592,11 @@ fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
 
 fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
-    let mut node_config: NodeConfig = toml::from_str(&config_str)?;
+    let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
 
     // Prefer systemd-supplied credentials; otherwise keys come from the TOML — fine for dev/test,
     // never for production. eprintln! because tracing isn't initialized yet at this point.
-    if !node_config.load_credentials()? {
+    if !validator_config.load_credentials()? {
         eprintln!(
             "WARNING: CREDENTIALS_DIRECTORY not set; using key material from {}. \
              Production must supply keys via systemd LoadCredential.",
@@ -961,18 +604,18 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         );
     }
 
-    let private_key = node_config.decode_private_key()?;
+    let private_key = validator_config.decode_private_key()?;
     let me = private_key.public_key();
-    let threshold_share = node_config.decode_threshold_share()?;
-    let threshold_polynomial = node_config.decode_threshold_polynomial()?;
-    let genesis_allocations = node_config.genesis_allocations()?;
+    let threshold_share = validator_config.decode_threshold_share()?;
+    let threshold_polynomial = validator_config.decode_threshold_polynomial()?;
+    let genesis_allocations = validator_config.genesis_allocations()?;
 
     let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
 
-    let participants = node_config.participants()?;
-    let peer_map = node_config.peer_address_map()?;
+    let participants = validator_config.participants()?;
+    let peer_map = validator_config.peer_address_map()?;
 
-    let listen_addr: SocketAddr = format!("0.0.0.0:{}", node_config.listen_port).parse()?;
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", validator_config.listen_port).parse()?;
 
     // Build consensus scheme
     let scheme = match Scheme::signer(
@@ -998,15 +641,15 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     };
 
     // Configure tokio runtime
-    let storage_dir = node_config.storage_directory()?;
+    let storage_dir = validator_config.storage_directory()?;
     let storage_dir_utf8 = storage_dir
         .to_str()
         .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
-    let metrics_addr = node_config
+    let metrics_addr = validator_config
         .metrics_port
         .map(|metrics_port| format!("0.0.0.0:{metrics_port}").parse())
         .transpose()?;
-    let ws_bind_addr = node_config
+    let ws_bind_addr = validator_config
         .ws_bind
         .as_ref()
         .map(|addr| {
@@ -1032,7 +675,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             version = env!("CARGO_PKG_VERSION"),
             "hellas validator starting",
         );
-        if let Some(metrics_port) = node_config.metrics_port {
+        if let Some(metrics_port) = validator_config.metrics_port {
             info!(metrics_port, "prometheus metrics server started");
         }
 
@@ -1122,7 +765,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         );
         let genesis_block = application.genesis_block();
         let stateful_startup_context = context.child("stateful_startup");
-        let plan = SyncPlan::<_, Scheme, Standard<hellas_chain::HellasBlock>>::init(
+        let plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
             &stateful_startup_context,
             partition_prefix.clone(),
         )
@@ -1151,7 +794,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             strategy: Sequential,
         };
         let (marshal_actor, marshal_mailbox, _last_height) =
-            MarshalActor::<_, Standard<hellas_chain::HellasBlock>, _, _, _, _, _>::init(
+            MarshalActor::<_, Standard<crate::HellasBlock>, _, _, _, _, _>::init(
                 context.child("marshal"),
                 finalizations_by_height,
                 finalized_blocks,
@@ -1297,7 +940,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             None
         };
 
-        if let Some(explorer_url) = &node_config.explorer_url {
+        if let Some(explorer_url) = &validator_config.explorer_url {
             warn!(
                 %explorer_url,
                 "explorer_url is not implemented",

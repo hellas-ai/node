@@ -1,4 +1,4 @@
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 mod full {
     use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, QueryError};
     use commonware_codec::{Decode, DecodeExt};
@@ -86,7 +86,7 @@ mod full {
     }
 }
 
-#[cfg(not(feature = "node"))]
+#[cfg(not(any(feature = "indexer", feature = "validator")))]
 mod light {
     use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, QueryError};
     use commonware_codec::{DecodeExt, ReadExt, Write, varint::UInt};
@@ -279,7 +279,7 @@ mod light {
     }
 }
 
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub use full::*;
-#[cfg(not(feature = "node"))]
+#[cfg(not(any(feature = "indexer", feature = "validator")))]
 pub use light::*;

@@ -16,6 +16,9 @@ default = []
 candle = ["hellas-executor/candle", "hellas-rpc/server"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
+chain = ["dep:hellas-chain", "dep:hellas-kernel", "hellas-chain/client"]
+indexer = ["chain", "hellas-chain/indexer"]
+validator = ["indexer", "hellas-chain/validator"]
 
 # OpenTelemetry / OTLP exporter + iroh-internal metrics. When off, none of the
 # opentelemetry crates compile, the trace context propagation paths in
@@ -42,8 +45,12 @@ catgrad = { workspace = true, default-features = false }
 chatgrad.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
+hellas-kernel = { workspace = true, default-features = false, features = [
+    "domain",
+], optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "node",
     "all-protocols",
@@ -54,6 +61,7 @@ hellas-wire = { workspace = true, features = [
     "discovery-mdns",
 ] }
 hellas-wire-adaptors.workspace = true
+hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.4"
 iroh-metrics = { version = "1", default-features = false, features = [
