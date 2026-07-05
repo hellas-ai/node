@@ -22,15 +22,15 @@ futures-core = "0.3"
 futures-util = "0.3"
 hellas-core.workspace = true
 hellas-rpc = { workspace = true, features = [
-  "node",
-  "execute",
-  "evaluate",
-  "fetch",
-  "courtesy",
+    "node",
+    "execute",
+    "evaluate",
+    "fetch",
+    "courtesy",
 ] }
 hellas-wire = { workspace = true }
 iroh-blobs = { workspace = true, features = ["fs-store"] }
-prometheus-client = "0.24"
+prometheus-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

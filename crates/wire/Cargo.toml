@@ -12,25 +12,22 @@ default = []
 
 # Transports
 iroh = ["dep:iroh", "dep:n0-future", "dep:portable-atomic", "dep:tokio-stream"]
-# Discovery backends. `discovery-dht` pulls in `mainline` for the
-# shared shard buckets, plus the small crypto/encoding deps shared with
-# `discovery-mdns` (postcard, sha2, async-stream, serde). `discovery-mdns`
-# pulls in the external `iroh-mdns-address-lookup` crate (iroh 1.0.0-rc.0
-# moved mDNS out of the core iroh crate into its own crate).
+# Discovery backends. `discovery-dht` pulls in `mainline` for the shared shard
+# buckets, plus crypto/encoding deps shared with `discovery-mdns`.
 discovery-dht = [
-  "iroh",
-  "dep:mainline",
-  "dep:async-stream",
-  "dep:postcard",
-  "dep:serde",
-  "dep:sha2",
+    "iroh",
+    "dep:mainline",
+    "dep:async-stream",
+    "dep:postcard",
+    "dep:serde",
+    "dep:sha2",
 ]
 discovery-mdns = [
-  "iroh",
-  "dep:async-stream",
-  "dep:data-encoding",
-  "dep:iroh-mdns-address-lookup",
-  "dep:postcard",
+    "iroh",
+    "dep:async-stream",
+    "dep:data-encoding",
+    "dep:iroh-mdns-address-lookup",
+    "dep:postcard",
 ]
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
@@ -53,44 +50,44 @@ futures-core = "0.3"
 
 # Optional transport deps
 iroh = { workspace = true, optional = true }
-iroh-mdns-address-lookup = { version = "0.2", optional = true }
-mainline = { version = "6", optional = true }
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
+mainline = { version = "7", optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
 
 # Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic
 # provides a mutex-fallback `AtomicU64` so the iroh ConnectionPool's
 # generation counter compiles on embedded targets.
 portable-atomic = { version = "1", default-features = false, features = [
-  "fallback",
+    "fallback",
 ], optional = true }
 postcard = { version = "1", default-features = false, features = [
-  "alloc",
+    "alloc",
 ], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
-tokio-tungstenite = { version = "0.27", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 tracing = { workspace = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-time = "1"
-worker = { version = "0.6", optional = true, default-features = false }
+worker = { version = "0.8", optional = true, default-features = false }
 ws_stream_wasm = { version = "0.7", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = [
-  "io-util",
-  "sync",
-  "macros",
-  "rt",
-  "time",
+    "io-util",
+    "sync",
+    "macros",
+    "rt",
+    "time",
 ] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
-  "sync",
-  "macros",
+    "sync",
+    "macros",
 ] }
 
 [dev-dependencies]

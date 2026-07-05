@@ -224,6 +224,7 @@ let
       apps."docker-push-all" = {
         type = "app";
         program = "${docker.pushAll}/bin/docker-push-all";
+        meta.description = "Push all Hellas Docker images";
       };
 
       devShells.cuda = pkgs.mkShell {
@@ -345,7 +346,7 @@ in
     check = {
       type = "app";
       program = lib.getExe ci.checkAll;
-      meta.description = "Run all CI checks (sort, fmt, clippy, test, wasm-rpc, outdated)";
+      meta.description = "Run local checks and dependency audits";
     };
     fix = {
       type = "app";
@@ -359,6 +360,7 @@ in
     lib.nameValuePair "check-${name}" {
       type = "app";
       program = lib.getExe pkg;
+      meta.description = "Run the ${name} check";
     }
   ) ci.checks)
   // (linuxOutputs.apps or { });
