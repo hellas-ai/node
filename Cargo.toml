@@ -47,6 +47,7 @@ commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", branch =
 dirs = "6"
 futures = "0.3"
 half = "2.7.1"
+hellas-chain = { path = "crates/chain", default-features = false }
 hellas-core = { path = "crates/core", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }

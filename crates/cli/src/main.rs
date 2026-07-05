@@ -335,6 +335,12 @@ enum Commands {
         #[command(subcommand)]
         command: commands::artifact::ArtifactCommand,
     },
+    /// Query or run Hellas chain components
+    #[cfg(feature = "chain")]
+    Chain {
+        #[command(subcommand)]
+        command: commands::chain::ChainCommand,
+    },
     /// Run LLM inference remotely or locally
     Llm {
         /// Node ID to run on remotely (omit to auto-discover)
@@ -606,6 +612,8 @@ async fn main() {
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
+        #[cfg(feature = "chain")]
+        Commands::Chain { command } => commands::chain::run(command).await,
         Commands::Llm {
             node_id,
             node_addrs,

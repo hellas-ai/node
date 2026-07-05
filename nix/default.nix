@@ -125,17 +125,28 @@ let
     in
     {
       cli = pkgSpec.mkHellasPackage {
-        buildInputs = [ ];
+        buildNoDefaultFeatures = true;
+        buildFeatures = [ "chain" ];
+      };
+      cli-validator = pkgSpec.mkHellasPackage {
+        buildNoDefaultFeatures = true;
+        buildFeatures = [ "validator" ];
       };
       cli-candle = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        buildFeatures = [ "candle" ];
+        buildFeatures = [
+          "chain"
+          "candle"
+        ];
       };
     }
     // lib.optionalAttrs hostPlatform.isDarwin {
       cli-candle-metal = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        buildFeatures = [ "candle-metal" ];
+        buildFeatures = [
+          "chain"
+          "candle-metal"
+        ];
       };
     };
 
@@ -308,7 +319,7 @@ let
   };
 
   hydraPackages = {
-    inherit (nativePackages) cli cli-candle;
+    inherit (nativePackages) cli cli-candle cli-validator;
   }
   // lib.optionalAttrs isX86_64Linux {
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;

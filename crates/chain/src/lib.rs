@@ -1,38 +1,57 @@
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
 #[cfg(any(feature = "client", feature = "wasm-client"))]
 pub mod client;
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod config;
-#[cfg(any(feature = "client", feature = "wasm-client", feature = "node"))]
+#[cfg(any(
+    feature = "client",
+    feature = "wasm-client",
+    feature = "indexer",
+    feature = "validator"
+))]
 mod consensus;
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
-#[cfg(feature = "node")]
+#[cfg(feature = "indexer")]
+pub mod follower;
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod indexer;
 #[cfg(any(feature = "client", feature = "wasm-client", feature = "server"))]
 pub mod light_client;
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod owner_index;
-#[cfg(feature = "node")]
+#[cfg(feature = "validator")]
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "validator")]
+pub mod validator;
 
-#[cfg(any(feature = "client", feature = "wasm-client", feature = "node"))]
+#[cfg(any(
+    feature = "client",
+    feature = "wasm-client",
+    feature = "indexer",
+    feature = "validator"
+))]
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
-#[cfg(any(feature = "client", feature = "wasm-client", feature = "node"))]
+#[cfg(any(
+    feature = "client",
+    feature = "wasm-client",
+    feature = "indexer",
+    feature = "validator"
+))]
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub use execution::store::{UtxoDb, utxo_db_config};
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub use indexer::{
     BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,
     init_finalization_store, spawn_follower_indexer,
@@ -42,7 +61,7 @@ pub use light_client::{
     ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
     LightClient, OwnerCoins, ProposalInfo, QueryError,
 };
-#[cfg(feature = "node")]
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 #[cfg(feature = "server")]
 pub use server::spawn_light_client_server;

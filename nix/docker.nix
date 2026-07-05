@@ -126,7 +126,10 @@ let
       cudaEnv = mkCudaEnv v;
       cliCuda = mkHellasPackage {
         buildNoDefaultFeatures = true;
-        buildFeatures = [ "candle-cuda" ];
+        buildFeatures = [
+          "chain"
+          "candle-cuda"
+        ];
         doCheck = false;
         nativeBuildInputs =
           (with pkgs.buildPackages; [

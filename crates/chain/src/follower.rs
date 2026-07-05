@@ -1,14 +1,13 @@
-use clap::Parser;
+use crate::{
+    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier, FinalizedBlock,
+    FinalizedBlockQuery, IngestError, LightClient as _, QueryError, client::RemoteLightClient,
+    config::Config, spawn_follower_indexer,
+};
 use commonware_codec::DecodeExt;
 use commonware_consensus::Heightable;
 use commonware_cryptography::Digestible;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use futures_util::StreamExt as _;
-use hellas_chain::{
-    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
-    FinalizedBlockQuery, IngestError, LightClient as _, QueryError, spawn_follower_indexer,
-};
-use hellas_chain::{client::RemoteLightClient, config::Config};
 use hellas_kernel::domain::{Digest, PublicKey};
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
 use std::{path::PathBuf, time::Duration};
@@ -20,7 +19,7 @@ const ANNOUNCED_BLOCK_RETRIES: u32 = 50;
 const ANNOUNCED_BLOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
-enum FollowerError {
+pub enum FollowerError {
     #[error("unable to determine local data directory")]
     MissingDataDirectory,
     #[error("storage directory is not valid UTF-8: {0}")]
@@ -58,7 +57,7 @@ enum FollowerError {
     #[error("{0}")]
     Query(#[from] QueryError),
     #[error("{0}")]
-    Consensus(#[from] hellas_chain::ConsensusVerificationError),
+    Consensus(#[from] crate::ConsensusVerificationError),
     #[error("{0}")]
     Ingest(#[from] IngestError),
 }
@@ -78,21 +77,15 @@ impl FollowerError {
     }
 }
 
-#[derive(Parser)]
-#[command(name = "follower")]
-struct Cli {
-    #[arg(long)]
-    rpc: String,
-    #[arg(long)]
-    storage_dir: Option<PathBuf>,
-    #[arg(long, default_value = "hellas-follower")]
-    partition_prefix: String,
+#[derive(Clone, Debug)]
+pub struct FollowerOptions {
+    pub rpc: String,
+    pub storage_dir: Option<PathBuf>,
+    pub partition_prefix: String,
 }
 
-fn main() -> Result<(), FollowerError> {
-    init_tracing();
-    let cli = Cli::parse();
-    let storage_dir = cli
+pub fn run(options: FollowerOptions) -> Result<(), FollowerError> {
+    let storage_dir = options
         .storage_dir
         .clone()
         .map(Ok)
@@ -103,11 +96,12 @@ fn main() -> Result<(), FollowerError> {
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)
         .with_tcp_nodelay(Some(true));
-    tokio::Runner::new(runtime_cfg).start(move |context| async move { follow(context, cli).await })
+    tokio::Runner::new(runtime_cfg)
+        .start(move |context| async move { follow(context, options).await })
 }
 
-async fn follow(context: tokio::Context, cli: Cli) -> Result<(), FollowerError> {
-    let client = RemoteLightClient::connect(cli.rpc.clone()).await?;
+async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(), FollowerError> {
+    let client = RemoteLightClient::connect(options.rpc.clone()).await?;
     let consensus_info = client.get_consensus_info().await?;
     let verifier = ConsensusVerifier::new(&consensus_info)?;
     let genesis_leader = genesis_leader(&consensus_info)?;
@@ -115,19 +109,19 @@ async fn follow(context: tokio::Context, cli: Cli) -> Result<(), FollowerError> 
         context.child("app"),
         genesis_leader,
         Vec::new(),
-        &format!("{}-genesis", cli.partition_prefix),
+        &format!("{}-genesis", options.partition_prefix),
         ApplicationConfig::default(),
     )
     .await;
     let (indexer, _marshal) = spawn_follower_indexer(
         context.child("indexer"),
-        &cli.partition_prefix,
+        &options.partition_prefix,
         Config::mainnet(),
         verifier,
         application.genesis_block(),
     )
     .await?;
-    follow_remote(indexer, cli.rpc, consensus_info).await
+    follow_remote(indexer, options.rpc, consensus_info).await
 }
 
 async fn follow_remote(
@@ -238,7 +232,7 @@ async fn has_local_payload(indexer: &ChainIndexer, payload: Digest) -> Result<bo
 
 async fn ingest_finalized_block(
     indexer: &ChainIndexer,
-    finalized: hellas_chain::FinalizedBlock,
+    finalized: FinalizedBlock,
     requested: u64,
 ) -> Result<(), FollowerError> {
     let block = ChainIndexer::decode_block(&finalized.block)?;
@@ -310,20 +304,4 @@ fn genesis_leader(info: &ConsensusInfo) -> Result<PublicKey, FollowerError> {
         .ok_or(FollowerError::InvalidValidatorKey)?;
     let bytes = hex::decode(validator).map_err(|_| FollowerError::InvalidValidatorKey)?;
     PublicKey::decode(bytes.as_slice()).map_err(|_| FollowerError::InvalidValidatorKey)
-}
-
-fn init_tracing() {
-    use tracing_subscriber::prelude::*;
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-                .compact(),
-        )
-        .init();
 }
