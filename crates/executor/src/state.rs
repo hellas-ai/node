@@ -1,198 +1,357 @@
 use std::collections::HashMap;
-use thiserror::Error;
+use std::str::FromStr;
+use std::time::Instant;
 
-use crate::weights::ResolvedWeightKey;
+use crate::DEFAULT_MAX_SEQ;
+use crate::fetch_provider::FetchProviderRequest;
+use catgrad::prelude::Dtype;
+use hellas_rpc::ExecutorError;
+use hellas_rpc::encode_token_ids;
+use hellas_rpc::pb::courtesy::{
+    EvaluateStart as PbEvaluateStart, QuotePreparedTextRequest, evaluate_start,
+};
+use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
+use hellas_rpc::pb::execute::{
+    FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
+    WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
+};
+use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
+use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
+use hellas_rpc::{Digest, EvaluateRequest, PublicKey, RequestCommitment};
+use uuid::Uuid;
 
-#[derive(Debug, Error)]
-pub enum StateError {
-    #[error("quote not found: {0}")]
-    QuoteNotFound(String),
-    #[error("execution not found: {0}")]
-    ExecutionNotFound(String),
+pub use hellas_rpc::error::StateError;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ModelLocator {
+    pub model_id: String,
+    pub revision: String,
+    pub dtype: Dtype,
 }
 
-#[derive(Clone)]
-pub struct ExecutionPlan {
-    pub graph: Vec<u8>,
-    pub weights_hint: Option<ResolvedWeightKey>,
-    pub input: String,
-    pub max_seq: u32,
-}
-
-pub struct Quote {
-    pub plan: ExecutionPlan,
-}
-
-pub struct Execution {
-    pub status: ExecutionStatus,
-    pub progress: u64,
-    pub result: Option<Vec<u8>>,
-    pub decoded: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-pub enum ExecutionStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
-impl ExecutionStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
+impl ModelLocator {
+    pub(crate) fn spec(&self) -> String {
+        model_spec(&self.model_id, &self.revision)
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Invocation {
+    pub input_ids: Vec<u32>,
+    pub max_new_tokens: u32,
+    pub stop_token_ids: Vec<i32>,
+}
+
+pub(crate) struct QuotePlan {
+    pub locator: ModelLocator,
+    pub invocation: Invocation,
+    pub initial_artifact_id: Option<Digest>,
+    pub runner_public_key: PublicKey,
+}
+
+impl QuotePlan {
+    pub(crate) fn from_prepared_text_request(
+        request: QuotePreparedTextRequest,
+        supported_dtypes: &[Dtype],
+    ) -> Result<Self, ExecutorError> {
+        let model_id = request.huggingface_model_id.trim();
+        if model_id.is_empty() {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "missing huggingface_model_id".to_string(),
+            ));
+        }
+
+        let revision = request.huggingface_revision.trim();
+        let revision = if revision.is_empty() {
+            DEFAULT_MODEL_REVISION
+        } else {
+            revision
+        }
+        .to_string();
+
+        let dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
+        let max_new_tokens = if request.max_new_tokens == 0 {
+            DEFAULT_MAX_SEQ
+        } else {
+            request.max_new_tokens
+        };
+
+        let input_ids = request.prompt_token_ids.clone();
+        if input_ids.is_empty() {
+            return Err(ExecutorError::InvalidTokenPayload(
+                "prompt is empty after decoding".to_string(),
+            ));
+        }
+        let stop_token_ids = request
+            .stop_token_ids
+            .iter()
+            .copied()
+            .map(|token| {
+                i32::try_from(token).map_err(|_| {
+                    ExecutorError::InvalidTokenPayload(format!(
+                        "stop token id {token} exceeds i32 range"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let initial_artifact_id = parse_evaluate_start(request.start)?;
+        let runner_public_key = request
+            .runner_public_key
+            .ok_or_else(|| {
+                ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string())
+            })
+            .and_then(|key| {
+                public_key_from_pb(key).map_err(|err| {
+                    ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
+                })
+            })?;
+
+        Ok(Self {
+            locator: ModelLocator {
+                model_id: model_id.to_string(),
+                revision,
+                dtype,
+            },
+            invocation: Invocation {
+                input_ids,
+                max_new_tokens,
+                stop_token_ids,
+            },
+            initial_artifact_id,
+            runner_public_key,
+        })
+    }
+}
+
+pub(crate) fn resolve_accept_dtypes(
+    prefs: &[String],
+    supported_dtypes: &[Dtype],
+) -> Result<Dtype, ExecutorError> {
+    if supported_dtypes.is_empty() {
+        return Err(ExecutorError::InvalidQuoteRequest(
+            "executor must support at least one dtype".to_string(),
+        ));
+    }
+    if prefs.is_empty() {
+        return Ok(supported_dtypes[0]);
+    }
+    let mut parsed = Vec::with_capacity(prefs.len());
+    for raw in prefs {
+        let dtype = Dtype::from_str(raw).map_err(|e| {
+            ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
+        })?;
+        if matches!(dtype, Dtype::U32) {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "model dtype must be f32, f16, bf16, or f8".to_string(),
+            ));
+        }
+        parsed.push(dtype);
+    }
+    for dtype in &parsed {
+        if supported_dtypes.contains(dtype) {
+            return Ok(*dtype);
+        }
+    }
+    Err(ExecutorError::DtypeNotSupported {
+        request: parsed[0],
+        supported: supported_dtypes.to_vec(),
+    })
+}
+
+pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateRequest {
+    PbEvaluateRequest {
+        text_execution: request.text_execution.as_bytes().to_vec(),
+        runner_public_key: Some(public_key_to_pb(&request.runner_public_key)),
+    }
+}
+
+pub(crate) fn evaluate_request_from_pb(
+    request: PbEvaluateRequest,
+) -> Result<EvaluateRequest, ExecutorError> {
+    Ok(EvaluateRequest {
+        text_execution: Digest::from_bytes(bytes32(&request.text_execution, "text_execution")?),
+        runner_public_key: request
+            .runner_public_key
+            .ok_or_else(|| {
+                ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string())
+            })
+            .and_then(|key| {
+                public_key_from_pb(key).map_err(|err| {
+                    ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
+                })
+            })?,
+    })
+}
+
+fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>, ExecutorError> {
+    let start = start
+        .and_then(|start| start.kind)
+        .ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing evaluate start".to_string()))?;
+    match start {
+        evaluate_start::Kind::Genesis(_) => Ok(None),
+        evaluate_start::Kind::Artifact(artifact) => Ok(Some(Digest::from_bytes(bytes32(
+            &artifact.artifact,
+            "artifact",
+        )?))),
+    }
+}
+
+fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
+    bytes.try_into().map_err(|_| {
+        ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
+    })
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    Digest::from_bytes(*bytes).to_string()
+}
+
+pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
+    if revision.is_empty() {
+        model_id.to_string()
+    } else {
+        format!("{model_id}@{revision}")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LocalModelStatus {
+    Ready,
+    Failed(String),
+}
+
+#[derive(Clone)]
+pub struct QuoteRecord {
+    pub request_commitment: RequestCommitment,
+    pub expires_at: Instant,
+    pub model_id: String,
+    pub runner_public_key: PublicKey,
+    pub kind: QuoteKind,
+}
+
+#[derive(Clone)]
+pub enum QuoteKind {
+    Evaluate {
+        evaluate_request: EvaluateRequest,
+        locator: ModelLocator,
+        invocation: Invocation,
+    },
+    Fetch {
+        request: FetchProviderRequest,
+    },
+}
+
+#[derive(Default)]
 pub struct ExecutorState {
-    quotes: HashMap<String, Quote>,
-    executions: HashMap<String, Execution>,
-    graphs: HashMap<String, Vec<u8>>,
-    next_quote_id: u64,
-    next_execution_id: u64,
+    quotes: HashMap<[u8; 32], QuoteRecord>,
 }
 
 impl ExecutorState {
     pub fn new() -> Self {
-        Self {
-            quotes: HashMap::new(),
-            executions: HashMap::new(),
-            graphs: HashMap::new(),
-            next_quote_id: 0,
-            next_execution_id: 0,
+        Self::default()
+    }
+
+    pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
+        let key = *quote.request_commitment.as_bytes();
+        self.quotes.insert(key, quote);
+        key
+    }
+
+    pub fn get_quote(
+        &self,
+        request_commitment: &[u8],
+        now: Instant,
+    ) -> Result<&QuoteRecord, StateError> {
+        let key: [u8; 32] = request_commitment.try_into().map_err(|_| {
+            StateError::QuoteNotFound(format!(
+                "invalid request_commitment length {}",
+                request_commitment.len()
+            ))
+        })?;
+        let quote = self
+            .quotes
+            .get(&key)
+            .ok_or_else(|| StateError::QuoteNotFound(hex32(&key)))?;
+        if quote.expires_at <= now {
+            return Err(StateError::QuoteExpired(hex32(&key)));
         }
+        Ok(quote)
     }
 
-    pub fn create_quote(&mut self, graph_id: String, plan: ExecutionPlan) -> String {
-        let quote_id = format!("quote-{}", self.next_quote_id);
-        self.next_quote_id += 1;
-        self.graphs.insert(graph_id.clone(), plan.graph.clone());
-        self.quotes.insert(quote_id.clone(), Quote { plan });
-        quote_id
+    pub fn remove_quote(&mut self, request_commitment: &[u8]) -> Option<QuoteRecord> {
+        let key: [u8; 32] = request_commitment.try_into().ok()?;
+        self.quotes.remove(&key)
     }
 
-    pub fn get_quote(&self, quote_id: &str) -> Result<&Quote, StateError> {
-        self.quotes
-            .get(quote_id)
-            .ok_or_else(|| StateError::QuoteNotFound(quote_id.to_string()))
-    }
-
-    pub fn get_graph(&self, graph_id: &str) -> Option<&Vec<u8>> {
-        self.graphs.get(graph_id)
-    }
-
-    pub fn create_execution(&mut self, quote_id: String) -> Result<String, StateError> {
-        if !self.quotes.contains_key(&quote_id) {
-            return Err(StateError::QuoteNotFound(quote_id));
-        }
-        let execution_id = format!("exec-{}", self.next_execution_id);
-        self.next_execution_id += 1;
-        self.executions.insert(
-            execution_id.clone(),
-            Execution {
-                status: ExecutionStatus::Pending,
-                progress: 0,
-                result: None,
-                decoded: None,
-            },
-        );
-        Ok(execution_id)
-    }
-
-    pub fn get_status(&self, execution_id: &str) -> Result<&ExecutionStatus, StateError> {
-        self.executions
-            .get(execution_id)
-            .map(|e| &e.status)
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn get_result(&self, execution_id: &str) -> Result<&[u8], StateError> {
-        self.executions
-            .get(execution_id)
-            .and_then(|e| e.result.as_deref())
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn get_progress(&self, execution_id: &str) -> Result<u64, StateError> {
-        self.executions
-            .get(execution_id)
-            .map(|e| e.progress)
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn get_decoded(&self, execution_id: &str) -> Result<Option<&str>, StateError> {
-        let decoded = self
-            .executions
-            .get(execution_id)
-            .map(|e| e.decoded.as_deref());
-        decoded.ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn set_status(
-        &mut self,
-        execution_id: &str,
-        status: ExecutionStatus,
-    ) -> Result<(), StateError> {
-        self.executions
-            .get_mut(execution_id)
-            .map(|exec| exec.status = status)
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn set_result(
-        &mut self,
-        execution_id: &str,
-        result: Vec<u8>,
-        decoded: Option<String>,
-    ) -> Result<(), StateError> {
-        self.executions
-            .get_mut(execution_id)
-            .map(|exec| {
-                exec.result = Some(result);
-                exec.decoded = decoded;
-            })
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))
-    }
-
-    pub fn append_output_chunk(
-        &mut self,
-        execution_id: &str,
-        chunk: &[u8],
-        decoded_chunk: Option<&str>,
-        progress: u64,
-    ) -> Result<(), StateError> {
-        let exec = self
-            .executions
-            .get_mut(execution_id)
-            .ok_or_else(|| StateError::ExecutionNotFound(execution_id.to_string()))?;
-
-        exec.progress = progress;
-
-        if !chunk.is_empty() {
-            exec.result
-                .get_or_insert_with(Vec::new)
-                .extend_from_slice(chunk);
-        }
-
-        if let Some(decoded_chunk) = decoded_chunk {
-            if !decoded_chunk.is_empty() {
-                exec.decoded
-                    .get_or_insert_with(String::new)
-                    .push_str(decoded_chunk);
-            }
-        }
-
-        Ok(())
+    pub fn prune_expired_quotes(&mut self, now: Instant) -> usize {
+        let before = self.quotes.len();
+        self.quotes.retain(|_, quote| quote.expires_at > now);
+        before - self.quotes.len()
     }
 }
 
-impl Default for ExecutorState {
-    fn default() -> Self {
-        Self::new()
+pub fn new_execution_id() -> String {
+    make_id("exec")
+}
+
+fn make_id(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndOfSequence,
+    MaxNewTokens,
+    Cancelled,
+}
+
+impl StopReason {
+    pub fn to_pb(self) -> PbFinishStatus {
+        match self {
+            Self::EndOfSequence => PbFinishStatus::EndOfSequence,
+            Self::MaxNewTokens => PbFinishStatus::MaxOutput,
+            Self::Cancelled => PbFinishStatus::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Termination {
+    Completed {
+        stop_reason: StopReason,
+        output_tokens: Vec<u32>,
+        receipt_dag_cbor: Vec<u8>,
+    },
+    Failed {
+        position: u64,
+        error: String,
+    },
+}
+
+impl Termination {
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed { .. })
+    }
+
+    pub fn into_pb(self) -> PbWorkEvent {
+        let kind = match self {
+            Self::Completed {
+                stop_reason,
+                output_tokens,
+                receipt_dag_cbor,
+            } => work_event::Kind::Finished(PbWorkFinished {
+                total_units: output_tokens.len() as u64,
+                status: stop_reason.to_pb() as i32,
+                output: encode_token_ids(&output_tokens),
+                receipt: Some(PbReceiptEnvelope {
+                    dag_cbor: receipt_dag_cbor,
+                }),
+                output_events: Vec::new(),
+            }),
+            Self::Failed { position, error } => {
+                work_event::Kind::Failed(PbWorkFailed { position, error })
+            }
+        };
+        PbWorkEvent { kind: Some(kind) }
     }
 }

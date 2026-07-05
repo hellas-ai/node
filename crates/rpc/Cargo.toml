@@ -7,17 +7,97 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["blake3", "prost-build", "prost-types", "protox"]
+
 [features]
 default = []
-client = ["tonic/channel"]
-server = ["tonic/server", "tonic-iroh-transport/discovery"]
-compile = ["dep:tonic-prost-build"]
+
+# === Protocol modules ======================================================
+# Each feature gates the generated items for one proto package, so binaries
+# only include the protocols they use.
+# `execute` is the foundation — evaluate, fetch, and courtesy all reference
+# `hellas.v1.Ticket` and related types.
+execute = []
+evaluate = ["execute"]
+fetch = ["execute", "dep:serde_json"]
+chain = []
+# Courtesy proto imports hellas.v1 (Ticket) and hellas.evaluate.v1
+# (EvaluateRequest), so the feature must pull both forward.
+courtesy = ["execute", "evaluate"]
+swarm = []
+all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
+
+# === Other knobs ===========================================================
+# Server-side dispatchers.
+server = []
+
+# Iroh transport binding. Enables `From<iroh::EndpointId> for PeerId`
+# (peers/id.rs) so consumers can construct PeerIds from iroh's
+# EndpointId without a separate conversion helper.
+iroh = ["dep:iroh"]
+iroh-client = ["iroh"]
+iroh-server = ["iroh"]
+
+# Binary-side bundle for the node binary (executor / model deps).
+node = [
+    "server",
+    "all-protocols",
+    "dep:catgrad",
+    "dep:catgrad-llm",
+    "dep:chatgrad",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
 
 [dependencies]
-tonic-iroh-transport = { workspace = true}
-tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-tonic-prost = "0.14"
-prost = "0.14"
+blake3 = { workspace = true }
+bytes = "1"
+catgrad = { workspace = true, default-features = false, features = [
+    "serde",
+], optional = true }
+catgrad-llm = { workspace = true, default-features = false, optional = true }
+chatgrad = { workspace = true, default-features = false, optional = true }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+hellas-wire = { workspace = true }
+hf-hub = { version = "0.5", default-features = false, features = [
+    "ureq",
+], optional = true }
+iroh = { workspace = true, optional = true }
+k256 = { workspace = true }
+prost = { version = "0.14", default-features = false, features = ["derive"] }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+serde_json = { workspace = true, optional = true }
+smol_str = "0.3"
+thiserror = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = [
+    "progressbar",
+    "fancy-regex",
+], optional = true }
+# `web-time` provides `std::time::Instant` / `SystemTime` equivalents so the
+# peer registry's monotonic clock works under wasm (where `Instant::now` panics with
+# "time not implemented on this platform"). Identical to std on native targets.
+web-time = "1"
+
+[target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
+tokenizers = { version = "0.21", features = [
+    "onig",
+    "esaxx_fast",
+], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [build-dependencies]
-tonic-prost-build = { version = "0.14", optional = true }
+blake3 = { workspace = true }
+hellas-wire = { workspace = true, default-features = false }
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.9"
+
+[dev-dependencies]
+tokio.workspace = true

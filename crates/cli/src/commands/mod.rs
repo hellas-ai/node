@@ -1,6 +1,26 @@
 pub type CliResult<T = ()> = anyhow::Result<T>;
 
-pub mod execute;
-pub mod health;
-#[cfg(feature = "serve")]
+use std::time::Duration;
+
+pub mod artifact;
+#[cfg(feature = "chain")]
+pub mod chain;
+pub(crate) mod codex_auth;
+pub(crate) mod discovery;
+pub mod fetch;
+pub mod gateway;
+pub mod identity;
+pub mod llm;
+pub mod monitor;
+pub(crate) mod openai_responses_stream;
+pub mod rpc;
+#[cfg(feature = "hellas-executor")]
 pub mod serve;
+
+pub(crate) fn http_client(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(request_timeout)
+        .build()
+        .expect("HTTP client configuration is valid")
+}

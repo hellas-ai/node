@@ -1,165 +1,247 @@
+//! Node server bootstrap.
+//!
+//! Binds an iroh `Endpoint` with all service ALPNs, runs the executor,
+//! and spawns a per-connection accept loop that routes each inbound
+//! stream to the right service's dispatcher (selected by ALPN).
+//!
+//! Peers can reach this node by direct address. Registry publishing is
+//! owned by the service-discovery path and is not started from this
+//! bootstrap.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use anyhow::Context;
-use hellas_executor::{ExecuteServer, Executor};
-use hellas_rpc::pb::hellas::node_server::{Node, NodeServer};
-use hellas_rpc::pb::hellas::{HealthCheckRequest, HealthCheckResponse, Presence};
-use std::time::Instant;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use tokio_stream::StreamExt;
-use tonic::{Request, Response, Status};
-use tonic_iroh_transport::gossip::{topic_for, GossipHandler, GossipRequest};
-use tonic_iroh_transport::iroh::discovery::mdns::MdnsDiscovery;
-use tonic_iroh_transport::iroh::discovery::EndpointData;
-use tonic_iroh_transport::iroh::discovery::pkarr::dht::DhtDiscovery;
-use tonic_iroh_transport::iroh::{Endpoint, EndpointId, TransportAddr};
-use tonic_iroh_transport::TransportBuilder;
-use tonic_iroh_transport::iroh::discovery::Discovery;
-use tonic_iroh_transport::iroh::Watcher;
-use std::net::Ipv6Addr;
-use std::net::SocketAddrV6;
+use catgrad::prelude::Dtype;
+use hellas_executor::{
+    ArtifactStoreConfig, CourtesyServer, EvaluateServer, ExecuteServer, Executor, ExecutorMetrics,
+    ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
+};
+use hellas_rpc::ProducerSigningKey;
+use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
+use hellas_rpc::policy::ExecutePolicy;
+use hellas_rpc::serve::AccountingDispatcher;
+use hellas_rpc::services::courtesy::Courtesy;
+use hellas_rpc::services::evaluate::Evaluate;
+use hellas_rpc::services::execute::Execute;
+use hellas_rpc::services::fetch::Fetch;
+use hellas_rpc::services::node::{Node, NodeServer};
+use hellas_wire::iroh::IrohTransport;
+use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
+use tokio::task::JoinHandle;
+use tracing::warn;
 
-const GRPC_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
-const DEFAULT_PORT: u16 = 31145;
+use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
 
-#[derive(Clone)]
-struct PresenceResponder {
-    endpoint_id: EndpointId,
-}
-
-#[tonic::async_trait]
-impl GossipHandler<Presence> for PresenceResponder {
-    async fn handle(&self, request: GossipRequest<Presence>) -> Result<(), Status> {
-        let msg = request.get_ref();
-        if msg.is_executor {
-            return Ok(());
-        }
-
-        info!(
-            hf_id = %msg.hf_id,
-            req_id = %msg.req_id,
-            from = %request.context().delivered_from.fmt_short(),
-            "responding to presence request"
-        );
-
-        let reply = Presence {
-            hf_id: msg.hf_id.clone(),
-            req_id: msg.req_id.clone(),
-            peer_id: self.endpoint_id.to_string(),
-            ttl_ms: msg.ttl_ms,
-            is_executor: true,
-        };
-
-        request
-            .sender()
-            .broadcast(&reply)
-            .await
-            .map_err(|e| Status::internal(format!("failed to broadcast presence reply: {e}")))?;
-
-        Ok(())
-    }
-}
-
-struct NodeService {
-    start_time: Instant,
-    node_id: String,
-}
-
-#[tonic::async_trait]
-impl Node for NodeService {
-    async fn health_check(
-        &self,
-        _request: Request<HealthCheckRequest>,
-    ) -> Result<Response<HealthCheckResponse>, Status> {
-        Ok(Response::new(HealthCheckResponse {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: self.start_time.elapsed().as_secs(),
-            node_id: self.node_id.clone(),
-        }))
-    }
-}
+use super::node_handler::NodeHandlerImpl;
 
 pub(super) struct NodeHandle {
+    node_id: EndpointId,
+    accept_task: Option<JoinHandle<()>>,
     endpoint: Endpoint,
-    guard: tonic_iroh_transport::TransportGuard,
-    addr_task: tokio::task::JoinHandle<()>,
+    discovery: Option<DiscoveryAdvertiser>,
 }
 
 impl NodeHandle {
     pub(super) fn node_id(&self) -> EndpointId {
-        self.endpoint.id()
+        self.node_id
     }
 
-    pub(super) async fn shutdown(self) -> anyhow::Result<()> {
-        self.addr_task.abort();
-        let _ = self.addr_task.await;
-        self.guard
-            .shutdown()
-            .await
-            .context("failed to shut down transport")?;
+    #[cfg(feature = "otel")]
+    pub(super) fn iroh_metrics(&self) -> iroh::metrics::EndpointMetrics {
+        self.endpoint.metrics().clone()
+    }
+
+    pub(super) async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self.accept_task.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(discovery) = self.discovery.take() {
+            discovery.shutdown().await;
+        }
+        self.endpoint.close().await;
         Ok(())
     }
 }
 
-pub(super) async fn spawn_node(enable_discovery: bool) -> anyhow::Result<NodeHandle> {
-    let mut builder = Endpoint::builder()
-        .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))
-        .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, DEFAULT_PORT, 0, 0));
+pub(super) struct NodeConfig {
+    pub(super) port: Option<u16>,
+    pub(super) execute_policy: ExecutePolicy,
+    pub(super) queue_size: usize,
+    pub(super) preload_models: Vec<String>,
+    pub(super) build: String,
+    pub(super) graffiti: Vec<u8>,
+    pub(super) supported_dtypes: Vec<Dtype>,
+    pub(super) fetch_access_policy: FetchAccessPolicy,
+    pub(super) artifact_store_path: PathBuf,
+    pub(super) fetch_routes: FetchRouteRegistry,
+    pub(super) fetch_max_in_flight: usize,
+    pub(super) fetch_queue_size: usize,
+    pub(super) secret_key: SecretKey,
+    pub(super) producer_key: ProducerSigningKey,
+    pub(super) metrics: Arc<ExecutorMetrics>,
+}
 
-    if enable_discovery {
-        builder = builder
-            .discovery(MdnsDiscovery::builder().service_name("hellas"))
-            // Adds internet discovery (DHT + optional pkarr relay); `Endpoint::builder()`
-            // already includes pkarr publisher + DNS resolver via the N0 preset.
-            .discovery(DhtDiscovery::builder().n0_dns_pkarr_relay());
-    } else {
-        builder = builder.clear_discovery();
+pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
+    let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        execute_policy: config.execute_policy,
+        queue_capacity: config.queue_size,
+        supported_dtypes: config.supported_dtypes,
+        metrics: config.metrics.clone(),
+        producer_key: Arc::new(config.producer_key),
+        fetch_access_policy: config.fetch_access_policy,
+        fetch_routes: config.fetch_routes,
+        fetch_max_in_flight: config.fetch_max_in_flight,
+        fetch_queue_capacity: config.fetch_queue_size,
+        artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
+    })
+    .await
+    .context("failed to spawn executor")?;
+    for model in &config.preload_models {
+        handle
+            .load_model_metadata(model.clone())
+            .await
+            .with_context(|| format!("failed to load model metadata for {model}"))?;
     }
 
+    let alpns = served_alpns();
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(config.secret_key)
+        .alpns(alpns.clone());
+    if let Some(port) = config.port {
+        builder = builder
+            .bind_addr(format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?)
+            .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+    }
     let endpoint = builder
         .bind()
         .await
-        .context("failed to create iroh endpoint")?;
+        .context("failed to bind iroh endpoint")?;
+    let node_id = endpoint.id();
+    let discovery = start_server_advertising(&endpoint, &alpns)
+        .context("failed to start service discovery advertising")?;
 
-    // Seed discovery with current addresses and keep publishing updates.
-    let discovery = endpoint.discovery().clone();
-    let mut addr_stream = endpoint.watch_addr().stream();
-    let addr_task = tokio::spawn(async move {
-        while let Some(addr) = addr_stream.next().await {
-            let addrs: Vec<_> = addr.ip_addrs().map(|a| TransportAddr::Ip(*a)).collect();
-            if addrs.is_empty() {
-                continue;
-            }
-            info!("discovery: {addrs:?}");
-            let data = EndpointData::new(addrs);
-            discovery.publish(&data);
+    // -- Construct a shared peer directory.
+    //
+    // The directory records inbound service observations and is shared
+    // across the dispatch path.
+    //
+    // Deferred until a concrete abuse scenario warrants it: an
+    // `AdmittingDispatcher<S>` that looks up per-method policy before
+    // forwarding to the generated dispatcher and records inbound request
+    // observations in the directory.
+    let local_peer = PeerId::from_bytes(*node_id.as_bytes());
+    let directory = Arc::new(PeerDirectory::new(local_peer));
+
+    // -- Build the Node handler with the operator-supplied build hash
+    //    and graffiti so introspection (`hellas rpc`) returns real data.
+    //    `NodeHandlerImpl: Clone` (its fields are Arc/Copy), so we
+    //    clone per-connection rather than wrap in Arc<dyn>.
+    let node_handler =
+        NodeHandlerImpl::new(node_id, config.build, config.graffiti, directory.clone());
+
+    // -- Accept loop: one task per inbound Connection; per-Connection
+    //    dispatch routed by ALPN to the matching service handler.
+    let accept_handle = handle.clone();
+    let accept_endpoint = endpoint.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let incoming = match accept_endpoint.accept().await {
+                Some(inc) => inc,
+                None => break, // endpoint closed
+            };
+            let accepting = match incoming.accept() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("incoming accept failed: {e}");
+                    continue;
+                }
+            };
+            let handle_for_conn = accept_handle.clone();
+            let node_handler_for_conn = node_handler.clone();
+            let manager_for_conn = directory.manager();
+            tokio::spawn(async move {
+                let conn = match accepting.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("connection handshake failed: {e}");
+                        return;
+                    }
+                };
+                let alpn = conn.alpn().to_vec();
+                if let Err(e) = serve_connection(
+                    alpn,
+                    conn,
+                    handle_for_conn,
+                    node_handler_for_conn,
+                    manager_for_conn,
+                )
+                .await
+                {
+                    warn!("serve_connection error: {e}");
+                }
+            });
         }
     });
 
-    let node_service = NodeService {
-        start_time: Instant::now(),
-        node_id: endpoint.id().to_string(),
-    };
+    Ok(NodeHandle {
+        node_id,
+        accept_task: Some(accept_task),
+        endpoint,
+        discovery: Some(discovery),
+    })
+}
 
-    let executor = Executor::spawn();
-    let execute_service = ExecuteServer::new(executor)
-        .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
-        .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
+/// Per-connection serve: each inbound substream becomes an `Inbound`
+/// dispatched to the right `XServer<ExecutorHandle>` based on the
+/// connection's negotiated ALPN.
+async fn serve_connection(
+    alpn: Vec<u8>,
+    conn: Connection,
+    handle: hellas_executor::ExecutorHandle,
+    node_handler: NodeHandlerImpl,
+    manager: PeerManager,
+) -> anyhow::Result<()> {
+    let transport = IrohTransport::new(conn);
 
-    let presence_responder = PresenceResponder {
-        endpoint_id: endpoint.id(),
-    };
+    // Every generated `XServer` is wrapped in `AccountingDispatcher`
+    // so per-peer counters (`total_requests`, `last_seen_ms`, RTT
+    // EMA) are populated for every inbound. That's the producer side
+    // of the data that `PeerDirectory::ranked_known_peers` consumes
+    // when surfacing `Node/get_known_peers`; without this wrapper
+    // the directory the node hands out is always empty.
+    if alpn == <Execute as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(ExecuteServer(handle), manager);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Evaluate as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(EvaluateServer(handle), manager);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(FetchServer(handle), manager);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(CourtesyServer(handle), manager);
+        serve_loop(&transport, &server).await
+    } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
+        serve_loop(&transport, &server).await
+    } else {
+        warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
+        Ok(())
+    }
+}
 
-    let guard = TransportBuilder::new(endpoint.clone())
-        .add_gossip::<Presence, _>(presence_responder)
-        .add_rpc(NodeServer::new(node_service))
-        .add_rpc(execute_service)
-        .spawn()
-        .await
-        .context("failed to start transport")?;
-
-    info!(
-        topic = ?topic_for::<Presence>(),
-        "listening for gossip presence requests"
-    );
-
-    Ok(NodeHandle { endpoint, guard, addr_task })
+async fn serve_loop<S>(transport: &IrohTransport, server: &S) -> anyhow::Result<()>
+where
+    S: Dispatcher<IrohTransport> + Send + Sync,
+    S::Error: Send + Sync + 'static,
+{
+    while let Ok(Some(inbound)) = transport.accept().await {
+        if let Err(e) = server.dispatch(inbound).await {
+            warn!("dispatch error: {e}");
+        }
+    }
+    Ok(())
 }

@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package hellas.evaluate.v1;
+
+import "hellas/v1/hellas.proto";
+
+// Binding/verifiable evaluation work. This is the protocol-level Catgrad path:
+// all large artifacts are named by CIDs and fetched/resolved outside protobuf.
+
+service Evaluate {
+  rpc CreateTicket(EvaluateRequest) returns (.hellas.v1.Ticket);
+}
+
+message EvaluateRequest {
+  // Content-addressed TextExecution artifact; exactly 32 bytes.
+  bytes text_execution = 1;
+  .hellas.v1.PublicKey runner_public_key = 2;
+}

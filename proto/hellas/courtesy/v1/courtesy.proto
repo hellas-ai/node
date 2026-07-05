@@ -1,0 +1,209 @@
+syntax = "proto3";
+
+package hellas.courtesy.v1;
+
+import "hellas/evaluate/v1/evaluate.proto";
+import "hellas/v1/hellas.proto";
+
+// Non-core provider conveniences. These APIs are not settlement/protocol
+// objects: providers may offer Hugging Face resolution, tokenization, chat
+// templates, model listing, and metrics, or decline to serve them.
+
+service Courtesy {
+  rpc QuotePreparedText(QuotePreparedTextRequest) returns (QuotePreparedTextResponse);
+  rpc QuotePrompt(QuotePromptRequest) returns (QuotePromptResponse);
+  rpc QuoteChatPrompt(QuoteChatPromptRequest) returns (QuoteChatPromptResponse);
+  rpc PutArtifact(PutArtifactRequest) returns (PutArtifactResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc DecodeTokens(stream DecodeTokensRequest) returns (stream DecodeTokensResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
+}
+
+message EvaluateStart {
+  oneof kind {
+    EvaluateGenesisStart genesis = 1;
+    EvaluateArtifactStart artifact = 2;
+  }
+}
+
+message EvaluateGenesisStart {}
+
+message EvaluateArtifactStart {
+  // Content-addressed TextArtifact artifact; exactly 32 bytes.
+  bytes artifact = 1;
+}
+
+message QuotePreparedTextRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  repeated uint32 prompt_token_ids = 3;
+  uint32 max_new_tokens = 4;
+  repeated uint32 stop_token_ids = 5;
+  EvaluateStart start = 6;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported -> request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuotePreparedTextResponse.dtype.
+  repeated string accept_dtypes = 7;
+  .hellas.v1.PublicKey runner_public_key = 8;
+}
+
+message QuotePreparedTextResponse {
+  .hellas.v1.Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 3;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
+}
+
+// Convenience RPC: the server handles tokenization and evaluate request
+// construction. Intended for lightweight clients (browsers) that don't have
+// the tokenizer.
+message QuotePromptRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  string prompt = 3;
+  uint32 max_new_tokens = 4;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported -> request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuotePromptResponse.dtype.
+  repeated string accept_dtypes = 5;
+  .hellas.v1.PublicKey runner_public_key = 6;
+}
+
+message QuotePromptResponse {
+  .hellas.v1.Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 3;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
+}
+
+// Convenience RPC: chat-style prompt quoting.
+// Like QuotePrompt but accepts a message array + system prompt.
+// The server applies the model's chat template to produce the prompt.
+message ChatMessage {
+  string role = 1; // "user", "assistant"
+  string content = 2;
+}
+
+message QuoteChatPromptRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  repeated ChatMessage messages = 3;
+  uint32 max_new_tokens = 4;
+  string system_prompt = 5;
+  // Ordered preference list (each one of "f32", "f16", "bf16"). The server
+  // picks the first entry it supports. Empty list lets the server pick its
+  // preferred dtype freely. None of the entries supported -> request is
+  // refused with FailedPrecondition. The chosen dtype is reported back in
+  // QuoteChatPromptResponse.dtype.
+  repeated string accept_dtypes = 6;
+  .hellas.v1.PublicKey runner_public_key = 7;
+}
+
+message QuoteChatPromptResponse {
+  .hellas.v1.Ticket ticket = 1;
+  uint32 prompt_tokens = 2;
+  // The dtype the server actually committed to running this quote at.
+  string dtype = 3;
+  .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
+}
+
+// Store one canonical evaluate artifact by its BLAKE3 digest. This API does not
+// publish evaluate metadata such as model locators or lazy substitutions; those
+// are separate provider-local interpretation state.
+message PutArtifactRequest {
+  bytes canonical_artifact = 1;
+}
+
+message PutArtifactResponse {
+  // BLAKE3 digest of canonical_artifact; exactly 32 bytes.
+  bytes digest = 1;
+}
+
+message GetArtifactRequest {
+  // BLAKE3 digest of canonical artifact bytes; exactly 32 bytes.
+  bytes digest = 1;
+}
+
+message GetArtifactResponse {
+  bytes canonical_artifact = 1;
+}
+
+// List models known to the executor and their readiness status.
+message ListModelsRequest {}
+
+message ModelInfo {
+  string model_id = 1;
+  string revision = 2;
+  ModelStatus status = 3;
+  // Human-readable error when status is FAILED.
+  string error = 4;
+}
+
+enum ModelStatus {
+  MODEL_STATUS_UNSPECIFIED = 0;
+  MODEL_STATUS_QUEUED = 1;
+  MODEL_STATUS_LOADING = 2;
+  MODEL_STATUS_READY = 3;
+  MODEL_STATUS_FAILED = 4;
+}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+// Convenience RPC: streaming token decoding for clients that do not carry a
+// local tokenizer. The first request selects the Hugging Face tokenizer; later
+// requests may omit the model fields and carry token bytes only. Responses are
+// incremental text deltas.
+message DecodeTokensRequest {
+  string huggingface_model_id = 1;
+  string huggingface_revision = 2;
+  // Raw token bytes (little-endian u32 token IDs, same format as Evaluate output).
+  bytes token_bytes = 3;
+}
+
+message DecodeTokensResponse {
+  // Decoded text (incremental delta; concatenate all responses for full output).
+  string text = 1;
+}
+
+// Cumulative token statistics since node start.
+message GetStatsRequest {}
+
+message TokenStats {
+  uint64 executions_started = 1;
+  uint64 executions_completed = 2;
+  uint64 executions_failed = 3;
+  uint64 prompt_tokens = 4;
+  uint64 cached_prompt_tokens = 5;
+  uint64 cached_output_tokens = 6;
+  uint64 prefill_tokens = 7;
+  uint64 generated_tokens = 8;
+}
+
+message ModelTokenStats {
+  string model_id = 1;
+  TokenStats stats = 2;
+}
+
+message GetStatsResponse {
+  TokenStats stats = 1;
+  repeated ModelTokenStats model_stats = 2;
+}
+
+message GetModelStatsRequest {
+  string model_id = 1;
+}
+
+message GetModelStatsResponse {
+  string model_id = 1;
+  TokenStats stats = 2;
+}

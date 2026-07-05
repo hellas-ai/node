@@ -1,0 +1,20 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Hellas service names are used directly as transport service names.
+    # Adding "Service" to every proto service makes the wire/API names worse.
+    - SERVICE_SUFFIX
+    # CreateTicket returns the generic Ticket object and RunTicket streams the
+    # generic WorkEvent. Both are intentional reusable protocol shapes.
+    - RPC_RESPONSE_STANDARD_NAME
+    # Scheme services intentionally accept the scheme request itself. Wrapping
+    # FetchRequest/EvaluateRequest in one-field *CreateTicketRequest messages
+    # would add wire ceremony without adding protocol state.
+    - RPC_REQUEST_STANDARD_NAME
+    # Ticket is the single reusable protocol object returned by every
+    # scheme-specific ticket creation surface.
+    - RPC_REQUEST_RESPONSE_UNIQUE

@@ -9,21 +9,76 @@ documentation.workspace = true
 
 [features]
 default = []
-serve = ["hellas-executor"]
+
+# Backend variants: each pulls in the optional `hellas-executor` dep plus the
+# RPC/transport server bits. Source code gates on the implicit `hellas-executor`
+# feature that cargo creates from the optional dep (no `dep:` prefix used).
+candle = ["hellas-executor/candle", "hellas-rpc/server"]
+candle-cuda = ["candle", "hellas-executor/candle-cuda"]
+candle-metal = ["candle", "hellas-executor/candle-metal"]
+chain = ["dep:hellas-chain", "dep:hellas-kernel", "hellas-chain/client"]
+indexer = ["chain", "hellas-chain/indexer"]
+validator = ["indexer", "hellas-chain/validator"]
+
+# OpenTelemetry / OTLP exporter + iroh-internal metrics. When off, none of the
+# opentelemetry crates compile, the trace context propagation paths in
+# `execution.rs` / `serve/node.rs` collapse to identity, and iroh's metrics
+# module is not built.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:iroh-metrics",
+]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dependencies]
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+base64.workspace = true
+catgrad = { workspace = true, default-features = false }
+chatgrad.workspace = true
 clap = { version = "4", features = ["derive"] }
-hellas-rpc = { workspace = true, features = ["client", "server"] }
-hellas-executor = { workspace = true, optional = true }
-tonic-iroh-transport = { workspace = true, features = ["gossip"] }
-tonic = { workspace = true }
+futures = "0.3"
+hellas-chain = { workspace = true, default-features = false, optional = true }
+hellas-executor = { workspace = true, default-features = false, optional = true }
+hellas-kernel = { workspace = true, default-features = false, features = [
+    "domain",
+], optional = true }
+hellas-rpc = { workspace = true, default-features = false, features = [
+    "node",
+    "all-protocols",
+] }
+hellas-wire = { workspace = true, features = [
+    "iroh",
+    "discovery-dht",
+    "discovery-mdns",
+] }
+hellas-wire-adaptors.workspace = true
+hex.workspace = true
+iroh = { workspace = true, features = ["tls-ring", "metrics"] }
+iroh-mdns-address-lookup = "0.4"
+iroh-metrics = { version = "1", default-features = false, features = [
+    "metrics",
+], optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+prometheus-client = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+tokio.workspace = true
 tokio-stream = { workspace = true }
-
-# dev-dependencies- add 'compile' feature to hellas-rpc
-[dev-dependencies]
-# hellas-rpc = { workspace = true, features = ["compile"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber.workspace = true

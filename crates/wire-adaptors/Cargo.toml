@@ -1,0 +1,19 @@
+[package]
+name = "hellas-wire-adaptors"
+description = "Transport-neutral wire adaptors for LLM request and response formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+futures-core = "0.3"
+futures-util = "0.3"
+serde.workspace = true
+serde_ipld_dagcbor.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures-executor = "0.3"

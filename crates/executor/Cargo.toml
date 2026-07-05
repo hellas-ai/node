@@ -7,18 +7,34 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = ["candle"]
+candle = ["catgrad/candle-backend"]
+candle-cuda = ["candle", "catgrad/cuda"]
+candle-metal = ["candle", "catgrad/metal"]
+
 [dependencies]
-hellas-rpc = { workspace = true, features = ["server"] }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
-thiserror = { workspace = true }
-tonic = { workspace = true }
-tracing = { workspace = true }
+async-stream = "0.3"
+blake3 = { workspace = true }
+catgrad = { workspace = true, default-features = false, features = ["serde"] }
+chatgrad = { workspace = true, default-features = false }
+futures-core = "0.3"
+futures-util = "0.3"
+hellas-rpc = { workspace = true, features = [
+    "node",
+    "execute",
+    "evaluate",
+    "fetch",
+    "courtesy",
+] }
+hellas-wire = { workspace = true }
+iroh-blobs = { workspace = true, features = ["fs-store"] }
+prometheus-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-catgrad = { git = "https://github.com/hellas-ai/catgrad", default-features = false, features = ["serde", "ndarray-backend"] }
-catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", default-features = false }
-hf-hub = "0.4"
-tokenizers = "0.21"
-minijinja = "2.11"
-minijinja-contrib = { version = "2.11", features = ["pycompat"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = "0.7"
+tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
