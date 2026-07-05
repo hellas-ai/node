@@ -243,8 +243,7 @@ mod tests {
             .apply(ctx, &FakeVerifier, &close)
             .expect("close accepted");
 
-        // -- 5. Drain the working set; this is what alto would replay
-        // back into the async store.
+        // -- 5. Drain the working set for replay into the async store.
         let final_set = state.into_store();
         let live_coins: Vec<_> = final_set
             .coin_slots()

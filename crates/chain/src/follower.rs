@@ -12,11 +12,11 @@ use hellas_kernel::domain::{Digest, PublicKey};
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
 use std::{path::PathBuf, time::Duration};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-const ANNOUNCED_BLOCK_RETRIES: u32 = 50;
-const ANNOUNCED_BLOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+const CATCH_UP_BATCH: u64 = 8;
+const IDLE_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum FollowerError {
@@ -38,8 +38,6 @@ pub enum FollowerError {
     ActivityStream(String),
     #[error("remote latest is {remote_latest}, but finalized block at height {height} was absent")]
     MissingFinalizedBlock { height: u64, remote_latest: u64 },
-    #[error("announced finalized block was unavailable for payload {payload:?}")]
-    AnnouncedBlockUnavailable { payload: Digest },
     #[error("remote snapshot height {remote} is behind local height {local}")]
     RemoteBehind { local: u64, remote: u64 },
     #[error(
@@ -68,7 +66,6 @@ impl FollowerError {
             self,
             Self::ActivityStreamEnded
                 | Self::ActivityStream(_)
-                | Self::AnnouncedBlockUnavailable { .. }
                 | Self::MissingFinalizedBlock { .. }
                 | Self::Query(
                     QueryError::ChannelClosed | QueryError::Remote(_) | QueryError::Connect(_)
@@ -146,40 +143,62 @@ async fn follow_connection(
     rpc: &str,
     consensus_info: &ConsensusInfo,
 ) -> Result<(), FollowerError> {
-    let client = RemoteLightClient::connect(rpc.to_string())
+    let sync_client = RemoteLightClient::connect(rpc.to_string())
         .await?
         .with_consensus_info(consensus_info)?;
-    catch_up(indexer, &client).await?;
-    let mut stream = client
+    let activity_client = RemoteLightClient::connect(rpc.to_string())
+        .await?
+        .with_consensus_info(consensus_info)?;
+    let mut stream = activity_client
         .subscribe_activity(vec![ActivityEventKind::Finalization])
         .await?;
-    catch_up(indexer, &client).await?;
+    info!("follower activity stream subscribed");
+    println!("activity stream subscribed");
 
+    let mut needs_sync = true;
     loop {
-        let event = stream
-            .next()
-            .await
-            .ok_or(FollowerError::ActivityStreamEnded)?
-            .map_err(|err| FollowerError::ActivityStream(err.to_string()))?;
-        let payload = match finalized_payload(event) {
-            Ok(Some(payload)) => payload,
-            Ok(None) => continue,
-            Err(err) => {
-                warn!(error = %err, "skipping malformed activity event");
-                continue;
-            }
+        if needs_sync {
+            needs_sync = catch_up_batch(indexer, &sync_client, CATCH_UP_BATCH).await?;
+        }
+        let delay = if needs_sync {
+            Duration::ZERO
+        } else {
+            IDLE_SYNC_INTERVAL
         };
-        catch_up_announced_payload(indexer, &client, payload).await?;
+        ::tokio::select! {
+            event = stream.next() => {
+                let event = event
+                    .ok_or(FollowerError::ActivityStreamEnded)?
+                    .map_err(|err| FollowerError::ActivityStream(err.to_string()))?;
+                match finalized_payload(event) {
+                    Ok(Some(payload)) => {
+                        println!("activity finalization {}", hex::encode(payload));
+                        needs_sync = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, "skipping malformed activity event");
+                    }
+                }
+            }
+            () = ::tokio::time::sleep(delay) => {
+                needs_sync = true;
+            }
+        }
     }
 }
 
-async fn catch_up(indexer: &ChainIndexer, client: &RemoteLightClient) -> Result<(), FollowerError> {
+async fn catch_up_batch(
+    indexer: &ChainIndexer,
+    client: &RemoteLightClient,
+    max_blocks: u64,
+) -> Result<bool, FollowerError> {
     let mut next_height = indexer
         .get_latest_block()
         .await?
         .map_or(1, |block| block.height.saturating_add(1));
     let Some(remote_latest) = client.get_latest_block().await? else {
-        return Ok(());
+        return Ok(false);
     };
     if next_height > remote_latest.height.saturating_add(1) {
         return Err(FollowerError::RemoteBehind {
@@ -187,7 +206,9 @@ async fn catch_up(indexer: &ChainIndexer, client: &RemoteLightClient) -> Result<
             remote: remote_latest.height,
         });
     }
-    while next_height <= remote_latest.height {
+    let target_height = remote_latest.height;
+    let batch_end = target_height.min(next_height.saturating_add(max_blocks.saturating_sub(1)));
+    while next_height <= batch_end {
         let Some(finalized) = client
             .get_finalized_block(FinalizedBlockQuery::Height(next_height))
             .await?
@@ -200,34 +221,7 @@ async fn catch_up(indexer: &ChainIndexer, client: &RemoteLightClient) -> Result<
         ingest_finalized_block(indexer, finalized, next_height).await?;
         next_height = next_height.saturating_add(1);
     }
-    Ok(())
-}
-
-async fn catch_up_announced_payload(
-    indexer: &ChainIndexer,
-    client: &RemoteLightClient,
-    payload: Digest,
-) -> Result<(), FollowerError> {
-    for _ in 0..ANNOUNCED_BLOCK_RETRIES {
-        match catch_up(indexer, client).await {
-            Ok(()) if has_local_payload(indexer, payload).await? => return Ok(()),
-            Ok(()) | Err(FollowerError::MissingFinalizedBlock { .. }) => {}
-            Err(err) => return Err(err),
-        }
-        ::tokio::time::sleep(ANNOUNCED_BLOCK_RETRY_DELAY).await;
-    }
-    Err(FollowerError::AnnouncedBlockUnavailable { payload })
-}
-
-async fn has_local_payload(indexer: &ChainIndexer, payload: Digest) -> Result<bool, FollowerError> {
-    match indexer
-        .get_finalized_block(FinalizedBlockQuery::Payload(payload))
-        .await
-    {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) | Err(QueryError::StateUnavailable(_)) => Ok(false),
-        Err(err) => Err(FollowerError::Query(err)),
-    }
+    Ok(batch_end < target_height)
 }
 
 async fn ingest_finalized_block(

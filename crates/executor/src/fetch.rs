@@ -4,12 +4,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hellas_core::{
-    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey,
-    canonical_dag_cbor, decode_dag_cbor,
-};
 use hellas_rpc::fetch::{
     FetchInput, FetchProtocolError, verify_input_events, verify_output_events,
+};
+use hellas_rpc::{
+    InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey,
+    canonical_dag_cbor, decode_dag_cbor,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -774,7 +774,7 @@ pub enum FetchStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::{build_input_events, build_output_events, verify_input_events};
 
     fn key(byte: u8) -> ProducerSigningKey {

@@ -2,7 +2,6 @@ mod actor;
 mod handle;
 
 use catgrad::prelude::Dtype;
-use hellas_core::{InputCommitment, OutputEventEnvelope};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
@@ -14,6 +13,7 @@ use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::{InputCommitment, OutputEventEnvelope};
 use hellas_wire::WireStatus;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};

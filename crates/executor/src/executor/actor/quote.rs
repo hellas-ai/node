@@ -6,7 +6,6 @@ use crate::state::{
 };
 use catgrad::prelude::Dtype;
 use chatgrad::types;
-use hellas_core::{CommitmentScheme, Digest, Evaluate, PublicKey, RequestCommitment};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::model::ModelAssets;
@@ -22,6 +21,7 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::public_key_from_pb;
 use hellas_rpc::spec::ModelSpec;
 use hellas_rpc::stream::input_event_from_pb;
+use hellas_rpc::{CommitmentScheme, Digest, Evaluate, PublicKey, RequestCommitment};
 use std::time::{Duration, Instant};
 
 use super::Executor;

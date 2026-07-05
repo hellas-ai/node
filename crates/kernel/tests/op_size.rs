@@ -12,8 +12,7 @@ use hellas_kernel::{Funding, OpenAuth, Payout, Proof, Tx, WebAuthnAssertion};
 #[test]
 fn tx_size_within_envelope() {
     // The 5 KiB cap on `Tx` is a sanity guard, not a target. WebAuthn
-    // open auth deliberately carries bounded browser assertion bytes, so
-    // the old native-only 768-byte envelope no longer applies.
+    // open auth deliberately carries bounded browser assertion bytes.
     // Stack frames for `List<Tx, N>` scale linearly here.
     assert!(
         size_of::<Tx>() <= 5 * 1024,

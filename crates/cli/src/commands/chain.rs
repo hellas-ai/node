@@ -52,11 +52,14 @@ pub enum QueryCommand {
         #[arg(long)]
         payload: Option<String>,
     },
-    /// Look up a coin by object ID in the latest finalized state
+    /// Look up a coin by object ID at an indexed payload
     Coin {
         /// Hex-encoded 32-byte object ID
         #[arg(long)]
         object_id: String,
+        /// Hex-encoded finalized payload to query
+        #[arg(long)]
+        payload: String,
     },
     /// List all known validators
     Validators,
@@ -142,6 +145,16 @@ pub async fn run(command: ChainCommand) -> CliResult {
     }
 }
 
+pub fn command_owns_tracing(command: &ChainCommand) -> bool {
+    match command {
+        #[cfg(feature = "validator")]
+        ChainCommand::Validator {
+            command: ValidatorCommand::Run { .. },
+        } => true,
+        _ => false,
+    }
+}
+
 async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
     let client = RemoteLightClient::connect(rpc).await?;
     let consensus_info = client.get_consensus_info().await?;
@@ -180,13 +193,10 @@ async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
                 None => println!("none"),
             }
         }
-        QueryCommand::Coin { object_id } => {
+        QueryCommand::Coin { object_id, payload } => {
             let object_id = parse_hex_digest(&object_id, "object_id")?;
-            let Some(latest) = client.get_latest_block().await? else {
-                println!("none");
-                return Ok(());
-            };
-            match client.get_coin(latest.payload, object_id).await? {
+            let payload = parse_hex_digest(&payload, "payload")?;
+            match client.get_coin(payload, object_id).await? {
                 Some(coin) => println!("{} {}", coin.owner, coin.value),
                 None => println!("none"),
             }

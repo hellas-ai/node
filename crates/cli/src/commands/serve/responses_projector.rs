@@ -149,7 +149,7 @@ fn fetch_payload_error(err: impl std::fmt::Display) -> FetchProjectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::JsonBytes;
+    use hellas_rpc::JsonBytes;
 
     fn request() -> FetchProviderRequest {
         FetchProviderRequest::new(
@@ -159,7 +159,7 @@ mod tests {
                 br#"{"model":"gpt-5.5-codex","input":"hi","stream":true,"max_output_tokens":8}"#
                     .to_vec(),
             ),
-            hellas_core::InputCommitment::from_digest(hellas_core::Digest::from_bytes([7; 32])),
+            hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([7; 32])),
         )
     }
 

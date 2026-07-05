@@ -2,7 +2,7 @@
 
 use crate::{
     app::Mempool,
-    execution::store::{UtxoDatabase, get as utxo_get, root as utxo_root},
+    execution::store::{UtxoDatabase, root as utxo_root},
     indexer::ChainIndexer,
     light_client::{
         ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins,
@@ -58,16 +58,16 @@ impl LightClient for LocalLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> Result<Option<Coin>, QueryError> {
-        let latest = self.get_latest_block().await?;
-        let Some(latest) = latest else {
+        let (cursor, coin) = self.owner_index.get_coin_snapshot(&object_id);
+        if cursor.height == 0 {
             return Ok(None);
-        };
-        if latest.payload != payload {
+        }
+        if cursor.payload != payload {
             return Err(QueryError::StateUnavailable(
-                "coin queries only support the latest payload".to_string(),
+                "coin queries only support the latest indexed payload".to_string(),
             ));
         }
-        Ok(utxo_get(&self.databases, &object_id).await)
+        Ok(coin)
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -99,19 +99,23 @@ impl LightClient for LocalLightClient {
     }
 
     async fn get_coins_by_owner(&self, owner: Address) -> Result<Option<OwnerCoins>, QueryError> {
-        let latest = self.get_latest_block().await?;
-        let Some(latest) = latest else {
+        let (cursor, coins) = self.owner_index.get_coins_by_owner_snapshot(&owner);
+        if cursor.height == 0 {
             return Ok(None);
-        };
-        let cursor = self.owner_index.cursor();
-        if cursor.payload != latest.payload {
-            return Err(QueryError::StateUnavailable(
-                "owner index has not reached latest payload".to_string(),
-            ));
         }
+        let Some(finalization) = self.chain_indexer.get_finalization(cursor.payload).await? else {
+            return Err(QueryError::StateUnavailable(
+                "owner index cursor finalization is unavailable".to_string(),
+            ));
+        };
         Ok(Some(OwnerCoins {
-            snapshot: latest,
-            coins: self.owner_index.get_coins_by_owner(&owner),
+            snapshot: LatestBlock {
+                height: cursor.height,
+                payload: cursor.payload,
+                state_root: cursor.state_root,
+                finalization,
+            },
+            coins,
         }))
     }
 }

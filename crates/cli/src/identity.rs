@@ -1,5 +1,5 @@
 use anyhow::Context;
-use hellas_core::ProducerSigningKey;
+use hellas_rpc::ProducerSigningKey;
 use iroh::SecretKey;
 use std::fs;
 use std::io::ErrorKind;

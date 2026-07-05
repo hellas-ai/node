@@ -27,14 +27,6 @@ where
     database.read().await.root()
 }
 
-#[cfg(feature = "validator")]
-pub async fn get<E>(database: &UtxoDatabase<E>, object: &ObjectId) -> Option<Coin>
-where
-    E: Storage + Clock + Metrics + 'static,
-{
-    database.read().await.get(object).await.ok().flatten()
-}
-
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
 

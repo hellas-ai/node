@@ -9,11 +9,6 @@ use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequ
 use crate::state::{QuoteKind, new_execution_id};
 use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use futures_util::StreamExt;
-use hellas_core::{
-    Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey, SignedReceipt,
-    canonical_dag_cbor,
-};
-use hellas_core::{Evaluate, EvaluateOutput};
 use hellas_rpc::ExecutorError;
 use hellas_rpc::error::StateError;
 use hellas_rpc::fetch::FetchOutputTranscriptBuilder;
@@ -23,6 +18,11 @@ use hellas_rpc::pb::execute::{
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::{VerifiedRunTicket, verify_run_ticket};
 use hellas_rpc::stream::output_event_to_pb;
+use hellas_rpc::{
+    Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey, SignedReceipt,
+    canonical_dag_cbor,
+};
+use hellas_rpc::{Evaluate, EvaluateOutput};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -375,7 +375,7 @@ impl Executor {
 
     async fn completed_evaluate_termination(
         &mut self,
-        evaluate_request: &hellas_core::EvaluateRequest,
+        evaluate_request: &hellas_rpc::EvaluateRequest,
         invocation: &crate::state::Invocation,
         stop_reason: crate::state::StopReason,
         output_tokens: Vec<u32>,
@@ -567,8 +567,8 @@ impl Executor {
 }
 
 fn ensure_authorized_runner(
-    expected: &hellas_core::PublicKey,
-    actual: &hellas_core::PublicKey,
+    expected: &hellas_rpc::PublicKey,
+    actual: &hellas_rpc::PublicKey,
 ) -> Result<(), ExecutorError> {
     if expected == actual {
         Ok(())
@@ -887,8 +887,8 @@ mod tests {
     };
     use catgrad::prelude::Dtype;
     use futures_util::stream;
-    use hellas_core::ProducerSigningKey;
     use hellas_rpc::ExecutorError;
+    use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;
     use hellas_rpc::pb::fetch::FetchRequest;
     use hellas_rpc::policy::ExecutePolicy;

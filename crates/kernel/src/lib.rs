@@ -54,7 +54,8 @@
 //! };
 //! ```
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "domain")]
+#[allow(unused_extern_crates)]
 extern crate alloc;
 
 mod block;

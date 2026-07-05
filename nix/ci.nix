@@ -3,6 +3,7 @@
   lib,
   rustToolchain,
   workspaceNativeBuildInputs,
+  extraChecks ? { },
 }:
 let
   mk =
@@ -25,9 +26,12 @@ let
 
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
-  checks = {
+  baseChecks = {
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
+      cargoEnv rustToolchain
+    );
+    executor-artifacts = mk "check-executor-artifacts" "cargo test -p hellas-executor artifacts::" (
       cargoEnv rustToolchain
     );
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
@@ -64,6 +68,8 @@ let
         "cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown"
         ((cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })) ++ [ pkgs.clang ]);
   };
+
+  checks = baseChecks // extraChecks;
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {

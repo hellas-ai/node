@@ -1,5 +1,5 @@
-use hellas_core::signature::verify_digest_signature;
-use hellas_core::{
+use crate::signature::verify_digest_signature;
+use crate::{
     Digest, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind, hash_tuple,
     tags,
 };

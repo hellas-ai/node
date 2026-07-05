@@ -75,7 +75,7 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use futures::StreamExt;
-    use hellas_core::{Digest, InputCommitment, JsonBytes};
+    use hellas_rpc::{Digest, InputCommitment, JsonBytes};
     use reqwest::header::AUTHORIZATION;
     use std::sync::Arc;
     use tokio::sync::oneshot;

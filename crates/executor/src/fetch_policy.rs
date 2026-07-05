@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hellas_core::{ProducerId, PublicKey, canonical_dag_cbor, decode_dag_cbor};
 use hellas_rpc::peers::TokenBucket;
+use hellas_rpc::{ProducerId, PublicKey, canonical_dag_cbor, decode_dag_cbor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -523,7 +523,7 @@ pub enum FetchAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::ProducerSigningKey;
 
     fn key(byte: u8) -> PublicKey {
         ProducerSigningKey::from_secret_bytes([byte; 32])

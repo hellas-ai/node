@@ -3,12 +3,15 @@
   pkgs,
   lib,
   package,
+  validatorPackage,
 }:
 let
   inherit (pkgs.hellasLib) executorPort;
   hellasModule = import ../modules/nixos.nix { inherit self; };
 
   gatewayPort = 8080;
+  chainRpcPort = 31246;
+  chainOwner = "wic3EQ9UxhwPSctsVsqdK9fpqivx6bMLpZZEyVD3MYeH";
 
   responsesMock = pkgs.writeText "responses-mock.py" ''
     import json
@@ -193,6 +196,137 @@ in
       assert "response.output_text.delta" in stream
       assert '"output_index":0' in stream
       assert '"content_index":0' in stream
+    '';
+  };
+
+  chain-validator-follower = pkgs.testers.runNixOSTest {
+    name = "hellas-chain-validator-follower";
+    nodes.machine = _: {
+      config = lib.mkMerge [
+        (mkBaseNode validatorPackage)
+        {
+          virtualisation.cores = 2;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+    testScript = ''
+      import time
+
+      cli = "${validatorPackage}/bin/hellas-cli"
+      rpc = "ws://127.0.0.1:${toString chainRpcPort}"
+      owner = "${chainOwner}"
+
+      def parse_fields(output):
+          fields = {}
+          for line in output.splitlines():
+              parts = line.split(" ", 1)
+              if len(parts) == 2:
+                  fields[parts[0]] = parts[1]
+          return fields
+
+      def latest_block():
+          output = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} latest-block")
+          fields = parse_fields(output)
+          assert "height" in fields and int(fields["height"]) > 0, output
+          assert "payload" in fields, output
+          return fields
+
+      def follower_height():
+          output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
+          heights = []
+          for line in output.splitlines():
+              parts = line.split()
+              if len(parts) == 3 and parts[0] == "height" and parts[2] in ["Applied", "Duplicate"]:
+                  heights.append(int(parts[1]))
+          return max(heights) if heights else 0
+
+      def follower_activity_events():
+          output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
+          return sum(1 for line in output.splitlines() if line.startswith("activity finalization "))
+
+      def wait_for_follower_stream_ready():
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
+              if "activity stream subscribed" in output:
+                  return
+              time.sleep(1)
+          follower = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
+          validator = machine.succeed("cat /tmp/chain-e2e/validator.log || true")
+          raise Exception(f"follower did not subscribe to activity stream\nfollower:\n{follower}\nvalidator:\n{validator}")
+
+      def wait_for_follower_stream(baseline, baseline_events):
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              remote = int(latest_block()["height"])
+              local = follower_height()
+              events = follower_activity_events()
+              if remote > baseline and local > baseline and events > baseline_events:
+                  return local
+              time.sleep(1)
+          follower = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
+          validator = machine.succeed("cat /tmp/chain-e2e/validator.log || true")
+          raise Exception(f"follower did not advance past {baseline}: remote={remote} local={local} events={events}\nfollower:\n{follower}\nvalidator:\n{validator}")
+
+      start_all()
+
+      machine.succeed("mkdir -p /tmp/chain-e2e/validator-home /tmp/chain-e2e/client-home /tmp/chain-e2e/follower-home /tmp/chain-e2e/follower-store")
+      machine.succeed(
+          f"HOME=/tmp/chain-e2e/validator-home {cli} chain validator config "
+          "-n 1 --seed 7 --start-port 31200 "
+          "--ws-bind 127.0.0.1:${toString chainRpcPort} "
+          "--metrics-port 39200 "
+          f"--genesis-allocation {owner}:424242 "
+          "> /tmp/chain-e2e/validator.toml"
+      )
+      machine.succeed(f"{cli} chain validator check-config --config /tmp/chain-e2e/validator.toml | grep -Fx ok")
+      machine.succeed(
+          f"HOME=/tmp/chain-e2e/validator-home RUST_LOG=info {cli} chain validator run "
+          "--config /tmp/chain-e2e/validator.toml "
+          "> /tmp/chain-e2e/validator.log 2>&1 & echo $! > /tmp/chain-e2e/validator.pid"
+      )
+      machine.wait_for_open_port(${toString chainRpcPort})
+      machine.succeed(
+          f"HOME=/tmp/chain-e2e/follower-home RUST_LOG=info {cli} chain indexer follow "
+          f"--rpc {rpc} --storage-dir /tmp/chain-e2e/follower-store "
+          "--partition-prefix chain-e2e-follower "
+          "> /tmp/chain-e2e/follower.log 2>&1 & echo $! > /tmp/chain-e2e/follower.pid"
+      )
+      machine.wait_until_succeeds(
+          f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} latest-block "
+          "> /tmp/chain-e2e/latest.log && grep -Eq '^height [1-9][0-9]*$' /tmp/chain-e2e/latest.log"
+      )
+      wait_for_follower_stream_ready()
+      baseline = follower_height()
+      baseline_events = follower_activity_events()
+      advanced = wait_for_follower_stream(baseline, baseline_events)
+      print(f"follower advanced from {baseline} to {advanced}")
+
+      latest = latest_block()
+      height = int(latest["height"])
+      payload = latest["payload"]
+
+      by_height = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalized-block --height {height}")
+      assert f"height {height}" in by_height.splitlines(), by_height
+      assert f"payload {payload}" in by_height.splitlines(), by_height
+      assert any(line.startswith("block ") for line in by_height.splitlines()), by_height
+
+      by_payload = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalized-block --payload {payload}")
+      assert f"height {height}" in by_payload.splitlines(), by_payload
+      assert f"payload {payload}" in by_payload.splitlines(), by_payload
+
+      finalization = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalization --payload {payload}").strip()
+      assert len(finalization) > 64 and all(c in "0123456789abcdef" for c in finalization), finalization
+
+      validators = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} validators")
+      assert validators.strip(), validators
+
+      coins = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
+      coin_lines = [line for line in coins.splitlines() if line.endswith(" 424242")]
+      assert len(coin_lines) == 1, coins
+
+      machine.succeed("kill $(cat /tmp/chain-e2e/follower.pid) $(cat /tmp/chain-e2e/validator.pid)")
     '';
   };
 }

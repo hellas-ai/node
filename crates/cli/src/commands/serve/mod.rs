@@ -1,12 +1,12 @@
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use catgrad::prelude::Dtype;
-use hellas_core::ProducerSigningKey;
 use hellas_executor::{
     CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
     RequestRateLimit, SpendLimit,
 };
+use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;
 use serde::Deserialize;
@@ -426,8 +426,8 @@ fn dedupe_preload_models(mut models: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::ProducerSigningKey;
     use hellas_executor::{FetchAccessError, FetchRequestView};
+    use hellas_rpc::ProducerSigningKey;
 
     fn public_key_hex(byte: u8) -> String {
         let key = ProducerSigningKey::from_secret_bytes([byte; 32])

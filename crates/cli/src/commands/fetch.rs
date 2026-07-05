@@ -4,7 +4,7 @@ use crate::execution::{
     fetch_execution_stream,
 };
 use futures::StreamExt;
-use hellas_core::ProducerSigningKey;
+use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::build_input_events;
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
@@ -22,7 +22,7 @@ pub struct ExecuteOptions {
     pub payload: Vec<u8>,
     pub retries: usize,
     pub producer_key_path: Option<PathBuf>,
-    pub trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
+    pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {

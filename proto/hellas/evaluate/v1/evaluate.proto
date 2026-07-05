@@ -12,7 +12,7 @@ service Evaluate {
 }
 
 message EvaluateRequest {
-  // catnix InputId<TextExecution>; exactly 32 bytes.
+  // Content-addressed TextExecution artifact; exactly 32 bytes.
   bytes text_execution = 1;
   .hellas.v1.PublicKey runner_public_key = 2;
 }

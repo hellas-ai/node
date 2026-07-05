@@ -1,19 +1,15 @@
-//! Content-addressed catgrad artifact primitives.
-//!
-//! `catnix` gives catgrad-shaped objects Nix-like input and output addresses.
-//! It deliberately does not know about Hellas receipts, producer signatures,
-//! settlement, prices, or evidence.
+//! Content-addressed evaluate artifact schema.
 
-use std::marker::PhantomData;
+use std::{format, marker::PhantomData, str, string::String, vec::Vec};
 
-const SOURCE_INPUT_SCHEMA: &str = "catnix.source.input.v1";
-const SOURCE_OUTPUT_SCHEMA: &str = "catnix.source.output.v1";
-const TOKEN_IDS_SCHEMA: &str = "catnix.token_ids.v1";
-const TEXT_POLICY_SCHEMA: &str = "catnix.text.policy.v1";
-const TEXT_EXECUTION_SCHEMA: &str = "catnix.text.execution.v1";
-const TEXT_STATE_SCHEMA: &str = "catnix.text.state.v1";
-const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "catnix.text.artifact.identity.v1";
-const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "catnix.text.artifact.output.v1";
+const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
+const SOURCE_OUTPUT_SCHEMA: &str = "hellas.evaluate.source.output.v1";
+const TOKEN_IDS_SCHEMA: &str = "hellas.evaluate.token_ids.v1";
+const TEXT_POLICY_SCHEMA: &str = "hellas.evaluate.text.policy.v1";
+const TEXT_EXECUTION_SCHEMA: &str = "hellas.evaluate.text.execution.v1";
+const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
+const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v1";
+const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Digest([u8; 32]);
@@ -32,8 +28,8 @@ impl Digest {
     }
 }
 
-impl std::fmt::Display for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Digest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for byte in &self.0 {
             write!(f, "{byte:02x}")?;
         }
@@ -41,8 +37,8 @@ impl std::fmt::Display for Digest {
     }
 }
 
-impl std::fmt::Debug for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Digest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Digest({self})")
     }
 }
@@ -123,20 +119,20 @@ impl<I> PartialEq for InputId<I> {
 
 impl<I> Eq for InputId<I> {}
 
-impl<I> std::hash::Hash for InputId<I> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<I> core::hash::Hash for InputId<I> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.digest.hash(state);
     }
 }
 
-impl<I> std::fmt::Display for InputId<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> core::fmt::Display for InputId<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.digest.fmt(f)
     }
 }
 
-impl<I> std::fmt::Debug for InputId<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> core::fmt::Debug for InputId<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "InputId({})", self.digest)
     }
 }
@@ -183,20 +179,20 @@ impl<O> PartialEq for OutputId<O> {
 
 impl<O> Eq for OutputId<O> {}
 
-impl<O> std::hash::Hash for OutputId<O> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<O> core::hash::Hash for OutputId<O> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.digest.hash(state);
     }
 }
 
-impl<O> std::fmt::Display for OutputId<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<O> core::fmt::Display for OutputId<O> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.digest.fmt(f)
     }
 }
 
-impl<O> std::fmt::Debug for OutputId<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<O> core::fmt::Debug for OutputId<O> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "OutputId({})", self.digest)
     }
 }
@@ -261,8 +257,8 @@ impl From<u32> for TokenId {
     }
 }
 
-impl std::fmt::Display for TokenId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TokenId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -284,18 +280,19 @@ pub struct TokenIdError {
 }
 
 impl TokenIdError {
-    pub const fn value(self) -> i32 {
+    #[cfg(test)]
+    fn value(self) -> i32 {
         self.value
     }
 }
 
-impl std::fmt::Display for TokenIdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TokenIdError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "token id {} is negative", self.value)
     }
 }
 
-impl std::error::Error for TokenIdError {}
+impl core::error::Error for TokenIdError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenIds {
@@ -317,14 +314,6 @@ impl TokenIds {
 
     pub fn as_slice(&self) -> &[TokenId] {
         &self.tokens
-    }
-
-    pub fn len(&self) -> usize {
-        self.tokens.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
     }
 }
 
@@ -388,6 +377,7 @@ impl TextPolicy {
         }
     }
 
+    #[cfg(test)]
     pub fn from_u32_stop_tokens(
         max_new_tokens: u32,
         stop_token_ids: impl IntoIterator<Item = u32>,
@@ -506,7 +496,7 @@ impl CanonicalDecode for TextExecution {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextOutput {
     execution: TextExecutionId,
     position: u64,
@@ -533,20 +523,12 @@ impl TextOutput {
         self.execution
     }
 
-    pub const fn position(&self) -> u64 {
-        self.position
-    }
-
     pub const fn state(&self) -> TextStateId {
         self.state
     }
-
-    pub const fn generated_tokens(&self) -> TokenIdsId {
-        self.generated_tokens
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextArtifact {
     Identity { bound_term: BoundTermId },
     Output(TextOutput),
@@ -613,13 +595,13 @@ impl DecodeError {
     }
 }
 
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.message.fmt(f)
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
 fn parse_canonical<T: Canonical>(
     bytes: &[u8],
@@ -629,7 +611,7 @@ fn parse_canonical<T: Canonical>(
     let value = decode(&mut decoder)?;
     decoder.finish()?;
     if value.canonical_bytes() != bytes {
-        return Err(DecodeError::new("value is not in catnix canonical form"));
+        return Err(DecodeError::new("value is not in canonical artifact form"));
     }
     Ok(value)
 }
@@ -719,6 +701,7 @@ fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact
     }
 }
 
+#[derive(Debug)]
 pub struct DagCborEncoder {
     bytes: Vec<u8>,
 }
@@ -748,14 +731,6 @@ impl DagCborEncoder {
 
     pub fn u64(&mut self, value: u64) {
         self.header(0, value);
-    }
-
-    pub fn i64(&mut self, value: i64) {
-        if value >= 0 {
-            self.header(0, value as u64);
-        } else {
-            self.header(1, (-1_i128 - value as i128) as u64);
-        }
     }
 
     fn header(&mut self, major: u8, value: u64) {
@@ -850,7 +825,7 @@ impl<'a> DagCborDecoder<'a> {
         let len = usize::try_from(self.read_len(3)?)
             .map_err(|_| DecodeError::new("text string length exceeds usize range"))?;
         let bytes = self.read_exact(len)?;
-        std::str::from_utf8(bytes).map_err(|err| DecodeError::new(format!("invalid utf-8: {err}")))
+        str::from_utf8(bytes).map_err(|err| DecodeError::new(format!("invalid utf-8: {err}")))
     }
 
     fn u32(&mut self) -> Result<u32, DecodeError> {
@@ -1098,7 +1073,11 @@ mod tests {
     #[test]
     fn decoder_rejects_wrong_schema() {
         let mut bytes = TokenIds::from([1]).canonical_bytes();
-        bytes[2] = b'x';
+        let schema_start = bytes
+            .iter()
+            .position(|byte| *byte == b'h')
+            .expect("schema tag starts with h");
+        bytes[schema_start] = b'x';
 
         let err = TokenIds::from_canonical_bytes(&bytes).unwrap_err();
         assert!(err.to_string().contains("schema tag"));
