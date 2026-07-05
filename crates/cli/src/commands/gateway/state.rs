@@ -50,7 +50,7 @@ pub(super) struct GatewayState {
     runtime: ExecutionRuntime,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
-    runner_key: Arc<hellas_core::ProducerSigningKey>,
+    runner_key: Arc<hellas_rpc::ProducerSigningKey>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -496,8 +496,7 @@ mod tests {
             responses_proxy: None,
             responses_fetch: None,
             runner_key: Arc::new(
-                hellas_core::ProducerSigningKey::from_secret_bytes([3; 32])
-                    .expect("valid test key"),
+                hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32]).expect("valid test key"),
             ),
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),

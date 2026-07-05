@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_core::Stream;
 use futures_util::stream;
-use hellas_core::{Digest, InputCommitment, JsonBytes};
+use hellas_rpc::{Digest, InputCommitment, JsonBytes};
 
 pub type FetchProviderResult<T> = Result<T, FetchProviderError>;
 pub type FetchProviderStream =

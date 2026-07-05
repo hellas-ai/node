@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
-use hellas_core::Digest;
+use hellas_rpc::Digest;
 use hellas_rpc::pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
 use hellas_rpc::services::courtesy::{Courtesy, CourtesyClientImpl};
 use hellas_wire::ServiceMarker;

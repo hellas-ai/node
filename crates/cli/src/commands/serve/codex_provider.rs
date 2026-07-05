@@ -92,7 +92,7 @@ mod tests {
     use axum::routing::post;
     use base64::Engine;
     use futures::StreamExt;
-    use hellas_core::JsonBytes;
+    use hellas_rpc::JsonBytes;
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
@@ -143,7 +143,7 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
             "codex",
             "responses",
             JsonBytes::new(body.to_vec()),
-            hellas_core::InputCommitment::from_digest(hellas_core::Digest::from_bytes([7; 32])),
+            hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([7; 32])),
         )
     }
 

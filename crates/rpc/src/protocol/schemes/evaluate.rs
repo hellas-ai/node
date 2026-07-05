@@ -7,14 +7,14 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateRequest {
-    /// catnix InputId<TextExecution>.
+    /// Content-addressed TextExecution artifact.
     pub text_execution: Digest,
     pub runner_public_key: PublicKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateOutput {
-    /// catnix OutputId<TextArtifact>.
+    /// Content-addressed TextArtifact artifact.
     pub text_artifact: Digest,
 }
 

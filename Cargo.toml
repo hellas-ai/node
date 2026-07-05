@@ -1,9 +1,7 @@
 [workspace]
 members = [
-    "crates/catnix",
     "crates/chain",
     "crates/cli",
-    "crates/core",
     "crates/executor",
     "crates/kernel",
     "crates/rpc",
@@ -29,7 +27,6 @@ catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat
     "serde",
 ] }
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
-catnix = { path = "crates/catnix", default-features = false }
 chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 clap = { version = "4", features = ["derive"] }
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
@@ -48,7 +45,6 @@ dirs = "6"
 futures = "0.3"
 half = "2.7.1"
 hellas-chain = { path = "crates/chain", default-features = false }
-hellas-core = { path = "crates/core", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }

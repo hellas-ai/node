@@ -46,7 +46,6 @@ chatgrad.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-chain = { workspace = true, default-features = false, optional = true }
-hellas-core.workspace = true
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-kernel = { workspace = true, default-features = false, features = [
     "domain",

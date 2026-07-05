@@ -58,7 +58,7 @@ pub struct GatewayOptions {
     pub responses_fetch_route_service: String,
     pub responses_fetch_route_method: String,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
-    pub trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
+    pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
     pub producer_key_path: Option<PathBuf>,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,

@@ -30,6 +30,13 @@ pub struct TracerGuard {
 }
 
 impl TracerGuard {
+    pub const fn noop() -> Self {
+        Self {
+            #[cfg(feature = "otel")]
+            provider: None,
+        }
+    }
+
     pub fn shutdown(self) {
         #[cfg(feature = "otel")]
         if let Some(provider) = self.provider

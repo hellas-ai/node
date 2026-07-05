@@ -1,6 +1,6 @@
 use std::str;
 
-use hellas_core::{
+use crate::{
     CanonicalizationId, InputCommitment, InputEventEnvelope, InputTranscriptBuilder, JsonBytes,
     OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, SchemeId,
     StreamVerifyError, verify_input_event_envelopes, verify_output_event_envelopes,

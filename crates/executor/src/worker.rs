@@ -2,7 +2,7 @@ use crate::executor::ExecutorMessage;
 use crate::state::{Invocation, ModelLocator, StopReason};
 use chatgrad::PreparedPrompt;
 use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
-use hellas_core::EvaluateRequest;
+use hellas_rpc::EvaluateRequest;
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };

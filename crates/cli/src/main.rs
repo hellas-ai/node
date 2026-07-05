@@ -24,9 +24,9 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
     }
 }
 
-fn parse_public_key_hex(s: &str) -> Result<hellas_core::PublicKey, String> {
-    let bytes = parse_hex_array::<{ hellas_core::PublicKey::LEN }>(s)?;
-    Ok(hellas_core::PublicKey::from_compressed_sec1(bytes))
+fn parse_public_key_hex(s: &str) -> Result<hellas_rpc::PublicKey, String> {
+    let bytes = parse_hex_array::<{ hellas_rpc::PublicKey::LEN }>(s)?;
+    Ok(hellas_rpc::PublicKey::from_compressed_sec1(bytes))
 }
 
 fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -314,7 +314,7 @@ enum Commands {
         /// secp256k1 keys as hex (see `producer-key show`). Defaults to this
         /// gateway's own producer key.
         #[arg(long = "trusted-producer-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
-        trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
+        trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
         /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
         #[arg(long = "wrap")]
         wrap: Option<String>,
@@ -416,7 +416,7 @@ enum Commands {
         /// comma-separate compressed secp256k1 keys as hex (see
         /// `producer-key show`). Defaults to this node's own producer key.
         #[arg(long = "trusted-producer-public-key", value_delimiter = ',', value_parser = parse_public_key_hex)]
-        trusted_producer_public_keys: Vec<hellas_core::PublicKey>,
+        trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
     },
     /// Inspect the local identity file
     Identity {
@@ -452,7 +452,11 @@ async fn main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
-    let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
+    let tracer_provider = if command_owns_tracing(&cli.command) {
+        tracing_config::TracerGuard::noop()
+    } else {
+        tracing_config::init_tracing(cli.log_file.as_deref())
+    };
     let producer_key_path = cli.producer_key_path.clone();
 
     if let Commands::ProducerKey {
@@ -711,6 +715,14 @@ async fn main() {
     if let Err(err) = result {
         eprintln!("error: {err:#}");
         std::process::exit(1);
+    }
+}
+
+fn command_owns_tracing(command: &Commands) -> bool {
+    match command {
+        #[cfg(feature = "chain")]
+        Commands::Chain { command } => commands::chain::command_owns_tracing(command),
+        _ => false,
     }
 }
 

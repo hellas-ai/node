@@ -85,6 +85,11 @@ impl OwnerIndex {
             .cloned()
     }
 
+    pub fn get_coin_snapshot(&self, object_id: &ObjectId) -> (OwnerCursor, Option<Coin>) {
+        let state = self.inner.read().expect("owner index lock poisoned");
+        (state.cursor, state.coins.get(object_id).cloned())
+    }
+
     pub fn get_coins_by_owner(&self, owner: &Address) -> Vec<(ObjectId, u64)> {
         self.inner
             .read()
@@ -93,6 +98,19 @@ impl OwnerIndex {
             .get(owner)
             .map(|coins| coins.iter().map(|(id, value)| (*id, *value)).collect())
             .unwrap_or_default()
+    }
+
+    pub fn get_coins_by_owner_snapshot(
+        &self,
+        owner: &Address,
+    ) -> (OwnerCursor, Vec<(ObjectId, u64)>) {
+        let state = self.inner.read().expect("owner index lock poisoned");
+        let coins = state
+            .by_owner
+            .get(owner)
+            .map(|coins| coins.iter().map(|(id, value)| (*id, *value)).collect())
+            .unwrap_or_default();
+        (state.cursor, coins)
     }
 }
 

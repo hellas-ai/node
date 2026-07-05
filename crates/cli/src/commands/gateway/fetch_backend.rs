@@ -1,7 +1,7 @@
 use async_stream::try_stream;
 use axum::body::Bytes;
 use futures::StreamExt;
-use hellas_core::ProducerSigningKey;
+use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::{build_input_events, verify_input_events};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;

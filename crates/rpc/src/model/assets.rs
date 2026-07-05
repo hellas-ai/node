@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::PublicKey;
 use crate::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
@@ -9,7 +10,6 @@ use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_templ
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
-use hellas_core::PublicKey;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 

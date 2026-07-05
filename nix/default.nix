@@ -36,6 +36,7 @@ let
   commonToolPackages = with pkgs; [
     jq
     just
+    nixfmt
     taplo
   ];
 
@@ -86,6 +87,7 @@ let
       rustToolchain
       workspaceNativeBuildInputs
       ;
+    extraChecks = kernel.checks;
   };
 
   mkHydraSourceCheck =
@@ -219,6 +221,7 @@ let
         import ./tests {
           inherit self pkgs lib;
           package = nativePackages.cli-candle;
+          validatorPackage = nativePackages.cli-validator;
         }
       );
     in

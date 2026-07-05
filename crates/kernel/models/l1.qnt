@@ -243,10 +243,6 @@ module l1 {
   // abstracted here as the same party key authorizing this edge.
   val fundingAuthorized = inv::fundingAuthorized(liveEdges, openAuth)
 
-  // ---------------------------------------------------------------------
-  // Trace tests — exported as ITF fixtures via `npm run quint:fixtures`
-  // ---------------------------------------------------------------------
-
   // Smoke: open the canonical edge, cooperatively close.
   run basicTraceTest =
     init

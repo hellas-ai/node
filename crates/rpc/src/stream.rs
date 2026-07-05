@@ -1,5 +1,5 @@
-use hellas_core::commitment::TagError;
-use hellas_core::{
+use crate::commitment::TagError;
+use crate::{
     CanonicalizationId, Digest, EventCommitment, InputCommitment, InputEventBody,
     InputEventBodyParts, InputEventEnvelope, OutputEventBody, OutputEventBodyParts,
     OutputEventEnvelope, ProducerId, PublicKey, SchemeId, Signature, SignatureKind,
@@ -201,7 +201,7 @@ pub enum StreamEnvelopeError {
     #[error("unknown scheme id: {0}")]
     Scheme(#[from] TagError),
     #[error("signature error: {0}")]
-    Signature(#[from] hellas_core::SignatureError),
+    Signature(#[from] crate::SignatureError),
     #[error("stream verification error: {0}")]
     Stream(#[from] StreamVerifyError),
 }
@@ -209,7 +209,7 @@ pub enum StreamEnvelopeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::{
+    use crate::{
         CanonicalizationId, InputTranscriptBuilder, OutputTranscriptBuilder, ProducerSigningKey,
         input_genesis,
     };

@@ -31,7 +31,7 @@ message EvaluateStart {
 message EvaluateGenesisStart {}
 
 message EvaluateArtifactStart {
-  // catnix OutputId<TextArtifact>; exactly 32 bytes.
+  // Content-addressed TextArtifact artifact; exactly 32 bytes.
   bytes artifact = 1;
 }
 
@@ -115,7 +115,7 @@ message QuoteChatPromptResponse {
   .hellas.evaluate.v1.EvaluateRequest evaluate_request = 4;
 }
 
-// Store one canonical catnix artifact by its BLAKE3 digest. This API does not
+// Store one canonical evaluate artifact by its BLAKE3 digest. This API does not
 // publish evaluate metadata such as model locators or lazy substitutions; those
 // are separate provider-local interpretation state.
 message PutArtifactRequest {

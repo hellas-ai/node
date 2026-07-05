@@ -15,12 +15,11 @@ candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
 async-stream = "0.3"
+blake3 = { workspace = true }
 catgrad = { workspace = true, default-features = false, features = ["serde"] }
-catnix.workspace = true
 chatgrad = { workspace = true, default-features = false }
 futures-core = "0.3"
 futures-util = "0.3"
-hellas-core.workspace = true
 hellas-rpc = { workspace = true, features = [
     "node",
     "execute",

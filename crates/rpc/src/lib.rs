@@ -14,6 +14,7 @@ pub mod call;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod peers;
+pub mod protocol;
 #[cfg(feature = "execute")]
 pub mod run_ticket;
 pub mod serve;
@@ -26,6 +27,21 @@ pub use spec::ModelSpec;
 pub mod policy;
 
 pub mod provenance;
+
+pub use protocol::{
+    AssuranceStrategy, CanonicalizationId, CommitmentScheme, DagCborDecodeError,
+    DagCborEncodeError, DagCborEncoder, DeliveryOutput, DeliveryRequest, Digest, Evaluate,
+    EvaluateOutput, EvaluateRequest, EventCommitment, InputCommitment, InputEventBody,
+    InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JsonBytes, OutputEventBody,
+    OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, ProducerId,
+    ProducerSigningKey, PublicKey, ReceiptBody, ReceiptCommitment, RequestCommitment,
+    ResultCommitment, SchemeId, Signature, SignatureError, SignatureKind, SignedInputEvent,
+    SignedOutputEvent, SignedReceipt, StreamId, StreamVerifyError, VerifyError, canonical_dag_cbor,
+    decode_dag_cbor, hash_tuple, input_genesis, output_genesis, verify_delivery,
+    verify_input_event_envelopes, verify_input_transcript, verify_output_event_envelopes,
+    verify_output_transcript, verify_receipt,
+};
+pub use protocol::{commitment, digest, signature, tags, value};
 
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is

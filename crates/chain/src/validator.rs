@@ -342,6 +342,7 @@ fn otlp_sample_rate() -> f64 {
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
 fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     use tracing_subscriber::prelude::*;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -357,13 +358,23 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
 
     let (otel_layer, provider) = init_otlp_layer();
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
-        .with(otel_layer)
-        .init();
+        .with(otel_layer);
 
-    provider
+    match subscriber.try_init() {
+        Ok(()) => provider,
+        Err(err) => {
+            eprintln!("warning: validator tracing subscriber not installed: {err}");
+            if let Some(provider) = provider
+                && let Err(shutdown_err) = provider.shutdown()
+            {
+                eprintln!("warning: failed to shut down unused validator tracer: {shutdown_err}");
+            }
+            None
+        }
+    }
 }
 
 fn init_otlp_layer<S>() -> (

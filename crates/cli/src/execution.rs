@@ -31,14 +31,9 @@ use catgrad::prelude::Dtype;
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::{BoxStream, Stream};
-use hellas_core::ProducerSigningKey;
-use hellas_core::{
-    DagCborDecodeError, Digest, EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey,
-    SchemeId, SignedReceipt as CoreSignedReceipt, StreamId, VerifyError, decode_dag_cbor,
-    output_genesis, verify_receipt,
-};
 #[cfg(feature = "hellas-executor")]
 use hellas_executor::{Executor, ExecutorHandle};
+use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::{
     FetchInput, FetchProtocolError, output_canonicalization, verify_input_events,
     verify_output_events,
@@ -57,6 +52,11 @@ use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
+use hellas_rpc::{
+    DagCborDecodeError, Digest, EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey,
+    SchemeId, SignedReceipt as CoreSignedReceipt, StreamId, VerifyError, decode_dag_cbor,
+    output_genesis, verify_receipt,
+};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
@@ -1575,7 +1575,7 @@ fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_core::ProducerSigningKey;
+    use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::{
         FetchOutputTranscriptBuilder, build_input_events, build_output_events,
     };

@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use catgrad::prelude::Dtype;
-use hellas_core::ProducerSigningKey;
 use hellas_executor::{
     ArtifactStoreConfig, CourtesyServer, EvaluateServer, ExecuteServer, Executor, ExecutorMetrics,
     ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
 };
+use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::serve::AccountingDispatcher;
