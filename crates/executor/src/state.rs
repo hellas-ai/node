@@ -1,27 +1,52 @@
 use std::collections::HashMap;
+#[cfg(feature = "evaluate")]
 use std::str::FromStr;
 use std::time::Instant;
 
+#[cfg(feature = "evaluate")]
 use crate::DEFAULT_MAX_SEQ;
 use crate::fetch_provider::FetchProviderRequest;
-use catgrad::prelude::Dtype;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::encode_token_ids;
+#[cfg(feature = "evaluate")]
+use hellas_rpc::Dtype;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::{
     EvaluateStart as PbEvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
+#[cfg(feature = "evaluate")]
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::pb::execute::{
     FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
     WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
 };
+#[cfg(feature = "evaluate")]
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
+#[cfg(feature = "evaluate")]
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-use hellas_rpc::{Digest, EvaluateRequest, PublicKey, RequestCommitment};
+use hellas_rpc::{Digest, PublicKey, RequestCommitment};
+#[cfg(feature = "evaluate")]
+use hellas_rpc::{EvaluateRequest, ExecutorError, encode_token_ids};
 use uuid::Uuid;
 
 pub use hellas_rpc::error::StateError;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreConfig {
+    Memory,
+    Fs(std::path::PathBuf),
+}
+
+impl ArtifactStoreConfig {
+    pub fn memory() -> Self {
+        Self::Memory
+    }
+
+    pub fn fs(path: impl Into<std::path::PathBuf>) -> Self {
+        Self::Fs(path.into())
+    }
+}
+
+#[cfg(feature = "evaluate")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ModelLocator {
     pub model_id: String,
@@ -29,12 +54,14 @@ pub(crate) struct ModelLocator {
     pub dtype: Dtype,
 }
 
+#[cfg(feature = "evaluate")]
 impl ModelLocator {
     pub(crate) fn spec(&self) -> String {
         model_spec(&self.model_id, &self.revision)
     }
 }
 
+#[cfg(feature = "evaluate")]
 #[derive(Clone, Debug)]
 pub struct Invocation {
     pub input_ids: Vec<u32>,
@@ -42,6 +69,7 @@ pub struct Invocation {
     pub stop_token_ids: Vec<i32>,
 }
 
+#[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
     pub locator: ModelLocator,
     pub invocation: Invocation,
@@ -49,6 +77,7 @@ pub(crate) struct QuotePlan {
     pub runner_public_key: PublicKey,
 }
 
+#[cfg(feature = "evaluate")]
 impl QuotePlan {
     pub(crate) fn from_prepared_text_request(
         request: QuotePreparedTextRequest,
@@ -123,6 +152,7 @@ impl QuotePlan {
     }
 }
 
+#[cfg(feature = "evaluate")]
 pub(crate) fn resolve_accept_dtypes(
     prefs: &[String],
     supported_dtypes: &[Dtype],
@@ -140,7 +170,7 @@ pub(crate) fn resolve_accept_dtypes(
         let dtype = Dtype::from_str(raw).map_err(|e| {
             ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
         })?;
-        if matches!(dtype, Dtype::U32) {
+        if !dtype.is_model_dtype() {
             return Err(ExecutorError::InvalidQuoteRequest(
                 "model dtype must be f32, f16, bf16, or f8".to_string(),
             ));
@@ -158,6 +188,7 @@ pub(crate) fn resolve_accept_dtypes(
     })
 }
 
+#[cfg(feature = "evaluate")]
 pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateRequest {
     PbEvaluateRequest {
         text_execution: request.text_execution.as_bytes().to_vec(),
@@ -165,6 +196,7 @@ pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateReq
     }
 }
 
+#[cfg(feature = "evaluate")]
 pub(crate) fn evaluate_request_from_pb(
     request: PbEvaluateRequest,
 ) -> Result<EvaluateRequest, ExecutorError> {
@@ -183,6 +215,7 @@ pub(crate) fn evaluate_request_from_pb(
     })
 }
 
+#[cfg(feature = "evaluate")]
 fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>, ExecutorError> {
     let start = start
         .and_then(|start| start.kind)
@@ -196,6 +229,7 @@ fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>
     }
 }
 
+#[cfg(feature = "evaluate")]
 fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
     bytes.try_into().map_err(|_| {
         ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
@@ -206,6 +240,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
     Digest::from_bytes(*bytes).to_string()
 }
 
+#[cfg(feature = "evaluate")]
 pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
     if revision.is_empty() {
         model_id.to_string()
@@ -214,6 +249,7 @@ pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
     }
 }
 
+#[cfg(feature = "evaluate")]
 #[derive(Clone, Debug)]
 pub(crate) enum LocalModelStatus {
     Ready,
@@ -231,11 +267,8 @@ pub struct QuoteRecord {
 
 #[derive(Clone)]
 pub enum QuoteKind {
-    Evaluate {
-        evaluate_request: EvaluateRequest,
-        locator: ModelLocator,
-        invocation: Invocation,
-    },
+    #[cfg(feature = "evaluate")]
+    Scheme(Box<dyn crate::scheme::SchemeJob>),
     Fetch {
         request: FetchProviderRequest,
     },
@@ -298,6 +331,7 @@ fn make_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
+#[cfg(feature = "evaluate")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndOfSequence,
@@ -305,6 +339,7 @@ pub enum StopReason {
     Cancelled,
 }
 
+#[cfg(feature = "evaluate")]
 impl StopReason {
     pub fn to_pb(self) -> PbFinishStatus {
         match self {
@@ -315,6 +350,7 @@ impl StopReason {
     }
 }
 
+#[cfg(feature = "evaluate")]
 #[derive(Debug, Clone)]
 pub enum Termination {
     Completed {
@@ -328,6 +364,7 @@ pub enum Termination {
     },
 }
 
+#[cfg(feature = "evaluate")]
 impl Termination {
     pub fn is_completed(&self) -> bool {
         matches!(self, Self::Completed { .. })

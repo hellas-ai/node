@@ -1,13 +1,12 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use hellas_rpc::ExecutorError;
 use hellas_rpc::{Digest, EvaluateRequest, hash_tuple};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Invocation, ModelLocator, QuotePlan};
+use crate::state::{ArtifactStoreConfig, Invocation, ModelLocator, QuotePlan};
 
 mod schema;
 
@@ -18,22 +17,6 @@ use schema::{
 };
 
 const EVALUATE_INDEX_FILE: &str = "evaluate-index.json";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ArtifactStoreConfig {
-    Memory,
-    Fs(PathBuf),
-}
-
-impl ArtifactStoreConfig {
-    pub fn memory() -> Self {
-        Self::Memory
-    }
-
-    pub fn fs(path: impl Into<PathBuf>) -> Self {
-        Self::Fs(path.into())
-    }
-}
 
 enum ArtifactBlobStore {
     Memory(iroh_blobs::store::mem::MemStore),
@@ -733,7 +716,7 @@ impl PersistedEvaluateIndex {
                 bound_term: bound_term.to_string(),
                 model_id: locator.model_id.clone(),
                 revision: locator.revision.clone(),
-                dtype: dtype_to_wire(locator.dtype),
+                dtype: locator.dtype.as_wire().to_string(),
             })
             .collect();
         bound_terms.sort_by(|a, b| a.bound_term.cmp(&b.bound_term));
@@ -759,7 +742,7 @@ impl PersistedEvaluateIndex {
         for entry in self.bound_terms {
             let bound_term =
                 BoundTermId::from_digest(parse_artifact_digest(&entry.bound_term, "bound_term")?);
-            let dtype = catgrad::prelude::Dtype::from_str(&entry.dtype).map_err(|err| {
+            let dtype = entry.dtype.parse::<hellas_rpc::Dtype>().map_err(|err| {
                 ExecutorError::ArtifactStore(format!(
                     "invalid dtype {:?} in evaluate artifact index: {err}",
                     entry.dtype
@@ -841,19 +824,9 @@ fn binding_digest(locator: &ModelLocator) -> Digest {
         &[
             locator.model_id.as_bytes(),
             locator.revision.as_bytes(),
-            dtype_to_wire(locator.dtype).as_bytes(),
+            locator.dtype.as_wire().as_bytes(),
         ],
     )
-}
-
-fn dtype_to_wire(dtype: catgrad::prelude::Dtype) -> String {
-    match dtype {
-        catgrad::prelude::Dtype::F32 => "f32".to_string(),
-        catgrad::prelude::Dtype::F16 => "f16".to_string(),
-        catgrad::prelude::Dtype::BF16 => "bf16".to_string(),
-        catgrad::prelude::Dtype::F8 => "f8".to_string(),
-        catgrad::prelude::Dtype::U32 => "u32".to_string(),
-    }
 }
 
 fn to_artifact_digest(digest: Digest) -> ArtifactDigest {
@@ -871,7 +844,7 @@ fn iroh_hash(digest: ArtifactDigest) -> iroh_blobs::Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catgrad::prelude::Dtype;
+    use hellas_rpc::Dtype;
 
     fn runner_public_key() -> hellas_rpc::PublicKey {
         hellas_rpc::ProducerSigningKey::from_secret_bytes([8; 32])

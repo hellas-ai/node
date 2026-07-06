@@ -1,7 +1,8 @@
 mod actor;
 mod handle;
 
-use catgrad::prelude::Dtype;
+#[cfg(feature = "evaluate")]
+use hellas_rpc::Dtype;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
@@ -21,7 +22,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::fetch_policy::FetchQuotaReservation;
 use crate::fetch_projection::{FetchProjector, FetchUsage};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
-use crate::worker::WorkerCompletion;
 pub use actor::{Executor, ExecutorSpawnConfig};
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
@@ -90,10 +90,8 @@ pub(crate) enum ExecutorMessage {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
-    /// Worker → actor: this execution finished (or failed). The actor records
-    /// terminal artifacts, signs the receipt, sends the final event, and
-    /// advances the pending queue.
-    WorkerFinished(WorkerCompletion),
+    #[cfg(feature = "evaluate")]
+    SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),
     FetchFinished(FetchCompletion),
     ListModels {
         reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
@@ -144,5 +142,6 @@ pub(crate) struct PendingFetch {
 #[derive(Clone)]
 pub struct ExecutorHandle {
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
+    #[cfg(feature = "evaluate")]
     pub(super) preferred_dtype: Dtype,
 }

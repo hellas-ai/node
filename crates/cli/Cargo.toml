@@ -10,10 +10,15 @@ documentation.workspace = true
 [features]
 default = []
 
-# Backend variants: each pulls in the optional `hellas-executor` dep plus the
-# RPC/transport server bits. Source code gates on the implicit `hellas-executor`
-# feature that cargo creates from the optional dep (no `dep:` prefix used).
-candle = ["hellas-executor/candle", "hellas-rpc/server"]
+node = ["dep:hellas-executor", "hellas-rpc/server"]
+evaluate = [
+    "node",
+    "hellas-executor/evaluate",
+    "hellas-rpc/node",
+    "dep:catgrad",
+    "dep:chatgrad",
+]
+candle = ["evaluate", "hellas-executor/candle"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
 chain = ["dep:hellas-chain", "dep:hellas-kernel", "hellas-chain/client"]
@@ -41,8 +46,8 @@ anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
 base64.workspace = true
-catgrad = { workspace = true, default-features = false }
-chatgrad.workspace = true
+catgrad = { workspace = true, default-features = false, optional = true }
+chatgrad = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-chain = { workspace = true, default-features = false, optional = true }
@@ -51,7 +56,6 @@ hellas-kernel = { workspace = true, default-features = false, features = [
     "domain",
 ], optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
-    "node",
     "all-protocols",
 ] }
 hellas-wire = { workspace = true, features = [

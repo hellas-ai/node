@@ -4,7 +4,7 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
     None => "unknown",
 };
 
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub mod error;
 
 #[cfg(feature = "node")]
@@ -23,18 +23,18 @@ pub mod spec;
 pub mod stream;
 pub use spec::ModelSpec;
 
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub mod policy;
 
 pub mod provenance;
 
 pub use protocol::{
     AssuranceStrategy, CanonicalizationId, CommitmentScheme, DagCborDecodeError,
-    DagCborEncodeError, DagCborEncoder, DeliveryOutput, DeliveryRequest, Digest, Evaluate,
+    DagCborEncodeError, DagCborEncoder, DeliveryOutput, DeliveryRequest, Digest, Dtype, Evaluate,
     EvaluateOutput, EvaluateRequest, EventCommitment, InputCommitment, InputEventBody,
     InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JsonBytes, OutputEventBody,
-    OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, ProducerId,
-    ProducerSigningKey, PublicKey, ReceiptBody, ReceiptCommitment, RequestCommitment,
+    OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, ParseDtypeError,
+    ProducerId, ProducerSigningKey, PublicKey, ReceiptBody, ReceiptCommitment, RequestCommitment,
     ResultCommitment, SchemeId, Signature, SignatureError, SignatureKind, SignedInputEvent,
     SignedOutputEvent, SignedReceipt, StreamId, StreamVerifyError, VerifyError, canonical_dag_cbor,
     decode_dag_cbor, hash_tuple, input_genesis, output_genesis, verify_delivery,
@@ -54,22 +54,22 @@ pub mod pb;
 /// Service marker and handler modules.
 pub use crate::pb::services;
 
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub use error::ExecutorError;
 
 #[cfg(feature = "node")]
 pub use model::ModelAssetsError;
 
 /// Default bound on the in-memory execution queue carried by `hellas_executor::Executor`.
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub const DEFAULT_EXECUTION_QUEUE_CAPACITY: usize = 8;
 
 /// Default maximum number of Fetch provider streams running at once.
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
 
 /// Default bound on Fetch executions waiting behind active provider streams.
-#[cfg(feature = "node")]
+#[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
 
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();

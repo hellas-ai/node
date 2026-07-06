@@ -7,14 +7,14 @@ use crate::execution::{
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use catgrad::prelude::Dtype;
 use chatgrad::PreparedPrompt;
 use chatgrad::types::Message;
 use chatgrad::types::openai;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
+use hellas_rpc::Dtype;
 use hellas_rpc::model::ModelAssets;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_wire_adaptors::{
@@ -37,9 +37,9 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 pub(super) struct GatewayState {
     pub(super) node_id: Option<EndpointId>,
     pub(super) node_addrs: Vec<SocketAddr>,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub(super) local: bool,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub(super) verify_local: bool,
     pub(super) verify_node_id: Option<EndpointId>,
     pub(super) retries: usize,
@@ -88,7 +88,7 @@ impl GatewayState {
             ResponsesBackend::Fetch => None,
         };
 
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
             ExecutionRuntime::local(
                 Executor::spawn_with_producer_key(
@@ -104,7 +104,7 @@ impl GatewayState {
         } else {
             ExecutionRuntime::remote(options.secret_key.clone()).await?
         };
-        #[cfg(not(feature = "hellas-executor"))]
+        #[cfg(not(feature = "evaluate"))]
         let runtime = ExecutionRuntime::remote(options.secret_key.clone()).await?;
 
         let responses_fetch = match options.responses_backend {
@@ -139,9 +139,9 @@ impl GatewayState {
         Ok(Self {
             node_id: options.node_id,
             node_addrs: options.node_addrs.clone(),
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             local: options.local,
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             verify_local: options.verify_local,
             verify_node_id: options.verify,
             retries: options.retries,
@@ -165,7 +165,7 @@ impl GatewayState {
     }
 
     fn execution_route(&self) -> ExecutionRoute {
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         if self.local {
             return ExecutionRoute::Local;
         }
@@ -175,7 +175,7 @@ impl GatewayState {
     fn execution_strategy(&self) -> ExecutionStrategy {
         let primary = self.execution_route();
 
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         if self.verify_local {
             return ExecutionStrategy::Verify {
                 primary,
@@ -461,7 +461,7 @@ impl IntoResponse for HttpError {
     }
 }
 
-#[cfg(all(test, feature = "hellas-executor"))]
+#[cfg(all(test, feature = "evaluate"))]
 mod tests {
     use super::*;
     use std::str::FromStr;

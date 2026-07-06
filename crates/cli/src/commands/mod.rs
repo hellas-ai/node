@@ -8,13 +8,16 @@ pub mod chain;
 pub(crate) mod codex_auth;
 pub(crate) mod discovery;
 pub mod fetch;
+#[cfg(feature = "evaluate")]
 pub mod gateway;
 pub mod identity;
+#[cfg(feature = "evaluate")]
 pub mod llm;
 pub mod monitor;
+#[cfg(feature = "node")]
 pub(crate) mod openai_responses_stream;
 pub mod rpc;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 pub mod serve;
 
 pub(crate) fn http_client(request_timeout: Duration) -> reqwest::Client {

@@ -1,8 +1,12 @@
 #[macro_use]
 extern crate tracing;
 
+#[cfg(feature = "evaluate")]
 mod artifacts;
+#[cfg(feature = "evaluate")]
 mod backend;
+#[cfg(feature = "evaluate")]
+mod evaluate;
 mod executor;
 mod fetch;
 mod fetch_policy;
@@ -10,10 +14,11 @@ mod fetch_projection;
 mod fetch_provider;
 mod fetch_registry;
 mod metrics;
+mod scheme;
 mod state;
+#[cfg(feature = "evaluate")]
 mod worker;
 
-pub use artifacts::ArtifactStoreConfig;
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch_policy::{
     CallerAccess, FetchAccessError, FetchAccessPolicy, FetchAdmission, FetchQuotaReservation,
@@ -34,5 +39,7 @@ pub use hellas_rpc::services::evaluate::EvaluateServer;
 pub use hellas_rpc::services::execute::ExecuteServer;
 pub use hellas_rpc::services::fetch::FetchServer;
 pub use metrics::ExecutorMetrics;
+pub use state::ArtifactStoreConfig;
 
+#[cfg(feature = "evaluate")]
 pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;

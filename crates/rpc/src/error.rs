@@ -1,8 +1,10 @@
+#[cfg(feature = "node")]
 use catgrad_llm::LLMError;
 use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
 
 use crate::TokenBytesError;
+#[cfg(feature = "node")]
 use crate::model::ModelAssetsError;
 
 /// Error returned when the backend fails to initialize.
@@ -39,8 +41,10 @@ pub enum ExecutorError {
     InvalidQuoteRequest(String),
     #[error(transparent)]
     BackendInit(#[from] BackendInitError),
+    #[cfg(feature = "node")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
+    #[cfg(feature = "node")]
     #[error("LLM error: {0}")]
     Llm(#[from] LLMError),
     #[error("weights not ready for {0}")]
@@ -66,13 +70,14 @@ pub enum ExecutorError {
         "program was built for dtype {request:?} but this executor only supports {supported:?}; rebuild the program at one of the supported dtypes or run an executor with --dtype {request:?} in its supported set"
     )]
     DtypeNotSupported {
-        request: catgrad::prelude::Dtype,
-        supported: Vec<catgrad::prelude::Dtype>,
+        request: crate::Dtype,
+        supported: Vec<crate::Dtype>,
     },
     #[error(transparent)]
     State(#[from] StateError),
 }
 
+#[cfg(feature = "node")]
 fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
     match err {
         ModelAssetsError::Spec(_)
@@ -95,6 +100,7 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
         ExecutorError::DtypeNotSupported { .. } => WireCode::FailedPrecondition,
+        #[cfg(feature = "node")]
         ExecutorError::ModelAssets(model_err) => model_assets_wire_code(model_err),
         ExecutorError::WeightsNotReady(_) | ExecutorError::State(StateError::QuoteExpired(_)) => {
             WireCode::FailedPrecondition
@@ -103,14 +109,16 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
             WireCode::NotFound
         }
+        #[cfg(feature = "node")]
+        ExecutorError::Llm(_) => WireCode::Internal,
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
-        | ExecutorError::Llm(_)
         | ExecutorError::WeightsError(_)
         | ExecutorError::ArtifactStore(_) => WireCode::Internal,
     }
 }
 
+#[cfg(feature = "node")]
 impl From<ModelAssetsError> for WireStatus {
     fn from(err: ModelAssetsError) -> Self {
         WireStatus::new(model_assets_wire_code(&err), err.to_string())

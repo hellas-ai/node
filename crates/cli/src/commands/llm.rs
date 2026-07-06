@@ -2,9 +2,9 @@ use crate::commands::CliResult;
 use crate::execution::{
     ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
 };
-use catgrad::prelude::Dtype;
 use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
+use hellas_rpc::Dtype;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use iroh::{EndpointId, SecretKey};
@@ -20,9 +20,9 @@ pub struct ExecuteOptions {
     pub prompt: String,
     pub max_seq: u32,
     pub retries: usize,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub local: bool,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub verify_local: bool,
     pub producer_key_path: Option<PathBuf>,
     pub raw: bool,
@@ -89,7 +89,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         // courtesy request below asks the provider for this dtype.
         let assets = Arc::new(ModelAssets::load(&options.model, dtype)?);
 
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
@@ -104,10 +104,10 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         } else {
             ExecutionRuntime::remote(secret_key.clone()).await?
         };
-        #[cfg(not(feature = "hellas-executor"))]
+        #[cfg(not(feature = "evaluate"))]
         let runtime = ExecutionRuntime::remote(secret_key.clone()).await?;
 
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         let strategy = if options.verify_local {
             if idx == 0 {
                 info!("executing remotely and verifying against local catgrad backend");
@@ -132,7 +132,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                 options.retries,
             ))
         };
-        #[cfg(not(feature = "hellas-executor"))]
+        #[cfg(not(feature = "evaluate"))]
         let strategy = ExecutionStrategy::Run(ExecutionRoute::remote(
             options.node_id,
             options.node_addrs.clone(),

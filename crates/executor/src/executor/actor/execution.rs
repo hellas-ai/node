@@ -7,7 +7,6 @@ use crate::fetch_policy::{FetchAccessError, FetchRoute};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
 use crate::state::{QuoteKind, new_execution_id};
-use crate::worker::{EnqueueError, ExecuteJob, WorkerCompletion, WorkerCompletionResult};
 use futures_util::StreamExt;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::error::StateError;
@@ -18,15 +17,10 @@ use hellas_rpc::pb::execute::{
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::{VerifiedRunTicket, verify_run_ticket};
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{
-    Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey, SignedReceipt,
-    canonical_dag_cbor,
-};
-use hellas_rpc::{Evaluate, EvaluateOutput};
+use hellas_rpc::{Digest, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use super::Executor;
 
@@ -54,7 +48,6 @@ impl Executor {
         {
             return Ok(outcome);
         }
-        let stream_batch_size = 1;
         self.store.prune_expired_quotes(Instant::now());
         let quote = match self.store.get_quote(&request_commitment, Instant::now()) {
             Ok(quote) => quote.clone(),
@@ -73,69 +66,22 @@ impl Executor {
         };
         ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
         match quote.kind {
-            QuoteKind::Evaluate {
-                evaluate_request,
-                locator,
-                invocation,
-            } => {
-                let provenance = ExecutionProvenance {
-                    commitment_id: *quote.request_commitment.as_bytes(),
-                };
-
-                let stat_prompt = invocation.input_ids.len() as u64;
-                let stat_cached_output = 0;
-
-                let model_id = quote.model_id.clone();
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Scheme(job) => {
                 let execution_id = new_execution_id();
-                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
-                let job = ExecuteJob {
-                    execution_id: execution_id.clone(),
-                    model_id: model_id.clone(),
-                    evaluate_request,
-                    locator,
-                    invocation,
-                    stream_batch_size,
-                    accepted_at: Instant::now(),
-                    cancel: CancellationToken::new(),
-                    sender,
-                };
-
-                let queued = match self.try_start_execution(job) {
-                    Ok(()) => false,
-                    Err(StartExecutionError::Busy(job)) => {
-                        if self.pending_executions.len() >= self.queue_capacity {
-                            return Err(ExecutorError::QueueFull {
-                                capacity: self.queue_capacity,
-                            });
-                        }
-                        self.pending_executions.push_back(*job);
-                        true
-                    }
-                    Err(StartExecutionError::Closed) => return Err(ExecutorError::ChannelClosed),
-                };
-
-                // Counters update after the queue accepts the job — no rollback path.
-                self.metrics.record_execution_started(
-                    &model_id,
-                    stat_prompt,
-                    /* cached_prompt= */ 0,
-                    stat_cached_output,
-                    /* prefill= */ stat_prompt,
-                );
+                let engine = self
+                    .evaluate
+                    .as_mut()
+                    .ok_or_else(super::evaluate_disabled)?;
+                let outcome = engine.start(
+                    job,
+                    crate::scheme::SchemeRunContext {
+                        execution_id,
+                        request_commitment: request_commitment_id,
+                    },
+                )?;
                 let _ = self.store.remove_quote(&request_commitment);
-
-                info!(
-                    %execution_id,
-                    request_commitment = %format_request_commitment(&request_commitment),
-                    queued,
-                    queue_len = self.pending_executions.len(),
-                    "accepted evaluate execution"
-                );
-
-                Ok(ExecuteOutcome {
-                    provenance,
-                    events: receiver,
-                })
+                Ok(outcome)
             }
             QuoteKind::Fetch { request } => {
                 let provenance = ExecutionProvenance {
@@ -301,14 +247,6 @@ impl Executor {
         Ok(Some(outcome))
     }
 
-    fn try_start_execution(&mut self, job: ExecuteJob) -> Result<(), StartExecutionError> {
-        match self.worker.try_enqueue(job) {
-            Ok(()) => Ok(()),
-            Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
-            Err(EnqueueError::Stopped(_job)) => Err(StartExecutionError::Closed),
-        }
-    }
-
     fn start_fetch_execution(&mut self, pending: PendingFetch) {
         self.active_fetches = self.active_fetches.saturating_add(1);
         spawn_fetch_provider(self.tx.clone(), Arc::clone(&self.producer_key), pending);
@@ -317,88 +255,6 @@ impl Executor {
     fn finish_fetch_slot(&mut self) {
         self.active_fetches = self.active_fetches.saturating_sub(1);
         self.dispatch_next_fetch();
-    }
-
-    pub(super) async fn handle_worker_finished(&mut self, completion: WorkerCompletion) {
-        let WorkerCompletion {
-            execution_id,
-            model_id,
-            evaluate_request,
-            invocation,
-            sender,
-            result,
-        } = completion;
-
-        let generated = result.position();
-        let termination = match result {
-            WorkerCompletionResult::Completed {
-                stop_reason,
-                output_tokens,
-            } => {
-                match self
-                    .completed_evaluate_termination(
-                        &evaluate_request,
-                        &invocation,
-                        stop_reason,
-                        output_tokens,
-                    )
-                    .await
-                {
-                    Ok(termination) => termination,
-                    Err(err) => {
-                        let msg = format!("{err:#}");
-                        warn!(
-                            "execute worker job {execution_id} failed while recording/signing receipt: {msg}"
-                        );
-                        crate::state::Termination::Failed {
-                            position: generated,
-                            error: msg,
-                        }
-                    }
-                }
-            }
-            WorkerCompletionResult::Failed { position, error } => {
-                crate::state::Termination::Failed { position, error }
-            }
-        };
-
-        if termination.is_completed() {
-            self.metrics
-                .record_execution_completed(&model_id, generated);
-        } else {
-            self.metrics.record_execution_failed(&model_id, generated);
-        }
-
-        let _ = sender.send(Ok(termination.into_pb())).await;
-        self.dispatch_next_execution();
-    }
-
-    async fn completed_evaluate_termination(
-        &mut self,
-        evaluate_request: &hellas_rpc::EvaluateRequest,
-        invocation: &crate::state::Invocation,
-        stop_reason: crate::state::StopReason,
-        output_tokens: Vec<u32>,
-    ) -> Result<crate::state::Termination, ExecutorError> {
-        let text_artifact = self
-            .artifacts
-            .record_completed_text(evaluate_request, invocation, &output_tokens)
-            .await?;
-        let evaluate_output = EvaluateOutput { text_artifact };
-        let receipt =
-            SignedReceipt::sign::<Evaluate>(evaluate_request, &evaluate_output, &self.producer_key)
-                .map_err(|err| {
-                    ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
-                })?;
-        let receipt_dag_cbor = canonical_dag_cbor(&receipt).map_err(|err| {
-            ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
-        })?;
-
-        Ok(crate::state::Termination::Completed {
-            stop_reason,
-            output_tokens,
-            receipt_dag_cbor,
-        })
     }
 
     pub(super) async fn handle_fetch_finished(&mut self, completion: FetchCompletion) {
@@ -490,31 +346,6 @@ impl Executor {
             "completed fetch execution"
         );
         self.finish_fetch_slot();
-    }
-
-    /// Pop pending jobs and dispatch the first one whose consumer is still
-    /// listening. Stale entries (consumer dropped while queued) are discarded
-    /// silently — the consumer already lost interest.
-    pub(super) fn dispatch_next_execution(&mut self) {
-        while let Some(job) = self.pending_executions.pop_front() {
-            if job.sender.is_closed() {
-                debug!(
-                    execution_id = %job.execution_id,
-                    "dropping queued execution: consumer disconnected before dispatch"
-                );
-                continue;
-            }
-            match self.try_start_execution(job) {
-                Ok(()) => return,
-                Err(StartExecutionError::Busy(job)) => {
-                    self.pending_executions.push_front(*job);
-                    return;
-                }
-                Err(StartExecutionError::Closed) => {
-                    warn!("failed to start queued execution: executor channel closed");
-                }
-            }
-        }
     }
 
     fn dispatch_next_fetch(&mut self) {
@@ -870,11 +701,6 @@ fn now_ms() -> u64 {
     u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
-enum StartExecutionError {
-    Busy(Box<ExecuteJob>),
-    Closed,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,8 +711,8 @@ mod tests {
         FetchProviderStream, FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
         FetchUsage, MockFetchProvider, ProjectedFetch,
     };
-    use catgrad::prelude::Dtype;
     use futures_util::stream;
+    use hellas_rpc::Dtype;
     use hellas_rpc::ExecutorError;
     use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;

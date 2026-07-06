@@ -24,38 +24,51 @@
 //! an Execute service transport for the selected peer.
 
 use async_stream::try_stream;
+#[cfg(feature = "evaluate")]
 use base64::Engine;
+#[cfg(feature = "evaluate")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-#[cfg(feature = "hellas-executor")]
-use catgrad::prelude::Dtype;
+#[cfg(feature = "evaluate")]
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
-use futures::stream::{BoxStream, Stream};
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
+use futures::stream::BoxStream;
+use futures::stream::Stream;
+#[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, ExecutorHandle};
+#[cfg(feature = "evaluate")]
+use hellas_rpc::Dtype;
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::{
     FetchInput, FetchProtocolError, output_canonicalization, verify_input_events,
     verify_output_events,
 };
+#[cfg(feature = "evaluate")]
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
+#[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
 use hellas_rpc::pb::execute::{
     self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
 };
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::sign_run_ticket;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
+#[cfg(feature = "evaluate")]
 use hellas_rpc::{
-    DagCborDecodeError, Digest, EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey,
-    SchemeId, SignedReceipt as CoreSignedReceipt, StreamId, VerifyError, decode_dag_cbor,
-    output_genesis, verify_receipt,
+    DagCborDecodeError, Digest, SignedReceipt as CoreSignedReceipt, VerifyError, decode_dag_cbor,
+    verify_receipt,
+};
+use hellas_rpc::{
+    EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey, SchemeId, StreamId,
+    output_genesis,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
@@ -69,8 +82,9 @@ use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 use tokio_stream::wrappers::ReceiverStream;
+#[cfg(feature = "evaluate")]
 use tracing::instrument;
 
 use crate::commands::discovery;
@@ -93,15 +107,19 @@ pub enum ExecutionError {
         #[source]
         source: WireStatus,
     },
+    #[cfg(feature = "evaluate")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
+    #[cfg(feature = "evaluate")]
     #[error("finished event missing receipt envelope")]
     MissingReceiptEnvelope,
+    #[cfg(feature = "evaluate")]
     #[error("failed to decode receipt envelope dag-cbor: {source}")]
     ReceiptDecode {
         #[source]
         source: DagCborDecodeError,
     },
+    #[cfg(feature = "evaluate")]
     #[error("receipt signature verification failed: {source}")]
     ReceiptSignature {
         #[source]
@@ -111,6 +129,7 @@ pub enum ExecutionError {
     UnknownFinishStatus { value: i32 },
     #[error("wire finish status is unspecified")]
     UnspecifiedFinishStatus,
+    #[cfg(feature = "evaluate")]
     #[error("evaluate execution returned a fetch receipt")]
     EvaluateReceiptExpected,
     #[error("fetch stream envelope decode failed: {source}")]
@@ -164,7 +183,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionRoute {
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     Local,
     RemoteDirect(RemoteNodeTarget),
     RemoteDiscovery {
@@ -220,6 +239,7 @@ impl From<EndpointId> for RemoteNodeTarget {
     }
 }
 
+#[cfg(feature = "evaluate")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStrategy {
     Run(ExecutionRoute),
@@ -243,7 +263,7 @@ pub struct RemoteRpc {
 
 #[derive(Clone, Default)]
 pub struct ExecutionRuntime {
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     local_executor: Option<ExecutorHandle>,
     /// `Some` iff remote dialing is configured. `None` means a local-
     /// only runtime; any `*Direct::*` path on such a runtime returns
@@ -255,6 +275,7 @@ pub struct ExecutionRuntime {
 // Stream item types
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "evaluate")]
 /// One observation from a streaming execution. Stream protocol: zero or
 /// more `Chunk` events, terminated by exactly one `Done`.
 #[derive(Debug, Clone)]
@@ -268,6 +289,7 @@ pub enum ExecutionEvent {
     Done(Outcome),
 }
 
+#[cfg(feature = "evaluate")]
 /// Terminal verdict of an execution.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -283,6 +305,7 @@ pub enum Outcome {
     },
 }
 
+#[cfg(feature = "evaluate")]
 /// Verified signed receipt envelope bytes as delivered by the executor.
 ///
 /// The gateway exposes these bytes directly as `hellas.receipt`. Evaluate
@@ -295,6 +318,7 @@ pub struct ReceiptArtifact {
     evaluate_text_artifact: Option<Digest>,
 }
 
+#[cfg(feature = "evaluate")]
 impl ReceiptArtifact {
     pub fn from_pb(envelope: Option<pb::ReceiptEnvelope>) -> ExecutionResult<Self> {
         let (dag_cbor, core) = decode_receipt_envelope(envelope)?;
@@ -322,6 +346,7 @@ impl ReceiptArtifact {
     }
 }
 
+#[cfg(feature = "evaluate")]
 impl Outcome {
     /// Cumulative token count at the moment the run terminated.
     /// Authoritative for usage frames on both Completed and Failed.
@@ -519,7 +544,7 @@ impl ExecutionRuntime {
     /// Local-only runtime: dispatches all calls in-process via the
     /// executor handle. `*Direct` / `*Discovery` routes are not
     /// reachable on this runtime — use [`Self::remote`] for those.
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub fn local(local_executor: ExecutorHandle) -> Self {
         Self {
             local_executor: Some(local_executor),
@@ -552,7 +577,7 @@ impl ExecutionRuntime {
         Ok(self)
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub fn spawn_default_local_with_producer_key(
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
@@ -568,7 +593,7 @@ impl ExecutionRuntime {
         Ok(Self::local(local_executor))
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     fn require_local_executor(&self) -> ExecutionResult<ExecutorHandle> {
         self.local_executor.clone().ok_or_else(|| {
             ExecutionError::protocol(
@@ -606,6 +631,7 @@ impl ExecutionRuntime {
 // ExecutionRequest — public entry point
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "evaluate")]
 pub struct ExecutionRequest {
     runtime: ExecutionRuntime,
     quote_req: QuotePreparedTextRequest,
@@ -613,6 +639,7 @@ pub struct ExecutionRequest {
     runner_key: Arc<ProducerSigningKey>,
 }
 
+#[cfg(feature = "evaluate")]
 impl ExecutionRequest {
     pub fn new(
         runtime: ExecutionRuntime,
@@ -637,9 +664,9 @@ impl ExecutionRequest {
 
     /// True if any leg of this strategy talks to a remote executor.
     pub fn uses_remote_transport(&self) -> bool {
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
-        #[cfg(not(feature = "hellas-executor"))]
+        #[cfg(not(feature = "evaluate"))]
         let is_remote = |_r: &ExecutionRoute| true;
         match &self.strategy {
             ExecutionStrategy::Run(route) => is_remote(route),
@@ -714,7 +741,7 @@ pub fn fetch_execution_stream(
     try_stream! {
         let input_commitment = verified_fetch_input(&request)?.input_commitment;
         match route {
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             ExecutionRoute::Local => {
                 let handle = runtime.require_local_executor()?;
                 let outcome = handle
@@ -791,11 +818,13 @@ pub fn fetch_execution_stream(
 // PreparedExecution — primary + optional shadow for Verify
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "evaluate")]
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
 }
 
+#[cfg(feature = "evaluate")]
 impl PreparedExecution {
     /// See [`PreparedRoute::provenance`] — this delegates to the primary
     /// route. Shadow's provenance is intentionally not exposed (verify is
@@ -841,6 +870,7 @@ impl PreparedExecution {
 
 /// Run the shadow stream to completion (discarding its chunks), extract
 /// its terminal outcome, and return the reconciled outcome.
+#[cfg(feature = "evaluate")]
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { receipt, .. } => {
@@ -886,6 +916,7 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResu
 }
 
 /// Consume a stream to its terminal `Done`, discarding chunks.
+#[cfg(feature = "evaluate")]
 async fn drain_to_outcome(
     stream: impl Stream<Item = ExecutionResult<ExecutionEvent>>,
 ) -> ExecutionResult<Outcome> {
@@ -904,9 +935,10 @@ async fn drain_to_outcome(
 // PreparedRoute
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "evaluate")]
 #[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     Local {
         handle: ExecutorHandle,
         request_commitment: Vec<u8>,
@@ -921,10 +953,11 @@ enum PreparedRoute {
     },
 }
 
+#[cfg(feature = "evaluate")]
 impl PreparedRoute {
     fn provenance(&self) -> Option<&ExecutionProvenance> {
         match self {
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             PreparedRoute::Local { provenance, .. } => Some(provenance),
             PreparedRoute::RemoteDirect { provenance, .. } => Some(provenance),
         }
@@ -938,7 +971,7 @@ impl PreparedRoute {
         runner_key: Arc<ProducerSigningKey>,
     ) -> ExecutionResult<Self> {
         match route {
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             ExecutionRoute::Local => {
                 let handle = runtime.require_local_executor()?;
                 handle
@@ -1024,7 +1057,7 @@ impl PreparedRoute {
 
     fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
         match self {
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "evaluate")]
             PreparedRoute::Local {
                 handle,
                 request_commitment,
@@ -1048,6 +1081,7 @@ impl PreparedRoute {
 /// Drain `ServiceRegistry::discover::<Courtesy>()` until we get a quote,
 /// returning the responding peer and the resolved ticket commitment +
 /// provenance.
+#[cfg(feature = "evaluate")]
 async fn discover_and_quote(
     registry: &ServiceRegistry,
     quote_req: &QuotePreparedTextRequest,
@@ -1244,7 +1278,7 @@ fn signed_run_ticket_request(
 // Local execute streams — talk directly to `ExecutorHandle`
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 fn local_execute_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
@@ -1280,7 +1314,7 @@ fn local_execute_stream(
     }
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 fn local_execute_fetch_stream(
     handle: ExecutorHandle,
     request_commitment: Vec<u8>,
@@ -1325,6 +1359,7 @@ fn local_execute_fetch_stream(
 // Remote execute streams — dial Execute service via IrohTransport
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "evaluate")]
 fn remote_execute_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
@@ -1432,6 +1467,7 @@ fn verify_fetch_stream_event(
     }
 }
 
+#[cfg(feature = "evaluate")]
 fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
     let Some(event) = event.kind else {
         return Err(ExecutionError::protocol("wire event with no body"));
@@ -1487,6 +1523,7 @@ fn convert_fetch_wire_event(
     }
 }
 
+#[cfg(feature = "evaluate")]
 fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
     let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
     if receipt.evaluate_text_artifact().is_none() {
@@ -1553,6 +1590,7 @@ fn verified_fetch_input(request: &PbFetchRequest) -> ExecutionResult<FetchInput>
     verify_input_events(&input).map_err(|source| ExecutionError::FetchTranscript { source })
 }
 
+#[cfg(feature = "evaluate")]
 fn decode_receipt_envelope(
     envelope: Option<pb::ReceiptEnvelope>,
 ) -> ExecutionResult<(Vec<u8>, CoreSignedReceipt)> {
@@ -1562,7 +1600,7 @@ fn decode_receipt_envelope(
     Ok((envelope.dag_cbor, core))
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "evaluate")]
 fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {

@@ -11,7 +11,7 @@ use tokenizers::Error as TokenizerError;
 
 use crate::{TokenBytesError, spec::ModelSpecError};
 
-pub use assets::{ModelAssets, TextOutputDecoder};
+pub use assets::{ModelAssets, TextOutputDecoder, to_catgrad_dtype};
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
 
