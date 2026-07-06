@@ -1,7 +1,7 @@
 use crate::{
     Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier, FinalizedBlock,
-    FinalizedBlockQuery, IngestError, LightClient as _, QueryError, client::RemoteLightClient,
-    config::Config, spawn_follower_indexer,
+    FinalizedBlockQuery, IngestError, IngestOutcome, LightClient as _, QueryError,
+    client::RemoteLightClient, config::Config, spawn_follower_indexer,
 };
 use commonware_codec::DecodeExt;
 use commonware_consensus::Heightable;
@@ -10,7 +10,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use futures_util::StreamExt as _;
 use hellas_kernel::domain::{Digest, PublicKey};
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -79,6 +79,45 @@ pub struct FollowerOptions {
     pub rpc: String,
     pub storage_dir: Option<PathBuf>,
     pub partition_prefix: String,
+    pub status: FollowerStatusSink,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowerStatus {
+    ActivityStreamSubscribed,
+    ActivityFinalization { payload: Digest },
+    BlockIngested { height: u64, outcome: IngestOutcome },
+}
+
+#[derive(Clone, Default)]
+pub struct FollowerStatusSink {
+    emit: Option<Arc<dyn Fn(FollowerStatus) + Send + Sync>>,
+}
+
+impl FollowerStatusSink {
+    pub fn quiet() -> Self {
+        Self::default()
+    }
+
+    pub fn callback(emit: impl Fn(FollowerStatus) + Send + Sync + 'static) -> Self {
+        Self {
+            emit: Some(Arc::new(emit)),
+        }
+    }
+
+    fn emit(&self, status: FollowerStatus) {
+        if let Some(emit) = &self.emit {
+            emit(status);
+        }
+    }
+}
+
+impl fmt::Debug for FollowerStatusSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FollowerStatusSink")
+            .field("enabled", &self.emit.is_some())
+            .finish()
+    }
 }
 
 pub fn run(options: FollowerOptions) -> Result<(), FollowerError> {
@@ -118,16 +157,17 @@ async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(),
         application.genesis_block(),
     )
     .await?;
-    follow_remote(indexer, options.rpc, consensus_info).await
+    follow_remote(indexer, options.rpc, consensus_info, options.status).await
 }
 
 async fn follow_remote(
     indexer: ChainIndexer,
     rpc: String,
     consensus_info: ConsensusInfo,
+    status: FollowerStatusSink,
 ) -> Result<(), FollowerError> {
     loop {
-        match follow_connection(&indexer, &rpc, &consensus_info).await {
+        match follow_connection(&indexer, &rpc, &consensus_info, &status).await {
             Ok(()) => unreachable!("follow_connection only returns when the stream disconnects"),
             Err(err) if err.retryable() => {
                 warn!(error = %err, "follower upstream disconnected");
@@ -142,6 +182,7 @@ async fn follow_connection(
     indexer: &ChainIndexer,
     rpc: &str,
     consensus_info: &ConsensusInfo,
+    status: &FollowerStatusSink,
 ) -> Result<(), FollowerError> {
     let sync_client = RemoteLightClient::connect(rpc.to_string())
         .await?
@@ -153,12 +194,12 @@ async fn follow_connection(
         .subscribe_activity(vec![ActivityEventKind::Finalization])
         .await?;
     info!("follower activity stream subscribed");
-    println!("activity stream subscribed");
+    status.emit(FollowerStatus::ActivityStreamSubscribed);
 
     let mut needs_sync = true;
     loop {
         if needs_sync {
-            needs_sync = catch_up_batch(indexer, &sync_client, CATCH_UP_BATCH).await?;
+            needs_sync = catch_up_batch(indexer, &sync_client, CATCH_UP_BATCH, status).await?;
         }
         let delay = if needs_sync {
             Duration::ZERO
@@ -172,7 +213,7 @@ async fn follow_connection(
                     .map_err(|err| FollowerError::ActivityStream(err.to_string()))?;
                 match finalized_payload(event) {
                     Ok(Some(payload)) => {
-                        println!("activity finalization {}", hex::encode(payload));
+                        status.emit(FollowerStatus::ActivityFinalization { payload });
                         needs_sync = true;
                     }
                     Ok(None) => {}
@@ -192,6 +233,7 @@ async fn catch_up_batch(
     indexer: &ChainIndexer,
     client: &RemoteLightClient,
     max_blocks: u64,
+    status: &FollowerStatusSink,
 ) -> Result<bool, FollowerError> {
     let mut next_height = indexer
         .get_latest_block()
@@ -218,7 +260,7 @@ async fn catch_up_batch(
                 remote_latest: remote_latest.height,
             });
         };
-        ingest_finalized_block(indexer, finalized, next_height).await?;
+        ingest_finalized_block(indexer, finalized, next_height, status).await?;
         next_height = next_height.saturating_add(1);
     }
     Ok(batch_end < target_height)
@@ -228,6 +270,7 @@ async fn ingest_finalized_block(
     indexer: &ChainIndexer,
     finalized: FinalizedBlock,
     requested: u64,
+    status: &FollowerStatusSink,
 ) -> Result<(), FollowerError> {
     let block = ChainIndexer::decode_block(&finalized.block)?;
     let block_height = block.height().get();
@@ -254,7 +297,10 @@ async fn ingest_finalized_block(
 
     let finalization = ChainIndexer::decode_finalization(&finalized.snapshot.finalization)?;
     let outcome = indexer.ingest_finalized(block, finalization).await?;
-    println!("height {block_height} {outcome:?}");
+    status.emit(FollowerStatus::BlockIngested {
+        height: block_height,
+        outcome,
+    });
     Ok(())
 }
 

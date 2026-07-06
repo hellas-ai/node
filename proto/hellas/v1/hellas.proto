@@ -70,9 +70,10 @@ message OutputEventEnvelope {
 }
 
 // Wire protocol: zero or more WorkChunk events, terminated by exactly one
-// WorkFinished or WorkFailed, after which the stream ends. Streaming chunks
-// are transport-only; the terminal output is the object committed to by the
-// receipt.
+// WorkFinished or WorkFailed, after which the stream ends. WorkChunk events
+// carry signed output events as they become available. WorkFinished.output is
+// scheme-specific: Evaluate text uses it for the complete token-id stream;
+// Fetch leaves it empty and commits terminal data in signed output_events.
 message WorkEvent {
   oneof kind {
     WorkChunk chunk = 1;
@@ -89,8 +90,8 @@ message WorkChunk {
 }
 
 message WorkFinished {
-  // Complete output object. Evaluate text uses little-endian u32 token IDs.
-  // Fetch uses exact UTF-8 JSON bytes.
+  // Complete output object when the scheme uses an in-band terminal payload.
+  // Evaluate text uses little-endian u32 token IDs. Fetch leaves this empty.
   bytes output = 1;
   ReceiptEnvelope receipt = 2;
   FinishStatus status = 3;

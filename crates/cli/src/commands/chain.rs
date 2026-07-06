@@ -246,12 +246,28 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
                     rpc,
                     storage_dir,
                     partition_prefix,
+                    status: follower_status_sink(),
                 })
             })
             .await??
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "indexer")]
+fn follower_status_sink() -> hellas_chain::follower::FollowerStatusSink {
+    hellas_chain::follower::FollowerStatusSink::callback(|status| match status {
+        hellas_chain::follower::FollowerStatus::ActivityStreamSubscribed => {
+            println!("activity stream subscribed");
+        }
+        hellas_chain::follower::FollowerStatus::ActivityFinalization { payload } => {
+            println!("activity finalization {}", hex::encode(payload));
+        }
+        hellas_chain::follower::FollowerStatus::BlockIngested { height, outcome } => {
+            println!("height {height} {outcome:?}");
+        }
+    })
 }
 
 #[cfg(feature = "validator")]
