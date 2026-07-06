@@ -171,7 +171,7 @@ impl CollectedOutput {
         for tool in self.tools {
             let arguments = tool.arguments.unwrap_or_else(|| {
                 serde_json::from_str(&tool.arguments_delta)
-                    .unwrap_or_else(|_| JsonValue::String(tool.arguments_delta))
+                    .unwrap_or(JsonValue::String(tool.arguments_delta))
             });
             indexed.push((
                 tool.index,

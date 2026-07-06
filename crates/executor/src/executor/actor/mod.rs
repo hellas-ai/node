@@ -1,20 +1,22 @@
 mod execution;
 mod quote;
 
-use crate::artifacts::{ArtifactStoreConfig, EvaluateArtifactStore};
+#[cfg(feature = "evaluate")]
+use crate::artifacts::EvaluateArtifactStore;
+#[cfg(feature = "evaluate")]
 use crate::backend;
+#[cfg(feature = "evaluate")]
+use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
 use crate::fetch_policy::{FetchAccessPolicy, FetchQuotaStoreBackend};
 use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
-use crate::state::{ExecutorState, LocalModelStatus, ModelLocator};
-use crate::worker::{ExecuteJob, ExecuteWorker};
-use catgrad::prelude::Dtype;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::ProducerSigningKey;
+use crate::scheme::SchemeEngine;
+use crate::state::{ArtifactStoreConfig, ExecutorState};
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
-use std::collections::{HashMap, VecDeque};
+use hellas_rpc::{Dtype, ExecutorError, ProducerSigningKey};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -24,12 +26,7 @@ pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
     pub(super) store: ExecutorState,
-    pub(super) artifacts: EvaluateArtifactStore,
-    pub(super) pending_executions: VecDeque<ExecuteJob>,
-    pub(super) queue_capacity: usize,
-    pub(super) models: HashMap<ModelLocator, LocalModelStatus>,
-    pub(super) worker: ExecuteWorker,
-    pub(super) execute_policy: ExecutePolicy,
+    pub(super) evaluate: Option<Box<dyn SchemeEngine>>,
     pub(super) metrics: Arc<ExecutorMetrics>,
     pub(super) producer_key: Arc<ProducerSigningKey>,
     pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
@@ -39,9 +36,6 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
-    /// Dtypes this executor will accept. The first entry is the *preferred*
-    /// dtype, used whenever the executor itself constructs a program.
-    pub(super) supported_dtypes: Vec<Dtype>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -58,8 +52,11 @@ pub struct ExecutorSpawnConfig {
 }
 
 struct ExecutorRuntimeConfig {
+    #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
     execute_policy: ExecutePolicy,
+    #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
     queue_capacity: usize,
+    #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
     supported_dtypes: Vec<Dtype>,
     metrics: Arc<ExecutorMetrics>,
     producer_key: Arc<ProducerSigningKey>,
@@ -67,6 +64,7 @@ struct ExecutorRuntimeConfig {
     fetch_routes: FetchRouteRegistry,
     fetch_max_in_flight: usize,
     fetch_queue_capacity: usize,
+    #[cfg(feature = "evaluate")]
     artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
 }
@@ -89,6 +87,7 @@ impl Executor {
             fetch_routes: FetchRouteRegistry::default(),
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+            #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
         })
@@ -112,6 +111,7 @@ impl Executor {
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+            #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
         })
@@ -122,6 +122,7 @@ impl Executor {
     ) -> Result<ExecutorHandle, ExecutorError> {
         let fetch_store = fetch_store_from_artifact_config(&config.artifact_store);
         let fetch_quota_store = fetch_quota_store_from_artifact_config(&config.artifact_store);
+        #[cfg(feature = "evaluate")]
         let artifacts = EvaluateArtifactStore::open(config.artifact_store).await?;
         Self::spawn_runtime(ExecutorRuntimeConfig {
             execute_policy: config.execute_policy,
@@ -133,6 +134,7 @@ impl Executor {
             fetch_routes: config.fetch_routes,
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
+            #[cfg(feature = "evaluate")]
             artifacts,
             fetch_store,
         })
@@ -140,32 +142,46 @@ impl Executor {
 
     fn spawn_runtime(config: ExecutorRuntimeConfig) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
-            !config.supported_dtypes.is_empty(),
-            "executor must support at least one dtype"
-        );
-        assert!(
             config.fetch_max_in_flight > 0,
             "fetch_max_in_flight must be greater than zero"
         );
-        let preferred_dtype = config.supported_dtypes[0];
+        #[cfg(feature = "evaluate")]
+        let preferred_dtype = config
+            .supported_dtypes
+            .first()
+            .copied()
+            .unwrap_or(Dtype::F32);
         let (tx, rx) = mpsc::unbounded_channel();
-        backend::create_backend()?;
         // Make the fetch store root durable before any ticket can run, so
         // running markers always link into an already-durable directory.
         config.fetch_store.init().map_err(|err| {
             ExecutorError::ArtifactStore(format!("fetch transcript store init failed: {err}"))
         })?;
         let fetch_caller_policy = FetchCallerPolicy::new(config.fetch_access_policy.caller_keys());
+        #[cfg(feature = "evaluate")]
+        let evaluate: Option<Box<dyn SchemeEngine>> = {
+            assert!(
+                !config.supported_dtypes.is_empty(),
+                "executor with evaluate enabled must support at least one dtype"
+            );
+            backend::create_backend()?;
+            Some(Box::new(EvaluateEngine::new(
+                config.artifacts,
+                config.supported_dtypes,
+                config.queue_capacity,
+                config.execute_policy,
+                config.metrics.clone(),
+                config.producer_key.clone(),
+                tx.clone(),
+            )))
+        };
+        #[cfg(not(feature = "evaluate"))]
+        let evaluate: Option<Box<dyn SchemeEngine>> = None;
         let executor = Self {
             rx,
             tx: tx.clone(),
             store: ExecutorState::new(),
-            artifacts: config.artifacts,
-            pending_executions: VecDeque::new(),
-            queue_capacity: config.queue_capacity,
-            models: HashMap::new(),
-            worker: ExecuteWorker::spawn(tx.clone()),
-            execute_policy: config.execute_policy,
+            evaluate,
             metrics: config.metrics,
             producer_key: config.producer_key,
             fetch_state: FetchStateMachine::new(config.fetch_store, fetch_caller_policy),
@@ -175,59 +191,88 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
-            supported_dtypes: config.supported_dtypes,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {
             tx,
+            #[cfg(feature = "evaluate")]
             preferred_dtype,
         })
-    }
-
-    /// First entry of [`Executor::supported_dtypes`]. Used when this
-    /// executor must pick a dtype itself.
-    pub(super) fn preferred_dtype(&self) -> Dtype {
-        self.supported_dtypes[0]
     }
 
     async fn run(mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
                 ExecutorMessage::QuoteEvaluate { request, reply } => {
-                    let _ = reply.send(self.handle_quote_evaluate(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.quote_evaluate(&mut self.store, request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::QuoteFetch { request, reply } => {
                     let _ = reply.send(self.handle_quote_fetch(request).await);
                 }
                 ExecutorMessage::QuotePrompt { request, reply } => {
-                    let _ = reply.send(self.handle_quote_prompt(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.quote_prompt(&mut self.store, request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::QuotePreparedText { request, reply } => {
-                    let _ = reply.send(self.handle_quote_prepared_text(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.quote_prepared_text(&mut self.store, request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::QuoteChatPrompt { request, reply } => {
-                    let _ = reply.send(self.handle_quote_chat_prompt(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.quote_chat_prompt(&mut self.store, request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::PutArtifact { request, reply } => {
-                    let _ = reply.send(self.handle_put_artifact(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.put_artifact(request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::GetArtifact { request, reply } => {
-                    let _ = reply.send(self.handle_get_artifact(request).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.get_artifact(request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::LoadModelMetadata { model, reply } => {
-                    let _ = reply.send(self.handle_load_model_metadata(model).await);
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.load_model_metadata(model).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
-                ExecutorMessage::WorkerFinished(completion) => {
-                    self.handle_worker_finished(completion).await;
+                #[cfg(feature = "evaluate")]
+                ExecutorMessage::SchemeFinished(completion) => {
+                    if let Some(engine) = self.evaluate.as_mut() {
+                        engine.on_completion(completion).await;
+                    }
                 }
                 ExecutorMessage::FetchFinished(completion) => {
                     self.handle_fetch_finished(completion).await;
                 }
                 ExecutorMessage::ListModels { reply } => {
-                    let _ = reply.send(Ok(self.handle_list_models().await));
+                    let models = match self.evaluate.as_ref() {
+                        Some(engine) => engine.list_models().await,
+                        None => Default::default(),
+                    };
+                    let _ = reply.send(Ok(models));
                 }
                 ExecutorMessage::GetStats { reply } => {
                     let model_stats = self
@@ -253,6 +298,10 @@ impl Executor {
             }
         }
     }
+}
+
+fn evaluate_disabled() -> ExecutorError {
+    ExecutorError::PolicyDenied("evaluate scheme is not enabled on this node".to_string())
 }
 
 fn fetch_store_from_artifact_config(config: &ArtifactStoreConfig) -> FetchTranscriptStoreBackend {

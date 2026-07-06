@@ -5,13 +5,17 @@
 //! inbound RPCs here.
 
 use std::pin::Pin;
+#[cfg(feature = "evaluate")]
 use std::sync::Arc;
 
-use catgrad::prelude::Dtype;
 use futures_core::Stream;
+#[cfg(feature = "evaluate")]
 use futures_util::StreamExt;
+#[cfg(feature = "evaluate")]
+use hellas_rpc::Dtype;
 use hellas_rpc::ExecutorError;
 use hellas_rpc::call::WithTrailer;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
@@ -32,6 +36,7 @@ use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[cfg(feature = "evaluate")]
 use crate::state::model_spec;
 
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
@@ -260,10 +265,22 @@ impl CourtesyHandler for ExecutorHandle {
         &self,
         request: DecodeTokensRequestStream,
     ) -> Result<DecodeTokensStream, WireStatus> {
-        Ok(decode_tokens_stream(request, self.preferred_dtype))
+        #[cfg(feature = "evaluate")]
+        {
+            Ok(decode_tokens_stream(request, self.preferred_dtype))
+        }
+        #[cfg(not(feature = "evaluate"))]
+        {
+            let _ = request;
+            Err(WireStatus::new(
+                WireCode::FailedPrecondition,
+                "evaluate scheme is not enabled on this node",
+            ))
+        }
     }
 }
 
+#[cfg(feature = "evaluate")]
 fn decode_tokens_stream(
     mut requests: DecodeTokensRequestStream,
     dtype: Dtype,
@@ -301,6 +318,7 @@ fn decode_tokens_stream(
     })
 }
 
+#[cfg(feature = "evaluate")]
 async fn load_decode_assets(
     model_id: String,
     revision: String,
@@ -319,12 +337,14 @@ async fn load_decode_assets(
     Ok(Arc::new(assets))
 }
 
+#[cfg(feature = "evaluate")]
 struct DecodeSession {
     model_id: String,
     revision: String,
     decoder: TextOutputDecoder,
 }
 
+#[cfg(feature = "evaluate")]
 impl DecodeSession {
     fn new(model_id: String, revision: String, assets: Arc<ModelAssets>) -> Self {
         let decoder = TextOutputDecoder::for_model(assets);

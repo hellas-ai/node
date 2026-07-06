@@ -26,7 +26,7 @@ impl MetricsBundle {
 
     /// Attach iroh's `EndpointMetrics` so they are emitted alongside the
     /// prometheus-client registry.
-    #[cfg(all(feature = "otel", feature = "hellas-executor"))]
+    #[cfg(all(feature = "otel", feature = "node"))]
     pub fn with_iroh(mut self, iroh: iroh::metrics::EndpointMetrics) -> Self {
         self.iroh = Some(iroh);
         self

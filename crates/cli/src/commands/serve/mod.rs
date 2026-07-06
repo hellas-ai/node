@@ -1,11 +1,11 @@
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
-use catgrad::prelude::Dtype;
 use hellas_executor::{
     CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
     RequestRateLimit, SpendLimit,
 };
+use hellas_rpc::Dtype;
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::policy::ExecutePolicy;
 use iroh::SecretKey;

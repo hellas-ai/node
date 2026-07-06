@@ -17,8 +17,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use catgrad::prelude::Dtype;
 use futures::Stream;
+use hellas_rpc::Dtype;
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -40,12 +40,12 @@ pub struct GatewayOptions {
     pub port: Option<u16>,
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub local: bool,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub verify_local: bool,
     pub verify: Option<EndpointId>,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     pub queue_size: usize,
     pub retries: usize,
     pub default_max_tokens: u32,
@@ -95,7 +95,7 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
         crate::metrics::spawn_metrics_server(metrics_port, bundle);
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     if state.local {
         info!(
             "local catgrad execution, queue size: {}",
@@ -109,7 +109,7 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
     } else if let Some(verify_node) = state.verify_node_id.as_ref() {
         info!("Verifying primary node against remote shadow node {verify_node}");
     }
-    #[cfg(not(feature = "hellas-executor"))]
+    #[cfg(not(feature = "evaluate"))]
     if let Some(verify_node) = state.verify_node_id.as_ref() {
         info!("Verifying primary node against remote shadow node {verify_node}");
     }

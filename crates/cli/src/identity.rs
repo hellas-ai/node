@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
 const PRODUCER_KEY_FILE: &str = "signing-key.secp256k1";
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 const ARTIFACT_STORE_DIR: &str = "artifacts";
 const KEY_LEN: usize = 32;
 
@@ -77,7 +77,7 @@ fn default_producer_key_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(PRODUCER_KEY_FILE, "--producer-key-path")
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 pub fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")
 }
@@ -267,7 +267,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn creates_new_producer_key_in_temp_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(reloaded.producer_id(), key.producer_id());
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn reloads_existing_producer_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,7 +344,7 @@ mod tests {
             dir.path().join(".hellas").join("signing-key.secp256k1")
         );
 
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "node")]
         {
             let path = default_artifact_store_path().unwrap();
             assert_eq!(path, dir.path().join(".hellas").join("artifacts"));

@@ -2,6 +2,7 @@
 
 pub mod commitment;
 pub mod digest;
+pub mod dtype;
 pub mod receipt;
 pub mod scheme;
 pub mod schemes;
@@ -14,6 +15,7 @@ pub use commitment::{
     AssuranceStrategy, ReceiptCommitment, RequestCommitment, ResultCommitment, SchemeId,
 };
 pub use digest::{Digest, hash_tuple};
+pub use dtype::{Dtype, ParseDtypeError};
 pub use receipt::{
     DeliveryOutput, DeliveryRequest, ReceiptBody, SignedReceipt, VerifyError, verify_delivery,
     verify_receipt,

@@ -136,14 +136,16 @@ fn worker_loop(
             }
         };
 
-        let _ = executor_tx.send(ExecutorMessage::WorkerFinished(WorkerCompletion {
-            execution_id,
-            model_id,
-            evaluate_request,
-            invocation,
-            sender,
-            result: termination,
-        }));
+        let _ = executor_tx.send(ExecutorMessage::SchemeFinished(Box::new(
+            WorkerCompletion {
+                execution_id,
+                model_id,
+                evaluate_request,
+                invocation,
+                sender,
+                result: termination,
+            },
+        )));
     }
 }
 
@@ -179,7 +181,7 @@ fn run_job(
                 &locator.revision,
                 backend,
                 true,
-                locator.dtype,
+                hellas_rpc::model::to_catgrad_dtype(locator.dtype),
             )
             .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
             engines.insert(locator.clone(), engine.clone());

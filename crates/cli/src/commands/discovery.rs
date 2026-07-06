@@ -1,26 +1,26 @@
 use anyhow::Context;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_rpc::services::courtesy::Courtesy;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_rpc::services::evaluate::Evaluate;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_rpc::services::execute::Execute;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_rpc::services::fetch::Fetch;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_rpc::services::node::Node;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_wire::ServiceMarker;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use hellas_wire::iroh::swarm::DhtPublisherConfig;
 use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, ServiceRegistry};
 use iroh::Endpoint;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use iroh::endpoint_info::UserData;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use tokio::sync::broadcast;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use tokio::task::JoinHandle;
 
 pub(crate) struct DiscoveryRegistry {
@@ -28,14 +28,14 @@ pub(crate) struct DiscoveryRegistry {
     pub(crate) peer_exchange: PeerExchangeBackend,
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 pub(crate) struct DiscoveryAdvertiser {
     mdns: MdnsAddressLookup,
     shutdown: broadcast::Sender<()>,
     task: JoinHandle<()>,
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 impl DiscoveryAdvertiser {
     pub(crate) async fn shutdown(self) {
         let Self {
@@ -49,7 +49,7 @@ impl DiscoveryAdvertiser {
     }
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 pub(crate) fn served_alpns() -> Vec<Vec<u8>> {
     vec![
         Execute::ALPN.as_bytes().to_vec(),
@@ -84,7 +84,7 @@ pub(crate) fn build_client_registry(endpoint: &Endpoint) -> anyhow::Result<Disco
     })
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 pub(crate) fn start_server_advertising(
     endpoint: &Endpoint,
     alpns: &[Vec<u8>],

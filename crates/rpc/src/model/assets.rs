@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use crate::PublicKey;
 use crate::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
 use crate::run_ticket::public_key_to_pb;
-use catgrad::prelude::Dtype;
+use crate::{Dtype, PublicKey};
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
@@ -49,7 +48,7 @@ impl ModelAssets {
         let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
             .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
 
-        let graph_model = get_model(&config, 1, None, dtype)
+        let graph_model = get_model(&config, 1, None, to_catgrad_dtype(dtype))
             .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?;
         let stop_token_ids: Vec<i32> = graph_model.config().get_eos_token_ids();
 
@@ -97,7 +96,7 @@ impl ModelAssets {
             start: Some(EvaluateStart {
                 kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
-            accept_dtypes: vec![dtype_to_wire(self.dtype).to_string()],
+            accept_dtypes: vec![self.dtype.as_wire().to_string()],
             runner_public_key: Some(public_key_to_pb(runner_public_key)),
         })
     }
@@ -218,12 +217,12 @@ impl TextOutputDecoder {
     }
 }
 
-fn dtype_to_wire(dtype: Dtype) -> &'static str {
+pub fn to_catgrad_dtype(dtype: Dtype) -> catgrad::prelude::Dtype {
     match dtype {
-        Dtype::F32 => "f32",
-        Dtype::F16 => "f16",
-        Dtype::BF16 => "bf16",
-        Dtype::F8 => "f8",
-        Dtype::U32 => "u32",
+        Dtype::F32 => catgrad::prelude::Dtype::F32,
+        Dtype::F16 => catgrad::prelude::Dtype::F16,
+        Dtype::BF16 => catgrad::prelude::Dtype::BF16,
+        Dtype::F8 => catgrad::prelude::Dtype::F8,
+        Dtype::U32 => catgrad::prelude::Dtype::U32,
     }
 }

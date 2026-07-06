@@ -8,20 +8,24 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["candle"]
-candle = ["catgrad/candle-backend"]
+default = ["evaluate", "candle"]
+evaluate = ["dep:catgrad", "dep:chatgrad", "hellas-rpc/node"]
+candle = ["evaluate", "catgrad/candle-backend"]
 candle-cuda = ["candle", "catgrad/cuda"]
 candle-metal = ["candle", "catgrad/metal"]
 
 [dependencies]
 async-stream = "0.3"
+async-trait = "0.1"
 blake3 = { workspace = true }
-catgrad = { workspace = true, default-features = false, features = ["serde"] }
-chatgrad = { workspace = true, default-features = false }
+catgrad = { workspace = true, default-features = false, features = [
+    "serde",
+], optional = true }
+chatgrad = { workspace = true, default-features = false, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
 hellas-rpc = { workspace = true, features = [
-    "node",
+    "server",
     "execute",
     "evaluate",
     "fetch",

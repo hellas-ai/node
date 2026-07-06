@@ -1,26 +1,33 @@
 #[macro_use]
 extern crate tracing;
 
-use catgrad::prelude::Dtype;
-use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "evaluate")]
+use clap::ValueEnum;
+use clap::{Parser, Subcommand};
+#[cfg(feature = "node")]
+use hellas_rpc::Dtype;
 use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 mod commands;
 mod execution;
 mod identity;
+#[cfg(feature = "node")]
 mod metrics;
 mod tracing_config;
 
+#[cfg(feature = "node")]
 /// `clap` value parser for `--dtype`. Accepts model floating-point dtypes.
-/// Rejects `u32`, which is the catgrad token-tensor dtype, never a model dtype.
+/// Rejects `u32`, which is the tensor token-index dtype, never a model dtype.
 fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
-    let dtype = Dtype::from_str(s)?;
-    match dtype {
-        Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F8 => Ok(dtype),
-        Dtype::U32 => Err("model dtype must be f32, f16, bf16, or f8".to_string()),
+    let dtype: Dtype = s
+        .parse()
+        .map_err(|err: hellas_rpc::ParseDtypeError| err.to_string())?;
+    if dtype.is_model_dtype() {
+        Ok(dtype)
+    } else {
+        Err("model dtype must be f32, f16, bf16, or f8".to_string())
     }
 }
 
@@ -42,6 +49,7 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
+#[cfg(feature = "evaluate")]
 fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     match serde_json::from_str::<serde_json::Value>(s) {
         Ok(serde_json::Value::Object(object)) => Ok(object),
@@ -56,11 +64,18 @@ fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Valu
 /// builds default to `f32` because CPUs typically emulate bf16 via f32 anyway,
 /// and `f32` is the safest broadly-correct choice. Used for `serve --dtype`
 /// and `gateway --dtype`.
-#[cfg(any(feature = "candle-cuda", feature = "candle-metal"))]
+#[cfg(all(
+    feature = "node",
+    any(feature = "candle-cuda", feature = "candle-metal")
+))]
 const DEFAULT_DTYPE_STR: &str = "bf16";
-#[cfg(not(any(feature = "candle-cuda", feature = "candle-metal")))]
+#[cfg(all(
+    feature = "node",
+    not(any(feature = "candle-cuda", feature = "candle-metal"))
+))]
 const DEFAULT_DTYPE_STR: &str = "f32";
 
+#[cfg(feature = "evaluate")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum GatewayResponsesBackend {
     Hellas,
@@ -68,6 +83,7 @@ enum GatewayResponsesBackend {
     Fetch,
 }
 
+#[cfg(feature = "evaluate")]
 impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
     fn from(value: GatewayResponsesBackend) -> Self {
         match value {
@@ -92,6 +108,7 @@ impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
 ///   bf16 because CPU bf16 throughput is rarely a win and we want a default
 ///   that loads on every backend, including GPUs without native bf16
 ///   support in non-standard builds.
+#[cfg(feature = "evaluate")]
 fn default_llm_dtypes(is_local_mode: bool) -> Vec<Dtype> {
     let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
     if is_local_mode && !cuda_or_metal {
@@ -164,7 +181,7 @@ enum CodexAuthCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
         /// Port to listen on (auto-selects if not specified or if in use)
@@ -224,6 +241,7 @@ enum Commands {
         )]
         fetch_queue_size: usize,
     },
+    #[cfg(feature = "evaluate")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
         /// Host interface to bind
@@ -239,11 +257,11 @@ enum Commands {
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
         /// Run locally with the catgrad backend instead of the Hellas network
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
         local: bool,
         /// Run remotely and verify that the response matches a local catgrad execution
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         #[arg(
             long = "verify-local",
             default_value_t = false,
@@ -252,20 +270,17 @@ enum Commands {
         verify_local: bool,
         /// Verify the primary remote node against a second remote node
         #[cfg_attr(
-            feature = "hellas-executor",
+            feature = "evaluate",
             arg(
                 long = "verify",
                 conflicts_with_all = ["local", "verify_local"],
                 requires = "node_id"
             )
         )]
-        #[cfg_attr(
-            not(feature = "hellas-executor"),
-            arg(long = "verify", requires = "node_id")
-        )]
+        #[cfg_attr(not(feature = "evaluate"), arg(long = "verify", requires = "node_id"))]
         verify: Option<EndpointId>,
         /// Maximum number of queued local executions when `--local` is set
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         #[arg(
             long = "queue-size",
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
@@ -341,6 +356,7 @@ enum Commands {
         #[command(subcommand)]
         command: commands::chain::ChainCommand,
     },
+    #[cfg(feature = "evaluate")]
     /// Run LLM inference remotely or locally
     Llm {
         /// Node ID to run on remotely (omit to auto-discover)
@@ -364,11 +380,11 @@ enum Commands {
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
         /// Run locally with the catgrad backend instead of the Hellas network
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id", "node_addrs"])]
         local: bool,
         /// Run remotely and locally, then verify that both outputs match
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "evaluate")]
         #[arg(
             long = "verify-local",
             default_value_t = false,
@@ -513,7 +529,7 @@ async fn main() {
     };
 
     let result = match cli.command {
-        #[cfg(feature = "hellas-executor")]
+        #[cfg(feature = "node")]
         Commands::Serve {
             port,
             execute_policy,
@@ -552,17 +568,15 @@ async fn main() {
             })
             .await
         }
+        #[cfg(feature = "evaluate")]
         Commands::Gateway {
             host,
             port,
             node_id,
             node_addrs,
-            #[cfg(feature = "hellas-executor")]
             local,
-            #[cfg(feature = "hellas-executor")]
             verify_local,
             verify,
-            #[cfg(feature = "hellas-executor")]
             queue_size,
             retries,
             default_max_tokens,
@@ -584,12 +598,9 @@ async fn main() {
                 port,
                 node_id,
                 node_addrs,
-                #[cfg(feature = "hellas-executor")]
                 local,
-                #[cfg(feature = "hellas-executor")]
                 verify_local,
                 verify,
-                #[cfg(feature = "hellas-executor")]
                 queue_size,
                 retries,
                 default_max_tokens,
@@ -618,6 +629,7 @@ async fn main() {
         Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
         #[cfg(feature = "chain")]
         Commands::Chain { command } => commands::chain::run(command).await,
+        #[cfg(feature = "evaluate")]
         Commands::Llm {
             node_id,
             node_addrs,
@@ -626,16 +638,11 @@ async fn main() {
             raw,
             max_seq,
             retries,
-            #[cfg(feature = "hellas-executor")]
             local,
-            #[cfg(feature = "hellas-executor")]
             verify_local,
             dtype,
         } => {
-            #[cfg(feature = "hellas-executor")]
             let is_local_mode = local || verify_local;
-            #[cfg(not(feature = "hellas-executor"))]
-            let is_local_mode = false;
             let dtype = if dtype.is_empty() {
                 default_llm_dtypes(is_local_mode)
             } else {
@@ -650,9 +657,7 @@ async fn main() {
                     raw,
                     max_seq,
                     retries,
-                    #[cfg(feature = "hellas-executor")]
                     local,
-                    #[cfg(feature = "hellas-executor")]
                     verify_local,
                     dtype,
                     producer_key_path: producer_key_path.clone(),
@@ -730,7 +735,7 @@ fn command_owns_tracing(command: &Commands) -> bool {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_accepts_local_mode() {
         let cli = Cli::try_parse_from(["hellas", "llm", "--local", "-p", "hello"]).unwrap();
@@ -753,6 +758,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_accepts_raw_mode() {
         let cli = Cli::try_parse_from(["hellas", "llm", "--raw", "-p", "hello"]).unwrap();
@@ -762,7 +768,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_local_with_node_id() {
         let result = Cli::try_parse_from([
@@ -777,7 +783,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_conflicting_local_modes() {
         let result =
@@ -786,7 +792,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_accepts_local_mode() {
         let cli = Cli::try_parse_from(["hellas", "gateway", "--local"]).unwrap();
@@ -805,7 +811,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_rejects_local_with_node_id() {
         let result = Cli::try_parse_from([
@@ -819,6 +825,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_node_addr_without_node_id() {
         let result = Cli::try_parse_from([
@@ -833,6 +840,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_rejects_node_addr_without_node_id() {
         let result = Cli::try_parse_from(["hellas", "gateway", "--node-addr", "127.0.0.1:31145"]);
@@ -956,11 +964,12 @@ mod tests {
     /// On CPU-only builds the default is `f32`; on CUDA/Metal builds it is
     /// `bf16`. See [`DEFAULT_DTYPE_STR`]. Used for `serve` / `gateway`,
     /// which still take a single dtype.
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     fn expected_default_dtype() -> Dtype {
         parse_model_dtype(DEFAULT_DTYPE_STR).unwrap()
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_dtype_omitted_yields_empty_vec_for_runtime_resolution() {
         // Clap parses no `--dtype` as an empty `Vec<Dtype>`; main resolves
@@ -972,6 +981,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_accepts_single_dtype() {
         let cli = Cli::try_parse_from(["hellas", "llm", "--dtype", "f16", "-p", "hi"]).unwrap();
@@ -981,6 +991,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_accepts_dtype_preference_list() {
         let cli =
@@ -993,6 +1004,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn default_llm_dtypes_local_cpu_skips_bf16() {
         let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
@@ -1004,12 +1016,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn default_llm_dtypes_network_uses_bf16_first() {
         let prefs = default_llm_dtypes(/* is_local_mode = */ false);
         assert_eq!(prefs, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_accepts_dtype_bf16() {
         let cli = Cli::try_parse_from(["hellas", "gateway", "--dtype", "bf16"]).unwrap();
@@ -1019,6 +1033,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_wrap_forwards_trailing_args() {
         let cli = Cli::try_parse_from([
@@ -1043,12 +1058,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_wrap_args_require_wrap() {
         let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
         assert!(result.is_err(), "trailing args without --wrap should error");
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_accepts_responses_fetch_backend() {
         let cli = Cli::try_parse_from([
@@ -1103,7 +1120,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_accepts_artifact_store_path() {
         let cli = Cli::try_parse_from([
@@ -1125,7 +1142,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_accepts_dtype_f16() {
         let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f16"]).unwrap();
@@ -1135,7 +1152,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_accepts_fetch_config() {
         let cli = Cli::try_parse_from([
@@ -1221,7 +1238,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_accepts_multi_dtype() {
         let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,f16,bf16"]).unwrap();
@@ -1233,7 +1250,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_dtype_defaults_to_build_default() {
         let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
@@ -1245,13 +1262,14 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[test]
     fn serve_rejects_dtype_u32_in_list() {
         let result = Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,u32"]);
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_dtype_u32() {
         let result = Cli::try_parse_from(["hellas", "llm", "--dtype", "u32", "-p", "hi"]);

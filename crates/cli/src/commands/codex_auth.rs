@@ -2,7 +2,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -17,7 +17,7 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
 pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
@@ -84,7 +84,7 @@ pub(crate) fn import_codex_cli(
 #[derive(Clone, Debug)]
 pub(crate) struct CodexAuthStore {
     path: PathBuf,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     token_url: Url,
 }
 
@@ -96,12 +96,12 @@ impl CodexAuthStore {
         };
         Ok(Self {
             path,
-            #[cfg(feature = "hellas-executor")]
+            #[cfg(feature = "node")]
             token_url: Url::parse(TOKEN_URL).expect("Codex auth token URL is valid"),
         })
     }
 
-    #[cfg(all(test, feature = "hellas-executor"))]
+    #[cfg(all(test, feature = "node"))]
     pub(crate) fn with_token_url(path: PathBuf, token_url: Url) -> Self {
         Self { path, token_url }
     }
@@ -122,7 +122,7 @@ impl CodexAuthStore {
         }
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     pub(crate) async fn access_token(&self) -> Result<String, CodexAuthError> {
         if !self.path.exists() {
             return Err(CodexAuthError::Missing);
@@ -197,7 +197,7 @@ pub(crate) struct CodexTokens {
     refresh_token: String,
 }
 
-#[cfg(all(test, feature = "hellas-executor"))]
+#[cfg(all(test, feature = "node"))]
 pub(crate) fn test_tokens(access_token: &str, refresh_token: &str) -> CodexTokens {
     CodexTokens {
         access_token: access_token.to_string(),
@@ -215,7 +215,7 @@ struct BlockedRefreshToken {
 pub(crate) enum CodexAuthError {
     #[error("no Codex credentials found; run `hellas codex-auth login`")]
     Missing,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[error("Codex auth refresh token is blocked: {0}")]
     RefreshBlocked(String),
     #[error("Codex auth path has no parent directory: {0}")]
@@ -258,13 +258,13 @@ pub(crate) enum CodexAuthError {
     TokenMissingAccessToken,
     #[error("Codex token response is missing refresh_token")]
     TokenMissingRefreshToken,
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[error("Codex token refresh failed: {message}")]
     RefreshFailed { message: String, terminal: bool },
 }
 
 impl CodexAuthError {
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     fn is_terminal(&self) -> bool {
         matches!(self, Self::RefreshFailed { terminal: true, .. })
     }
@@ -434,7 +434,7 @@ struct DeviceExchange {
     code_verifier: String,
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 async fn refresh_tokens(
     client: &reqwest::Client,
     token_url: Url,
@@ -522,7 +522,7 @@ fn tokens_from_codex_cli_json(value: &JsonValue) -> Result<CodexTokens, CodexAut
     })
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 fn refresh_error(status: reqwest::StatusCode, body: &str) -> (String, bool) {
     let mut code = None;
     let mut message = None;
@@ -595,7 +595,7 @@ fn required_string(value: &JsonValue, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 fn access_token_expiring(token: &str, skew_seconds: u64) -> bool {
     let Some(expires_at) = access_token_expiry_seconds(token) else {
         return true;
@@ -617,7 +617,7 @@ fn access_token_expiry_seconds(token: &str) -> Option<u64> {
     value.get("exp").and_then(JsonValue::as_u64)
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -625,7 +625,7 @@ fn unix_seconds() -> u64 {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "hellas-executor")]
+#[cfg(feature = "node")]
 fn now_timestamp() -> String {
     unix_seconds().to_string()
 }
@@ -741,15 +741,15 @@ impl Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     use axum::Router;
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     use axum::extract::State;
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     use axum::routing::post;
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     use serde_json::json;
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     use std::sync::Arc;
 
     #[test]
@@ -813,7 +813,7 @@ mod tests {
         assert_eq!(loaded.last_refresh.as_deref(), Some("123"));
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[tokio::test]
     async fn refresh_rotates_tokens() {
         #[derive(Clone)]
@@ -860,7 +860,7 @@ mod tests {
         assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[tokio::test]
     async fn terminal_refresh_error_blocks_token() {
         async fn token() -> (axum::http::StatusCode, axum::Json<JsonValue>) {
@@ -896,7 +896,7 @@ mod tests {
         assert!(store.load().unwrap().refresh_token_blocked.is_some());
     }
 
-    #[cfg(feature = "hellas-executor")]
+    #[cfg(feature = "node")]
     #[tokio::test]
     async fn malformed_refresh_success_is_retryable() {
         async fn token() -> axum::Json<JsonValue> {
