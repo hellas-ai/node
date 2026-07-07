@@ -1,6 +1,5 @@
-//! Tower middleware that lifts `ExecutionProvenance` and, when known before
-//! headers are sent, a terminal signed receipt envelope from response
-//! extensions into `x-hellas-*` HTTP response headers.
+//! Tower middleware that lifts `ExecutionProvenance` from response extensions
+//! into `x-hellas-*` HTTP response headers.
 //!
 //! Handlers stay free of header-attachment boilerplate: they insert the
 //! typed values into `response.extensions_mut()` and this layer renders
@@ -13,14 +12,10 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{
-    COMMITMENT_KEY as COMMITMENT_HEADER, ExecutionProvenance, RECEIPT_KEY as RECEIPT_HEADER,
-    encode_hex,
+    COMMITMENT_KEY as COMMITMENT_HEADER, ExecutionProvenance, encode_hex,
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ReceiptHeader(pub String);
 
 #[derive(Clone, Default)]
 pub(super) struct ProvenanceLayer;
@@ -72,19 +67,10 @@ fn apply_provenance_headers(response: &mut Response<Body>) {
             .headers_mut()
             .insert(commitment_header(), header_value(&prov.commitment_id));
     }
-    if let Some(receipt) = extensions.get::<ReceiptHeader>() {
-        response
-            .headers_mut()
-            .insert(receipt_header(), receipt_string_header_value(&receipt.0));
-    }
 }
 
 fn commitment_header() -> HeaderName {
     HeaderName::from_static(COMMITMENT_HEADER)
-}
-
-fn receipt_header() -> HeaderName {
-    HeaderName::from_static(RECEIPT_HEADER)
 }
 
 fn header_value(bytes: &[u8; 32]) -> HeaderValue {
@@ -92,19 +78,12 @@ fn header_value(bytes: &[u8; 32]) -> HeaderValue {
         .expect("64-char lowercase hex is always a valid header value")
 }
 
-fn receipt_string_header_value(receipt: &str) -> HeaderValue {
-    HeaderValue::from_str(receipt).expect("receipt envelope is always a valid header value")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
 
-    fn build_response_with_extensions(
-        prov: Option<ExecutionProvenance>,
-        receipt: Option<ReceiptHeader>,
-    ) -> Response<Body> {
+    fn build_response_with_extensions(prov: Option<ExecutionProvenance>) -> Response<Body> {
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .body(Body::empty())
@@ -112,19 +91,15 @@ mod tests {
         if let Some(prov) = prov {
             response.extensions_mut().insert(prov);
         }
-        if let Some(receipt) = receipt {
-            response.extensions_mut().insert(receipt);
-        }
         response
     }
 
     #[test]
-    fn applies_both_headers_when_present() {
+    fn applies_commitment_header_when_present() {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
         };
-        let receipt = ReceiptHeader("AQID".to_string());
-        let mut response = build_response_with_extensions(Some(prov.clone()), Some(receipt));
+        let mut response = build_response_with_extensions(Some(prov.clone()));
         apply_provenance_headers(&mut response);
         assert_eq!(
             response
@@ -133,32 +108,13 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("ab".repeat(32).as_str())
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(RECEIPT_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some("AQID")
-        );
-    }
-
-    #[test]
-    fn skips_receipt_header_when_absent() {
-        let prov = ExecutionProvenance {
-            commitment_id: [1; 32],
-        };
-        let mut response = build_response_with_extensions(Some(prov), None);
-        apply_provenance_headers(&mut response);
-        assert!(response.headers().contains_key(COMMITMENT_HEADER));
-        assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
     #[test]
     fn no_extensions_yields_no_headers() {
-        let mut response = build_response_with_extensions(None, None);
+        let mut response = build_response_with_extensions(None);
         apply_provenance_headers(&mut response);
         assert!(!response.headers().contains_key(COMMITMENT_HEADER));
-        assert!(!response.headers().contains_key(RECEIPT_HEADER));
     }
 
     /// End-to-end: dispatch a request through an axum `Router` wrapped with
@@ -178,9 +134,6 @@ mod tests {
             let mut response = Response::new(Body::empty());
             response.extensions_mut().insert(prov);
             response
-                .extensions_mut()
-                .insert(ReceiptHeader("BAUG".to_string()));
-            response
         }
 
         let app = Router::new()
@@ -193,6 +146,5 @@ mod tests {
             response.headers().get(COMMITMENT_HEADER).unwrap(),
             &"12".repeat(32)
         );
-        assert_eq!(response.headers().get(RECEIPT_HEADER).unwrap(), "BAUG");
     }
 }

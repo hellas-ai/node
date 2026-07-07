@@ -252,9 +252,6 @@ fn provenance_json(provenance: &crate::Provenance) -> Option<JsonValue> {
             JsonValue::String(commitment.clone()),
         );
     }
-    if let Some(receipt) = &provenance.receipt {
-        object.insert("receipt".to_string(), JsonValue::String(receipt.clone()));
-    }
     (!object.is_empty()).then_some(JsonValue::Object(object))
 }
 
@@ -370,7 +367,6 @@ mod tests {
             stop_reason: StopReason::EndOfText,
             provenance: Some(Provenance {
                 call_commitment: Some("aa".repeat(32)),
-                receipt: Some("bb".repeat(32)),
             }),
             error: None,
         };
@@ -389,7 +385,6 @@ mod tests {
         assert_eq!(body["choices"][0]["text"], " world");
         assert_eq!(body["usage"]["total_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
-        assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
     }
 
     #[test]
@@ -445,7 +440,6 @@ mod tests {
                 &mut state,
                 OutputEvent::Provenance(Provenance {
                     call_commitment: Some("aa".repeat(32)),
-                    receipt: None,
                 }),
             )
             .unwrap();
@@ -472,7 +466,6 @@ mod tests {
                 &mut state,
                 OutputEvent::Provenance(Provenance {
                     call_commitment: Some("aa".repeat(32)),
-                    receipt: Some("bb".repeat(32)),
                 }),
             )
             .unwrap();
@@ -490,7 +483,6 @@ mod tests {
             panic!("expected json terminal chunk");
         };
         assert_eq!(done_json["hellas"]["commitment"], "aa".repeat(32));
-        assert_eq!(done_json["hellas"]["receipt"], "bb".repeat(32));
         assert!(matches!(finished[1].data, WireEventData::Text(ref text) if text == "[DONE]"));
     }
 }

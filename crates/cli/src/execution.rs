@@ -25,10 +25,6 @@
 
 use async_stream::try_stream;
 #[cfg(feature = "evaluate")]
-use base64::Engine;
-#[cfg(feature = "evaluate")]
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-#[cfg(feature = "evaluate")]
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
 #[cfg(feature = "evaluate")]
@@ -37,8 +33,16 @@ use futures::stream::Stream;
 #[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, ExecutorHandle};
 #[cfg(feature = "evaluate")]
+use hellas_rpc::Digest;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
-use hellas_rpc::ProducerSigningKey;
+#[cfg(feature = "evaluate")]
+use hellas_rpc::evaluate::{
+    EvaluateStopReason, TOKEN_DELTA_EVENT_KIND, decode_token_delta_payload,
+    output_canonicalization as evaluate_output_canonicalization,
+    verify_output_events as verify_evaluate_output_events,
+    verify_terminal_continuation as verify_evaluate_terminal_continuation,
+};
 use hellas_rpc::fetch::{
     FetchInput, FetchProtocolError, output_canonicalization, verify_input_events,
     verify_output_events,
@@ -61,14 +65,9 @@ use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
-#[cfg(feature = "evaluate")]
 use hellas_rpc::{
-    DagCborDecodeError, Digest, SignedReceipt as CoreSignedReceipt, VerifyError, decode_dag_cbor,
-    verify_receipt,
-};
-use hellas_rpc::{
-    EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey, SchemeId, StreamId,
-    output_genesis,
+    EventCommitment, InputCommitment, OutputEventEnvelope, ProducerSigningKey, PublicKey, SchemeId,
+    StreamId, output_genesis,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
@@ -110,28 +109,16 @@ pub enum ExecutionError {
     #[cfg(feature = "evaluate")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
-    #[cfg(feature = "evaluate")]
-    #[error("finished event missing receipt envelope")]
-    MissingReceiptEnvelope,
-    #[cfg(feature = "evaluate")]
-    #[error("failed to decode receipt envelope dag-cbor: {source}")]
-    ReceiptDecode {
-        #[source]
-        source: DagCborDecodeError,
-    },
-    #[cfg(feature = "evaluate")]
-    #[error("receipt signature verification failed: {source}")]
-    ReceiptSignature {
-        #[source]
-        source: VerifyError,
-    },
     #[error("unknown finish status {value}")]
     UnknownFinishStatus { value: i32 },
     #[error("wire finish status is unspecified")]
     UnspecifiedFinishStatus,
     #[cfg(feature = "evaluate")]
-    #[error("evaluate execution returned a fetch receipt")]
-    EvaluateReceiptExpected,
+    #[error("evaluate transcript verification failed: {source}")]
+    EvaluateTranscript {
+        #[source]
+        source: hellas_rpc::evaluate::EvaluateProtocolError,
+    },
     #[error("fetch stream envelope decode failed: {source}")]
     FetchStreamEnvelope {
         #[source]
@@ -296,54 +283,14 @@ pub enum Outcome {
     Completed {
         total_tokens: u64,
         stop_reason: StopReason,
-        receipt: ReceiptArtifact,
+        text_artifact: Digest,
+        output_events: Vec<OutputEventEnvelope>,
     },
     Failed {
         /// Tokens emitted before the failure (for honest usage reporting).
         position: u64,
         error: String,
     },
-}
-
-#[cfg(feature = "evaluate")]
-/// Verified signed receipt envelope bytes as delivered by the executor.
-///
-/// The gateway exposes these bytes directly as `hellas.receipt`. Evaluate
-/// callers that need the result artifact digest can project it from
-/// the verified envelope, but that digest is not the universal receipt
-/// identity.
-#[derive(Debug, Clone)]
-pub struct ReceiptArtifact {
-    dag_cbor: Vec<u8>,
-    evaluate_text_artifact: Option<Digest>,
-}
-
-#[cfg(feature = "evaluate")]
-impl ReceiptArtifact {
-    pub fn from_pb(envelope: Option<pb::ReceiptEnvelope>) -> ExecutionResult<Self> {
-        let (dag_cbor, core) = decode_receipt_envelope(envelope)?;
-        verify_receipt(&core).map_err(|source| ExecutionError::ReceiptSignature { source })?;
-        Ok(Self::from_verified_core(dag_cbor, &core))
-    }
-
-    pub fn encoded(&self) -> String {
-        URL_SAFE_NO_PAD.encode(&self.dag_cbor)
-    }
-
-    pub fn evaluate_text_artifact(&self) -> Option<Digest> {
-        self.evaluate_text_artifact
-    }
-
-    fn from_verified_core(dag_cbor: Vec<u8>, core: &CoreSignedReceipt) -> Self {
-        let evaluate_text_artifact = match core.body().scheme() {
-            SchemeId::Evaluate => Some(core.body().result().digest()),
-            _ => None,
-        };
-        Self {
-            dag_cbor,
-            evaluate_text_artifact,
-        }
-    }
 }
 
 #[cfg(feature = "evaluate")]
@@ -372,6 +319,16 @@ pub enum StopReason {
 pub enum FetchExecutionEvent {
     Chunk {
         position: u64,
+        output_event: OutputEventEnvelope,
+        event: WireOutputEvent,
+    },
+    Done(FetchOutcome),
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum DecodedFetchWireEvent {
+    Chunk {
         output_event: OutputEventEnvelope,
         event: WireOutputEvent,
     },
@@ -419,6 +376,7 @@ struct FetchChunkVerifier {
     stream_id: StreamId,
     previous_event: EventCommitment,
     next_sequence: u64,
+    next_position: u64,
     trust: ProducerTrust,
     producer_key: Option<PublicKey>,
     events: Vec<OutputEventEnvelope>,
@@ -432,13 +390,17 @@ impl FetchChunkVerifier {
             stream_id,
             previous_event: output_genesis(input, stream_id),
             next_sequence: 0,
+            next_position: 0,
             trust,
             producer_key: None,
             events: Vec::new(),
         }
     }
 
-    fn verify_chunk(&mut self, event: OutputEventEnvelope) -> ExecutionResult<OutputEventEnvelope> {
+    fn verify_chunk(
+        &mut self,
+        event: OutputEventEnvelope,
+    ) -> ExecutionResult<(u64, OutputEventEnvelope)> {
         let public_key = *event.event().public_key();
         match self.producer_key {
             Some(expected) if expected != public_key => {
@@ -498,10 +460,16 @@ impl FetchChunkVerifier {
                 "fetch output chunk canonicalization mismatch",
             ));
         }
+        let payload_len = u64::try_from(event.payload().len()).map_err(|_| {
+            ExecutionError::protocol("fetch output chunk length exceeds u64 position range")
+        })?;
+        self.next_position = self.next_position.checked_add(payload_len).ok_or_else(|| {
+            ExecutionError::protocol("fetch output position exceeds u64 position range")
+        })?;
         self.previous_event = event.event_commitment();
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.events.push(event.clone());
-        Ok(event)
+        Ok((self.next_position, event))
     }
 
     fn verify_terminal(&self, outcome: &FetchOutcome) -> ExecutionResult<()> {
@@ -533,6 +501,129 @@ impl FetchChunkVerifier {
         }
         hellas_rpc::fetch::verify_terminal_continuation(&self.events, output_events)
             .map_err(|source| ExecutionError::FetchTranscript { source })
+    }
+}
+
+#[cfg(feature = "evaluate")]
+struct EvaluateChunkVerifier {
+    input: InputCommitment,
+    stream_id: StreamId,
+    previous_event: EventCommitment,
+    next_sequence: u64,
+    next_position: u64,
+    producer_key: Option<PublicKey>,
+    events: Vec<OutputEventEnvelope>,
+}
+
+#[cfg(feature = "evaluate")]
+impl EvaluateChunkVerifier {
+    fn new(input: InputCommitment) -> Self {
+        let stream_id = StreamId::from_input_commitment(input);
+        Self {
+            input,
+            stream_id,
+            previous_event: output_genesis(input, stream_id),
+            next_sequence: 0,
+            next_position: 0,
+            producer_key: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn verify_chunk(
+        &mut self,
+        event: OutputEventEnvelope,
+    ) -> ExecutionResult<(u64, hellas_rpc::evaluate::EvaluateTokenDelta)> {
+        let public_key = *event.event().public_key();
+        match self.producer_key {
+            Some(expected) if expected != public_key => {
+                return Err(ExecutionError::protocol(
+                    "evaluate output chunk producer key changed mid-stream",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                self.producer_key = Some(public_key);
+            }
+        }
+        event.verify(&public_key).map_err(|source| {
+            ExecutionError::source(
+                "evaluate output chunk signature verification failed",
+                source,
+            )
+        })?;
+        let body = event.event().body();
+        if body.scheme() != SchemeId::Evaluate {
+            return Err(ExecutionError::protocol(
+                "evaluate output chunk used the wrong scheme",
+            ));
+        }
+        if body.input() != self.input {
+            return Err(ExecutionError::protocol(
+                "evaluate output chunk input commitment mismatch",
+            ));
+        }
+        if body.stream_id() != self.stream_id {
+            return Err(ExecutionError::protocol(
+                "evaluate output chunk stream id mismatch",
+            ));
+        }
+        if body.sequence() != self.next_sequence {
+            return Err(ExecutionError::protocol(format!(
+                "evaluate output chunk sequence mismatch: expected {}, got {}",
+                self.next_sequence,
+                body.sequence()
+            )));
+        }
+        if body.previous_event() != self.previous_event {
+            return Err(ExecutionError::protocol(
+                "evaluate output chunk previous-event mismatch",
+            ));
+        }
+        if body.kind() != TOKEN_DELTA_EVENT_KIND {
+            return Err(ExecutionError::protocol(format!(
+                "evaluate output chunk must be {TOKEN_DELTA_EVENT_KIND}, got {}",
+                body.kind()
+            )));
+        }
+        if body.canonicalization() != evaluate_output_canonicalization() {
+            return Err(ExecutionError::protocol(
+                "evaluate output chunk canonicalization mismatch",
+            ));
+        }
+        let delta = decode_token_delta_payload(event.payload())
+            .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
+        if delta.start_position != self.next_position {
+            return Err(ExecutionError::protocol(format!(
+                "evaluate output chunk token position mismatch: expected {}, got {}",
+                self.next_position, delta.start_position
+            )));
+        }
+        self.next_position = delta
+            .end_position()
+            .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
+        self.previous_event = event.event_commitment();
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.events.push(event);
+        Ok((self.next_position, delta))
+    }
+
+    fn verify_terminal(&self, outcome: &Outcome) -> ExecutionResult<()> {
+        let Outcome::Completed { output_events, .. } = outcome else {
+            return Ok(());
+        };
+        if let Some(first) = output_events.first() {
+            let first_key = *first.event().public_key();
+            if let Some(pinned) = self.producer_key
+                && pinned != first_key
+            {
+                return Err(ExecutionError::protocol(
+                    "evaluate terminal transcript producer key does not match streamed chunks",
+                ));
+            }
+        }
+        verify_evaluate_terminal_continuation(&self.events, output_events)
+            .map_err(|source| ExecutionError::EvaluateTranscript { source })
     }
 }
 
@@ -835,7 +926,7 @@ impl PreparedExecution {
 
     /// Stream primary's events live. If a shadow is configured, run it
     /// after primary completes and only emit primary's `Done` once the two
-    /// receipts agree. Mismatch is reported as a `Done(Failed)` so the
+    /// terminal artifact commitments agree. Mismatch is reported as a `Done(Failed)` so the
     /// terminal frame is honest about the disagreement.
     pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
         let Self { primary, shadow } = self;
@@ -873,27 +964,16 @@ impl PreparedExecution {
 #[cfg(feature = "evaluate")]
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
-        Outcome::Completed { receipt, .. } => {
-            receipt.evaluate_text_artifact().ok_or_else(|| {
-                ExecutionError::protocol(
-                    "primary evaluate execution did not produce artifact digest",
-                )
-            })?
-        }
+        Outcome::Completed { text_artifact, .. } => *text_artifact,
         Outcome::Failed { .. } => return Ok(primary),
     };
 
     let shadow_outcome = drain_to_outcome(shadow.stream()).await?;
     match shadow_outcome {
         Outcome::Completed {
-            receipt: shadow_receipt,
+            text_artifact: shadow_digest,
             ..
         } => {
-            let shadow_digest = shadow_receipt.evaluate_text_artifact().ok_or_else(|| {
-                ExecutionError::protocol(
-                    "shadow evaluate execution did not produce artifact digest",
-                )
-            })?;
             if primary_digest == shadow_digest {
                 Ok(primary)
             } else {
@@ -1274,6 +1354,19 @@ fn signed_run_ticket_request(
         .map_err(|source| ExecutionError::source("failed to sign run ticket", source))
 }
 
+#[cfg(feature = "evaluate")]
+fn evaluate_input_from_request_commitment(
+    request_commitment: &[u8],
+) -> ExecutionResult<InputCommitment> {
+    let digest: [u8; 32] = request_commitment.try_into().map_err(|_| {
+        ExecutionError::protocol(format!(
+            "ticket request_commitment must be 32 bytes, got {}",
+            request_commitment.len()
+        ))
+    })?;
+    Ok(InputCommitment::from_digest(Digest::from_bytes(digest)))
+}
+
 // ---------------------------------------------------------------------------
 // Local execute streams — talk directly to `ExecutorHandle`
 // ---------------------------------------------------------------------------
@@ -1293,10 +1386,12 @@ fn local_execute_stream(
         let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
         let mut events = ReceiverStream::new(outcome.events);
         let mut got_terminal = false;
+        let input_commitment = evaluate_input_from_request_commitment(&request_commitment)?;
+        let mut verifier = EvaluateChunkVerifier::new(input_commitment);
         while let Some(item) = events.next().await {
             let wire = item
                 .map_err(|status: WireStatus| ExecutionError::wire("local execution stream failed", status))?;
-            let event = convert_wire_event(wire)?;
+            let event = convert_wire_event(wire, input_commitment, &mut verifier)?;
             let is_done = matches!(event, ExecutionEvent::Done(_));
             yield event;
             if is_done {
@@ -1373,9 +1468,13 @@ fn remote_execute_stream(
             .await
             .map_err(|status| ExecutionError::wire("failed to start remote execute stream", status))?;
         let mut got_terminal = false;
+        let input_commitment = evaluate_input_from_request_commitment(&request_commitment)?;
+        let mut verifier = EvaluateChunkVerifier::new(input_commitment);
         while let Some(item) = wire.next().await {
             let event = convert_wire_event(
-                item.map_err(|status: WireStatus| ExecutionError::wire("remote execute stream failed", status))?
+                item.map_err(|status: WireStatus| ExecutionError::wire("remote execute stream failed", status))?,
+                input_commitment,
+                &mut verifier,
             )?;
             let is_done = matches!(event, ExecutionEvent::Done(_));
             yield event;
@@ -1445,22 +1544,21 @@ fn remote_execute_fetch_stream(
 
 fn verify_fetch_stream_event(
     verifier: &mut FetchChunkVerifier,
-    event: FetchExecutionEvent,
+    event: DecodedFetchWireEvent,
 ) -> ExecutionResult<FetchExecutionEvent> {
     match event {
-        FetchExecutionEvent::Chunk {
-            position,
+        DecodedFetchWireEvent::Chunk {
             output_event,
             event,
         } => {
-            let output_event = verifier.verify_chunk(output_event)?;
+            let (position, output_event) = verifier.verify_chunk(output_event)?;
             Ok(FetchExecutionEvent::Chunk {
                 position,
                 output_event,
                 event,
             })
         }
-        FetchExecutionEvent::Done(outcome) => {
+        DecodedFetchWireEvent::Done(outcome) => {
             verifier.verify_terminal(&outcome)?;
             Ok(FetchExecutionEvent::Done(outcome))
         }
@@ -1468,16 +1566,33 @@ fn verify_fetch_stream_event(
 }
 
 #[cfg(feature = "evaluate")]
-fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
+fn convert_wire_event(
+    event: WorkEvent,
+    input_commitment: InputCommitment,
+    verifier: &mut EvaluateChunkVerifier,
+) -> ExecutionResult<ExecutionEvent> {
     let Some(event) = event.kind else {
         return Err(ExecutionError::protocol("wire event with no body"));
     };
     match event {
-        work_event::Kind::Chunk(chunk) => Ok(ExecutionEvent::Chunk {
-            position: chunk.position,
-            tokens: chunk.bytes,
-        }),
-        work_event::Kind::Finished(finished) => Ok(ExecutionEvent::Done(parse_finished(finished)?)),
+        work_event::Kind::Chunk(chunk) => {
+            let output_event = chunk.output_event.ok_or_else(|| {
+                ExecutionError::protocol("evaluate work chunk missing signed output event")
+            })?;
+            let output_event = output_event_from_pb(output_event).map_err(|source| {
+                ExecutionError::source("evaluate output event decode failed", source)
+            })?;
+            let (position, delta) = verifier.verify_chunk(output_event)?;
+            Ok(ExecutionEvent::Chunk {
+                position,
+                tokens: delta.token_bytes(),
+            })
+        }
+        work_event::Kind::Finished(finished) => {
+            let outcome = parse_finished(finished, input_commitment)?;
+            verifier.verify_terminal(&outcome)?;
+            Ok(ExecutionEvent::Done(outcome))
+        }
         work_event::Kind::Failed(failed) => Ok(ExecutionEvent::Done(Outcome::Failed {
             position: failed.position,
             error: failed.error,
@@ -1488,7 +1603,7 @@ fn convert_wire_event(event: WorkEvent) -> ExecutionResult<ExecutionEvent> {
 fn convert_fetch_wire_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
-) -> ExecutionResult<FetchExecutionEvent> {
+) -> ExecutionResult<DecodedFetchWireEvent> {
     let Some(event) = event.kind else {
         return Err(ExecutionError::protocol("wire event with no body"));
     };
@@ -1499,24 +1614,18 @@ fn convert_fetch_wire_event(
             })?;
             let output_event = output_event_from_pb(output_event)
                 .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
-            if output_event.payload() != chunk.bytes {
-                return Err(ExecutionError::protocol(
-                    "fetch work chunk bytes do not match output event payload",
-                ));
-            }
             let event = decode_fetch_event_payload(output_event.payload()).map_err(|source| {
                 ExecutionError::source("fetch output event payload decode failed", source)
             })?;
-            Ok(FetchExecutionEvent::Chunk {
-                position: chunk.position,
+            Ok(DecodedFetchWireEvent::Chunk {
                 output_event,
                 event,
             })
         }
-        work_event::Kind::Finished(finished) => Ok(FetchExecutionEvent::Done(
+        work_event::Kind::Finished(finished) => Ok(DecodedFetchWireEvent::Done(
             parse_fetch_finished(finished, input_commitment)?,
         )),
-        work_event::Kind::Failed(failed) => Ok(FetchExecutionEvent::Done(FetchOutcome::Failed {
+        work_event::Kind::Failed(failed) => Ok(DecodedFetchWireEvent::Done(FetchOutcome::Failed {
             position: failed.position,
             error: failed.error,
         })),
@@ -1524,16 +1633,48 @@ fn convert_fetch_wire_event(
 }
 
 #[cfg(feature = "evaluate")]
-fn parse_finished(finished: WorkFinished) -> ExecutionResult<Outcome> {
-    let receipt = ReceiptArtifact::from_pb(finished.receipt)?;
-    if receipt.evaluate_text_artifact().is_none() {
-        return Err(ExecutionError::EvaluateReceiptExpected);
+fn parse_finished(
+    finished: WorkFinished,
+    input_commitment: InputCommitment,
+) -> ExecutionResult<Outcome> {
+    let frame_stop_reason = stop_reason_from_pb(finished.status)?;
+    let output_events = finished
+        .output_events
+        .into_iter()
+        .map(output_event_from_pb)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ExecutionError::source("evaluate output event decode failed", source))?;
+    let output = verify_evaluate_output_events(input_commitment, &output_events)
+        .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
+    let terminal = output.terminal;
+    let terminal_stop_reason = stop_reason_from_evaluate(terminal.stop_reason)?;
+    if terminal_stop_reason != frame_stop_reason {
+        return Err(ExecutionError::protocol(
+            "evaluate terminal stop reason does not match stream finish status",
+        ));
     }
-    let stop_reason = stop_reason_from_pb(finished.status)?;
+    if terminal
+        .usage
+        .is_some_and(|usage| usage.output_units != terminal.final_position)
+    {
+        return Err(ExecutionError::protocol(
+            "evaluate terminal usage output_units does not match final_position",
+        ));
+    }
+    let total_tokens = terminal
+        .usage
+        .map(|usage| usage.total_units)
+        .unwrap_or(terminal.final_position);
+    if finished.total_units != total_tokens {
+        return Err(ExecutionError::protocol(
+            "evaluate terminal usage does not match stream total_units",
+        ));
+    }
     Ok(Outcome::Completed {
-        total_tokens: finished.total_units,
-        stop_reason,
-        receipt,
+        total_tokens,
+        stop_reason: terminal_stop_reason,
+        text_artifact: terminal.text_artifact,
+        output_events,
     })
 }
 
@@ -1550,11 +1691,6 @@ fn parse_fetch_finished(
         .map_err(|source| ExecutionError::FetchStreamEnvelope { source })?;
     let output = verify_output_events(input_commitment, &output_events)
         .map_err(|source| ExecutionError::FetchTranscript { source })?;
-    if !finished.output.is_empty() {
-        return Err(ExecutionError::protocol(
-            "fetch finished output must be empty; terminal data is carried by the signed transcript",
-        ));
-    }
     let (_, terminal_payload) = output.output_event_payloads();
     let terminal = decode_fetch_terminal_payload(terminal_payload)
         .map_err(|source| ExecutionError::source("fetch terminal payload decode failed", source))?;
@@ -1562,6 +1698,18 @@ fn parse_fetch_finished(
         output_events,
         terminal,
     })
+}
+
+#[cfg(feature = "evaluate")]
+fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopReason> {
+    match value.as_u8() {
+        1 => Ok(StopReason::EndOfSequence),
+        2 => Ok(StopReason::MaxNewTokens),
+        3 => Ok(StopReason::Cancelled),
+        other => Err(ExecutionError::EvaluateTranscript {
+            source: hellas_rpc::evaluate::EvaluateProtocolError::UnknownStopReason(other),
+        }),
+    }
 }
 
 fn stop_reason_from_pb(value: i32) -> ExecutionResult<StopReason> {
@@ -1591,16 +1739,6 @@ fn verified_fetch_input(request: &PbFetchRequest) -> ExecutionResult<FetchInput>
 }
 
 #[cfg(feature = "evaluate")]
-fn decode_receipt_envelope(
-    envelope: Option<pb::ReceiptEnvelope>,
-) -> ExecutionResult<(Vec<u8>, CoreSignedReceipt)> {
-    let envelope = envelope.ok_or(ExecutionError::MissingReceiptEnvelope)?;
-    let core: CoreSignedReceipt = decode_dag_cbor(&envelope.dag_cbor)
-        .map_err(|source| ExecutionError::ReceiptDecode { source })?;
-    Ok((envelope.dag_cbor, core))
-}
-
-#[cfg(feature = "evaluate")]
 fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
     let revision = quote_req.huggingface_revision.trim();
     if revision.is_empty() {
@@ -1614,9 +1752,16 @@ fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
 mod tests {
     use super::*;
     use hellas_rpc::ProducerSigningKey;
+    #[cfg(feature = "evaluate")]
+    use hellas_rpc::evaluate::{
+        EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
+        input_commitment as evaluate_input_commitment,
+    };
     use hellas_rpc::fetch::{
         FetchOutputTranscriptBuilder, build_input_events, build_output_events,
     };
+    #[cfg(feature = "evaluate")]
+    use hellas_rpc::pb::execute::WorkChunk;
     use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
     use hellas_wire_adaptors::{
         OutputEvent as WireOutputEvent, StopReason as WireStopReason, encode_fetch_terminal_payload,
@@ -1646,8 +1791,6 @@ mod tests {
         let input = verified_fetch_input(request).unwrap().input_commitment;
         let events = build_output_events(input, terminal_payload, producer).unwrap();
         WorkFinished {
-            output: Vec::new(),
-            receipt: None,
             status: FinishStatus::EndOfSequence as i32,
             total_units: 0,
             output_events: events.iter().map(output_event_to_pb).collect(),
@@ -1660,6 +1803,89 @@ mod tests {
             usage: None,
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "evaluate")]
+    fn evaluate_request(runner: &ProducerSigningKey) -> hellas_rpc::EvaluateRequest {
+        hellas_rpc::EvaluateRequest {
+            text_execution: Digest::from_bytes([9; 32]),
+            runner_public_key: runner.public_key(),
+        }
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn evaluate_chunk_projects_signed_event() {
+        let runner = key(1);
+        let producer = key(2);
+        let request = evaluate_request(&runner);
+        let input = evaluate_input_commitment(&request);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
+
+        let mut verifier = EvaluateChunkVerifier::new(input);
+        let event = WorkEvent {
+            kind: Some(work_event::Kind::Chunk(WorkChunk {
+                output_event: Some(output_event_to_pb(&token_event)),
+            })),
+        };
+
+        let decoded = convert_wire_event(event, input, &mut verifier).unwrap();
+        assert!(matches!(
+            decoded,
+            ExecutionEvent::Chunk {
+                position: 2,
+                tokens
+            } if tokens == hellas_rpc::encode_token_ids(&[10, 11])
+        ));
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn evaluate_finished_verifies_streamed_prefix_and_terminal_event() {
+        let runner = key(1);
+        let producer = key(2);
+        let request = evaluate_request(&runner);
+        let input = evaluate_input_commitment(&request);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 2,
+                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                text_artifact: Digest::from_bytes([4; 32]),
+                usage: Some(EvaluateUsage {
+                    input_units: 3,
+                    output_units: 2,
+                    total_units: 5,
+                }),
+            })
+            .unwrap();
+        let mut verifier = EvaluateChunkVerifier::new(input);
+        let chunk = WorkEvent {
+            kind: Some(work_event::Kind::Chunk(WorkChunk {
+                output_event: Some(output_event_to_pb(&token_event)),
+            })),
+        };
+        convert_wire_event(chunk, input, &mut verifier).unwrap();
+
+        let finished = WorkEvent {
+            kind: Some(work_event::Kind::Finished(WorkFinished {
+                status: FinishStatus::EndOfSequence as i32,
+                total_units: 5,
+                output_events: output_events.iter().map(output_event_to_pb).collect(),
+            })),
+        };
+
+        let decoded = convert_wire_event(finished, input, &mut verifier).unwrap();
+        assert!(matches!(
+            decoded,
+            ExecutionEvent::Done(Outcome::Completed {
+                total_tokens: 5,
+                stop_reason: StopReason::EndOfSequence,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1775,13 +2001,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_finished_rejects_unsigned_body_output() {
+    fn fetch_finished_rejects_tampered_output_event_payload() {
         let caller = key(1);
         let producer = key(2);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let terminal_payload = finished_terminal_payload();
         let mut finished = fetch_finished(&request, &producer, &terminal_payload);
-        finished.output = br#"{"x":2}"#.to_vec();
+        finished.output_events[0].payload = br#"{"x":2}"#.to_vec();
 
         assert!(matches!(
             parse_fetch_finished(
@@ -1789,7 +2015,7 @@ mod tests {
                 verified_fetch_input(&request).unwrap().input_commitment
             )
             .unwrap_err(),
-            ExecutionError::Protocol(_)
+            ExecutionError::FetchStreamEnvelope { .. } | ExecutionError::FetchTranscript { .. }
         ));
     }
 }

@@ -3,7 +3,7 @@ syntax = "proto3";
 package hellas.v1;
 
 // Core Hellas work protocol. This file owns the generic ticket and execution
-// surface plus transport-neutral event/receipt shapes. Scheme-specific ticket
+// surface plus transport-neutral event shapes. Scheme-specific ticket
 // creation lives in evaluate.proto / fetch.proto; non-core helper APIs live in
 // courtesy.proto; p2p/node discovery lives in swarm.proto.
 
@@ -71,9 +71,9 @@ message OutputEventEnvelope {
 
 // Wire protocol: zero or more WorkChunk events, terminated by exactly one
 // WorkFinished or WorkFailed, after which the stream ends. WorkChunk events
-// carry signed output events as they become available. WorkFinished.output is
-// scheme-specific: Evaluate text uses it for the complete token-id stream;
-// Fetch leaves it empty and commits terminal data in signed output_events.
+// carry signed output events as they become available. Successful result
+// commitment lives in the terminal signed output event; WorkFinished is stream
+// framing, not a scheme result carrier.
 message WorkEvent {
   oneof kind {
     WorkChunk chunk = 1;
@@ -83,20 +83,13 @@ message WorkEvent {
 }
 
 message WorkChunk {
-  // Cumulative position AFTER this chunk.
-  uint64 position = 1;
-  bytes bytes = 2;
-  OutputEventEnvelope output_event = 3;
+  OutputEventEnvelope output_event = 1;
 }
 
 message WorkFinished {
-  // Complete output object when the scheme uses an in-band terminal payload.
-  // Evaluate text uses little-endian u32 token IDs. Fetch leaves this empty.
-  bytes output = 1;
-  ReceiptEnvelope receipt = 2;
-  FinishStatus status = 3;
-  uint64 total_units = 4;
-  repeated OutputEventEnvelope output_events = 5;
+  FinishStatus status = 1;
+  uint64 total_units = 2;
+  repeated OutputEventEnvelope output_events = 3;
 }
 
 message WorkFailed {
@@ -110,9 +103,4 @@ enum FinishStatus {
   FINISH_STATUS_END_OF_SEQUENCE = 1;
   FINISH_STATUS_MAX_OUTPUT = 2;
   FINISH_STATUS_CANCELLED = 3;
-}
-
-// Canonical hellas-rpc SignedReceipt encoded as strict dag-cbor.
-message ReceiptEnvelope {
-  bytes dag_cbor = 1;
 }

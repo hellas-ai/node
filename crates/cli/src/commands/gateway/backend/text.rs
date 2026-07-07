@@ -6,7 +6,7 @@ use crate::execution::Outcome;
 
 use super::super::state::PreparedGeneration;
 use super::generation::{GenerationEvent, generation_stream};
-use super::provenance::{provenance_from_parts, stop_reason_from_runtime, usage};
+use super::provenance::{provenance_from_execution, stop_reason_from_runtime, usage};
 
 pub(super) fn text_events(
     prepared: PreparedGeneration,
@@ -30,19 +30,17 @@ pub(super) fn text_events(
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
                     total_tokens,
                     stop_reason,
-                    receipt,
+                    text_artifact,
+                    ..
                 })))) => {
                     info!(
-                        receipt = %receipt.encoded(),
+                        %text_artifact,
                         provenance = ?stream_provenance,
                         total_tokens,
                         ?stop_reason,
                         "gateway stream ready"
                     );
-                    if let Some(provenance) = provenance_from_parts(
-                        stream_provenance.as_ref(),
-                        Some(&receipt),
-                    ) {
+                    if let Some(provenance) = stream_provenance.as_ref().map(provenance_from_execution) {
                         yield OutputEvent::Provenance(provenance);
                     }
                     yield OutputEvent::Finished {

@@ -41,9 +41,8 @@ pub struct TicketOutcome<R> {
 }
 
 /// Streaming execution paired with the provenance committed to at
-/// quote-acceptance time. The producer receipt is terminal and travels via
-/// the final `WorkFinished.receipt` event — it's not part of
-/// `ExecutionProvenance`.
+/// quote-acceptance time. Scheme results are carried by signed terminal
+/// output events in the stream, not by `ExecutionProvenance`.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
     pub provenance: ExecutionProvenance,

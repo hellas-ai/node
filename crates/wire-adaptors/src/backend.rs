@@ -227,9 +227,6 @@ fn merge_provenance(current: &mut Option<Provenance>, next: Provenance) {
             if next.call_commitment.is_some() {
                 current.call_commitment = next.call_commitment;
             }
-            if next.receipt.is_some() {
-                current.receipt = next.receipt;
-            }
         }
         None => *current = Some(next),
     }
@@ -271,8 +268,7 @@ mod tests {
                     arguments: json!({"query": "tea"}),
                 })),
                 Ok(OutputEvent::Provenance(Provenance {
-                    call_commitment: None,
-                    receipt: Some("receipt".to_string()),
+                    call_commitment: Some("call".to_string()),
                 })),
                 Ok(OutputEvent::Finished {
                     stop_reason: crate::StopReason::EndOfText,
@@ -285,7 +281,6 @@ mod tests {
             ]),
             Some(Provenance {
                 call_commitment: Some("call".to_string()),
-                receipt: None,
             }),
         );
 
@@ -296,7 +291,6 @@ mod tests {
             result.provenance,
             Some(Provenance {
                 call_commitment: Some("call".to_string()),
-                receipt: Some("receipt".to_string()),
             })
         );
         assert_eq!(
@@ -339,7 +333,6 @@ mod tests {
             ]),
             Some(Provenance {
                 call_commitment: Some("call".to_string()),
-                receipt: None,
             }),
         );
 
@@ -364,7 +357,6 @@ mod tests {
             result.provenance,
             Some(Provenance {
                 call_commitment: Some("call".to_string()),
-                receipt: None,
             })
         );
     }

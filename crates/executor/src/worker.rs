@@ -2,10 +2,12 @@ use crate::executor::ExecutorMessage;
 use crate::state::{Invocation, ModelLocator, StopReason};
 use chatgrad::PreparedPrompt;
 use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
-use hellas_rpc::EvaluateRequest;
+use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
+use hellas_rpc::stream::output_event_to_pb;
+use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, ProducerSigningKey};
 use hellas_wire::WireStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +29,7 @@ pub(crate) enum EnqueueError {
 
 pub(crate) struct ExecuteJob {
     pub execution_id: String,
+    pub request_commitment: [u8; 32],
     pub model_id: String,
     pub evaluate_request: EvaluateRequest,
     pub locator: ModelLocator,
@@ -35,6 +38,7 @@ pub(crate) struct ExecuteJob {
     pub accepted_at: Instant,
     pub cancel: CancellationToken,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
+    pub producer_key: Arc<ProducerSigningKey>,
 }
 
 struct DecodeOutcome {
@@ -44,6 +48,7 @@ struct DecodeOutcome {
 
 pub(crate) struct WorkerCompletion {
     pub execution_id: String,
+    pub request_commitment: [u8; 32],
     pub model_id: String,
     pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,
@@ -55,6 +60,7 @@ pub(crate) enum WorkerCompletionResult {
     Completed {
         stop_reason: StopReason,
         output_tokens: Vec<u32>,
+        output_events: Vec<OutputEventEnvelope>,
     },
     Failed {
         position: u64,
@@ -97,18 +103,27 @@ fn worker_loop(
     let mut engines: HashMap<ModelLocator, ModelEngine> = HashMap::new();
     while let Ok(job) = rx.recv() {
         let execution_id = job.execution_id.clone();
+        let request_commitment = job.request_commitment;
         let model_id = job.model_id.clone();
         let sender = job.sender.clone();
         let cancel = job.cancel.clone();
         let evaluate_request = job.evaluate_request.clone();
         let invocation = job.invocation.clone();
+        let producer_key = job.producer_key.clone();
 
         let position = Arc::new(AtomicU64::new(0));
+        let mut output_builder = EvaluateOutputTranscriptBuilder::new(
+            input_commitment(&evaluate_request),
+            &producer_key,
+        );
+        let mut output_events = Vec::new();
         let on_progress = make_on_progress(
             Arc::clone(&position),
             sender.clone(),
             cancel.clone(),
             execution_id.clone(),
+            &mut output_builder,
+            &mut output_events,
         );
 
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -117,6 +132,7 @@ fn worker_loop(
             Ok(Ok(outcome)) => WorkerCompletionResult::Completed {
                 stop_reason: outcome.stop_reason,
                 output_tokens: outcome.output_tokens,
+                output_events,
             },
             Ok(Err(err)) => {
                 let msg = format!("{err:#}");
@@ -139,6 +155,7 @@ fn worker_loop(
         let _ = executor_tx.send(ExecutorMessage::SchemeFinished(Box::new(
             WorkerCompletion {
                 execution_id,
+                request_commitment,
                 model_id,
                 evaluate_request,
                 invocation,
@@ -151,7 +168,7 @@ fn worker_loop(
 
 fn run_job(
     job: ExecuteJob,
-    mut on_progress: impl FnMut(u64, &[u8]),
+    mut on_progress: impl FnMut(u64, Vec<u32>) -> Result<(), hellas_rpc::ExecutorError>,
     engines: &mut HashMap<ModelLocator, ModelEngine>,
 ) -> Result<DecodeOutcome, hellas_rpc::ExecutorError> {
     let ExecuteJob {
@@ -198,15 +215,19 @@ fn run_job(
     let mut output_tokens = Vec::new();
     let mut pending = Vec::with_capacity(batch_size);
     let mut generated = 0u64;
+    let mut progress_error = None;
 
     let generated_output = engine
         .generate_tokens_from_prepared(&prepared, invocation.max_new_tokens, |token| {
             generated = generated.saturating_add(1);
             output_tokens.push(token.token_id);
             pending.push(token.token_id);
-            if pending.len() >= batch_size {
-                on_progress(generated, &hellas_rpc::encode_token_ids(&pending));
-                pending.clear();
+            if pending.len() >= batch_size
+                && let Err(err) = on_progress(generated, std::mem::take(&mut pending))
+            {
+                progress_error = Some(err);
+                cancel.cancel();
+                return Ok(GenerationControl::Cancel);
             }
             if cancel.is_cancelled() {
                 Ok(GenerationControl::Cancel)
@@ -216,8 +237,12 @@ fn run_job(
         })
         .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
 
+    if let Some(err) = progress_error {
+        return Err(err);
+    }
+
     if !pending.is_empty() {
-        on_progress(generated, &hellas_rpc::encode_token_ids(&pending));
+        on_progress(generated, pending)?;
     }
 
     let stop_reason = match generated_output.termination {
@@ -246,24 +271,30 @@ fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, hellas_rpc::ExecutorE
         .collect()
 }
 
-fn make_on_progress(
+fn make_on_progress<'a, 'b>(
     position: Arc<AtomicU64>,
     sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     cancel: CancellationToken,
     execution_id: String,
-) -> impl FnMut(u64, &[u8]) + Send {
-    move |progress: u64, chunk: &[u8]| {
+    output_builder: &'a mut EvaluateOutputTranscriptBuilder<'b>,
+    output_events: &'a mut Vec<OutputEventEnvelope>,
+) -> impl FnMut(u64, Vec<u32>) -> Result<(), hellas_rpc::ExecutorError> + Send + 'a {
+    move |progress: u64, token_ids: Vec<u32>| {
         position.store(progress, Ordering::Relaxed);
+        let output_event = output_builder
+            .push_token_delta(token_ids)
+            .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
         let event = PbWorkEvent {
             kind: Some(PbEvent::Chunk(PbChunk {
-                position: progress,
-                bytes: chunk.to_vec(),
-                output_event: None,
+                output_event: Some(output_event_to_pb(&output_event)),
             })),
         };
         if sender.blocking_send(Ok(event)).is_err() {
             debug!(%execution_id, "consumer dropped; cancelling worker");
             cancel.cancel();
+            return Err(hellas_rpc::ExecutorError::ChannelClosed);
         }
+        output_events.push(output_event);
+        Ok(())
     }
 }

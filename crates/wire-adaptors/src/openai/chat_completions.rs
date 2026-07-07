@@ -626,9 +626,6 @@ fn provenance_json(provenance: &crate::Provenance) -> Option<JsonValue> {
             JsonValue::String(commitment.clone()),
         );
     }
-    if let Some(receipt) = &provenance.receipt {
-        object.insert("receipt".to_string(), JsonValue::String(receipt.clone()));
-    }
     (!object.is_empty()).then_some(JsonValue::Object(object))
 }
 
@@ -886,7 +883,6 @@ mod tests {
             stop_reason: StopReason::EndOfText,
             provenance: Some(Provenance {
                 call_commitment: Some("aa".repeat(32)),
-                receipt: Some("bb".repeat(32)),
             }),
             error: None,
         };
@@ -905,7 +901,6 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "done");
         assert_eq!(body["usage"]["prompt_tokens"], 3);
         assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
-        assert_eq!(body["hellas"]["receipt"], "bb".repeat(32));
     }
 
     #[test]

@@ -3431,13 +3431,7 @@ name = "hellas-kernel"
 version = "0.1.0"
 dependencies = [
  "allocation-counter",
- "base64ct",
  "blake3",
- "bs58",
- "bytes",
- "commonware-codec",
- "commonware-consensus",
- "commonware-cryptography",
  "criterion 0.8.2",
  "hellas-kernel",
  "itf",
@@ -3449,8 +3443,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "stateright",
- "thiserror 2.0.18",
- "url",
 ]
 
 [[package]]

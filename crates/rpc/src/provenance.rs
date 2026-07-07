@@ -16,12 +16,8 @@ use thiserror::Error;
 /// Metadata key for the work commitment digest (raw 32 bytes).
 pub const COMMITMENT_KEY: &str = "x-hellas-commitment-bin";
 
-/// Metadata key for the terminal signed receipt envelope.
-pub const RECEIPT_KEY: &str = "x-hellas-receipt-bin";
-
-/// Pre-flight provenance for a single execution. The signed receipt envelope
-/// is terminal and not part of this struct — it travels via the streaming
-/// `Outcome::Completed` payload.
+/// Pre-flight provenance for a single execution. Scheme result commitments
+/// live in signed terminal output events, not in this struct.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],

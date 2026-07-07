@@ -11,6 +11,8 @@ pub mod error;
 pub mod model;
 
 pub mod call;
+#[cfg(feature = "evaluate")]
+pub mod evaluate;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod peers;
@@ -29,17 +31,15 @@ pub mod policy;
 pub mod provenance;
 
 pub use protocol::{
-    AssuranceStrategy, CanonicalizationId, CommitmentScheme, DagCborDecodeError,
-    DagCborEncodeError, DagCborEncoder, DeliveryOutput, DeliveryRequest, Digest, Dtype, Evaluate,
-    EvaluateOutput, EvaluateRequest, EventCommitment, InputCommitment, InputEventBody,
+    AssuranceStrategy, CanonicalizationId, DagCborDecodeError, DagCborEncodeError, DagCborEncoder,
+    Digest, Dtype, Evaluate, EvaluateRequest, EventCommitment, InputCommitment, InputEventBody,
     InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JsonBytes, OutputEventBody,
     OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, ParseDtypeError,
-    ProducerId, ProducerSigningKey, PublicKey, ReceiptBody, ReceiptCommitment, RequestCommitment,
-    ResultCommitment, SchemeId, Signature, SignatureError, SignatureKind, SignedInputEvent,
-    SignedOutputEvent, SignedReceipt, StreamId, StreamVerifyError, VerifyError, canonical_dag_cbor,
-    decode_dag_cbor, hash_tuple, input_genesis, output_genesis, verify_delivery,
-    verify_input_event_envelopes, verify_input_transcript, verify_output_event_envelopes,
-    verify_output_transcript, verify_receipt,
+    ProducerId, ProducerSigningKey, PublicKey, RequestCommitment, SchemeId, Signature,
+    SignatureError, SignatureKind, SignedInputEvent, SignedOutputEvent, StreamId,
+    StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
+    output_genesis, verify_input_event_envelopes, verify_input_transcript,
+    verify_output_event_envelopes, verify_output_transcript,
 };
 pub use protocol::{commitment, digest, signature, tags, value};
 
