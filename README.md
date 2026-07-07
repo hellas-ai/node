@@ -5,7 +5,7 @@
 Install:
 
 ```bash
-cargo install --git https://github.com/hellas-ai/node
+cargo install --git https://github.com/hellas-ai/hellas
 ```
 
 Execute:
@@ -34,7 +34,7 @@ cargo run -- execute --verify-local -p hey
 Install server features:
 
 ```bash
-cargo install --git https://github.com/hellas-ai/node --features serve
+cargo install --git https://github.com/hellas-ai/hellas --features serve
 ```
 
 Run server:
@@ -108,7 +108,7 @@ Docker images: `.#docker-cpu`, `.#docker-cuda12-sm89`, etc. They stream to stdou
 
 ```bash
 $(nix build .#docker-cuda12-sm89 --print-out-paths) | docker load
-nix run .#docker-push-all                # push all images to ghcr.io/hellas-ai/node
+nix run .#docker-push-all                # push all images to ghcr.io/hellas-ai/hellas
 ```
 
 Run a CUDA server with persistent HF cache, metrics, and Jaeger tracing:
@@ -120,7 +120,7 @@ docker run --rm -it \
   -p 9090:9090 \
   -v ~/.cache/huggingface:/home/hellas/.cache/huggingface \
   -e OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://jaeger:4318/v1/traces \
-  ghcr.io/hellas-ai/node:cuda12-sm89 \
+  ghcr.io/hellas-ai/hellas:cuda12-sm89 \
   --execute-policy=eager \
   --metrics-port=9090 \
   --preload HuggingFaceTB/SmolLM2-135M-Instruct

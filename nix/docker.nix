@@ -8,7 +8,7 @@
   cliCandle,
 }:
 let
-  imageRepository = "ghcr.io/hellas-ai/node";
+  imageRepository = "ghcr.io/hellas-ai/hellas";
   runtimeCoreLibs = with pkgs; [
     stdenv.cc.cc.lib
     glibc
