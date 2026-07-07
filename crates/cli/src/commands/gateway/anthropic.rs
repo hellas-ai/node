@@ -5,8 +5,8 @@ use super::wire_adaptor::{backend_wire_response, parse_backend_request};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
-use hellas_wire_adaptors::RenderContext;
-use hellas_wire_adaptors::anthropic::AnthropicMessagesAdaptor;
+use hellas_adaptors::RenderContext;
+use hellas_adaptors::anthropic::AnthropicMessagesAdaptor;
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {

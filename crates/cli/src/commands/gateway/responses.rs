@@ -5,9 +5,9 @@ use super::{next_id, now_unix};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
-use hellas_wire_adaptors::openai::responses::OpenAiResponsesAdaptor;
-use hellas_wire_adaptors::openai::responses::ParsedResponseRequest;
-use hellas_wire_adaptors::{BackendRequest, RenderContext};
+use hellas_adaptors::openai::responses::OpenAiResponsesAdaptor;
+use hellas_adaptors::openai::responses::ParsedResponseRequest;
+use hellas_adaptors::{BackendRequest, RenderContext};
 use std::sync::Arc;
 
 pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {

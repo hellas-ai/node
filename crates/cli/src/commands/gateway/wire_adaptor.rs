@@ -4,7 +4,7 @@ use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_wire_adaptors::{
+use hellas_adaptors::{
     AdaptorError, BackendError, BackendRequest, ExecutionBackend, OutputEvent, Provenance,
     RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse, WireStreamEvent,
 };

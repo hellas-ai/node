@@ -1,6 +1,6 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_wire_adaptors::{BackendError, OutputEvent, TextChannel};
+use hellas_adaptors::{BackendError, OutputEvent, TextChannel};
 
 use crate::execution::Outcome;
 

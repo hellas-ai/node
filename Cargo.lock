@@ -3312,6 +3312,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hellas-adaptors"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "hellas-rpc",
+ "serde",
+ "serde_ipld_dagcbor",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hellas-chain"
 version = "0.1.0"
 dependencies = [
@@ -3373,11 +3387,11 @@ dependencies = [
  "chatgrad",
  "clap",
  "futures",
+ "hellas-adaptors",
  "hellas-chain",
  "hellas-executor",
  "hellas-rpc",
  "hellas-wire",
- "hellas-wire-adaptors",
  "hex",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -3505,20 +3519,6 @@ dependencies = [
  "web-time",
  "worker",
  "ws_stream_wasm",
-]
-
-[[package]]
-name = "hellas-wire-adaptors"
-version = "0.1.0"
-dependencies = [
- "futures-core",
- "futures-executor",
- "futures-util",
- "hellas-rpc",
- "serde",
- "serde_ipld_dagcbor",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
