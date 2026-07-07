@@ -212,7 +212,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 limit: self.config.body_frame_max,
             });
         }
-        let limit = self.config.body_frame_max;
         let slot = self
             .slot_mut(idx)
             .ok_or(MuxError::Protocol("send on empty slot"))?;
@@ -237,7 +236,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         }
         slot.peer_recv_credit -= payload.len() as u32;
         slot.send_queue.push_back(Frame::Body(payload));
-        let _ = limit;
         Ok(())
     }
 
@@ -288,22 +286,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         slot.send_queue.clear();
         slot.send_queue
             .push_front(Frame::Reset(ResetFrame { code }));
-    }
-
-    /// Pull buffered body chunks off the slot for the application.
-    pub fn drain_recv(&mut self, idx: SlotIndex) -> Vec<Bytes> {
-        let Some(slot) = self.slot_mut(idx) else {
-            return Vec::new();
-        };
-        let drained: Vec<Bytes> = slot.recv_buf.drain(..).collect();
-        // Replenish local credit if we've drained below the refill ratio.
-        let drained_bytes: u32 = drained.iter().map(|b| b.len() as u32).sum();
-        slot.local_recv_credit = slot
-            .local_recv_credit
-            .saturating_add(drained_bytes)
-            .min(slot.local_credit_high_water);
-        // Note: a Credit frame is emitted on demand by `prepare_credit_updates`.
-        drained
     }
 
     /// Examine slots and queue Credit frames where local_recv_credit has
@@ -363,7 +345,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         // now considered shipped. Free its slot before scanning so a
         // newly-opened slot can reclaim the index.
         self.drain_pending_terminal_free();
-        let start = self.rr;
         for _ in 0..N {
             let idx = self.rr;
             self.rr = (self.rr + 1) % (N as u16);
@@ -396,7 +377,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 return Some(bytes);
             }
         }
-        let _ = start;
         None
     }
 
@@ -465,7 +445,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         }
         if let Some(s) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut()) {
             s.state = SlotState::Closed;
-            s.recv_buf.clear();
         }
         self.mark_free(idx);
         true
@@ -567,7 +546,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             }
             Frame::End(end) => {
                 slot.peer_terminal = true;
-                slot.recv_trailer = Some(end.trailer.clone());
                 slot.state = match slot.state {
                     SlotState::OpenRemote | SlotState::OpenLocal | SlotState::Open => {
                         SlotState::HalfClosedRemote
@@ -626,18 +604,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         self.slot(idx)
             .map(|s| !s.send_queue.iter().any(|f| matches!(f, Frame::Body(_))))
             .unwrap_or(false)
-    }
-
-    /// Whether this slot has any pending recv chunks for the app.
-    pub fn recv_pending(&self, idx: SlotIndex) -> bool {
-        self.slot(idx)
-            .map(|s| !s.recv_buf.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Trailer captured from inbound End / Reset, if any.
-    pub fn recv_trailer(&self, idx: SlotIndex) -> Option<Trailer> {
-        self.slot(idx).and_then(|s| s.recv_trailer.clone())
     }
 
     // -- Hibernation snapshot/restore ---------------------------------------
@@ -747,10 +713,9 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     /// Construct a `StreamSlot` from a snapshot. The caller supplies the
     /// post-wake `opened_at` (so `Instant`s reconstitute relative to the
     /// new clock). `send_queue` starts empty here; the cf_do snapshot
-    /// reader re-pushes any persisted entries afterward. `recv_buf` and
-    /// `recv_trailer` always reset — inbound-side buffered state is not
-    /// part of the hibernation contract (peer will retransmit or surface
-    /// a transport-level failure).
+    /// reader re-pushes any persisted entries afterward. Inbound body and
+    /// trailer reach the app through `recv()` events, not slot buffers, so
+    /// there is no inbound-side state to restore.
     #[cfg(feature = "ws-cf-do")]
     pub(crate) fn make_restored_slot(
         generation: u16,
@@ -777,8 +742,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             // Closed: both. Open*/Open: neither.
             local_terminal: matches!(state, SlotState::HalfClosedLocal | SlotState::Closed),
             peer_terminal: matches!(state, SlotState::HalfClosedRemote | SlotState::Closed),
-            recv_buf: Default::default(),
-            recv_trailer: None,
         }
     }
 }

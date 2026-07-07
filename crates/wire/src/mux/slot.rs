@@ -1,6 +1,5 @@
 //! Per-slot stream state.
 
-use bytes::Bytes;
 use web_time::Instant;
 
 use crate::frame::Frame;
@@ -29,13 +28,6 @@ impl Role {
         match self {
             Self::Client => 0,
             Self::Server => 1,
-        }
-    }
-
-    pub const fn peer(self) -> Self {
-        match self {
-            Self::Client => Self::Server,
-            Self::Server => Self::Client,
         }
     }
 
@@ -92,12 +84,6 @@ pub struct StreamSlot {
     pub peer_terminal: bool,
     /// Whether we've sent our terminal frame (End or Reset).
     pub local_terminal: bool,
-    /// Recv-side buffer of in-flight Body bytes pending application
-    /// consumption. Plain `VecDeque<Bytes>` so we don't merge across
-    /// allocations.
-    pub recv_buf: std::collections::VecDeque<Bytes>,
-    /// Trailer captured from inbound End / synthesized from Reset.
-    pub recv_trailer: Option<crate::metadata::Trailer>,
 }
 
 impl StreamSlot {
@@ -114,8 +100,6 @@ impl StreamSlot {
             send_queue: std::collections::VecDeque::with_capacity(SLOT_QUEUE_CAP),
             peer_terminal: false,
             local_terminal: false,
-            recv_buf: Default::default(),
-            recv_trailer: None,
         }
     }
 
@@ -132,8 +116,6 @@ impl StreamSlot {
             send_queue: std::collections::VecDeque::with_capacity(SLOT_QUEUE_CAP),
             peer_terminal: false,
             local_terminal: false,
-            recv_buf: Default::default(),
-            recv_trailer: None,
         }
     }
 
