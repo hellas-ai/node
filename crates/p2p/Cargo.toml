@@ -1,0 +1,20 @@
+[package]
+name = "hellas-p2p"
+description = "Sans-io peer registry, admission control, and connection directory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+# `From<iroh::EndpointId> for PeerId` so callers can build a PeerId from
+# iroh's EndpointId without a hex round-trip.
+iroh = ["dep:iroh"]
+
+[dependencies]
+hellas-wire = { workspace = true }
+thiserror = { workspace = true }
+web-time = "1"
+iroh = { workspace = true, optional = true }

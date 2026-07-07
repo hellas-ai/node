@@ -32,10 +32,10 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 # Server-side dispatchers.
 server = []
 
-# Iroh transport binding. Enables `From<iroh::EndpointId> for PeerId`
-# (peers/id.rs) so consumers can construct PeerIds from iroh's
-# EndpointId without a separate conversion helper.
-iroh = ["dep:iroh"]
+# Iroh transport binding. Forwards to `hellas-p2p/iroh`, which enables
+# `From<iroh::EndpointId> for PeerId` so consumers can build PeerIds from
+# iroh's EndpointId without a hex round-trip.
+iroh = ["hellas-p2p/iroh"]
 iroh-client = ["iroh"]
 iroh-server = ["iroh"]
 
@@ -65,7 +65,6 @@ hellas-wire = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = [
     "ureq",
 ], optional = true }
-iroh = { workspace = true, optional = true }
 k256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true }
@@ -78,10 +77,7 @@ tokenizers = { version = "0.21", default-features = false, features = [
     "progressbar",
     "fancy-regex",
 ], optional = true }
-# `web-time` provides `std::time::Instant` / `SystemTime` equivalents so the
-# peer registry's monotonic clock works under wasm (where `Instant::now` panics with
-# "time not implemented on this platform"). Identical to std on native targets.
-web-time = "1"
+hellas-p2p = { workspace = true }
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
 tokenizers = { version = "0.21", features = [

@@ -10,6 +10,10 @@ use axum::response::{IntoResponse, Response};
 use chatgrad::PreparedPrompt;
 use chatgrad::types::Message;
 use chatgrad::types::openai;
+use hellas_adaptors::{
+    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
+    Message as WireMessage,
+};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
 use hellas_rpc::Dtype;
@@ -17,10 +21,6 @@ use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_adaptors::{
-    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
-    Message as WireMessage,
-};
 use iroh::EndpointId;
 use std::collections::HashMap;
 use std::error::Error as StdError;

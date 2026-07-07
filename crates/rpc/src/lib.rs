@@ -17,7 +17,10 @@ pub mod evaluate;
 pub mod fetch;
 #[cfg(feature = "fetch")]
 pub mod output;
-pub mod peers;
+/// Peer registry, admission, and connection directory. Re-exported from
+/// the standalone [`hellas_p2p`] crate; `hellas_rpc::peers::X` paths
+/// remain valid.
+pub use hellas_p2p as peers;
 pub mod protocol;
 #[cfg(feature = "execute")]
 pub mod run_ticket;
@@ -60,6 +63,30 @@ pub mod pb;
 
 /// Service marker and handler modules.
 pub use crate::pb::services;
+
+/// ALPN/FQN service aliases derived from this crate's generated service
+/// catalogue, for injecting into [`peers::PeerDirectoryConfig`]. p2p is
+/// protocol-agnostic and ships an empty alias table; this is where the
+/// concrete services get wired in.
+pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
+    crate::services::KNOWN_SERVICES
+        .iter()
+        .flat_map(|entry| {
+            [
+                peers::ServiceAlias::new(entry.alpn, entry.name),
+                peers::ServiceAlias::new(entry.name, entry.name),
+            ]
+        })
+        .collect()
+}
+
+/// A [`peers::PeerDirectoryConfig`] preseeded with [`peer_service_aliases`].
+pub fn peer_directory_config() -> peers::PeerDirectoryConfig {
+    peers::PeerDirectoryConfig {
+        service_aliases: peer_service_aliases(),
+        ..Default::default()
+    }
+}
 
 #[cfg(feature = "execute")]
 pub use error::ExecutorError;

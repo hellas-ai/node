@@ -3,11 +3,11 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
-use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_adaptors::{
     AdaptorError, BackendError, BackendRequest, ExecutionBackend, OutputEvent, Provenance,
     RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse, WireStreamEvent,
 };
+use hellas_rpc::provenance::ExecutionProvenance;
 
 use super::{json_error, sse_data, sse_event_data, sse_response};
 

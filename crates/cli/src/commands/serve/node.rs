@@ -133,7 +133,12 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     // forwarding to the generated dispatcher and records inbound request
     // observations in the directory.
     let local_peer = PeerId::from_bytes(*node_id.as_bytes());
-    let directory = Arc::new(PeerDirectory::new(local_peer));
+    // Seed the directory with this crate's generated service catalogue so
+    // ALPN/FQN service-filter queries resolve (p2p ships no service names).
+    let directory = Arc::new(PeerDirectory::with_config(
+        local_peer,
+        hellas_rpc::peer_directory_config(),
+    ));
 
     // -- Build the Node handler with the operator-supplied build hash
     //    and graffiti so introspection (`hellas rpc`) returns real data.

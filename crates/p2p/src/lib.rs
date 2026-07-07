@@ -30,7 +30,7 @@ mod registry;
 mod security;
 
 pub use admission::{AcquireDenied, TokenBucket};
-pub use directory::{PeerDirectory, PeerDirectoryConfig};
+pub use directory::{PeerDirectory, PeerDirectoryConfig, ServiceAlias};
 pub use id::PeerId;
 pub use manager::{
     PeerManager, PeerManagerError, PeerServiceSession, PeerSession, RpcObservation, RpcPermitGuard,
@@ -46,3 +46,29 @@ pub use security::{AuthLevel, TransportSecurity};
 // registry consumes those traits — no separate `RpcService` /
 // `RpcMethod` here.
 pub use hellas_wire::{MethodMarker as RpcMethod, ServiceMarker as RpcService};
+
+/// Fake service/method markers for tests, standing in for the codegen
+/// markers the peer engine consumes at runtime. Kept here so the three
+/// test modules share one definition instead of each re-declaring it.
+#[cfg(test)]
+pub(crate) mod test_markers {
+    use hellas_wire::{MethodMarker, ServiceMarker};
+
+    pub struct TestService;
+    impl ServiceMarker for TestService {
+        const NAME: &'static str = "hellas.swarm.v1.Node";
+        const ALPN: &'static str = "/hellas.swarm.v1.Node/1.0";
+        const SERVICE_ID: u32 = 1;
+    }
+
+    pub struct GetNodeInfo;
+    impl MethodMarker for GetNodeInfo {
+        type Service = TestService;
+        type Request = ();
+        type Response = ();
+        const NAME: &'static str = "GetNodeInfo";
+        const METHOD_ID: u32 = 1;
+        const REQUEST_STREAMING: bool = false;
+        const RESPONSE_STREAMING: bool = false;
+    }
+}

@@ -24,19 +24,6 @@ impl ServiceAlias {
     }
 }
 
-fn default_service_aliases() -> Vec<ServiceAlias> {
-    // Derive the alias table from the generated `KNOWN_SERVICES` list so the
-    // directory's view of "what services exist" stays in sync with codegen.
-    // Each service contributes two aliases: one keyed by ALPN and one keyed
-    // by FQN, both pointing at the FQN as the canonical service name.
-    let mut aliases = Vec::with_capacity(crate::services::KNOWN_SERVICES.len() * 2);
-    for entry in crate::services::KNOWN_SERVICES {
-        aliases.push(ServiceAlias::new(entry.alpn, entry.name));
-        aliases.push(ServiceAlias::new(entry.name, entry.name));
-    }
-    aliases
-}
-
 /// Policy and bounds for serving peer-disclosure APIs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerDirectoryConfig {
@@ -47,6 +34,8 @@ pub struct PeerDirectoryConfig {
     pub max_service_filter_len: usize,
     pub global_known_peers_bucket_capacity: f64,
     pub global_known_peers_bucket_refill_per_sec: f64,
+    /// ALPN/FQN aliases the directory accepts in service-filter queries.
+    /// Empty unless the owning crate injects its service catalogue.
     pub service_aliases: Vec<ServiceAlias>,
     /// Minimum `AuthLevel` a peer must hold to appear in
     /// [`PeerDirectory::ranked_known_peers`]. Default is `Untrusted` (no
@@ -70,7 +59,10 @@ impl Default for PeerDirectoryConfig {
             max_service_filter_len: DEFAULT_MAX_SERVICE_FILTER_LEN,
             global_known_peers_bucket_capacity: DEFAULT_GLOBAL_BUCKET_CAPACITY,
             global_known_peers_bucket_refill_per_sec: DEFAULT_GLOBAL_BUCKET_REFILL_PER_SEC,
-            service_aliases: default_service_aliases(),
+            // Empty by default: p2p does not know the concrete protocol
+            // services. The owning crate (hellas-rpc) populates this from its
+            // generated service catalogue via `hellas_rpc::peer_service_aliases`.
+            service_aliases: Vec::new(),
             min_disclosed_auth_level: AuthLevel::Untrusted,
         }
     }
@@ -271,12 +263,12 @@ fn bounded_penalty(count: u64, weight: i64) -> i64 {
     count.saturating_mul(weight as u64).min(i64::MAX as u64) as i64
 }
 
-#[cfg(all(test, feature = "swarm"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peers::DiscoverySource;
-    use crate::peers::TransportSecurity;
-    use crate::services::node::Node as NodeService;
+    use crate::DiscoverySource;
+    use crate::TransportSecurity;
+    use crate::test_markers::TestService as NodeService;
     use hellas_wire::ServiceMarker;
 
     fn peer(byte: u8) -> PeerId {
@@ -306,10 +298,19 @@ mod tests {
         let requester = peer(99);
         let mut ids = vec![peer(5), peer(2), peer(7), peer(1), peer(3)];
 
+        // p2p ships an empty alias table (it does not know concrete
+        // services); inject the test service so ALPN queries resolve.
+        let config = PeerDirectoryConfig {
+            service_aliases: vec![ServiceAlias::new(
+                <NodeService as ServiceMarker>::ALPN,
+                <NodeService as ServiceMarker>::NAME,
+            )],
+            ..Default::default()
+        };
         let mut expected: Option<Vec<PeerId>> = None;
         let id_count = ids.len();
         for trial in 0..8 {
-            let directory = PeerDirectory::new(local);
+            let directory = PeerDirectory::with_config(local, config.clone());
             ids.rotate_left(trial % id_count);
             for id in &ids {
                 mark_node(&directory, *id);
