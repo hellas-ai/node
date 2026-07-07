@@ -6,9 +6,21 @@
 //! `origin` or `rpIdHash`; those bytes are still signed by the authenticator,
 //! but the verifier treats `WebAuthn` as a portable P-256 transaction-signing
 //! envelope. The accepted `clientDataJSON` grammar is deliberately narrower
-//! than arbitrary JSON: a top-level object with required `type` and
-//! `challenge`, plus known ignored browser fields (`origin`, `crossOrigin`,
-//! `topOrigin`).
+//! than arbitrary JSON: a top-level object with required unescaped `type` and
+//! `challenge` members, where every other member is skipped as long as its
+//! value is *simple* (string, boolean, null, or number). Nested objects and
+//! arrays are rejected. Browsers deliberately inject unknown members —
+//! Chrome's `other_keys_can_be_added_here` decoy exists precisely to break
+//! template parsers — so unknown-member tolerance is required by the
+//! `WebAuthn` spec's client-data verification algorithm; the simple-value
+//! restriction keeps parsing bounded and deterministic.
+//!
+//! Policy note: this verifier accepts user presence *or* user verification
+//! (`UP | UV`) and ignores `origin`. The chain-facing envelope in
+//! [`crate::domain`] enforces a stricter browser-shaped policy (UP *and*
+//! UV, HTTPS origin allowlist, `rpIdHash` binding) for its own transaction
+//! kinds. The two are intentionally different products; do not wire one
+//! where the other is expected.
 
 use p256::{
     EncodedPoint,
@@ -118,9 +130,11 @@ fn verifying_key(
     pub_key_y: &[u8; PayloadHash::LENGTH],
 ) -> Result<VerifyingKey, WebAuthnError> {
     let mut encoded = [0_u8; 65];
-    encoded[0] = 0x04;
-    encoded[1..33].copy_from_slice(pub_key_x);
-    encoded[33..].copy_from_slice(pub_key_y);
+    let (tag, coords) = encoded.split_at_mut(1);
+    tag.fill(0x04);
+    let (xs, ys) = coords.split_at_mut(PayloadHash::LENGTH);
+    xs.copy_from_slice(pub_key_x);
+    ys.copy_from_slice(pub_key_y);
     let point = EncodedPoint::from_bytes(encoded).map_err(|_| WebAuthnError::InvalidPublicKey)?;
     VerifyingKey::from_encoded_point(&point).map_err(|_| WebAuthnError::InvalidPublicKey)
 }
@@ -135,8 +149,9 @@ fn verify_p256_signature(
 
     let verifying_key = verifying_key(assertion.pub_key_x(), assertion.pub_key_y())?;
     let mut sig = [0_u8; 64];
-    sig[..PayloadHash::LENGTH].copy_from_slice(assertion.r());
-    sig[PayloadHash::LENGTH..].copy_from_slice(assertion.s());
+    let (r_half, s_half) = sig.split_at_mut(PayloadHash::LENGTH);
+    r_half.copy_from_slice(assertion.r());
+    s_half.copy_from_slice(assertion.s());
     let signature = P256Signature::from_slice(&sig).map_err(|_| WebAuthnError::InvalidSignature)?;
 
     verifying_key
@@ -152,7 +167,7 @@ fn webauthn_message_hash(
         return Err(WebAuthnError::DataTooShort);
     }
 
-    let flags = webauthn_data[32];
+    let flags = *webauthn_data.get(32).ok_or(WebAuthnError::DataTooShort)?;
     if flags & (UP | UV) == 0 {
         return Err(WebAuthnError::MissingUserPresence);
     }
@@ -163,8 +178,7 @@ fn webauthn_message_hash(
         return Err(WebAuthnError::ExtensionsUnsupported);
     }
 
-    let auth_data = &webauthn_data[..MIN_AUTH_DATA_LEN];
-    let client_data_json = &webauthn_data[MIN_AUTH_DATA_LEN..];
+    let (auth_data, client_data_json) = webauthn_data.split_at(MIN_AUTH_DATA_LEN);
     validate_client_data_json(client_data_json, &base64url_32(hash.as_bytes()))?;
 
     let client_data_hash = Sha256::digest(client_data_json);
@@ -178,6 +192,10 @@ fn webauthn_message_hash(
     Ok(out)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "const-bounded base64 layout: 32 input bytes emit exactly 43 output bytes"
+)]
 fn base64url_32(input: &[u8; PayloadHash::LENGTH]) -> [u8; 43] {
     let mut out = [0_u8; 43];
     let mut input_index = 0;
@@ -247,13 +265,11 @@ fn validate_client_data_json(
                     return Err(WebAuthnError::InvalidChallenge);
                 }
             }
-            FieldName::Origin | FieldName::TopOrigin => {
-                parser.parse_string()?;
-            }
-            FieldName::CrossOrigin => {
-                parser.parse_bool()?;
-            }
-            FieldName::Unknown => return Err(WebAuthnError::InvalidClientDataJson),
+            // Any other member (browser-injected `origin`, `crossOrigin`,
+            // `topOrigin`, Chrome's decoy key, future additions) is
+            // skipped, provided its value is simple. Structured values
+            // are rejected to keep parsing bounded.
+            FieldName::Other => parser.skip_simple_value()?,
         }
 
         parser.skip_ws();
@@ -284,23 +300,19 @@ struct JsonString<'a> {
 enum FieldName {
     Type,
     Challenge,
-    Origin,
-    CrossOrigin,
-    TopOrigin,
-    Unknown,
+    Other,
 }
 
+/// Escaped member names never match a required field: `type`/`challenge`
+/// must appear literally, and an escaped alias is skipped as unknown.
 fn field_name(value: JsonString<'_>) -> FieldName {
     if value.escaped {
-        return FieldName::Unknown;
+        return FieldName::Other;
     }
     match value.bytes {
         b"type" => FieldName::Type,
         b"challenge" => FieldName::Challenge,
-        b"origin" => FieldName::Origin,
-        b"crossOrigin" => FieldName::CrossOrigin,
-        b"topOrigin" => FieldName::TopOrigin,
-        _ => FieldName::Unknown,
+        _ => FieldName::Other,
     }
 }
 
@@ -348,6 +360,10 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "start <= end <= input.len(): pos only advances past peeked bytes"
+    )]
     fn parse_string(&mut self) -> Result<JsonString<'a>, WebAuthnError> {
         self.expect(b'"')?;
         let start = self.pos;
@@ -399,19 +415,43 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_bool(&mut self) -> Result<(), WebAuthnError> {
+    /// Skips one *simple* JSON value: string, `true`, `false`, `null`, or
+    /// number. Objects and arrays are rejected — unknown members may not
+    /// carry structure.
+    fn skip_simple_value(&mut self) -> Result<(), WebAuthnError> {
         match self.peek() {
+            Some(b'"') => self.parse_string().map(|_| ()),
             Some(b't') => self.consume_literal(b"true"),
             Some(b'f') => self.consume_literal(b"false"),
+            Some(b'n') => self.consume_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
             _ => Err(WebAuthnError::InvalidClientDataJson),
         }
     }
 
-    fn consume_literal(&mut self, literal: &[u8]) -> Result<(), WebAuthnError> {
-        if self.input.len().saturating_sub(self.pos) < literal.len() {
+    /// Consumes a loose number token. The value is never interpreted, so
+    /// full JSON number grammar is not enforced — only that the token is
+    /// non-empty and built from number characters.
+    fn skip_number(&mut self) -> Result<(), WebAuthnError> {
+        let start = self.pos;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => self.pos += 1,
+                _ => break,
+            }
+        }
+        if self.pos == start {
             return Err(WebAuthnError::InvalidClientDataJson);
         }
-        if &self.input[self.pos..self.pos + literal.len()] != literal {
+        Ok(())
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> Result<(), WebAuthnError> {
+        if self
+            .input
+            .get(self.pos..self.pos + literal.len())
+            .is_none_or(|head| head != literal)
+        {
             return Err(WebAuthnError::InvalidClientDataJson);
         }
         self.pos += literal.len();
@@ -420,6 +460,7 @@ impl<'a> JsonParser<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, reason = "test constants are in-bounds")]
 mod tests {
     use super::*;
     use crate::{MAX_WEBAUTHN_DATA_LENGTH, WebAuthnData};
@@ -455,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn client_data_accepts_known_ignored_fields_and_whitespace() {
+    fn client_data_accepts_unknown_simple_members_and_whitespace() {
         let input = br#" {
             "origin": "https://example.invalid",
             "type": "webauthn.get",
@@ -466,9 +507,26 @@ mod tests {
 
         assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
 
-        let input = br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":true}"#;
+        // Chrome injects a decoy member specifically to break template
+        // parsers; the grammar must skip it (and any other simple-valued
+        // unknown member) or real passkey assertions fail.
+        let input = br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","other_keys_can_be_added_here":"do not compare clientDataJSON against a template. See https://goo.gl/yabPex"}"#;
 
         assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
+
+        let input = br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":true,"androidPackageName":"com.example.wallet","futureCount":-1.5e3,"futureFlag":null}"#;
+
+        assert_eq!(validate_client_data_json(input, &ZERO_CHALLENGE), Ok(()));
+
+        // An escaped alias of a required member name is skipped as an
+        // unknown member; the literal `type` member is what gets checked.
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"ty\u0070e":"evil","type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Ok(()),
+        );
     }
 
     #[test]
@@ -523,17 +581,29 @@ mod tests {
             ),
             Err(WebAuthnError::InvalidClientDataType),
         );
+        // An escaped alias of `type` is skipped as an unknown member, so
+        // the required literal member is missing here.
         assert_eq!(
             validate_client_data_json(
                 br#"{"ty\u0070e":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
                 &ZERO_CHALLENGE,
             ),
-            Err(WebAuthnError::InvalidClientDataJson),
+            Err(WebAuthnError::MissingClientDataField),
+        );
+        // A first *literal* `type` member wins even when a later duplicate
+        // holds the expected value - the checked value cannot be displaced.
+        assert_eq!(
+            validate_client_data_json(
+                br#"{"type":"evil","type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                &ZERO_CHALLENGE,
+            ),
+            Err(WebAuthnError::InvalidClientDataType),
         );
     }
 
     #[test]
-    fn client_data_rejects_unknown_fields_and_malformed_ignored_values() {
+    fn client_data_rejects_structured_and_malformed_unknown_values() {
+        // Malformed literal token.
         assert_eq!(
             validate_client_data_json(
                 br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":truex}"#,
@@ -541,6 +611,7 @@ mod tests {
             ),
             Err(WebAuthnError::InvalidClientDataJson),
         );
+        // Unknown members may not carry structure (objects/arrays).
         assert_eq!(
             validate_client_data_json(
                 br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#,
@@ -550,18 +621,12 @@ mod tests {
         );
         assert_eq!(
             validate_client_data_json(
-                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":true}"#,
+                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":[1,2]}"#,
                 &ZERO_CHALLENGE,
             ),
             Err(WebAuthnError::InvalidClientDataJson),
         );
-        assert_eq!(
-            validate_client_data_json(
-                br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":"false"}"#,
-                &ZERO_CHALLENGE,
-            ),
-            Err(WebAuthnError::InvalidClientDataJson),
-        );
+        // Truncated literal.
         assert_eq!(
             validate_client_data_json(
                 br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","crossOrigin":tru"#,
@@ -569,6 +634,7 @@ mod tests {
             ),
             Err(WebAuthnError::InvalidClientDataJson),
         );
+        // Bad unicode escape inside a skipped string.
         assert_eq!(
             validate_client_data_json(
                 br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","topOrigin":"\u12x4"}"#,
@@ -576,6 +642,7 @@ mod tests {
             ),
             Err(WebAuthnError::InvalidClientDataJson),
         );
+        // Raw control character inside a skipped string.
         assert_eq!(
             validate_client_data_json(
                 b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"origin\":\"\n\"}",

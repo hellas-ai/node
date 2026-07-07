@@ -160,6 +160,7 @@ impl Encode for TermsBody {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, reason = "test constants are in-bounds")]
 mod tests {
     use super::*;
     use crate::{

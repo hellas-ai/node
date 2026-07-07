@@ -23,8 +23,8 @@ impl<const C: usize, const E: usize> View<C, E> {
     #[must_use]
     pub fn new(coins: [Option<(CoinId, Coin)>; C], edges: [Option<(EdgeId, Edge)>; E]) -> Self {
         Self {
-            coins: Self::pack_coins(coins),
-            edges: Self::pack_edges(edges),
+            coins: pack_sorted(coins),
+            edges: pack_sorted(edges),
         }
     }
 
@@ -63,53 +63,26 @@ impl<const C: usize, const E: usize> View<C, E> {
     pub fn edge_len(&self) -> usize {
         self.edges().count()
     }
+}
 
-    fn pack<T: Copy, const N: usize>(items: [Option<T>; N]) -> [Option<T>; N] {
-        let mut packed = [None; N];
-        for (index, item) in items.into_iter().flatten().enumerate() {
-            packed[index] = Some(item);
-        }
-
-        packed
+/// Compacts live entries to the front and sorts them by identifier.
+fn pack_sorted<K: Ord + Copy, V: Copy, const N: usize>(
+    items: [Option<(K, V)>; N],
+) -> [Option<(K, V)>; N] {
+    let mut packed = [None; N];
+    let mut len = 0;
+    for (slot, item) in packed.iter_mut().zip(items.into_iter().flatten()) {
+        *slot = Some(item);
+        len += 1;
     }
-
-    fn pack_coins(items: [Option<(CoinId, Coin)>; C]) -> [Option<(CoinId, Coin)>; C] {
-        let mut packed = Self::pack(items);
-        Self::sort(&mut packed, |left, right| {
-            left.0.as_bytes() > right.0.as_bytes()
+    if let Some(live) = packed.get_mut(..len) {
+        live.sort_unstable_by(|left, right| match (left, right) {
+            (Some((left_id, _)), Some((right_id, _))) => left_id.cmp(right_id),
+            // The packed prefix holds only `Some` entries.
+            _ => core::cmp::Ordering::Equal,
         });
-        packed
     }
-
-    fn pack_edges(items: [Option<(EdgeId, Edge)>; E]) -> [Option<(EdgeId, Edge)>; E] {
-        let mut packed = Self::pack(items);
-        Self::sort(&mut packed, |left, right| {
-            left.0.as_bytes() > right.0.as_bytes()
-        });
-        packed
-    }
-
-    fn sort<T: Copy, const N: usize>(items: &mut [Option<T>; N], gt: fn(T, T) -> bool) {
-        let mut index = 1;
-        while index < N {
-            let Some(item) = items[index] else {
-                return;
-            };
-            let mut insert = index;
-            while insert > 0 {
-                let Some(previous) = items[insert - 1] else {
-                    break;
-                };
-                if !gt(previous, item) {
-                    break;
-                }
-                items[insert] = items[insert - 1];
-                insert -= 1;
-            }
-            items[insert] = Some(item);
-            index += 1;
-        }
-    }
+    packed
 }
 
 /// Store extension for producing bounded abstract state views.

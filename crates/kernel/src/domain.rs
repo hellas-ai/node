@@ -1,4 +1,20 @@
 //! Domain types used by the Hellas chain and light-client API.
+//!
+//! # `WebAuthn` policy divergence
+//!
+//! [`Transaction::verify_signature`] enforces a browser-shaped policy:
+//! UP *and* UV flags, an HTTPS origin allowlist, and `rpIdHash` binding.
+//! The kernel's open-authorization verifier ([`crate::webauthn`], feature
+//! `webauthn`) is deliberately looser — UP *or* UV, origin ignored — and
+//! treats `WebAuthn` as a portable P-256 transaction-signing envelope.
+//! They are different products; do not wire one where the other is
+//! expected. This module is transitional and slated to move to its own
+//! crate.
+
+// Transitional chain-facing module: exempt from the kernel core's
+// panic-freedom indexing lint until it moves to its own crate. Slice
+// arithmetic here is bounded by the codec range configs.
+#![allow(clippy::indexing_slicing)]
 
 #[cfg(any(test, feature = "test-support"))]
 use alloc::borrow::ToOwned;

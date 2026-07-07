@@ -32,7 +32,11 @@ impl Encode for Payout {
 impl Decode for Payout {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         let (owner, n) = Key::decode(buf)?;
-        let (value, m) = u64::decode(&buf[n..])?;
+        let rest = buf.get(n..).ok_or(DecodeError::InsufficientBytes {
+            needed: n,
+            got: buf.len(),
+        })?;
+        let (value, m) = u64::decode(rest)?;
         Ok((Self { owner, value }, n + m))
     }
 }

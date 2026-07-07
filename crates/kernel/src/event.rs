@@ -39,6 +39,10 @@ impl<const N: usize> Diff<N> {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "one push per applied operation; the operation list is bounded by the same N"
+    )]
     pub(crate) fn push(&mut self, event: &Event) {
         debug_assert!(self.len < N);
         self.events[self.len] = Some(event.clone());
@@ -59,17 +63,17 @@ impl<const N: usize> Diff<N> {
 
     /// Returns the event at `index`, if any.
     #[must_use]
-    pub const fn event(&self, index: usize) -> Option<&Event> {
+    pub fn event(&self, index: usize) -> Option<&Event> {
         if index >= self.len {
             return None;
         }
 
-        self.events[index].as_ref()
+        self.events.get(index)?.as_ref()
     }
 
     /// Iterates over committed events.
     pub fn iter(&self) -> impl Iterator<Item = &Event> + '_ {
-        self.events[..self.len].iter().flatten()
+        self.events.iter().take(self.len).flatten()
     }
 }
 
@@ -151,12 +155,7 @@ impl Change {
     }
 
     fn ids<const N: usize>(coins: &List<(CoinId, Coin), N>) -> List<CoinId, N> {
-        let fill = coins.as_slice().first().map_or(CoinId::ZERO, |&(id, _)| id);
-        let mut items = [fill; N];
-        for (index, (id, _)) in coins.as_slice().iter().enumerate() {
-            items[index] = *id;
-        }
-        List::take(items, coins.len())
+        coins.clone().map(CoinId::ZERO, |(id, _)| id)
     }
 }
 

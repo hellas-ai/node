@@ -150,12 +150,7 @@ impl Edge {
     }
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {
-        let mut total = 0_u64;
-        for (_, coin) in coins {
-            total = total.checked_add(coin.value())?;
-        }
-
-        Some(total)
+        coins.checked_sum(|(_, coin)| coin.value())
     }
 
     /// Returns the value locked by this edge.
@@ -208,6 +203,11 @@ pub struct Genesis {
 
 impl Genesis {
     /// Creates an initial coin seed.
+    ///
+    /// The id is trusted chain configuration. Prefer ids derived via
+    /// [`CoinId::genesis`]: a hand-picked id that collides with a future
+    /// payout id (`H(payout ‖ edge ‖ index ‖ owner)`) would permanently
+    /// block that close path with [`crate::ApplyError::OutputExists`].
     #[must_use]
     pub const fn coin(id: CoinId, owner: Key, value: u64) -> Self {
         Self {

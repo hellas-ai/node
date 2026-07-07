@@ -149,8 +149,8 @@ impl Tx {
     ) -> List<CoinId, MAX_EDGE_OUTPUTS> {
         let mut ids = [CoinId::ZERO; MAX_EDGE_OUTPUTS];
 
-        for (index, payout) in outputs.iter().enumerate() {
-            ids[index] = payout.id(edge, index);
+        for (index, (slot, payout)) in ids.iter_mut().zip(outputs).enumerate() {
+            *slot = payout.id(edge, index);
         }
 
         List::take(ids, outputs.len())
@@ -274,7 +274,7 @@ where
         terms.timeout(),
     )
     .map_err(|reason| invalid_open(output, reason))?;
-    check_open_terms(output, &edge, terms, context)?;
+    check_open_terms(output, &edge, terms)?;
     check_open_signatures(
         output, funding, terms, parties, maker_auth, taker_auth, verifier,
     )?;
@@ -304,15 +304,10 @@ fn check_funding_ownership(
     Ok(())
 }
 
-fn check_open_terms(
-    output: EdgeId,
-    edge: &Edge,
-    terms: &Terms,
-    context: Context,
-) -> KernelResult<()> {
-    if terms.timeout() <= context.block_height() {
-        return Err(invalid_open(output, InvalidOpenReason::TimeoutNotFuture));
-    }
+/// Timeout-vs-height rejection happens earlier, in [`open_lifetime_fee`]:
+/// a non-future timeout cannot price a lifetime fee. By the time this
+/// runs, `terms.timeout() > context.block_height()` already holds.
+fn check_open_terms(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelResult<()> {
     let Some(timeout_value) = payout_total(terms.timeout_outputs()) else {
         return Err(invalid_open(output, InvalidOpenReason::TermsPayoutOverflow));
     };
@@ -395,11 +390,7 @@ where
 }
 
 fn payout_total<const N: usize>(outputs: &List<Payout, N>) -> Option<u64> {
-    let mut total = 0_u64;
-    for output in outputs {
-        total = total.checked_add(output.value())?;
-    }
-    Some(total)
+    outputs.checked_sum(|output| output.value())
 }
 
 // Timeout is checked structurally because none of its rules — terms-hash
@@ -468,8 +459,8 @@ where
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
     let mut ids = [CoinId::ZERO; MAX_EDGE_INPUTS];
 
-    for (index, id) in funding.iter().enumerate() {
-        ids[index] = id;
+    for (slot, id) in ids.iter_mut().zip(funding.iter()) {
+        *slot = id;
     }
 
     List::take(ids, funding.len())
@@ -477,9 +468,9 @@ fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
 
 fn open_coins<B: Batch>(funding: &Funding, batch: &B) -> KernelResult<OpenCoins> {
     let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
-    for (index, id) in funding.iter().enumerate() {
+    for (slot, id) in coins.iter_mut().zip(funding.iter()) {
         let coin = batch.coin(id).ok_or(ApplyError::MissingCoin { id })?;
-        coins[index] = (id, coin);
+        *slot = (id, coin);
     }
     Ok(List::take(coins, funding.len()))
 }
@@ -496,8 +487,8 @@ fn check_close_outputs<B: Batch>(input: EdgeId, outputs: &Payouts, batch: &B) ->
 
 fn close_coins(input: EdgeId, outputs: &Payouts) -> CloseCoins {
     let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
-    for (index, output) in outputs.iter().enumerate() {
-        coins[index] = output.coin(input, index);
+    for (index, (slot, output)) in coins.iter_mut().zip(outputs).enumerate() {
+        *slot = output.coin(input, index);
     }
     List::take(coins, outputs.len())
 }
@@ -524,8 +515,33 @@ fn units(value: usize) -> u64 {
 }
 
 fn duplicate<T: Copy + Eq>(items: &[T]) -> Option<T> {
-    items
-        .iter()
-        .enumerate()
-        .find_map(|(i, item)| items[i + 1..].contains(item).then_some(*item))
+    let mut rest = items;
+    while let Some((head, tail)) = rest.split_first() {
+        if tail.contains(head) {
+            return Some(*head);
+        }
+        rest = tail;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `open_reserve_cost` assumes `Mutual` at max fanout is the most
+    /// expensive close. If a future `CloseKind` breaks that, already-open
+    /// edges become uncloseable (`ReserveTooSmall`); fail here instead.
+    #[test]
+    fn reserve_covers_every_close_kind_at_every_fanout() {
+        let reserve = open_reserve_cost();
+        for kind in [CloseKind::Mutual, CloseKind::Timeout, CloseKind::Violation] {
+            for outputs in 0..=MAX_EDGE_OUTPUTS {
+                assert!(
+                    close_cost(outputs, kind).fits(reserve),
+                    "close_cost({outputs}, {kind:?}) exceeds the open-time reserve",
+                );
+            }
+        }
+    }
 }

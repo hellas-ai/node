@@ -316,19 +316,20 @@ impl Sig {
     ///
     /// This is forgeable and not a cryptographic signature. Whether the kernel
     /// accepts this shape is decided by the [`crate::SigVerifier`] passed at
-    /// apply time.
+    /// apply time. Gated behind the `placeholders` feature so production
+    /// builds cannot construct one.
+    #[cfg(any(test, feature = "placeholders"))]
     #[must_use]
     pub fn placeholder(key: Key, hash: PayloadHash) -> Self {
         let mut out = [0_u8; Self::LENGTH];
-        let first = Self::half(key, hash, 0);
-        let second = Self::half(key, hash, 1);
-
-        out[..PayloadHash::LENGTH].copy_from_slice(&first);
-        out[PayloadHash::LENGTH..].copy_from_slice(&second);
+        let (first_half, second_half) = out.split_at_mut(PayloadHash::LENGTH);
+        first_half.copy_from_slice(&Self::half(key, hash, 0));
+        second_half.copy_from_slice(&Self::half(key, hash, 1));
 
         Self(out)
     }
 
+    #[cfg(any(test, feature = "placeholders"))]
     fn half(key: Key, hash: PayloadHash, index: u8) -> [u8; PayloadHash::LENGTH] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(crate::consts::SIG_PLACEHOLDER);
@@ -428,18 +429,17 @@ impl Party {
 /// Reads `N` canonical bytes from `buf`. Helper for fixed-shape byte
 /// newtype `Decode` impls.
 fn decode_fixed<const N: usize>(buf: &[u8]) -> Result<([u8; N], usize), DecodeError> {
-    if buf.len() < N {
+    let Some(head) = buf.get(..N) else {
         return Err(DecodeError::InsufficientBytes {
             needed: N,
             got: buf.len(),
         });
-    }
+    };
     let mut bytes = [0_u8; N];
-    bytes.copy_from_slice(&buf[..N]);
+    bytes.copy_from_slice(head);
     Ok((bytes, N))
 }
 
-#[allow(dead_code)]
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in &self.0 {
