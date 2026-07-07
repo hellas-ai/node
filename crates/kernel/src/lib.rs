@@ -31,8 +31,9 @@
 //! forgeable witnesses); production verifiers wire real cryptography.
 //! Optional feature-gated helpers provide
 //! concrete native/`WebAuthn` verification without changing the apply path.
-//! `OpenAuth` is only a witness format: it proves consent from the same
-//! party key used for coin ownership, terms, and payouts.
+//! [`Auth`] is only a witness format: it proves consent from the same
+//! party key used for coin ownership, terms, and payouts — over the open
+//! hash when opening, over the close payload hash when closing mutually.
 //!
 //! State objects and events are not directly constructible outside the crate.
 //!
@@ -93,9 +94,7 @@ pub use secp256k1::Secp256k1Verifier;
 pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::Terms;
-pub use tx::{
-    CloseKind, Funding, OpenAuth, Payout, Proof, Seal, Tx, WebAuthnAssertion, WebAuthnData,
-};
+pub use tx::{Auth, CloseKind, Funding, Payout, Proof, Seal, Tx, WebAuthnAssertion, WebAuthnData};
 pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};
 #[cfg(feature = "webauthn")]

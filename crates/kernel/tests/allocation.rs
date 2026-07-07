@@ -16,8 +16,8 @@ mod support;
 use support::{FAKE_VERIFIER, FixedStore, list, open_tx};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis, Key,
-    List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
+    Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis,
+    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
     ProtocolCode, Sig, State, Terms, Tx,
 };
 
@@ -48,8 +48,8 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let expected_close = Tx::close(
         edge,
         Proof::mutual(
-            Sig::placeholder(maker_key, expected_close_hash),
-            Sig::placeholder(taker_key, expected_close_hash),
+            Auth::native(Sig::placeholder(maker_key, expected_close_hash)),
+            Auth::native(Sig::placeholder(taker_key, expected_close_hash)),
         ),
         close_outputs.clone(),
     );
@@ -72,8 +72,8 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         );
         let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
         let proof = Proof::mutual(
-            Sig::placeholder(maker_key, close_hash),
-            Sig::placeholder(taker_key, close_hash),
+            Auth::native(Sig::placeholder(maker_key, close_hash)),
+            Auth::native(Sig::placeholder(taker_key, close_hash)),
         );
         let open = open_tx(funding(maker, taker), terms, maker_key, taker_key);
         assert_eq!(open, expected_open.clone());

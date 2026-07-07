@@ -30,8 +30,8 @@
 mod support;
 
 use hellas_kernel::{
-    BlockHeight, CloseKind, EdgeId, Fees, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, Parties,
-    Payout, Proof, ProtocolCode, Secp256k1Verifier, Terms, TermsHash, Tx,
+    Auth, BlockHeight, CloseKind, EdgeId, Fees, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
+    Parties, Payout, Proof, ProtocolCode, Secp256k1Verifier, Terms, TermsHash, Tx,
 };
 use secp256k1::SecretKey;
 use support::{
@@ -205,8 +205,8 @@ fn signed_open(wallets: &Wallets, funding: Funding, terms: Terms) -> Tx {
     Tx::open(
         funding,
         terms,
-        secp_sign(&wallets.maker_secret, hash),
-        secp_sign(&wallets.taker_secret, hash),
+        Auth::native(secp_sign(&wallets.maker_secret, hash)),
+        Auth::native(secp_sign(&wallets.taker_secret, hash)),
     )
 }
 
@@ -220,8 +220,8 @@ fn signed_mutual_close(
     Tx::close(
         edge_id,
         Proof::mutual(
-            secp_sign(&wallets.maker_secret, hash),
-            secp_sign(&wallets.taker_secret, hash),
+            Auth::native(secp_sign(&wallets.maker_secret, hash)),
+            Auth::native(secp_sign(&wallets.taker_secret, hash)),
         ),
         outputs,
     )

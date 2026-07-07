@@ -33,8 +33,8 @@
 mod support;
 
 use hellas_kernel::{
-    BlockHeight, Fees, Funding, Genesis, OpenAuth, Parties, Proof, ProtocolCode, Secp256k1Verifier,
-    Terms, Tx,
+    Auth, BlockHeight, CloseKind, Fees, Funding, Genesis, Parties, Proof, ProtocolCode,
+    Secp256k1Verifier, Terms, Tx,
 };
 use support::{
     apply_one, coin_id, context, context_fee, empty_party, genesis, lifetime_fee, p256_public_key,
@@ -53,14 +53,15 @@ fn main() {
 
     let maker_coin = coin_id(0xc1);
     let open_context = context(1, 0x30, FEES);
-    let close_context = context(5, 0x31, FEES);
+    // Mutual closes are pre-expiry: the close happens strictly before the
+    // committed timeout height.
+    let close_context = context(3, 0x31, FEES);
     let timeout = BlockHeight::new(5);
-    let timeout_outputs = payouts2(maker_key, 31, taker_key, 16);
     let terms = Terms::basic(
         PROTOCOL,
         Parties::new(maker_key, taker_key),
         timeout,
-        timeout_outputs.clone(),
+        payouts2(maker_key, 31, taker_key, 16),
     );
     let funding = Funding::new(party_one(maker_coin), empty_party());
     let edge_id = Tx::edge_id_of(&funding, &terms);
@@ -69,19 +70,19 @@ fn main() {
         webauthn_assertion(&taker_passkey, open_hash, "https://wallet.example.invalid");
     assert_eq!(assertion_key, taker_key);
 
-    let open = Tx::open_with_auth(
+    let open = Tx::open(
         funding,
         terms.clone(),
-        OpenAuth::native(secp_sign(&maker_secret, open_hash)),
-        OpenAuth::webauthn(taker_assertion),
+        Auth::native(secp_sign(&maker_secret, open_hash)),
+        Auth::webauthn(taker_assertion),
     );
     let open_fee = context_fee(open_context, open.cost());
     let lifetime_fee = lifetime_fee(open_context, timeout);
     let mut state = genesis(&[Genesis::coin(maker_coin, maker_key, 60)]);
 
-    println!("== Hellas mixed open auth ==");
-    println!("maker: native secp256k1 open auth");
-    println!("taker: WebAuthn open auth with passkey P-256 key, no funding input");
+    println!("== Hellas mixed auth ==");
+    println!("maker: native secp256k1 auth");
+    println!("taker: WebAuthn passkey auth (P-256), no funding input");
 
     let event = apply_one(&mut state, &verifier, open_context, open);
     let opened = state.store().edge(edge_id).expect("open inserted edge");
@@ -99,14 +100,28 @@ fn main() {
         lifetime_fee,
     );
 
-    let close = Tx::close(edge_id, Proof::timeout(terms), timeout_outputs);
+    // Renegotiated cooperative split: principal plus the reserve surplus
+    // left after the committed mutual-close fee. The passkey authorizes
+    // the close payload hash the same way it authorized the open.
+    let mutual_outputs = payouts2(maker_key, 30, taker_key, 15);
+    let close_hash = Tx::payload_hash(edge_id, CloseKind::Mutual, terms.hash(), &mutual_outputs);
+    let (taker_close_assertion, _) =
+        webauthn_assertion(&taker_passkey, close_hash, "https://wallet.example.invalid");
+    let close = Tx::close(
+        edge_id,
+        Proof::mutual(
+            Auth::native(secp_sign(&maker_secret, close_hash)),
+            Auth::webauthn(taker_close_assertion),
+        ),
+        mutual_outputs,
+    );
     let close_fee = schedule_fee(opened.close_fees(), close.cost());
     let event = apply_one(&mut state, &verifier, close_context, close);
     println!(
-        "timeout close @{}: {}",
+        "mutual close @{}: {}",
         close_context.block_height().get(),
         summarize(&event),
     );
-    println!("  close fee {close_fee} paid from reserve");
+    println!("  close fee {close_fee} paid from reserve; both parties authorized the new split");
     print_live_coins(state.store());
 }

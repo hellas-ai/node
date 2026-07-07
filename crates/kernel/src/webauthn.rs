@@ -1,8 +1,9 @@
-//! `WebAuthn` verification for open authorizations.
+//! `WebAuthn` verification for [`crate::Auth`] witnesses.
 //!
 //! This follows Tempo's consensus shape: the kernel validates the `WebAuthn`
 //! assertion and requires `clientDataJSON.challenge` to be the base64url
-//! encoding of the canonical open hash. It intentionally does not enforce
+//! encoding of the canonical payload hash — the open hash for opens, the
+//! close payload hash for cooperative closes. It intentionally does not enforce
 //! `origin` or `rpIdHash`; those bytes are still signed by the authenticator,
 //! but the verifier treats `WebAuthn` as a portable P-256 transaction-signing
 //! envelope. The accepted `clientDataJSON` grammar is deliberately narrower
@@ -78,7 +79,7 @@ pub enum WebAuthnError {
     InvalidSignature,
 }
 
-/// Verifies a `WebAuthn` assertion against a party key and open hash.
+/// Verifies a `WebAuthn` assertion against a party key and payload hash.
 ///
 /// The party key is the compressed SEC1 encoding of the P-256 public key
 /// carried by the assertion.

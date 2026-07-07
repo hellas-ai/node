@@ -12,7 +12,7 @@ mod payout;
 mod proof;
 
 pub use self::{
-    auth::{OpenAuth, WebAuthnAssertion, WebAuthnData},
+    auth::{Auth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
     payout::Payout,
     proof::{CloseKind, Proof, Seal},
@@ -26,7 +26,7 @@ use crate::{
     event::Change,
     list::List,
     object::{Coin, Edge},
-    primitive::{CoinId, EdgeId, PayloadHash, Sig, TermsHash},
+    primitive::{CoinId, EdgeId, PayloadHash, TermsHash},
     store::Batch,
     terms::Terms,
     verifier::{SealPublicInputs, SealVerifier, SigVerifier},
@@ -40,7 +40,7 @@ type CloseCoins = List<(CoinId, Coin), MAX_EDGE_OUTPUTS>;
 /// A protocol transaction submitted to the Hellas kernel.
 #[allow(
     clippy::large_enum_variant,
-    reason = "Open transactions may carry two inline WebAuthn assertions in this no-alloc kernel"
+    reason = "Opens and mutual closes may carry two inline WebAuthn assertions in this no-alloc kernel"
 )]
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Tx {
@@ -56,10 +56,10 @@ pub enum Tx {
         /// Maker's authorization over [`Tx::open_hash`]. Required even when
         /// the maker funding list is empty — opening an edge that names
         /// the maker as a party requires the maker's consent.
-        maker_auth: OpenAuth,
+        maker_auth: Auth,
         /// Taker's authorization over [`Tx::open_hash`]. Same
         /// authorization rule as `maker_auth`.
-        taker_auth: OpenAuth,
+        taker_auth: Auth,
     },
 
     /// Close one edge into bounded owner-only coin payouts.
@@ -74,30 +74,14 @@ pub enum Tx {
 }
 
 impl Tx {
-    /// Creates an open transaction from concrete terms.
-    #[must_use]
-    pub const fn open(funding: Funding, terms: Terms, maker_sig: Sig, taker_sig: Sig) -> Self {
-        Self::Open {
-            funding,
-            terms,
-            maker_auth: OpenAuth::native(maker_sig),
-            taker_auth: OpenAuth::native(taker_sig),
-        }
-    }
-
-    /// Creates an open transaction from concrete terms and typed party-key
+    /// Creates an open transaction from concrete terms and party-key
     /// authorization witnesses.
     ///
     /// `maker_auth` and `taker_auth` are checked against the maker/taker keys
     /// committed by `terms.parties()`, even when that party contributes no
     /// funding input.
     #[must_use]
-    pub const fn open_with_auth(
-        funding: Funding,
-        terms: Terms,
-        maker_auth: OpenAuth,
-        taker_auth: OpenAuth,
-    ) -> Self {
+    pub const fn open(funding: Funding, terms: Terms, maker_auth: Auth, taker_auth: Auth) -> Self {
         Self::Open {
             funding,
             terms,
@@ -230,8 +214,8 @@ fn close_cost(outputs: usize, kind: CloseKind) -> Cost {
 fn apply_open<B, V>(
     funding: &Funding,
     terms: &Terms,
-    maker_auth: &OpenAuth,
-    taker_auth: &OpenAuth,
+    maker_auth: &Auth,
+    taker_auth: &Auth,
     context: Context,
     verifier: &V,
     batch: &B,
@@ -275,7 +259,7 @@ where
     )
     .map_err(|reason| invalid_open(output, reason))?;
     check_open_terms(output, &edge, terms)?;
-    check_open_signatures(
+    check_open_auth(
         output, funding, terms, parties, maker_auth, taker_auth, verifier,
     )?;
     Ok(Change::open(&coins, (output, edge)))
@@ -339,18 +323,18 @@ fn open_lifetime_fee(context: Context, terms: &Terms) -> Result<u64, InvalidOpen
         .ok_or(InvalidOpenReason::LifetimeFeeOverflow)
 }
 
-fn check_open_signatures<V: SigVerifier + ?Sized>(
+fn check_open_auth<V: SigVerifier + ?Sized>(
     output: EdgeId,
     funding: &Funding,
     terms: &Terms,
     parties: crate::object::Parties,
-    maker_auth: &OpenAuth,
-    taker_auth: &OpenAuth,
+    maker_auth: &Auth,
+    taker_auth: &Auth,
     verifier: &V,
 ) -> KernelResult<()> {
     let hash = Tx::open_hash(funding, terms);
-    if !verifier.verify_open_auth(maker_auth, parties.maker(), hash)
-        || !verifier.verify_open_auth(taker_auth, parties.taker(), hash)
+    if !verifier.verify_auth(maker_auth, parties.maker(), hash)
+        || !verifier.verify_auth(taker_auth, parties.taker(), hash)
     {
         return Err(invalid_open(output, InvalidOpenReason::BadSignature));
     }
@@ -413,8 +397,8 @@ where
             }
             let hash = Tx::payload_hash(input, CloseKind::Mutual, edge.terms(), outputs);
             let parties = edge.parties();
-            if verifier.verify_sig(*maker, parties.maker(), hash)
-                && verifier.verify_sig(*taker, parties.taker(), hash)
+            if verifier.verify_auth(maker, parties.maker(), hash)
+                && verifier.verify_auth(taker, parties.taker(), hash)
             {
                 Ok(())
             } else {

@@ -145,7 +145,7 @@ impl Batch for WorkingBatch<'_> {
 mod tests {
     use super::*;
     use hellas_kernel::{
-        CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+        Auth, CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
         PayloadHash, Payout, ProtocolCode, SealPublicInputs, SealVerifier, Sig, SigVerifier, State,
         Terms, Tx,
     };
@@ -198,8 +198,8 @@ mod tests {
         let open = Tx::open(
             funding,
             terms.clone(),
-            Sig::placeholder(MAKER, open_hash),
-            Sig::placeholder(TAKER, open_hash),
+            Auth::native(Sig::placeholder(MAKER, open_hash)),
+            Auth::native(Sig::placeholder(TAKER, open_hash)),
         );
 
         let close_outputs = payouts(10, 5);
@@ -208,8 +208,8 @@ mod tests {
         let close = Tx::close(
             edge,
             hellas_kernel::Proof::mutual(
-                Sig::placeholder(MAKER, close_hash),
-                Sig::placeholder(TAKER, close_hash),
+                Auth::native(Sig::placeholder(MAKER, close_hash)),
+                Auth::native(Sig::placeholder(TAKER, close_hash)),
             ),
             close_outputs,
         );

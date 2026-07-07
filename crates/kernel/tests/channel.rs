@@ -31,8 +31,8 @@ use support::{
 };
 
 use hellas_kernel::{
-    ApplyError, Block, BlockHash, BlockHeight, CloseKind, CoinId, Context, Cost, EdgeId, Event,
-    EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
+    ApplyError, Auth, Block, BlockHash, BlockHeight, CloseKind, CoinId, Context, Cost, EdgeId,
+    Event, EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
     InvalidProofReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
     PayloadHash, Payout, Proof, Seal, Sig, State, Terms, TermsHash, Tx, View,
 };
@@ -99,10 +99,6 @@ fn other_proof() -> Proof {
 
 fn mutual_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
     placeholder_mutual(input, terms(), outputs, MAKER, TAKER)
-}
-
-fn taker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
-    Sig::placeholder(TAKER, mutual_hash(input, outputs))
 }
 
 fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> PayloadHash {

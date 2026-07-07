@@ -1,11 +1,11 @@
-//! Open authorization witnesses.
+//! Party-key authorization witnesses.
 //!
-//! Close proofs deliberately keep using compact native [`Sig`] values because
-//! cooperative closes are settlement-key signatures over a close payload hash.
-//! Opens need a wider envelope: a party may authorize an edge with the same
-//! native signature shape, or with a `WebAuthn` assertion whose challenge binds
-//! to the canonical open hash. Both variants prove consent from the same
-//! kernel party key used for funding ownership, terms, and payouts.
+//! [`Auth`] is the kernel's one consent envelope: it proves that a party
+//! key authorized a canonical payload hash — the open hash when opening an
+//! edge, the close payload hash for a cooperative close. `Native` carries a
+//! compact settlement signature; `WebAuthn` carries an assertion whose
+//! challenge is that same hash. Both prove consent from the same kernel
+//! party key used for funding ownership, terms, and payouts.
 
 use crate::{
     consts::MAX_WEBAUTHN_DATA_LENGTH,
@@ -82,23 +82,25 @@ impl WebAuthnAssertion {
     }
 }
 
-/// Party-key authorization for an edge open.
+/// Party-key authorization over a canonical payload hash.
 ///
 /// This is a witness envelope, not a separate identity. The verifier checks
-/// each variant against the maker/taker key committed in [`crate::Terms`].
+/// each variant against the maker/taker key committed in [`crate::Terms`],
+/// for both edge opens ([`crate::Tx::open_hash`]) and cooperative closes
+/// ([`crate::Tx::payload_hash`]).
 #[allow(
     clippy::large_enum_variant,
-    reason = "Open auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"
+    reason = "Auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"
 )]
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub enum OpenAuth {
-    /// Compact native settlement signature over [`crate::Tx::open_hash`].
+pub enum Auth {
+    /// Compact native settlement signature over the payload hash.
     Native(Sig),
-    /// `WebAuthn` assertion whose challenge is [`crate::Tx::open_hash`].
+    /// `WebAuthn` assertion whose challenge is the payload hash.
     WebAuthn(WebAuthnAssertion),
 }
 
-impl OpenAuth {
+impl Auth {
     /// Wraps a compact native settlement signature.
     #[must_use]
     pub const fn native(sig: Sig) -> Self {
@@ -112,7 +114,7 @@ impl OpenAuth {
     }
 }
 
-impl From<Sig> for OpenAuth {
+impl From<Sig> for Auth {
     fn from(sig: Sig) -> Self {
         Self::Native(sig)
     }

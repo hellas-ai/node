@@ -18,7 +18,7 @@
 mod support;
 
 use hellas_kernel::{
-    ApplyError, BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Funding, Genesis,
+    ApplyError, Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Funding, Genesis,
     InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Seal,
     SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig, State, Terms, Tx,
 };
@@ -38,11 +38,12 @@ fn keypair(seed: u8) -> (SecretKey, Key) {
     (secret, Key::from_bytes(public.serialize()))
 }
 
-fn sign(secret: &SecretKey, hash: hellas_kernel::PayloadHash) -> Sig {
+/// Real ECDSA authorization from `secret` over `hash`.
+fn sign(secret: &SecretKey, hash: hellas_kernel::PayloadHash) -> Auth {
     let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);
-    Sig::from_bytes(signature.serialize_compact())
+    Auth::native(Sig::from_bytes(signature.serialize_compact()))
 }
 
 fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {

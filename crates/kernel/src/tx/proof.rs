@@ -2,8 +2,8 @@
 //!
 //! A [`Proof`] is the kernel-visible *shape* of why an edge should
 //! close. Each variant maps to exactly one validation kind: `Mutual` →
-//! [`crate::SigVerifier`], `Timeout` → kernel inline structural check,
-//! `Violation` → [`crate::SealVerifier`].
+//! [`crate::SigVerifier`] (one [`Auth`] witness per party), `Timeout` →
+//! kernel inline structural check, `Violation` → [`crate::SealVerifier`].
 //!
 //! Abstract counterpart: `models/types.qnt::Proof` (witness ADT) and
 //! `models/verifier.qnt` (`proofOk`, `payoutsBound`). The Quint module
@@ -16,7 +16,7 @@ use crate::{
     canonical::Encode,
     primitive::{PayloadHash, ProtocolCode},
 };
-use crate::{consts::SEAL_LENGTH, context::Cost, primitive::Sig, terms::Terms};
+use crate::{consts::SEAL_LENGTH, context::Cost, terms::Terms, tx::Auth};
 
 /// Universal close witness kind.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -104,17 +104,21 @@ impl Seal {
 /// Each variant maps to one validator: `Mutual` is checked by
 /// [`crate::SigVerifier`], `Timeout` is checked structurally inside the
 /// kernel, `Violation` is checked by [`crate::SealVerifier`].
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Mutual auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"
+)]
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Proof {
-    /// Cooperative close signed by both edge parties. The signed
+    /// Cooperative close authorized by both edge parties. The authorized
     /// payload is `Tx::payload_hash(edge_id, Mutual, edge.terms(),
     /// payouts)`; the terms commitment is read from the edge itself, so
     /// no terms reveal is needed here.
     Mutual {
-        /// Maker signature.
-        maker: Sig,
-        /// Taker signature.
-        taker: Sig,
+        /// Maker authorization.
+        maker: Auth,
+        /// Taker authorization.
+        taker: Auth,
     },
 
     /// Timeout close under committed terms.
@@ -135,7 +139,7 @@ pub enum Proof {
 impl Proof {
     /// Creates a cooperative close witness.
     #[must_use]
-    pub const fn mutual(maker: Sig, taker: Sig) -> Self {
+    pub const fn mutual(maker: Auth, taker: Auth) -> Self {
         Self::Mutual { maker, taker }
     }
 

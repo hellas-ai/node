@@ -209,13 +209,9 @@ fn close_surplus_uses_selected_close_kind() {
     let terms_hash = terms_value.hash();
     let open = open_tx(funding_value, terms_value);
     let mutual_outputs = payouts(Payout::new(MAKER, 14), Payout::new(TAKER, 14));
-    let mutual_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &mutual_outputs);
     let close = Tx::close(
         edge,
-        Proof::mutual(
-            Sig::placeholder(MAKER, mutual_hash),
-            Sig::placeholder(TAKER, mutual_hash),
-        ),
+        support::placeholder_mutual(edge, terms_hash, &mutual_outputs, MAKER, TAKER),
         mutual_outputs.clone(),
     );
     let output_ids = Tx::close_output_ids(edge, &mutual_outputs);
@@ -300,10 +296,12 @@ fn close_rejects_bad_mutual_signature_without_mutation() {
     let mut state = open_state();
     let store = *state.store();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
+    // Maker's witness authorizes the wrong payload (other terms); taker's
+    // is canonical. One bad witness fails the whole mutual close.
     let bad_hash = Tx::payload_hash(edge(), CloseKind::Mutual, other_terms(), &outputs);
     let proof = Proof::mutual(
-        Sig::placeholder(MAKER, bad_hash),
-        taker_sig(edge(), &outputs),
+        Auth::native(Sig::placeholder(MAKER, bad_hash)),
+        Auth::native(Sig::placeholder(TAKER, mutual_hash(edge(), &outputs))),
     );
 
     assert_eq!(

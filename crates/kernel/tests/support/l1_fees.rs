@@ -2,8 +2,8 @@ use super::{FixedStore, coin_id, state};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Seal, Sig, State,
-    Terms, Tx, View,
+    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Seal, State, Terms,
+    Tx, View,
 };
 
 pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -101,15 +101,12 @@ pub(crate) fn context(height: i64, fees: Fees) -> Context {
 }
 
 pub(crate) fn open(shape: FundingShape) -> Tx {
-    let funding = open_funding(shape);
-    let terms = terms(shape);
     let parties = parties(shape);
-    let hash = Tx::open_hash(&funding, &terms);
-    Tx::open(
-        funding,
-        terms,
-        Sig::placeholder(parties.maker(), hash),
-        Sig::placeholder(parties.taker(), hash),
+    super::open_tx(
+        open_funding(shape),
+        terms(shape),
+        parties.maker(),
+        parties.taker(),
     )
 }
 
@@ -118,11 +115,13 @@ pub(crate) fn close(shape: FundingShape, proof: ProofKey) -> Tx {
     let outputs = payouts(shape);
     let proof = match proof {
         ProofKey::Mutual => {
-            let hash = Tx::payload_hash(input, CloseKind::Mutual, terms(shape).hash(), &outputs);
             let parties = parties(shape);
-            Proof::mutual(
-                Sig::placeholder(parties.maker(), hash),
-                Sig::placeholder(parties.taker(), hash),
+            super::placeholder_mutual(
+                input,
+                terms(shape).hash(),
+                &outputs,
+                parties.maker(),
+                parties.taker(),
             )
         }
         ProofKey::Timeout => Proof::timeout(terms(shape)),
