@@ -45,6 +45,10 @@ impl<T, const N: usize> List<T, N> {
 
     /// Borrows the live entries.
     #[must_use]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "every constructor establishes len <= N"
+    )]
     pub fn as_slice(&self) -> &[T] {
         &self.items[..self.len]
     }
@@ -54,6 +58,15 @@ impl<T, const N: usize> List<T, N> {
     /// Borrows the live entries.
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.as_slice().iter()
+    }
+
+    /// Sums `value` over live entries, returning `None` on overflow.
+    pub(crate) fn checked_sum(&self, value: impl Fn(&T) -> u64) -> Option<u64> {
+        let mut total = 0_u64;
+        for item in self {
+            total = total.checked_add(value(item))?;
+        }
+        Some(total)
     }
 }
 
@@ -111,8 +124,8 @@ impl<T: Copy, const N: usize> List<T, N> {
     #[must_use]
     pub fn map<U: Copy>(self, fill: U, mut f: impl FnMut(T) -> U) -> List<U, N> {
         let mut items = [fill; N];
-        for (index, item) in self.as_slice().iter().enumerate() {
-            items[index] = f(*item);
+        for (slot, item) in items.iter_mut().zip(self.as_slice()) {
+            *slot = f(*item);
         }
 
         List {

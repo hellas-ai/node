@@ -11,13 +11,12 @@
 //! defers the same checks by routing each variant to the matching
 //! verifier impl (or to its own inline check for Timeout).
 
+#[cfg(any(test, feature = "placeholders"))]
 use crate::{
     canonical::Encode,
-    consts::SEAL_LENGTH,
-    context::Cost,
-    primitive::{PayloadHash, ProtocolCode, Sig},
-    terms::Terms,
+    primitive::{PayloadHash, ProtocolCode},
 };
+use crate::{consts::SEAL_LENGTH, context::Cost, primitive::Sig, terms::Terms};
 
 /// Universal close witness kind.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -86,7 +85,9 @@ impl Seal {
     ///
     /// This is forgeable and not a cryptographic proof. Whether the kernel
     /// accepts this shape is decided by the [`crate::SealVerifier`] passed
-    /// at apply time.
+    /// at apply time. Gated behind the `placeholders` feature so production
+    /// builds cannot construct one.
+    #[cfg(any(test, feature = "placeholders"))]
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: PayloadHash) -> Self {
         let mut hasher = blake3::Hasher::new();

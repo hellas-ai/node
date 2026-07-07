@@ -25,8 +25,12 @@ domain = [
     "dep:url",
 ]
 domain-std = ["domain", "commonware-codec/std", "commonware-cryptography/std"]
+# Forgeable deterministic Sig/Seal placeholders for tests and modelling.
+# Deliberately not part of any default or production feature set: a build
+# without this feature physically cannot construct a placeholder witness.
+placeholders = []
 secp256k1 = ["dep:secp256k1"]
-test-support = ["domain"]
+test-support = ["domain", "placeholders"]
 webauthn = ["dep:p256", "dep:sha2"]
 
 [dependencies]
@@ -53,6 +57,11 @@ thiserror = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 
 [dev-dependencies]
+# Self-dependency so the crate's own integration tests, benches, and
+# examples see the placeholder constructors without shipping them in
+# production builds.
+hellas-kernel = { path = ".", features = ["placeholders"] }
+
 allocation-counter = "0.8"
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
@@ -95,6 +104,9 @@ dbg-macro = "deny"
 disallowed-methods = "deny"
 disallowed-types = "deny"
 expect-used = "deny"
+# Panic-freedom lock: every index/slice in the transition core must be
+# `get`-based or carry a reviewed `#[allow]` stating why it cannot panic.
+indexing-slicing = "deny"
 nursery = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 print-stderr = "deny"

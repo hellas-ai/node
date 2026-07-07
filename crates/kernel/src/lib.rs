@@ -26,8 +26,10 @@
 //! authorizations, [`SealVerifier`] decides dispute seals. [`Proof::Timeout`]
 //! needs neither — its admissibility is purely structural and the kernel
 //! checks it inline. Test verifiers accept the deterministic placeholders
-//! documented on [`Sig::placeholder`] and [`Seal::placeholder`]; production
-//! verifiers wire real cryptography. Optional feature-gated helpers provide
+//! built by `Sig::placeholder` and `Seal::placeholder` (available only
+//! under the `placeholders` feature — production builds cannot construct
+//! forgeable witnesses); production verifiers wire real cryptography.
+//! Optional feature-gated helpers provide
 //! concrete native/`WebAuthn` verification without changing the apply path.
 //! `OpenAuth` is only a witness format: it proves consent from the same
 //! party key used for coin ownership, terms, and payouts.

@@ -18,8 +18,8 @@
 //! (PERF.md §4) — so the kernel stays a pure transition function and
 //! parallel signature verification does not have to retrofit the apply
 //! path. Tests provide forgeable verifiers that accept the deterministic
-//! shapes built by [`crate::Sig::placeholder`] and
-//! [`crate::Seal::placeholder`].
+//! shapes built by `Sig::placeholder` and `Seal::placeholder` (gated
+//! behind the `placeholders` feature).
 //!
 //! Abstract counterpart: `models/verifier.qnt`. The Quint module's
 //! `sigOk` / `sealOk` predicates are pure — the abstract model takes the

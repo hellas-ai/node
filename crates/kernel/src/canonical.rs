@@ -80,6 +80,10 @@ impl Writer for BufferWriter<'_> {
     /// capacity (`self.buf.len() - self.pos`). This indicates the
     /// caller sized the buffer below the value's `encoded_size()` —
     /// a programming error.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "undersized buffers are a documented caller bug; panicking here is the contract"
+    )]
     fn write(&mut self, bytes: &[u8]) {
         let end = self.pos + bytes.len();
         self.buf[self.pos..end].copy_from_slice(bytes);
@@ -158,7 +162,6 @@ pub enum DecodeError {
 ///
 /// All kernel commitments funnel through this function. The protocol
 /// hash binding is `BLAKE3(domain ‖ value.encode_to(...))`.
-#[allow(dead_code)]
 pub(crate) fn hash<T: Encode + ?Sized>(domain: &[u8], value: &T) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
@@ -200,14 +203,14 @@ impl Encode for u32 {
 
 impl Decode for u32 {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
-        if buf.len() < 4 {
+        let Some(head) = buf.get(..4) else {
             return Err(DecodeError::InsufficientBytes {
                 needed: 4,
                 got: buf.len(),
             });
-        }
+        };
         let mut bytes = [0_u8; 4];
-        bytes.copy_from_slice(&buf[..4]);
+        bytes.copy_from_slice(head);
         Ok((Self::from_be_bytes(bytes), 4))
     }
 }
@@ -224,14 +227,14 @@ impl Encode for u64 {
 
 impl Decode for u64 {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
-        if buf.len() < 8 {
+        let Some(head) = buf.get(..8) else {
             return Err(DecodeError::InsufficientBytes {
                 needed: 8,
                 got: buf.len(),
             });
-        }
+        };
         let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&buf[..8]);
+        bytes.copy_from_slice(head);
         Ok((Self::from_be_bytes(bytes), 8))
     }
 }
@@ -240,6 +243,8 @@ impl Decode for u64 {
 // fit easily in `u32`, but we use `u64` to keep cross-platform hashes
 // stable and to match the historical `Digest::usize` encoding so the
 // protocol commitment stays the same across this refactor.
+// `Self` in these signatures IS `usize` (clippy::use_self insists on the
+// keyword); read `MAX_ENCODED_SIZE: Self` as `: usize`.
 impl Encode for usize {
     const MAX_ENCODED_SIZE: Self = 8;
     fn encoded_size(&self) -> Self {
@@ -252,7 +257,7 @@ impl Encode for usize {
 }
 
 impl Decode for usize {
-    fn decode(buf: &[u8]) -> Result<(Self, Self), DecodeError> {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         let (value, consumed) = u64::decode(buf)?;
         // On 64-bit platforms (the only ones we target) this fits.
         let as_usize = Self::try_from(value).unwrap_or(Self::MAX);
@@ -314,7 +319,12 @@ impl<T: Decode + Copy + Default, const N: usize> Decode for crate::List<T, N> {
         }
         let mut items = [T::default(); N];
         for slot in items.iter_mut().take(len) {
-            let (item, n) = T::decode(&buf[consumed..])?;
+            // Guards against a buggy item decoder over-reporting `n`.
+            let rest = buf.get(consumed..).ok_or(DecodeError::InsufficientBytes {
+                needed: consumed,
+                got: buf.len(),
+            })?;
+            let (item, n) = T::decode(rest)?;
             *slot = item;
             consumed += n;
         }

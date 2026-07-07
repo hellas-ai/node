@@ -137,6 +137,11 @@ impl<S: Store> State<S> {
 
     /// Applies one ordered block atomically and returns its diff.
     ///
+    /// The kernel does not enforce a block resource budget here: admission
+    /// control is the host's job (see [`Block::fits`]), applied before a
+    /// block reaches this point. Likewise [`Context::previous_hash`] is
+    /// carried for verifiers and hosts, not validated against any chain.
+    ///
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.

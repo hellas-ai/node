@@ -100,8 +100,10 @@ pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v1";
 
 /// Prefix for the deterministic seal placeholder used by tests and
 /// modelling. Inputs: protocol code, close kind tag, close hash.
+#[cfg(any(test, feature = "placeholders"))]
 pub(crate) const SEAL_PLACEHOLDER: &[u8] = b"hellas.seal.placeholder.v1";
 
 /// Prefix for the deterministic signature placeholder used by tests and
 /// modelling. Inputs: half index (0 or 1), key, close hash.
+#[cfg(any(test, feature = "placeholders"))]
 pub(crate) const SIG_PLACEHOLDER: &[u8] = b"hellas.sig.placeholder.v1";
