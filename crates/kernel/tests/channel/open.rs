@@ -320,7 +320,7 @@ fn open_allows_exact_fee_and_reserve_funding() {
 
 #[test]
 fn open_rejects_nonfuture_timeout_without_mutation() {
-    let terms_value = Terms::basic(PROTOCOL, PARTIES, CONTEXT.block_height(), TIMEOUT_OUTPUTS);
+    let terms_value = Terms::basic(PROTOCOL, PARTIES, CONTEXT.block_height(), l1::payouts());
     let funding_value = funding(MAKER_COIN, TAKER_COIN);
     let output = Tx::edge_id_of(&funding_value, &terms_value);
     let open = open_tx(funding_value, terms_value);
@@ -418,6 +418,35 @@ fn open_rejects_funding_below_fee_without_mutation() {
             output,
             reason: InvalidOpenReason::FundingInsufficient,
         }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn open_rejects_missing_funding_coin_without_mutation() {
+    // EXTRA_COIN has a store slot but was never seeded, so validation
+    // fails coin lookup before any ownership or signature work.
+    let open = open_tx(funding(MAKER_COIN, EXTRA_COIN), basic_terms());
+    let mut state = funded_state_for(&open);
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::MissingCoin { id: EXTRA_COIN }),
+    );
+    assert_eq!(*state.store(), store);
+}
+
+#[test]
+fn open_rejects_replayed_open_while_edge_lives() {
+    // Replaying the exact open hits the edge-occupancy check first —
+    // it fires before the (also failing) consumed-funding lookup.
+    let mut state = open_state();
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open_op()),
+        Err(ApplyError::EdgeExists { id: edge() }),
     );
     assert_eq!(*state.store(), store);
 }

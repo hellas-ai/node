@@ -2,6 +2,7 @@
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 use hellas_kernel::{
     BufferWriter, Decode, DecodeError, Encode, Key, List, MAX_EDGE_OUTPUTS, Payout, Writer,

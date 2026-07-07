@@ -13,6 +13,7 @@
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -22,7 +23,7 @@ use hellas_kernel::{
     SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig, State, Terms, Tx,
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
-use support::{FixedStore, party_one, payouts_two};
+use support::{FixedStore, list};
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const CONTEXT: Context = Context::new(
@@ -44,8 +45,8 @@ fn sign(secret: &SecretKey, hash: hellas_kernel::PayloadHash) -> Sig {
     Sig::from_bytes(signature.serialize_compact())
 }
 
-const fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    payouts_two(maker, 7, taker, 8)
+fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    support::payouts(&[(maker, 7), (taker, 8)])
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
     let terms_hash = terms.hash();
     let maker_coin = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
-    let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
+    let funding = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding, &terms);
     let open_hash = Tx::open_hash(&funding, &terms);
     let open = Tx::open(
@@ -104,7 +105,7 @@ fn forged_signature_is_rejected_by_real_verifier() {
     let terms_hash = terms.hash();
     let maker_coin = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker_coin = CoinId::from_bytes([2; CoinId::LENGTH]);
-    let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
+    let funding = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding, &terms);
     // Open is honestly authorized by both parties; the forgery happens on
     // the close side below (the test's actual subject).

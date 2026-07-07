@@ -3,6 +3,7 @@
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
 #![allow(clippy::std_instead_of_core)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -73,8 +74,22 @@ impl Model for ChannelModel {
             return Some(state);
         }
 
-        if let Some(error) = action.error() {
-            return Self::invalid_state(&mut state, last_state, context, &op, error);
+        if let Some(expected) = action.error() {
+            // Expected-error actions must reject with exactly this error
+            // and leave state untouched. Panic rather than return `None`:
+            // a `None` would silently prune the branch, hiding a kernel
+            // that started accepting (or mis-classifying) invalid input.
+            // This matters for actions like `EarlyTimeout` whose wrongful
+            // acceptance yields a canonical-looking state no shape or
+            // value property can distinguish from a legitimate close.
+            match state.apply(context, &FAKE_VERIFIER, &op) {
+                Ok(event) => panic!("kernel accepted {action:?}: {event:?}"),
+                Err(error) => {
+                    assert_eq!(error, expected, "wrong rejection for {action:?}");
+                    assert_eq!(state, *last_state, "rejection of {action:?} mutated state");
+                }
+            }
+            return Some(state);
         }
 
         let event = state.apply(context, &FAKE_VERIFIER, &op).ok()?;
@@ -96,22 +111,6 @@ impl Model for ChannelModel {
 }
 
 impl ChannelModel {
-    fn invalid_state(
-        state: &mut State<ChannelStore>,
-        last_state: &State<ChannelStore>,
-        context: Context,
-        op: &Tx,
-        error: ApplyError,
-    ) -> Option<State<ChannelStore>> {
-        let rejected = state.apply(context, &FAKE_VERIFIER, op).err()?;
-
-        if rejected == error && *state == *last_state {
-            Some(*state)
-        } else {
-            None
-        }
-    }
-
     fn valid_state(
         state: &State<ChannelStore>,
         action: Action,

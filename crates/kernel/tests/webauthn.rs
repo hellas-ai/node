@@ -6,6 +6,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -17,7 +18,7 @@ use hellas_kernel::{
 };
 use p256::ecdsa::{Signature as P256Signature, SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
-use support::{FixedStore, coin_id, party_one, payouts_two, state};
+use support::{FixedStore, coin_id, list, state};
 
 const CONTEXT: Context = Context::new(
     BlockHeight::new(1),
@@ -58,12 +59,12 @@ fn keypair(seed: u8) -> SigningKey {
 
 fn make_terms(maker: Key, protocol: u8) -> Terms {
     let parties = Parties::new(maker, TAKER);
-    let outputs: List<Payout, MAX_EDGE_OUTPUTS> = payouts_two(maker, 7, TAKER, 8);
+    let outputs: List<Payout, MAX_EDGE_OUTPUTS> = support::payouts(&[(maker, 7), (TAKER, 8)]);
     Terms::basic(ProtocolCode::new(protocol), parties, TIMEOUT, outputs)
 }
 
-const fn funding() -> Funding {
-    Funding::new(party_one(MAKER_COIN), party_one(TAKER_COIN))
+fn funding() -> Funding {
+    Funding::new(list(&[MAKER_COIN]), list(&[TAKER_COIN]))
 }
 
 fn sign_webauthn(
@@ -258,7 +259,7 @@ fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
     let taker_sk = keypair(4);
     let taker_key = p256_key_from_signing_key(&taker_sk);
     let funding = funding();
-    let outputs = payouts_two(maker_key, 7, taker_key, 8);
+    let outputs = support::payouts(&[(maker_key, 7), (taker_key, 8)]);
     let terms = Terms::basic(
         ProtocolCode::new(1),
         Parties::new(maker_key, taker_key),

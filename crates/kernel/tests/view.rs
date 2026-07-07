@@ -5,6 +5,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -12,7 +13,7 @@ use hellas_kernel::{
     BlockHash, BlockHeight, Context, Funding, Genesis, MAX_EDGE_OUTPUTS, Parties, Payout,
     ProtocolCode, Sig, Terms, Tx,
 };
-use support::{FAKE_VERIFIER, FixedStore, coin_id, key, party_one, state};
+use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, state};
 
 #[test]
 fn view_compacts_sparse_coins_and_sorts_by_id() {
@@ -47,8 +48,8 @@ fn view_compacts_sparse_edges_and_sorts_by_id() {
     let taker_a = coin_id(2);
     let maker_b = coin_id(3);
     let taker_b = coin_id(4);
-    let funding_a = Funding::new(party_one(maker_a), party_one(taker_a));
-    let funding_b = Funding::new(party_one(maker_b), party_one(taker_b));
+    let funding_a = Funding::new(list(&[maker_a]), list(&[taker_a]));
+    let funding_b = Funding::new(list(&[maker_b]), list(&[taker_b]));
     let terms_a = terms(maker, taker, 1);
     let terms_b = terms(maker, taker, 2);
     let edge_a = Tx::edge_id_of(&funding_a, &terms_a);

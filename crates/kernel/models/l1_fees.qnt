@@ -53,6 +53,8 @@ module l1_fees {
     | NoInput
     | OpenInput(FundingShape)
     | CloseInput(Proof)
+    | RejectedOpenInput(FundingShape)
+    | RejectedCloseInput(Proof)
     | RaiseFeeInput
     | TickInput
     | IdleInput
@@ -523,6 +525,54 @@ module l1_fees {
     lastEvent' = NoEvent,
   }
 
+  // A rejected open attempt: `openBy`'s precondition fails, state is
+  // untouched, and the attempt is recorded so the Rust ITF runner can
+  // replay it against the kernel and assert it is rejected with the
+  // store unchanged (no specific error is asserted; the model records
+  // no rejection reason).
+  action rejectOpen(s) = all {
+    not(canOpen(s)),
+    coins' = coins,
+    edges' = edges,
+    reserves' = reserves,
+    closeFees' = closeFees,
+    edgeShape' = edgeShape,
+    edgeParties' = edgeParties,
+    liveCoins' = liveCoins,
+    liveEdges' = liveEdges,
+    paid' = paid,
+    height' = height,
+    currentCloseFee' = currentCloseFee,
+    postedStake' = postedStake,
+    stakeAwards' = stakeAwards,
+    closeOutcome' = closeOutcome,
+    lastInput' = RejectedOpenInput(s),
+    lastEvent' = NoEvent,
+  }
+
+  // A rejected close attempt: the dual of `rejectOpen` for the close
+  // actions. The recorded proof kind tells the Rust runner which close
+  // shape to replay.
+  action rejectClose(p) = all {
+    not(canClose(p)),
+    coins' = coins,
+    edges' = edges,
+    reserves' = reserves,
+    closeFees' = closeFees,
+    edgeShape' = edgeShape,
+    edgeParties' = edgeParties,
+    liveCoins' = liveCoins,
+    liveEdges' = liveEdges,
+    paid' = paid,
+    height' = height,
+    currentCloseFee' = currentCloseFee,
+    postedStake' = postedStake,
+    stakeAwards' = stakeAwards,
+    closeOutcome' = closeOutcome,
+    lastInput' = RejectedCloseInput(p),
+    lastEvent' = NoEvent,
+  }
+
   action tick = all {
     height < TimeoutHeight,
     coins' = coins,
@@ -769,6 +819,7 @@ module l1_fees {
 
   run underfundedOneSidedOpenRejectedTest =
     initUnderfunded
+      .then(rejectOpen(MakerOnlyFunding))
       .expect(not(canOpen(MakerOnlyFunding)))
 
   run feeRaiseDoesNotStrandCloseTest =
@@ -812,6 +863,8 @@ module l1_fees {
     init
       .then(openBy(FullFunding))
       .then(tick)
+      .then(rejectClose(Mutual))
+      .then(rejectClose(Violation))
       .expect(height >= TimeoutHeight
         and canClose(Timeout)
         and not(canClose(Mutual))

@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_types)]
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::std_instead_of_core)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -122,17 +123,9 @@ fn assert_event_matches(
             prop_assert_eq!(*input, l1::edge_id(edge));
             prop_assert_eq!(outputs, &l1::output_ids(edge));
         }
-        (Step::BadPayout(edge), EventKind::EdgeClosed { input, outputs }) => {
-            prop_assert_eq!(*input, l1::edge_id(edge));
-            // BadPayout produces non-canonical outputs; the kernel either
-            // rejects (handled by the err branch above) or, in pathological
-            // configurations, emits the close event with the supplied outputs.
-            prop_assert_eq!(
-                outputs,
-                &Tx::close_output_ids(l1::edge_id(edge), &l1::bad_payouts())
-            );
-        }
-        _ => prop_assert!(false),
+        // BadPayout closes are value-mismatched; the kernel must reject
+        // them (handled by the err branch above), never emit an event.
+        _ => prop_assert!(false, "unexpected event {event:?} for step {step:?}"),
     }
 
     Ok(())

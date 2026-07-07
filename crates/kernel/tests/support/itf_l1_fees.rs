@@ -117,6 +117,8 @@ pub(crate) enum Input {
     NoInput,
     OpenInput(FundingShapeTag),
     CloseInput(ProofTag),
+    RejectedOpenInput(FundingShapeTag),
+    RejectedCloseInput(ProofTag),
     RaiseFeeInput,
     TickInput,
     IdleInput,
