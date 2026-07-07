@@ -30,6 +30,7 @@ use futures::StreamExt;
 #[cfg(feature = "evaluate")]
 use futures::stream::BoxStream;
 use futures::stream::Stream;
+use hellas_adaptors::OutputEvent as WireOutputEvent;
 #[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, ExecutorHandle};
 #[cfg(feature = "evaluate")]
@@ -75,7 +76,6 @@ use hellas_rpc::{
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
-use hellas_adaptors::OutputEvent as WireOutputEvent;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -1751,21 +1751,20 @@ fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_adaptors::{OutputEvent as WireOutputEvent, StopReason as WireStopReason};
     use hellas_rpc::ProducerSigningKey;
     #[cfg(feature = "evaluate")]
     use hellas_rpc::evaluate::{
         EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
         input_commitment as evaluate_input_commitment,
     };
+    use hellas_rpc::fetch::encode_fetch_terminal_payload;
     use hellas_rpc::fetch::{
         FetchOutputTranscriptBuilder, build_input_events, build_output_events,
     };
     #[cfg(feature = "evaluate")]
     use hellas_rpc::pb::execute::WorkChunk;
     use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
-    use hellas_adaptors::{
-        OutputEvent as WireOutputEvent, StopReason as WireStopReason, encode_fetch_terminal_payload,
-    };
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")

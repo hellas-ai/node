@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/executor",
     "crates/kernel",
+    "crates/p2p",
     "crates/rpc",
     "crates/wire",
     "crates/adaptors",
@@ -47,6 +48,7 @@ half = "2.7.1"
 hellas-chain = { path = "crates/chain", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
+hellas-p2p = { path = "crates/p2p", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
 hellas-adaptors = { path = "crates/adaptors", default-features = false }

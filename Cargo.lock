@@ -3460,6 +3460,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-p2p"
+version = "0.1.0"
+dependencies = [
+ "hellas-wire",
+ "iroh",
+ "thiserror 2.0.18",
+ "web-time",
+]
+
+[[package]]
 name = "hellas-rpc"
 version = "0.1.0"
 dependencies = [
@@ -3471,9 +3481,9 @@ dependencies = [
  "futures-core",
  "futures-util",
  "getrandom 0.2.17",
+ "hellas-p2p",
  "hellas-wire",
  "hf-hub 0.5.0",
- "iroh",
  "k256",
  "prost",
  "prost-build",
@@ -3487,7 +3497,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tokio",
- "web-time",
 ]
 
 [[package]]

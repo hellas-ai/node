@@ -1,6 +1,6 @@
 use crate::execution::StopReason as RuntimeStopReason;
-use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 use hellas_adaptors::{Provenance, StopReason, Usage};
+use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 
 pub(super) fn provenance_from_execution(provenance: &ExecutionProvenance) -> Provenance {
     Provenance {

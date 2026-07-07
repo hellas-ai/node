@@ -808,14 +808,14 @@ fn truncate_string(mut value: String, max_len: usize) -> String {
     value
 }
 
-#[cfg(all(test, feature = "swarm"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::node::Node;
+    use crate::test_markers::TestService as Node;
 
     const NODE: &str = "hellas.swarm.v1.Node";
     const GET_NODE_INFO: RequestKind =
-        RequestKind::for_method::<crate::services::node::GetNodeInfo>();
+        RequestKind::for_method::<crate::test_markers::GetNodeInfo>();
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
