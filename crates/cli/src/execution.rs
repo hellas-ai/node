@@ -34,6 +34,8 @@ use hellas_adaptors::OutputEvent as WireOutputEvent;
 #[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, ExecutorHandle};
 #[cfg(feature = "evaluate")]
+use hellas_models::{ModelAssets, ModelAssetsError};
+#[cfg(feature = "evaluate")]
 use hellas_rpc::Digest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
@@ -51,8 +53,6 @@ use hellas_rpc::fetch::{
 use hellas_rpc::fetch::{
     FetchTerminalPayload, decode_fetch_event_payload, decode_fetch_terminal_payload,
 };
-#[cfg(feature = "evaluate")]
-use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,

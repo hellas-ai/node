@@ -1,3 +1,10 @@
+//! Model assets: HuggingFace download, tokenizer, and text decoding.
+//!
+//! The model domain layer. Depends on `hellas-rpc` for protocol
+//! primitives (`Dtype`, `ModelSpec`, token codecs) but owns no protocol
+//! shape itself — it hands callers domain results and leaves wire
+//! assembly to them.
+
 mod assets;
 mod config;
 mod hf;
@@ -9,7 +16,7 @@ use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;
 
-use crate::{TokenBytesError, spec::ModelSpecError};
+use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{ModelAssets, PreparedQuote, TextOutputDecoder, to_catgrad_dtype};
 
@@ -91,3 +98,6 @@ pub enum ModelAssetsError {
         source: LLMError,
     },
 }
+
+mod wire;
+pub use wire::model_assets_wire_code;

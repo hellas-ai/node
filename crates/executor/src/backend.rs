@@ -1,5 +1,5 @@
+use crate::BackendInitError;
 use catgrad::interpreter::backend::candle::CandleBackend;
-use hellas_rpc::error::BackendInitError;
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;

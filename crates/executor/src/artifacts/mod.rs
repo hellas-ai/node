@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hellas_rpc::ExecutorError;
+use crate::ExecutorError;
 use hellas_rpc::{Digest, EvaluateRequest, hash_tuple};
 use serde::{Deserialize, Serialize};
 

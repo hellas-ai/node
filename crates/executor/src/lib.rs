@@ -2,6 +2,9 @@
 extern crate tracing;
 
 #[cfg(feature = "evaluate")]
+mod error;
+pub use error::{BackendInitError, ExecutorError, StateError};
+
 mod artifacts;
 #[cfg(feature = "evaluate")]
 mod backend;

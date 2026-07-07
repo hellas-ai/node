@@ -1,3 +1,5 @@
+use crate::ExecutorError;
+use crate::StateError;
 use crate::executor::{
     ExecuteOutcome, ExecutorMessage, FetchCompletion, FetchProviderFailure, FetchProviderRun,
     PendingFetch,
@@ -8,8 +10,6 @@ use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
 use crate::state::{QuoteKind, new_execution_id};
 use futures_util::StreamExt;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::error::StateError;
 use hellas_rpc::fetch::FetchOutputTranscriptBuilder;
 use hellas_rpc::pb::execute::{
     FinishStatus, RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
@@ -712,6 +712,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecutorError;
     use crate::{
         ArtifactStoreConfig, CallerAccess, Executor, ExecutorMetrics, ExecutorSpawnConfig,
         FetchAccessPolicy, FetchProjectionError, FetchProjectionSession, FetchProjector,
@@ -721,7 +722,6 @@ mod tests {
     };
     use futures_util::stream;
     use hellas_rpc::Dtype;
-    use hellas_rpc::ExecutorError;
     use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;
     use hellas_rpc::pb::fetch::FetchRequest;

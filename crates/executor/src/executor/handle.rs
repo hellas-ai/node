@@ -8,15 +8,15 @@ use std::pin::Pin;
 #[cfg(feature = "evaluate")]
 use std::sync::Arc;
 
+use crate::ExecutorError;
 use futures_core::Stream;
 #[cfg(feature = "evaluate")]
 use futures_util::StreamExt;
 #[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::call::WithTrailer;
+use hellas_models::{ModelAssets, TextOutputDecoder};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
+use hellas_rpc::Dtype;
+use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
     GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,

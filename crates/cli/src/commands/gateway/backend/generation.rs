@@ -4,7 +4,7 @@ use hellas_adaptors::BackendError;
 use thiserror::Error;
 
 use crate::execution::{ExecutionError, Outcome};
-use hellas_rpc::model::{ModelAssetsError, TextOutputDecoder};
+use hellas_models::{ModelAssetsError, TextOutputDecoder};
 
 use super::super::state::PreparedGeneration;
 

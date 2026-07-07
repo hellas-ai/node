@@ -4,12 +4,6 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
     None => "unknown",
 };
 
-#[cfg(feature = "execute")]
-pub mod error;
-
-#[cfg(feature = "node")]
-pub mod model;
-
 pub mod call;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;
@@ -89,12 +83,6 @@ pub fn peer_directory_config() -> peers::PeerDirectoryConfig {
         ..Default::default()
     }
 }
-
-#[cfg(feature = "execute")]
-pub use error::ExecutorError;
-
-#[cfg(feature = "node")]
-pub use model::ModelAssetsError;
 
 /// Default bound on the in-memory execution queue carried by `hellas_executor::Executor`.
 #[cfg(feature = "execute")]

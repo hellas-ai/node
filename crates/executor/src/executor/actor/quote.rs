@@ -1,11 +1,12 @@
 use std::time::{Duration, Instant};
 
+use crate::ExecutorError;
 use hellas_rpc::fetch::verify_input_events;
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::stream::input_event_from_pb;
-use hellas_rpc::{Digest, ExecutorError, RequestCommitment};
+use hellas_rpc::{Digest, RequestCommitment};
 
 use crate::executor::TicketOutcome;
 use crate::fetch_provider::FetchProviderRequest;

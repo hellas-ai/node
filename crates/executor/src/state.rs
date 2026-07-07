@@ -5,6 +5,7 @@ use std::time::Instant;
 
 #[cfg(feature = "evaluate")]
 use crate::DEFAULT_MAX_SEQ;
+use crate::ExecutorError;
 use crate::fetch_provider::FetchProviderRequest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
@@ -26,10 +27,10 @@ use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Digest, PublicKey, RequestCommitment};
-use hellas_rpc::{EvaluateRequest, ExecutorError, OutputEventEnvelope};
+use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
 use uuid::Uuid;
 
-pub use hellas_rpc::error::StateError;
+pub use crate::StateError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactStoreConfig {

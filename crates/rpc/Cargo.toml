@@ -40,31 +40,17 @@ iroh-client = ["iroh"]
 iroh-server = ["iroh"]
 
 # Binary-side bundle for the node binary (executor / model deps).
-node = [
-    "server",
-    "all-protocols",
-    "dep:catgrad",
-    "dep:catgrad-llm",
-    "dep:chatgrad",
-    "dep:serde_json",
-    "dep:tokenizers",
-    "dep:hf-hub",
-]
+# Binary-side bundle for the node binary (server + every protocol). The
+# model-asset and LLM deps that used to live here moved out with the
+# `model` module (now `hellas-models`).
+node = ["server", "all-protocols"]
 
 [dependencies]
 blake3 = { workspace = true }
 bytes = "1"
-catgrad = { workspace = true, default-features = false, features = [
-    "serde",
-], optional = true }
-catgrad-llm = { workspace = true, default-features = false, optional = true }
-chatgrad = { workspace = true, default-features = false, optional = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 hellas-wire = { workspace = true }
-hf-hub = { version = "0.5", default-features = false, features = [
-    "ureq",
-], optional = true }
 k256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true }
@@ -73,24 +59,13 @@ serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
-tokenizers = { version = "0.21", default-features = false, features = [
-    "progressbar",
-    "fancy-regex",
-], optional = true }
 hellas-auth = { workspace = true }
 hellas-p2p = { workspace = true }
-
-[target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
-tokenizers = { version = "0.21", features = [
-    "onig",
-    "esaxx_fast",
-], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
 [build-dependencies]
-blake3 = { workspace = true }
 hellas-wire = { workspace = true, default-features = false }
 prost-build = "0.14"
 prost-types = "0.14"

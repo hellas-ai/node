@@ -3394,6 +3394,7 @@ dependencies = [
  "hellas-adaptors",
  "hellas-chain",
  "hellas-executor",
+ "hellas-models",
  "hellas-rpc",
  "hellas-wire",
  "hex",
@@ -3427,9 +3428,11 @@ dependencies = [
  "async-trait",
  "blake3",
  "catgrad",
+ "catgrad-llm",
  "chatgrad",
  "futures-core",
  "futures-util",
+ "hellas-models",
  "hellas-rpc",
  "hellas-wire",
  "iroh-blobs",
@@ -3464,6 +3467,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-models"
+version = "0.1.0"
+dependencies = [
+ "catgrad",
+ "catgrad-llm",
+ "chatgrad",
+ "hellas-rpc",
+ "hellas-wire",
+ "hf-hub 0.5.0",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "hellas-p2p"
 version = "0.1.0"
 dependencies = [
@@ -3479,16 +3497,12 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
- "catgrad",
- "catgrad-llm",
- "chatgrad",
  "futures-core",
  "futures-util",
  "getrandom 0.2.17",
  "hellas-auth",
  "hellas-p2p",
  "hellas-wire",
- "hf-hub 0.5.0",
  "k256",
  "prost",
  "prost-build",
@@ -3500,7 +3514,6 @@ dependencies = [
  "serde_json",
  "smol_str 0.3.6",
  "thiserror 2.0.18",
- "tokenizers 0.21.4",
  "tokio",
 ]
 

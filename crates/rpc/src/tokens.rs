@@ -3,7 +3,7 @@
 //!
 //! Not scheme-specific: the evaluate scheme produces these bytes, `model`
 //! decodes them back to text, executor artifacts round-trip them, and
-//! [`crate::ExecutorError`] surfaces a malformed length. Lives here rather
+//! `hellas_executor::ExecutorError` surfaces a malformed length. Lives here rather
 //! than in the crate root so the primitive has a named home.
 
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();

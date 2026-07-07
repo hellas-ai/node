@@ -1,11 +1,11 @@
-#[cfg(feature = "node")]
+#[cfg(feature = "evaluate")]
 use catgrad_llm::LLMError;
 use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
 
-use crate::TokenBytesError;
-#[cfg(feature = "node")]
-use crate::model::ModelAssetsError;
+#[cfg(feature = "evaluate")]
+use hellas_models::ModelAssetsError;
+use hellas_rpc::TokenBytesError;
 
 /// Error returned when the backend fails to initialize.
 #[derive(Clone, Debug, Error)]
@@ -41,10 +41,10 @@ pub enum ExecutorError {
     InvalidQuoteRequest(String),
     #[error(transparent)]
     BackendInit(#[from] BackendInitError),
-    #[cfg(feature = "node")]
+    #[cfg(feature = "evaluate")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
-    #[cfg(feature = "node")]
+    #[cfg(feature = "evaluate")]
     #[error("LLM error: {0}")]
     Llm(#[from] LLMError),
     #[error("weights not ready for {0}")]
@@ -70,25 +70,11 @@ pub enum ExecutorError {
         "program was built for dtype {request:?} but this executor only supports {supported:?}; rebuild the program at one of the supported dtypes or run an executor with --dtype {request:?} in its supported set"
     )]
     DtypeNotSupported {
-        request: crate::Dtype,
-        supported: Vec<crate::Dtype>,
+        request: hellas_rpc::Dtype,
+        supported: Vec<hellas_rpc::Dtype>,
     },
     #[error(transparent)]
     State(#[from] StateError),
-}
-
-#[cfg(feature = "node")]
-fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
-    match err {
-        ModelAssetsError::Spec(_)
-        | ModelAssetsError::ParseModelConfig { .. }
-        | ModelAssetsError::ConstructModelConfig { .. }
-        | ModelAssetsError::NegativePromptTokenId { .. }
-        | ModelAssetsError::NegativeStopTokenId { .. }
-        | ModelAssetsError::TokenBytes { .. }
-        | ModelAssetsError::OutputTokenOutOfRange { .. } => WireCode::InvalidArgument,
-        _ => WireCode::Internal,
-    }
 }
 
 fn executor_wire_code(err: &ExecutorError) -> WireCode {
@@ -100,8 +86,8 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
         ExecutorError::DtypeNotSupported { .. } => WireCode::FailedPrecondition,
-        #[cfg(feature = "node")]
-        ExecutorError::ModelAssets(model_err) => model_assets_wire_code(model_err),
+        #[cfg(feature = "evaluate")]
+        ExecutorError::ModelAssets(model_err) => hellas_models::model_assets_wire_code(model_err),
         ExecutorError::WeightsNotReady(_) | ExecutorError::State(StateError::QuoteExpired(_)) => {
             WireCode::FailedPrecondition
         }
@@ -109,19 +95,12 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
             WireCode::NotFound
         }
-        #[cfg(feature = "node")]
+        #[cfg(feature = "evaluate")]
         ExecutorError::Llm(_) => WireCode::Internal,
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::WeightsError(_)
         | ExecutorError::ArtifactStore(_) => WireCode::Internal,
-    }
-}
-
-#[cfg(feature = "node")]
-impl From<ModelAssetsError> for WireStatus {
-    fn from(err: ModelAssetsError) -> Self {
-        WireStatus::new(model_assets_wire_code(&err), err.to_string())
     }
 }
 

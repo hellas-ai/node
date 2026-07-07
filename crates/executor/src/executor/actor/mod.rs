@@ -1,6 +1,7 @@
 mod execution;
 mod quote;
 
+use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
@@ -15,7 +16,7 @@ use crate::scheme::SchemeEngine;
 use crate::state::{ArtifactStoreConfig, ExecutorState};
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::{Dtype, ExecutorError, ProducerSigningKey};
+use hellas_rpc::{Dtype, ProducerSigningKey};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;

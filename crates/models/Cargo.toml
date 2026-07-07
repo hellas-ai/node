@@ -1,0 +1,25 @@
+[package]
+name = "hellas-models"
+description = "Model assets: HuggingFace download, tokenizer, text decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+hellas-rpc = { workspace = true, default-features = false, features = ["execute"] }
+hellas-wire = { workspace = true }
+catgrad = { workspace = true, default-features = false, features = ["serde"] }
+catgrad-llm = { workspace = true, default-features = false }
+chatgrad = { workspace = true, default-features = false }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = [
+    "progressbar",
+    "fancy-regex",
+] }
+
+[target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
+tokenizers = { version = "0.21", features = ["onig", "esaxx_fast"] }
