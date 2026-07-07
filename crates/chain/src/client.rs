@@ -1,12 +1,12 @@
+use crate::domain::{
+    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
+    WebAuthnSignature as DomainWebAuthnSignature,
+};
 use crate::{
     ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
     LightClient, OwnerCoins, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
-use hellas_kernel::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
-    WebAuthnSignature as DomainWebAuthnSignature,
-};
 use hellas_rpc::{
     call::StreamingCall,
     pb::{chain::*, services::light_client::LightClientClientImpl},

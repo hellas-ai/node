@@ -1,13 +1,13 @@
+use crate::domain::Bounded;
+use crate::domain::{
+    Address, Coin, DecodeExt, Digest, Encode, MAX_MERGE_INPUTS, ObjectId, Transaction,
+    UserPublicKey, UserSignature, WebAuthnSignature,
+};
 use crate::{
     ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
     LightClient as LightClientApi, ProposalInfo,
 };
 use futures_util::{Stream, StreamExt as _};
-use hellas_kernel::List;
-use hellas_kernel::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, MAX_MERGE_INPUTS, ObjectId, Transaction,
-    UserPublicKey, UserSignature, WebAuthnSignature,
-};
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, FinalizationEvent,
@@ -398,7 +398,7 @@ fn merge_from_proto(tx: MergeCoinTx) -> Result<Transaction, WireStatus> {
     for (index, input) in tx.inputs.into_iter().enumerate() {
         inputs[index] = digest_from_bytes(input, "input")?;
     }
-    let inputs = List::new(inputs, len).ok_or_else(|| {
+    let inputs = Bounded::new(inputs, len).ok_or_else(|| {
         WireStatus::new(
             WireCode::InvalidArgument,
             "merge input count exceeds capacity",

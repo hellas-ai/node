@@ -21,7 +21,7 @@ evaluate = [
 candle = ["evaluate", "hellas-executor/candle"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
-chain = ["dep:hellas-chain", "dep:hellas-kernel", "hellas-chain/client"]
+chain = ["dep:hellas-chain", "hellas-chain/client"]
 indexer = ["chain", "hellas-chain/indexer"]
 validator = ["indexer", "hellas-chain/validator"]
 
@@ -52,9 +52,6 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-executor = { workspace = true, default-features = false, optional = true }
-hellas-kernel = { workspace = true, default-features = false, features = [
-    "domain",
-], optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
 ] }

@@ -1,3 +1,6 @@
+use crate::domain::{
+    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
+};
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
     Mempool, OwnerIndex, UtxoDb,
@@ -37,9 +40,6 @@ use commonware_storage::{
 };
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
-use hellas_kernel::domain::{
-    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
-};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use prometheus_client::metrics::gauge::Gauge;

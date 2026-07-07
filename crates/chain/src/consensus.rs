@@ -1,11 +1,11 @@
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod full {
+    use crate::domain::{Scheme, ThresholdVariant};
     use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, QueryError};
     use commonware_codec::{Decode, DecodeExt};
     use commonware_consensus::simplex::types::Finalization as SimplexFinalization;
     use commonware_cryptography::{certificate::Verifier as _, sha256::Digest};
     use commonware_parallel::Sequential;
-    use hellas_kernel::domain::{Scheme, ThresholdVariant};
     use rand::rngs::OsRng;
     use thiserror::Error;
 

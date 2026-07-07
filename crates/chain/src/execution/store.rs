@@ -1,3 +1,4 @@
+use crate::domain::{Coin, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_glue::stateful::db::{ManagedDb, Shared};
 use commonware_parallel::Sequential;
@@ -11,7 +12,6 @@ use commonware_storage::{
     },
     translator::EightCap,
 };
-use hellas_kernel::domain::{Coin, ObjectId};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Coin, Sha256, EightCap, Sequential>;

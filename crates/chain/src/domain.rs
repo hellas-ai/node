@@ -4,83 +4,48 @@
 //!
 //! [`Transaction::verify_signature`] enforces a browser-shaped policy:
 //! UP *and* UV flags, an HTTPS origin allowlist, and `rpIdHash` binding.
-//! The kernel's open-authorization verifier ([`crate::webauthn`], feature
+//! The kernel's open-authorization verifier (`hellas-kernel`, feature
 //! `webauthn`) is deliberately looser — UP *or* UV, origin ignored — and
 //! treats `WebAuthn` as a portable P-256 transaction-signing envelope.
 //! They are different products; do not wire one where the other is
-//! expected. This module is transitional and slated to move to its own
-//! crate.
-
-// Transitional chain-facing module: exempt from the kernel core's
-// panic-freedom indexing lint until it moves to its own crate. Slice
-// arithmetic here is bounded by the codec range configs.
-#![allow(clippy::indexing_slicing)]
-
-#[cfg(any(test, feature = "test-support"))]
-use alloc::borrow::ToOwned;
-#[cfg(test)]
-use alloc::string::ToString;
+//! expected.
 
 /// Digest used by chain-facing APIs.
-#[cfg(feature = "domain")]
 pub use commonware_cryptography::sha256::Digest;
-/// Digest bytes used when domain cryptography is not enabled.
-#[cfg(not(feature = "domain"))]
-pub type Digest = [u8; 32];
 
 /// Decoding helper for domain types.
-#[cfg(feature = "domain")]
 pub use commonware_codec::DecodeExt;
 /// Encoding helper for domain types.
-#[cfg(feature = "domain")]
 pub use commonware_codec::Encode;
 
-#[cfg(feature = "domain")]
-use crate::List;
-#[cfg(feature = "domain")]
 use base64ct::{Base64UrlUnpadded, Encoding};
-#[cfg(feature = "domain")]
 use bytes::BytesMut;
-#[cfg(feature = "domain")]
 use commonware_codec::{
     EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
 };
-#[cfg(feature = "domain")]
 /// Signing helper for domain key types.
 pub use commonware_cryptography::Signer;
-#[cfg(feature = "domain")]
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
-#[cfg(feature = "domain")]
 use p256::ecdsa::signature::Verifier as _;
-#[cfg(feature = "domain")]
 use serde_json::Value as JsonValue;
-#[cfg(feature = "domain")]
 use sha2::{Digest as _, Sha256 as Sha2};
-#[cfg(feature = "domain")]
 use url::Url;
 
 /// Validator public key.
-#[cfg(feature = "domain")]
 pub type PublicKey = ed25519::PublicKey;
 /// Validator private key.
-#[cfg(feature = "domain")]
 pub type PrivateKey = ed25519::PrivateKey;
 /// User public key.
-#[cfg(feature = "domain")]
 pub type UserPublicKey = secp256r1::standard::PublicKey;
 /// User signature.
-#[cfg(feature = "domain")]
 pub type UserSignature = secp256r1::standard::Signature;
 /// Object identifier in the chain state.
-#[cfg(feature = "domain")]
 pub type ObjectId = Digest;
 
 /// User address derived from a secp256r1 public key.
-#[cfg(feature = "domain")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Address(UserPublicKey);
 
-#[cfg(feature = "domain")]
 impl Address {
     /// Returns the public key encoded by this address.
     #[must_use]
@@ -95,21 +60,18 @@ impl Address {
     }
 }
 
-#[cfg(feature = "domain")]
 impl From<UserPublicKey> for Address {
     fn from(pk: UserPublicKey) -> Self {
         Self(pk)
     }
 }
 
-#[cfg(feature = "domain")]
 impl AsRef<UserPublicKey> for Address {
     fn as_ref(&self) -> &UserPublicKey {
         &self.0
     }
 }
 
-#[cfg(feature = "domain")]
 impl core::fmt::Display for Address {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use commonware_codec::Encode;
@@ -117,7 +79,6 @@ impl core::fmt::Display for Address {
     }
 }
 
-#[cfg(feature = "domain")]
 impl core::str::FromStr for Address {
     type Err = AddressError;
 
@@ -128,7 +89,6 @@ impl core::str::FromStr for Address {
     }
 }
 
-#[cfg(feature = "domain")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 /// Address parsing error.
 pub enum AddressError {
@@ -140,19 +100,16 @@ pub enum AddressError {
     InvalidKey,
 }
 
-#[cfg(feature = "domain")]
 impl FixedSize for Address {
     const SIZE: usize = UserPublicKey::SIZE;
 }
 
-#[cfg(feature = "domain")]
 impl Write for Address {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.0.write(buf);
     }
 }
 
-#[cfg(feature = "domain")]
 impl Read for Address {
     type Cfg = ();
 
@@ -161,15 +118,64 @@ impl Read for Address {
     }
 }
 
-#[cfg(feature = "domain")]
-impl<T: Write, const N: usize> Write for List<T, N> {
+/// Bounded array-backed list for chain wire payloads.
+///
+/// Local to this crate so the commonware codec impls below can live
+/// beside the type (orphan rule); the chain wire format is independent
+/// of the kernel's canonical encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bounded<T, const N: usize> {
+    items: [T; N],
+    len: usize,
+}
+
+impl<T, const N: usize> Bounded<T, N> {
+    /// Creates a bounded list from a backing array and live length.
+    #[must_use]
+    pub fn new(items: [T; N], len: usize) -> Option<Self> {
+        (len <= N).then_some(Self { items, len })
+    }
+
+    /// Borrows the live entries.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        self.items.get(..self.len).unwrap_or(&self.items)
+    }
+
+    /// Returns the number of live entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when the list has no live entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Iterates over the live entries.
+    pub fn iter(&self) -> core::slice::Iter<'_, T> {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a Bounded<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<T: Write, const N: usize> Write for Bounded<T, N> {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.as_slice().write(buf);
     }
 }
 
-#[cfg(feature = "domain")]
-impl<T: EncodeSize, const N: usize> EncodeSize for List<T, N> {
+impl<T: EncodeSize, const N: usize> EncodeSize for Bounded<T, N> {
     fn encode_size(&self) -> usize {
         self.as_slice().encode_size()
     }
@@ -179,8 +185,7 @@ impl<T: EncodeSize, const N: usize> EncodeSize for List<T, N> {
     }
 }
 
-#[cfg(feature = "domain")]
-impl<const N: usize> Read for List<u8, N> {
+impl<const N: usize> Read for Bounded<u8, N> {
     type Cfg = (RangeCfg<usize>, ());
 
     fn read_cfg(buf: &mut impl bytes::Buf, (range, _cfg): &Self::Cfg) -> Result<Self, CodecError> {
@@ -189,12 +194,11 @@ impl<const N: usize> Read for List<u8, N> {
         for slot in items.iter_mut().take(len) {
             *slot = u8::read(buf)?;
         }
-        Ok(Self::take(items, len))
+        Ok(Self { items, len })
     }
 }
 
-#[cfg(feature = "domain")]
-impl<const N: usize> Read for List<ObjectId, N> {
+impl<const N: usize> Read for Bounded<ObjectId, N> {
     type Cfg = (RangeCfg<usize>, ());
 
     fn read_cfg(buf: &mut impl bytes::Buf, (range, _cfg): &Self::Cfg) -> Result<Self, CodecError> {
@@ -203,110 +207,87 @@ impl<const N: usize> Read for List<ObjectId, N> {
         for slot in items.iter_mut().take(len) {
             *slot = ObjectId::read(buf)?;
         }
-        Ok(Self::take(items, len))
+        Ok(Self { items, len })
     }
 }
 
 /// Threshold signature variant used by consensus.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type ThresholdVariant = commonware_cryptography::bls12381::primitives::variant::MinPk;
 /// Threshold signature share.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type ThresholdShare = commonware_cryptography::bls12381::primitives::group::Share;
 /// Threshold sharing polynomial.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type ThresholdPolynomial =
     commonware_cryptography::bls12381::primitives::sharing::Sharing<ThresholdVariant>;
 /// Consensus signing scheme.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type Scheme = commonware_consensus::simplex::scheme::bls12381_threshold::vrf::Scheme<
     PublicKey,
     ThresholdVariant,
 >;
 /// Consensus context.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type Context = commonware_consensus::simplex::types::Context<Digest, PublicKey>;
 /// Consensus activity event.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Digest>;
 
 /// The epoch number used in consensus.
 ///
 /// No reconfiguration - the network always starts in epoch 0.
-#[cfg(feature = "consensus")]
+#[cfg(feature = "domain-consensus")]
 pub const EPOCH: commonware_consensus::types::Epoch = commonware_consensus::types::Epoch::zero();
 
 /// `WebAuthn` policy version.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
 /// Chain identifier committed into `WebAuthn` challenges.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_CHAIN_ID: &[u8] = b"hellas-devnet-1";
 /// Whether `WebAuthn` user presence is required.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_REQUIRE_UP: bool = true;
 /// Whether `WebAuthn` user verification is required.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_REQUIRE_UV: bool = true;
 /// Whether cross-origin assertions are rejected.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_REQUIRE_CROSS_ORIGIN_FALSE: bool = true;
 /// Whether HTTPS origins are required.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_REQUIRE_HTTPS_ORIGIN: bool = true;
 /// Whether HTTP localhost origins are allowed.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_ALLOW_HTTP_LOCALHOST_ORIGIN: bool = true;
 /// Whether attested credential data is allowed.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_ALLOW_ATTESTED_CREDENTIAL_DATA: bool = false;
 /// Whether `WebAuthn` extensions are allowed.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_ALLOW_EXTENSIONS: bool = false;
 /// Required `WebAuthn` client data type.
-#[cfg(feature = "domain")]
 pub const WEBAUTHN_TYPE_GET: &str = "webauthn.get";
 
 /// Domain separator for `WebAuthn` challenges.
-#[cfg(feature = "domain")]
 pub const CHALLENGE_DOMAIN: &[u8] = b"hellas-webauthn-challenge-v1";
 /// Transfer transaction tag.
-#[cfg(feature = "domain")]
 pub const TRANSFER_TAG: u8 = 0x01;
 /// Merge transaction tag.
-#[cfg(feature = "domain")]
 pub const MERGE_TAG: u8 = 0x02;
 /// Maximum merge input count.
-#[cfg(feature = "domain")]
 pub const MAX_MERGE_INPUTS: usize = 32;
 /// Maximum transactions per block.
-#[cfg(feature = "domain")]
 pub const MAX_TXS_PER_BLOCK: usize = 256;
 /// Default genesis allocation balance.
-#[cfg(feature = "domain")]
 pub const GENESIS_BALANCE: u64 = 100_000_000;
 /// Minimum `WebAuthn` authenticator data length.
-#[cfg(feature = "domain")]
 pub const MIN_AUTHENTICATOR_DATA_LEN: usize = 37;
 /// Maximum `WebAuthn` authenticator data length.
-#[cfg(feature = "domain")]
 pub const MAX_AUTHENTICATOR_DATA_LEN: usize = 256;
 /// Maximum `WebAuthn` client data JSON length.
-#[cfg(feature = "domain")]
 pub const MAX_CLIENT_DATA_JSON_LEN: usize = 1024;
 
 /// Bounded authenticator data carried by a `WebAuthn` signature.
-#[cfg(feature = "domain")]
-pub type AuthenticatorData = List<u8, MAX_AUTHENTICATOR_DATA_LEN>;
+pub type AuthenticatorData = Bounded<u8, MAX_AUTHENTICATOR_DATA_LEN>;
 /// Bounded client data JSON carried by a `WebAuthn` signature.
-#[cfg(feature = "domain")]
-pub type ClientDataJson = List<u8, MAX_CLIENT_DATA_JSON_LEN>;
+pub type ClientDataJson = Bounded<u8, MAX_CLIENT_DATA_JSON_LEN>;
 /// Bounded merge input list.
-#[cfg(feature = "domain")]
-pub type MergeInputs = List<ObjectId, MAX_MERGE_INPUTS>;
+pub type MergeInputs = Bounded<ObjectId, MAX_MERGE_INPUTS>;
 
 /// Returns the deterministic object id for a genesis allocation.
-#[cfg(feature = "domain")]
 #[must_use]
 pub fn genesis_object_id(validator_index: u16) -> ObjectId {
     let mut buf = BytesMut::new();
@@ -316,7 +297,6 @@ pub fn genesis_object_id(validator_index: u16) -> ObjectId {
 }
 
 /// Returns the deterministic object id for a transaction output.
-#[cfg(feature = "domain")]
 #[must_use]
 pub fn output_object_id(tx_digest: &Digest, output_index: u8) -> ObjectId {
     let mut buf = BytesMut::new();
@@ -325,7 +305,6 @@ pub fn output_object_id(tx_digest: &Digest, output_index: u8) -> ObjectId {
     Sha256::hash(&buf)
 }
 
-#[cfg(feature = "domain")]
 fn challenge_prefix(buf: &mut BytesMut, tag: u8) {
     const WEBAUTHN_CHAIN_ID_LEN: u8 = 14;
 
@@ -337,7 +316,6 @@ fn challenge_prefix(buf: &mut BytesMut, tag: u8) {
 }
 
 /// Returns the `WebAuthn` challenge for a transfer transaction.
-#[cfg(feature = "domain")]
 #[must_use]
 pub fn transfer_challenge(input: &ObjectId, recipient: &Address, amount: u64) -> Digest {
     let mut buf = BytesMut::new();
@@ -349,7 +327,6 @@ pub fn transfer_challenge(input: &ObjectId, recipient: &Address, amount: u64) ->
 }
 
 /// Returns the `WebAuthn` challenge for a merge transaction.
-#[cfg(feature = "domain")]
 #[must_use]
 pub fn merge_challenge(sorted_inputs: &[ObjectId]) -> Digest {
     let mut buf = BytesMut::new();
@@ -358,14 +335,13 @@ pub fn merge_challenge(sorted_inputs: &[ObjectId]) -> Digest {
     Sha256::hash(&buf)
 }
 
-#[cfg(feature = "domain")]
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha2::new();
     hasher.update(bytes);
     hasher.finalize().into()
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn secp256r1_key_from_material(material: &[u8]) -> p256::ecdsa::SigningKey {
     let mut salt = 0u8;
     loop {
@@ -381,12 +357,10 @@ fn secp256r1_key_from_material(material: &[u8]) -> p256::ecdsa::SigningKey {
     }
 }
 
-#[cfg(feature = "domain")]
 fn localhost_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
-#[cfg(feature = "domain")]
 fn origin_is_allowed(url: &Url) -> bool {
     let scheme = url.scheme();
     (scheme == "https")
@@ -395,7 +369,6 @@ fn origin_is_allowed(url: &Url) -> bool {
             && url.host_str().is_some_and(localhost_host))
 }
 
-#[cfg(feature = "domain")]
 fn lower_host_hash(host: &str) -> Option<[u8; 32]> {
     const MAX_RP_ID_LEN: usize = 253;
 
@@ -409,7 +382,6 @@ fn lower_host_hash(host: &str) -> Option<[u8; 32]> {
     Some(sha256_bytes(&lower[..host.len()]))
 }
 
-#[cfg(feature = "domain")]
 /// Returns the SHA-256 RP ID hash for a permitted `WebAuthn` origin.
 #[must_use]
 pub fn rp_id_hash_from_origin(origin: &str) -> Option<[u8; 32]> {
@@ -422,7 +394,6 @@ pub fn rp_id_hash_from_origin(origin: &str) -> Option<[u8; 32]> {
 
 // --- Coin (gated) ---
 
-#[cfg(feature = "domain")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Chain coin object.
 pub struct Coin {
@@ -432,12 +403,10 @@ pub struct Coin {
     pub value: u64,
 }
 
-#[cfg(feature = "domain")]
 impl FixedSize for Coin {
     const SIZE: usize = Address::SIZE + u64::SIZE;
 }
 
-#[cfg(feature = "domain")]
 impl Write for Coin {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.owner.write(buf);
@@ -445,7 +414,6 @@ impl Write for Coin {
     }
 }
 
-#[cfg(feature = "domain")]
 impl Read for Coin {
     type Cfg = ();
 
@@ -459,7 +427,6 @@ impl Read for Coin {
 
 // --- WebAuthnSignature (gated) ---
 
-#[cfg(feature = "domain")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// `WebAuthn` signature payload committed by a transaction.
 pub struct WebAuthnSignature {
@@ -471,17 +438,15 @@ pub struct WebAuthnSignature {
     pub client_data_json: ClientDataJson,
 }
 
-#[cfg(feature = "domain")]
-fn byte_list_from_slice<const N: usize>(bytes: &[u8]) -> Option<List<u8, N>> {
+fn byte_list_from_slice<const N: usize>(bytes: &[u8]) -> Option<Bounded<u8, N>> {
     if bytes.len() > N {
         return None;
     }
     let mut items = [0_u8; N];
     items[..bytes.len()].copy_from_slice(bytes);
-    List::new(items, bytes.len())
+    Bounded::new(items, bytes.len())
 }
 
-#[cfg(feature = "domain")]
 impl WebAuthnSignature {
     /// Builds a bounded `WebAuthn` signature payload.
     #[must_use]
@@ -501,7 +466,6 @@ impl WebAuthnSignature {
     }
 }
 
-#[cfg(feature = "domain")]
 impl EncodeSize for WebAuthnSignature {
     fn encode_size(&self) -> usize {
         self.signature.encode_size()
@@ -510,7 +474,6 @@ impl EncodeSize for WebAuthnSignature {
     }
 }
 
-#[cfg(feature = "domain")]
 impl Write for WebAuthnSignature {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.signature.write(buf);
@@ -519,7 +482,6 @@ impl Write for WebAuthnSignature {
     }
 }
 
-#[cfg(feature = "domain")]
 impl Read for WebAuthnSignature {
     type Cfg = ();
 
@@ -543,7 +505,6 @@ impl Read for WebAuthnSignature {
 
 // --- Transaction (gated) ---
 
-#[cfg(feature = "domain")]
 // Keep transactions inline/stack-allocated to avoid per-transaction heap churn in hot paths.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
@@ -569,12 +530,10 @@ pub enum Transaction {
     },
 }
 
-#[cfg(feature = "domain")]
 fn merge_inputs_are_strictly_sorted(inputs: &[ObjectId]) -> bool {
     inputs.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-#[cfg(feature = "domain")]
 fn client_data_rp_hash(bytes: &[u8], expected_challenge: &[u8]) -> Option<[u8; 32]> {
     let json: JsonValue = serde_json::from_slice(bytes).ok()?;
     let obj = json.as_object()?;
@@ -601,7 +560,6 @@ fn client_data_rp_hash(bytes: &[u8], expected_challenge: &[u8]) -> Option<[u8; 3
     rp_id_hash_from_origin(origin)
 }
 
-#[cfg(feature = "domain")]
 fn verify_webauthn_signature(
     expected_challenge: &[u8],
     signature: &WebAuthnSignature,
@@ -654,7 +612,6 @@ fn verify_webauthn_signature(
     verifying_key.verify(&msg[..msg_len], &sig).is_ok()
 }
 
-#[cfg(feature = "domain")]
 impl Transaction {
     /// Verifies the transaction `WebAuthn` signature against `owner`.
     #[must_use]
@@ -686,7 +643,7 @@ impl Transaction {
     }
 }
 
-#[cfg(all(feature = "domain", any(test, feature = "test-support")))]
+#[cfg(test)]
 impl From<ed25519::PublicKey> for Address {
     fn from(pk: ed25519::PublicKey) -> Self {
         let key = secp256r1_key_from_material(pk.as_ref());
@@ -694,7 +651,7 @@ impl From<ed25519::PublicKey> for Address {
     }
 }
 
-#[cfg(all(feature = "domain", any(test, feature = "test-support")))]
+#[cfg(test)]
 impl Transaction {
     /// Builds a signed transfer transaction for tests.
     #[must_use]
@@ -733,7 +690,6 @@ impl Transaction {
     }
 }
 
-#[cfg(feature = "domain")]
 impl EncodeSize for Transaction {
     fn encode_size(&self) -> usize {
         match self {
@@ -756,7 +712,6 @@ impl EncodeSize for Transaction {
     }
 }
 
-#[cfg(feature = "domain")]
 impl Write for Transaction {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         match self {
@@ -781,7 +736,6 @@ impl Write for Transaction {
     }
 }
 
-#[cfg(feature = "domain")]
 impl Read for Transaction {
     type Cfg = ();
 
@@ -803,24 +757,24 @@ impl Read for Transaction {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 /// Derives a deterministic secp256r1 signing key from `seed`.
 #[must_use]
 pub fn secp256r1_key_from_seed(seed: u64) -> p256::ecdsa::SigningKey {
     secp256r1_key_from_material(&seed.to_le_bytes())
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 /// Derives a chain address from a secp256r1 signing key.
 #[must_use]
 pub fn addr_from_signing_key(key: &p256::ecdsa::SigningKey) -> Address {
     Address::from(UserPublicKey::from(key.verifying_key().to_owned()))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 const MOCK_WEBAUTHN_ORIGIN: &str = "https://wallet.hellas.ai";
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn push_bytes(dst: &mut [u8], len: &mut usize, bytes: &[u8]) -> Option<()> {
     let end = len.checked_add(bytes.len())?;
     if end > dst.len() {
@@ -831,7 +785,7 @@ fn push_bytes(dst: &mut [u8], len: &mut usize, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn client_data_json_for_origin(challenge: &Digest, origin: &str) -> Option<ClientDataJson> {
     let mut challenge_buf = [0_u8; 43];
     let challenge_b64 = Base64UrlUnpadded::encode(challenge.as_ref(), &mut challenge_buf).ok()?;
@@ -847,7 +801,7 @@ fn client_data_json_for_origin(challenge: &Digest, origin: &str) -> Option<Clien
     byte_list_from_slice(&json[..len])
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 /// Creates a deterministic `WebAuthn` signature for tests using `origin`.
 #[must_use]
 pub fn mock_webauthn_sign_with_origin(
@@ -882,7 +836,7 @@ pub fn mock_webauthn_sign_with_origin(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 /// Creates a deterministic `WebAuthn` signature for tests.
 #[must_use]
 pub fn mock_webauthn_sign(

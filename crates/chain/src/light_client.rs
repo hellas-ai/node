@@ -1,4 +1,4 @@
-use hellas_kernel::domain::{Address, Coin, Digest, ObjectId, Transaction};
+use crate::domain::{Address, Coin, Digest, ObjectId, Transaction};
 use hellas_wire::{WireCode, WireStatus};
 
 /// Flattened proposal metadata for the activity stream.

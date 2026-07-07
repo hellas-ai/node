@@ -1,3 +1,4 @@
+use crate::domain::{PublicKey, Scheme};
 use crate::{
     app::{HellasBlock, MarshalMailbox},
     config::Config,
@@ -24,7 +25,6 @@ use commonware_resolver::{Fetch, Resolver, TargetedResolver};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, tokio};
 use commonware_storage::archive::immutable;
 use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVec};
-use hellas_kernel::domain::{PublicKey, Scheme};
 use rand_core::CryptoRngCore;
 use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
@@ -474,6 +474,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ThresholdVariant;
     use crate::{
         Application, ApplicationConfig, CONSENSUS_NAMESPACE, ConsensusInfo,
         consensus::ConsensusVerifier,
@@ -487,7 +488,6 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use commonware_utils::{N3f1, ordered::Set};
-    use hellas_kernel::domain::ThresholdVariant;
     use rand::{SeedableRng, rngs::StdRng};
 
     struct ConsensusFixture {
