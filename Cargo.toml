@@ -16,7 +16,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/hellas-ai/node"
+repository = "https://github.com/hellas-ai/hellas"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
