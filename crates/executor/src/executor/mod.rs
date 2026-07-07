@@ -1,9 +1,9 @@
 mod actor;
 mod handle;
 
+use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
-use hellas_rpc::ExecutorError;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
     GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,

@@ -16,8 +16,8 @@ use hellas_adaptors::{
 };
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
+use hellas_models::ModelAssets;
 use hellas_rpc::Dtype;
-use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;

@@ -168,9 +168,9 @@ fn worker_loop(
 
 fn run_job(
     job: ExecuteJob,
-    mut on_progress: impl FnMut(u64, Vec<u32>) -> Result<(), hellas_rpc::ExecutorError>,
+    mut on_progress: impl FnMut(u64, Vec<u32>) -> Result<(), crate::ExecutorError>,
     engines: &mut HashMap<ModelLocator, ModelEngine>,
-) -> Result<DecodeOutcome, hellas_rpc::ExecutorError> {
+) -> Result<DecodeOutcome, crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
         locator,
@@ -198,9 +198,9 @@ fn run_job(
                 &locator.revision,
                 backend,
                 true,
-                hellas_rpc::model::to_catgrad_dtype(locator.dtype),
+                hellas_models::to_catgrad_dtype(locator.dtype),
             )
-            .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
+            .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
             engines.insert(locator.clone(), engine.clone());
             engine
         }
@@ -235,7 +235,7 @@ fn run_job(
                 Ok(GenerationControl::Continue)
             }
         })
-        .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
+        .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
 
     if let Some(err) = progress_error {
         return Err(err);
@@ -257,13 +257,13 @@ fn run_job(
     })
 }
 
-fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, hellas_rpc::ExecutorError> {
+fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, crate::ExecutorError> {
     input_ids
         .iter()
         .copied()
         .map(|token| {
             i32::try_from(token).map_err(|_| {
-                hellas_rpc::ExecutorError::InvalidTokenPayload(format!(
+                crate::ExecutorError::InvalidTokenPayload(format!(
                     "token id {token} exceeds i32 range"
                 ))
             })
@@ -278,12 +278,12 @@ fn make_on_progress<'a, 'b>(
     execution_id: String,
     output_builder: &'a mut EvaluateOutputTranscriptBuilder<'b>,
     output_events: &'a mut Vec<OutputEventEnvelope>,
-) -> impl FnMut(u64, Vec<u32>) -> Result<(), hellas_rpc::ExecutorError> + Send + 'a {
+) -> impl FnMut(u64, Vec<u32>) -> Result<(), crate::ExecutorError> + Send + 'a {
     move |progress: u64, token_ids: Vec<u32>| {
         position.store(progress, Ordering::Relaxed);
         let output_event = output_builder
             .push_token_delta(token_ids)
-            .map_err(|err| hellas_rpc::ExecutorError::WeightsError(err.to_string()))?;
+            .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
         let event = PbWorkEvent {
             kind: Some(PbEvent::Chunk(PbChunk {
                 output_event: Some(output_event_to_pb(&output_event)),
@@ -292,7 +292,7 @@ fn make_on_progress<'a, 'b>(
         if sender.blocking_send(Ok(event)).is_err() {
             debug!(%execution_id, "consumer dropped; cancelling worker");
             cancel.cancel();
-            return Err(hellas_rpc::ExecutorError::ChannelClosed);
+            return Err(crate::ExecutorError::ChannelClosed);
         }
         output_events.push(output_event);
         Ok(())

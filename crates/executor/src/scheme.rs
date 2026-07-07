@@ -2,8 +2,8 @@
 
 use std::any::Any;
 
+use crate::ExecutorError;
 use async_trait::async_trait;
-use hellas_rpc::ExecutorError;
 use hellas_rpc::PublicKey;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, PutArtifactRequest,

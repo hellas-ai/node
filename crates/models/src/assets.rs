@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use crate::Dtype;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
+use hellas_rpc::Dtype;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::config::encode_i32_tokens;
 use super::hf::get_model_metadata_files;
 use super::{ModelAssetsError, Result};
-use crate::{decode_token_ids, spec::ModelSpec};
+use hellas_rpc::{decode_token_ids, spec::ModelSpec};
 
 /// Model-domain result of preparing a prompt for a quote: everything the
 /// model layer contributes to a `QuotePreparedTextRequest`, minus the

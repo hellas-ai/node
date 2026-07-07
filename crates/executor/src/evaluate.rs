@@ -3,14 +3,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ExecutorError;
 use async_trait::async_trait;
 use chatgrad::types;
-use hellas_rpc::ExecutorError;
+use hellas_models::{ModelAssets, PreparedQuote};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::model::{ModelAssets, PreparedQuote};
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, GetArtifactRequest, GetArtifactResponse,
     ListModelsResponse, ModelInfo, ModelStatus, PutArtifactRequest, PutArtifactResponse,
@@ -436,7 +436,7 @@ impl SchemeEngine for EvaluateEngine {
     }
 
     async fn load_model_metadata(&mut self, model: String) -> Result<(), ExecutorError> {
-        let spec = ModelSpec::parse(&model).map_err(hellas_rpc::ModelAssetsError::from)?;
+        let spec = ModelSpec::parse(&model).map_err(hellas_models::ModelAssetsError::from)?;
         let locator = ModelLocator {
             model_id: spec.id,
             revision: spec.revision,
@@ -697,7 +697,7 @@ fn load_assets(
     model_id: &str,
     revision: &str,
     dtype: Dtype,
-) -> Result<ModelAssets, hellas_rpc::ModelAssetsError> {
+) -> Result<ModelAssets, hellas_models::ModelAssetsError> {
     ModelAssets::load(&model_spec(model_id, revision), dtype)
 }
 

@@ -4,7 +4,7 @@ use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 
 use super::{ModelAssetsError, Result};
-use crate::spec::ModelSpec;
+use hellas_rpc::spec::ModelSpec;
 
 pub(super) fn get_model_metadata_files(model: &ModelSpec) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let mut builder = ApiBuilder::from_env();

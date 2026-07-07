@@ -4,9 +4,9 @@ use crate::execution::{
 };
 use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
+use hellas_executor::ExecutorError;
+use hellas_models::{ModelAssets, TextOutputDecoder};
 use hellas_rpc::Dtype;
-use hellas_rpc::ExecutorError;
-use hellas_rpc::model::{ModelAssets, TextOutputDecoder};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
