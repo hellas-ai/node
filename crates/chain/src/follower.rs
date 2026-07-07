@@ -1,3 +1,4 @@
+use crate::domain::{Digest, PublicKey};
 use crate::{
     Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier, FinalizedBlock,
     FinalizedBlockQuery, IngestError, IngestOutcome, LightClient as _, QueryError,
@@ -8,7 +9,6 @@ use commonware_consensus::Heightable;
 use commonware_cryptography::Digestible;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use futures_util::StreamExt as _;
-use hellas_kernel::domain::{Digest, PublicKey};
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use thiserror::Error;

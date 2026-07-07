@@ -1,3 +1,4 @@
+use crate::domain::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
 use crate::execution::store::UtxoSyncTarget;
 use bytes::{Buf, BufMut};
 use commonware_codec::{
@@ -9,7 +10,6 @@ use commonware_consensus::{
     types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Digest as _, Digestible, Hasher, Sha256, sha256::Digest};
-use hellas_kernel::domain::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
 
 pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;
 

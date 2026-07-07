@@ -1,10 +1,8 @@
 use crate::HellasBlock;
+use crate::domain::{Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id};
 use commonware_codec::Encode;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
-use hellas_kernel::domain::{
-    Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id,
-};
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
@@ -352,6 +350,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{PrivateKey, genesis_object_id};
     use commonware_consensus::{
         CertifiableBlock,
         types::{Epoch, Height, Round, View},
@@ -359,7 +358,6 @@ mod tests {
     use commonware_cryptography::{Digest as _, Signer as _, ed25519};
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::non_empty_range;
-    use hellas_kernel::domain::{PrivateKey, genesis_object_id};
 
     fn key(seed: u64) -> PrivateKey {
         ed25519::PrivateKey::from_seed(seed)

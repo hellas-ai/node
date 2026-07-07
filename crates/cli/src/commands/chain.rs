@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, client::RemoteLightClient};
-use hellas_kernel::domain::{Address, Digest};
+use hellas_chain::domain::{Address, Digest};
 
 use crate::commands::CliResult;
 

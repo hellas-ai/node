@@ -56,16 +56,10 @@
 //! };
 //! ```
 
-#[cfg(feature = "domain")]
-#[allow(unused_extern_crates)]
-extern crate alloc;
-
 mod block;
 mod canonical;
 pub(crate) mod consts;
 mod context;
-#[cfg(feature = "domain")]
-pub mod domain;
 mod error;
 mod event;
 mod list;

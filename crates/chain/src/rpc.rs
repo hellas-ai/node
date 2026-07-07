@@ -1,5 +1,6 @@
 //! Local implementation of the light-client query interface.
 
+use crate::domain::{Address, Coin, ObjectId, Transaction};
 use crate::{
     app::Mempool,
     execution::store::{UtxoDatabase, root as utxo_root},
@@ -11,7 +12,6 @@ use crate::{
     owner_index::OwnerIndex,
 };
 use commonware_cryptography::sha256::Digest;
-use hellas_kernel::domain::{Address, Coin, ObjectId, Transaction};
 
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]

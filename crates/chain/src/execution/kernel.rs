@@ -1,12 +1,10 @@
 use super::store::UtxoDatabase;
+use crate::domain::{Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id};
 use commonware_codec::Encode;
 use commonware_consensus::types::Height;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::{Clock, Metrics, Storage};
-use hellas_kernel::domain::{
-    Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id,
-};
 use thiserror::Error;
 
 type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;

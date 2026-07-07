@@ -16,11 +16,11 @@
 //! restriction keeps parsing bounded and deterministic.
 //!
 //! Policy note: this verifier accepts user presence *or* user verification
-//! (`UP | UV`) and ignores `origin`. The chain-facing envelope in
-//! [`crate::domain`] enforces a stricter browser-shaped policy (UP *and*
-//! UV, HTTPS origin allowlist, `rpIdHash` binding) for its own transaction
-//! kinds. The two are intentionally different products; do not wire one
-//! where the other is expected.
+//! (`UP | UV`) and ignores `origin`. The chain-facing envelope (the
+//! `hellas-chain` crate's `domain` module) enforces a stricter
+//! browser-shaped policy (UP *and* UV, HTTPS origin allowlist, `rpIdHash`
+//! binding) for its own transaction kinds. The two are intentionally
+//! different products; do not wire one where the other is expected.
 
 use p256::{
     EncodedPoint,
