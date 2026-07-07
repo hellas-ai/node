@@ -193,7 +193,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         let next_gen = prev_gen.wrapping_add(1);
 
         let now = self.clock.now();
-        let mut slot = StreamSlot::open_local(method_id, now, self.config.initial_credit);
+        let mut slot = StreamSlot::open(method_id, now, self.config.initial_credit);
         slot.generation = next_gen;
         // Queue the OPEN frame for scheduler.
         slot.send_queue
@@ -215,9 +215,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         let slot = self
             .slot_mut(idx)
             .ok_or(MuxError::Protocol("send on empty slot"))?;
-        if matches!(slot.state, SlotState::HalfClosedLocal | SlotState::Closed)
-            || slot.local_terminal
-        {
+        if slot.local_terminal {
             return Err(MuxError::SlotClosed(idx));
         }
         if (slot.peer_recv_credit as usize) < payload.len() {
@@ -256,13 +254,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             trailer,
         };
         slot.local_terminal = true;
-        slot.state = match slot.state {
-            SlotState::OpenLocal | SlotState::OpenRemote | SlotState::Open => {
-                SlotState::HalfClosedLocal
-            }
-            SlotState::HalfClosedRemote => SlotState::Closed,
-            other => other,
-        };
         // End frame goes at the BACK — any in-flight Body should ship
         // first.
         slot.send_queue.push_back(Frame::End(end));
@@ -279,7 +270,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         }
         slot.local_terminal = true;
         slot.peer_terminal = true;
-        slot.state = SlotState::Closed;
         // Reset takes priority over any in-flight frames — push to front
         // and drop everything behind it (they'd be irrelevant on the
         // closed stream anyway).
@@ -443,9 +433,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         if !slot.send_queue.is_empty() {
             return false;
         }
-        if let Some(s) = self.streams.get_mut(idx as usize).and_then(|s| s.as_mut()) {
-            s.state = SlotState::Closed;
-        }
         self.mark_free(idx);
         true
     }
@@ -481,7 +468,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 }
             }
             let now = self.clock.now();
-            let mut slot = StreamSlot::open_remote(open.method_id, now, self.config.initial_credit);
+            let mut slot = StreamSlot::open(open.method_id, now, self.config.initial_credit);
             slot.generation = keyed.key.generation;
             self.streams[idx as usize] = Some(slot);
             // The fresh slot record overwrites a Closed predecessor.
@@ -522,7 +509,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                     let code = WireCode::ResourceExhausted;
                     slot.peer_terminal = true;
                     slot.local_terminal = true;
-                    slot.state = SlotState::Closed;
                     slot.send_queue.clear();
                     slot.send_queue
                         .push_front(Frame::Reset(ResetFrame { code }));
@@ -546,13 +532,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             }
             Frame::End(end) => {
                 slot.peer_terminal = true;
-                slot.state = match slot.state {
-                    SlotState::OpenRemote | SlotState::OpenLocal | SlotState::Open => {
-                        SlotState::HalfClosedRemote
-                    }
-                    SlotState::HalfClosedLocal => SlotState::Closed,
-                    other => other,
-                };
                 events.push(Event::EndStream {
                     slot: idx,
                     trailer: end.trailer,
@@ -564,7 +543,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             Frame::Reset(r) => {
                 slot.peer_terminal = true;
                 slot.local_terminal = true;
-                slot.state = SlotState::Closed;
                 // Peer aborted — any frames we had queued for this
                 // stream are pointless. Drop them so the slot can be
                 // reclaimed immediately rather than waiting for a
@@ -729,7 +707,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
     ) -> StreamSlot {
         StreamSlot {
             generation,
-            state,
             method_id,
             opened_at,
             deadline,
