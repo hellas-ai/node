@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-use crate::pb::courtesy::{
-    EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
-};
-use crate::run_ticket::public_key_to_pb;
-use crate::{Dtype, PublicKey};
+use crate::Dtype;
 use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
@@ -16,6 +12,18 @@ use super::config::encode_i32_tokens;
 use super::hf::get_model_metadata_files;
 use super::{ModelAssetsError, Result};
 use crate::{decode_token_ids, spec::ModelSpec};
+
+/// Model-domain result of preparing a prompt for a quote: everything the
+/// model layer contributes to a `QuotePreparedTextRequest`, minus the
+/// protocol framing (start marker, runner key) the caller adds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedQuote {
+    pub huggingface_model_id: String,
+    pub huggingface_revision: String,
+    pub prompt_token_ids: Vec<u32>,
+    pub stop_token_ids: Vec<u32>,
+    pub accept_dtype: String,
+}
 
 pub struct ModelAssets {
     model: ModelSpec,
@@ -74,30 +82,24 @@ impl ModelAssets {
         })
     }
 
-    pub fn build_quote_prepared_text_request(
-        &self,
-        prepared_prompt: &PreparedPrompt,
-        max_seq: u32,
-        runner_public_key: &PublicKey,
-    ) -> Result<QuotePreparedTextRequest> {
-        let input_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
+    /// Encode a prepared prompt into the model-domain pieces of a quote:
+    /// model identity, validated token streams, and the model's dtype.
+    /// Assembling the wire `QuotePreparedTextRequest` (start marker,
+    /// runner key) is the caller's job — the model layer owns no protocol
+    /// shape.
+    pub fn prepare_quote(&self, prepared_prompt: &PreparedPrompt) -> Result<PreparedQuote> {
+        let prompt_token_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
             ModelAssetsError::NegativePromptTokenId { token }
         })?;
         let stop_token_ids = encode_i32_tokens(&prepared_prompt.stop_token_ids, |token| {
             ModelAssetsError::NegativeStopTokenId { token }
         })?;
-
-        Ok(QuotePreparedTextRequest {
+        Ok(PreparedQuote {
             huggingface_model_id: self.model.id.clone(),
             huggingface_revision: self.model.revision.clone(),
-            prompt_token_ids: input_ids,
-            max_new_tokens: max_seq,
+            prompt_token_ids,
             stop_token_ids,
-            start: Some(EvaluateStart {
-                kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
-            }),
-            accept_dtypes: vec![self.dtype.as_wire().to_string()],
-            runner_public_key: Some(public_key_to_pb(runner_public_key)),
+            accept_dtype: self.dtype.as_wire().to_string(),
         })
     }
 

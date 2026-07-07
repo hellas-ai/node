@@ -10,17 +10,18 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::model::ModelAssets;
+use hellas_rpc::model::{ModelAssets, PreparedQuote};
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
-    PutArtifactRequest, PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse,
-    QuotePreparedTextRequest, QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    EvaluateGenesisStart, EvaluateStart, GetArtifactRequest, GetArtifactResponse,
+    ListModelsResponse, ModelInfo, ModelStatus, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
+    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, evaluate_start,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{PublicKey as PbPublicKey, Ticket};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::run_ticket::public_key_from_pb;
+use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 use hellas_rpc::spec::ModelSpec;
 use hellas_rpc::{
     Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, PublicKey,
@@ -366,12 +367,13 @@ impl SchemeEngine for EvaluateEngine {
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
-        let mut prepared_request = assets.build_quote_prepared_text_request(
-            &prepared,
+        let quote = assets.prepare_quote(&prepared)?;
+        let prepared_request = quote_prepared_text_request(
+            quote,
             request.max_new_tokens,
+            dtype.as_wire().to_string(),
             &runner_public_key,
-        )?;
-        prepared_request.accept_dtypes = vec![dtype.as_wire().to_string()];
+        );
         let inner = self.quote_prepared_text(store, prepared_request).await?;
 
         Ok(TicketOutcome {
@@ -413,12 +415,13 @@ impl SchemeEngine for EvaluateEngine {
         let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
-        let mut prepared_request = assets.build_quote_prepared_text_request(
-            &prepared,
+        let quote = assets.prepare_quote(&prepared)?;
+        let prepared_request = quote_prepared_text_request(
+            quote,
             request.max_new_tokens,
+            dtype.as_wire().to_string(),
             &runner_public_key,
-        )?;
-        prepared_request.accept_dtypes = vec![dtype.as_wire().to_string()];
+        );
         let inner = self.quote_prepared_text(store, prepared_request).await?;
 
         Ok(TicketOutcome {
@@ -649,6 +652,29 @@ impl SchemeEngine for EvaluateEngine {
 
         let _ = sender.send(Ok(termination.into_pb())).await;
         self.dispatch_next_execution();
+    }
+}
+
+/// Assemble the wire `QuotePreparedTextRequest` from the model-domain
+/// [`PreparedQuote`] plus the protocol framing (genesis start marker,
+/// runner key) the model layer deliberately leaves to callers.
+fn quote_prepared_text_request(
+    quote: PreparedQuote,
+    max_new_tokens: u32,
+    accept_dtype: String,
+    runner_public_key: &hellas_rpc::PublicKey,
+) -> QuotePreparedTextRequest {
+    QuotePreparedTextRequest {
+        huggingface_model_id: quote.huggingface_model_id,
+        huggingface_revision: quote.huggingface_revision,
+        prompt_token_ids: quote.prompt_token_ids,
+        max_new_tokens,
+        stop_token_ids: quote.stop_token_ids,
+        start: Some(EvaluateStart {
+            kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+        }),
+        accept_dtypes: vec![accept_dtype],
+        runner_public_key: Some(public_key_to_pb(runner_public_key)),
     }
 }
 

@@ -54,7 +54,9 @@ use hellas_rpc::fetch::{
 #[cfg(feature = "evaluate")]
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
+use hellas_rpc::pb::courtesy::{
+    EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
+};
 use hellas_rpc::pb::execute::{
     self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
 };
@@ -63,6 +65,7 @@ use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::policy::ExecutePolicy;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::run_ticket::public_key_to_pb;
 use hellas_rpc::run_ticket::sign_run_ticket;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::services::courtesy::Courtesy;
@@ -740,11 +743,19 @@ impl ExecutionRequest {
         strategy: ExecutionStrategy,
         runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
-        let quote_req = assets.build_quote_prepared_text_request(
-            &prepared_prompt,
-            max_seq,
-            &runner_key.public_key(),
-        )?;
+        let quote = assets.prepare_quote(&prepared_prompt)?;
+        let quote_req = QuotePreparedTextRequest {
+            huggingface_model_id: quote.huggingface_model_id,
+            huggingface_revision: quote.huggingface_revision,
+            prompt_token_ids: quote.prompt_token_ids,
+            max_new_tokens: max_seq,
+            stop_token_ids: quote.stop_token_ids,
+            start: Some(EvaluateStart {
+                kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+            }),
+            accept_dtypes: vec![quote.accept_dtype],
+            runner_public_key: Some(public_key_to_pb(&runner_key.public_key())),
+        };
         Ok(Self {
             runtime,
             quote_req,
