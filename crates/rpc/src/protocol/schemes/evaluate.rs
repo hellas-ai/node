@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CommitmentScheme, DagCborEncoder, Digest, PublicKey, RequestCommitment, ResultCommitment,
-    SchemeId,
-};
+use crate::{DagCborEncoder, Digest, PublicKey, RequestCommitment};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateRequest {
@@ -12,21 +9,10 @@ pub struct EvaluateRequest {
     pub runner_public_key: PublicKey,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvaluateOutput {
-    /// Content-addressed TextArtifact artifact.
-    pub text_artifact: Digest,
-}
-
 pub struct Evaluate;
 
-impl CommitmentScheme for Evaluate {
-    type Request = EvaluateRequest;
-    type Output = EvaluateOutput;
-
-    const SCHEME: SchemeId = SchemeId::Evaluate;
-
-    fn commit_request(request: &Self::Request) -> RequestCommitment {
+impl Evaluate {
+    pub fn commit_request(request: &EvaluateRequest) -> RequestCommitment {
         let mut encoder = DagCborEncoder::new();
         encoder.array(4);
         encoder.str("hellas.evaluate.request.v1");
@@ -34,10 +20,6 @@ impl CommitmentScheme for Evaluate {
         encoder.u64(request.runner_public_key.kind().to_byte() as u64);
         encoder.bytes(request.runner_public_key.bytes());
         RequestCommitment::from_canonical_bytes(&encoder.into_bytes())
-    }
-
-    fn commit_output(output: &Self::Output) -> ResultCommitment {
-        ResultCommitment::from_digest(output.text_artifact)
     }
 }
 

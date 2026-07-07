@@ -16,16 +16,17 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::execute::{
-    FinishStatus as PbFinishStatus, ReceiptEnvelope as PbReceiptEnvelope, WorkEvent as PbWorkEvent,
-    WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished, work_event,
+    FinishStatus as PbFinishStatus, WorkEvent as PbWorkEvent, WorkFailed as PbWorkFailed,
+    WorkFinished as PbWorkFinished, work_event,
 };
 #[cfg(feature = "evaluate")]
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 #[cfg(feature = "evaluate")]
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-use hellas_rpc::{Digest, PublicKey, RequestCommitment};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::{EvaluateRequest, ExecutorError, encode_token_ids};
+use hellas_rpc::stream::output_event_to_pb;
+use hellas_rpc::{Digest, PublicKey, RequestCommitment};
+use hellas_rpc::{EvaluateRequest, ExecutorError, OutputEventEnvelope};
 use uuid::Uuid;
 
 pub use hellas_rpc::error::StateError;
@@ -355,8 +356,8 @@ impl StopReason {
 pub enum Termination {
     Completed {
         stop_reason: StopReason,
-        output_tokens: Vec<u32>,
-        receipt_dag_cbor: Vec<u8>,
+        total_units: u64,
+        output_events: Vec<OutputEventEnvelope>,
     },
     Failed {
         position: u64,
@@ -374,16 +375,12 @@ impl Termination {
         let kind = match self {
             Self::Completed {
                 stop_reason,
-                output_tokens,
-                receipt_dag_cbor,
+                total_units,
+                output_events,
             } => work_event::Kind::Finished(PbWorkFinished {
-                total_units: output_tokens.len() as u64,
+                total_units,
                 status: stop_reason.to_pb() as i32,
-                output: encode_token_ids(&output_tokens),
-                receipt: Some(PbReceiptEnvelope {
-                    dag_cbor: receipt_dag_cbor,
-                }),
-                output_events: Vec::new(),
+                output_events: output_events.iter().map(output_event_to_pb).collect(),
             }),
             Self::Failed { position, error } => {
                 work_event::Kind::Failed(PbWorkFailed { position, error })

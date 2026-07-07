@@ -48,6 +48,18 @@ impl Executor {
         {
             return Ok(outcome);
         }
+        #[cfg(feature = "evaluate")]
+        if let Some(engine) = self.evaluate.as_ref()
+            && let Some(outcome) = engine
+                .replay_completed(request_commitment_id, &verified_run.public_key)
+                .await?
+        {
+            info!(
+                request_commitment = %format_request_commitment(&request_commitment),
+                "replayed evaluate execution"
+            );
+            return Ok(outcome);
+        }
         self.store.prune_expired_quotes(Instant::now());
         let quote = match self.store.get_quote(&request_commitment, Instant::now()) {
             Ok(quote) => quote.clone(),
@@ -549,8 +561,6 @@ async fn process_projected_fetch(
                 sender
                     .send(Ok(WorkEvent {
                         kind: Some(work_event::Kind::Chunk(WorkChunk {
-                            position: *position,
-                            bytes: payload,
                             output_event: Some(output_event_to_pb(&output_event)),
                         })),
                     }))
@@ -631,8 +641,6 @@ fn fetch_finished_event(
     let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
     Ok(WorkEvent {
         kind: Some(work_event::Kind::Finished(WorkFinished {
-            output: Vec::new(),
-            receipt: None,
             status: status as i32,
             total_units,
             output_events: pb_output_events,
@@ -976,17 +984,14 @@ mod tests {
             run_one(&handle, ticket.request_commitment, &signing_key).await;
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].bytes, b"event:ok");
         let chunk_event = chunks[0]
             .output_event
             .as_ref()
             .expect("fetch chunk should carry signed output event");
-        assert_eq!(chunk_event.payload, chunks[0].bytes);
+        assert_eq!(chunk_event.payload, b"event:ok");
         assert!(replay_chunks.is_empty());
-        assert!(first.output.is_empty());
         assert_eq!(first.output_events[0], *chunk_event);
         assert_eq!(first.output_events[1].payload, b"done");
-        assert_eq!(replayed.output, first.output);
         assert_eq!(replayed.output_events, first.output_events);
         assert_eq!(provider.calls("echo", "run", input), 1);
     }
@@ -1184,7 +1189,7 @@ mod tests {
             timeout(Duration::from_secs(2), drain_outcome(first_outcome.events))
                 .await
                 .unwrap();
-        assert!(first_finished.output.is_empty());
+        assert!(!first_finished.output_events.is_empty());
 
         let (chunks, second_finished) = timeout(
             Duration::from_secs(2),
@@ -1193,7 +1198,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(chunks.len(), 1);
-        assert!(second_finished.output.is_empty());
+        assert!(!second_finished.output_events.is_empty());
         assert_eq!(provider.calls(), 2);
     }
 
@@ -1232,9 +1237,9 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert!(first_finished.output.is_empty());
+        assert!(!first_finished.output_events.is_empty());
         assert_eq!(second_chunks.len(), 1);
-        assert!(second_finished.output.is_empty());
+        assert!(!second_finished.output_events.is_empty());
         assert_eq!(provider.calls(), 2);
     }
 }

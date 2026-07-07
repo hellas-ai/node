@@ -41,8 +41,7 @@ where
 /// Unary call returning both the response and the terminal trailer
 /// metadata. Server-side handlers populate the trailer via
 /// `WithTrailer<R>`; this surfaces those bytes to the client so it
-/// can read `x-hellas-commitment-bin` / receipts / OTel response
-/// context.
+/// can read `x-hellas-commitment-bin` / OTel response context.
 pub async fn unary_with_trailer<T, M>(
     transport: &T,
     request: M::Request,
@@ -491,7 +490,7 @@ impl<Q, R: Message + Default> futures_core::Stream for BidiStreamingCall<Q, R> {
 }
 
 /// A successful unary response plus any trailer metadata the handler
-/// wants to emit (commitments, receipts, OTel span context, …).
+/// wants to emit (commitments, OTel span context, ...).
 #[derive(Debug)]
 pub struct WithTrailer<R> {
     pub response: R,
@@ -519,7 +518,7 @@ impl<R> From<R> for WithTrailer<R> {
 
 /// Server-side helper: decode a single prost message off the recv stream,
 /// emit a single response, then close with an Ok trailer (optionally
-/// carrying provenance/receipt metadata via `WithTrailer`).
+/// carrying provenance metadata via `WithTrailer`).
 pub async fn dispatch_unary<T, M, F, Fut, RespOrTrailer>(
     inbound: hellas_wire::transport::Inbound<T::Stream>,
     handler: F,

@@ -4,6 +4,7 @@ use std::any::Any;
 
 use async_trait::async_trait;
 use hellas_rpc::ExecutorError;
+use hellas_rpc::PublicKey;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, PutArtifactRequest,
     PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
@@ -80,6 +81,14 @@ pub trait SchemeEngine: Send + Sync {
         job: Box<dyn SchemeJob>,
         ctx: SchemeRunContext,
     ) -> Result<ExecuteOutcome, ExecutorError>;
+
+    async fn replay_completed(
+        &self,
+        _request_commitment: [u8; 32],
+        _runner_public_key: &PublicKey,
+    ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
+        Ok(None)
+    }
 
     async fn on_completion(&mut self, completion: Box<dyn SchemeCompletion>);
 }

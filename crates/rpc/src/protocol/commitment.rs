@@ -133,8 +133,6 @@ macro_rules! digest_commitment {
 }
 
 digest_commitment!(RequestCommitment);
-digest_commitment!(ResultCommitment);
-digest_commitment!(ReceiptCommitment);
 
 #[cfg(test)]
 mod tests {

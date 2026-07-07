@@ -9,7 +9,6 @@ use hellas_wire_adaptors::{
     RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse, WireStreamEvent,
 };
 
-use super::provenance_layer::ReceiptHeader;
 use super::{json_error, sse_data, sse_event_data, sse_response};
 
 pub(super) fn parse_backend_request<A: WireAdaptor>(
@@ -276,11 +275,6 @@ fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenanc
         response.extensions_mut().insert(ExecutionProvenance {
             commitment_id: call,
         });
-    }
-    if let Some(receipt) = provenance.receipt.as_ref() {
-        response
-            .extensions_mut()
-            .insert(ReceiptHeader(receipt.clone()));
     }
 }
 

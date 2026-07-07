@@ -271,8 +271,6 @@ pub struct Usage {
 pub struct Provenance {
     /// Lowercase hex commitment string ready for provider wire JSON.
     pub call_commitment: Option<String>,
-    /// Lowercase hex receipt string ready for provider wire JSON.
-    pub receipt: Option<String>,
 }
 
 #[cfg(test)]

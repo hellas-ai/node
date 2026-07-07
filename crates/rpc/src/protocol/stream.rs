@@ -582,6 +582,34 @@ impl<'a> OutputTranscriptBuilder<'a> {
         }
     }
 
+    pub fn resume_verified(
+        scheme: SchemeId,
+        input: InputCommitment,
+        signing_key: &'a ProducerSigningKey,
+        canonicalization: CanonicalizationId,
+        events: Vec<OutputEventEnvelope>,
+    ) -> Result<Self, StreamVerifyError> {
+        let public_key = signing_key.public_key();
+        verify_output_event_envelopes(scheme, input, &public_key, &events)?;
+        let stream_id = StreamId::from_input_commitment(input);
+        let previous_event = events
+            .last()
+            .map(OutputEventEnvelope::event_commitment)
+            .ok_or(StreamVerifyError::EmptyTranscript)?;
+        let next_sequence =
+            u64::try_from(events.len()).map_err(|_| StreamVerifyError::SequenceOverflow)?;
+        Ok(Self {
+            scheme,
+            input,
+            stream_id,
+            signing_key,
+            canonicalization,
+            previous_event,
+            next_sequence,
+            events,
+        })
+    }
+
     pub fn push(
         &mut self,
         kind: impl Into<String>,

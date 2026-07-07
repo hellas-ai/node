@@ -75,7 +75,6 @@ impl ExecutionBackend for ResponsesFetchBackend {
                 ),
                 Some(Provenance {
                     call_commitment: Some(input_commitment),
-                    receipt: None,
                 }),
             ))
         })

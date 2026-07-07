@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chatgrad::types;
 use hellas_rpc::ExecutorError;
+use hellas_rpc::evaluate::{
+    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
+    input_commitment,
+};
 use hellas_rpc::model::ModelAssets;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, ModelInfo, ModelStatus,
@@ -19,8 +23,7 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::public_key_from_pb;
 use hellas_rpc::spec::ModelSpec;
 use hellas_rpc::{
-    CommitmentScheme, Digest, Dtype, Evaluate, EvaluateOutput, EvaluateRequest, ProducerSigningKey,
-    PublicKey, SignedReceipt, canonical_dag_cbor,
+    Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, PublicKey,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -76,12 +79,19 @@ pub struct EvaluateEngine {
     artifacts: EvaluateArtifactStore,
     supported_dtypes: Vec<Dtype>,
     models: HashMap<ModelLocator, LocalModelStatus>,
+    completed: HashMap<[u8; 32], CompletedEvaluate>,
     worker: ExecuteWorker,
     pending_executions: VecDeque<ExecuteJob>,
     queue_capacity: usize,
     execute_policy: ExecutePolicy,
     metrics: Arc<ExecutorMetrics>,
     producer_key: Arc<ProducerSigningKey>,
+}
+
+#[derive(Clone)]
+struct CompletedEvaluate {
+    runner_public_key: PublicKey,
+    termination: Termination,
 }
 
 impl EvaluateEngine {
@@ -98,6 +108,7 @@ impl EvaluateEngine {
             artifacts,
             supported_dtypes,
             models: HashMap::new(),
+            completed: HashMap::new(),
             worker: ExecuteWorker::spawn(tx),
             pending_executions: VecDeque::new(),
             queue_capacity,
@@ -117,6 +128,32 @@ impl EvaluateEngine {
             Err(EnqueueError::Busy(job)) => Err(StartExecutionError::Busy(job)),
             Err(EnqueueError::Stopped(_job)) => Err(StartExecutionError::Closed),
         }
+    }
+
+    pub(super) async fn replay_completed(
+        &self,
+        request_commitment: [u8; 32],
+        runner_public_key: &PublicKey,
+    ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
+        let Some(completed) = self.completed.get(&request_commitment) else {
+            return Ok(None);
+        };
+        if completed.runner_public_key != *runner_public_key {
+            return Err(ExecutorError::PolicyDenied(
+                "run ticket signer is not authorized for this ticket".to_string(),
+            ));
+        }
+        let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+        sender
+            .send(Ok(completed.termination.clone().into_pb()))
+            .await
+            .map_err(|_| ExecutorError::ChannelClosed)?;
+        Ok(Some(ExecuteOutcome {
+            provenance: ExecutionProvenance {
+                commitment_id: request_commitment,
+            },
+            events: receiver,
+        }))
     }
 
     fn dispatch_next_execution(&mut self) {
@@ -147,29 +184,50 @@ impl EvaluateEngine {
         invocation: &Invocation,
         stop_reason: StopReason,
         output_tokens: Vec<u32>,
+        output_events: Vec<OutputEventEnvelope>,
     ) -> Result<Termination, ExecutorError> {
         let text_artifact = self
             .artifacts
             .record_completed_text(evaluate_request, invocation, &output_tokens)
             .await?;
-        let evaluate_output = EvaluateOutput { text_artifact };
-        let receipt =
-            SignedReceipt::sign::<Evaluate>(evaluate_request, &evaluate_output, &self.producer_key)
-                .map_err(|err| {
-                    ExecutorError::WeightsError(format!("receipt signing failed: {err}"))
-                })?;
-        let receipt_dag_cbor = canonical_dag_cbor(&receipt).map_err(|err| {
-            ExecutorError::WeightsError(format!("receipt encoding failed: {err}"))
-        })?;
+        let input_units = invocation.input_ids.len() as u64;
+        let output_units = output_tokens.len() as u64;
+        let total_units = input_units.saturating_add(output_units);
+        let terminal = EvaluateTerminal {
+            final_position: output_units,
+            stop_reason: evaluate_stop_reason(stop_reason),
+            text_artifact,
+            usage: Some(EvaluateUsage {
+                input_units,
+                output_units,
+                total_units,
+            }),
+        };
+        let output_events = EvaluateOutputTranscriptBuilder::resume_verified(
+            input_commitment(evaluate_request),
+            &self.producer_key,
+            output_events,
+        )
+        .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?
+        .finish(terminal)
+        .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?;
         Ok(Termination::Completed {
             stop_reason,
-            output_tokens,
-            receipt_dag_cbor,
+            total_units,
+            output_events,
         })
     }
 
     fn resolve_accept_dtypes(&self, prefs: &[String]) -> Result<Dtype, ExecutorError> {
         resolve_accept_dtypes(prefs, &self.supported_dtypes)
+    }
+}
+
+fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
+    match stop_reason {
+        StopReason::EndOfSequence => EvaluateStopReason::END_OF_SEQUENCE,
+        StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
+        StopReason::Cancelled => EvaluateStopReason::CANCELLED,
     }
 }
 
@@ -464,6 +522,7 @@ impl SchemeEngine for EvaluateEngine {
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let execute_job = ExecuteJob {
             execution_id: ctx.execution_id.clone(),
+            request_commitment: ctx.request_commitment,
             model_id: model_id.clone(),
             evaluate_request,
             locator,
@@ -472,6 +531,7 @@ impl SchemeEngine for EvaluateEngine {
             accepted_at: Instant::now(),
             cancel: CancellationToken::new(),
             sender,
+            producer_key: self.producer_key.clone(),
         };
 
         let queued = match self.try_start_execution(execute_job) {
@@ -512,6 +572,14 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
+    async fn replay_completed(
+        &self,
+        request_commitment: [u8; 32],
+        runner_public_key: &PublicKey,
+    ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
+        EvaluateEngine::replay_completed(self, request_commitment, runner_public_key).await
+    }
+
     async fn on_completion(&mut self, completion: Box<dyn crate::scheme::SchemeCompletion>) {
         let completion = match completion.into_any().downcast::<WorkerCompletion>() {
             Ok(completion) => *completion,
@@ -522,6 +590,7 @@ impl SchemeEngine for EvaluateEngine {
         };
         let WorkerCompletion {
             execution_id,
+            request_commitment,
             model_id,
             evaluate_request,
             invocation,
@@ -534,6 +603,7 @@ impl SchemeEngine for EvaluateEngine {
             WorkerCompletionResult::Completed {
                 stop_reason,
                 output_tokens,
+                output_events,
             } => {
                 match self
                     .completed_evaluate_termination(
@@ -541,6 +611,7 @@ impl SchemeEngine for EvaluateEngine {
                         &invocation,
                         stop_reason,
                         output_tokens,
+                        output_events,
                     )
                     .await
                 {
@@ -548,7 +619,7 @@ impl SchemeEngine for EvaluateEngine {
                     Err(err) => {
                         let msg = format!("{err:#}");
                         warn!(
-                            "execute worker job {execution_id} failed while recording/signing receipt: {msg}"
+                            "execute worker job {execution_id} failed while recording/signing output transcript: {msg}"
                         );
                         Termination::Failed {
                             position: generated,
@@ -565,6 +636,13 @@ impl SchemeEngine for EvaluateEngine {
         if termination.is_completed() {
             self.metrics
                 .record_execution_completed(&model_id, generated);
+            self.completed.insert(
+                request_commitment,
+                CompletedEvaluate {
+                    runner_public_key: evaluate_request.runner_public_key,
+                    termination: termination.clone(),
+                },
+            );
         } else {
             self.metrics.record_execution_failed(&model_id, generated);
         }
@@ -599,4 +677,102 @@ fn load_assets(
 
 fn hex32(bytes: &[u8; 32]) -> String {
     Digest::from_bytes(*bytes).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
+    }
+
+    fn test_engine(producer_key: Arc<ProducerSigningKey>) -> EvaluateEngine {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        EvaluateEngine::new(
+            EvaluateArtifactStore::memory(),
+            vec![Dtype::F32],
+            1,
+            ExecutePolicy::Eager,
+            Arc::new(ExecutorMetrics::default()),
+            producer_key,
+            tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_completed_returns_stored_evaluate_transcript() {
+        let producer = Arc::new(key(2));
+        let runner = key(3).public_key();
+        let mut engine = test_engine(producer.clone());
+        let request_commitment = [7; 32];
+        let input =
+            hellas_rpc::InputCommitment::from_digest(Digest::from_bytes(request_commitment));
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        builder.push_token_delta(vec![10]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 1,
+                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                text_artifact: Digest::from_bytes([8; 32]),
+                usage: Some(EvaluateUsage {
+                    input_units: 4,
+                    output_units: 1,
+                    total_units: 5,
+                }),
+            })
+            .unwrap();
+        let termination = Termination::Completed {
+            stop_reason: StopReason::EndOfSequence,
+            total_units: 5,
+            output_events,
+        };
+        let expected = termination.clone().into_pb();
+        engine.completed.insert(
+            request_commitment,
+            CompletedEvaluate {
+                runner_public_key: runner,
+                termination,
+            },
+        );
+
+        let mut outcome = engine
+            .replay_completed(request_commitment, &runner)
+            .await
+            .unwrap()
+            .expect("stored completion should replay");
+        let event = outcome
+            .events
+            .recv()
+            .await
+            .expect("replay emits terminal event")
+            .unwrap();
+        assert_eq!(event, expected);
+        assert!(outcome.events.is_closed());
+    }
+
+    #[tokio::test]
+    async fn replay_completed_rejects_wrong_runner_key() {
+        let producer = Arc::new(key(2));
+        let runner = key(3).public_key();
+        let wrong_runner = key(4).public_key();
+        let mut engine = test_engine(producer);
+        let request_commitment = [7; 32];
+        engine.completed.insert(
+            request_commitment,
+            CompletedEvaluate {
+                runner_public_key: runner,
+                termination: Termination::Failed {
+                    position: 0,
+                    error: "not replayed".to_string(),
+                },
+            },
+        );
+
+        let err = engine
+            .replay_completed(request_commitment, &wrong_runner)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::PolicyDenied(_)));
+    }
 }

@@ -1,27 +1,18 @@
-//! Protocol primitives for Hellas commitments and producer receipts.
+//! Protocol primitives for Hellas commitments and signed streams.
 
 pub mod commitment;
 pub mod digest;
 pub mod dtype;
-pub mod receipt;
-pub mod scheme;
 pub mod schemes;
 pub mod signature;
 pub mod stream;
 pub mod tags;
 pub mod value;
 
-pub use commitment::{
-    AssuranceStrategy, ReceiptCommitment, RequestCommitment, ResultCommitment, SchemeId,
-};
+pub use commitment::{AssuranceStrategy, RequestCommitment, SchemeId};
 pub use digest::{Digest, hash_tuple};
 pub use dtype::{Dtype, ParseDtypeError};
-pub use receipt::{
-    DeliveryOutput, DeliveryRequest, ReceiptBody, SignedReceipt, VerifyError, verify_delivery,
-    verify_receipt,
-};
-pub use scheme::CommitmentScheme;
-pub use schemes::evaluate::{Evaluate, EvaluateOutput, EvaluateRequest};
+pub use schemes::evaluate::{Evaluate, EvaluateRequest};
 pub use signature::{
     ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,
 };
