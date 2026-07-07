@@ -1,0 +1,10 @@
+[package]
+name = "hellas-auth"
+description = "Execution authorization policy and glob matching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]

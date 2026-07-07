@@ -30,8 +30,10 @@ pub mod spec;
 pub mod stream;
 pub use spec::ModelSpec;
 
+/// Execution authorization policy. Re-exported from the standalone
+/// [`hellas_auth`] crate; `hellas_rpc::policy::X` paths remain valid.
 #[cfg(feature = "execute")]
-pub mod policy;
+pub use hellas_auth as policy;
 
 pub mod provenance;
 
