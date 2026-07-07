@@ -526,6 +526,13 @@ mod tests {
 // and hands out raw payload bytes; these codecs give those bytes their
 // meaning. The codec strings version the payload shapes independently
 // of the transcript canonicalization.
+//
+// Ownership boundary: these signed-payload codecs live here, not in
+// hellas-adaptors. The reciprocal — converting to/from provider wire
+// formats (OpenAI, Anthropic, SSE) — is adaptors' job and must never
+// appear in this crate. rpc does not depend on adaptors; the vocabulary
+// (crate::output) flows the other way. Rule of thumb: signed bytes → rpc,
+// vendor-HTTP bytes → adaptors.
 // ---------------------------------------------------------------------
 
 use std::collections::TryReserveError;
