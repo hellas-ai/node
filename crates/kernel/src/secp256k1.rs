@@ -24,7 +24,7 @@
 use secp256k1::{Message, PublicKey, Secp256k1, VerifyOnly, ecdsa::Signature};
 
 use crate::primitive::{Key, PayloadHash, Sig};
-use crate::tx::{OpenAuth, Seal};
+use crate::tx::{Auth, Seal};
 use crate::verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 
 /// Verifier that accepts compact-form secp256k1 ECDSA signatures from
@@ -63,15 +63,15 @@ impl SigVerifier for Secp256k1Verifier {
         self.secp.verify_ecdsa(message, &signature, &pk).is_ok()
     }
 
-    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
+    fn verify_auth(&self, auth: &Auth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
+            Auth::Native(sig) => self.verify_sig(*sig, party_key, hash),
             #[cfg(feature = "webauthn")]
-            OpenAuth::WebAuthn(assertion) => {
+            Auth::WebAuthn(assertion) => {
                 crate::webauthn::verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
             #[cfg(not(feature = "webauthn"))]
-            OpenAuth::WebAuthn(_) => false,
+            Auth::WebAuthn(_) => false,
         }
     }
 }

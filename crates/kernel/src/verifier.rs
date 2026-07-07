@@ -2,9 +2,9 @@
 //!
 //! The transition core delegates cryptography through two narrow traits:
 //!
-//!   - [`SigVerifier`] decides whether a settlement signature or open
-//!     authorization is valid over a canonical payload hash. Used for
-//!     [`Proof::Mutual`] and [`crate::Tx::Open`].
+//!   - [`SigVerifier`] decides whether a party-key [`Auth`] witness is
+//!     valid over a canonical payload hash. Used for [`crate::Tx::Open`]
+//!     and [`Proof::Mutual`].
 //!   - [`SealVerifier`] decides whether a protocol-specific dispute
 //!     seal is admissible over the canonical close public inputs.
 //!     Used for [`Proof::Violation`].
@@ -33,14 +33,14 @@
 use crate::consts::MAX_EDGE_OUTPUTS;
 use crate::list::List;
 use crate::primitive::{EdgeId, Key, PayloadHash, ProtocolCode, Sig, TermsHash};
-use crate::tx::{OpenAuth, Payout, Seal};
+use crate::tx::{Auth, Payout, Seal};
 
-/// Decides whether one settlement signature is admissible over a close
-/// payload hash.
+/// Decides whether one party-key authorization is admissible over a
+/// canonical payload hash.
 ///
-/// Used by the kernel for [`Proof::Mutual`]: both maker and taker
-/// signatures are checked through this trait against the canonical
-/// [`crate::Tx::payload_hash`] of the close payload.
+/// Used by the kernel for [`crate::Tx::Open`] (both parties authorize the
+/// open hash) and [`Proof::Mutual`] (both parties authorize the canonical
+/// [`crate::Tx::payload_hash`] of the close).
 ///
 /// [`Proof::Mutual`]: crate::Proof::Mutual
 pub trait SigVerifier {
@@ -49,17 +49,17 @@ pub trait SigVerifier {
     #[must_use]
     fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool;
 
-    /// Returns true when `auth` is a valid open authorization from
-    /// `party_key` over `hash`.
+    /// Returns true when `auth` is a valid authorization from `party_key`
+    /// over `hash`.
     ///
-    /// Native open authorizations reuse [`Self::verify_sig`]. `WebAuthn` is
+    /// Native authorizations reuse [`Self::verify_sig`]. `WebAuthn` is
     /// rejected by default so existing native-only verifiers do not
     /// accidentally start accepting a new signature scheme.
     #[must_use]
-    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
+    fn verify_auth(&self, auth: &Auth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
-            OpenAuth::WebAuthn(_) => false,
+            Auth::Native(sig) => self.verify_sig(*sig, party_key, hash),
+            Auth::WebAuthn(_) => false,
         }
     }
 }

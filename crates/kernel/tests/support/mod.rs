@@ -12,7 +12,7 @@ pub(crate) mod l1_fees;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
-    Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
+    Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
     KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, Proof, Seal,
     SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, Terms, TermsHash, Tx,
     View,
@@ -281,15 +281,16 @@ pub(crate) fn payouts(entries: &[(Key, u64)]) -> List<Payout, MAX_EDGE_OUTPUTS> 
     list
 }
 
-/// `Tx::Open` signed with the placeholder sigs `FAKE_VERIFIER` accepts,
-/// keyed to `maker`/`taker`. Adversarial tests pass mismatching keys.
+/// `Tx::Open` authorized with the placeholder sigs `FAKE_VERIFIER`
+/// accepts, keyed to `maker`/`taker`. Adversarial tests pass mismatching
+/// keys.
 pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
     let hash = Tx::open_hash(&funding, &terms);
     Tx::open(
         funding,
         terms,
-        Sig::placeholder(maker, hash),
-        Sig::placeholder(taker, hash),
+        Auth::native(Sig::placeholder(maker, hash)),
+        Auth::native(Sig::placeholder(taker, hash)),
     )
 }
 
@@ -302,7 +303,10 @@ pub(crate) fn placeholder_mutual(
     taker: Key,
 ) -> Proof {
     let hash = mutual_hash(input, terms, outputs);
-    Proof::mutual(Sig::placeholder(maker, hash), Sig::placeholder(taker, hash))
+    Proof::mutual(
+        Auth::native(Sig::placeholder(maker, hash)),
+        Auth::native(Sig::placeholder(taker, hash)),
+    )
 }
 
 /// Canonical payload hash a mutual close witness signs.

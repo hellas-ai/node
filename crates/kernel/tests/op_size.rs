@@ -8,13 +8,13 @@
 
 #![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 use core::mem::size_of;
-use hellas_kernel::{Funding, OpenAuth, Payout, Proof, Tx, WebAuthnAssertion};
+use hellas_kernel::{Auth, Funding, Payout, Proof, Tx, WebAuthnAssertion};
 
 #[test]
 fn tx_size_within_envelope() {
-    // The 5 KiB cap on `Tx` is a sanity guard, not a target. WebAuthn
-    // open auth deliberately carries bounded browser assertion bytes.
-    // Stack frames for `List<Tx, N>` scale linearly here.
+    // The 5 KiB cap on `Tx` is a sanity guard, not a target. Opens and
+    // mutual closes deliberately carry bounded browser assertion bytes
+    // inline. Stack frames for `List<Tx, N>` scale linearly here.
     assert!(
         size_of::<Tx>() <= 5 * 1024,
         "Tx size {} exceeds 5 KiB cap",
@@ -26,16 +26,14 @@ fn tx_size_within_envelope() {
 fn component_sizes() {
     // Per-component sizes for visibility. Bumping any of these caps is a
     // deliberate review item.
+    // Mutual carries two inline Auth witnesses, so Proof is sized by the
+    // WebAuthn worst case just like Tx::Open.
     assert!(
-        size_of::<Proof>() <= 384,
+        size_of::<Proof>() <= 2 * 2304 + 128,
         "Proof size {}",
         size_of::<Proof>()
     );
-    assert!(
-        size_of::<OpenAuth>() <= 2304,
-        "OpenAuth size {}",
-        size_of::<OpenAuth>(),
-    );
+    assert!(size_of::<Auth>() <= 2304, "Auth size {}", size_of::<Auth>());
     assert!(
         size_of::<WebAuthnAssertion>() <= 2304,
         "WebAuthnAssertion size {}",

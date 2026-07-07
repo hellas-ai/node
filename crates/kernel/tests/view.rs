@@ -11,9 +11,9 @@ mod support;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, Context, Funding, Genesis, MAX_EDGE_OUTPUTS, Parties, Payout,
-    ProtocolCode, Sig, Terms, Tx,
+    ProtocolCode, Terms, Tx,
 };
-use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, state};
+use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, open_tx as open, state};
 
 #[test]
 fn view_compacts_sparse_coins_and_sorts_by_id() {
@@ -96,20 +96,5 @@ fn terms(maker: hellas_kernel::Key, taker: hellas_kernel::Key, protocol: u8) -> 
         Parties::new(maker, taker),
         BlockHeight::new(9),
         outputs,
-    )
-}
-
-fn open(
-    funding: Funding,
-    terms: Terms,
-    maker: hellas_kernel::Key,
-    taker: hellas_kernel::Key,
-) -> Tx {
-    let hash = Tx::open_hash(&funding, &terms);
-    Tx::open(
-        funding,
-        terms,
-        Sig::placeholder(maker, hash),
-        Sig::placeholder(taker, hash),
     )
 }

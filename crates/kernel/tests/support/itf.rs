@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout,
-    Proof, ProtocolCode, Seal, Sig, Terms, Tx,
+    Proof, ProtocolCode, Seal, Terms, Tx,
 };
 
 use super::l1;
@@ -252,11 +252,7 @@ pub(crate) fn close_op(body: &CloseInputBody) -> Tx {
     let terms = l1::terms();
     let proof = match body.proof {
         ProofTag::Mutual => {
-            let hash = Tx::payload_hash(input, CloseKind::Mutual, terms.hash(), &outputs);
-            Proof::mutual(
-                Sig::placeholder(l1::MAKER, hash),
-                Sig::placeholder(l1::TAKER, hash),
-            )
+            super::placeholder_mutual(input, terms.hash(), &outputs, l1::MAKER, l1::TAKER)
         }
         ProofTag::Timeout => Proof::timeout(terms),
         ProofTag::Violation => Proof::violation(terms, seal_for(input, &outputs)),

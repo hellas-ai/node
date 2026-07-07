@@ -11,8 +11,8 @@
 mod support;
 
 use hellas_kernel::{
-    ApplyError, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason, Key,
-    List, MAX_EDGE_OUTPUTS, MAX_WEBAUTHN_DATA_LENGTH, OpenAuth, Parties, PayloadHash, Payout,
+    ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason,
+    Key, List, MAX_EDGE_OUTPUTS, MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash, Payout,
     ProtocolCode, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Terms, Tx,
     WebAuthnAssertion, WebAuthnData, p256_key, verify_webauthn_assertion,
 };
@@ -37,10 +37,10 @@ impl SigVerifier for MixedVerifier {
         sig == Sig::placeholder(party_key, hash)
     }
 
-    fn verify_open_auth(&self, auth: &OpenAuth, party_key: Key, hash: PayloadHash) -> bool {
+    fn verify_auth(&self, auth: &Auth, party_key: Key, hash: PayloadHash) -> bool {
         match auth {
-            OpenAuth::Native(sig) => self.verify_sig(*sig, party_key, hash),
-            OpenAuth::WebAuthn(assertion) => {
+            Auth::Native(sig) => self.verify_sig(*sig, party_key, hash),
+            Auth::WebAuthn(assertion) => {
                 verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
         }
@@ -129,11 +129,11 @@ fn webauthn_open_auth_is_checked_in_kernel() {
     let (maker_assertion, _) = sign_webauthn(&maker_sk, hash, "https://not-hellas.invalid");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open_with_auth(
+    let open = Tx::open(
         funding,
         terms,
-        OpenAuth::webauthn(maker_assertion),
-        OpenAuth::native(taker_sig),
+        Auth::webauthn(maker_assertion),
+        Auth::native(taker_sig),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -165,11 +165,11 @@ fn webauthn_open_rejects_wrong_challenge() {
     let (maker_assertion, _) = sign_webauthn(&maker_sk, wrong_hash, "https://example.invalid");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open_with_auth(
+    let open = Tx::open(
         funding,
         terms,
-        OpenAuth::webauthn(maker_assertion),
-        OpenAuth::native(taker_sig),
+        Auth::webauthn(maker_assertion),
+        Auth::native(taker_sig),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -200,11 +200,11 @@ fn webauthn_open_rejects_assertion_from_wrong_party_key() {
         sign_webauthn(&wrong_sk, hash, "https://wallet.example.invalid");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open_with_auth(
+    let open = Tx::open(
         funding,
         terms,
-        OpenAuth::webauthn(maker_assertion),
-        OpenAuth::native(taker_sig),
+        Auth::webauthn(maker_assertion),
+        Auth::native(taker_sig),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -224,10 +224,15 @@ fn webauthn_open_rejects_assertion_from_wrong_party_key() {
     );
 }
 
+/// End-to-end passkey lifecycle under the bundled production verifier: a
+/// native maker and a `WebAuthn` taker open an edge and cooperatively
+/// close it, the taker authorizing each payload hash through an assertion
+/// (passkey hardware cannot sign bare digests, so the assertion envelope
+/// is the only witness shape a passkey party can produce).
 #[cfg(feature = "secp256k1")]
 #[test]
-fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
-    use hellas_kernel::{CloseKind, InvalidProofReason, Proof, Secp256k1Verifier};
+fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
+    use hellas_kernel::{CloseKind, Proof, Secp256k1Verifier};
     use secp256k1::{Message, Secp256k1, SecretKey};
 
     fn secp_keypair(seed: u8) -> (SecretKey, Key) {
@@ -237,22 +242,11 @@ fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
         (secret, Key::from_bytes(public.serialize()))
     }
 
-    fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
+    fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Auth {
         let secp = Secp256k1::new();
         let message = Message::from_digest(hash.to_bytes());
         let signature = secp.sign_ecdsa(message, secret);
-        Sig::from_bytes(signature.serialize_compact())
-    }
-
-    fn p256_raw_sig(signing_key: &SigningKey, hash: PayloadHash) -> Sig {
-        let signature: P256Signature = signing_key
-            .sign_prehash(hash.as_bytes())
-            .expect("P-256 prehash signing succeeds");
-        let signature = signature.normalize_s().unwrap_or(signature);
-        let bytes = signature.to_bytes();
-        let mut out = [0_u8; Sig::LENGTH];
-        out.copy_from_slice(&bytes);
-        Sig::from_bytes(out)
+        Auth::native(Sig::from_bytes(signature.serialize_compact()))
     }
 
     let (maker_sk, maker_key) = secp_keypair(3);
@@ -271,14 +265,16 @@ fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
     let (taker_assertion, assertion_key) =
         sign_webauthn(&taker_sk, open_hash, "https://wallet.example.invalid");
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = Tx::open_with_auth(
+    let maker_out = outputs.as_slice()[0].id(edge, 0);
+    let taker_out = outputs.as_slice()[1].id(edge, 1);
+    let open = Tx::open(
         funding,
         terms,
-        OpenAuth::native(secp_sign(&maker_sk, open_hash)),
-        OpenAuth::webauthn(taker_assertion),
+        secp_sign(&maker_sk, open_hash),
+        Auth::webauthn(taker_assertion),
     );
     let mut state = state(
-        FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
+        FixedStore::empty([MAKER_COIN, TAKER_COIN, maker_out, taker_out], [edge]),
         [
             Genesis::coin(MAKER_COIN, maker_key, 10),
             Genesis::coin(TAKER_COIN, taker_key, 5),
@@ -296,23 +292,35 @@ fn bundled_verifier_accepts_mixed_open_but_not_passkey_mutual_close() {
     );
 
     let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
+    let (taker_close_assertion, _) =
+        sign_webauthn(&taker_sk, close_hash, "https://wallet.example.invalid");
     let close = Tx::close(
         edge,
         Proof::mutual(
             secp_sign(&maker_sk, close_hash),
-            p256_raw_sig(&taker_sk, close_hash),
+            Auth::webauthn(taker_close_assertion),
         ),
         outputs,
     );
 
+    state
+        .apply(CONTEXT, &verifier, &close)
+        .expect("bundled verifier accepts native maker + WebAuthn taker mutual close");
+    assert_eq!(state.store().edge(edge), None);
     assert_eq!(
-        state.apply(CONTEXT, &verifier, &close),
-        Err(ApplyError::InvalidProof {
-            input: edge,
-            reason: InvalidProofReason::BadSignature,
-        }),
+        state
+            .store()
+            .coin(maker_out)
+            .map(hellas_kernel::Coin::value),
+        Some(7),
     );
-    assert!(state.store().edge(edge).is_some());
+    assert_eq!(
+        state
+            .store()
+            .coin(taker_out)
+            .map(hellas_kernel::Coin::value),
+        Some(8),
+    );
 }
 
 fn p256_key_from_signing_key(signing_key: &SigningKey) -> Key {
