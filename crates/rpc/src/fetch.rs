@@ -553,9 +553,6 @@ type PayloadDecodeError = serde_ipld_dagcbor::DecodeError<Infallible>;
 const EVENT_CODEC: &str = "hellas.fetch.output.event.v1";
 const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v1";
 
-type EncodeError = serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>;
-type DecodeError = serde_ipld_dagcbor::DecodeError<Infallible>;
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FetchEventPayload {
     TextDelta {

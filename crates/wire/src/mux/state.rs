@@ -7,7 +7,7 @@ use crate::frame::{CreditFrame, EndFrame, Frame, OpenFrame, ResetFrame};
 use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
 
-use super::slot::{Role, SlotIndex, SlotState, StreamSlot};
+use super::slot::{Role, SlotIndex, StreamSlot};
 use super::wire::{StreamKey, decode_keyed_frame, encode_keyed_frame};
 
 #[derive(Clone, Copy, Debug)]
