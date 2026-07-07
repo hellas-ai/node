@@ -2,11 +2,9 @@ use hellas_executor::{
     FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
     FetchProviderRequest, FetchRequestView, FetchUsage, ProjectedFetch,
 };
+use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 use hellas_wire_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
-use hellas_wire_adaptors::{
-    OutputEvent, RawRequest, Usage, WireAdaptor, encode_fetch_event_payload,
-    encode_fetch_terminal_payload,
-};
+use hellas_wire_adaptors::{OutputEvent, RawRequest, Usage, WireAdaptor};
 
 use crate::commands::openai_responses_stream::ResponsesSseProjector;
 
