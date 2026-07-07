@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use hellas_wire_adaptors::{
+use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
 };
 

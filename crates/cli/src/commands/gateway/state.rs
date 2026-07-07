@@ -17,7 +17,7 @@ use hellas_rpc::model::ModelAssets;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_wire_adaptors::{
+use hellas_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
     Message as WireMessage,
 };

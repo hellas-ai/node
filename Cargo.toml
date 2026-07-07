@@ -6,7 +6,7 @@ members = [
     "crates/kernel",
     "crates/rpc",
     "crates/wire",
-    "crates/wire-adaptors",
+    "crates/adaptors",
 ]
 default-members = ["crates/cli"]
 resolver = "2"
@@ -49,7 +49,7 @@ hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
-hellas-wire-adaptors = { path = "crates/wire-adaptors", default-features = false }
+hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hex = "0.4"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh = { version = "1", default-features = false }

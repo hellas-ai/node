@@ -5,7 +5,7 @@ use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::{build_input_events, verify_input_events};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
-use hellas_wire_adaptors::{
+use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
     Provenance,
 };
@@ -157,7 +157,7 @@ fn provider_request_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_wire_adaptors::{CanonicalExecution, ExecutionRequest, Input, ModelRef, RawRequest};
+    use hellas_adaptors::{CanonicalExecution, ExecutionRequest, Input, ModelRef, RawRequest};
 
     fn backend_request(body: &[u8], model: &str) -> BackendRequest {
         BackendRequest::new(

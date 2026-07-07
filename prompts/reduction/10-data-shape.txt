@@ -1,0 +1,19 @@
+lens: data shapes.
+
+wrong data shapes generate code everywhere they travel: derived fields that must be
+kept in sync, enums whose variants share most of their payload, six arguments that
+always travel together, and half-used machinery (an Encode without a Decode, a
+builder with one call site).
+
+method- for every struct: is any field computable from the others? a cached
+derivation is an invariant to maintain and a desync bug waiting- justify it with a
+measurement or delete it (the kernel's Terms{body,hash} is the pattern done right:
+constructor-enforced, documented- use it as the bar). for every enum: if all
+variants share fields, hoist them; if one variant dominates usage, maybe it wants
+to be a struct with an optional extension. for every function over 4 parameters:
+the parameters are a struct asking to exist- but only if the same group recurs.
+for every trait/impl pair: is the full surface used, or did we implement eight
+methods because the trait demanded it and callers use two?
+
+output: per finding, the shape change, the call sites it simplifies (count them),
+and the invariant it removes or makes constructor-enforced.

@@ -1,0 +1,19 @@
+lens: configuration surface.
+
+every knob is a promise: it multiplies the test matrix and freezes an interface.
+most knobs are set once, to the same value, forever.
+
+method- inventory all configuration: feature flags, config-file fields, env vars,
+constructor parameters, CLI flags. for each: find every place a non-default value is
+actually used (in the repo, in CI, in deployment configs). a knob with one observed
+value is a constant- inline it. a feature combination never built is dead- remove
+the cfg branches it guards. options plumbed through five layers to reach their user
+suggest the wrong layer owns the decision. also check cfg-gated code: each cfg
+doubles the states a reader must hold; collapse gates that always co-occur into one
+feature.
+
+be conservative with anything protocol-visible (chain version constants, bounds
+like MAX_*): those are consensus parameters, not knobs, and their docs say so.
+
+output: knob inventory with observed values, and one commit per removed knob so
+each is individually revertable.

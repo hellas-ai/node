@@ -2,8 +2,8 @@ use crate::commands::http_client;
 use crate::commands::openai_responses_stream::ResponsesSseProjector;
 use axum::body::Bytes;
 use futures::StreamExt;
-use hellas_wire_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
-use hellas_wire_adaptors::{
+use hellas_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
+use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
     WireAdaptor,
 };
@@ -152,8 +152,8 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::post;
-    use hellas_wire_adaptors::openai::responses::OpenAiResponsesAdaptor;
-    use hellas_wire_adaptors::{
+    use hellas_adaptors::openai::responses::OpenAiResponsesAdaptor;
+    use hellas_adaptors::{
         OutputEvent, OutputItem, RawRequest, StopReason, TextChannel, Usage, WireAdaptor,
     };
     use std::sync::Arc;

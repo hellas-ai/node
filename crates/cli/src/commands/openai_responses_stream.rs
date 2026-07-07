@@ -1,7 +1,7 @@
-use hellas_wire_adaptors::openai::responses::{
+use hellas_adaptors::openai::responses::{
     OpenAiResponsesAdaptor, ParsedResponseRequest, ResponsesIngressState,
 };
-use hellas_wire_adaptors::{BackendError, OutputEvent, SseDecoder, WireIngress, WireStreamEvent};
+use hellas_adaptors::{BackendError, OutputEvent, SseDecoder, WireIngress, WireStreamEvent};
 
 pub(crate) struct ResponsesSseProjector {
     adaptor: OpenAiResponsesAdaptor,

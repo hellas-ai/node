@@ -1,0 +1,15 @@
+okay, so currently i have this project, hellas- it's the user-facing part of my decentralized AI startup.
+one way to look at it is a productionising of my co-founder's work- catgrad. catgrad is a categorical deep learning compiler with deterministic runtime.
+
+since catgrad programs have a canonical representation and deterministic execution, hellas is basically a 'blockchain' on top of catgrad, where users can pay one another to run programs, check results etc. there's a few different 'moving parts' to the blockchain side:
+
+1- the consensus layer - hellas is a l1 proof-of-stake blockchain, using UTXO model and some modern ideas from chains like sui and worldcoin. we heavily use primitives from the `commonware.xyz` library. it's kind of 'a blockchain in a box'- you bring your own STF and the library does the rest. so we use this library for a lot of stuff- storage, crypto, p2p, etc etc.
+
+2- the transition function - hellas is not like normal blockchains- it doesns't have a VM (maybe conceptually its a super-simple VM idk, does boolean comparator count as a vm? genuine q). there are only two types of transaction- Bind and Resolve.
+
+Bind - You commit some capital, to be paid out under various resolutions (ie- if some invariant held, permit payouts. if fraud proved, send all coins to the accuser, etc)
+Resolve - You provide a proof that resolves the condition a certain way- capital is distributed
+
+So you can see that there is only really two kinds of object in hellas world-
+
+Coin - this is the capital - when it is not currently Bound, the capital exists in the form of a Coin

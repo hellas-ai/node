@@ -1,0 +1,21 @@
+lens: the test estate.
+
+tests are code too, and they bloat differently: coverage overlap across layers,
+scaffolding that outweighs assertions, tests that cannot fail meaningfully, and
+compile-time cost from many tiny integration binaries.
+
+method- map what each test layer actually pins (unit / integration / proptest /
+model-check / trace-replay). for every test ask: what change to src would make this
+fail, and is any *other* test already failing for that change? fully-shadowed tests
+go. tests asserting library behavior (serde round-trips of derived impls, std
+semantics) go. measure scaffold-to-assertion ratio per file; when a helper module
+is larger than the tests it serves, the helpers are the wrong shape. merge tiny
+integration targets that exist only for file organization- each binary is a link
+step.
+
+never delete: adversarial tests, rejection-path tests, store-contract tests, and
+anything that pins consensus-visible behavior- even if they look redundant, state
+their overlap explicitly and keep them.
+
+output: coverage map, deletion list with the shadowing test named for each, merge
+plan for the binaries.

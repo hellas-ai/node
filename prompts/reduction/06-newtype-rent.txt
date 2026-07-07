@@ -1,0 +1,19 @@
+lens: does the type machinery pay rent?
+
+newtypes, const generics, typestate, and trait indirection are good exactly when
+they delete a class of bugs. each one also costs: constructors, accessors, impl
+blocks, conversions at every boundary. audit whether each pays.
+
+method- for every newtype/wrapper: list the bug it prevents (mixing coin/edge ids:
+real bug, keep). then count its ceremony- from_bytes/to_bytes/as_bytes triplets,
+Encode/Decode impls, Display impls. if several types share identical ceremony,
+that's a macro or a shared generic, not five hand-copies. for every generic
+parameter and trait: how many concrete instantiations exist? one instantiation =
+the generic is speculative; inline it. two = maybe. dyn traits with one impl are
+the same smell.
+
+the kernel's id newtypes stay- they are domain-separated hashes and the type
+distinction is the security property. the question is the ceremony *around* them.
+
+output: per type, the bug-class it prevents, ceremony line count, and keep/inline/
+macro decision.

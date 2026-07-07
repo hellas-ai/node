@@ -1,0 +1,19 @@
+lens: comment and doc weight.
+
+comments that restate the code rot into lies and cost tokens forever. comments that
+state an invariant the code cannot express are the most valuable lines in the repo.
+the skill is telling them apart at scale.
+
+method- sweep every doc comment and inline comment, sorting into: (a) invariant/
+safety/protocol rationale- keep, these are sacred; (b) narration of the next line-
+delete; (c) section banners and field docs that repeat the field name- delete;
+(d) duplicated prose (the same "abstract counterpart" paragraph in ten module
+headers- keep one canonical statement, link the rest); (e) stale claims- fix or
+delete, a wrong comment is worse than none. be suspicious of any comment explaining
+*what* rather than *why*.
+
+do not touch: domain-separator docs, feature-gating rationale, panic contracts,
+anything a consensus auditor would need.
+
+output: one commit per crate, and a count of lines removed vs invariant-comments
+preserved so i can see the ratio.

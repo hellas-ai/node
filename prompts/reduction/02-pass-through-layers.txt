@@ -1,0 +1,18 @@
+lens: pass-through layers.
+
+a layer earns its place by *changing* something- representation, invariant, failure
+mode, trust level. a layer that receives X, renames it, and hands it to the next
+layer is typing practice.
+
+method- pick a user-visible operation (submit tx, run inference, fetch result) and
+trace it top to bottom, writing down every function boundary it crosses. for each
+boundary ask: what does the callee know or enforce that the caller could not? if the
+answer is nothing, the boundary is a candidate for collapse. adaptors that adapt an
+adaptor are the strongest signal. count the wrapper structs whose only field is the
+thing they wrap and whose methods all delegate.
+
+do not collapse a boundary that exists for a *trust* reason (kernel vs host, signed
+vs unsigned data) even if it looks like a pass-through today.
+
+output: the call-trace with each boundary marked keep/collapse and why, then the
+collapse as separate commits, deepest layer first.

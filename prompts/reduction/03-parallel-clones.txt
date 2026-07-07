@@ -1,0 +1,16 @@
+lens: parallel implementations.
+
+when we support N similar backends/protocols/formats, the code often becomes N
+near-identical files that drift apart. every fix must then be made N times, and one
+day it is made N-1 times.
+
+method- diff the siblings against each other (e.g. the wire-adaptor families, the
+per-scheme protocol modules, parallel test scaffolds). classify each divergence as
+essential (the formats genuinely differ) or accidental (same logic, different
+spelling). for accidental divergence decide: extract the shared skeleton, or- often
+better- delete the abstraction and keep one honest copy if N is small and stable.
+extraction that needs generics, trait objects, and a config struct to save 40 lines
+is a loss; count the *total* lines including the machinery.
+
+output: per family, the essential-difference summary (this is valuable documentation
+by itself), the chosen strategy, and the measured before/after line count.

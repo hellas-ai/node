@@ -75,7 +75,7 @@ use hellas_rpc::{
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
-use hellas_wire_adaptors::OutputEvent as WireOutputEvent;
+use hellas_adaptors::OutputEvent as WireOutputEvent;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::error::Error as StdError;
 use std::net::SocketAddr;
@@ -1763,7 +1763,7 @@ mod tests {
     #[cfg(feature = "evaluate")]
     use hellas_rpc::pb::execute::WorkChunk;
     use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
-    use hellas_wire_adaptors::{
+    use hellas_adaptors::{
         OutputEvent as WireOutputEvent, StopReason as WireStopReason, encode_fetch_terminal_payload,
     };
 
