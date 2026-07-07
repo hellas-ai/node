@@ -137,9 +137,12 @@ impl<T, const N: usize> Bounded<T, N> {
     }
 
     /// Borrows the live entries.
+    ///
+    /// Every constructor (including the codec `Read` impls) establishes
+    /// `len <= N`.
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
-        self.items.get(..self.len).unwrap_or(&self.items)
+        &self.items[..self.len]
     }
 
     /// Returns the number of live entries.
@@ -190,6 +193,9 @@ impl<const N: usize> Read for Bounded<u8, N> {
 
     fn read_cfg(buf: &mut impl bytes::Buf, (range, _cfg): &Self::Cfg) -> Result<Self, CodecError> {
         let len = usize::read_cfg(buf, range)?;
+        if len > N {
+            return Err(CodecError::InvalidLength(len));
+        }
         let mut items = [0_u8; N];
         for slot in items.iter_mut().take(len) {
             *slot = u8::read(buf)?;
@@ -203,6 +209,9 @@ impl<const N: usize> Read for Bounded<ObjectId, N> {
 
     fn read_cfg(buf: &mut impl bytes::Buf, (range, _cfg): &Self::Cfg) -> Result<Self, CodecError> {
         let len = usize::read_cfg(buf, range)?;
+        if len > N {
+            return Err(CodecError::InvalidLength(len));
+        }
         let mut items = [ObjectId::from([0; 32]); N];
         for slot in items.iter_mut().take(len) {
             *slot = ObjectId::read(buf)?;
@@ -306,7 +315,16 @@ pub fn output_object_id(tx_digest: &Digest, output_index: u8) -> ObjectId {
 }
 
 fn challenge_prefix(buf: &mut BytesMut, tag: u8) {
-    const WEBAUTHN_CHAIN_ID_LEN: u8 = 14;
+    // Length-prefix the chain id so the domain encoding is unambiguous.
+    // Derived, not hard-coded: a wrong literal here silently corrupts
+    // every challenge's domain separation.
+    const WEBAUTHN_CHAIN_ID_LEN: u8 = {
+        assert!(WEBAUTHN_CHAIN_ID.len() <= u8::MAX as usize);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            WEBAUTHN_CHAIN_ID.len() as u8
+        }
+    };
 
     buf.extend_from_slice(CHALLENGE_DOMAIN);
     WEBAUTHN_POLICY_VERSION.write(buf);
@@ -953,6 +971,30 @@ mod tests {
         let encoded = addr.to_string();
         let decoded: Address = encoded.parse().expect("base58 decode");
         assert_eq!(addr, decoded);
+    }
+
+    #[test]
+    fn challenge_prefix_length_matches_chain_id() {
+        let mut buf = BytesMut::new();
+        challenge_prefix(&mut buf, TRANSFER_TAG);
+
+        let after_domain = &buf[CHALLENGE_DOMAIN.len()..];
+        assert_eq!(after_domain[0], WEBAUTHN_POLICY_VERSION);
+        let declared_len = after_domain[1] as usize;
+        assert_eq!(declared_len, WEBAUTHN_CHAIN_ID.len());
+        assert_eq!(&after_domain[2..2 + declared_len], WEBAUTHN_CHAIN_ID);
+        assert_eq!(after_domain[2 + declared_len], TRANSFER_TAG);
+    }
+
+    #[test]
+    fn bounded_read_rejects_len_over_capacity_despite_loose_range() {
+        // A caller passing a RangeCfg wider than the type's capacity must
+        // still get a decode error, not a corrupt list.
+        let oversized: Bounded<u8, 8> = byte_list_from_slice(&[7; 8]).expect("fits");
+        let encoded = oversized.encode();
+        let decoded =
+            Bounded::<u8, 4>::read_cfg(&mut encoded.as_ref(), &(RangeCfg::new(0..=usize::MAX), ()));
+        assert!(matches!(decoded, Err(CodecError::InvalidLength(8))));
     }
 
     #[test]
