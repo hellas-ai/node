@@ -171,12 +171,10 @@ const SNAPSHOT_MAGIC: u8 = 0xA2;
 const ROLE_CLIENT: u8 = 0;
 const ROLE_SERVER: u8 = 1;
 
-const STATE_OPEN_LOCAL: u8 = 0;
-const STATE_OPEN_REMOTE: u8 = 1;
-const STATE_OPEN: u8 = 2;
-const STATE_HALF_CLOSED_LOCAL: u8 = 3;
-const STATE_HALF_CLOSED_REMOTE: u8 = 4;
-const STATE_CLOSED: u8 = 5;
+const STATE_OPEN: u8 = 0;
+const STATE_HALF_CLOSED_LOCAL: u8 = 1;
+const STATE_HALF_CLOSED_REMOTE: u8 = 2;
+const STATE_CLOSED: u8 = 3;
 
 fn role_tag(r: Role) -> u8 {
     match r {
@@ -195,8 +193,6 @@ fn role_from_tag(t: u8) -> Result<Role, CfDoError> {
 
 fn state_tag(s: SlotState) -> u8 {
     match s {
-        SlotState::OpenLocal => STATE_OPEN_LOCAL,
-        SlotState::OpenRemote => STATE_OPEN_REMOTE,
         SlotState::Open => STATE_OPEN,
         SlotState::HalfClosedLocal => STATE_HALF_CLOSED_LOCAL,
         SlotState::HalfClosedRemote => STATE_HALF_CLOSED_REMOTE,
@@ -206,8 +202,6 @@ fn state_tag(s: SlotState) -> u8 {
 
 fn state_from_tag(t: u8) -> Result<SlotState, CfDoError> {
     match t {
-        STATE_OPEN_LOCAL => Ok(SlotState::OpenLocal),
-        STATE_OPEN_REMOTE => Ok(SlotState::OpenRemote),
         STATE_OPEN => Ok(SlotState::Open),
         STATE_HALF_CLOSED_LOCAL => Ok(SlotState::HalfClosedLocal),
         STATE_HALF_CLOSED_REMOTE => Ok(SlotState::HalfClosedRemote),
@@ -264,7 +258,7 @@ pub fn serialize_mux<const N: usize, C: Clock>(mux: &Multiplexer<N, C>) -> Vec<u
     for (idx, slot) in occupied {
         out.extend_from_slice(&idx.to_le_bytes());
         out.extend_from_slice(&slot.generation.to_le_bytes());
-        out.push(state_tag(slot.state));
+        out.push(state_tag(slot.state()));
         out.extend_from_slice(&slot.method_id.to_le_bytes());
         out.extend_from_slice(&slot.peer_recv_credit.to_le_bytes());
         out.extend_from_slice(&slot.local_recv_credit.to_le_bytes());
@@ -590,7 +584,7 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
         let slot_state = mux
             .iter_occupied_slots()
             .find(|(occ_idx, _)| *occ_idx == idx)
-            .map(|(_, slot)| slot.state);
+            .map(|(_, slot)| slot.state());
         let slot_state = match slot_state {
             Some(s) => s,
             None => {
@@ -636,7 +630,7 @@ pub fn deserialize_mux<const N: usize, C: Clock>(
         .iter_occupied_slots()
         .filter(|(idx, slot)| {
             our_role.owns_slot(*idx)
-                && slot.state == SlotState::Closed
+                && slot.state() == SlotState::Closed
                 && slot.send_queue.is_empty()
         })
         .map(|(idx, _)| idx)
@@ -1632,7 +1626,7 @@ mod tests {
                 (
                     idx,
                     s.generation,
-                    s.state,
+                    s.state(),
                     s.method_id,
                     s.peer_recv_credit,
                     s.local_recv_credit,
@@ -1649,7 +1643,7 @@ mod tests {
                 (
                     idx,
                     s.generation,
-                    s.state,
+                    s.state(),
                     s.method_id,
                     s.peer_recv_credit,
                     s.local_recv_credit,
@@ -1682,7 +1676,7 @@ mod tests {
             let slot_state = mux
                 .iter_occupied_slots()
                 .find(|(occ_idx, _)| *occ_idx == idx)
-                .map(|(_, slot)| slot.state);
+                .map(|(_, slot)| slot.state());
             assert!(
                 slot_state.is_some(),
                 "[{side}] term_free idx {idx} is not occupied"
@@ -1703,7 +1697,7 @@ mod tests {
         let term_free: Vec<SlotIndex> = mux.pending_terminal_free_slice().to_vec();
         let role = mux.role();
         for (idx, slot) in mux.iter_occupied_slots() {
-            if role.owns_slot(idx) && slot.state == SlotState::Closed {
+            if role.owns_slot(idx) && slot.state() == SlotState::Closed {
                 let has_queue = !slot.send_queue.is_empty();
                 let in_term_free = term_free.contains(&idx);
                 assert!(

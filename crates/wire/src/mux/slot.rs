@@ -36,15 +36,12 @@ impl Role {
     }
 }
 
-/// Lifecycle states for a slot. Transitions defined by the state
-/// machine in `state.rs`.
+/// Lifecycle view of a slot, computed from its two terminal flags by
+/// [`StreamSlot::state`]. Not stored — the flags are the source of truth,
+/// so state and flags can never disagree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotState {
-    /// We sent OPEN; awaiting first inbound activity from peer.
-    OpenLocal,
-    /// Peer sent OPEN; awaiting first outbound from us.
-    OpenRemote,
-    /// Both directions live.
+    /// Neither side has sent its terminal frame.
     Open,
     /// We closed send; can still receive.
     HalfClosedLocal,
@@ -56,7 +53,6 @@ pub enum SlotState {
 
 pub struct StreamSlot {
     pub generation: u16,
-    pub state: SlotState,
     pub method_id: u32,
     pub opened_at: Instant,
     pub deadline: Option<Instant>,
@@ -87,10 +83,12 @@ pub struct StreamSlot {
 }
 
 impl StreamSlot {
-    pub fn open_local(method_id: u32, opened_at: Instant, initial_credit: u32) -> Self {
+    /// A freshly-opened slot. Local vs remote origin is not tracked — it
+    /// drives no logic and never survived hibernation. `generation` is
+    /// bumped by the allocator before the slot is published.
+    pub fn open(method_id: u32, opened_at: Instant, initial_credit: u32) -> Self {
         Self {
-            generation: 0, // bumped by the allocator before construction-and-publish
-            state: SlotState::OpenLocal,
+            generation: 0,
             method_id,
             opened_at,
             deadline: None,
@@ -103,19 +101,13 @@ impl StreamSlot {
         }
     }
 
-    pub fn open_remote(method_id: u32, opened_at: Instant, initial_credit: u32) -> Self {
-        Self {
-            generation: 0,
-            state: SlotState::OpenRemote,
-            method_id,
-            opened_at,
-            deadline: None,
-            peer_recv_credit: initial_credit,
-            local_recv_credit: initial_credit,
-            local_credit_high_water: initial_credit,
-            send_queue: std::collections::VecDeque::with_capacity(SLOT_QUEUE_CAP),
-            peer_terminal: false,
-            local_terminal: false,
+    /// Lifecycle view derived from the two terminal flags.
+    pub fn state(&self) -> SlotState {
+        match (self.local_terminal, self.peer_terminal) {
+            (false, false) => SlotState::Open,
+            (true, false) => SlotState::HalfClosedLocal,
+            (false, true) => SlotState::HalfClosedRemote,
+            (true, true) => SlotState::Closed,
         }
     }
 
