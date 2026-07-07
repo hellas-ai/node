@@ -15,6 +15,8 @@ pub mod call;
 pub mod evaluate;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+#[cfg(feature = "fetch")]
+pub mod output;
 pub mod peers;
 pub mod protocol;
 #[cfg(feature = "execute")]

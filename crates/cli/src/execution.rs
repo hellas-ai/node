@@ -47,6 +47,9 @@ use hellas_rpc::fetch::{
     FetchInput, FetchProtocolError, output_canonicalization, verify_input_events,
     verify_output_events,
 };
+use hellas_rpc::fetch::{
+    FetchTerminalPayload, decode_fetch_event_payload, decode_fetch_terminal_payload,
+};
 #[cfg(feature = "evaluate")]
 use hellas_rpc::model::{ModelAssets, ModelAssetsError};
 #[cfg(feature = "evaluate")]
@@ -72,10 +75,7 @@ use hellas_rpc::{
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::ServiceRegistry;
 use hellas_wire::{ServiceMarker, WireStatus};
-use hellas_wire_adaptors::{
-    FetchTerminalPayload, OutputEvent as WireOutputEvent, decode_fetch_event_payload,
-    decode_fetch_terminal_payload,
-};
+use hellas_wire_adaptors::OutputEvent as WireOutputEvent;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use std::error::Error as StdError;
 use std::net::SocketAddr;

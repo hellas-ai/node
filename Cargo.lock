@@ -3514,6 +3514,7 @@ dependencies = [
  "futures-core",
  "futures-executor",
  "futures-util",
+ "hellas-rpc",
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
