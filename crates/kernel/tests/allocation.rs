@@ -10,9 +10,10 @@
 //! or rustc warning. Re-run `cargo test --test allocation` after any
 //! field-shape change to those types.
 
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 mod support;
 
-use support::{FAKE_VERIFIER, FixedStore};
+use support::{FAKE_VERIFIER, FixedStore, list, open_tx};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis, Key,
@@ -119,46 +120,21 @@ fn funding(maker: CoinId, taker: CoinId) -> Funding {
 }
 
 fn party1(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(inputs) = List::new([id; MAX_PARTY_INPUTS], 1) else {
-        panic!("invalid test party list");
-    };
-    inputs
+    list(&[id])
 }
 
 fn payouts(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let Some(outputs) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test payout list");
-    };
-    outputs
+    list(&[first, second])
 }
 
 fn input_ids(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
-    let Some(ids) = List::new([first, second, first, first, first, first, first, first], 2) else {
-        panic!("invalid test input id list");
-    };
-    ids
+    list(&[first, second])
 }
 
 fn output_ids(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    let Some(ids) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test output id list");
-    };
-    ids
+    list(&[first, second])
 }
 
 fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
     ids.as_slice()[index]
-}
-
-/// Builds a `Tx::Open` with placeholder signatures (`Sig::placeholder` is
-/// allocation-free) and is itself allocation-free, preserving the
-/// zero-alloc invariant the test asserts.
-fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
-    let hash = Tx::open_hash(&funding, &terms);
-    Tx::open(
-        funding,
-        terms,
-        Sig::placeholder(maker, hash),
-        Sig::placeholder(taker, hash),
-    )
 }

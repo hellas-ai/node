@@ -346,7 +346,7 @@ fn close_rejects_timeout_before_deadline_without_mutation() {
 
     assert_eq!(
         state.apply(
-            EARLY_CONTEXT,
+            CONTEXT,
             &FAKE_VERIFIER,
             &Tx::close(
                 edge(),
@@ -580,6 +580,34 @@ fn close_allows_zero_value_payout_coin() {
         state.store().coin(taker_out).map(coin_view),
         Some((TAKER, 15)),
     );
+}
+
+#[test]
+fn close_rejects_occupied_output_id_without_mutation() {
+    // A coin already sits at the id the first payout would derive; the
+    // close must refuse rather than overwrite it. Only trusted genesis
+    // configuration can produce this collision — payout ids bind their
+    // producing edge, so no in-protocol close can pre-occupy another's.
+    let mut state = state(
+        empty_store(),
+        [MAKER_SEED, TAKER_SEED, Genesis::coin(maker_out(), MAKER, 1)],
+    );
+    let _event = apply(&mut state, &open_op());
+    let store = *state.store();
+
+    assert_eq!(
+        state.apply(
+            TIMEOUT_CONTEXT,
+            &FAKE_VERIFIER,
+            &Tx::close(
+                edge(),
+                proof(),
+                payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
+            ),
+        ),
+        Err(ApplyError::OutputExists { id: maker_out() }),
+    );
+    assert_eq!(*state.store(), store);
 }
 
 #[test]

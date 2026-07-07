@@ -81,10 +81,21 @@ module types {
   // state; every other action records its input here. The Rust ITF runner
   // reads `lastInput` from each trace state, drives the kernel with it, and
   // asserts the kernel's emitted event against `lastEvent`.
+  //
+  // `RejectedOpenInput` / `RejectedCloseInput` record attempts the model's
+  // preconditions refuse. They leave state untouched here, and the Rust
+  // runner replays each one against the kernel, asserting the apply is
+  // rejected and the store is unchanged — so "the kernel rejects what the
+  // model rejects" is exercised by trace replay, not just stated by an
+  // `expect(not(can...))` on the abstract side. The model carries no
+  // rejection-reason taxonomy, so *which* `ApplyError` fires is pinned by
+  // the kernel's unit tests, not by replay.
   type Input =
     | NoInput
     | OpenInput(Edge)
     | CloseInput({ edge: Edge, proof: Proof, makerPay: int, takerPay: int })
+    | RejectedOpenInput({ edge: Edge, asMaker: Party, asTaker: Party })
+    | RejectedCloseInput({ edge: Edge, proof: Proof, makerPay: int, takerPay: int })
     | TickInput
     | IdleInput
 

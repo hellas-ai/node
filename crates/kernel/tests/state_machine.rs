@@ -2,20 +2,17 @@
 //!
 //! This test runs `proptest-state-machine` over a closed enum of kernel
 //! operations, applies each to both the kernel and a `BTreeMap`-backed
-//! reference, and asserts the two agree on live coin/edge shape after every
-//! step. The reference encodes the intended semantics in straight Rust, no
-//! signatures and no fee math, so divergence from the kernel surfaces as a
-//! bug in either side.
+//! reference, and asserts the two agree on the exact live coin/edge sets
+//! after every step. The reference encodes the intended semantics in
+//! straight Rust — no signatures and no fee math — so divergence from the
+//! kernel surfaces as a bug in either side.
 //!
-//! Existing coverage:
-//!   - `tests/sequence.rs`     — proptest with invariant checks (no ref).
-//!   - `tests/itf.rs`          — Quint-driven trace replay (4 fixtures).
-//!   - `tests/stateright.rs`   — exhaustive bounded model checking.
-//!
-//! What this adds: an *independent Rust reference* that proptest hammers with
-//! random sequences (with shrinking) over a slightly different transition
-//! grammar than Quint exposes, catching kernel-state-tracking bugs that
-//! happen to lie outside Quint's transition relation.
+//! Unlike the fixed-scenario suites (`tests/channel*`, `tests/itf.rs`,
+//! `tests/stateright.rs`), every case here draws fresh scenario
+//! parameters: funding values, the committed timeout height and timeout
+//! split, and per-close mutual splits. The kernel context tracks the
+//! reference height, so timeout gating is exercised at whatever heights
+//! the generator lands on rather than at two pinned constants.
 
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
@@ -23,6 +20,7 @@
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -30,130 +28,150 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Parties, Payout, Proof, ProtocolCode, Sig, State, Terms, Tx,
+    Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
-use support::{FAKE_VERIFIER, FixedStore, party_one, payouts_two};
-
-const COIN_SLOTS: usize = 6;
-const EDGE_SLOTS: usize = 2;
+use support::{
+    FAKE_VERIFIER, coin_id, list,
+    map_store::{MapStore, map_state},
+    open_tx, placeholder_mutual,
+};
 
 const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 const PARTIES: Parties = Parties::new(MAKER, TAKER);
 const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
-const TIMEOUT: BlockHeight = BlockHeight::new(2);
-const CONTEXT: Context = Context::new(
-    BlockHeight::new(1),
-    BlockHash::from_bytes([0; BlockHash::LENGTH]),
-);
-const TIMEOUT_CONTEXT: Context =
-    Context::new(TIMEOUT, BlockHash::from_bytes([0; BlockHash::LENGTH]));
+const MAKER_COIN: CoinId = coin_id(1);
+const TAKER_COIN: CoinId = coin_id(2);
 
-const MAKER_COIN: CoinId = CoinId::from_bytes([1; CoinId::LENGTH]);
-const TAKER_COIN: CoinId = CoinId::from_bytes([2; CoinId::LENGTH]);
-const MAKER_VALUE: u64 = 10;
-const TAKER_VALUE: u64 = 5;
-const MAKER_PAYOUT: u64 = 7;
-const TAKER_PAYOUT: u64 = 8;
+/// Scenario parameters drawn once per proptest case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Params {
+    maker_value: u64,
+    taker_value: u64,
+    /// Committed timeout height; opens happen strictly below it.
+    timeout: u64,
+    /// Maker's share of the committed timeout payouts.
+    timeout_maker_pay: u64,
+}
 
-const MAKER_SEED: Genesis = Genesis::coin(MAKER_COIN, MAKER, MAKER_VALUE);
-const TAKER_SEED: Genesis = Genesis::coin(TAKER_COIN, TAKER, TAKER_VALUE);
+impl Params {
+    const fn total(self) -> u64 {
+        self.maker_value + self.taker_value
+    }
+
+    fn terms(self) -> Terms {
+        Terms::basic(
+            PROTOCOL,
+            PARTIES,
+            BlockHeight::new(self.timeout),
+            payouts(
+                self.timeout_maker_pay,
+                self.total() - self.timeout_maker_pay,
+            ),
+        )
+    }
+
+    fn edge_id(self) -> EdgeId {
+        Tx::edge_id_of(&funding(), &self.terms())
+    }
+}
+
+fn payouts(maker_pay: u64, taker_pay: u64) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    list(&[Payout::new(MAKER, maker_pay), Payout::new(TAKER, taker_pay)])
+}
+
+fn funding() -> Funding {
+    Funding::new(list(&[MAKER_COIN]), list(&[TAKER_COIN]))
+}
+
+const fn context_at(height: u64) -> Context {
+    Context::new(
+        BlockHeight::new(height),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    )
+}
+
+fn open_op(params: Params) -> Tx {
+    open_tx(funding(), params.terms(), MAKER, TAKER)
+}
+
+fn timeout_close(params: Params) -> Tx {
+    let outputs = payouts(
+        params.timeout_maker_pay,
+        params.total() - params.timeout_maker_pay,
+    );
+    Tx::close(params.edge_id(), Proof::timeout(params.terms()), outputs)
+}
+
+fn mutual_close(params: Params, maker_pay: u64) -> Tx {
+    let edge = params.edge_id();
+    let outputs = payouts(maker_pay, params.total() - maker_pay);
+    let proof = placeholder_mutual(edge, params.terms().hash(), &outputs, MAKER, TAKER);
+    Tx::close(edge, proof, outputs)
+}
 
 // Reference model -----------------------------------------------------------
 
 /// Live state, no fees, no signatures. The reference assumes every operation
 /// it accepts the kernel will also accept; the kernel acceptance set is a
 /// strict subset (proof verification, fee math, etc.). When the reference
-/// applies a transition, the kernel must reach byte-identical live state.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+/// applies a transition, the kernel must reach the identical live state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RefState {
-    coins: BTreeMap<CoinId, RefCoin>,
-    edges: BTreeMap<EdgeId, RefEdge>,
+    params: Params,
+    coins: BTreeMap<CoinId, (Key, u64)>,
+    /// Locked value while the edge is live.
+    edge: Option<u64>,
     height: u64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct RefCoin {
-    owner: Key,
-    value: u64,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct RefEdge {
-    value: u64,
-}
-
 impl RefState {
-    fn genesis() -> Self {
+    fn genesis(params: Params) -> Self {
         let mut coins = BTreeMap::new();
-        coins.insert(
-            MAKER_COIN,
-            RefCoin {
-                owner: MAKER,
-                value: MAKER_VALUE,
-            },
-        );
-        coins.insert(
-            TAKER_COIN,
-            RefCoin {
-                owner: TAKER,
-                value: TAKER_VALUE,
-            },
-        );
+        coins.insert(MAKER_COIN, (MAKER, params.maker_value));
+        coins.insert(TAKER_COIN, (TAKER, params.taker_value));
         Self {
+            params,
             coins,
-            edges: BTreeMap::new(),
+            edge: None,
             height: 1,
+        }
+    }
+
+    fn funding_live(&self) -> bool {
+        self.coins.contains_key(&MAKER_COIN) && self.coins.contains_key(&TAKER_COIN)
+    }
+
+    fn close_into(&mut self, maker_pay: u64) {
+        let edge = self.params.edge_id();
+        self.edge = None;
+        for (index, payout) in payouts(maker_pay, self.params.total() - maker_pay)
+            .iter()
+            .enumerate()
+        {
+            self.coins
+                .insert(payout.id(edge, index), (payout.owner(), payout.value()));
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum Transition {
-    /// Open the canonical full-funded edge (`MAKER_COIN`, `TAKER_COIN`) with
-    /// the canonical timeout split as terms. Disabled once the edge is open.
-    OpenFullEdge,
-    /// Resolve the open edge with the canonical timeout payouts. Picks
-    /// `Timeout` so the path requires no signatures and works in any feature
-    /// config.
-    ResolveTimeout,
-    /// Advance height. Reaching `TIMEOUT` enables the resolve.
+    /// Lock both genesis coins under the drawn terms. Requires the
+    /// committed timeout to still be in the future.
+    Open,
+    /// Resolve at the committed timeout split; height must have reached
+    /// the timeout.
+    CloseTimeout,
+    /// Cooperative close at an arbitrary conserving split, before the
+    /// timeout.
+    CloseMutual {
+        maker_pay: u64,
+    },
     Tick,
-}
-
-fn terms() -> Terms {
-    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, canonical_payouts())
-}
-
-const fn canonical_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
-    payouts_two(MAKER, MAKER_PAYOUT, TAKER, TAKER_PAYOUT)
-}
-
-const fn full_funding() -> Funding {
-    Funding::new(party_one(MAKER_COIN), party_one(TAKER_COIN))
-}
-
-fn full_open() -> Tx {
-    let funding = full_funding();
-    let terms = terms();
-    let hash = Tx::open_hash(&funding, &terms);
-    Tx::open(
-        funding,
-        terms,
-        Sig::placeholder(MAKER, hash),
-        Sig::placeholder(TAKER, hash),
-    )
-}
-
-fn full_edge_id() -> EdgeId {
-    Tx::edge_id_of(&full_funding(), &terms())
-}
-
-fn timeout_resolve() -> Tx {
-    Tx::close(full_edge_id(), Proof::timeout(terms()), canonical_payouts())
 }
 
 struct L1Reference;
@@ -163,88 +181,74 @@ impl ReferenceStateMachine for L1Reference {
     type Transition = Transition;
 
     fn init_state() -> BoxedStrategy<Self::State> {
-        Just(RefState::genesis()).boxed()
+        (0..=100_u64, 0..=100_u64, 2..=6_u64, 0..=201_u64)
+            .prop_map(|(maker_value, taker_value, timeout, split_seed)| {
+                let params = Params {
+                    maker_value,
+                    taker_value,
+                    timeout,
+                    timeout_maker_pay: split_seed % (maker_value + taker_value + 1),
+                };
+                RefState::genesis(params)
+            })
+            .boxed()
     }
 
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
-        let edge = full_edge_id();
-        let edge_open = state.edges.contains_key(&edge);
-        let funding_present =
-            state.coins.contains_key(&MAKER_COIN) && state.coins.contains_key(&TAKER_COIN);
+        let tick = || Just(Transition::Tick).boxed();
+        let open = if state.funding_live() && state.height < state.params.timeout {
+            Just(Transition::Open).boxed()
+        } else {
+            tick()
+        };
+        let timeout = if state.edge.is_some() && state.height >= state.params.timeout {
+            Just(Transition::CloseTimeout).boxed()
+        } else {
+            tick()
+        };
+        let mutual = if state.edge.is_some() && state.height < state.params.timeout {
+            (0..=state.params.total())
+                .prop_map(|maker_pay| Transition::CloseMutual { maker_pay })
+                .boxed()
+        } else {
+            tick()
+        };
 
-        // Each branch is gated on whether its precondition holds. Branches
-        // contribute equal weight; proptest filters via `preconditions_met`.
-        prop_oneof![
-            Just(Transition::Tick),
-            Just(if funding_present && !edge_open {
-                Transition::OpenFullEdge
-            } else {
-                Transition::Tick
-            }),
-            Just(if edge_open && state.height >= TIMEOUT.get() {
-                Transition::ResolveTimeout
-            } else {
-                Transition::Tick
-            },),
-        ]
-        .boxed()
+        prop_oneof![1 => tick(), 2 => open, 2 => timeout, 3 => mutual].boxed()
     }
 
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
         match transition {
-            Transition::OpenFullEdge => {
+            Transition::Open => {
                 let maker = state
                     .coins
                     .remove(&MAKER_COIN)
-                    .expect("OpenFullEdge precondition: maker coin present");
+                    .expect("Open precondition: maker coin present");
                 let taker = state
                     .coins
                     .remove(&TAKER_COIN)
-                    .expect("OpenFullEdge precondition: taker coin present");
-                let edge = full_edge_id();
-                state.edges.insert(
-                    edge,
-                    RefEdge {
-                        value: maker.value + taker.value,
-                    },
-                );
+                    .expect("Open precondition: taker coin present");
+                state.edge = Some(maker.1 + taker.1);
             }
-            Transition::ResolveTimeout => {
-                let edge = full_edge_id();
-                state
-                    .edges
-                    .remove(&edge)
-                    .expect("ResolveTimeout precondition: edge open");
-                let outputs = canonical_payouts();
-                for (index, payout) in outputs.iter().enumerate() {
-                    let id = payout.id(edge, index);
-                    state.coins.insert(
-                        id,
-                        RefCoin {
-                            owner: payout.owner(),
-                            value: payout.value(),
-                        },
-                    );
-                }
-            }
-            Transition::Tick => {
-                state.height += 1;
-            }
+            Transition::CloseTimeout => state.close_into(state.params.timeout_maker_pay),
+            Transition::CloseMutual { maker_pay } => state.close_into(*maker_pay),
+            Transition::Tick => state.height += 1,
         }
         state
     }
 
     fn preconditions(state: &Self::State, transition: &Self::Transition) -> bool {
         match transition {
-            Transition::OpenFullEdge => {
-                let edge = full_edge_id();
-                !state.edges.contains_key(&edge)
-                    && state.coins.contains_key(&MAKER_COIN)
-                    && state.coins.contains_key(&TAKER_COIN)
+            Transition::Open => {
+                state.edge.is_none() && state.funding_live() && state.height < state.params.timeout
             }
-            Transition::ResolveTimeout => {
-                let edge = full_edge_id();
-                state.edges.contains_key(&edge) && state.height >= TIMEOUT.get()
+            Transition::CloseTimeout => {
+                state.edge.is_some() && state.height >= state.params.timeout
+            }
+            Transition::CloseMutual { maker_pay } => {
+                state.edge.is_some()
+                    && state.height < state.params.timeout
+                    && *maker_pay <= state.params.total()
             }
             Transition::Tick => true,
         }
@@ -253,57 +257,45 @@ impl ReferenceStateMachine for L1Reference {
 
 // SUT -----------------------------------------------------------------------
 
-type Store = FixedStore<COIN_SLOTS, EDGE_SLOTS>;
-
-struct Sut {
-    state: State<Store>,
-    /// Tracks block height under proptest control. The kernel reads height
-    /// from each `Context`, so we synthesize the right context for resolves.
-    height: u64,
-}
-
 struct L1Test;
 
 impl StateMachineTest for L1Test {
-    type SystemUnderTest = Sut;
+    type SystemUnderTest = State<MapStore>;
     type Reference = L1Reference;
 
     fn init_test(
-        _ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+        ref_state: &<Self::Reference as ReferenceStateMachine>::State,
     ) -> Self::SystemUnderTest {
-        let outputs = canonical_payouts();
-        let maker_out = outputs.as_slice()[0].id(full_edge_id(), 0);
-        let taker_out = outputs.as_slice()[1].id(full_edge_id(), 1);
-        let store = FixedStore::empty(
-            [
-                MAKER_COIN, TAKER_COIN, maker_out, taker_out, MAKER_COIN, TAKER_COIN,
-            ],
-            [full_edge_id(), full_edge_id()],
-        );
-        let state = State::genesis(store, &[MAKER_SEED, TAKER_SEED])
-            .expect("genesis seeded against the canonical store");
-        Sut { state, height: 1 }
+        map_state([
+            Genesis::coin(MAKER_COIN, MAKER, ref_state.params.maker_value),
+            Genesis::coin(TAKER_COIN, TAKER, ref_state.params.taker_value),
+        ])
     }
 
     fn apply(
         mut sut: Self::SystemUnderTest,
-        _ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+        ref_state: &<Self::Reference as ReferenceStateMachine>::State,
         transition: <Self::Reference as ReferenceStateMachine>::Transition,
     ) -> Self::SystemUnderTest {
+        // `ref_state` is the post-transition state; only `Tick` changes
+        // height, so for the kernel-visible transitions the post-height
+        // equals the height the operation must apply at.
+        let params = ref_state.params;
+        let context = context_at(ref_state.height);
         match transition {
-            Transition::OpenFullEdge => {
-                sut.state
-                    .apply(CONTEXT, &FAKE_VERIFIER, &full_open())
-                    .expect("kernel rejected OpenFullEdge that ref accepted");
+            Transition::Open => {
+                sut.apply(context, &FAKE_VERIFIER, &open_op(params))
+                    .expect("kernel rejected Open that ref accepted");
             }
-            Transition::ResolveTimeout => {
-                sut.state
-                    .apply(TIMEOUT_CONTEXT, &FAKE_VERIFIER, &timeout_resolve())
-                    .expect("kernel rejected ResolveTimeout that ref accepted");
+            Transition::CloseTimeout => {
+                sut.apply(context, &FAKE_VERIFIER, &timeout_close(params))
+                    .expect("kernel rejected CloseTimeout that ref accepted");
             }
-            Transition::Tick => {
-                sut.height += 1;
+            Transition::CloseMutual { maker_pay } => {
+                sut.apply(context, &FAKE_VERIFIER, &mutual_close(params, maker_pay))
+                    .expect("kernel rejected CloseMutual that ref accepted");
             }
+            Transition::Tick => {}
         }
         sut
     }
@@ -312,25 +304,27 @@ impl StateMachineTest for L1Test {
         sut: &Self::SystemUnderTest,
         ref_state: &<Self::Reference as ReferenceStateMachine>::State,
     ) {
-        // Live coin set + values match.
-        assert_eq!(
-            sut.height, ref_state.height,
-            "height: kernel {} vs ref {}",
-            sut.height, ref_state.height,
-        );
-        for (id, ref_coin) in &ref_state.coins {
-            let actual = sut.state.store().coin(*id).unwrap_or_else(|| {
-                panic!("kernel missing coin {id:?} that ref expects {ref_coin:?}")
-            });
-            assert_eq!(actual.owner(), ref_coin.owner, "coin {id:?} owner");
-            assert_eq!(actual.value(), ref_coin.value, "coin {id:?} value");
+        // Exact live coin set: same cardinality, same (owner, value) per id.
+        let store = sut.store();
+        assert_eq!(store.coin_count(), ref_state.coins.len(), "live coin set");
+        for (id, (owner, value)) in &ref_state.coins {
+            let coin = store
+                .coin(*id)
+                .unwrap_or_else(|| panic!("kernel missing coin {id:?}"));
+            assert_eq!(coin.owner(), *owner, "coin {id:?} owner");
+            assert_eq!(coin.value(), *value, "coin {id:?} value");
         }
-        // Live edge set + values match.
-        for (id, ref_edge) in &ref_state.edges {
-            let actual = sut.state.store().edge(*id).unwrap_or_else(|| {
-                panic!("kernel missing edge {id:?} that ref expects {ref_edge:?}")
-            });
-            assert_eq!(actual.value(), ref_edge.value, "edge {id:?} value");
+
+        // Exact live edge set (zero or one).
+        match ref_state.edge {
+            Some(value) => {
+                let edge = store
+                    .edge(ref_state.params.edge_id())
+                    .expect("kernel missing the live edge");
+                assert_eq!(edge.value(), value, "edge locked value");
+                assert_eq!(store.edge_count(), 1, "live edge set");
+            }
+            None => assert_eq!(store.edge_count(), 0, "live edge set"),
         }
     }
 }

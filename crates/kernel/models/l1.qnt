@@ -148,6 +148,36 @@ module l1 {
     lastEvent' = EdgeClosedEvent(e),
   }
 
+  // A rejected open attempt. Enabled exactly when `openEdge` is disabled;
+  // live state is untouched and the attempt is recorded in `lastInput`
+  // so the Rust ITF runner can drive the kernel with the same input and
+  // assert it is rejected with the store unchanged (the specific error
+  // is unit-test territory; the model records no rejection reason).
+  action rejectOpen(e, asMaker, asTaker) = all {
+    not(canOpen(e, asMaker, asTaker)),
+    coins' = coins,
+    edges' = edges,
+    liveCoins' = liveCoins,
+    liveEdges' = liveEdges,
+    height' = height,
+    openAuth' = openAuth,
+    lastInput' = RejectedOpenInput({ edge: e, asMaker: asMaker, asTaker: asTaker }),
+    lastEvent' = NoEvent,
+  }
+
+  // A rejected close attempt: the dual of `rejectOpen` for `closeEdge`.
+  action rejectClose(e, p, makerPay, takerPay) = all {
+    not(canClose(e, p, makerPay, takerPay)),
+    coins' = coins,
+    edges' = edges,
+    liveCoins' = liveCoins,
+    liveEdges' = liveEdges,
+    height' = height,
+    openAuth' = openAuth,
+    lastInput' = RejectedCloseInput({ edge: e, proof: p, makerPay: makerPay, takerPay: takerPay }),
+    lastEvent' = NoEvent,
+  }
+
   // Advance height. Required for Timeout proofs to become admissible.
   action tick = all {
     coins' = coins,
@@ -279,11 +309,15 @@ module l1 {
   run earlyTimeoutRejectedTest =
     init
       .then(openEdge(Edge1, Maker, Taker))
+      .then(rejectClose(Edge1, Timeout, MakerPayout, TakerPayout))
       .expect(not(canClose(Edge1, Timeout, MakerPayout, TakerPayout)))
 
   // Negative trace: each unauthorized open shape is disabled from genesis.
   run unauthorizedOpenRejectedTest =
     init
+      .then(rejectOpen(Edge1, Adversary, Adversary))
+      .then(rejectOpen(Edge1, Adversary, Taker))
+      .then(rejectOpen(Edge1, Maker, Adversary))
       .expect(not(canOpen(Edge1, Adversary, Adversary))
         and not(canOpen(Edge1, Adversary, Taker))
         and not(canOpen(Edge1, Maker, Adversary)))
@@ -294,6 +328,9 @@ module l1 {
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
+      .then(rejectOpen(Edge2, Adversary, Adversary))
+      .then(rejectOpen(Edge2, Adversary, Taker))
+      .then(rejectOpen(Edge2, Maker, Adversary))
       .expect(canOpen(Edge2, Maker, Taker)
         and not(canOpen(Edge2, Adversary, Adversary))
         and not(canOpen(Edge2, Adversary, Taker))
@@ -302,6 +339,7 @@ module l1 {
   // Negative trace: Edge2 cannot open until Edge1's payout coins exist.
   run edge2BeforeFundingRejectedTest =
     init
+      .then(rejectOpen(Edge2, Maker, Taker))
       .expect(not(canOpen(Edge2, Maker, Taker)))
 
   // Negative trace: a value-conserving but non-canonical payout split is
@@ -309,6 +347,8 @@ module l1 {
   run nonCanonicalCloseRejectedTest =
     init
       .then(openEdge(Edge1, Maker, Taker))
+      .then(rejectClose(Edge1, Mutual, EdgeValue, 0))
+      .then(rejectClose(Edge1, Violation, EdgeValue, 0))
       .expect(not(canClose(Edge1, Mutual, EdgeValue, 0))
         and not(canClose(Edge1, Violation, EdgeValue, 0)))
 
@@ -318,6 +358,7 @@ module l1 {
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
+      .then(rejectClose(Edge1, Timeout, EdgeValue, 0))
       .expect(height >= TimeoutHeight
         and not(canClose(Edge1, Timeout, EdgeValue, 0)))
 
@@ -327,6 +368,7 @@ module l1 {
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(closeEdge(Edge1, Mutual, MakerPayout, TakerPayout))
+      .then(rejectOpen(Edge1, Maker, Taker))
       .expect(not(canOpen(Edge1, Maker, Taker)))
 
   // Timeout closes the edge after paid lifetime expires. With this small model's
@@ -337,6 +379,7 @@ module l1 {
       .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
       .then(closeEdge(Edge1, Timeout, MakerPayout, TakerPayout))
+      .then(rejectOpen(Edge2, Maker, Taker))
       .expect(valueConserved
         and atMostOneLiveEdge
         and noNegativeValue
@@ -349,6 +392,8 @@ module l1 {
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
+      .then(rejectClose(Edge1, Mutual, MakerPayout, TakerPayout))
+      .then(rejectClose(Edge1, Violation, MakerPayout, TakerPayout))
       .expect(height >= TimeoutHeight
         and not(canClose(Edge1, Mutual, MakerPayout, TakerPayout))
         and not(canClose(Edge1, Violation, MakerPayout, TakerPayout)))
@@ -372,6 +417,7 @@ module l1 {
       .then(tick)
       .then(idle)
       .then(tick)
+      .then(rejectOpen(Edge1, Maker, Taker))
       .expect(valueConserved
         and noNegativeValue
         and height == 3

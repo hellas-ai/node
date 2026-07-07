@@ -1,9 +1,14 @@
 //! Channel open/close tests.
+//!
+//! Scenario constants (keys, coin ids, values, timeout, canonical terms)
+//! come from `support::l1`; this root adds the fee-bearing contexts,
+//! terms variants, and fixed-slot stores the lifecycle tests need.
 
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 mod support;
 
@@ -16,19 +21,22 @@ mod op;
 #[path = "channel/open.rs"]
 mod open;
 
-use support::{FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, state};
+use support::l1::{
+    self, CONTEXT, EdgeKey, MAKER, MAKER_ID as MAKER_COIN, OpenKey, PARTIES, PROTOCOL, TAKER,
+    TAKER_ID as TAKER_COIN, TIMEOUT, TIMEOUT_CONTEXT,
+};
+use support::{
+    FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, list,
+    open_tx as open_tx_with, placeholder_mutual, placeholder_seal, state,
+};
 
 use hellas_kernel::{
     ApplyError, Block, BlockHash, BlockHeight, CloseKind, CoinId, Context, Cost, EdgeId, Event,
     EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
     InvalidProofReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    PayloadHash, Payout, Proof, ProtocolCode, Seal, Sig, State, Terms, TermsHash, Tx, View,
+    PayloadHash, Payout, Proof, Seal, Sig, State, Terms, TermsHash, Tx, View,
 };
 
-const CONTEXT: Context = Context::new(
-    BlockHeight::new(1),
-    BlockHash::from_bytes([0; BlockHash::LENGTH]),
-);
 const FEE_CONTEXT: Context = Context::with_fees(
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
@@ -39,41 +47,24 @@ const RESOURCE_CONTEXT: Context = Context::with_fees(
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
 );
-const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const RESOURCE_TIMEOUT_CONTEXT: Context = Context::with_fees(
     TIMEOUT,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
 );
-const EARLY_CONTEXT: Context = Context::new(
-    BlockHeight::new(1),
-    BlockHash::from_bytes([0; BlockHash::LENGTH]),
-);
-const TIMEOUT_CONTEXT: Context =
-    Context::new(TIMEOUT, BlockHash::from_bytes([0; BlockHash::LENGTH]));
 
-const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
-const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
-const PARTIES: Parties = Parties::new(MAKER, TAKER);
-const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
-const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
-
-const MAKER_COIN: CoinId = coin_id(1);
-const TAKER_COIN: CoinId = coin_id(2);
 const EXTRA_COIN: CoinId = coin_id(7);
-
-const TIMEOUT_OUTPUTS: List<Payout, MAX_EDGE_OUTPUTS> =
-    payouts_const(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-fn basic_terms() -> Terms {
-    Terms::basic(PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
-}
-
-fn other_terms_value() -> Terms {
-    Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, TIMEOUT_OUTPUTS)
-}
 
 const MAKER_SEED: Genesis = Genesis::coin(MAKER_COIN, MAKER, 10);
 const TAKER_SEED: Genesis = Genesis::coin(TAKER_COIN, TAKER, 5);
+
+fn basic_terms() -> Terms {
+    l1::terms()
+}
+
+fn other_terms_value() -> Terms {
+    l1::other_terms()
+}
 
 fn terms() -> TermsHash {
     basic_terms().hash()
@@ -107,11 +98,7 @@ fn other_proof() -> Proof {
 }
 
 fn mutual_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::mutual(maker_sig(input, outputs), taker_sig(input, outputs))
-}
-
-fn maker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
-    Sig::placeholder(MAKER, mutual_hash(input, outputs))
+    placeholder_mutual(input, terms(), outputs, MAKER, TAKER)
 }
 
 fn taker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
@@ -119,51 +106,43 @@ fn taker_sig(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Sig {
 }
 
 fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> PayloadHash {
-    close_hash(CloseKind::Mutual, input, outputs)
+    support::mutual_hash(input, terms(), outputs)
 }
 
 fn violation_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::violation(basic_terms(), seal(CloseKind::Violation, input, outputs))
+    Proof::violation(
+        basic_terms(),
+        placeholder_seal(input, &basic_terms(), outputs),
+    )
 }
 
-fn seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    Seal::placeholder(PROTOCOL, kind, close_hash(kind, input, outputs))
-}
-
+/// Seal bound to the canonical payload of the *other* terms; rejected as
+/// `TermsMismatch` (proof terms) or `BadSeal` (payload binding) depending
+/// on which side the test corrupts.
 fn other_seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    Seal::placeholder(OTHER_PROTOCOL, kind, other_close_hash(kind, input, outputs))
-}
-
-fn close_hash(
-    kind: CloseKind,
-    input: EdgeId,
-    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> PayloadHash {
-    Tx::payload_hash(input, kind, terms(), outputs)
-}
-
-fn other_close_hash(
-    kind: CloseKind,
-    input: EdgeId,
-    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> PayloadHash {
-    Tx::payload_hash(input, kind, other_terms(), outputs)
+    let hash = Tx::payload_hash(input, kind, other_terms(), outputs);
+    Seal::placeholder(l1::OTHER_PROTOCOL, kind, hash)
 }
 
 fn edge() -> EdgeId {
-    Tx::edge_id_of(&funding(MAKER_COIN, TAKER_COIN), &basic_terms())
+    l1::edge_id(EdgeKey::First)
 }
 
 fn maker_out() -> CoinId {
-    nth(&output_ids(), 0)
+    l1::maker_out(EdgeKey::First)
 }
 
 fn taker_out() -> CoinId {
-    nth(&output_ids(), 1)
+    l1::taker_out(EdgeKey::First)
 }
 
 fn extra_out() -> CoinId {
-    nth(&output_ids3_values(), 2)
+    let outputs = payouts3(
+        Payout::new(MAKER, 6),
+        Payout::new(TAKER, 5),
+        Payout::new(MAKER, 4),
+    );
+    nth(&Tx::close_output_ids(edge(), &outputs), 2)
 }
 
 fn funded_state() -> State<FixedStore<6, 1>> {
@@ -181,7 +160,7 @@ fn open_state() -> State<FixedStore<6, 1>> {
 }
 
 fn open_op() -> Tx {
-    open_tx(funding(MAKER_COIN, TAKER_COIN), basic_terms())
+    l1::open_case(OpenKey::Full)
 }
 
 fn open_edge_id(open: &Tx) -> EdgeId {
@@ -192,20 +171,10 @@ fn open_edge_id(open: &Tx) -> EdgeId {
 }
 
 /// Builds a `Tx::Open` with canonical placeholder open signatures for
-/// `(MAKER, TAKER)`. Every channel test that constructs an open consumes
-/// coins owned by `MAKER`/`TAKER` (the parties named in `basic_terms`), and
-/// `FAKE_VERIFIER` accepts placeholder sigs for any key/hash — so this
-/// helper covers every honest-open test path. Adversarial tests
-/// (`open_rejects_*` etc.) construct signatures directly.
+/// `(MAKER, TAKER)`. Adversarial tests use `open_tx_with` and pass the
+/// keys they claim.
 fn open_tx(funding: Funding, terms: Terms) -> Tx {
     open_tx_with(funding, terms, MAKER, TAKER)
-}
-
-fn open_tx_with(funding: Funding, terms: Terms, maker_key: Key, taker_key: Key) -> Tx {
-    let hash = Tx::open_hash(&funding, &terms);
-    let maker_sig = Sig::placeholder(maker_key, hash);
-    let taker_sig = Sig::placeholder(taker_key, hash);
-    Tx::open(funding, terms, maker_sig, taker_sig)
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {
@@ -213,42 +182,23 @@ fn funding(maker: CoinId, taker: CoinId) -> Funding {
 }
 
 fn maker2_funding(first: CoinId, second: CoinId, taker: CoinId) -> Funding {
-    Funding::new(party2(first, second), party1(taker))
+    Funding::new(list(&[first, second]), party1(taker))
 }
 
 fn empty_party() -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(inputs) = List::new([MAKER_COIN; MAX_PARTY_INPUTS], 0) else {
-        panic!("invalid test party list");
-    };
-    inputs
+    list(&[])
 }
 
 fn party1(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(inputs) = List::new([id; MAX_PARTY_INPUTS], 1) else {
-        panic!("invalid test party list");
-    };
-    inputs
-}
-
-fn party2(first: CoinId, second: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
-    let Some(inputs) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test party list");
-    };
-    inputs
+    list(&[id])
 }
 
 fn payouts(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let Some(outputs) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test payout list");
-    };
-    outputs
+    list(&[first, second])
 }
 
 fn payouts3(first: Payout, second: Payout, third: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let Some(outputs) = List::new([first, second, third, first], 3) else {
-        panic!("invalid test payout list");
-    };
-    outputs
+    list(&[first, second, third])
 }
 
 const fn payouts4() -> List<Payout, MAX_EDGE_OUTPUTS> {
@@ -260,72 +210,28 @@ const fn payouts4() -> List<Payout, MAX_EDGE_OUTPUTS> {
     ])
 }
 
-const fn payouts_const(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let Some(outputs) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test payout list");
-    };
-    outputs
-}
-
 fn no_payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
-    let payout = Payout::new(MAKER, 0);
-    let Some(outputs) = List::new([payout; MAX_EDGE_OUTPUTS], 0) else {
-        panic!("invalid test payout list");
-    };
-    outputs
+    list(&[])
 }
 
 fn input_ids0() -> List<CoinId, MAX_EDGE_INPUTS> {
-    let Some(ids) = List::new([MAKER_COIN; MAX_EDGE_INPUTS], 0) else {
-        panic!("invalid test input id list");
-    };
-    ids
-}
-
-fn input_ids2(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
-    let Some(ids) = List::new([first, second, first, first, first, first, first, first], 2) else {
-        panic!("invalid test input id list");
-    };
-    ids
+    list(&[])
 }
 
 fn input_ids1(id: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
-    let Some(ids) = List::new([id; MAX_EDGE_INPUTS], 1) else {
-        panic!("invalid test input id list");
-    };
-    ids
+    list(&[id])
+}
+
+fn input_ids2(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
+    list(&[first, second])
 }
 
 fn input_ids3(first: CoinId, second: CoinId, third: CoinId) -> List<CoinId, MAX_EDGE_INPUTS> {
-    let Some(ids) = List::new([first, second, third, first, first, first, first, first], 3) else {
-        panic!("invalid test input id list");
-    };
-    ids
+    list(&[first, second, third])
 }
 
 fn output_ids0() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    let Some(ids) = List::new([maker_out(); MAX_EDGE_OUTPUTS], 0) else {
-        panic!("invalid test output id list");
-    };
-    ids
-}
-
-fn output_ids() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Tx::close_output_ids(
-        edge(),
-        &payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8)),
-    )
-}
-
-fn output_ids3_values() -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    Tx::close_output_ids(
-        edge(),
-        &payouts3(
-            Payout::new(MAKER, 6),
-            Payout::new(TAKER, 5),
-            Payout::new(MAKER, 4),
-        ),
-    )
+    list(&[])
 }
 
 fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
@@ -333,17 +239,11 @@ fn nth<const N: usize>(ids: &List<CoinId, N>, index: usize) -> CoinId {
 }
 
 fn output_ids2(first: CoinId, second: CoinId) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    let Some(ids) = List::new([first, second, first, first], 2) else {
-        panic!("invalid test output id list");
-    };
-    ids
+    list(&[first, second])
 }
 
 fn output_ids3(first: CoinId, second: CoinId, third: CoinId) -> List<CoinId, MAX_EDGE_OUTPUTS> {
-    let Some(ids) = List::new([first, second, third, first], 3) else {
-        panic!("invalid test output id list");
-    };
-    ids
+    list(&[first, second, third])
 }
 
 fn apply<const C: usize, const E: usize>(

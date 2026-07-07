@@ -6,6 +6,7 @@
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 //! ITF fixture replay against concrete Rust state.
 //!
@@ -33,7 +34,10 @@ use itf::Runner as ItfRunner;
 use support::{
     FAKE_VERIFIER, coin_view,
     itf::PartyTag,
-    itf::{CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for},
+    itf::{
+        CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for,
+        rejected_op_for,
+    },
     itf_l1_fees as fee_itf,
     l1::{
         MAKER, MAKER_ID, TAKER, TAKER_ID, TraceState, TraceView, edge_id, edge_value,
@@ -75,6 +79,26 @@ impl ItfRunner for L1Runner {
                     format!("kernel rejected input {:?}: {err:?}", expected.last_input)
                 })?;
                 Ok(Some(event.kind().clone()))
+            }
+            // The model refused this attempt; the kernel must too. Any
+            // `ApplyError` is accepted here: the model records no
+            // rejection reason, so exact error variants are pinned by
+            // the channel unit tests instead. A failing apply is atomic,
+            // and `state_invariant` then checks the kernel's live view
+            // against the model's unchanged state.
+            Input::RejectedOpenInput(_) | Input::RejectedCloseInput(_) => {
+                let op = rejected_op_for(&expected.last_input)
+                    .expect("rejected_op_for returned None for rejected input");
+                let context = context_for_height(expected.height)?;
+                actual
+                    .apply(context, &FAKE_VERIFIER, &op)
+                    .map_or(Ok(None), |event| {
+                        Err(format!(
+                            "kernel accepted rejected input {:?}: {:?}",
+                            expected.last_input,
+                            event.kind(),
+                        ))
+                    })
             }
         }
     }
@@ -221,6 +245,41 @@ impl ItfRunner for L1FeesRunner {
                     format!("kernel rejected l1_fees close {proof:?} for {shape:?}: {err:?}")
                 })?;
                 Ok(Some(event.kind().clone()))
+            }
+            // The model refused this open (e.g. underfunded); the kernel
+            // must too, and `state_invariant` verifies nothing moved.
+            fee_itf::Input::RejectedOpenInput(shape_tag) => {
+                let shape = shape_tag.to_model();
+                let op = fee_model::open(shape);
+                let context = fee_model::context(expected.height, fee_model::fees_for_open(shape));
+                actual
+                    .apply(context, &FAKE_VERIFIER, &op)
+                    .map_or(Ok(None), |event| {
+                        Err(format!(
+                            "kernel accepted rejected l1_fees open {shape:?}: {:?}",
+                            event.kind(),
+                        ))
+                    })
+            }
+            // The model refused this close (e.g. pre-expiry proof after
+            // the timeout); the kernel must reject the same fully-formed
+            // close under the same fee schedule.
+            fee_itf::Input::RejectedCloseInput(proof_tag) => {
+                let proof = proof_tag.to_model();
+                let shape = expected_shape(expected)?;
+                let op = fee_model::close(shape, proof);
+                let context = fee_model::context(
+                    expected.height,
+                    fees_for_close(expected.current_close_fee)?,
+                );
+                actual
+                    .apply(context, &FAKE_VERIFIER, &op)
+                    .map_or(Ok(None), |event| {
+                        Err(format!(
+                            "kernel accepted rejected l1_fees close {proof:?} for {shape:?}: {:?}",
+                            event.kind(),
+                        ))
+                    })
             }
         }
     }

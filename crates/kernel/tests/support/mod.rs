@@ -12,9 +12,10 @@ pub(crate) mod l1_fees;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
-    Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult,
-    Key, Parties, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store,
-    TermsHash, Tx, View,
+    Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
+    KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, Proof, Seal,
+    SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, Terms, TermsHash, Tx,
+    View,
 };
 
 /// Forgeable verifier used by every test in this crate. Accepts the
@@ -257,31 +258,69 @@ pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, BlockHeight, Parties, Te
     )
 }
 
-/// One-coin party funding: a `MAX_PARTY_INPUTS`-sized list with `id` in
-/// position 0 and a single live entry. The fill value is `id` itself, which
-/// is harmless because `as_slice()` only exposes the first `len` entries.
-pub(crate) const fn party_one(
-    id: CoinId,
-) -> hellas_kernel::List<CoinId, { hellas_kernel::MAX_PARTY_INPUTS }> {
-    let Some(list) = hellas_kernel::List::new([id; hellas_kernel::MAX_PARTY_INPUTS], 1) else {
-        panic!("one-coin party fits");
+/// Bounded list literal: the given items live, remaining slots defaulted.
+/// The capacity `N` is inferred from the call site.
+pub(crate) fn list<T: Copy + Default, const N: usize>(items: &[T]) -> List<T, N> {
+    let mut buf = [T::default(); N];
+    buf[..items.len()].copy_from_slice(items);
+    let Some(list) = List::new(buf, items.len()) else {
+        panic!("test list exceeds capacity");
     };
     list
 }
 
-/// Bilateral payouts with explicit values: `(maker_key, maker_value)` at
-/// position 0, `(taker_key, taker_value)` at position 1, len = 2.
-pub(crate) const fn payouts_two(
-    maker: Key,
-    maker_value: u64,
-    taker: Key,
-    taker_value: u64,
-) -> hellas_kernel::List<hellas_kernel::Payout, { hellas_kernel::MAX_EDGE_OUTPUTS }> {
-    let payout = hellas_kernel::Payout::new(maker, maker_value);
-    let mut buf = [payout; hellas_kernel::MAX_EDGE_OUTPUTS];
-    buf[1] = hellas_kernel::Payout::new(taker, taker_value);
-    let Some(list) = hellas_kernel::List::new(buf, 2) else {
-        panic!("two payouts fit");
+/// Payout list literal from `(owner, value)` pairs.
+pub(crate) fn payouts(entries: &[(Key, u64)]) -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let mut buf = [Payout::default(); MAX_EDGE_OUTPUTS];
+    for (slot, (owner, value)) in buf.iter_mut().zip(entries) {
+        *slot = Payout::new(*owner, *value);
+    }
+    let Some(list) = List::new(buf, entries.len()) else {
+        panic!("test payouts exceed capacity");
     };
     list
+}
+
+/// `Tx::Open` signed with the placeholder sigs `FAKE_VERIFIER` accepts,
+/// keyed to `maker`/`taker`. Adversarial tests pass mismatching keys.
+pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
+    let hash = Tx::open_hash(&funding, &terms);
+    Tx::open(
+        funding,
+        terms,
+        Sig::placeholder(maker, hash),
+        Sig::placeholder(taker, hash),
+    )
+}
+
+/// Placeholder-signed mutual close proof over the canonical close payload.
+pub(crate) fn placeholder_mutual(
+    input: EdgeId,
+    terms: TermsHash,
+    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
+    maker: Key,
+    taker: Key,
+) -> Proof {
+    let hash = mutual_hash(input, terms, outputs);
+    Proof::mutual(Sig::placeholder(maker, hash), Sig::placeholder(taker, hash))
+}
+
+/// Canonical payload hash a mutual close witness signs.
+pub(crate) fn mutual_hash(
+    input: EdgeId,
+    terms: TermsHash,
+    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
+) -> PayloadHash {
+    Tx::payload_hash(input, CloseKind::Mutual, terms, outputs)
+}
+
+/// Placeholder seal bound to the canonical violation close payload, as
+/// `FAKE_VERIFIER` expects.
+pub(crate) fn placeholder_seal(
+    input: EdgeId,
+    terms: &Terms,
+    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
+) -> Seal {
+    let hash = Tx::payload_hash(input, CloseKind::Violation, terms.hash(), outputs);
+    Seal::placeholder(terms.protocol(), CloseKind::Violation, hash)
 }

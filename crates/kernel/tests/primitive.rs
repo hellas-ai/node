@@ -1,5 +1,6 @@
 //! Primitive wrapper tests.
 
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Cost, Decode, DecodeError, EdgeId, Encode, Fees,
     Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Party, Payout, ProtocolCode,

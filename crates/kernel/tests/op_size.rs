@@ -6,6 +6,7 @@
 //! cap rather than equal — bumping the cap deliberately is a one-line
 //! review item, but a 2× regression would break the build.
 
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 use core::mem::size_of;
 use hellas_kernel::{Funding, OpenAuth, Payout, Proof, Tx, WebAuthnAssertion};
 

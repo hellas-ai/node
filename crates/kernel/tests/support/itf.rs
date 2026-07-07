@@ -20,8 +20,8 @@ use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Payout, Proof,
-    ProtocolCode, Seal, Sig, Tx,
+    BlockHash, BlockHeight, CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout,
+    Proof, ProtocolCode, Seal, Sig, Terms, Tx,
 };
 
 use super::l1;
@@ -99,6 +99,8 @@ pub(crate) enum Input {
     NoInput,
     OpenInput(EdgeTag),
     CloseInput(CloseInputBody),
+    RejectedOpenInput(RejectedOpenBody),
+    RejectedCloseInput(CloseInputBody),
     TickInput,
     IdleInput,
 }
@@ -112,6 +114,16 @@ pub(crate) struct CloseInputBody {
     pub(crate) maker_pay: i64,
     #[serde(with = "As::<Integer>")]
     pub(crate) taker_pay: i64,
+}
+
+/// Body of a `RejectedOpenInput`: the edge whose open was attempted plus
+/// the party identities the submitter claimed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectedOpenBody {
+    pub(crate) edge: EdgeTag,
+    pub(crate) as_maker: PartyTag,
+    pub(crate) as_taker: PartyTag,
 }
 
 /// Quint `Event` ADT (abstract event emitted by the action that produced
@@ -143,14 +155,88 @@ pub(crate) fn context_for_height(height: i64) -> Result<Context, String> {
     ))
 }
 
-/// Concrete `Tx` (when the input maps to one). `NoInput`, `TickInput`,
-/// and `IdleInput` produce no kernel work.
+/// Concrete `Tx` (when the input maps to accepted kernel work). `NoInput`,
+/// `TickInput`, and `IdleInput` produce none; rejected inputs are handled
+/// separately by [`rejected_op_for`] so the throughput bench (which shares
+/// this conversion) measures only accepted applies.
 pub(crate) fn op_for(input: &Input) -> Option<Tx> {
     match input {
         Input::OpenInput(tag) => Some(l1::open(edge_key(*tag))),
         Input::CloseInput(body) => Some(close_op(body)),
-        Input::NoInput | Input::TickInput | Input::IdleInput => None,
+        Input::NoInput
+        | Input::TickInput
+        | Input::IdleInput
+        | Input::RejectedOpenInput(_)
+        | Input::RejectedCloseInput(_) => None,
     }
+}
+
+/// Concrete `Tx` for a rejected input; the kernel must refuse it.
+pub(crate) fn rejected_op_for(input: &Input) -> Option<Tx> {
+    match input {
+        Input::RejectedOpenInput(body) => Some(rejected_open_op(*body)),
+        Input::RejectedCloseInput(body) => Some(rejected_close_op(body)),
+        _ => None,
+    }
+}
+
+/// Maps a model party to its concrete settlement key.
+pub(crate) const fn party_key(tag: PartyTag) -> hellas_kernel::Key {
+    match tag {
+        PartyTag::Maker => l1::MAKER,
+        PartyTag::Taker => l1::TAKER,
+        PartyTag::Adversary => l1::ADVERSARY,
+    }
+}
+
+/// Builds the open the model rejected: canonical funding for the edge,
+/// terms naming the *claimed* parties, signed by the claimed keys. When a
+/// claimed party does not own the matching funding coins the kernel must
+/// reject (ownership check); when the funding coins are simply absent it
+/// must reject on lookup.
+fn rejected_open_op(body: RejectedOpenBody) -> Tx {
+    let maker_key = party_key(body.as_maker);
+    let taker_key = party_key(body.as_taker);
+    let terms = Terms::basic(
+        l1::PROTOCOL,
+        Parties::new(maker_key, taker_key),
+        l1::TIMEOUT,
+        l1::payouts_owned(maker_key, taker_key),
+    );
+    super::open_tx(
+        l1::funding_for(edge_key(body.edge)),
+        terms,
+        maker_key,
+        taker_key,
+    )
+}
+
+/// Builds the close the model rejected. Witnesses bind to the *canonical*
+/// split — the only payload the parties abstractly authorized — so a
+/// canonical-split rejection carries valid witnesses (the kernel must
+/// reject on its height guards), while a non-canonical split carries
+/// witnesses that do not match the submitted payouts (the kernel must
+/// reject the witness).
+fn rejected_close_op(body: &CloseInputBody) -> Tx {
+    let edge = edge_key(body.edge);
+    let input = l1::edge_id(edge);
+    let terms = l1::terms();
+    let outputs = l1::payouts_with(
+        u64::try_from(body.maker_pay).expect("negative rejected maker payout"),
+        u64::try_from(body.taker_pay).expect("negative rejected taker payout"),
+    );
+    let canonical = l1::payouts();
+    let proof = match body.proof {
+        ProofTag::Mutual => {
+            super::placeholder_mutual(input, terms.hash(), &canonical, l1::MAKER, l1::TAKER)
+        }
+        ProofTag::Timeout => Proof::timeout(terms),
+        ProofTag::Violation => {
+            let seal = super::placeholder_seal(input, &terms, &canonical);
+            Proof::violation(terms, seal)
+        }
+    };
+    Tx::close(input, proof, outputs)
 }
 
 /// Builds a close `Tx` from a model `CloseInput`. Payouts are taken

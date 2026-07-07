@@ -7,6 +7,7 @@
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 use hellas_kernel::List;
 
