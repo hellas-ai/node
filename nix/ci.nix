@@ -66,10 +66,11 @@ let
     wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
-    wasm-chain =
-      mk "check-wasm-chain"
-        "cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown"
-        ((cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })) ++ [ pkgs.clang ]);
+    wasm-chain = mk "check-wasm-chain" ''
+      export CC_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.clang-unwrapped "clang"}
+      export AR_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.llvm "llvm-ar"}
+      cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown
+    '' (cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; }));
   };
 
   checks = baseChecks // extraChecks;
