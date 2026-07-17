@@ -1,10 +1,10 @@
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
-#[cfg(feature = "node")]
+#[cfg(any(feature = "node", feature = "gateway"))]
 use hellas_rpc::Dtype;
 use iroh::EndpointId;
 use std::net::SocketAddr;
@@ -13,11 +13,11 @@ use std::path::PathBuf;
 mod commands;
 mod execution;
 mod identity;
-#[cfg(feature = "node")]
+#[cfg(any(feature = "node", feature = "gateway"))]
 mod metrics;
 mod tracing_config;
 
-#[cfg(feature = "node")]
+#[cfg(any(feature = "node", feature = "gateway"))]
 /// `clap` value parser for `--dtype`. Accepts model floating-point dtypes.
 /// Rejects `u32`, which is the tensor token-index dtype, never a model dtype.
 fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
@@ -49,7 +49,7 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     match serde_json::from_str::<serde_json::Value>(s) {
         Ok(serde_json::Value::Object(object)) => Ok(object),
@@ -65,17 +65,17 @@ fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Valu
 /// and `f32` is the safest broadly-correct choice. Used for `serve --dtype`
 /// and `gateway --dtype`.
 #[cfg(all(
-    feature = "node",
+    any(feature = "node", feature = "gateway"),
     any(feature = "candle-cuda", feature = "candle-metal")
 ))]
 const DEFAULT_DTYPE_STR: &str = "bf16";
 #[cfg(all(
-    feature = "node",
+    any(feature = "node", feature = "gateway"),
     not(any(feature = "candle-cuda", feature = "candle-metal"))
 ))]
 const DEFAULT_DTYPE_STR: &str = "f32";
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum GatewayResponsesBackend {
     Hellas,
@@ -83,7 +83,7 @@ enum GatewayResponsesBackend {
     Fetch,
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
     fn from(value: GatewayResponsesBackend) -> Self {
         match value {
@@ -241,7 +241,7 @@ enum Commands {
         )]
         fetch_queue_size: usize,
     },
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     Gateway {
         /// Host interface to bind
@@ -568,15 +568,18 @@ async fn main() {
             })
             .await
         }
-        #[cfg(feature = "evaluate")]
+        #[cfg(feature = "gateway")]
         Commands::Gateway {
             host,
             port,
             node_id,
             node_addrs,
+            #[cfg(feature = "evaluate")]
             local,
+            #[cfg(feature = "evaluate")]
             verify_local,
             verify,
+            #[cfg(feature = "evaluate")]
             queue_size,
             retries,
             default_max_tokens,
@@ -598,9 +601,12 @@ async fn main() {
                 port,
                 node_id,
                 node_addrs,
+                #[cfg(feature = "evaluate")]
                 local,
+                #[cfg(feature = "evaluate")]
                 verify_local,
                 verify,
+                #[cfg(feature = "evaluate")]
                 queue_size,
                 retries,
                 default_max_tokens,

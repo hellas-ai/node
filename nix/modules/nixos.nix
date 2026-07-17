@@ -29,7 +29,22 @@ in
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
-      gateway = hellas.gatewayOptions { inherit lib; };
+      gateway = hellas.gatewayOptions { inherit lib; } // {
+        package = mkOption {
+          type = types.package;
+          default =
+            if gateway.local || gateway.verifyLocal then
+              cfg.package
+            else
+              hellas.pickGatewayPackage pkgs;
+          defaultText = lib.literalMD ''
+            The slim gateway CLI (`packages.cli`), or `services.hellas.package`
+            when `gateway.local` / `gateway.verifyLocal` request an in-process
+            executor.
+          '';
+          description = "The hellas CLI used to run the HTTP gateway.";
+        };
+      };
       openFirewall = mkOption {
         type = types.bool;
         default = false;
@@ -111,10 +126,14 @@ in
         // {
           HOME = "/var/lib/hellas-gateway";
         }
+        // lib.optionalAttrs (cfg.otel.endpoint != null) {
+          # Distinguish gateway spans from the node's in shared trace storage.
+          OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
+        }
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
-          [ "${cfg.package}/bin/hellas-cli" ]
+          [ "${gateway.package}/bin/hellas-cli" ]
           ++ hellas.mkGatewayArgs {
             inherit lib gateway;
           }

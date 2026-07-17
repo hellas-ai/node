@@ -8,13 +8,13 @@ pub mod chain;
 pub(crate) mod codex_auth;
 pub(crate) mod discovery;
 pub mod fetch;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod identity;
 #[cfg(feature = "evaluate")]
 pub mod llm;
 pub mod monitor;
-#[cfg(feature = "node")]
+#[cfg(any(feature = "node", feature = "gateway"))]
 pub(crate) mod openai_responses_stream;
 pub mod rpc;
 #[cfg(feature = "node")]
