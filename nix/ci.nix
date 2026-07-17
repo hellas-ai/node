@@ -34,6 +34,9 @@ let
     executor-artifacts = mk "check-executor-artifacts" "cargo test -p hellas-executor artifacts::" (
       cargoEnv rustToolchain
     );
+    validator =
+      mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
+        (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"
