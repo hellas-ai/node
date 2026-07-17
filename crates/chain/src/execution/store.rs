@@ -82,6 +82,6 @@ where
         .await
         .expect("genesis probe database must initialize");
     let state_root = db.root();
-    let sync_target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&db).await;
+    let sync_target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&db);
     (state_root, sync_target)
 }
