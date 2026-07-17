@@ -128,7 +128,12 @@ let
     {
       cli = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        buildFeatures = [ "chain" ];
+        # `gateway` is the slim HTTP gateway: model assets + network routing,
+        # no executor backend. Local execution needs a candle variant.
+        buildFeatures = [
+          "chain"
+          "gateway"
+        ];
       };
       cli-validator = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;

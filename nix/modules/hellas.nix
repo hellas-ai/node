@@ -20,6 +20,11 @@ rec {
     else
       pkgSet.cli-candle;
 
+  # Slim gateway-capable CLI: model assets + network routing, no executor
+  # backend. Sufficient for the HTTP gateway unless it runs `--local` /
+  # `--verify-local`, which need an executor (candle) build.
+  pickGatewayPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
+
   renderEnvironment = builtins.mapAttrs (_: toString);
 
   commonOptions =

@@ -24,22 +24,22 @@
 //! an Execute service transport for the selected peer.
 
 use async_stream::try_stream;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use chatgrad::PreparedPrompt;
 use futures::StreamExt;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use futures::stream::BoxStream;
 use futures::stream::Stream;
 use hellas_adaptors::OutputEvent as WireOutputEvent;
 #[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, ExecutorHandle};
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_models::{ModelAssets, ModelAssetsError};
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_rpc::Digest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_rpc::evaluate::{
     EvaluateStopReason, TOKEN_DELTA_EVENT_KIND, decode_token_delta_payload,
     output_canonicalization as evaluate_output_canonicalization,
@@ -53,7 +53,7 @@ use hellas_rpc::fetch::{
 use hellas_rpc::fetch::{
     FetchTerminalPayload, decode_fetch_event_payload, decode_fetch_terminal_payload,
 };
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
@@ -63,11 +63,12 @@ use hellas_rpc::pb::execute::{
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_rpc::provenance::ExecutionProvenance;
+#[cfg(feature = "gateway")]
 use hellas_rpc::run_ticket::public_key_to_pb;
 use hellas_rpc::run_ticket::sign_run_ticket;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use hellas_rpc::services::courtesy::Courtesy;
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::Fetch;
@@ -86,7 +87,7 @@ use std::sync::Arc;
 use thiserror::Error;
 #[cfg(feature = "evaluate")]
 use tokio_stream::wrappers::ReceiverStream;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 use tracing::instrument;
 
 use crate::commands::discovery;
@@ -109,14 +110,14 @@ pub enum ExecutionError {
         #[source]
         source: WireStatus,
     },
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
     #[error("unknown finish status {value}")]
     UnknownFinishStatus { value: i32 },
     #[error("wire finish status is unspecified")]
     UnspecifiedFinishStatus,
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[error("evaluate transcript verification failed: {source}")]
     EvaluateTranscript {
         #[source]
@@ -229,7 +230,7 @@ impl From<EndpointId> for RemoteNodeTarget {
     }
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStrategy {
     Run(ExecutionRoute),
@@ -265,7 +266,7 @@ pub struct ExecutionRuntime {
 // Stream item types
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 /// One observation from a streaming execution. Stream protocol: zero or
 /// more `Chunk` events, terminated by exactly one `Done`.
 #[derive(Debug, Clone)]
@@ -279,7 +280,7 @@ pub enum ExecutionEvent {
     Done(Outcome),
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 /// Terminal verdict of an execution.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -296,7 +297,7 @@ pub enum Outcome {
     },
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl Outcome {
     /// Cumulative token count at the moment the run terminated.
     /// Authoritative for usage frames on both Completed and Failed.
@@ -507,7 +508,7 @@ impl FetchChunkVerifier {
     }
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 struct EvaluateChunkVerifier {
     input: InputCommitment,
     stream_id: StreamId,
@@ -518,7 +519,7 @@ struct EvaluateChunkVerifier {
     events: Vec<OutputEventEnvelope>,
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl EvaluateChunkVerifier {
     fn new(input: InputCommitment) -> Self {
         let stream_id = StreamId::from_input_commitment(input);
@@ -725,7 +726,7 @@ impl ExecutionRuntime {
 // ExecutionRequest — public entry point
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 pub struct ExecutionRequest {
     runtime: ExecutionRuntime,
     quote_req: QuotePreparedTextRequest,
@@ -733,7 +734,7 @@ pub struct ExecutionRequest {
     runner_key: Arc<ProducerSigningKey>,
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl ExecutionRequest {
     pub fn new(
         runtime: ExecutionRuntime,
@@ -765,6 +766,7 @@ impl ExecutionRequest {
     }
 
     /// True if any leg of this strategy talks to a remote executor.
+    #[cfg(feature = "evaluate")]
     pub fn uses_remote_transport(&self) -> bool {
         #[cfg(feature = "evaluate")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
@@ -821,6 +823,7 @@ impl ExecutionRequest {
     /// Owning consumption: dropping the returned stream cancels everything
     /// downstream (broadcast subscribers, wire streams, the executor's
     /// per-running cancel token).
+    #[cfg(feature = "evaluate")]
     pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
         try_stream! {
             let prepared = self.prepare().await?;
@@ -920,13 +923,13 @@ pub fn fetch_execution_stream(
 // PreparedExecution — primary + optional shadow for Verify
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl PreparedExecution {
     /// See [`PreparedRoute::provenance`] — this delegates to the primary
     /// route. Shadow's provenance is intentionally not exposed (verify is
@@ -972,7 +975,7 @@ impl PreparedExecution {
 
 /// Run the shadow stream to completion (discarding its chunks), extract
 /// its terminal outcome, and return the reconciled outcome.
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { text_artifact, .. } => *text_artifact,
@@ -1007,7 +1010,7 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResu
 }
 
 /// Consume a stream to its terminal `Done`, discarding chunks.
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 async fn drain_to_outcome(
     stream: impl Stream<Item = ExecutionResult<ExecutionEvent>>,
 ) -> ExecutionResult<Outcome> {
@@ -1026,7 +1029,7 @@ async fn drain_to_outcome(
 // PreparedRoute
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 #[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
     #[cfg(feature = "evaluate")]
@@ -1044,7 +1047,7 @@ enum PreparedRoute {
     },
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 impl PreparedRoute {
     fn provenance(&self) -> Option<&ExecutionProvenance> {
         match self {
@@ -1172,7 +1175,7 @@ impl PreparedRoute {
 /// Drain `ServiceRegistry::discover::<Courtesy>()` until we get a quote,
 /// returning the responding peer and the resolved ticket commitment +
 /// provenance.
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 async fn discover_and_quote(
     registry: &ServiceRegistry,
     quote_req: &QuotePreparedTextRequest,
@@ -1365,7 +1368,7 @@ fn signed_run_ticket_request(
         .map_err(|source| ExecutionError::source("failed to sign run ticket", source))
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn evaluate_input_from_request_commitment(
     request_commitment: &[u8],
 ) -> ExecutionResult<InputCommitment> {
@@ -1465,7 +1468,7 @@ fn local_execute_fetch_stream(
 // Remote execute streams — dial Execute service via IrohTransport
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn remote_execute_stream(
     transport: IrohTransport,
     request_commitment: Vec<u8>,
@@ -1576,7 +1579,7 @@ fn verify_fetch_stream_event(
     }
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn convert_wire_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
@@ -1643,7 +1646,7 @@ fn convert_fetch_wire_event(
     }
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn parse_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
@@ -1711,7 +1714,7 @@ fn parse_fetch_finished(
     })
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "gateway")]
 fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopReason> {
     match value.as_u8() {
         1 => Ok(StopReason::EndOfSequence),
