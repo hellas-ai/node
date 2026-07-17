@@ -4,50 +4,61 @@
 //! and structural types. Field names are intentionally excluded:
 //! renaming a field does not change the wire form and must not change
 //! the method ID.
+//!
+//! These types are owned (`String`/`Vec`) rather than borrowed: their
+//! only producer is the `hellas-rpc` build script, which resolves them
+//! out of protobuf descriptors and hashes them into the `METHOD_ID` /
+//! `SERVICE_ID` constants baked into generated marker types. Nothing
+//! constructs them at runtime, so const-buildability is not a goal.
+//!
+//! The encoded byte stream is a wire-compatibility surface: any change
+//! to `encode_to` rotates every method and service ID and breaks
+//! routing against already-deployed nodes. The golden tests at the
+//! bottom of this file pin the current encoding.
 
 use crate::canonical::{Encode, Writer};
 
 pub const METHOD_DOMAIN: &[u8] = b"hellas.wire.method.v1";
 pub const SERVICE_DOMAIN: &[u8] = b"hellas.wire.service.v1";
 
-#[derive(Clone, Copy, Debug)]
-pub struct MethodSchema<'a> {
-    pub fqn: &'a str,
-    pub request: TypeSchema<'a>,
-    pub response: TypeSchema<'a>,
+#[derive(Clone, Debug)]
+pub struct MethodSchema {
+    pub fqn: String,
+    pub request: TypeSchema,
+    pub response: TypeSchema,
     pub request_streaming: bool,
     pub response_streaming: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ServiceSchema<'a> {
-    pub fqn: &'a str,
-    pub methods: &'a [&'a MethodSchema<'a>],
+#[derive(Clone, Debug)]
+pub struct ServiceSchema {
+    pub fqn: String,
+    pub methods: Vec<MethodSchema>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum TypeSchema<'a> {
+#[derive(Clone, Debug)]
+pub enum TypeSchema {
     Primitive(PrimKind),
-    Message(MessageSchema<'a>),
+    Message(MessageSchema),
     EnumRef {
-        name: &'a str,
-        variants: &'a [(&'a str, i32)],
+        name: String,
+        variants: Vec<(String, i32)>,
     },
-    Repeated(&'a TypeSchema<'a>),
-    Map(&'a TypeSchema<'a>, &'a TypeSchema<'a>),
-    Optional(&'a TypeSchema<'a>),
+    Repeated(Box<TypeSchema>),
+    Map(Box<TypeSchema>, Box<TypeSchema>),
+    Optional(Box<TypeSchema>),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MessageSchema<'a> {
-    pub name: &'a str,
-    pub fields: &'a [FieldSchema<'a>],
+#[derive(Clone, Debug)]
+pub struct MessageSchema {
+    pub name: String,
+    pub fields: Vec<FieldSchema>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct FieldSchema<'a> {
+#[derive(Clone, Debug)]
+pub struct FieldSchema {
     pub number: u32,
-    pub ty: TypeSchema<'a>,
+    pub ty: TypeSchema,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,7 +93,7 @@ impl Encode for PrimKind {
     }
 }
 
-impl<'a> Encode for TypeSchema<'a> {
+impl Encode for TypeSchema {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
 
     fn encoded_size(&self) -> usize {
@@ -90,11 +101,11 @@ impl<'a> Encode for TypeSchema<'a> {
             Self::Primitive(p) => p.encoded_size(),
             Self::Message(m) => m.encoded_size(),
             Self::EnumRef { name, variants } => {
-                name.encoded_size()
+                name.as_str().encoded_size()
                     + 4
                     + variants
                         .iter()
-                        .map(|(n, v)| n.encoded_size() + 4 + Encode::encoded_size(v))
+                        .map(|(n, v)| n.as_str().encoded_size() + 4 + Encode::encoded_size(v))
                         .sum::<usize>()
             }
             Self::Repeated(inner) | Self::Optional(inner) => inner.encoded_size(),
@@ -115,11 +126,11 @@ impl<'a> Encode for TypeSchema<'a> {
             }
             Self::EnumRef { name, variants } => {
                 writer.write(&[2]);
-                name.encode_to(writer);
+                name.as_str().encode_to(writer);
                 let len = u32::try_from(variants.len()).expect("enum variant count fits u32");
                 writer.write(&len.to_be_bytes());
-                for (n, v) in *variants {
-                    n.encode_to(writer);
+                for (n, v) in variants {
+                    n.as_str().encode_to(writer);
                     writer.write(&v.to_be_bytes());
                 }
             }
@@ -150,7 +161,7 @@ impl Encode for i32 {
     }
 }
 
-impl<'a> Encode for FieldSchema<'a> {
+impl Encode for FieldSchema {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
         4 + self.ty.encoded_size()
@@ -161,26 +172,29 @@ impl<'a> Encode for FieldSchema<'a> {
     }
 }
 
-impl<'a> Encode for MessageSchema<'a> {
+impl Encode for MessageSchema {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
         // Name is part of the message identity (different names = different
         // types even if fields match). Fields encoded with explicit length.
-        self.name.encoded_size() + self.fields.encoded_size()
+        self.name.as_str().encoded_size() + self.fields.as_slice().encoded_size()
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        self.name.encode_to(writer);
-        self.fields.encode_to(writer);
+        self.name.as_str().encode_to(writer);
+        self.fields.as_slice().encode_to(writer);
     }
 }
 
-impl<'a> Encode for MethodSchema<'a> {
+impl Encode for MethodSchema {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
-        self.fqn.encoded_size() + self.request.encoded_size() + self.response.encoded_size() + 2
+        self.fqn.as_str().encoded_size()
+            + self.request.encoded_size()
+            + self.response.encoded_size()
+            + 2
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        self.fqn.encode_to(writer);
+        self.fqn.as_str().encode_to(writer);
         self.request.encode_to(writer);
         self.response.encode_to(writer);
         writer.write(&[u8::from(self.request_streaming)]);
@@ -188,22 +202,18 @@ impl<'a> Encode for MethodSchema<'a> {
     }
 }
 
-impl<'a> Encode for ServiceSchema<'a> {
+impl Encode for ServiceSchema {
     const MAX_ENCODED_SIZE: usize = usize::MAX;
     fn encoded_size(&self) -> usize {
-        self.fqn.encoded_size() + 4 + self.methods.iter().map(|m| m.encoded_size()).sum::<usize>()
+        self.fqn.as_str().encoded_size() + self.methods.as_slice().encoded_size()
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        self.fqn.encode_to(writer);
-        let len = u32::try_from(self.methods.len()).expect("methods.len fits u32");
-        writer.write(&len.to_be_bytes());
-        for m in self.methods {
-            m.encode_to(writer);
-        }
+        self.fqn.as_str().encode_to(writer);
+        self.methods.as_slice().encode_to(writer);
     }
 }
 
-impl<'a> MethodSchema<'a> {
+impl MethodSchema {
     pub fn digest(&self) -> [u8; 32] {
         crate::canonical::hash(METHOD_DOMAIN, self)
     }
@@ -216,7 +226,7 @@ impl<'a> MethodSchema<'a> {
     }
 }
 
-impl<'a> ServiceSchema<'a> {
+impl ServiceSchema {
     pub fn digest(&self) -> [u8; 32] {
         crate::canonical::hash(SERVICE_DOMAIN, self)
     }
@@ -224,5 +234,90 @@ impl<'a> ServiceSchema<'a> {
     pub fn service_id(&self) -> u32 {
         let d = self.digest();
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A schema exercising every construct that appears in a hellas
+    /// .proto today: message nesting, primitives, repeated, enum refs,
+    /// and streaming flags.
+    fn sample_method() -> MethodSchema {
+        MethodSchema {
+            fqn: "hellas.test.v1.Echo/Ping".to_string(),
+            request: TypeSchema::Message(MessageSchema {
+                name: "PingRequest".to_string(),
+                fields: vec![
+                    FieldSchema {
+                        number: 1,
+                        ty: TypeSchema::Primitive(PrimKind::String),
+                    },
+                    FieldSchema {
+                        number: 2,
+                        ty: TypeSchema::Repeated(Box::new(TypeSchema::Primitive(PrimKind::U64))),
+                    },
+                    FieldSchema {
+                        number: 3,
+                        ty: TypeSchema::EnumRef {
+                            name: "Mode".to_string(),
+                            variants: vec![
+                                ("MODE_UNSPECIFIED".to_string(), 0),
+                                ("MODE_FAST".to_string(), 1),
+                            ],
+                        },
+                    },
+                    FieldSchema {
+                        number: 4,
+                        ty: TypeSchema::Message(MessageSchema {
+                            name: "Inner".to_string(),
+                            fields: vec![FieldSchema {
+                                number: 1,
+                                ty: TypeSchema::Primitive(PrimKind::Bytes),
+                            }],
+                        }),
+                    },
+                ],
+            }),
+            response: TypeSchema::Message(MessageSchema {
+                name: "PingResponse".to_string(),
+                fields: vec![],
+            }),
+            request_streaming: false,
+            response_streaming: true,
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Golden vector. If this test fails, the canonical schema encoding
+    /// changed: every generated METHOD_ID rotates and deployed nodes
+    /// will no longer route this build's calls. Only update the pinned
+    /// value as part of a deliberate, coordinated protocol break.
+    #[test]
+    fn method_digest_is_pinned() {
+        let m = sample_method();
+        assert_eq!(
+            hex(&m.digest()),
+            "5030af1327754bf8a0ccf3f85451a25a9557881b0464b66a1411eb0d4ad5bb05",
+        );
+        assert_eq!(m.method_id(), 0x13af3050);
+    }
+
+    /// Same contract as [`method_digest_is_pinned`], for SERVICE_ID.
+    #[test]
+    fn service_digest_is_pinned() {
+        let s = ServiceSchema {
+            fqn: "hellas.test.v1.Echo".to_string(),
+            methods: vec![sample_method()],
+        };
+        assert_eq!(
+            hex(&s.digest()),
+            "88e6c731942566bb903c20afa36a37211edb7c3ddc2bbe456ba6f85ac8ed3da3",
+        );
+        assert_eq!(s.service_id(), 0x31c7e688);
     }
 }
