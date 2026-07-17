@@ -8,7 +8,16 @@ repository.workspace = true
 documentation.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["blake3", "prost-build", "prost-types", "protox"]
+ignored = [
+    "blake3",
+    "prettyplease",
+    "proc-macro2",
+    "prost-build",
+    "prost-types",
+    "protox",
+    "quote",
+    "syn",
+]
 
 [features]
 default = []
@@ -67,9 +76,13 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [build-dependencies]
 hellas-wire = { workspace = true, default-features = false }
+prettyplease = "0.2"
+proc-macro2 = "1"
 prost-build = "0.14"
 prost-types = "0.14"
 protox = "0.9"
+quote = "1"
+syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
 tokio.workspace = true

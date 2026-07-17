@@ -101,3 +101,30 @@ pub mod chain {
 pub mod services {
     include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));
 }
+
+/// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
+/// schema encoding → truncated blake3. If one of these assertions fails,
+/// either the canonical encoding or the proto definition changed — both
+/// rotate the ID, and deployed nodes will refuse this build's calls on
+/// the affected methods. Update a pin only as a deliberate protocol break.
+#[cfg(test)]
+mod id_pins {
+    #[allow(unused_imports)]
+    use hellas_wire::{MethodMarker, ServiceMarker};
+
+    #[cfg(feature = "execute")]
+    #[test]
+    fn execute_ids_are_stable() {
+        use super::services::execute::{Execute, RunTicket};
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xa2f84feb);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x43672b6d);
+    }
+
+    #[cfg(feature = "chain")]
+    #[test]
+    fn chain_ids_are_stable() {
+        use super::services::light_client::{GetStateRoot, LightClient};
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x983eb385);
+        assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xe34795e9);
+    }
+}

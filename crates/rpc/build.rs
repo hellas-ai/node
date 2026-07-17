@@ -5,12 +5,14 @@
 //! 1. Parse all `.proto` files at the workspace `proto/` root with `protox`
 //!    (pure-Rust, no `protoc` dependency).
 //! 2. Walk the resulting `FileDescriptorSet` to build an in-memory schema
-//!    table and to derive per-method 32-bit IDs via
-//!    `hellas_wire::MethodSchema::method_id()`.
+//!    table, extract the service surface, and derive per-method 32-bit IDs
+//!    via `hellas_wire::MethodSchema::method_id()`.
 //! 3. Hand the same `FileDescriptorSet` to `prost-build::Config::compile_fds`
-//!    to emit the prost message types, and install a custom service
-//!    generator (`HellasGenerator`) that emits typed service / method
-//!    markers and client/server traits speaking the `hellas_wire` API.
+//!    to emit the prost message types (messages only — services are
+//!    rendered by this script).
+//! 4. Render the typed service / method markers and client/server code
+//!    speaking the `hellas_wire` API as `quote!` token streams, validated
+//!    with `syn` and formatted with `prettyplease`.
 //!
 //! All output goes to `OUT_DIR`. The library `include!()`s the per-package
 //! files from `src/pb/`.
@@ -18,12 +20,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
 
-use hellas_wire::schema::PrimKind;
-use prost_build::{Method, Service, ServiceGenerator};
+use hellas_wire::schema::{
+    FieldSchema, MessageSchema, MethodSchema, PrimKind, ServiceSchema, TypeSchema,
+};
+use proc_macro2::{Ident, Literal, TokenStream};
 use prost_types::field_descriptor_proto::{Label, Type as FieldType};
 use prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet};
+use quote::{format_ident, quote};
 
 fn main() {
     emit_git_rev();
@@ -73,16 +78,13 @@ fn regenerate() {
     //    into `MessageSchema` (or `EnumRef`) and derive method IDs.
     let schema_index = SchemaIndex::build(&fds);
 
+    let services = collect_services(&fds);
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
 
-    // 3. Run prost-build with our custom generator. Generated message files
-    //    land directly in OUT_DIR; per-package service-marker / trait code
-    //    is emitted to OUT_DIR/hellas_rpc_services.rs by the generator.
-    let services: Arc<Mutex<Vec<RpcService>>> = Arc::new(Mutex::new(Vec::new()));
-    let generator = HellasGenerator {
-        services: services.clone(),
-    };
-
+    // 3. Run prost-build for the message types only; the service surface
+    //    is rendered by this script, so no prost service_generator is
+    //    installed and prost skips `service` blocks entirely.
     let mut config = prost_build::Config::new();
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
@@ -91,22 +93,13 @@ fn regenerate() {
         "hellas.v1.WorkEvent.kind",
         "#[allow(clippy::large_enum_variant)]",
     );
-    config.service_generator(Box::new(generator));
-
-    // prost-build needs a Clone-able copy because we also walked the same
-    // FDS for schema indexing.
     config
-        .compile_fds(fds.clone())
+        .compile_fds(fds)
         .expect("prost-build failed to emit message types");
 
     // 4. Render and write the service / marker / client / server modules,
     //    keyed off the collected `RpcService` list and the schema index.
-    let services_snapshot = services
-        .lock()
-        .expect("service collector mutex poisoned")
-        .clone();
-
-    let body = render_generated(&services_snapshot, &schema_index);
+    let body = render_generated(&services, &schema_index);
     let out_path = out_dir.join("hellas_rpc_services.rs");
     fs::write(&out_path, body).expect("failed to write hellas_rpc_services.rs");
 }
@@ -129,9 +122,7 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) {
 // Service collection
 // =============================================================================
 
-/// Mirror of `prost_build::Service` decoupled from the generator lifetime so
-/// the rendering code can run after `compile_fds` returns.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The service surface the renderer needs, straight from the descriptors.
 struct RpcService {
     /// `hellas.courtesy.v1`.
     package: String,
@@ -140,58 +131,58 @@ struct RpcService {
     methods: Vec<RpcMethod>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct RpcMethod {
     /// `QuotePrompt` (as it appears in the .proto).
     proto_name: String,
-    /// Rust path of the request type (`super::QuotePromptRequest`, post-prost rewrites).
-    request_rust_type: String,
-    /// Rust path of the response type.
-    response_rust_type: String,
-    /// Fully-qualified proto request type, e.g. `.hellas.courtesy.v1.QuotePromptRequest`.
+    /// Fully-qualified proto request type with a leading dot, e.g.
+    /// `.hellas.courtesy.v1.QuotePromptRequest` — matching `SchemaIndex` keys.
     request_proto_type: String,
-    /// Fully-qualified proto response type, e.g. `.hellas.courtesy.v1.QuotePromptResponse`.
+    /// Fully-qualified proto response type with a leading dot.
     response_proto_type: String,
     request_streaming: bool,
     response_streaming: bool,
 }
 
-struct HellasGenerator {
-    services: Arc<Mutex<Vec<RpcService>>>,
-}
-
-impl ServiceGenerator for HellasGenerator {
-    fn generate(&mut self, service: Service, _buf: &mut String) {
-        let methods = service
-            .methods
-            .iter()
-            .map(|m: &Method| RpcMethod {
-                proto_name: m.proto_name.clone(),
-                request_rust_type: m.input_type.clone(),
-                response_rust_type: m.output_type.clone(),
-                request_proto_type: ensure_dotted(&m.input_proto_type),
-                response_proto_type: ensure_dotted(&m.output_proto_type),
-                request_streaming: m.client_streaming,
-                response_streaming: m.server_streaming,
-            })
-            .collect();
-        self.services
-            .lock()
-            .expect("service vec poisoned")
-            .push(RpcService {
-                package: service.package.clone(),
-                proto_name: service.proto_name.clone(),
+/// Extract every `service` block from the `FileDescriptorSet`, in file
+/// order. The same FDS drives prost message generation, so there is no
+/// second source of truth to keep aligned.
+fn collect_services(fds: &FileDescriptorSet) -> Vec<RpcService> {
+    let mut services = Vec::new();
+    for file in &fds.file {
+        let package = file.package();
+        for svc in &file.service {
+            let methods = svc
+                .method
+                .iter()
+                .map(|m| {
+                    // The hellas wire protocol has no client-streaming unary
+                    // shape. Reject at codegen time instead of emitting stubs
+                    // that fail every call at runtime.
+                    if m.client_streaming() && !m.server_streaming() {
+                        panic!(
+                            "{package}.{}/{} is client-streaming unary, which hellas-rpc \
+                             does not support; make the response `stream` (bidi) instead",
+                            svc.name(),
+                            m.name()
+                        );
+                    }
+                    RpcMethod {
+                        proto_name: m.name().to_string(),
+                        request_proto_type: m.input_type().to_string(),
+                        response_proto_type: m.output_type().to_string(),
+                        request_streaming: m.client_streaming(),
+                        response_streaming: m.server_streaming(),
+                    }
+                })
+                .collect();
+            services.push(RpcService {
+                package: package.to_string(),
+                proto_name: svc.name().to_string(),
                 methods,
             });
+        }
     }
-}
-
-fn ensure_dotted(name: &str) -> String {
-    if name.starts_with('.') {
-        name.to_string()
-    } else {
-        format!(".{name}")
-    }
+    services
 }
 
 // =============================================================================
@@ -200,7 +191,7 @@ fn ensure_dotted(name: &str) -> String {
 
 /// Owns the in-memory representation of every proto message and enum the
 /// build script sees. The keys are fully-qualified names with a leading
-/// dot (matching how prost reports `input_proto_type`).
+/// dot (matching descriptor `input_type` / `output_type` references).
 struct SchemaIndex {
     messages: HashMap<String, IndexedMessage>,
     enums: HashMap<String, IndexedEnum>,
@@ -319,7 +310,7 @@ impl SchemaIndex {
 
     /// Resolve a fully-qualified type reference (e.g. `.hellas.v1.Ticket`)
     /// into a `MessageSchema` recursively, owning all referenced strings.
-    fn message_schema(&self, fqn: &str) -> OwnedMessageSchema {
+    fn message_schema(&self, fqn: &str) -> MessageSchema {
         let msg = self
             .messages
             .get(fqn)
@@ -333,7 +324,7 @@ impl SchemaIndex {
         fqn: &str,
         msg: &IndexedMessage,
         visiting: &mut Vec<String>,
-    ) -> OwnedMessageSchema {
+    ) -> MessageSchema {
         // Method-id derivation requires acyclic service-facing message trees.
         // Panic at the cycle boundary instead of recursing until stack overflow.
         if visiting.contains(&fqn.to_string()) {
@@ -343,46 +334,51 @@ impl SchemaIndex {
         let fields = msg
             .fields
             .iter()
-            .map(|f| OwnedFieldSchema {
+            .map(|f| FieldSchema {
                 number: f.number,
                 ty: self.field_schema(&f.ty, f.label, visiting),
             })
             .collect();
         visiting.pop();
-        OwnedMessageSchema {
+        MessageSchema {
             name: msg.short_name.clone(),
             fields,
         }
     }
 
+    /// Proto `map<k, v>` fields never reach here as `TypeSchema::Map`:
+    /// the descriptor represents them as a repeated synthetic MapEntry
+    /// message, which is also their actual wire form. Likewise proto3
+    /// `optional` does not change the wire form, so no field produces
+    /// `TypeSchema::Optional`.
     fn field_schema(
         &self,
         ty: &IndexedFieldType,
         label: Label,
         visiting: &mut Vec<String>,
-    ) -> OwnedTypeSchema {
+    ) -> TypeSchema {
         let base = match ty {
-            IndexedFieldType::Primitive(p) => OwnedTypeSchema::Primitive(*p),
+            IndexedFieldType::Primitive(p) => TypeSchema::Primitive(*p),
             IndexedFieldType::Message(fqn) => {
                 let msg = self
                     .messages
                     .get(fqn)
                     .unwrap_or_else(|| panic!("missing message in schema index: {fqn}"));
-                OwnedTypeSchema::Message(self.message_schema_inner(fqn, msg, visiting))
+                TypeSchema::Message(self.message_schema_inner(fqn, msg, visiting))
             }
             IndexedFieldType::Enum(fqn) => {
                 let en = self
                     .enums
                     .get(fqn)
                     .unwrap_or_else(|| panic!("missing enum in schema index: {fqn}"));
-                OwnedTypeSchema::EnumRef {
+                TypeSchema::EnumRef {
                     name: en.short_name.clone(),
                     variants: en.variants.clone(),
                 }
             }
         };
         match label {
-            Label::Repeated => OwnedTypeSchema::Repeated(Box::new(base)),
+            Label::Repeated => TypeSchema::Repeated(Box::new(base)),
             _ => base,
         }
     }
@@ -436,95 +432,116 @@ fn classify_field(f: &FieldDescriptorProto) -> IndexedFieldType {
 }
 
 // =============================================================================
-// Owned schema mirror (heap-backed; `MethodSchema<'a>` only borrows from
-// these for the duration of the digest computation).
+// Render plan — everything the token templates need, computed once.
 // =============================================================================
 
-struct OwnedMethodSchema {
-    fqn: String,
-    request: OwnedTypeSchema,
-    response: OwnedTypeSchema,
-    request_streaming: bool,
-    response_streaming: bool,
-}
-
-#[derive(Clone)]
-struct OwnedMessageSchema {
+/// Per-method render inputs.
+struct MethodPlan {
+    /// Marker type ident (`QuotePrompt`).
+    marker: Ident,
+    /// Client / handler method ident (`quote_prompt`).
+    fn_name: Ident,
+    /// Method name as spelled in the .proto.
     name: String,
-    fields: Vec<OwnedFieldSchema>,
+    method_id: u32,
+    /// Absolute Rust path of the prost request type.
+    request: syn::Path,
+    /// Absolute Rust path of the prost response type.
+    response: syn::Path,
+    shape: Shape,
 }
 
-#[derive(Clone)]
-struct OwnedFieldSchema {
-    number: u32,
-    ty: OwnedTypeSchema,
+/// The RPC shapes the hellas wire protocol supports. Client-streaming
+/// unary is rejected in `collect_services`.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Unary,
+    ServerStreaming,
+    BidiStreaming,
 }
 
-#[derive(Clone)]
-enum OwnedTypeSchema {
-    Primitive(PrimKind),
-    Message(OwnedMessageSchema),
-    EnumRef {
-        name: String,
-        variants: Vec<(String, i32)>,
-    },
-    Repeated(Box<OwnedTypeSchema>),
+/// Per-service render inputs.
+struct ServicePlan {
+    feature: &'static str,
+    module: Ident,
+    /// Service marker ident (`Courtesy`).
+    service: Ident,
+    fqn: String,
+    alpn: String,
+    service_id: u32,
+    handler: Ident,
+    client: Ident,
+    server: Ident,
+    methods: Vec<MethodPlan>,
 }
 
-impl OwnedMethodSchema {
-    fn method_id(&self) -> u32 {
-        // Encode directly to a blake3::Hasher in the same byte order as
-        // `hellas_wire::schema::MethodSchema::encode_to`. Sidesteps the
-        // self-referential lifetime gymnastics of building borrowed
-        // `MethodSchema<'a>` values.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(hellas_wire::schema::METHOD_DOMAIN);
-        encode_str(&self.fqn, &mut hasher);
-        encode_owned_type(&self.request, &mut hasher);
-        encode_owned_type(&self.response, &mut hasher);
-        hasher.update(&[u8::from(self.request_streaming)]);
-        hasher.update(&[u8::from(self.response_streaming)]);
-        let d = *hasher.finalize().as_bytes();
-        u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
+    let fqn = format!("{}.{}", service.package, service.proto_name);
+
+    // One schema resolution per method feeds both the METHOD_ID constants
+    // and the ServiceSchema digest behind SERVICE_ID.
+    let schemas: Vec<MethodSchema> = service
+        .methods
+        .iter()
+        .map(|m| build_method_schema(&fqn, m, index))
+        .collect();
+    let method_ids: Vec<u32> = schemas.iter().map(MethodSchema::method_id).collect();
+    let service_id = ServiceSchema {
+        fqn: fqn.clone(),
+        methods: schemas,
+    }
+    .service_id();
+
+    let methods = service
+        .methods
+        .iter()
+        .zip(method_ids)
+        .map(|(m, method_id)| {
+            let shape = match (m.request_streaming, m.response_streaming) {
+                (false, false) => Shape::Unary,
+                (false, true) => Shape::ServerStreaming,
+                (true, true) => Shape::BidiStreaming,
+                (true, false) => {
+                    unreachable!("client-streaming unary methods are rejected at collection time")
+                }
+            };
+            MethodPlan {
+                marker: format_ident!("{}", m.proto_name),
+                fn_name: format_ident!("{}", to_snake_case(&m.proto_name)),
+                name: m.proto_name.clone(),
+                method_id,
+                request: rust_path(&m.request_proto_type),
+                response: rust_path(&m.response_proto_type),
+                shape,
+            }
+        })
+        .collect();
+
+    let alpn = format!("/{fqn}/1.0");
+    ServicePlan {
+        feature: feature_for_package(&service.package),
+        module: format_ident!("{}", to_snake_case(&service.proto_name)),
+        service: format_ident!("{}", service.proto_name),
+        alpn,
+        service_id,
+        handler: format_ident!("{}Handler", service.proto_name),
+        client: format_ident!("{}ClientImpl", service.proto_name),
+        server: format_ident!("{}Server", service.proto_name),
+        methods,
+        fqn,
     }
 }
 
-fn encode_str(s: &str, hasher: &mut blake3::Hasher) {
-    let len = u32::try_from(s.len()).expect("str length fits u32");
-    hasher.update(&len.to_be_bytes());
-    hasher.update(s.as_bytes());
-}
-
-fn encode_owned_type(ty: &OwnedTypeSchema, hasher: &mut blake3::Hasher) {
-    match ty {
-        OwnedTypeSchema::Primitive(p) => {
-            hasher.update(&[0]);
-            hasher.update(&[*p as u8]);
-        }
-        OwnedTypeSchema::Message(msg) => {
-            hasher.update(&[1]);
-            encode_str(&msg.name, hasher);
-            let len = u32::try_from(msg.fields.len()).expect("fields fit u32");
-            hasher.update(&len.to_be_bytes());
-            for f in &msg.fields {
-                hasher.update(&f.number.to_be_bytes());
-                encode_owned_type(&f.ty, hasher);
-            }
-        }
-        OwnedTypeSchema::EnumRef { name, variants } => {
-            hasher.update(&[2]);
-            encode_str(name, hasher);
-            let len = u32::try_from(variants.len()).expect("variants fit u32");
-            hasher.update(&len.to_be_bytes());
-            for (n, v) in variants {
-                encode_str(n, hasher);
-                hasher.update(&v.to_be_bytes());
-            }
-        }
-        OwnedTypeSchema::Repeated(inner) => {
-            hasher.update(&[3]);
-            encode_owned_type(inner, hasher);
-        }
+fn build_method_schema(service_fqn: &str, method: &RpcMethod, index: &SchemaIndex) -> MethodSchema {
+    let request_msg = index.message_schema(&method.request_proto_type);
+    let response_msg = index.message_schema(&method.response_proto_type);
+    MethodSchema {
+        // FQN matches the generated service directory convention.
+        fqn: format!("{service_fqn}/{}", method.proto_name),
+        request: TypeSchema::Message(request_msg),
+        response: TypeSchema::Message(response_msg),
+        request_streaming: method.request_streaming,
+        response_streaming: method.response_streaming,
     }
 }
 
@@ -532,410 +549,293 @@ fn encode_owned_type(ty: &OwnedTypeSchema, hasher: &mut blake3::Hasher) {
 // Code generation
 // =============================================================================
 
+const GENERATED_HEADER: &str = "// @generated by `hellas-rpc` build.rs. Do not edit by hand.\n\
+     //\n\
+     // Service / method markers, typed client traits, and server\n\
+     // dispatchers. The wrapping module sets allow-lints.\n\n";
+
 fn render_generated(services: &[RpcService], index: &SchemaIndex) -> String {
-    let mut out = String::new();
-    out.push_str(
-        "// @generated by `hellas-rpc` build.rs. Do not edit by hand.\n\
-         //\n\
-         // Service / method markers, typed client traits, and server\n\
-         // dispatchers. The wrapping module sets allow-lints.\n\n",
-    );
+    let plans: Vec<ServicePlan> = services.iter().map(|s| plan_service(s, index)).collect();
 
-    // The generated file is included from `src/pb/services.rs`. Every type
-    // reference is rooted at the corresponding `crate::pb::<package>` module
-    // (see `package_rust_path`). The pb modules in turn `include!()` the
-    // prost-generated `<package>.rs` files from OUT_DIR.
+    // Inventory: every service regardless of feature gating, so
+    // transport-layer code iterates these without re-declaring names.
+    let entries = plans.iter().map(|p| {
+        let name = &p.fqn;
+        let alpn = &p.alpn;
+        quote! { KnownService { name: #name, alpn: #alpn } }
+    });
+    let blocks = plans.iter().map(render_service_block);
 
-    // Inventory: every service and every rate-limited method, regardless of
-    // feature gating. Transport-layer code iterates these without
-    // re-declaring service names.
-    out.push_str("/// A protocol-level service entry — its FQN and the wire ALPN.\n");
-    out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
-    out.push_str("pub struct KnownService {\n    pub name: &'static str,\n    pub alpn: &'static str,\n}\n\n");
+    let tokens = quote! {
+        /// A protocol-level service entry — its FQN and the wire ALPN.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct KnownService {
+            pub name: &'static str,
+            pub alpn: &'static str,
+        }
 
-    out.push_str("/// Catalogue of every service this crate knows about.\n");
-    out.push_str("pub const KNOWN_SERVICES: &[KnownService] = &[\n");
-    for service in services {
-        let fqn = format!("{}.{}", service.package, service.proto_name);
-        let alpn = format!("/{fqn}/1.0");
-        out.push_str(&format!(
-            "    KnownService {{ name: {:?}, alpn: {:?} }},\n",
-            fqn, alpn
-        ));
-    }
-    out.push_str("];\n\n");
+        /// Catalogue of every service this crate knows about.
+        pub const KNOWN_SERVICES: &[KnownService] = &[#(#entries),*];
 
-    // Method ID table (string -> u32). Used by inbound dispatch when
-    // resolving method paths. Kept independently of the cfg-gated marker
-    // impls so callers always see the full table.
-    out.push_str("/// All method IDs known at codegen time, keyed by `service_fqn/method_name`.\n");
-    out.push_str("pub const KNOWN_METHOD_IDS: &[(&'static str, u32)] = &[\n");
-    for service in services {
-        let fqn = format!("{}.{}", service.package, service.proto_name);
-        for method in &service.methods {
-            let method_fqn = format!("{fqn}.{}", method.proto_name);
-            let owned = build_method_schema(&fqn, method, index);
-            let id = owned.method_id();
-            out.push_str(&format!(
-                "    ({:?}, 0x{:08x}),\n",
-                format!("/{fqn}/{}", method.proto_name),
-                id
-            ));
-            // Suppress unused-variable warning for symmetry.
-            let _ = method_fqn;
+        #(#blocks)*
+    };
+
+    // parse2 validates that the emitted tokens are well-formed Rust items
+    // (a template bug fails here, not at some rustc error pointing into
+    // OUT_DIR) and feeds prettyplease so the emitted file stays readable.
+    let file: syn::File = syn::parse2(tokens).expect("generated service code parses as Rust");
+    format!("{GENERATED_HEADER}{}", prettyplease::unparse(&file))
+}
+
+fn render_service_block(plan: &ServicePlan) -> TokenStream {
+    let ServicePlan {
+        feature,
+        module,
+        service,
+        fqn,
+        alpn,
+        handler,
+        client,
+        server,
+        ..
+    } = plan;
+    let service_id = hex_u32(plan.service_id);
+
+    let markers = plan.methods.iter().map(|m| {
+        let MethodPlan {
+            marker,
+            name,
+            request,
+            response,
+            ..
+        } = m;
+        let method_id = hex_u32(m.method_id);
+        let request_streaming = m.shape == Shape::BidiStreaming;
+        let response_streaming = m.shape != Shape::Unary;
+        quote! {
+            pub struct #marker;
+
+            impl MethodMarker for #marker {
+                type Service = #service;
+                type Request = #request;
+                type Response = #response;
+                const NAME: &'static str = #name;
+                const METHOD_ID: u32 = #method_id;
+                const REQUEST_STREAMING: bool = #request_streaming;
+                const RESPONSE_STREAMING: bool = #response_streaming;
+            }
+        }
+    });
+
+    let handler_methods = plan.methods.iter().map(handler_signature);
+    let client_methods = plan.methods.iter().map(client_method);
+    let dispatch_arms = plan.methods.iter().map(dispatch_arm);
+
+    let handler_doc = doc_lines(&[
+        "Server-side handler trait. Concrete servers implement".to_string(),
+        format!("this; the generated `{server}` dispatcher routes inbound"),
+        "frames to the matching handler.".to_string(),
+    ]);
+    let server_doc = doc_lines(&[
+        format!("Wraps a `{handler}` and routes inbound streams to it"),
+        "by `method_id`. For unary methods the dispatch decodes the".to_string(),
+        "request, invokes the handler, encodes the response, and".to_string(),
+        "emits a terminal trailer. Streaming methods are routed".to_string(),
+        "through the matching stream helper.".to_string(),
+    ]);
+
+    quote! {
+        #[cfg(feature = #feature)]
+        pub mod #module {
+            use ::hellas_wire::{MethodMarker, ServiceMarker};
+
+            pub struct #service;
+
+            impl ServiceMarker for #service {
+                const NAME: &'static str = #fqn;
+                const ALPN: &'static str = #alpn;
+                const SERVICE_ID: u32 = #service_id;
+            }
+
+            #(#markers)*
+
+            #handler_doc
+            pub trait #handler: Send + Sync + 'static {
+                #(#handler_methods)*
+            }
+
+            /// Generic client over any `StreamTransport`. Wraps a transport
+            /// handle by reference; clone to share. Uses the prost-aware
+            /// helpers in `crate::call`.
+            #[derive(Clone, Debug)]
+            pub struct #client<T> {
+                transport: T,
+            }
+
+            impl<T> #client<T>
+            where
+                T: ::hellas_wire::StreamTransport + Sync,
+                T::Error: ::std::error::Error + Send + Sync + 'static,
+                T::Stream: 'static,
+            {
+                pub fn new(transport: T) -> Self {
+                    Self { transport }
+                }
+
+                #(#client_methods)*
+            }
+
+            #server_doc
+            pub struct #server<H>(pub H);
+
+            impl<T, H> ::hellas_wire::Dispatcher<T> for #server<H>
+            where
+                T: ::hellas_wire::StreamTransport + Send + Sync,
+                <T::Stream as ::hellas_wire::Stream>::RecvHalf: 'static,
+                <T::Stream as ::hellas_wire::Stream>::SendHalf: 'static,
+                H: #handler,
+            {
+                type Error = ::hellas_wire::TransportError;
+
+                async fn dispatch(
+                    &self,
+                    inbound: ::hellas_wire::Inbound<T::Stream>,
+                ) -> ::core::result::Result<(), Self::Error> {
+                    match inbound.method_id {
+                        #(#dispatch_arms)*
+                        other => Err(::hellas_wire::TransportError::Protocol(
+                            format!("unknown method_id 0x{:08x}", other),
+                        )),
+                    }
+                }
+            }
         }
     }
-    out.push_str("];\n\n");
-
-    for service in services {
-        render_service_block(&mut out, service, index);
-    }
-
-    out
 }
 
-fn render_service_block(out: &mut String, service: &RpcService, index: &SchemaIndex) {
-    let feature = feature_for_package(&service.package);
-    let fqn = format!("{}.{}", service.package, service.proto_name);
-    let alpn = format!("/{fqn}/1.0");
-    let module_name = service_module_ident(&service.proto_name);
-
-    // Service ID (low-32 of blake3 of canonicalized ServiceSchema).
-    let service_id = compute_service_id(&fqn, service, index);
-
-    out.push_str(&format!(
-        "#[cfg(feature = \"{feature}\")]\npub mod {module_name} {{\n"
-    ));
-    out.push_str("    use ::hellas_wire::{MethodMarker, ServiceMarker};\n\n");
-
-    // -- Service marker --
-    out.push_str(&format!("    pub struct {};\n\n", service.proto_name));
-    out.push_str(&format!(
-        "    impl ServiceMarker for {} {{\n\
-        \x20       const NAME: &'static str = {:?};\n\
-        \x20       const ALPN: &'static str = {:?};\n\
-        \x20       const SERVICE_ID: u32 = 0x{:08x};\n\
-        \x20   }}\n\n",
-        service.proto_name, fqn, alpn, service_id
-    ));
-
-    // -- Method markers --
-    for method in &service.methods {
-        let method_name = &method.proto_name;
-        let owned = build_method_schema(&fqn, method, index);
-        let method_id = owned.method_id();
-        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
-        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
-        out.push_str(&format!("    pub struct {method_name};\n\n"));
-        out.push_str(&format!(
-            "    impl MethodMarker for {method_name} {{\n\
-            \x20       type Service = {service};\n\
-            \x20       type Request = {request_ty};\n\
-            \x20       type Response = {response_ty};\n\
-            \x20       const NAME: &'static str = {name:?};\n\
-            \x20       const METHOD_ID: u32 = 0x{id:08x};\n\
-            \x20       const REQUEST_STREAMING: bool = {req_stream};\n\
-            \x20       const RESPONSE_STREAMING: bool = {resp_stream};\n\
-            \x20   }}\n\n",
-            service = service.proto_name,
-            request_ty = request_ty,
-            response_ty = response_ty,
-            name = method_name,
-            id = method_id,
-            req_stream = method.request_streaming,
-            resp_stream = method.response_streaming,
-        ));
-    }
-
-    // -- Server trait --
-    let server_trait = format!("{}Handler", service.proto_name);
-    out.push_str(&format!(
-        "    /// Server-side handler trait. Concrete servers implement\n\
-        \x20   /// this; the generated `{server}Server` dispatcher routes inbound\n\
-        \x20   /// frames to the matching handler.\n\
-        \x20   pub trait {server_trait}: Send + Sync + 'static {{\n",
-        server = service.proto_name,
-        server_trait = server_trait,
-    ));
-    for method in &service.methods {
-        let fn_name = to_snake_case(&method.proto_name);
-        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
-        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
-        let (sig_req, sig_resp) = server_signature(method, &request_ty, &response_ty);
-        // For unary methods, allow the handler to return either the bare
-        // response type or `WithTrailer<R>` (which carries response-side
-        // metadata like provenance). For streaming methods, keep the
-        // stream-type return as-is.
-        let handler_resp = if !method.request_streaming && !method.response_streaming {
-            format!(
-                "impl Into<crate::call::WithTrailer<{sig_resp}>> + Send",
-                sig_resp = sig_resp
-            )
-        } else {
-            sig_resp.clone()
-        };
-        out.push_str(&format!(
-            "        fn {fn_name}(&self, request: {sig_req}) -> impl ::core::future::Future<Output = ::core::result::Result<{handler_resp}, ::hellas_wire::WireStatus>> + Send;\n",
-        ));
-    }
-    out.push_str("    }\n\n");
-
-    // -- Generic Client over any StreamTransport, using rpc::call helpers --
-    //
-    // Methods are inherent on `XClientImpl<T>`.
-    let client_impl_name = format!("{}ClientImpl", service.proto_name);
-    out.push_str(&format!(
-        "    /// Generic client over any `StreamTransport`. Wraps a transport\n\
-        \x20   /// handle by reference; clone to share. Uses the prost-aware\n\
-        \x20   /// helpers in `crate::call`.\n\
-        \x20   #[derive(Clone, Debug)]\n\
-        \x20   pub struct {client_impl_name}<T> {{\n\
-        \x20       transport: T,\n\
-        \x20   }}\n\n\
-        \x20   impl<T> {client_impl_name}<T>\n\
-        \x20   where\n\
-        \x20       T: ::hellas_wire::StreamTransport + Sync,\n\
-        \x20       T::Error: ::std::error::Error + Send + Sync + 'static,\n\
-        \x20       T::Stream: 'static,\n\
-        \x20   {{\n\
-        \x20       pub fn new(transport: T) -> Self {{\n\
-        \x20           Self {{ transport }}\n\
-        \x20       }}\n\n",
-        client_impl_name = client_impl_name,
-    ));
-    for method in &service.methods {
-        let fn_name = to_snake_case(&method.proto_name);
-        let request_ty = proto_fqn_to_rust_path(&method.request_proto_type);
-        let response_ty = proto_fqn_to_rust_path(&method.response_proto_type);
-        let (sig_req, sig_resp) = client_signature(method, &request_ty, &response_ty);
-        let method_marker = &method.proto_name;
-        let (real_sig_req, real_sig_resp, body) = match (
-            method.request_streaming,
-            method.response_streaming,
-        ) {
-            (false, false) => {
-                let body = format!(
-                    "            async move {{\n\
-                        \x20               crate::call::unary::<T, {method_marker}>(\n\
-                        \x20                   &self.transport, request, ::hellas_wire::Metadata::new()).await\n\
-                        \x20           }}",
-                    method_marker = method_marker,
-                );
-                (sig_req.clone(), sig_resp.clone(), body)
-            }
-            (false, true) => {
-                let body = format!(
-                    "            async move {{\n\
-                    \x20               crate::call::server_streaming::<T, {method_marker}>(\n\
-                    \x20                   &self.transport, request, ::hellas_wire::Metadata::new()).await\n\
-                    \x20           }}",
-                    method_marker = method_marker,
-                );
-                (
-                    sig_req.clone(),
-                    format!("crate::call::StreamingCall<{resp}>", resp = response_ty),
-                    body,
-                )
-            }
-            (true, true) => {
-                let body = format!(
-                    "            async move {{\n\
-                    \x20               crate::call::bidi_streaming::<T, {method_marker}>(\n\
-                    \x20                   &self.transport, ::hellas_wire::Metadata::new()).await\n\
-                    \x20           }}",
-                    method_marker = method_marker,
-                );
-                (
-                    String::new(),
-                    format!(
-                        "crate::call::BidiStreamingCall<{req}, {resp}>",
-                        req = request_ty,
-                        resp = response_ty
-                    ),
-                    body,
-                )
-            }
-            (true, false) => {
-                let body = "            async move { let _ = request; Err(::hellas_wire::WireStatus::unimplemented(\"client-streaming unary RPC is not supported by this client\")) }".to_string();
-                (sig_req.clone(), sig_resp.clone(), body)
-            }
-        };
-        let params = if real_sig_req.is_empty() {
-            "&self".to_string()
-        } else {
-            format!("&self, request: {real_sig_req}")
-        };
-        out.push_str(&format!(
-            "        pub fn {fn_name}({params}) -> impl ::core::future::Future<Output = ::core::result::Result<{real_sig_resp}, ::hellas_wire::WireStatus>> + Send {{\n\
-            {body}\n\
-            \x20       }}\n",
-        ));
-    }
-    out.push_str("    }\n\n");
-
-    // -- Server dispatcher --
-    out.push_str(&format!(
-        "    /// Wraps a `{server_trait}` and routes inbound streams to it\n\
-        \x20   /// by `method_id`. For unary methods the dispatch decodes the\n\
-        \x20   /// request, invokes the handler, encodes the response, and\n\
-        \x20   /// emits a terminal trailer. Streaming methods are routed\n\
-        \x20   /// through the matching stream helper.\n\
-        \x20   pub struct {service}Server<H>(pub H);\n\n\
-        \x20   impl<T, H> ::hellas_wire::Dispatcher<T> for {service}Server<H>\n\
-        \x20   where\n\
-        \x20       T: ::hellas_wire::StreamTransport + Send + Sync,\n\
-        \x20       <T::Stream as ::hellas_wire::Stream>::RecvHalf: 'static,\n\
-        \x20       <T::Stream as ::hellas_wire::Stream>::SendHalf: 'static,\n\
-        \x20       H: {server_trait},\n\
-        \x20   {{\n\
-        \x20       type Error = ::hellas_wire::TransportError;\n\n\
-        \x20       async fn dispatch(\n\
-        \x20           &self,\n\
-        \x20           inbound: ::hellas_wire::Inbound<T::Stream>,\n\
-        \x20       ) -> ::core::result::Result<(), Self::Error> {{\n\
-        \x20           match inbound.method_id {{\n",
-        service = service.proto_name,
-        server_trait = server_trait,
-    ));
-    for method in &service.methods {
-        let fn_name = to_snake_case(&method.proto_name);
-        let method_marker = &method.proto_name;
-        let case_body = match (method.request_streaming, method.response_streaming) {
-            (false, false) => format!(
-                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
-                \x20                   crate::call::dispatch_unary::<T, {method_marker}, _, _, _>(inbound, |req| {{\n\
-                \x20                       let h = &self.0;\n\
-                \x20                       async move {{ h.{fn_name}(req).await }}\n\
-                \x20                   }}).await\n\
-                \x20               }}",
-                method_marker = method_marker,
-                fn_name = fn_name,
-            ),
-            (false, true) => format!(
-                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
-                \x20                   crate::call::dispatch_server_streaming::<T, {method_marker}, _, _, _>(inbound, |req| {{\n\
-                \x20                       let h = &self.0;\n\
-                \x20                       async move {{ h.{fn_name}(req).await }}\n\
-                \x20                   }}).await\n\
-                \x20               }}",
-                method_marker = method_marker,
-                fn_name = fn_name,
-            ),
-            (true, true) => format!(
-                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
-                \x20                   crate::call::dispatch_bidi_streaming::<T, {method_marker}, _, _, _>(inbound, |req| {{\n\
-                \x20                       let h = &self.0;\n\
-                \x20                       async move {{ h.{fn_name}(::std::boxed::Box::pin(req)).await }}\n\
-                \x20                   }}).await\n\
-                \x20               }}",
-                method_marker = method_marker,
-                fn_name = fn_name,
-            ),
-            (true, false) => format!(
-                "                <{method_marker} as ::hellas_wire::MethodMarker>::METHOD_ID => {{\n\
-                \x20                   let _ = (&self.0, inbound);\n\
-                \x20                   ::core::result::Result::Err(::hellas_wire::TransportError::Protocol(\n\
-                \x20                       \"client-streaming unary dispatch is not supported for {method_marker}\".to_string()\n\
-                \x20                   ))\n\
-                \x20               }}",
-                method_marker = method_marker,
-            ),
-        };
-        out.push_str(&case_body);
-        out.push('\n');
-    }
-    out.push_str(
-        "                other => Err(::hellas_wire::TransportError::Protocol(\n\
-        \x20                   format!(\"unknown method_id 0x{:08x}\", other)\n\
-        \x20               )),\n\
-        \x20           }\n\
-        \x20       }\n\
-        \x20   }\n\n",
-    );
-
-    out.push_str("}\n\n");
-}
-
-fn build_method_schema(
-    service_fqn: &str,
-    method: &RpcMethod,
-    index: &SchemaIndex,
-) -> OwnedMethodSchema {
-    let request_msg = index.message_schema(&method.request_proto_type);
-    let response_msg = index.message_schema(&method.response_proto_type);
-    OwnedMethodSchema {
-        // FQN matches the generated service directory convention.
-        fqn: format!("{service_fqn}/{}", method.proto_name),
-        request: OwnedTypeSchema::Message(request_msg),
-        response: OwnedTypeSchema::Message(response_msg),
-        request_streaming: method.request_streaming,
-        response_streaming: method.response_streaming,
-    }
-}
-
-fn compute_service_id(fqn: &str, service: &RpcService, index: &SchemaIndex) -> u32 {
-    let methods: Vec<OwnedMethodSchema> = service
-        .methods
-        .iter()
-        .map(|m| build_method_schema(fqn, m, index))
-        .collect();
-
-    // Encode the ServiceSchema canonical form directly to a blake3
-    // hasher, mirroring `hellas_wire::schema::ServiceSchema::encode_to`.
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(hellas_wire::schema::SERVICE_DOMAIN);
-    encode_str(fqn, &mut hasher);
-    let len = u32::try_from(methods.len()).expect("methods fit u32");
-    hasher.update(&len.to_be_bytes());
-    for m in &methods {
-        encode_str(&m.fqn, &mut hasher);
-        encode_owned_type(&m.request, &mut hasher);
-        encode_owned_type(&m.response, &mut hasher);
-        hasher.update(&[u8::from(m.request_streaming)]);
-        hasher.update(&[u8::from(m.response_streaming)]);
-    }
-    let d = *hasher.finalize().as_bytes();
-    u32::from_le_bytes([d[0], d[1], d[2], d[3]])
-}
-
-fn client_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, String) {
-    let req_sig = if method.request_streaming && method.response_streaming {
-        String::new()
-    } else if method.request_streaming {
-        format!("impl ::futures_core::Stream<Item = {req}> + Send + Unpin")
-    } else {
-        req.to_string()
+fn handler_signature(m: &MethodPlan) -> TokenStream {
+    let MethodPlan {
+        fn_name,
+        request,
+        response,
+        ..
+    } = m;
+    let request_ty = match m.shape {
+        Shape::BidiStreaming => boxed_stream(request),
+        _ => quote! { #request },
     };
-    let resp_sig = if method.request_streaming && method.response_streaming {
-        format!("crate::call::BidiStreamingCall<{req}, {resp}>")
-    } else if method.response_streaming {
-        format!("crate::call::StreamingCall<{resp}>")
-    } else {
-        resp.to_string()
+    // Unary handlers may return the bare response or `WithTrailer<R>`
+    // (which carries response-side metadata like provenance); streaming
+    // handlers return their response stream.
+    let output = match m.shape {
+        Shape::Unary => quote! { impl Into<crate::call::WithTrailer<#response>> + Send },
+        _ => boxed_stream(response),
     };
-    (req_sig, resp_sig)
+    quote! {
+        fn #fn_name(
+            &self,
+            request: #request_ty,
+        ) -> impl ::core::future::Future<
+            Output = ::core::result::Result<#output, ::hellas_wire::WireStatus>,
+        > + Send;
+    }
 }
 
-fn server_signature(method: &RpcMethod, req: &str, resp: &str) -> (String, String) {
-    let req_sig = if method.request_streaming {
-        format!(
-            "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{req}, ::hellas_wire::WireStatus>> + Send>>"
-        )
-    } else {
-        req.to_string()
+fn client_method(m: &MethodPlan) -> TokenStream {
+    let MethodPlan {
+        marker,
+        fn_name,
+        request,
+        response,
+        ..
+    } = m;
+    let (params, output, body) = match m.shape {
+        Shape::Unary => (
+            quote! { &self, request: #request },
+            quote! { #response },
+            quote! {
+                crate::call::unary::<T, #marker>(
+                    &self.transport, request, ::hellas_wire::Metadata::new()).await
+            },
+        ),
+        Shape::ServerStreaming => (
+            quote! { &self, request: #request },
+            quote! { crate::call::StreamingCall<#response> },
+            quote! {
+                crate::call::server_streaming::<T, #marker>(
+                    &self.transport, request, ::hellas_wire::Metadata::new()).await
+            },
+        ),
+        // Bidi takes no request parameter: the request stream is driven
+        // through the returned call handle.
+        Shape::BidiStreaming => (
+            quote! { &self },
+            quote! { crate::call::BidiStreamingCall<#request, #response> },
+            quote! {
+                crate::call::bidi_streaming::<T, #marker>(
+                    &self.transport, ::hellas_wire::Metadata::new()).await
+            },
+        ),
     };
-    let resp_sig = if method.response_streaming {
-        format!(
-            "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = ::core::result::Result<{resp}, ::hellas_wire::WireStatus>> + Send>>"
-        )
-    } else {
-        resp.to_string()
-    };
-    (req_sig, resp_sig)
+    quote! {
+        pub fn #fn_name(
+            #params,
+        ) -> impl ::core::future::Future<
+            Output = ::core::result::Result<#output, ::hellas_wire::WireStatus>,
+        > + Send {
+            async move { #body }
+        }
+    }
 }
 
-fn service_module_ident(proto_name: &str) -> String {
-    to_snake_case(proto_name)
+fn dispatch_arm(m: &MethodPlan) -> TokenStream {
+    let MethodPlan {
+        marker, fn_name, ..
+    } = m;
+    let helper = match m.shape {
+        Shape::Unary => quote! { dispatch_unary },
+        Shape::ServerStreaming => quote! { dispatch_server_streaming },
+        Shape::BidiStreaming => quote! { dispatch_bidi_streaming },
+    };
+    let req_expr = match m.shape {
+        Shape::BidiStreaming => quote! { ::std::boxed::Box::pin(req) },
+        _ => quote! { req },
+    };
+    quote! {
+        <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+            crate::call::#helper::<T, #marker, _, _, _>(inbound, |req| {
+                let h = &self.0;
+                async move { h.#fn_name(#req_expr).await }
+            })
+            .await
+        }
+    }
+}
+
+/// Boxed request/response stream type as it appears in handler signatures.
+fn boxed_stream(item: &syn::Path) -> TokenStream {
+    quote! {
+        ::std::pin::Pin<Box<dyn ::futures_core::Stream<
+            Item = ::core::result::Result<#item, ::hellas_wire::WireStatus>,
+        > + Send>>
+    }
+}
+
+/// One `#[doc = "..."]` attribute per line; prettyplease renders them as
+/// `///` doc comments.
+fn doc_lines(lines: &[String]) -> TokenStream {
+    let lines = lines.iter().map(|l| format!(" {l}"));
+    quote! { #(#[doc = #lines])* }
+}
+
+/// Hex-formatted u32 literal so IDs stay grep-able in the emitted file.
+fn hex_u32(v: u32) -> Literal {
+    Literal::from_str(&format!("0x{v:08x}")).expect("hex u32 literal")
+}
+
+fn rust_path(proto_fqn: &str) -> syn::Path {
+    let path = proto_fqn_to_rust_path(proto_fqn);
+    syn::parse_str(&path).unwrap_or_else(|e| panic!("invalid Rust path `{path}`: {e}"))
 }
 
 fn feature_for_package(package: &str) -> &'static str {
@@ -969,10 +869,8 @@ fn to_snake_case(input: &str) -> String {
 }
 
 /// Translate a fully-qualified proto type (e.g. `.hellas.swarm.v1.GetNodeInfoResponse`)
-/// into an absolute Rust path under `crate::pb::hellas::...`. Prost's
-/// `input_type` field is *relative* to the per-package module it generated,
-/// so it isn't usable from the centralized `pb::services` module without
-/// rewriting.
+/// into an absolute Rust path under `crate::pb::hellas::...`, usable from
+/// the centralized `pb::services` module.
 ///
 /// Nested message types (`.pkg.Parent.Child`) come through as Parent.child
 /// in proto naming — translated as `parent::Child` in Rust by prost's own
