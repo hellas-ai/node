@@ -2,68 +2,50 @@
 
 ## Quickstart
 
-Install:
-
-```bash
-cargo install --git https://github.com/hellas-ai/hellas
-```
-
 Execute:
 
 ```bash
-cargo run -- execute -p hey
+cargo run --features candle -- llm -p hey
 ```
 
 Execute locally with the catgrad backend:
 
 ```bash
-cargo run -- execute --local -p hey
+cargo run --features candle -- llm --local -p hey
 ```
-
-Local execution uses the same catgrad executor backend as `serve` and prefers
-accelerated backends when available (Metal on macOS, `--features cuda` on Linux).
 
 Verify a remote execution against the local catgrad backend:
 
 ```bash
-cargo run -- execute --verify-local -p hey
+cargo run --features candle -- llm --verify-local -p hey
 ```
 
 ## End-to-end
 
-Install server features:
-
-```bash
-cargo install --git https://github.com/hellas-ai/hellas --features serve
-```
-
 Run server:
 
 ```bash
-hellas-cli serve --execute-policy=eager
-Node Address: bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550
-RPC server running. Press Ctrl+C to stop
+cargo run --features candle -- serve --execute-policy=eager
 ```
 
-`hellas-cli serve` without policy flags now starts in deny-by-default mode
+`serve` without policy flags starts in deny-by-default mode
 (`--execute-policy=skip`). Only pass eager or allow-list policies when you
 intentionally want a node to serve remote work.
 
-Preload weights on startup:
+Load model metadata on startup:
 
 ```bash
-hellas-cli serve \
+cargo run --features candle -- serve \
   --execute-policy=eager \
   --preload HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
-Repeat `--preload` to warm multiple models before the node starts serving.
+Repeat `--preload` to load metadata for multiple models.
 
 Run client:
 
 ```bash
-cargo run -- execute bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550 -p hey
-Hello! How can I help you today?
+cargo run --features candle -- llm bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550 -p hey
 ```
 
 Monitor discovery and peer health:
@@ -75,13 +57,14 @@ cargo run -- monitor --timeout-secs 30
 Run HTTP gateway (OpenAI / Anthropic / plain completions over Hellas network):
 
 ```bash
-cargo run -- gateway --port 8080
+cargo run --features gateway -- gateway --port 8080
 ```
 
 Routes:
 
 ```bash
 POST /v1/chat/completions
+POST /v1/responses
 POST /v1/messages
 POST /v1/completions
 ```
@@ -111,7 +94,7 @@ $(nix build .#docker-cuda12-sm89 --print-out-paths) | docker load
 nix run .#docker-push-all                # push all images to ghcr.io/hellas-ai/hellas
 ```
 
-Run a CUDA server with persistent HF cache, metrics, and Jaeger tracing:
+Run a CUDA server with persistent HF cache and metrics:
 
 ```bash
 docker run --rm -it \
@@ -119,7 +102,6 @@ docker run --rm -it \
   -p 31145:31145/udp \
   -p 9090:9090 \
   -v ~/.cache/huggingface:/home/hellas/.cache/huggingface \
-  -e OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://jaeger:4318/v1/traces \
   ghcr.io/hellas-ai/hellas:cuda12-sm89 \
   --execute-policy=eager \
   --metrics-port=9090 \
