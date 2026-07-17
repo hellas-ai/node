@@ -57,6 +57,7 @@ catgrad = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+hellas-adaptors.workspace = true
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-models = { workspace = true, optional = true }
@@ -68,7 +69,6 @@ hellas-wire = { workspace = true, features = [
     "discovery-dht",
     "discovery-mdns",
 ] }
-hellas-adaptors.workspace = true
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.4"

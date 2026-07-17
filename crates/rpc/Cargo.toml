@@ -59,6 +59,8 @@ blake3 = { workspace = true }
 bytes = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+hellas-auth = { workspace = true }
+hellas-p2p = { workspace = true }
 hellas-wire = { workspace = true }
 k256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
@@ -68,8 +70,6 @@ serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
-hellas-auth = { workspace = true }
-hellas-p2p = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
