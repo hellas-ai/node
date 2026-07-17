@@ -27,3 +27,7 @@ i'm sorry if this isn't interesting, you're a great coder and i have deep respec
 so- what to do- i'm fully aware this this codebase is a long way from where it needs to be.
 
 the kind of stuff i'm looking for will notice abstractions that are useless and just cause extra typing. interfaces that are the wrong shape, requiring boilerplate.
+
+this doesnt just apply to the code too- but the files- is our crate layout ok? our modules? does everything have correct visibility>
+
+and our usage of libraries- are we using them in the expected way? are we duplicating features that they may already include upstream? can we simplify our code by relying on that?

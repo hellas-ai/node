@@ -13,3 +13,23 @@ Resolve - You provide a proof that resolves the condition a certain way- capital
 So you can see that there is only really two kinds of object in hellas world-
 
 Coin - this is the capital - when it is not currently Bound, the capital exists in the form of a Coin
+
+etc etc. you can read ../whitepaper repo to find out more about it.
+
+anyway- we depend a lot on these commonware crates. the commonware ecosystem looks kinda like this:
+
+commonware/monorepo - these are where the shared libs are
+commonware/alto - this is kinda a 'demo' repo where contributors put together as an example
+tempo/tempo - this is a modern, high-performance EVM blockchain, using the commonware libs
+
+these are all open-source projects and its encouraged to use them for reference.
+
+since we depend so heavily on them- something we want to do semi-regularly is make sure we're on the latest release. take a look at the PRs, issues, changelog. of all these projects, not just commonware. stuff we're looking for:
+
+- bug fixes that we might also need
+- checking that we're using the libraries correctly
+- checking upstream updates arent gonna break our app
+- integrating new ideas and features fro the other repos
+- lifting patterns and code shape from these projects where we feel it could benefit us
+
+as always though- we're focused on simplicity, elegance, correctness.
