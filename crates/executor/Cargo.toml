@@ -9,7 +9,13 @@ documentation.workspace = true
 
 [features]
 default = ["evaluate", "candle"]
-evaluate = ["dep:catgrad", "dep:catgrad-llm", "dep:chatgrad", "dep:hellas-models", "hellas-rpc/node"]
+evaluate = [
+    "dep:catgrad",
+    "dep:catgrad-llm",
+    "dep:chatgrad",
+    "dep:hellas-models",
+    "hellas-rpc/node",
+]
 candle = ["evaluate", "catgrad/candle-backend"]
 candle-cuda = ["candle", "catgrad/cuda"]
 candle-metal = ["candle", "catgrad/metal"]
@@ -23,9 +29,9 @@ catgrad = { workspace = true, default-features = false, features = [
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
-hellas-models = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
+hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = [
     "server",
     "execute",

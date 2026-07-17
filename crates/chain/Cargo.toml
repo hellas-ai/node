@@ -101,9 +101,6 @@ wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
 bs58 = { version = "0.5", optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.11", optional = true }
-url = { version = "2", optional = true }
 bytes = { workspace = true, optional = true }
 commonware-actor = { workspace = true, optional = true }
 commonware-broadcast = { workspace = true, optional = true }
@@ -138,6 +135,8 @@ prometheus-client = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "net",
@@ -155,6 +154,7 @@ tracing-subscriber = { workspace = true, optional = true, features = [
     "json",
     "env-filter",
 ] }
+url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 commonware-consensus = { workspace = true, features = ["mocks"] }

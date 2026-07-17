@@ -33,10 +33,7 @@ in
         package = mkOption {
           type = types.package;
           default =
-            if gateway.local || gateway.verifyLocal then
-              cfg.package
-            else
-              hellas.pickGatewayPackage pkgs;
+            if gateway.local || gateway.verifyLocal then cfg.package else hellas.pickGatewayPackage pkgs;
           defaultText = lib.literalMD ''
             The slim gateway CLI (`packages.cli`), or `services.hellas.package`
             when `gateway.local` / `gateway.verifyLocal` request an in-process

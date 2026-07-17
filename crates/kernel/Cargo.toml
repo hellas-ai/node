@@ -30,13 +30,13 @@ secp256k1 = { version = "0.31", default-features = false, optional = true, featu
 sha2 = { version = "0.11", default-features = false, optional = true }
 
 [dev-dependencies]
+
+allocation-counter = "0.8"
+criterion = "0.8.2"
 # Self-dependency so the crate's own integration tests, benches, and
 # examples see the placeholder constructors without shipping them in
 # production builds.
 hellas-kernel = { path = ".", features = ["placeholders"] }
-
-allocation-counter = "0.8"
-criterion = "0.8.2"
 itf = "0.4"
 proptest = "1"
 proptest-state-machine = "0.8"
