@@ -4,10 +4,10 @@ use crate::execution::{
     fetch_execution_stream,
 };
 use futures::StreamExt;
-use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::build_input_events;
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
+use hellas_rpc::{ContentId, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -19,6 +19,7 @@ pub struct ExecuteOptions {
     pub node_addrs: Vec<SocketAddr>,
     pub service: String,
     pub method: String,
+    pub execution_environment: ContentId,
     pub payload: Vec<u8>,
     pub retries: usize,
     pub producer_key_path: Option<PathBuf>,
@@ -50,6 +51,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             &options.service,
             &options.method,
             &options.payload,
+            options.execution_environment,
             &caller_key,
         )?,
     };
@@ -91,8 +93,9 @@ pub(crate) fn signed_input_events(
     service: &str,
     method: &str,
     payload: &[u8],
+    execution_environment: ContentId,
     key: &ProducerSigningKey,
 ) -> anyhow::Result<Vec<hellas_rpc::pb::execute::InputEventEnvelope>> {
-    let events = build_input_events(service, method, payload, key)?;
+    let events = build_input_events(service, method, payload, execution_environment, key)?;
     Ok(events.iter().map(input_event_to_pb).collect())
 }

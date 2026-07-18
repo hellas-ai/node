@@ -1,5 +1,7 @@
 use anyhow::Context;
 use hellas_rpc::ProducerSigningKey;
+#[cfg(feature = "node")]
+use hellas_rpc::{AssuranceRequirement, ContentId};
 use iroh::SecretKey;
 use std::fs;
 use std::io::ErrorKind;
@@ -11,6 +13,22 @@ const PRODUCER_KEY_FILE: &str = "signing-key.secp256k1";
 #[cfg(feature = "node")]
 const ARTIFACT_STORE_DIR: &str = "artifacts";
 const KEY_LEN: usize = 32;
+
+#[cfg(feature = "node")]
+pub fn load_provider_terms(
+    genesis: Option<&Path>,
+    codec: Option<&str>,
+    policy: Option<ContentId>,
+) -> anyhow::Result<(Vec<u8>, AssuranceRequirement)> {
+    let path = genesis.context("local provider requires --provider-genesis")?;
+    let genesis = fs::read(path)
+        .with_context(|| format!("failed to read provider genesis {}", path.display()))?;
+    let assurance = AssuranceRequirement::new(
+        codec.context("local provider requires --assurance-codec")?,
+        policy.context("local provider requires --assurance-policy")?,
+    )?;
+    Ok((genesis, assurance))
+}
 
 /// Resolve the identity file path and load or create the secret key.
 ///

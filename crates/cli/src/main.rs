@@ -32,8 +32,8 @@ fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
 }
 
 fn parse_public_key_hex(s: &str) -> Result<hellas_rpc::PublicKey, String> {
-    let bytes = parse_hex_array::<{ hellas_rpc::PublicKey::LEN }>(s)?;
-    Ok(hellas_rpc::PublicKey::from_compressed_sec1(bytes))
+    let bytes = parse_hex_array::<33>(s)?;
+    Ok(hellas_rpc::PublicKey::Secp256k1(bytes))
 }
 
 fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -47,6 +47,10 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
             .map_err(|err| format!("invalid hex at byte {idx}: {err}"))?;
     }
     Ok(out)
+}
+
+fn parse_content_id_hex(s: &str) -> Result<hellas_rpc::ContentId, String> {
+    parse_hex_array::<32>(s).map(hellas_rpc::ContentId::from_bytes)
 }
 
 #[cfg(feature = "gateway")]
@@ -130,6 +134,21 @@ struct Cli {
     /// Path to producer signing key (default: $HOME/.hellas/signing-key.secp256k1)
     #[arg(long = "producer-key-path", global = true)]
     producer_key_path: Option<PathBuf>,
+
+    #[cfg(feature = "node")]
+    /// Canonical SignedProviderGenesis bytes served with local quotes.
+    #[arg(long = "provider-genesis", global = true)]
+    provider_genesis: Option<PathBuf>,
+
+    #[cfg(feature = "node")]
+    /// Required assurance evidence codec for local quotes.
+    #[arg(long = "assurance-codec", global = true)]
+    assurance_codec: Option<String>,
+
+    #[cfg(feature = "node")]
+    /// Assurance policy ContentId for local quotes.
+    #[arg(long = "assurance-policy", global = true, value_parser = parse_content_id_hex)]
+    assurance_policy: Option<hellas_rpc::ContentId>,
 
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
@@ -320,6 +339,9 @@ enum Commands {
         /// Fetch route method used when --responses-backend=fetch.
         #[arg(long = "responses-fetch-route-method", default_value = "responses")]
         responses_fetch_route_method: String,
+        /// Fetch ProgramManifest ContentId expected from the provider route.
+        #[arg(long = "responses-fetch-execution-environment", value_parser = parse_content_id_hex, required_if_eq("responses_backend", "fetch"))]
+        responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
         /// JSON object merged into OpenAI Responses requests before signing
         /// and sending them through Fetch.
         #[arg(long = "responses-fetch-request-overrides", value_parser = parse_json_object)]
@@ -415,6 +437,9 @@ enum Commands {
         /// Fetch method label. The protocol records it but does not interpret it.
         #[arg(long)]
         method: String,
+        /// Fetch ProgramManifest ContentId expected from the provider route.
+        #[arg(long = "execution-environment", value_parser = parse_content_id_hex)]
+        execution_environment: hellas_rpc::ContentId,
         /// Exact UTF-8 JSON payload bytes.
         #[arg(
             long,
@@ -474,6 +499,12 @@ async fn main() {
         tracing_config::init_tracing(cli.log_file.as_deref())
     };
     let producer_key_path = cli.producer_key_path.clone();
+    #[cfg(feature = "node")]
+    let provider_genesis = cli.provider_genesis.clone();
+    #[cfg(feature = "node")]
+    let assurance_codec = cli.assurance_codec.clone();
+    #[cfg(feature = "node")]
+    let assurance_policy = cli.assurance_policy;
 
     if let Commands::ProducerKey {
         command: ProducerKeyCommand::Show,
@@ -551,6 +582,17 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
+            let (provider_genesis, assurance) = match identity::load_provider_terms(
+                provider_genesis.as_deref(),
+                assurance_codec.as_deref(),
+                assurance_policy,
+            ) {
+                Ok(terms) => terms,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    std::process::exit(1);
+                }
+            };
             commands::serve::run(commands::serve::ServeOptions {
                 port,
                 execute_policy,
@@ -565,6 +607,8 @@ async fn main() {
                 fetch_queue_size,
                 secret_key,
                 producer_key,
+                provider_genesis,
+                assurance,
             })
             .await
         }
@@ -591,6 +635,7 @@ async fn main() {
             responses_proxy_api_key_env,
             responses_fetch_route_service,
             responses_fetch_route_method,
+            responses_fetch_execution_environment,
             responses_fetch_request_overrides,
             trusted_producer_public_keys,
             wrap,
@@ -618,10 +663,17 @@ async fn main() {
                 responses_proxy_api_key_env,
                 responses_fetch_route_service,
                 responses_fetch_route_method,
+                responses_fetch_execution_environment,
                 responses_fetch_request_overrides: responses_fetch_request_overrides
                     .unwrap_or_default(),
                 trusted_producer_public_keys,
                 producer_key_path: producer_key_path.clone(),
+                #[cfg(feature = "evaluate")]
+                provider_genesis: provider_genesis.clone(),
+                #[cfg(feature = "evaluate")]
+                assurance_codec: assurance_codec.clone(),
+                #[cfg(feature = "evaluate")]
+                assurance_policy,
                 secret_key,
                 wrap,
                 wrap_args,
@@ -667,6 +719,9 @@ async fn main() {
                     verify_local,
                     dtype,
                     producer_key_path: producer_key_path.clone(),
+                    provider_genesis: provider_genesis.clone(),
+                    assurance_codec: assurance_codec.clone(),
+                    assurance_policy,
                 },
                 secret_key,
             )
@@ -677,6 +732,7 @@ async fn main() {
             node_addrs,
             service,
             method,
+            execution_environment,
             payload,
             payload_file,
             retries,
@@ -698,6 +754,7 @@ async fn main() {
                             node_addrs,
                             service,
                             method,
+                            execution_environment,
                             payload,
                             retries,
                             producer_key_path: producer_key_path.clone(),
@@ -863,6 +920,8 @@ mod tests {
             "echo",
             "--method",
             "run",
+            "--execution-environment",
+            "0909090909090909090909090909090909090909090909090909090909090909",
             "--payload",
             r#"{"x":1}"#,
         ])
@@ -1083,6 +1142,8 @@ mod tests {
             "codex",
             "--responses-fetch-route-method",
             "responses",
+            "--responses-fetch-execution-environment",
+            "0909090909090909090909090909090909090909090909090909090909090909",
             "--responses-fetch-request-overrides",
             r#"{"store":false}"#,
         ])

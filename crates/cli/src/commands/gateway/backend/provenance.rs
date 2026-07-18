@@ -22,6 +22,5 @@ pub(super) fn stop_reason_from_runtime(stop_reason: RuntimeStopReason) -> StopRe
     match stop_reason {
         RuntimeStopReason::EndOfSequence => StopReason::EndOfText,
         RuntimeStopReason::MaxNewTokens => StopReason::MaxOutputTokens,
-        RuntimeStopReason::Cancelled => StopReason::Cancelled,
     }
 }

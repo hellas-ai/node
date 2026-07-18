@@ -5,9 +5,11 @@ use hellas_executor::{
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
     RequestRateLimit, SpendLimit,
 };
-use hellas_rpc::Dtype;
-use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::policy::ExecutePolicy;
+use hellas_rpc::{
+    AssuranceRequirement, ContentId, Dtype, FetchProgramManifest, ProducerSigningKey,
+    ProgramManifest,
+};
 use iroh::SecretKey;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -41,6 +43,8 @@ pub struct ServeOptions {
     pub fetch_queue_size: usize,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
+    pub provider_genesis: Vec<u8>,
+    pub assurance: AssuranceRequirement,
 }
 
 pub async fn run(options: ServeOptions) -> CliResult<()> {
@@ -83,6 +87,8 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         fetch_queue_size: options.fetch_queue_size,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
+        provider_genesis: options.provider_genesis,
+        assurance: options.assurance,
         metrics: metrics.clone(),
     })
     .await
@@ -160,6 +166,12 @@ fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, F
             .register(
                 FetchRoute::new(route.service, route.method),
                 FetchRouteEntry {
+                    execution_environment: ProgramManifest::Fetch(FetchProgramManifest {
+                        program: parse_content_id(&route.manifest.program)?,
+                        config: parse_content_id(&route.manifest.config)?,
+                        build: parse_content_id(&route.manifest.build)?,
+                    })
+                    .content_id(),
                     provider: route.upstream.into_provider()?,
                     projector_factory,
                     capabilities: route.capabilities.into_policy()?,
@@ -204,9 +216,29 @@ struct FetchConfigRoute {
     /// The wire contract this route speaks; selects the output projector and
     /// event canonicalizer. Explicit because it is consensus-relevant.
     protocol: FetchRouteProtocol,
+    manifest: FetchManifest,
     upstream: FetchUpstream,
     #[serde(default)]
     capabilities: FetchPolicyLimits,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchManifest {
+    program: String,
+    config: String,
+    build: String,
+}
+
+fn parse_content_id(raw: &str) -> CliResult<ContentId> {
+    if raw.len() != 64 {
+        bail!("ContentId must be 64 hex characters");
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&raw[index * 2..index * 2 + 2], 16)
+            .with_context(|| format!("invalid ContentId hex at byte {index}"))?;
+    }
+    Ok(ContentId::from_bytes(bytes))
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +504,11 @@ mod tests {
             "service": "codex",
             "method": "responses",
             "protocol": "openai-responses",
+            "manifest": {
+                "program": "0101010101010101010101010101010101010101010101010101010101010101",
+                "config": "0202020202020202020202020202020202020202020202020202020202020202",
+                "build": "0303030303030303030303030303030303030303030303030303030303030303"
+            },
             // Keep this fixture independent of the process-global HOME.
             "upstream": { "type": "codex-oauth", "auth_path": "/tmp/hellas-test-codex-auth.json" },
             "capabilities": capabilities,
