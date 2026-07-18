@@ -122,7 +122,7 @@ mod tests {
             static_feed(vec![local, remote], 10, 100, Scope::Any),
             static_feed(vec![remote], 20, 100, Scope::Any),
         ];
-        let mut engine = SwarmEngine::new(local, b"/svc.Test/1.0", feeds);
+        let mut engine = SwarmEngine::new(local, b"/svc.Test/2.0", feeds);
 
         let first = engine
             .next()

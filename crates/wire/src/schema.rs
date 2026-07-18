@@ -18,8 +18,8 @@
 
 use crate::canonical::{Encode, Writer};
 
-pub const METHOD_DOMAIN: &[u8] = b"hellas.wire.method.v1";
-pub const SERVICE_DOMAIN: &[u8] = b"hellas.wire.service.v1";
+pub const METHOD_DOMAIN: &[u8] = b"hellas.wire.method.v2";
+pub const SERVICE_DOMAIN: &[u8] = b"hellas.wire.service.v2";
 
 #[derive(Clone, Debug)]
 pub struct MethodSchema {
@@ -40,10 +40,7 @@ pub struct ServiceSchema {
 pub enum TypeSchema {
     Primitive(PrimKind),
     Message(MessageSchema),
-    EnumRef {
-        name: String,
-        variants: Vec<(String, i32)>,
-    },
+    EnumRef { name: String, variants: Vec<i32> },
     Repeated(Box<TypeSchema>),
     Map(Box<TypeSchema>, Box<TypeSchema>),
     Optional(Box<TypeSchema>),
@@ -103,10 +100,7 @@ impl Encode for TypeSchema {
             Self::EnumRef { name, variants } => {
                 name.as_str().encoded_size()
                     + 4
-                    + variants
-                        .iter()
-                        .map(|(n, v)| n.as_str().encoded_size() + 4 + Encode::encoded_size(v))
-                        .sum::<usize>()
+                    + variants.iter().map(Encode::encoded_size).sum::<usize>()
             }
             Self::Repeated(inner) | Self::Optional(inner) => inner.encoded_size(),
             Self::Map(k, v) => k.encoded_size() + v.encoded_size(),
@@ -129,8 +123,7 @@ impl Encode for TypeSchema {
                 name.as_str().encode_to(writer);
                 let len = u32::try_from(variants.len()).expect("enum variant count fits u32");
                 writer.write(&len.to_be_bytes());
-                for (n, v) in variants {
-                    n.as_str().encode_to(writer);
+                for v in variants {
                     writer.write(&v.to_be_bytes());
                 }
             }
@@ -262,10 +255,7 @@ mod tests {
                         number: 3,
                         ty: TypeSchema::EnumRef {
                             name: "Mode".to_string(),
-                            variants: vec![
-                                ("MODE_UNSPECIFIED".to_string(), 0),
-                                ("MODE_FAST".to_string(), 1),
-                            ],
+                            variants: vec![0, 1],
                         },
                     },
                     FieldSchema {
@@ -302,9 +292,9 @@ mod tests {
         let m = sample_method();
         assert_eq!(
             hex(&m.digest()),
-            "5030af1327754bf8a0ccf3f85451a25a9557881b0464b66a1411eb0d4ad5bb05",
+            "f871f1b997a9126e9091c64573f48c6d03da21195e0c3b3258c11865cc978fd7",
         );
-        assert_eq!(m.method_id(), 0x13af3050);
+        assert_eq!(m.method_id(), 0xb9f171f8);
     }
 
     /// Same contract as [`method_digest_is_pinned`], for SERVICE_ID.
@@ -316,8 +306,8 @@ mod tests {
         };
         assert_eq!(
             hex(&s.digest()),
-            "88e6c731942566bb903c20afa36a37211edb7c3ddc2bbe456ba6f85ac8ed3da3",
+            "b44b68e822aa2a26a1ce863a62809716ee58c1b110bc651c381dcf35984a243f",
         );
-        assert_eq!(s.service_id(), 0x31c7e688);
+        assert_eq!(s.service_id(), 0xe8684bb4);
     }
 }

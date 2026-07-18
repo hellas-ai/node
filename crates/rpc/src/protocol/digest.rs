@@ -34,6 +34,44 @@ impl Digest {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentId(Digest);
+
+impl ContentId {
+    pub fn hash(bytes: &[u8]) -> Self {
+        Self(Digest::hash(bytes))
+    }
+
+    pub const fn from_bytes(bytes: [u8; Digest::LEN]) -> Self {
+        Self(Digest::from_bytes(bytes))
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, DigestError> {
+        Digest::from_slice(bytes).map(Self)
+    }
+
+    pub const fn digest(self) -> Digest {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; Digest::LEN] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for ContentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ContentId").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ContentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DigestError {
     #[error("digest must be 32 bytes, got {len}")]
@@ -103,7 +141,7 @@ impl<'de> Deserialize<'de> for Digest {
 
 pub fn hash_tuple(tag: &str, fields: &[&[u8]]) -> Digest {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(tags::HASH_TUPLE_V1.as_bytes());
+    hasher.update(tags::HASH_TUPLE_V2.as_bytes());
     hasher.update(&(tag.len() as u32).to_be_bytes());
     hasher.update(tag.as_bytes());
     hasher.update(&(fields.len() as u32).to_be_bytes());

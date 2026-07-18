@@ -40,12 +40,14 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 [dependencies]
 blake3 = { workspace = true }
 bytes = "1"
+ed25519-dalek = { workspace = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 hellas-auth = { workspace = true }
 hellas-p2p = { workspace = true }
 hellas-wire = { workspace = true }
 k256 = { workspace = true }
+p256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true }
 serde_bytes = { workspace = true }

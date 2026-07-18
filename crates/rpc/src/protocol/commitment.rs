@@ -26,33 +26,10 @@ impl SchemeId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum AssuranceStrategy {
-    ProducerAttested = tags::STRATEGY_PRODUCER_ATTESTED,
-    ZkTls = tags::STRATEGY_ZKTLS,
-}
-
-impl AssuranceStrategy {
-    pub const fn to_byte(self) -> u8 {
-        self as u8
-    }
-
-    pub fn from_byte(byte: u8) -> Result<Self, TagError> {
-        match byte {
-            tags::STRATEGY_PRODUCER_ATTESTED => Ok(Self::ProducerAttested),
-            tags::STRATEGY_ZKTLS => Ok(Self::ZkTls),
-            _ => Err(TagError::UnknownStrategy(byte)),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TagError {
     #[error("unknown scheme id byte 0x{0:02x}")]
     UnknownScheme(u8),
-    #[error("unknown assurance strategy byte 0x{0:02x}")]
-    UnknownStrategy(u8),
 }
 
 macro_rules! impl_u8_serde {
@@ -103,7 +80,6 @@ macro_rules! impl_u8_serde {
 }
 
 impl_u8_serde!(SchemeId, SchemeId::from_byte);
-impl_u8_serde!(AssuranceStrategy, AssuranceStrategy::from_byte);
 
 macro_rules! digest_commitment {
     ($ty:ident) => {

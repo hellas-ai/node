@@ -11,7 +11,7 @@ pub struct CanonicalizationId(Digest);
 
 impl CanonicalizationId {
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(hash_tuple(tags::STREAM_CANONICALIZATION_ID_V1, &[bytes]))
+        Self(hash_tuple(tags::STREAM_CANONICALIZATION_ID_V2, &[bytes]))
     }
 
     pub const fn from_digest(digest: Digest) -> Self {
@@ -54,7 +54,7 @@ pub struct InputCommitment(Digest);
 impl InputCommitment {
     pub fn from_terminal_event(event: EventCommitment) -> Self {
         Self(hash_tuple(
-            tags::STREAM_INPUT_COMMITMENT_V1,
+            tags::STREAM_INPUT_COMMITMENT_V2,
             &[event.as_bytes()],
         ))
     }
@@ -77,7 +77,7 @@ pub struct StreamId(Digest);
 
 impl StreamId {
     pub fn from_input_commitment(input: InputCommitment) -> Self {
-        Self(hash_tuple(tags::STREAM_ID_V1, &[input.as_bytes()]))
+        Self(hash_tuple(tags::STREAM_ID_V2, &[input.as_bytes()]))
     }
 
     pub const fn from_digest(digest: Digest) -> Self {
@@ -159,7 +159,7 @@ impl InputEventBody {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = DagCborEncoder::new();
         encoder.array(8);
-        encoder.str(tags::STREAM_INPUT_EVENT_V1);
+        encoder.str(tags::STREAM_INPUT_EVENT_V2);
         encoder.u64(self.scheme.to_byte() as u64);
         encoder.u64(self.sequence);
         encoder.bytes(self.previous_event.as_bytes());
@@ -175,7 +175,7 @@ impl InputEventBody {
     }
 
     pub fn signature_preimage(&self) -> Digest {
-        hash_tuple(tags::STREAM_EVENT_SIGNATURE_V1, &[&self.canonical_bytes()])
+        hash_tuple(tags::STREAM_EVENT_SIGNATURE_V2, &[&self.canonical_bytes()])
     }
 }
 
@@ -259,7 +259,7 @@ impl OutputEventBody {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = DagCborEncoder::new();
         encoder.array(10);
-        encoder.str(tags::STREAM_OUTPUT_EVENT_V1);
+        encoder.str(tags::STREAM_OUTPUT_EVENT_V2);
         encoder.u64(self.scheme.to_byte() as u64);
         encoder.bytes(self.input.as_bytes());
         encoder.bytes(self.stream_id.as_bytes());
@@ -277,7 +277,7 @@ impl OutputEventBody {
     }
 
     pub fn signature_preimage(&self) -> Digest {
-        hash_tuple(tags::STREAM_EVENT_SIGNATURE_V1, &[&self.canonical_bytes()])
+        hash_tuple(tags::STREAM_EVENT_SIGNATURE_V2, &[&self.canonical_bytes()])
     }
 }
 
@@ -679,14 +679,14 @@ pub fn input_genesis(scheme: SchemeId, caller_key: &PublicKey) -> EventCommitmen
     let scheme = [scheme.to_byte()];
     let key_kind = [caller_key.kind().to_byte()];
     EventCommitment::from_digest(hash_tuple(
-        tags::STREAM_INPUT_GENESIS_V1,
+        tags::STREAM_INPUT_GENESIS_V2,
         &[&scheme, &key_kind, caller_key.bytes()],
     ))
 }
 
 pub fn output_genesis(input: InputCommitment, stream_id: StreamId) -> EventCommitment {
     EventCommitment::from_digest(hash_tuple(
-        tags::STREAM_OUTPUT_GENESIS_V1,
+        tags::STREAM_OUTPUT_GENESIS_V2,
         &[input.as_bytes(), stream_id.as_bytes()],
     ))
 }
@@ -1130,7 +1130,7 @@ mod tests {
         signature_bytes[7] ^= 0x01;
         let tampered = SignedOutputEvent::from_parts(
             envelope.event().body().clone(),
-            Signature::from_compact_secp256k1(signature_bytes),
+            Signature::Secp256k1(signature_bytes),
             *envelope.event().public_key(),
         )
         .unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
 
         assert_eq!(
             actual,
-            "c71feec4ba73731587f1d354046b1b2b1b54bdb0b45888f9553f2f976eeb9f19"
+            "a118ccc717bbbd633f84bedc8e883cc03be39ada5e810fae527278305487ec37"
         );
     }
 }

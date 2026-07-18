@@ -116,15 +116,15 @@ mod id_pins {
     #[test]
     fn execute_ids_are_stable() {
         use super::services::execute::{Execute, RunTicket};
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xa2f84feb);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x43672b6d);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xf5bbaa4d);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xed73b80c);
     }
 
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{GetStateRoot, LightClient};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x983eb385);
-        assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xe34795e9);
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x690128bc);
+        assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0x4a19b4e6);
     }
 }
