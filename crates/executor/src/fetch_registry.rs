@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::fetch_policy::{FetchRoute, FetchRoutePolicy};
 use crate::fetch_projection::FetchProjectorFactory;
 use crate::fetch_provider::FetchProvider;
+use hellas_rpc::ContentId;
 
 /// The route table: the single source of fetch dispatch truth.
 ///
@@ -19,6 +20,7 @@ pub struct FetchRouteRegistry {
 
 #[derive(Clone)]
 pub struct FetchRouteEntry {
+    pub execution_environment: ContentId,
     pub provider: Arc<dyn FetchProvider>,
     pub projector_factory: Arc<dyn FetchProjectorFactory>,
     /// Route-wide self-protection, independent of caller: what this upstream

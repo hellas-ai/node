@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::ExecutorError;
 use hellas_rpc::fetch::verify_input_events;
@@ -10,12 +10,9 @@ use hellas_rpc::{Digest, RequestCommitment};
 
 use crate::executor::TicketOutcome;
 use crate::fetch_provider::FetchProviderRequest;
-use crate::state::{QuoteKind, QuoteRecord};
+use crate::state::{QUOTE_AMOUNT, QUOTE_TTL, QuoteKind, QuoteRecord, quote_ticket};
 
 use super::Executor;
-
-const STATIC_QUOTE_AMOUNT: u64 = 1000;
-const QUOTE_TTL: Duration = Duration::from_secs(30);
 
 impl Executor {
     pub(super) async fn handle_quote_fetch(
@@ -37,6 +34,7 @@ impl Executor {
         let hellas_rpc::fetch::FetchInput {
             service,
             method,
+            execution_environment,
             body,
             caller_key,
             ..
@@ -46,8 +44,14 @@ impl Executor {
             ))
         })?;
         let route = crate::fetch_policy::FetchRoute::new(service.clone(), method.clone());
-        if !self.fetch_routes.contains(&route) {
-            return Err(super::execution::no_fetch_route_error(&route));
+        let entry = self
+            .fetch_routes
+            .entry(&route)
+            .ok_or_else(|| super::execution::no_fetch_route_error(&route))?;
+        if execution_environment != entry.execution_environment {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "fetch execution environment does not match route manifest".into(),
+            ));
         }
         let (quote, _) = self
             .fetch_state
@@ -61,8 +65,13 @@ impl Executor {
         );
 
         let request_commitment = RequestCommitment::from_digest(quote.input_commitment.digest());
-        let request_commitment_bytes = self.store.create_quote(QuoteRecord {
+        let (terms, ticket) = quote_ticket(
             request_commitment,
+            self.provider.genesis.as_slice(),
+            self.provider.assurance.clone(),
+        )?;
+        let request_commitment_bytes = self.store.create_quote(QuoteRecord {
+            terms,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: format!("fetch:{service}/{method}"),
             runner_public_key: caller_key,
@@ -75,16 +84,12 @@ impl Executor {
             request_commitment = %format_request_commitment(&request_commitment_bytes),
             service,
             method,
-            amount = STATIC_QUOTE_AMOUNT,
+            amount = QUOTE_AMOUNT,
             "quoted fetch execution"
         );
 
         Ok(TicketOutcome {
-            response: Ticket {
-                request_commitment: request_commitment_bytes.to_vec(),
-                amount: STATIC_QUOTE_AMOUNT,
-                ttl_ms: QUOTE_TTL.as_millis() as u64,
-            },
+            response: ticket,
             provenance: ExecutionProvenance {
                 commitment_id: request_commitment_bytes,
             },

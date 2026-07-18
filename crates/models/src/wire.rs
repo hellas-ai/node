@@ -12,6 +12,8 @@ pub fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
         ModelAssetsError::Spec(_)
         | ModelAssetsError::ParseModelConfig { .. }
         | ModelAssetsError::ConstructModelConfig { .. }
+        | ModelAssetsError::InvalidProgramGraph
+        | ModelAssetsError::UnresolvedRevision
         | ModelAssetsError::NegativePromptTokenId { .. }
         | ModelAssetsError::NegativeStopTokenId { .. }
         | ModelAssetsError::TokenBytes { .. }

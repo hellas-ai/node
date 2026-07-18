@@ -14,15 +14,22 @@ use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::{InputCommitment, OutputEventEnvelope};
+use hellas_rpc::{AssuranceRequirement, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
 use hellas_wire::WireStatus;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::fetch_policy::FetchQuotaReservation;
-use crate::fetch_projection::{FetchProjector, FetchUsage};
+use crate::fetch_projection::FetchProjector;
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
 pub use actor::{Executor, ExecutorSpawnConfig};
+
+#[derive(Clone)]
+pub(crate) struct ProviderContext {
+    pub producer_key: Arc<ProducerSigningKey>,
+    pub genesis: Arc<Vec<u8>>,
+    pub assurance: AssuranceRequirement,
+}
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the
@@ -118,7 +125,6 @@ pub(crate) type ExecuteEventReceiverSender = mpsc::Sender<Result<WorkEvent, Wire
 
 pub(crate) struct FetchProviderRun {
     pub output_events: Vec<OutputEventEnvelope>,
-    pub usage: FetchUsage,
 }
 
 pub(crate) struct FetchProviderFailure {

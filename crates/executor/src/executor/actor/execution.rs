@@ -8,11 +8,11 @@ use crate::fetch::{FetchStateError, FetchTranscript};
 use crate::fetch_policy::{FetchAccessError, FetchRoute};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
-use crate::state::{QuoteKind, new_execution_id};
+use crate::state::{QuoteKind, new_execution_id, validate_job_terms};
 use futures_util::StreamExt;
-use hellas_rpc::fetch::FetchOutputTranscriptBuilder;
+use hellas_rpc::fetch::{FetchOutputTranscriptBuilder, decode_fetch_terminal_payload};
 use hellas_rpc::pb::execute::{
-    FinishStatus, RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
+    RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
 };
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::{VerifiedRunTicket, verify_run_ticket};
@@ -38,7 +38,12 @@ impl Executor {
         let verified_run = verify_run_ticket(&request).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!("invalid run ticket: {err}"))
         })?;
-        let request_commitment_id = verified_run.request_commitment;
+        validate_job_terms(
+            &verified_run.terms,
+            self.provider.genesis.as_slice(),
+            &self.provider.assurance,
+        )?;
+        let request_commitment_id = *verified_run.terms.request.as_bytes();
         let request_commitment = request_commitment_id.to_vec();
         let input_commitment =
             InputCommitment::from_digest(Digest::from_bytes(request_commitment_id));
@@ -76,6 +81,11 @@ impl Executor {
                 });
             }
         };
+        if quote.terms != verified_run.terms {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "run ticket terms do not match quote".into(),
+            ));
+        }
         ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
         match quote.kind {
             #[cfg(feature = "evaluate")]
@@ -238,7 +248,7 @@ impl Executor {
         request_commitment_id: [u8; 32],
         verified_run: &VerifiedRunTicket,
     ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
-        let producer_key = self.producer_key.public_key();
+        let producer_key = self.provider.producer_key.public_key();
         let transcript = match self
             .fetch_state
             .replay_completed(input_commitment, &producer_key)
@@ -261,7 +271,11 @@ impl Executor {
 
     fn start_fetch_execution(&mut self, pending: PendingFetch) {
         self.active_fetches = self.active_fetches.saturating_add(1);
-        spawn_fetch_provider(self.tx.clone(), Arc::clone(&self.producer_key), pending);
+        spawn_fetch_provider(
+            self.tx.clone(),
+            Arc::clone(&self.provider.producer_key),
+            pending,
+        );
     }
 
     fn finish_fetch_slot(&mut self) {
@@ -286,44 +300,51 @@ impl Executor {
                 let error = failure.error.to_string();
                 if let Err(err) = self
                     .fetch_access_policy
-                    .reconcile_reservation(quota_reservation.as_ref(), None)
+                    .cancel_reservation(quota_reservation.as_ref())
                 {
                     warn!(
                         %execution_id,
                         quota_error = %err,
-                        "failed to reconcile fetch quota after provider failure"
+                        "failed to cancel fetch quota after provider failure"
                     );
                 }
                 let _ = self.fetch_state.fail(input_commitment, error.clone());
-                self.metrics
-                    .record_execution_failed(&model_id, failure.position);
+                self.metrics.record_execution_failed(&model_id, 0);
                 send_fetch_failed(sender, failure.position, error).await;
                 self.finish_fetch_slot();
                 return;
             }
         };
 
-        let transcript = match self.fetch_state.complete_output(
-            input_commitment,
-            run.output_events,
-            &self.producer_key.public_key(),
-        ) {
-            Ok(transcript) => transcript,
+        let (event, billable_units) = match fetch_finished_event(&run.output_events) {
+            Ok(event) => event,
             Err(err) => {
-                let error = fetch_execute_error(err).to_string();
+                let error = err.to_string();
                 let _ = self.fetch_state.fail(input_commitment, error.clone());
-                let total_units = run.usage.total_or_output();
-                self.metrics.record_execution_failed(&model_id, total_units);
-                send_fetch_failed(sender, total_units, error).await;
+                let _ = self
+                    .fetch_access_policy
+                    .cancel_reservation(quota_reservation.as_ref());
+                self.metrics.record_execution_failed(&model_id, 0);
+                send_fetch_failed(sender, 0, error).await;
                 self.finish_fetch_slot();
                 return;
             }
         };
-
-        let total_units = run.usage.total_or_output();
+        if let Err(err) = self.fetch_state.complete_output(
+            input_commitment,
+            run.output_events,
+            &self.provider.producer_key.public_key(),
+        ) {
+            let error = fetch_execute_error(err).to_string();
+            let _ = self.fetch_state.fail(input_commitment, error.clone());
+            self.metrics.record_execution_failed(&model_id, 0);
+            send_fetch_failed(sender, 0, error).await;
+            self.finish_fetch_slot();
+            return;
+        }
         if let Err(err) = self
             .fetch_access_policy
-            .reconcile_reservation(quota_reservation.as_ref(), Some(run.usage))
+            .reconcile_reservation(quota_reservation.as_ref(), billable_units)
         {
             warn!(
                 %execution_id,
@@ -331,30 +352,15 @@ impl Executor {
                 "failed to reconcile fetch quota after provider completion"
             );
         }
-        let event = match fetch_finished_event(
-            transcript.output_events(),
-            FinishStatus::EndOfSequence,
-            total_units,
-        ) {
-            Ok(event) => event,
-            Err(err) => {
-                let error = err.to_string();
-                let _ = self.fetch_state.fail(input_commitment, error.clone());
-                self.metrics.record_execution_failed(&model_id, total_units);
-                send_fetch_failed(sender, total_units, error).await;
-                self.finish_fetch_slot();
-                return;
-            }
-        };
 
         self.metrics
-            .record_execution_completed(&model_id, total_units);
+            .record_execution_completed(&model_id, billable_units);
         let _ = sender.send(Ok(event)).await;
 
         info!(
             %execution_id,
             request_commitment = %format_request_commitment(&request_commitment_id),
-            total_units,
+            billable_units,
             "completed fetch execution"
         );
         self.finish_fetch_slot();
@@ -476,7 +482,7 @@ async fn run_fetch_provider(
 ) -> Result<FetchProviderRun, FetchProviderFailure> {
     let mut builder = FetchOutputTranscriptBuilder::new(input_commitment, producer_key);
     let mut position = 0_u64;
-    let mut terminal_payload = None;
+    let mut terminal = None;
     let mut stream = provider
         .run(request)
         .await
@@ -493,7 +499,7 @@ async fn run_fetch_provider(
         process_projected_fetch(
             projected,
             &mut builder,
-            &mut terminal_payload,
+            &mut terminal,
             &mut position,
             &sender,
         )
@@ -507,12 +513,12 @@ async fn run_fetch_provider(
     process_projected_fetch(
         projected,
         &mut builder,
-        &mut terminal_payload,
+        &mut terminal,
         &mut position,
         &sender,
     )
     .await?;
-    let terminal_payload = terminal_payload.ok_or_else(|| FetchProviderFailure {
+    let terminal_payload = terminal.ok_or_else(|| FetchProviderFailure {
         position,
         error: FetchProviderError::failed(
             "fetch provider ended without terminal event".to_string(),
@@ -524,23 +530,20 @@ async fn run_fetch_provider(
             position,
             error: FetchProviderError::failed(format!("fetch output transcript failed: {err}")),
         })?;
-    Ok(FetchProviderRun {
-        output_events,
-        usage: projector.usage().unwrap_or_default(),
-    })
+    Ok(FetchProviderRun { output_events })
 }
 
 async fn process_projected_fetch(
     projected: Vec<ProjectedFetch>,
     builder: &mut FetchOutputTranscriptBuilder<'_>,
-    terminal_payload: &mut Option<Vec<u8>>,
+    terminal: &mut Option<Vec<u8>>,
     position: &mut u64,
     sender: &mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
 ) -> Result<(), FetchProviderFailure> {
     for item in projected {
         match item {
             ProjectedFetch::Event(payload) => {
-                if terminal_payload.is_some() {
+                if terminal.is_some() {
                     return Err(FetchProviderFailure {
                         position: *position,
                         error: FetchProviderError::failed(
@@ -573,7 +576,7 @@ async fn process_projected_fetch(
                     })?;
             }
             ProjectedFetch::Terminal(payload) => {
-                if terminal_payload.replace(payload).is_some() {
+                if terminal.replace(payload).is_some() {
                     return Err(FetchProviderFailure {
                         position: *position,
                         error: FetchProviderError::failed(
@@ -608,8 +611,6 @@ async fn fetch_transcript_outcome(
             commitment_id: request_commitment_id,
         },
         transcript.output_events(),
-        FinishStatus::EndOfSequence,
-        0,
     )
     .await
 }
@@ -617,10 +618,8 @@ async fn fetch_transcript_outcome(
 async fn fetch_finished_outcome(
     provenance: ExecutionProvenance,
     output_events: &[OutputEventEnvelope],
-    status: FinishStatus,
-    total_units: u64,
 ) -> Result<ExecuteOutcome, ExecutorError> {
-    let event = fetch_finished_event(output_events, status, total_units)?;
+    let (event, _) = fetch_finished_event(output_events)?;
     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
     sender
         .send(Ok(event))
@@ -635,17 +634,23 @@ async fn fetch_finished_outcome(
 
 fn fetch_finished_event(
     output_events: &[OutputEventEnvelope],
-    status: FinishStatus,
-    total_units: u64,
-) -> Result<WorkEvent, ExecutorError> {
+) -> Result<(WorkEvent, u64), ExecutorError> {
+    let terminal = output_events
+        .last()
+        .ok_or_else(|| ExecutorError::InvalidQuoteRequest("empty fetch transcript".to_string()))?;
+    let billable_units = decode_fetch_terminal_payload(terminal.payload())
+        .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?
+        .billable_units();
     let pb_output_events = output_events.iter().map(output_event_to_pb).collect();
-    Ok(WorkEvent {
-        kind: Some(work_event::Kind::Finished(WorkFinished {
-            status: status as i32,
-            total_units,
-            output_events: pb_output_events,
-        })),
-    })
+    Ok((
+        WorkEvent {
+            kind: Some(work_event::Kind::Finished(WorkFinished {
+                output_events: pb_output_events,
+                assurance_evidence: Vec::new(),
+            })),
+        },
+        billable_units,
+    ))
 }
 
 pub(super) fn fetch_execute_error(err: FetchStateError) -> ExecutorError {
@@ -718,7 +723,7 @@ mod tests {
         FetchAccessPolicy, FetchProjectionError, FetchProjectionSession, FetchProjector,
         FetchProjectorFactory, FetchProvider, FetchProviderFuture, FetchProviderRequest,
         FetchProviderStream, FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
-        FetchUsage, MockFetchProvider, ProjectedFetch,
+        MockFetchProvider, ProjectedFetch,
     };
     use futures_util::stream;
     use hellas_rpc::Dtype;
@@ -775,9 +780,15 @@ mod tests {
 
     impl FetchProjector for TestFetchProjector {
         fn project(&mut self, bytes: &[u8]) -> Result<Vec<ProjectedFetch>, FetchProjectionError> {
-            if let Some(terminal) = bytes.strip_prefix(b"terminal:") {
+            if bytes.strip_prefix(b"terminal:").is_some() {
                 self.terminal_seen = true;
-                Ok(vec![ProjectedFetch::Terminal(terminal.to_vec())])
+                let event = hellas_rpc::output::OutputEvent::Finished {
+                    stop_reason: hellas_rpc::output::StopReason::EndOfText,
+                    usage: None,
+                };
+                let payload = hellas_rpc::fetch::encode_fetch_terminal_payload(&event)
+                    .map_err(|error| FetchProjectionError::failed(error.to_string()))?;
+                Ok(vec![ProjectedFetch::Terminal(payload)])
             } else {
                 Ok(vec![ProjectedFetch::Event(bytes.to_vec())])
             }
@@ -791,10 +802,6 @@ mod tests {
                     "test stream ended without terminal".to_string(),
                 ))
             }
-        }
-
-        fn usage(&self) -> Option<FetchUsage> {
-            None
         }
     }
 
@@ -838,33 +845,48 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
     }
 
+    fn test_assurance() -> hellas_rpc::AssuranceRequirement {
+        hellas_rpc::AssuranceRequirement::new(
+            hellas_rpc::TPM2_QUOTE,
+            hellas_rpc::ContentId::from_bytes([8; 32]),
+        )
+        .unwrap()
+    }
+
+    fn test_genesis() -> Vec<u8> {
+        b"genesis".to_vec()
+    }
+
+    fn test_environment() -> hellas_rpc::ContentId {
+        hellas_rpc::ContentId::from_bytes([9; 32])
+    }
+
     fn fetch_request(
         key: &ProducerSigningKey,
         service: &str,
         method: &str,
         body: &[u8],
     ) -> FetchRequest {
-        let events = build_input_events(service, method, body, key).unwrap();
+        let events = build_input_events(service, method, body, test_environment(), key).unwrap();
         FetchRequest {
             input: events.iter().map(input_event_to_pb).collect(),
         }
     }
 
-    fn run_ticket_request(request_commitment: &[u8], key: &ProducerSigningKey) -> RunTicketRequest {
-        let request_commitment: [u8; 32] = request_commitment
-            .try_into()
-            .expect("test request commitment is 32 bytes");
-        hellas_rpc::run_ticket::sign_run_ticket(request_commitment, key)
-            .expect("test run ticket signs")
+    fn run_ticket_request(
+        ticket: hellas_rpc::pb::execute::Ticket,
+        key: &ProducerSigningKey,
+    ) -> RunTicketRequest {
+        hellas_rpc::run_ticket::sign_run_ticket(ticket, key).expect("test run ticket signs")
     }
 
     async fn run_one(
         handle: &crate::ExecutorHandle,
-        request_commitment: Vec<u8>,
+        ticket: hellas_rpc::pb::execute::Ticket,
         key: &ProducerSigningKey,
     ) -> (Vec<WorkChunk>, WorkFinished) {
         let outcome = handle
-            .run_ticket_handle(run_ticket_request(&request_commitment, key))
+            .run_ticket_handle(run_ticket_request(ticket, key))
             .await
             .unwrap();
         drain_outcome(outcome.events).await
@@ -897,6 +919,7 @@ mod tests {
             .register(
                 FetchRoute::new(service, method),
                 crate::FetchRouteEntry {
+                    execution_environment: test_environment(),
                     provider,
                     projector_factory,
                     capabilities: FetchRoutePolicy::default(),
@@ -919,6 +942,8 @@ mod tests {
             supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(producer_key),
+            provider_genesis: Arc::new(test_genesis()),
+            assurance: test_assurance(),
             fetch_access_policy: FetchAccessPolicy::trusted_callers([caller_key]),
             fetch_routes: test_routes("echo", "run", provider, Arc::new(TestFetchProjectorFactory)),
             fetch_max_in_flight,
@@ -931,11 +956,11 @@ mod tests {
 
     async fn run_failed(
         handle: &crate::ExecutorHandle,
-        request_commitment: Vec<u8>,
+        ticket: hellas_rpc::pb::execute::Ticket,
         key: &ProducerSigningKey,
     ) -> WorkFailed {
         let mut outcome = handle
-            .run_ticket_handle(run_ticket_request(&request_commitment, key))
+            .run_ticket_handle(run_ticket_request(ticket, key))
             .await
             .unwrap()
             .events;
@@ -968,6 +993,8 @@ mod tests {
             1,
             vec![Dtype::F32],
             key(),
+            test_genesis(),
+            test_assurance(),
             test_routes(
                 "echo",
                 "run",
@@ -978,10 +1005,8 @@ mod tests {
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
-        let (chunks, first) =
-            run_one(&handle, ticket.request_commitment.clone(), &signing_key).await;
-        let (replay_chunks, replayed) =
-            run_one(&handle, ticket.request_commitment, &signing_key).await;
+        let (chunks, first) = run_one(&handle, ticket.clone(), &signing_key).await;
+        let (replay_chunks, replayed) = run_one(&handle, ticket, &signing_key).await;
 
         assert_eq!(chunks.len(), 1);
         let chunk_event = chunks[0]
@@ -991,7 +1016,12 @@ mod tests {
         assert_eq!(chunk_event.payload, b"event:ok");
         assert!(replay_chunks.is_empty());
         assert_eq!(first.output_events[0], *chunk_event);
-        assert_eq!(first.output_events[1].payload, b"done");
+        assert_eq!(
+            decode_fetch_terminal_payload(&first.output_events[1].payload)
+                .unwrap()
+                .billable_units(),
+            0
+        );
         assert_eq!(replayed.output_events, first.output_events);
         assert_eq!(provider.calls("echo", "run", input), 1);
     }
@@ -1007,6 +1037,8 @@ mod tests {
             1,
             vec![Dtype::F32],
             key(),
+            test_genesis(),
+            test_assurance(),
             test_routes(
                 "echo",
                 "run",
@@ -1017,7 +1049,7 @@ mod tests {
         .unwrap();
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
-        let failed = run_failed(&handle, ticket.request_commitment, &signing_key).await;
+        let failed = run_failed(&handle, ticket, &signing_key).await;
 
         assert_eq!(failed.position, 0);
         assert!(failed.error.contains("mock fetch response not programmed"));
@@ -1049,8 +1081,14 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let signing_key = key();
-        let events =
-            build_input_events("echo", "run", br#"{"hello":"crash"}"#, &signing_key).unwrap();
+        let events = build_input_events(
+            "echo",
+            "run",
+            br#"{"hello":"crash"}"#,
+            test_environment(),
+            &signing_key,
+        )
+        .unwrap();
         let input = hellas_rpc::fetch::verify_input_events(&events)
             .unwrap()
             .input_commitment;
@@ -1078,6 +1116,8 @@ mod tests {
             supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(key()),
+            provider_genesis: Arc::new(test_genesis()),
+            assurance: test_assurance(),
             fetch_access_policy: FetchAccessPolicy::trusted_callers([signing_key.public_key()]),
             fetch_routes: test_routes(
                 "echo",
@@ -1092,8 +1132,15 @@ mod tests {
         .await
         .unwrap();
 
+        let ticket = crate::state::quote_ticket(
+            hellas_rpc::RequestCommitment::from_digest(input.digest()),
+            &test_genesis(),
+            test_assurance(),
+        )
+        .unwrap()
+        .1;
         let err = handle
-            .run_ticket_handle(run_ticket_request(input.digest().as_bytes(), &signing_key))
+            .run_ticket_handle(run_ticket_request(ticket, &signing_key))
             .await
             .unwrap_err();
 
@@ -1133,6 +1180,8 @@ mod tests {
             supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(key()),
+            provider_genesis: Arc::new(test_genesis()),
+            assurance: test_assurance(),
             fetch_access_policy: policy,
             fetch_routes: test_routes(
                 "codex",
@@ -1150,7 +1199,7 @@ mod tests {
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
         let err = handle
-            .run_ticket_handle(run_ticket_request(&ticket.request_commitment, &signing_key))
+            .run_ticket_handle(run_ticket_request(ticket, &signing_key))
             .await
             .unwrap_err();
 
@@ -1169,17 +1218,11 @@ mod tests {
         let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
 
         let first_outcome = handle
-            .run_ticket_handle(run_ticket_request(
-                &first_ticket.request_commitment,
-                &signing_key,
-            ))
+            .run_ticket_handle(run_ticket_request(first_ticket, &signing_key))
             .await
             .unwrap();
         let error = handle
-            .run_ticket_handle(run_ticket_request(
-                &second_ticket.request_commitment,
-                &signing_key,
-            ))
+            .run_ticket_handle(run_ticket_request(second_ticket.clone(), &signing_key))
             .await
             .unwrap_err();
         assert!(matches!(error, ExecutorError::QueueFull { capacity: 0 }));
@@ -1193,7 +1236,7 @@ mod tests {
 
         let (chunks, second_finished) = timeout(
             Duration::from_secs(2),
-            run_one(&handle, second_ticket.request_commitment, &signing_key),
+            run_one(&handle, second_ticket, &signing_key),
         )
         .await
         .unwrap();
@@ -1213,17 +1256,11 @@ mod tests {
         let second_ticket = handle.create_fetch_ticket(second).await.unwrap().response;
 
         let first_outcome = handle
-            .run_ticket_handle(run_ticket_request(
-                &first_ticket.request_commitment,
-                &signing_key,
-            ))
+            .run_ticket_handle(run_ticket_request(first_ticket, &signing_key))
             .await
             .unwrap();
         let second_outcome = handle
-            .run_ticket_handle(run_ticket_request(
-                &second_ticket.request_commitment,
-                &signing_key,
-            ))
+            .run_ticket_handle(run_ticket_request(second_ticket, &signing_key))
             .await
             .unwrap();
 
