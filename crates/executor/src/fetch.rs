@@ -799,8 +799,14 @@ mod tests {
         let producer = key(2);
         let producer_key = producer.public_key();
 
-        let input_events =
-            build_input_events("openai", "responses", br#"{"model":"gpt-test"}"#, &caller).unwrap();
+        let input_events = build_input_events(
+            "openai",
+            "responses",
+            br#"{"model":"gpt-test"}"#,
+            hellas_rpc::ContentId::from_bytes([9; 32]),
+            &caller,
+        )
+        .unwrap();
         let verified = verify_input_events(&input_events).unwrap();
         let caller_key = verified.caller_key;
         let quote = FetchQuote::from_verified(&verified, input_events);

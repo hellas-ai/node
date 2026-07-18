@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ExecutorError;
-use hellas_rpc::{Digest, EvaluateRequest, hash_tuple};
+use hellas_rpc::{ContentId, Digest, EvaluateRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::state::{ArtifactStoreConfig, Invocation, ModelLocator, QuotePlan};
@@ -160,6 +160,7 @@ pub(crate) struct EvaluateArtifactStore {
 
 struct MaterializedTextSource {
     locator: ModelLocator,
+    execution_environment: hellas_rpc::ContentId,
     tokens: Vec<u32>,
 }
 
@@ -216,8 +217,9 @@ impl EvaluateArtifactStore {
         &mut self,
         plan: &QuotePlan,
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
+        let execution_environment = plan.execution_environment;
         let bound_term_id =
-            BoundTermId::from_digest(to_artifact_digest(binding_digest(&plan.locator)));
+            BoundTermId::from_digest(to_artifact_digest(execution_environment.digest()));
         if let Entry::Vacant(entry) = self.bound_terms.entry(bound_term_id) {
             entry.insert(plan.locator.clone());
             self.persist_evaluate_index()?;
@@ -246,6 +248,8 @@ impl EvaluateArtifactStore {
         let evaluate_request = EvaluateRequest {
             text_execution: from_artifact_digest(execution_id.digest()),
             runner_public_key: plan.runner_public_key,
+            execution_environment,
+            nonce: rand::random(),
         };
 
         Ok(ResolvedEvaluateExecution {
@@ -263,6 +267,11 @@ impl EvaluateArtifactStore {
             TextExecutionId::from_digest(to_artifact_digest(evaluate_request.text_execution));
         let execution = self.text_execution(execution_id).await?;
         let source = self.materialize_source(execution.from()).await?;
+        if source.execution_environment != evaluate_request.execution_environment {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "execution environment does not match the bound program manifest".to_string(),
+            ));
+        }
         let prompt_tokens = self.token_ids(execution.prompt_tokens()).await?;
         let policy = self.text_policy(execution.policy()).await?;
         let mut input_ids = source.tokens;
@@ -391,23 +400,31 @@ impl EvaluateArtifactStore {
                 let locator = self.bound_term_locator(bound_term)?;
                 Ok(MaterializedTextSource {
                     locator,
+                    execution_environment: hellas_rpc::ContentId::from_bytes(
+                        *bound_term.as_bytes(),
+                    ),
                     tokens: Vec::new(),
                 })
             }
             TextArtifact::Output(output) => {
                 let execution = self.text_execution(output.execution()).await?;
-                let locator = self.source_locator(execution.from().clone()).await?;
+                let (locator, execution_environment) =
+                    self.source_locator(execution.from().clone()).await?;
                 let state = self.text_state(output.state()).await?;
                 let tokens = self.token_ids(state.tokens()).await?;
                 Ok(MaterializedTextSource {
                     locator,
+                    execution_environment,
                     tokens: token_ids_to_u32(&tokens),
                 })
             }
         }
     }
 
-    async fn source_locator(&mut self, source: TextSource) -> Result<ModelLocator, ExecutorError> {
+    async fn source_locator(
+        &mut self,
+        source: TextSource,
+    ) -> Result<(ModelLocator, ContentId), ExecutorError> {
         let mut source = source;
         loop {
             let (artifact_id, expected_execution) = match source {
@@ -420,7 +437,10 @@ impl EvaluateArtifactStore {
             }
             match artifact {
                 TextArtifact::Identity { bound_term } => {
-                    return self.bound_term_locator(bound_term);
+                    return Ok((
+                        self.bound_term_locator(bound_term)?,
+                        ContentId::from_bytes(*bound_term.as_bytes()),
+                    ));
                 }
                 TextArtifact::Output(output) => {
                     source = self
@@ -818,17 +838,6 @@ fn text_policy(invocation: &Invocation) -> Result<TextPolicy, ExecutorError> {
     Ok(TextPolicy::new(invocation.max_new_tokens, stop_token_ids))
 }
 
-fn binding_digest(locator: &ModelLocator) -> Digest {
-    hash_tuple(
-        "hellas.executor.synthetic_binding.v1",
-        &[
-            locator.model_id.as_bytes(),
-            locator.revision.as_bytes(),
-            locator.dtype.as_wire().as_bytes(),
-        ],
-    )
-}
-
 fn to_artifact_digest(digest: Digest) -> ArtifactDigest {
     ArtifactDigest::from_bytes(digest.into_bytes())
 }
@@ -856,6 +865,8 @@ mod tests {
         EvaluateRequest {
             text_execution,
             runner_public_key: runner_public_key(),
+            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
+            nonce: [7; 32],
         }
     }
 
@@ -866,6 +877,7 @@ mod tests {
                 revision: "main".to_string(),
                 dtype: Dtype::F32,
             },
+            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
             invocation: Invocation {
                 input_ids: vec![1, 2, 3],
                 max_new_tokens: 8,

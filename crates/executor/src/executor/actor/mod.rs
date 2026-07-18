@@ -16,12 +16,12 @@ use crate::scheme::SchemeEngine;
 use crate::state::{ArtifactStoreConfig, ExecutorState};
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::{Dtype, ProducerSigningKey};
+use hellas_rpc::{AssuranceRequirement, Dtype, ProducerSigningKey};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::{ExecutorHandle, ExecutorMessage, PendingFetch};
+use super::{ExecutorHandle, ExecutorMessage, PendingFetch, ProviderContext};
 
 pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
@@ -29,7 +29,7 @@ pub struct Executor {
     pub(super) store: ExecutorState,
     pub(super) evaluate: Option<Box<dyn SchemeEngine>>,
     pub(super) metrics: Arc<ExecutorMetrics>,
-    pub(super) producer_key: Arc<ProducerSigningKey>,
+    pub(super) provider: ProviderContext,
     pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
     pub(super) fetch_access_policy: FetchAccessPolicy,
     pub(super) fetch_routes: FetchRouteRegistry,
@@ -45,6 +45,8 @@ pub struct ExecutorSpawnConfig {
     pub supported_dtypes: Vec<Dtype>,
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
+    pub provider_genesis: Arc<Vec<u8>>,
+    pub assurance: AssuranceRequirement,
     pub fetch_access_policy: FetchAccessPolicy,
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -60,7 +62,7 @@ struct ExecutorRuntimeConfig {
     #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
     supported_dtypes: Vec<Dtype>,
     metrics: Arc<ExecutorMetrics>,
-    producer_key: Arc<ProducerSigningKey>,
+    provider: ProviderContext,
     fetch_access_policy: FetchAccessPolicy,
     fetch_routes: FetchRouteRegistry,
     fetch_max_in_flight: usize,
@@ -76,6 +78,8 @@ impl Executor {
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
+        provider_genesis: Vec<u8>,
+        assurance: AssuranceRequirement,
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);
         Self::spawn_runtime(ExecutorRuntimeConfig {
@@ -83,7 +87,11 @@ impl Executor {
             queue_capacity,
             supported_dtypes,
             metrics: Arc::new(ExecutorMetrics::default()),
-            producer_key: producer_key.clone(),
+            provider: ProviderContext {
+                producer_key: producer_key.clone(),
+                genesis: Arc::new(provider_genesis),
+                assurance,
+            },
             fetch_access_policy: FetchAccessPolicy::trusted_callers([producer_key.public_key()]),
             fetch_routes: FetchRouteRegistry::default(),
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
@@ -99,6 +107,8 @@ impl Executor {
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
+        provider_genesis: Vec<u8>,
+        assurance: AssuranceRequirement,
         fetch_routes: FetchRouteRegistry,
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);
@@ -107,7 +117,11 @@ impl Executor {
             queue_capacity,
             supported_dtypes,
             metrics: Arc::new(ExecutorMetrics::default()),
-            producer_key: producer_key.clone(),
+            provider: ProviderContext {
+                producer_key: producer_key.clone(),
+                genesis: Arc::new(provider_genesis),
+                assurance,
+            },
             fetch_access_policy: FetchAccessPolicy::trusted_callers([producer_key.public_key()]),
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
@@ -130,7 +144,11 @@ impl Executor {
             queue_capacity: config.queue_capacity,
             supported_dtypes: config.supported_dtypes,
             metrics: config.metrics,
-            producer_key: config.producer_key,
+            provider: ProviderContext {
+                producer_key: config.producer_key,
+                genesis: config.provider_genesis,
+                assurance: config.assurance,
+            },
             fetch_access_policy: config.fetch_access_policy.with_store(fetch_quota_store),
             fetch_routes: config.fetch_routes,
             fetch_max_in_flight: config.fetch_max_in_flight,
@@ -172,7 +190,7 @@ impl Executor {
                 config.queue_capacity,
                 config.execute_policy,
                 config.metrics.clone(),
-                config.producer_key.clone(),
+                config.provider.clone(),
                 tx.clone(),
             )))
         };
@@ -184,7 +202,7 @@ impl Executor {
             store: ExecutorState::new(),
             evaluate,
             metrics: config.metrics,
-            producer_key: config.producer_key,
+            provider: config.provider,
             fetch_state: FetchStateMachine::new(config.fetch_store, fetch_caller_policy),
             fetch_access_policy: config.fetch_access_policy,
             fetch_routes: config.fetch_routes,

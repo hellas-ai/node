@@ -8,22 +8,6 @@ pub enum ProjectedFetch {
     Terminal(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FetchUsage {
-    pub input_units: Option<u64>,
-    pub output_units: Option<u64>,
-    pub total_units: Option<u64>,
-}
-
-impl FetchUsage {
-    pub fn total_or_output(self) -> u64 {
-        self.total_units
-            .or(self.output_units)
-            .or(self.input_units)
-            .unwrap_or_default()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequestView {
     pub service: String,
@@ -51,7 +35,6 @@ pub struct FetchProjectionSession {
 pub trait FetchProjector: Send + Sync + 'static {
     fn project(&mut self, bytes: &[u8]) -> Result<Vec<ProjectedFetch>, FetchProjectionError>;
     fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchProjectionError>;
-    fn usage(&self) -> Option<FetchUsage>;
 }
 
 pub trait FetchProjectorFactory: Send + Sync + 'static {

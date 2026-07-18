@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 #[cfg(feature = "evaluate")]
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "evaluate")]
 use crate::DEFAULT_MAX_SEQ;
@@ -17,20 +17,24 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::execute::{
-    FinishStatus as PbFinishStatus, WorkEvent as PbWorkEvent, WorkFailed as PbWorkFailed,
-    WorkFinished as PbWorkFinished, work_event,
+    WorkEvent as PbWorkEvent, WorkFailed as PbWorkFailed, WorkFinished as PbWorkFinished,
+    work_event,
 };
+use hellas_rpc::run_ticket::ticket_to_pb;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 #[cfg(feature = "evaluate")]
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{Digest, PublicKey, RequestCommitment};
+use hellas_rpc::{AssuranceRequirement, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
 use uuid::Uuid;
 
 pub use crate::StateError;
+
+pub(crate) const QUOTE_AMOUNT: u64 = 1000;
+pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactStoreConfig {
@@ -74,6 +78,7 @@ pub struct Invocation {
 #[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
     pub locator: ModelLocator,
+    pub execution_environment: ContentId,
     pub invocation: Invocation,
     pub initial_artifact_id: Option<Digest>,
     pub runner_public_key: PublicKey,
@@ -137,12 +142,23 @@ impl QuotePlan {
                 })
             })?;
 
+        let locator = ModelLocator {
+            model_id: model_id.to_string(),
+            revision,
+            dtype,
+        };
+        let backend = if cfg!(any(feature = "candle-cuda", feature = "candle-metal")) {
+            "accelerated"
+        } else {
+            "cpu"
+        };
+        let execution_environment = hellas_rpc::ProgramManifest::Evaluate(
+            hellas_models::program_manifest(&locator.spec(), locator.dtype, backend)?,
+        )
+        .content_id();
         Ok(Self {
-            locator: ModelLocator {
-                model_id: model_id.to_string(),
-                revision,
-                dtype,
-            },
+            locator,
+            execution_environment,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens,
@@ -195,6 +211,8 @@ pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateReq
     PbEvaluateRequest {
         text_execution: request.text_execution.as_bytes().to_vec(),
         runner_public_key: Some(public_key_to_pb(&request.runner_public_key)),
+        execution_environment: request.execution_environment.as_bytes().to_vec(),
+        nonce: request.nonce.to_vec(),
     }
 }
 
@@ -214,6 +232,15 @@ pub(crate) fn evaluate_request_from_pb(
                     ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
                 })
             })?,
+        execution_environment: ContentId::from_slice(&request.execution_environment).map_err(
+            |_| {
+                ExecutorError::InvalidQuoteRequest(format!(
+                    "execution_environment must be 32 bytes, got {}",
+                    request.execution_environment.len()
+                ))
+            },
+        )?,
+        nonce: bytes32(&request.nonce, "nonce")?,
     })
 }
 
@@ -260,11 +287,45 @@ pub(crate) enum LocalModelStatus {
 
 #[derive(Clone)]
 pub struct QuoteRecord {
-    pub request_commitment: RequestCommitment,
+    pub terms: JobTerms,
     pub expires_at: Instant,
     pub model_id: String,
     pub runner_public_key: PublicKey,
     pub kind: QuoteKind,
+}
+
+pub(crate) fn quote_ticket(
+    request: RequestCommitment,
+    provider_genesis: &[u8],
+    assurance: AssuranceRequirement,
+) -> Result<(JobTerms, hellas_rpc::pb::execute::Ticket), ExecutorError> {
+    let terms = JobTerms {
+        request,
+        provider_genesis: ContentId::hash(provider_genesis),
+        assurance,
+        amount: QUOTE_AMOUNT,
+        ttl_ms: QUOTE_TTL.as_millis() as u64,
+    };
+    let ticket = ticket_to_pb(terms.clone(), provider_genesis.to_vec())
+        .map_err(|error| ExecutorError::InvalidQuoteRequest(error.to_string()))?;
+    Ok((terms, ticket))
+}
+
+pub(crate) fn validate_job_terms(
+    terms: &JobTerms,
+    provider_genesis: &[u8],
+    assurance: &AssuranceRequirement,
+) -> Result<(), ExecutorError> {
+    if terms.provider_genesis != ContentId::hash(provider_genesis)
+        || terms.assurance != *assurance
+        || terms.amount != QUOTE_AMOUNT
+        || terms.ttl_ms != QUOTE_TTL.as_millis() as u64
+    {
+        return Err(ExecutorError::InvalidQuoteRequest(
+            "run ticket terms do not match provider quote terms".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -287,7 +348,7 @@ impl ExecutorState {
     }
 
     pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
-        let key = *quote.request_commitment.as_bytes();
+        let key = *quote.terms.request.as_bytes();
         self.quotes.insert(key, quote);
         key
     }
@@ -342,22 +403,9 @@ pub enum StopReason {
 }
 
 #[cfg(feature = "evaluate")]
-impl StopReason {
-    pub fn to_pb(self) -> PbFinishStatus {
-        match self {
-            Self::EndOfSequence => PbFinishStatus::EndOfSequence,
-            Self::MaxNewTokens => PbFinishStatus::MaxOutput,
-            Self::Cancelled => PbFinishStatus::Cancelled,
-        }
-    }
-}
-
-#[cfg(feature = "evaluate")]
 #[derive(Debug, Clone)]
 pub enum Termination {
     Completed {
-        stop_reason: StopReason,
-        total_units: u64,
         output_events: Vec<OutputEventEnvelope>,
     },
     Failed {
@@ -368,20 +416,11 @@ pub enum Termination {
 
 #[cfg(feature = "evaluate")]
 impl Termination {
-    pub fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed { .. })
-    }
-
     pub fn into_pb(self) -> PbWorkEvent {
         let kind = match self {
-            Self::Completed {
-                stop_reason,
-                total_units,
-                output_events,
-            } => work_event::Kind::Finished(PbWorkFinished {
-                total_units,
-                status: stop_reason.to_pb() as i32,
+            Self::Completed { output_events } => work_event::Kind::Finished(PbWorkFinished {
                 output_events: output_events.iter().map(output_event_to_pb).collect(),
+                assurance_evidence: Vec::new(),
             }),
             Self::Failed { position, error } => {
                 work_event::Kind::Failed(PbWorkFailed { position, error })

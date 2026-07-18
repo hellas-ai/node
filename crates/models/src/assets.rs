@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use catgrad_llm::utils::{get_model, get_model_architecture, get_model_chat_template};
+use catgrad_llm::utils::{
+    get_model, get_model_architecture, get_model_chat_template, get_model_files,
+};
 use catgrad_llm::{Detokenizer, LLMError};
 use chatgrad::types::Message;
 use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
-use hellas_rpc::Dtype;
+use hellas_rpc::{ContentId, DagCborEncoder, Dtype, EvaluateProgramManifest};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -12,6 +14,70 @@ use super::config::encode_i32_tokens;
 use super::hf::get_model_metadata_files;
 use super::{ModelAssetsError, Result};
 use hellas_rpc::{decode_token_ids, spec::ModelSpec};
+
+pub fn program_manifest(
+    model: &str,
+    dtype: Dtype,
+    backend_profile: &str,
+) -> Result<EvaluateProgramManifest> {
+    let spec = ModelSpec::parse(model)?;
+    let (mut weight_paths, config_path, tokenizer_path, tokenizer_config_path) =
+        get_model_files(&spec.id, &spec.revision)
+            .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
+    weight_paths.sort();
+    let weights = weight_paths
+        .iter()
+        .map(|path| read_content_id(path))
+        .collect::<Result<Vec<_>>>()?;
+    let config_bytes = read_asset(&config_path)?;
+    let config: Value = serde_json::from_slice(&config_bytes)
+        .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
+    let graph = get_model(&config, 1, None, to_catgrad_dtype(dtype))
+        .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?
+        .term()
+        .ok_or(ModelAssetsError::InvalidProgramGraph)?;
+    let graph = ContentId::hash(
+        &serde_json::to_vec(&graph)
+            .map_err(|source| ModelAssetsError::SerializeProgram { source })?,
+    );
+    let tokenizer = read_content_id(&tokenizer_path)?;
+    let tokenizer_config = read_content_id(&tokenizer_config_path)?;
+    let mut tokenizer_manifest = DagCborEncoder::new();
+    tokenizer_manifest.array(3);
+    tokenizer_manifest.str("hellas.program.tokenizer.v2");
+    tokenizer_manifest.bytes(tokenizer.as_bytes());
+    tokenizer_manifest.bytes(tokenizer_config.as_bytes());
+    let resolved_revision = config_path
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .ok_or(ModelAssetsError::UnresolvedRevision)?
+        .to_string();
+    let build = ContentId::hash(
+        format!("hellas:{}:{}", hellas_rpc::VERSION, hellas_rpc::GIT_REV).as_bytes(),
+    );
+    Ok(EvaluateProgramManifest {
+        weights,
+        graph,
+        config: ContentId::hash(&config_bytes),
+        tokenizer: ContentId::hash(&tokenizer_manifest.into_bytes()),
+        resolved_revision,
+        numeric_profile: dtype.as_wire().to_string(),
+        backend_profile: backend_profile.to_string(),
+        build,
+    })
+}
+
+fn read_content_id(path: &std::path::Path) -> Result<ContentId> {
+    read_asset(path).map(|bytes| ContentId::hash(&bytes))
+}
+
+fn read_asset(path: &std::path::Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|source| ModelAssetsError::ReadManifestAsset {
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// Model-domain result of preparing a prompt for a quote: everything the
 /// model layer contributes to a `QuotePreparedTextRequest`, minus the

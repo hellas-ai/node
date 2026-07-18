@@ -9,7 +9,7 @@ use hellas_rpc::{ProducerId, PublicKey, canonical_dag_cbor, decode_dag_cbor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::fetch_projection::{FetchRequestView, FetchUsage};
+use crate::fetch_projection::FetchRequestView;
 
 #[derive(Clone, Debug)]
 pub struct FetchAccessPolicy {
@@ -126,7 +126,7 @@ impl FetchAccessPolicy {
     pub fn reconcile_reservation(
         &mut self,
         reservation: Option<&FetchQuotaReservation>,
-        usage: Option<FetchUsage>,
+        billable_units: u64,
     ) -> Result<(), FetchAccessError> {
         let Some(reservation) = reservation else {
             return Ok(());
@@ -137,14 +137,13 @@ impl FetchAccessPolicy {
         if caller.spend.is_none() {
             return Ok(());
         }
-        let charged_units = usage_charge_units(usage).unwrap_or(reservation.reserved_units);
         let mut ledger = self.quota_store.load(reservation.caller_id)?;
         if let Some(entry) = ledger
             .entries
             .iter_mut()
             .find(|entry| entry.id == reservation.id)
         {
-            entry.units = charged_units;
+            entry.units = billable_units;
         }
         self.quota_store.put(reservation.caller_id, &ledger)?;
         Ok(())
@@ -197,14 +196,6 @@ fn reserved_units(
         Some(limit) => requested.min(limit),
         None => requested,
     })
-}
-
-fn usage_charge_units(usage: Option<FetchUsage>) -> Option<u64> {
-    let usage = usage?;
-    usage
-        .output_units
-        .or(usage.total_units)
-        .or(usage.input_units)
 }
 
 fn prune_ledger(ledger: &mut SpendLedger, now_ms: u64, window: Duration) {
@@ -796,14 +787,7 @@ mod tests {
         ));
 
         policy
-            .reconcile_reservation(
-                admission.reservation.as_ref(),
-                Some(FetchUsage {
-                    input_units: None,
-                    output_units: Some(40),
-                    total_units: None,
-                }),
-            )
+            .reconcile_reservation(admission.reservation.as_ref(), 40)
             .unwrap();
         policy
             .authorize_admission(
@@ -814,43 +798,6 @@ mod tests {
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
-    }
-
-    #[test]
-    fn missing_usage_keeps_reservation() {
-        let caller = key(1);
-        let mut access = CallerAccess::allow_all(caller);
-        access.spend = Some(SpendLimit {
-            max_units: 50,
-            window: Duration::from_secs(60),
-        });
-        let mut policy = FetchAccessPolicy::new([access]);
-
-        let admission = policy
-            .authorize_admission(
-                &caller,
-                &request(Some(50)),
-                1_000,
-                "r1".to_string(),
-                &FetchRoutePolicy::default(),
-            )
-            .unwrap();
-        policy
-            .reconcile_reservation(admission.reservation.as_ref(), None)
-            .unwrap();
-
-        assert!(matches!(
-            policy
-                .authorize_admission(
-                    &caller,
-                    &request(Some(1)),
-                    1_000,
-                    "r2".to_string(),
-                    &FetchRoutePolicy::default()
-                )
-                .unwrap_err(),
-            FetchAccessError::QuotaExceeded { .. }
-        ));
     }
 
     #[test]

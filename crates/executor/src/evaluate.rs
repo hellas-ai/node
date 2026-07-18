@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
@@ -23,27 +23,24 @@ use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 use hellas_rpc::spec::ModelSpec;
-use hellas_rpc::{
-    Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, PublicKey,
-};
+use hellas_rpc::{Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::artifacts::EvaluateArtifactStore;
-use crate::executor::{ExecuteOutcome, ExecutorMessage, TicketOutcome};
+use crate::executor::{ExecuteOutcome, ExecutorMessage, ProviderContext, TicketOutcome};
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
-    ExecutorState, Invocation, LocalModelStatus, ModelLocator, QuoteKind, QuotePlan, QuoteRecord,
-    StopReason, Termination, evaluate_request_to_pb, model_spec, resolve_accept_dtypes,
+    ExecutorState, Invocation, LocalModelStatus, ModelLocator, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind,
+    QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, model_spec,
+    quote_ticket, resolve_accept_dtypes,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
 };
 
-const STATIC_QUOTE_AMOUNT: u64 = 1000;
-const QUOTE_TTL: Duration = Duration::from_secs(30);
 const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 
 /// The opaque quote payload the executor core stores for an evaluate ticket.
@@ -86,7 +83,7 @@ pub struct EvaluateEngine {
     queue_capacity: usize,
     execute_policy: ExecutePolicy,
     metrics: Arc<ExecutorMetrics>,
-    producer_key: Arc<ProducerSigningKey>,
+    provider: ProviderContext,
 }
 
 #[derive(Clone)]
@@ -102,7 +99,7 @@ impl EvaluateEngine {
         queue_capacity: usize,
         execute_policy: ExecutePolicy,
         metrics: Arc<ExecutorMetrics>,
-        producer_key: Arc<ProducerSigningKey>,
+        provider: ProviderContext,
         tx: mpsc::UnboundedSender<ExecutorMessage>,
     ) -> Self {
         Self {
@@ -115,7 +112,7 @@ impl EvaluateEngine {
             queue_capacity,
             execute_policy,
             metrics,
-            producer_key,
+            provider,
         }
     }
 
@@ -186,37 +183,36 @@ impl EvaluateEngine {
         stop_reason: StopReason,
         output_tokens: Vec<u32>,
         output_events: Vec<OutputEventEnvelope>,
-    ) -> Result<Termination, ExecutorError> {
+    ) -> Result<(Termination, u64), ExecutorError> {
         let text_artifact = self
             .artifacts
             .record_completed_text(evaluate_request, invocation, &output_tokens)
             .await?;
         let input_units = invocation.input_ids.len() as u64;
         let output_units = output_tokens.len() as u64;
-        let total_units = input_units.saturating_add(output_units);
+        let usage = EvaluateUsage {
+            input_units,
+            output_units,
+        };
+        let billable_units = usage.billable_units().map_err(|err| {
+            ExecutorError::WeightsError(format!("evaluate billing failed: {err}"))
+        })?;
         let terminal = EvaluateTerminal {
             final_position: output_units,
             stop_reason: evaluate_stop_reason(stop_reason),
             text_artifact,
-            usage: Some(EvaluateUsage {
-                input_units,
-                output_units,
-                total_units,
-            }),
+            usage,
+            billable_units,
         };
         let output_events = EvaluateOutputTranscriptBuilder::resume_verified(
             input_commitment(evaluate_request),
-            &self.producer_key,
+            &self.provider.producer_key,
             output_events,
         )
         .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?
         .finish(terminal)
         .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?;
-        Ok(Termination::Completed {
-            stop_reason,
-            total_units,
-            output_events,
-        })
+        Ok((Termination::Completed { output_events }, billable_units))
     }
 
     fn resolve_accept_dtypes(&self, prefs: &[String]) -> Result<Dtype, ExecutorError> {
@@ -228,7 +224,7 @@ fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
     match stop_reason {
         StopReason::EndOfSequence => EvaluateStopReason::END_OF_SEQUENCE,
         StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
-        StopReason::Cancelled => EvaluateStopReason::CANCELLED,
+        StopReason::Cancelled => unreachable!("cancellation is not a success terminal"),
     }
 }
 
@@ -261,9 +257,14 @@ impl SchemeEngine for EvaluateEngine {
             )));
         }
         let request_commitment = Evaluate::commit_request(&evaluate_request);
+        let (terms, ticket) = quote_ticket(
+            request_commitment,
+            self.provider.genesis.as_slice(),
+            self.provider.assurance.clone(),
+        )?;
         let model_id = resolved.locator.spec();
         let request_commitment_bytes = store.create_quote(QuoteRecord {
-            request_commitment,
+            terms,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: model_id.clone(),
             runner_public_key: evaluate_request.runner_public_key,
@@ -276,11 +277,7 @@ impl SchemeEngine for EvaluateEngine {
         });
 
         Ok(TicketOutcome {
-            response: Ticket {
-                request_commitment: request_commitment_bytes.to_vec(),
-                amount: STATIC_QUOTE_AMOUNT,
-                ttl_ms: QUOTE_TTL.as_millis() as u64,
-            },
+            response: ticket,
             provenance: ExecutionProvenance {
                 commitment_id: request_commitment_bytes,
             },
@@ -310,12 +307,17 @@ impl SchemeEngine for EvaluateEngine {
         let evaluate_request = resolved.evaluate_request.clone();
         let evaluate_request_pb = evaluate_request_to_pb(&evaluate_request);
         let request_commitment = Evaluate::commit_request(&evaluate_request);
+        let (terms, ticket) = quote_ticket(
+            request_commitment,
+            self.provider.genesis.as_slice(),
+            self.provider.assurance.clone(),
+        )?;
         let commitment_id = request_commitment.digest();
         let model_id = plan.locator.spec();
         let prompt_tokens = plan.invocation.input_ids.len() as u32;
         let dtype_wire = plan.locator.dtype.as_wire().to_string();
         let request_commitment_bytes = store.create_quote(QuoteRecord {
-            request_commitment,
+            terms,
             expires_at: Instant::now() + QUOTE_TTL,
             model_id: model_id.clone(),
             runner_public_key: evaluate_request.runner_public_key,
@@ -331,18 +333,14 @@ impl SchemeEngine for EvaluateEngine {
             request_commitment = %hex32(&request_commitment_bytes),
             commitment_id = %commitment_id,
             prompt_tokens,
-            amount = STATIC_QUOTE_AMOUNT,
+            amount = QUOTE_AMOUNT,
             total_ms = total_start.elapsed().as_millis(),
             "quoted prepared evaluate text execution"
         );
 
         Ok(TicketOutcome {
             response: QuotePreparedTextResponse {
-                ticket: Some(Ticket {
-                    request_commitment: request_commitment_bytes.to_vec(),
-                    amount: STATIC_QUOTE_AMOUNT,
-                    ttl_ms: QUOTE_TTL.as_millis() as u64,
-                }),
+                ticket: Some(ticket),
                 prompt_tokens,
                 dtype: dtype_wire,
                 evaluate_request: Some(evaluate_request_pb),
@@ -534,7 +532,7 @@ impl SchemeEngine for EvaluateEngine {
             accepted_at: Instant::now(),
             cancel: CancellationToken::new(),
             sender,
-            producer_key: self.producer_key.clone(),
+            producer_key: self.provider.producer_key.clone(),
         };
 
         let queued = match self.try_start_execution(execute_job) {
@@ -602,43 +600,56 @@ impl SchemeEngine for EvaluateEngine {
         } = completion;
 
         let generated = result.position();
-        let termination = match result {
+        let (termination, billable_units) = match result {
             WorkerCompletionResult::Completed {
                 stop_reason,
                 output_tokens,
                 output_events,
             } => {
-                match self
-                    .completed_evaluate_termination(
-                        &evaluate_request,
-                        &invocation,
-                        stop_reason,
-                        output_tokens,
-                        output_events,
-                    )
-                    .await
-                {
-                    Ok(termination) => termination,
-                    Err(err) => {
-                        let msg = format!("{err:#}");
-                        warn!(
-                            "execute worker job {execution_id} failed while recording/signing output transcript: {msg}"
-                        );
+                if stop_reason == StopReason::Cancelled {
+                    (
                         Termination::Failed {
                             position: generated,
-                            error: msg,
+                            error: "execution cancelled".to_string(),
+                        },
+                        None,
+                    )
+                } else {
+                    match self
+                        .completed_evaluate_termination(
+                            &evaluate_request,
+                            &invocation,
+                            stop_reason,
+                            output_tokens,
+                            output_events,
+                        )
+                        .await
+                    {
+                        Ok((termination, billable_units)) => (termination, Some(billable_units)),
+                        Err(err) => {
+                            let msg = format!("{err:#}");
+                            warn!(
+                                "execute worker job {execution_id} failed while recording/signing output transcript: {msg}"
+                            );
+                            (
+                                Termination::Failed {
+                                    position: generated,
+                                    error: msg,
+                                },
+                                None,
+                            )
                         }
                     }
                 }
             }
             WorkerCompletionResult::Failed { position, error } => {
-                Termination::Failed { position, error }
+                (Termination::Failed { position, error }, None)
             }
         };
 
-        if termination.is_completed() {
+        if let Some(billable_units) = billable_units {
             self.metrics
-                .record_execution_completed(&model_id, generated);
+                .record_execution_completed(&model_id, billable_units);
             self.completed.insert(
                 request_commitment,
                 CompletedEvaluate {
@@ -708,6 +719,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_rpc::ProducerSigningKey;
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
@@ -721,7 +733,15 @@ mod tests {
             1,
             ExecutePolicy::Eager,
             Arc::new(ExecutorMetrics::default()),
-            producer_key,
+            ProviderContext {
+                producer_key,
+                genesis: Arc::new(b"genesis".to_vec()),
+                assurance: hellas_rpc::AssuranceRequirement::new(
+                    hellas_rpc::TPM2_QUOTE,
+                    hellas_rpc::ContentId::from_bytes([8; 32]),
+                )
+                .unwrap(),
+            },
             tx,
         )
     }
@@ -741,18 +761,14 @@ mod tests {
                 final_position: 1,
                 stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
                 text_artifact: Digest::from_bytes([8; 32]),
-                usage: Some(EvaluateUsage {
+                usage: EvaluateUsage {
                     input_units: 4,
                     output_units: 1,
-                    total_units: 5,
-                }),
+                },
+                billable_units: 5,
             })
             .unwrap();
-        let termination = Termination::Completed {
-            stop_reason: StopReason::EndOfSequence,
-            total_units: 5,
-            output_events,
-        };
+        let termination = Termination::Completed { output_events };
         let expected = termination.clone().into_pb();
         engine.completed.insert(
             request_commitment,

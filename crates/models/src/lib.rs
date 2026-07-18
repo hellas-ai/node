@@ -18,7 +18,9 @@ use tokenizers::Error as TokenizerError;
 
 use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
-pub use assets::{ModelAssets, PreparedQuote, TextOutputDecoder, to_catgrad_dtype};
+pub use assets::{
+    ModelAssets, PreparedQuote, TextOutputDecoder, program_manifest, to_catgrad_dtype,
+};
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
 
@@ -78,8 +80,18 @@ pub enum ModelAssetsError {
     #[error("failed to serialize program")]
     SerializeProgram {
         #[source]
-        source: LLMError,
+        source: serde_json::Error,
     },
+    #[error("program graph does not match its declared type")]
+    InvalidProgramGraph,
+    #[error("failed to read manifest asset {path:?}")]
+    ReadManifestAsset {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("model cache path has no immutable revision")]
+    UnresolvedRevision,
     #[error("failed to decode tokens")]
     DecodeTokens {
         #[source]

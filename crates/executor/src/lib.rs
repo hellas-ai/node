@@ -30,7 +30,7 @@ pub use fetch_policy::{
 };
 pub use fetch_projection::{
     FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
-    FetchRequestView, FetchUsage, ProjectedFetch,
+    FetchRequestView, ProjectedFetch,
 };
 pub use fetch_provider::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
