@@ -19,7 +19,7 @@
 //! struct MyService;
 //! impl ServiceMarker for MyService {
 //!     const NAME: &'static str = "my.Service";
-//!     const ALPN: &'static str = "/my.Service/1.0";
+//!     const ALPN: &'static str = "/my.Service/2.0";
 //!     const SERVICE_ID: u32 = 0;
 //! }
 //!

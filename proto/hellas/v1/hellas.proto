@@ -13,24 +13,42 @@ service Execute {
 
 message Ticket {
   bytes request_commitment = 1; // exactly 32 bytes
-  uint64 amount = 2;
-  uint64 ttl_ms = 3;
+  JobTerms terms = 2;
+  bytes provider_genesis = 3; // canonical SignedProviderGenesis
+}
+
+message JobTerms {
+  bytes provider_genesis = 1; // ContentId
+  AssuranceRequirement assurance = 2;
+  uint64 amount = 3;
+  uint64 ttl_ms = 4;
+}
+
+message AssuranceRequirement {
+  string codec = 1;
+  bytes policy = 2; // ContentId
 }
 
 message RunTicketRequest {
-  bytes request_commitment = 1; // exactly 32 bytes
+  Ticket ticket = 1;
   Signature signature = 2;
   PublicKey public_key = 3;
 }
 
 message PublicKey {
-  uint32 kind = 1;
-  bytes bytes = 2;
+  oneof kind {
+    bytes secp256k1 = 1;
+    bytes ed25519 = 2;
+    bytes p256 = 3;
+  }
 }
 
 message Signature {
-  uint32 kind = 1;
-  bytes bytes = 2;
+  oneof kind {
+    bytes secp256k1 = 1;
+    bytes ed25519 = 2;
+    bytes p256 = 3;
+  }
 }
 
 message InputEventBody {
@@ -87,20 +105,19 @@ message WorkChunk {
 }
 
 message WorkFinished {
-  FinishStatus status = 1;
-  uint64 total_units = 2;
+  reserved 1, 2;
   repeated OutputEventEnvelope output_events = 3;
+  repeated AssuranceEvidence assurance_evidence = 4;
+}
+
+message AssuranceEvidence {
+  string codec = 1;
+  bytes credential = 2;
+  bytes proof = 3;
 }
 
 message WorkFailed {
   // Units emitted before failure (tokens for evaluate text, bytes for fetch).
   uint64 position = 1;
   string error = 2;
-}
-
-enum FinishStatus {
-  FINISH_STATUS_UNSPECIFIED = 0;
-  FINISH_STATUS_END_OF_SEQUENCE = 1;
-  FINISH_STATUS_MAX_OUTPUT = 2;
-  FINISH_STATUS_CANCELLED = 3;
 }

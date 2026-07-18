@@ -1,12 +1,13 @@
 use std::str;
 
 use crate::{
-    CanonicalizationId, InputCommitment, InputEventEnvelope, InputTranscriptBuilder, JsonBytes,
-    OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, SchemeId,
-    StreamVerifyError, verify_input_event_envelopes, verify_output_event_envelopes,
+    CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope, InputTranscriptBuilder,
+    JsonBytes, OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey,
+    SchemeId, StreamVerifyError, verify_input_event_envelopes, verify_output_event_envelopes,
 };
+use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 
-const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v1";
+const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v2";
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
 const OUTPUT_EVENT_KIND: &str = "response.event";
 const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
@@ -15,6 +16,7 @@ const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
 pub struct FetchInput {
     pub input_commitment: InputCommitment,
     pub caller_key: PublicKey,
+    pub execution_environment: ContentId,
     pub service: String,
     pub method: String,
     pub body: JsonBytes,
@@ -45,11 +47,19 @@ pub fn build_input_events(
     service: &str,
     method: &str,
     payload: &[u8],
+    execution_environment: ContentId,
     key: &ProducerSigningKey,
 ) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
     validate_non_empty_service_method(service, method)?;
     validate_json("request.body", payload)?;
     let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, key, input_canonicalization());
+    let mut nonce = [0; 32];
+    OsRng.fill_bytes(&mut nonce);
+    builder.push(
+        "execution.environment",
+        execution_environment.as_bytes().to_vec(),
+    )?;
+    builder.push("request.nonce", nonce.to_vec())?;
     builder.push("service", service.as_bytes().to_vec())?;
     builder.push("method", method.as_bytes().to_vec())?;
     builder.push("request.body", payload.to_vec())?;
@@ -112,12 +122,13 @@ pub fn verify_input_events(
         .event()
         .public_key();
     let input_commitment = verify_input_event_envelopes(SchemeId::Fetch, &caller_key, events)?;
-    let (service, method, body) = input_parts(events)?;
+    let (execution_environment, service, method, body) = input_parts(events)?;
     validate_non_empty_service_method(&service, &method)?;
     validate_json("request.body", body.as_bytes())?;
     Ok(FetchInput {
         input_commitment,
         caller_key,
+        execution_environment,
         service,
         method,
         body,
@@ -197,33 +208,48 @@ fn output_payloads(
 
 fn input_parts(
     events: &[InputEventEnvelope],
-) -> Result<(String, String, JsonBytes), FetchProtocolError> {
-    if events.len() != 4 {
+) -> Result<(ContentId, String, String, JsonBytes), FetchProtocolError> {
+    if events.len() != 6 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
         });
     }
-    expect_input_event(&events[0], 0, "service")?;
-    expect_input_event(&events[1], 1, "method")?;
-    expect_input_event(&events[2], 2, "request.body")?;
-    expect_input_event(&events[3], 3, "input.end")?;
-    if !events[3].payload().is_empty() {
+    expect_input_event(&events[0], 0, "execution.environment")?;
+    expect_input_event(&events[1], 1, "request.nonce")?;
+    expect_input_event(&events[2], 2, "service")?;
+    expect_input_event(&events[3], 3, "method")?;
+    expect_input_event(&events[4], 4, "request.body")?;
+    expect_input_event(&events[5], 5, "input.end")?;
+    if !events[5].payload().is_empty() {
         return Err(FetchProtocolError::NonEmptyInputEnd);
     }
+    let execution_environment = ContentId::from_slice(events[0].payload()).map_err(|_| {
+        FetchProtocolError::WrongInputLength {
+            field: "execution.environment",
+            actual: events[0].payload().len(),
+        }
+    })?;
+    if events[1].payload().len() != 32 {
+        return Err(FetchProtocolError::WrongInputLength {
+            field: "request.nonce",
+            actual: events[1].payload().len(),
+        });
+    }
     let service =
-        str::from_utf8(events[0].payload()).map_err(|source| FetchProtocolError::Utf8 {
+        str::from_utf8(events[2].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "service",
             source,
         })?;
     let method =
-        str::from_utf8(events[1].payload()).map_err(|source| FetchProtocolError::Utf8 {
+        str::from_utf8(events[3].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "method",
             source,
         })?;
     Ok((
+        execution_environment,
         service.to_string(),
         method.to_string(),
-        JsonBytes::new(events[2].payload().to_vec()),
+        JsonBytes::new(events[4].payload().to_vec()),
     ))
 }
 
@@ -296,8 +322,10 @@ pub enum FetchProtocolError {
     EmptyInputTranscript,
     #[error("fetch output transcript is empty")]
     EmptyOutputTranscript,
-    #[error("fetch input transcript must contain exactly 4 events, got {actual}")]
+    #[error("fetch input transcript must contain exactly 6 events, got {actual}")]
     WrongInputEventCount { actual: usize },
+    #[error("fetch {field} must be 32 bytes, got {actual}")]
+    WrongInputLength { field: &'static str, actual: usize },
     #[error("fetch output transcript must contain exactly one terminal event, got {actual} events")]
     WrongOutputEventCount { actual: usize },
     #[error("fetch input event {index} must be {expected}, got {actual}")]
@@ -344,11 +372,21 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
     }
 
+    fn environment() -> ContentId {
+        ContentId::from_bytes([9; 32])
+    }
+
     #[test]
     fn input_events_round_trip_through_shape_verifier() {
         let caller = key(1);
-        let events =
-            build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap();
+        let events = build_input_events(
+            "openai",
+            "responses",
+            br#"{"model":"gpt"}"#,
+            environment(),
+            &caller,
+        )
+        .unwrap();
 
         let input = verify_input_events(&events).unwrap();
 
@@ -359,11 +397,31 @@ mod tests {
     }
 
     #[test]
+    fn identical_requests_get_fresh_commitments() {
+        let caller = key(1);
+        let first =
+            build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap();
+        let second =
+            build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap();
+        assert_ne!(
+            verify_input_events(&first).unwrap().input_commitment,
+            verify_input_events(&second).unwrap().input_commitment
+        );
+    }
+
+    #[test]
     fn output_events_round_trip_through_shape_verifier() {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{"model":"gpt"}"#,
+                environment(),
+                &caller,
+            )
+            .unwrap(),
         )
         .unwrap()
         .input_commitment;
@@ -382,7 +440,14 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{"model":"gpt"}"#,
+                environment(),
+                &caller,
+            )
+            .unwrap(),
         )
         .unwrap()
         .input_commitment;
@@ -417,7 +482,14 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{"model":"gpt"}"#, &caller).unwrap(),
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{"model":"gpt"}"#,
+                environment(),
+                &caller,
+            )
+            .unwrap(),
         )
         .unwrap()
         .input_commitment;
@@ -443,6 +515,10 @@ mod tests {
         let caller = key(1);
         let mut builder =
             InputTranscriptBuilder::new(SchemeId::Fetch, &caller, input_canonicalization());
+        builder
+            .push("execution.environment", environment().as_bytes().to_vec())
+            .unwrap();
+        builder.push("request.nonce", vec![0; 32]).unwrap();
         builder.push("service", Vec::new()).unwrap();
         builder.push("method", b"responses".to_vec()).unwrap();
         builder.push("request.body", br#"{}"#.to_vec()).unwrap();
@@ -461,8 +537,12 @@ mod tests {
         let mut builder = InputTranscriptBuilder::new(
             SchemeId::Fetch,
             &caller,
-            CanonicalizationId::from_bytes(b"wrong.input.v1"),
+            CanonicalizationId::from_bytes(b"wrong.input.v2"),
         );
+        builder
+            .push("execution.environment", environment().as_bytes().to_vec())
+            .unwrap();
+        builder.push("request.nonce", vec![0; 32]).unwrap();
         builder.push("service", b"openai".to_vec()).unwrap();
         builder.push("method", b"responses".to_vec()).unwrap();
         builder.push("request.body", br#"{}"#.to_vec()).unwrap();
@@ -480,7 +560,7 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{}"#, &caller).unwrap(),
+            &build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap(),
         )
         .unwrap()
         .input_commitment;
@@ -498,7 +578,7 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{}"#, &caller).unwrap(),
+            &build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap(),
         )
         .unwrap()
         .input_commitment;
@@ -506,7 +586,7 @@ mod tests {
             SchemeId::Fetch,
             input,
             &producer,
-            CanonicalizationId::from_bytes(b"wrong.output.v1"),
+            CanonicalizationId::from_bytes(b"wrong.output.v2"),
         );
         builder
             .push("response.terminal", br#"{}"#.to_vec())
@@ -550,8 +630,8 @@ use crate::output::{
 type PayloadEncodeError = serde_ipld_dagcbor::EncodeError<TryReserveError>;
 type PayloadDecodeError = serde_ipld_dagcbor::DecodeError<Infallible>;
 
-const EVENT_CODEC: &str = "hellas.fetch.output.event.v1";
-const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v1";
+const EVENT_CODEC: &str = "hellas.fetch.output.event.v2";
+const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v2";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FetchEventPayload {
@@ -583,10 +663,7 @@ pub enum FetchTerminalPayload {
     Finished {
         stop_reason: StopReason,
         usage: Option<Usage>,
-    },
-    Failed {
-        message: String,
-        code: Option<String>,
+        billable_units: u64,
     },
 }
 
@@ -608,7 +685,19 @@ pub fn decode_fetch_event_payload(bytes: &[u8]) -> Result<OutputEvent, FetchPayl
 }
 
 pub fn encode_fetch_terminal_payload(event: &OutputEvent) -> Result<Vec<u8>, FetchPayloadError> {
-    let payload = FetchTerminalPayload::try_from(event)?;
+    let payload = match event {
+        OutputEvent::Finished {
+            stop_reason: StopReason::Cancelled,
+            ..
+        } => return Err(FetchPayloadError::CancelledTerminal),
+        OutputEvent::Finished { stop_reason, usage } => FetchTerminalPayload::Finished {
+            stop_reason: *stop_reason,
+            usage: *usage,
+            billable_units: fetch_billable_units(*usage),
+        },
+        OutputEvent::Error { .. } => return Err(FetchPayloadError::FailureAsTerminal),
+        _ => return Err(FetchPayloadError::NonTerminalAsTerminal),
+    };
     serde_ipld_dagcbor::to_vec(&(TERMINAL_CODEC, payload)).map_err(FetchPayloadError::Encode)
 }
 
@@ -623,20 +712,47 @@ pub fn decode_fetch_terminal_payload(
             actual: codec,
         });
     }
+    let FetchTerminalPayload::Finished {
+        usage,
+        billable_units,
+        ..
+    } = &payload;
+    let expected = fetch_billable_units(*usage);
+    if *billable_units != expected {
+        return Err(FetchPayloadError::BillableUnitsMismatch {
+            expected,
+            actual: *billable_units,
+        });
+    }
     Ok(payload)
+}
+
+fn fetch_billable_units(usage: Option<Usage>) -> u64 {
+    usage
+        .and_then(|usage| {
+            usage
+                .output_tokens
+                .or(usage.total_tokens)
+                .or(usage.input_tokens)
+        })
+        .unwrap_or_default()
 }
 
 impl FetchTerminalPayload {
     pub fn to_output_event(&self) -> OutputEvent {
         match self {
-            Self::Finished { stop_reason, usage } => OutputEvent::Finished {
+            Self::Finished {
+                stop_reason, usage, ..
+            } => OutputEvent::Finished {
                 stop_reason: *stop_reason,
                 usage: *usage,
             },
-            Self::Failed { message, code } => OutputEvent::Error {
-                message: message.clone(),
-                code: code.clone(),
-            },
+        }
+    }
+
+    pub const fn billable_units(&self) -> u64 {
+        match self {
+            Self::Finished { billable_units, .. } => *billable_units,
         }
     }
 }
@@ -737,24 +853,6 @@ impl TryFrom<FetchEventPayload> for OutputEvent {
     }
 }
 
-impl TryFrom<&OutputEvent> for FetchTerminalPayload {
-    type Error = FetchPayloadError;
-
-    fn try_from(event: &OutputEvent) -> Result<Self, Self::Error> {
-        match event {
-            OutputEvent::Finished { stop_reason, usage } => Ok(Self::Finished {
-                stop_reason: *stop_reason,
-                usage: *usage,
-            }),
-            OutputEvent::Error { message, code } => Ok(Self::Failed {
-                message: message.clone(),
-                code: code.clone(),
-            }),
-            _ => Err(FetchPayloadError::NonTerminalAsTerminal),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum FetchPayloadError {
     #[error("fetch payload encode failed: {0}")]
@@ -770,8 +868,14 @@ pub enum FetchPayloadError {
     TerminalAsEvent,
     #[error("non-terminal fetch payload cannot be encoded as a terminal event")]
     NonTerminalAsTerminal,
+    #[error("fetch cancellation is a failure")]
+    CancelledTerminal,
+    #[error("fetch failure cannot be signed as a success terminal")]
+    FailureAsTerminal,
     #[error("fetch payload index does not fit this platform")]
     IndexOutOfRange,
+    #[error("fetch billable_units must be {expected}, got {actual}")]
+    BillableUnitsMismatch { expected: u64, actual: u64 },
 }
 
 #[cfg(test)]
@@ -811,6 +915,7 @@ mod payload_tests {
         let decoded = decode_fetch_terminal_payload(&encoded).unwrap();
 
         assert_eq!(decoded.to_output_event(), event);
+        assert_eq!(decoded.billable_units(), 4);
     }
 
     #[test]
@@ -834,7 +939,7 @@ mod payload_tests {
             channel: TextChannel::Output,
         };
         let actual = hex(&encode_fetch_event_payload(&event).unwrap());
-        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7631a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
+        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7632a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
         assert_eq!(actual, expected);
     }
 }

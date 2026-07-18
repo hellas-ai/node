@@ -1,9 +1,10 @@
 use crate::commitment::TagError;
+use crate::run_ticket::{public_key_from_pb, public_key_to_pb, signature_from_pb, signature_to_pb};
 use crate::{
     CanonicalizationId, Digest, EventCommitment, InputCommitment, InputEventBody,
     InputEventBodyParts, InputEventEnvelope, OutputEventBody, OutputEventBodyParts,
-    OutputEventEnvelope, ProducerId, PublicKey, SchemeId, Signature, SignatureKind,
-    SignedInputEvent, SignedOutputEvent, StreamId, StreamVerifyError,
+    OutputEventEnvelope, ProducerId, SchemeId, SignedInputEvent, SignedOutputEvent, StreamId,
+    StreamVerifyError,
 };
 
 use crate::pb::execute as pb;
@@ -117,49 +118,9 @@ pub fn output_event_from_pb(
     Ok(OutputEventEnvelope::new(signed, event.payload)?)
 }
 
-fn public_key_to_pb(key: &PublicKey) -> pb::PublicKey {
-    pb::PublicKey {
-        kind: u32::from(key.kind().to_byte()),
-        bytes: key.bytes().to_vec(),
-    }
-}
-
-fn public_key_from_pb(key: pb::PublicKey) -> Result<PublicKey, StreamEnvelopeError> {
-    match signature_kind_from_u32(key.kind)? {
-        SignatureKind::Secp256k1 => {
-            let bytes: [u8; PublicKey::LEN] =
-                fixed_bytes("public_key.bytes", key.bytes.as_slice())?;
-            Ok(PublicKey::from_compressed_sec1(bytes))
-        }
-    }
-}
-
-fn signature_to_pb(signature: &Signature) -> pb::Signature {
-    pb::Signature {
-        kind: u32::from(signature.kind().to_byte()),
-        bytes: signature.bytes().to_vec(),
-    }
-}
-
-fn signature_from_pb(signature: pb::Signature) -> Result<Signature, StreamEnvelopeError> {
-    match signature_kind_from_u32(signature.kind)? {
-        SignatureKind::Secp256k1 => {
-            let bytes: [u8; Signature::LEN] =
-                fixed_bytes("signature.bytes", signature.bytes.as_slice())?;
-            Ok(Signature::from_compact_secp256k1(bytes))
-        }
-    }
-}
-
 fn scheme_from_u32(value: u32) -> Result<SchemeId, StreamEnvelopeError> {
     let value = u8::try_from(value).map_err(|_| StreamEnvelopeError::SchemeOutOfRange(value))?;
     Ok(SchemeId::from_byte(value)?)
-}
-
-fn signature_kind_from_u32(value: u32) -> Result<SignatureKind, StreamEnvelopeError> {
-    let value =
-        u8::try_from(value).map_err(|_| StreamEnvelopeError::SignatureKindOutOfRange(value))?;
-    Ok(SignatureKind::from_byte(value)?)
 }
 
 fn digest_from_bytes(name: &'static str, bytes: &[u8]) -> Result<Digest, StreamEnvelopeError> {
@@ -196,12 +157,12 @@ pub enum StreamEnvelopeError {
     },
     #[error("scheme id {0} does not fit in one byte")]
     SchemeOutOfRange(u32),
-    #[error("signature kind {0} does not fit in one byte")]
-    SignatureKindOutOfRange(u32),
     #[error("unknown scheme id: {0}")]
     Scheme(#[from] TagError),
     #[error("signature error: {0}")]
     Signature(#[from] crate::SignatureError),
+    #[error("signature wire error: {0}")]
+    SignatureWire(#[from] crate::run_ticket::RunTicketAuthError),
     #[error("stream verification error: {0}")]
     Stream(#[from] StreamVerifyError),
 }

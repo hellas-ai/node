@@ -221,7 +221,7 @@ enum IndexedFieldType {
 #[derive(Clone, Debug)]
 struct IndexedEnum {
     short_name: String,
-    variants: Vec<(String, i32)>,
+    variants: Vec<i32>,
 }
 
 impl SchemaIndex {
@@ -292,12 +292,7 @@ impl SchemaIndex {
         let variants = en
             .value
             .iter()
-            .map(|v| {
-                (
-                    v.name.clone().unwrap_or_default(),
-                    v.number.unwrap_or_default(),
-                )
-            })
+            .map(|v| v.number.unwrap_or_default())
             .collect();
         enums.insert(
             fqn,
@@ -517,7 +512,7 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
         })
         .collect();
 
-    let alpn = format!("/{fqn}/1.0");
+    let alpn = format!("/{fqn}/2.0");
     ServicePlan {
         feature: feature_for_package(&service.package),
         module: format_ident!("{}", to_snake_case(&service.proto_name)),

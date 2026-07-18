@@ -3437,6 +3437,7 @@ dependencies = [
  "hellas-wire",
  "iroh-blobs",
  "prometheus-client",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3496,6 +3497,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "ed25519-dalek",
  "futures-core",
  "futures-util",
  "getrandom 0.2.17",
@@ -3503,6 +3505,7 @@ dependencies = [
  "hellas-p2p",
  "hellas-wire",
  "k256",
+ "p256",
  "prettyplease",
  "proc-macro2",
  "prost",

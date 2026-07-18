@@ -158,7 +158,7 @@ pub trait RecvHalf:
 pub trait ServiceMarker {
     /// Fully-qualified service name (`package.Service`).
     const NAME: &'static str;
-    /// Wire ALPN derived from `NAME` (e.g. `/hellas.swarm.v1.Node/1.0`).
+    /// Wire ALPN derived from `NAME` (e.g. `/hellas.swarm.v1.Node/2.0`).
     const ALPN: &'static str;
     /// Truncated 32-bit service id (blake3-of-schema, low 4 bytes LE).
     const SERVICE_ID: u32;

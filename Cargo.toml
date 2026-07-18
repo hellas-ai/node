@@ -45,6 +45,7 @@ commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", branch
 commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
 commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
 dirs = "6"
+ed25519-dalek = { version = "3.0.0-rc.0", default-features = false }
 futures = "0.3"
 half = "2.7.1"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
@@ -70,6 +71,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
     "reqwest-rustls-webpki-roots",
 ] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 prometheus-client = "0.24"
 rand = "0.8"
 rand_core = "0.6"

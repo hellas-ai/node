@@ -8,11 +8,11 @@ use crate::{
 };
 use crate::{DagCborDecodeError, DagCborEncodeError, canonical_dag_cbor};
 
-const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v1";
-pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v1";
-pub const TERMINAL_EVENT_KIND: &str = "evaluate.terminal.v1";
-const TOKEN_DELTA_CODEC: &str = "hellas.evaluate.output.token_delta.v1";
-const TERMINAL_CODEC: &str = "hellas.evaluate.output.terminal.v1";
+const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v2";
+pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v2";
+pub const TERMINAL_EVENT_KIND: &str = "evaluate.terminal.v2";
+const TOKEN_DELTA_CODEC: &str = "hellas.evaluate.output.token_delta.v2";
+const TERMINAL_CODEC: &str = "hellas.evaluate.output.terminal.v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateStopReason(u8);
@@ -20,7 +20,6 @@ pub struct EvaluateStopReason(u8);
 impl EvaluateStopReason {
     pub const END_OF_SEQUENCE: Self = Self(1);
     pub const MAX_OUTPUT: Self = Self(2);
-    pub const CANCELLED: Self = Self(3);
 
     pub const fn as_u8(self) -> u8 {
         self.0
@@ -30,7 +29,6 @@ impl EvaluateStopReason {
         match value {
             1 => Ok(Self::END_OF_SEQUENCE),
             2 => Ok(Self::MAX_OUTPUT),
-            3 => Ok(Self::CANCELLED),
             other => Err(EvaluateProtocolError::UnknownStopReason(other)),
         }
     }
@@ -40,7 +38,15 @@ impl EvaluateStopReason {
 pub struct EvaluateUsage {
     pub input_units: u64,
     pub output_units: u64,
-    pub total_units: u64,
+}
+
+impl EvaluateUsage {
+    /// Evaluate bills prompt tokens plus generated tokens.
+    pub fn billable_units(self) -> Result<u64, EvaluateProtocolError> {
+        self.input_units
+            .checked_add(self.output_units)
+            .ok_or(EvaluateProtocolError::BillableUnitsOverflow)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +74,8 @@ pub struct EvaluateTerminal {
     pub final_position: u64,
     pub stop_reason: EvaluateStopReason,
     pub text_artifact: Digest,
-    pub usage: Option<EvaluateUsage>,
+    pub usage: EvaluateUsage,
+    pub billable_units: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +127,22 @@ pub fn decode_terminal_payload(bytes: &[u8]) -> Result<EvaluateTerminal, Evaluat
         });
     }
     EvaluateStopReason::from_u8(payload.stop_reason.as_u8())?;
+    validate_terminal(&payload)?;
     Ok(payload)
+}
+
+fn validate_terminal(terminal: &EvaluateTerminal) -> Result<(), EvaluateProtocolError> {
+    if terminal.usage.output_units != terminal.final_position {
+        return Err(EvaluateProtocolError::UsagePositionMismatch);
+    }
+    let expected = terminal.usage.billable_units()?;
+    if terminal.billable_units != expected {
+        return Err(EvaluateProtocolError::BillableUnitsMismatch {
+            expected,
+            actual: terminal.billable_units,
+        });
+    }
+    Ok(())
 }
 
 pub struct EvaluateOutputTranscriptBuilder<'a> {
@@ -194,6 +216,7 @@ impl<'a> EvaluateOutputTranscriptBuilder<'a> {
                 actual: terminal.final_position,
             });
         }
+        validate_terminal(&terminal)?;
         self.inner
             .push(TERMINAL_EVENT_KIND, encode_terminal_payload(&terminal)?)?;
         let (events, _) = self.inner.finish()?;
@@ -344,6 +367,12 @@ pub enum EvaluateProtocolError {
     ProducerKeyMismatch,
     #[error("evaluate output position exceeded u64 range")]
     PositionOverflow,
+    #[error("evaluate usage output units do not match final position")]
+    UsagePositionMismatch,
+    #[error("evaluate billable units mismatch: expected {expected}, got {actual}")]
+    BillableUnitsMismatch { expected: u64, actual: u64 },
+    #[error("evaluate billable units exceed u64 range")]
+    BillableUnitsOverflow,
 }
 
 #[cfg(test)]
@@ -365,11 +394,11 @@ mod tests {
             final_position: 2,
             stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
             text_artifact: Digest::from_bytes([4; 32]),
-            usage: Some(EvaluateUsage {
+            usage: EvaluateUsage {
                 input_units: 7,
                 output_units: 2,
-                total_units: 9,
-            }),
+            },
+            billable_units: 9,
         };
         let events = builder.finish(terminal.clone()).unwrap();
 
@@ -394,7 +423,11 @@ mod tests {
                 final_position: 1,
                 stop_reason: EvaluateStopReason::MAX_OUTPUT,
                 text_artifact: Digest::from_bytes([4; 32]),
-                usage: None,
+                usage: EvaluateUsage {
+                    input_units: 0,
+                    output_units: 1,
+                },
+                billable_units: 1,
             })
             .unwrap();
 
@@ -415,7 +448,11 @@ mod tests {
                     final_position: 2,
                     stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
                     text_artifact: Digest::from_bytes([4; 32]),
-                    usage: None,
+                    usage: EvaluateUsage {
+                        input_units: 0,
+                        output_units: 2,
+                    },
+                    billable_units: 2,
                 })
                 .unwrap_err(),
             EvaluateProtocolError::TerminalPositionMismatch {

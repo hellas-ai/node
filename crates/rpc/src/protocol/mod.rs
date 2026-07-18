@@ -3,15 +3,24 @@
 pub mod commitment;
 pub mod digest;
 pub mod dtype;
+pub mod identity;
+pub mod job;
+pub mod manifest;
 pub mod schemes;
 pub mod signature;
 pub mod stream;
 pub mod tags;
 pub mod value;
 
-pub use commitment::{AssuranceStrategy, RequestCommitment, SchemeId};
-pub use digest::{Digest, hash_tuple};
+pub use commitment::{RequestCommitment, SchemeId};
+pub use digest::{ContentId, Digest, hash_tuple};
 pub use dtype::{Dtype, ParseDtypeError};
+pub use identity::{
+    PlatformCredential, ProviderGenesisStatement, ProviderIdentityV1, RootKind, RootProof,
+    SignedProviderGenesis,
+};
+pub use job::{AMD_SEV_SNP, APPLE_APP_ATTEST, AssuranceRequirement, JobTerms, TPM2_QUOTE};
+pub use manifest::{EvaluateProgramManifest, FetchProgramManifest, ProgramManifest};
 pub use schemes::evaluate::{Evaluate, EvaluateRequest};
 pub use signature::{
     ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,

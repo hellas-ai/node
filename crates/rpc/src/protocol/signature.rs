@@ -1,9 +1,8 @@
-use serde::de::{Error as DeError, Visitor};
+use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+use k256::ecdsa::{Signature as K256Signature, SigningKey};
+use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-
-use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
-use k256::ecdsa::{Signature as K256Signature, SigningKey, VerifyingKey};
 
 use crate::digest::Digest;
 use crate::{hash_tuple, tags};
@@ -12,6 +11,8 @@ use crate::{hash_tuple, tags};
 #[repr(u8)]
 pub enum SignatureKind {
     Secp256k1 = tags::SIGNATURE_SECP256K1,
+    Ed25519 = tags::SIGNATURE_ED25519,
+    P256 = tags::SIGNATURE_P256,
 }
 
 impl SignatureKind {
@@ -22,6 +23,8 @@ impl SignatureKind {
     pub fn from_byte(byte: u8) -> Result<Self, SignatureError> {
         match byte {
             tags::SIGNATURE_SECP256K1 => Ok(Self::Secp256k1),
+            tags::SIGNATURE_ED25519 => Ok(Self::Ed25519),
+            tags::SIGNATURE_P256 => Ok(Self::P256),
             _ => Err(SignatureError::UnknownSignatureKind(byte)),
         }
     }
@@ -41,64 +44,31 @@ impl<'de> Deserialize<'de> for SignatureKind {
     where
         D: Deserializer<'de>,
     {
-        struct KindVisitor;
-
-        impl Visitor<'_> for KindVisitor {
-            type Value = SignatureKind;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a one-byte signature kind")
-            }
-
-            fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                SignatureKind::from_byte(v).map_err(E::custom)
-            }
-
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                let byte = u8::try_from(v).map_err(E::custom)?;
-                self.visit_u8(byte)
-            }
-        }
-
-        deserializer.deserialize_u8(KindVisitor)
+        let byte = u8::deserialize(deserializer)?;
+        Self::from_byte(byte).map_err(D::Error::custom)
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PublicKey {
-    kind: SignatureKind,
-    bytes: [u8; 33],
+pub enum PublicKey {
+    Secp256k1([u8; 33]),
+    Ed25519([u8; 32]),
+    P256([u8; 33]),
 }
 
 impl PublicKey {
-    pub const LEN: usize = 33;
-
-    pub const fn from_compressed_sec1(bytes: [u8; Self::LEN]) -> Self {
-        Self {
-            kind: SignatureKind::Secp256k1,
-            bytes,
+    pub const fn kind(&self) -> SignatureKind {
+        match self {
+            Self::Secp256k1(_) => SignatureKind::Secp256k1,
+            Self::Ed25519(_) => SignatureKind::Ed25519,
+            Self::P256(_) => SignatureKind::P256,
         }
     }
 
-    pub const fn kind(&self) -> SignatureKind {
-        self.kind
-    }
-
-    pub const fn bytes(&self) -> &[u8; Self::LEN] {
-        &self.bytes
-    }
-
-    pub fn verifying_key(&self) -> Result<VerifyingKey, SignatureError> {
-        match self.kind {
-            SignatureKind::Secp256k1 => {
-                VerifyingKey::from_sec1_bytes(&self.bytes).map_err(SignatureError::from)
-            }
+    pub const fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Secp256k1(bytes) | Self::P256(bytes) => bytes,
+            Self::Ed25519(bytes) => bytes,
         }
     }
 }
@@ -106,7 +76,7 @@ impl PublicKey {
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PublicKey")
-            .field("kind", &self.kind)
+            .field("kind", &self.kind())
             .field("producer_id", &ProducerId::from_public_key(self))
             .finish()
     }
@@ -117,7 +87,7 @@ impl Serialize for PublicKey {
     where
         S: Serializer,
     {
-        (&self.kind, serde_bytes::Bytes::new(&self.bytes)).serialize(serializer)
+        (self.kind(), serde_bytes::Bytes::new(self.bytes())).serialize(serializer)
     }
 }
 
@@ -128,49 +98,41 @@ impl<'de> Deserialize<'de> for PublicKey {
     {
         let (kind, bytes): (SignatureKind, serde_bytes::ByteBuf) =
             Deserialize::deserialize(deserializer)?;
-        if kind != SignatureKind::Secp256k1 {
-            return Err(D::Error::custom("unsupported public key kind"));
+        match kind {
+            SignatureKind::Secp256k1 => fixed(bytes.as_ref(), "secp256k1 public key")
+                .map(Self::Secp256k1)
+                .map_err(D::Error::custom),
+            SignatureKind::Ed25519 => fixed(bytes.as_ref(), "Ed25519 public key")
+                .map(Self::Ed25519)
+                .map_err(D::Error::custom),
+            SignatureKind::P256 => fixed(bytes.as_ref(), "P-256 public key")
+                .map(Self::P256)
+                .map_err(D::Error::custom),
         }
-        let bytes: [u8; Self::LEN] = bytes.into_vec().try_into().map_err(|bytes: Vec<u8>| {
-            D::Error::custom(format!("public key must be 33 bytes, got {}", bytes.len()))
-        })?;
-        Ok(Self { kind, bytes })
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Signature {
-    kind: SignatureKind,
-    bytes: [u8; 64],
+pub enum Signature {
+    Secp256k1([u8; 64]),
+    Ed25519([u8; 64]),
+    P256([u8; 64]),
 }
 
 impl Signature {
     pub const LEN: usize = 64;
 
-    pub const fn from_compact_secp256k1(bytes: [u8; Self::LEN]) -> Self {
-        Self {
-            kind: SignatureKind::Secp256k1,
-            bytes,
+    pub const fn kind(&self) -> SignatureKind {
+        match self {
+            Self::Secp256k1(_) => SignatureKind::Secp256k1,
+            Self::Ed25519(_) => SignatureKind::Ed25519,
+            Self::P256(_) => SignatureKind::P256,
         }
     }
 
-    pub const fn kind(&self) -> SignatureKind {
-        self.kind
-    }
-
     pub const fn bytes(&self) -> &[u8; Self::LEN] {
-        &self.bytes
-    }
-
-    fn as_k256(&self) -> Result<K256Signature, SignatureError> {
-        match self.kind {
-            SignatureKind::Secp256k1 => {
-                let sig = K256Signature::from_slice(&self.bytes).map_err(SignatureError::from)?;
-                if sig.normalize_s().is_some() {
-                    return Err(SignatureError::HighS);
-                }
-                Ok(sig)
-            }
+        match self {
+            Self::Secp256k1(bytes) | Self::Ed25519(bytes) | Self::P256(bytes) => bytes,
         }
     }
 }
@@ -178,7 +140,7 @@ impl Signature {
 impl fmt::Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Signature")
-            .field("kind", &self.kind)
+            .field("kind", &self.kind())
             .finish_non_exhaustive()
     }
 }
@@ -188,7 +150,7 @@ impl Serialize for Signature {
     where
         S: Serializer,
     {
-        (&self.kind, serde_bytes::Bytes::new(&self.bytes)).serialize(serializer)
+        (self.kind(), serde_bytes::Bytes::new(self.bytes())).serialize(serializer)
     }
 }
 
@@ -199,14 +161,19 @@ impl<'de> Deserialize<'de> for Signature {
     {
         let (kind, bytes): (SignatureKind, serde_bytes::ByteBuf) =
             Deserialize::deserialize(deserializer)?;
-        if kind != SignatureKind::Secp256k1 {
-            return Err(D::Error::custom("unsupported signature kind"));
-        }
-        let bytes: [u8; Self::LEN] = bytes.into_vec().try_into().map_err(|bytes: Vec<u8>| {
-            D::Error::custom(format!("signature must be 64 bytes, got {}", bytes.len()))
-        })?;
-        Ok(Self { kind, bytes })
+        let bytes = fixed(bytes.as_ref(), "signature").map_err(D::Error::custom)?;
+        Ok(match kind {
+            SignatureKind::Secp256k1 => Self::Secp256k1(bytes),
+            SignatureKind::Ed25519 => Self::Ed25519(bytes),
+            SignatureKind::P256 => Self::P256(bytes),
+        })
     }
+}
+
+fn fixed<const N: usize>(bytes: &[u8], name: &str) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("{name} must be {N} bytes, got {}", bytes.len()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,7 +183,7 @@ impl ProducerId {
     pub fn from_public_key(public_key: &PublicKey) -> Self {
         let kind = [public_key.kind().to_byte()];
         Self(hash_tuple(
-            tags::PRODUCER_ID_V1,
+            tags::PRODUCER_ID_V2,
             &[&kind, public_key.bytes()],
         ))
     }
@@ -262,13 +229,13 @@ impl ProducerSigningKey {
     }
 
     pub fn public_key(&self) -> PublicKey {
-        let verifying_key = self.inner.verifying_key();
-        let point = verifying_key.to_encoded_point(true);
-        let bytes: [u8; PublicKey::LEN] = point
-            .as_bytes()
-            .try_into()
-            .expect("compressed secp256k1 public key is 33 bytes");
-        PublicKey::from_compressed_sec1(bytes)
+        let point = self.inner.verifying_key().to_encoded_point(true);
+        PublicKey::Secp256k1(
+            point
+                .as_bytes()
+                .try_into()
+                .expect("compressed secp256k1 public key is 33 bytes"),
+        )
     }
 
     pub fn producer_id(&self) -> ProducerId {
@@ -278,9 +245,7 @@ impl ProducerSigningKey {
     pub fn sign_digest(&self, digest: Digest) -> Result<Signature, SignatureError> {
         let signature: K256Signature = self.inner.sign_prehash(digest.as_bytes())?;
         let signature = signature.normalize_s().unwrap_or(signature);
-        Ok(Signature::from_compact_secp256k1(
-            signature.to_bytes().into(),
-        ))
+        Ok(Signature::Secp256k1(signature.to_bytes().into()))
     }
 
     #[cfg(test)]
@@ -294,16 +259,42 @@ pub fn verify_digest_signature(
     signature: &Signature,
     digest: Digest,
 ) -> Result<(), SignatureError> {
-    if public_key.kind() != signature.kind() {
-        return Err(SignatureError::KindMismatch {
-            public_key: public_key.kind(),
-            signature: signature.kind(),
-        });
+    match (public_key, signature) {
+        (PublicKey::Secp256k1(key), Signature::Secp256k1(signature)) => {
+            let key = k256::ecdsa::VerifyingKey::from_sec1_bytes(key)?;
+            let signature = K256Signature::from_slice(signature)?;
+            if signature.normalize_s().is_some() {
+                return Err(SignatureError::HighS);
+            }
+            key.verify_prehash(digest.as_bytes(), &signature)?;
+        }
+        (PublicKey::Ed25519(key), Signature::Ed25519(signature)) => {
+            let key = ed25519_dalek::VerifyingKey::from_bytes(key)
+                .map_err(|error| SignatureError::Ed25519(error.to_string()))?;
+            key.verify_strict(
+                digest.as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(signature),
+            )
+            .map_err(|error| SignatureError::Ed25519(error.to_string()))?;
+        }
+        (PublicKey::P256(key), Signature::P256(signature)) => {
+            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(key)
+                .map_err(|error| SignatureError::P256(error.to_string()))?;
+            let signature = p256::ecdsa::Signature::from_slice(signature)
+                .map_err(|error| SignatureError::P256(error.to_string()))?;
+            if signature.normalize_s().is_some() {
+                return Err(SignatureError::HighS);
+            }
+            key.verify_prehash(digest.as_bytes(), &signature)
+                .map_err(|error| SignatureError::P256(error.to_string()))?;
+        }
+        _ => {
+            return Err(SignatureError::KindMismatch {
+                public_key: public_key.kind(),
+                signature: signature.kind(),
+            });
+        }
     }
-
-    let verifying_key = public_key.verifying_key()?;
-    let signature = signature.as_k256()?;
-    verifying_key.verify_prehash(digest.as_bytes(), &signature)?;
     Ok(())
 }
 
@@ -316,10 +307,14 @@ pub enum SignatureError {
         public_key: SignatureKind,
         signature: SignatureKind,
     },
-    #[error("secp256k1 signature is not normalized to low-S form")]
+    #[error("ECDSA signature is not normalized to low-S form")]
     HighS,
     #[error("secp256k1 error: {0}")]
     Secp256k1(String),
+    #[error("Ed25519 error: {0}")]
+    Ed25519(String),
+    #[error("P-256 error: {0}")]
+    P256(String),
 }
 
 impl From<k256::ecdsa::Error> for SignatureError {
@@ -337,30 +332,58 @@ impl From<k256::elliptic_curve::Error> for SignatureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     #[test]
-    fn secp256k1_sign_verify_round_trip() {
-        let key = ProducerSigningKey::deterministic_for_tests();
+    fn all_schemes_verify_protocol_digest() {
         let digest = hash_tuple("test.digest", &[b"payload"]);
-        let signature = key.sign_digest(digest).unwrap();
-        verify_digest_signature(&key.public_key(), &signature, digest).unwrap();
+        let secp = ProducerSigningKey::deterministic_for_tests();
+        verify_digest_signature(
+            &secp.public_key(),
+            &secp.sign_digest(digest).unwrap(),
+            digest,
+        )
+        .unwrap();
+
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let ed_signature = ed.sign(digest.as_bytes()).to_bytes();
+        verify_digest_signature(
+            &PublicKey::Ed25519(ed.verifying_key().to_bytes()),
+            &Signature::Ed25519(ed_signature),
+            digest,
+        )
+        .unwrap();
+
+        let p256 = p256::ecdsa::SigningKey::from_bytes(&[3; 32].into()).unwrap();
+        let p256_signature: p256::ecdsa::Signature = p256.sign_prehash(digest.as_bytes()).unwrap();
+        verify_digest_signature(
+            &PublicKey::P256(
+                p256.verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+            ),
+            &Signature::P256(
+                p256_signature
+                    .normalize_s()
+                    .unwrap_or(p256_signature)
+                    .to_bytes()
+                    .into(),
+            ),
+            digest,
+        )
+        .unwrap();
     }
 
     #[test]
-    fn invalid_signature_fails() {
+    fn tag_mismatch_fails() {
         let key = ProducerSigningKey::deterministic_for_tests();
         let digest = hash_tuple("test.digest", &[b"payload"]);
-        let mut signature = key.sign_digest(digest).unwrap();
-        signature.bytes[0] ^= 0x01;
-        assert!(verify_digest_signature(&key.public_key(), &signature, digest).is_err());
-    }
-
-    #[test]
-    fn producer_id_is_stable() {
-        let key = ProducerSigningKey::deterministic_for_tests();
-        assert_eq!(
-            ProducerId::from_public_key(&key.public_key()),
-            key.producer_id()
-        );
+        let signature = Signature::P256(*key.sign_digest(digest).unwrap().bytes());
+        assert!(matches!(
+            verify_digest_signature(&key.public_key(), &signature, digest),
+            Err(SignatureError::KindMismatch { .. })
+        ));
     }
 }

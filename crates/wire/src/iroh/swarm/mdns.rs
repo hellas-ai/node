@@ -178,31 +178,31 @@ mod tests {
 
     #[test]
     fn classify_user_data_alpn_distinguishes_missing_match_and_mismatch() {
-        let encoded = encode_alpns(&[b"/svc.A/1.0".to_vec(), b"/svc.B/1.0".to_vec()])
+        let encoded = encode_alpns(&[b"/svc.A/2.0".to_vec(), b"/svc.B/2.0".to_vec()])
             .expect("valid user-data");
 
         assert_eq!(
-            classify_user_data_alpn(Some(&encoded), b"/svc.A/1.0"),
+            classify_user_data_alpn(Some(&encoded), b"/svc.A/2.0"),
             UserDataAlpnMatch::Match
         );
         assert_eq!(
-            classify_user_data_alpn(Some(&encoded), b"/svc.C/1.0"),
+            classify_user_data_alpn(Some(&encoded), b"/svc.C/2.0"),
             UserDataAlpnMatch::Mismatch
         );
         assert_eq!(
-            classify_user_data_alpn(None, b"/svc.A/1.0"),
+            classify_user_data_alpn(None, b"/svc.A/2.0"),
             UserDataAlpnMatch::Missing
         );
     }
 
     #[test]
     fn encode_decode_round_trips_alpns() {
-        let encoded = encode_alpns(&[b"/svc.a/1.0".to_vec(), b"/svc.b/1.0".to_vec()])
+        let encoded = encode_alpns(&[b"/svc.a/2.0".to_vec(), b"/svc.b/2.0".to_vec()])
             .expect("encoding should succeed");
         let decoded = decode_alpns(&encoded);
         assert_eq!(
             decoded,
-            vec![b"/svc.a/1.0".to_vec(), b"/svc.b/1.0".to_vec()]
+            vec![b"/svc.a/2.0".to_vec(), b"/svc.b/2.0".to_vec()]
         );
     }
 

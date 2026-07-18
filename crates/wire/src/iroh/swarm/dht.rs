@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn signing_key_derivation_is_deterministic() {
-        let alpn = b"/test.Service/1.0";
+        let alpn = b"/test.Service/2.0";
         let minute = 12345u64;
 
         let key1 = derive_signing_key(alpn, minute, 3);
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn signing_key_changes_with_minute() {
-        let alpn = b"/test.Service/1.0";
+        let alpn = b"/test.Service/2.0";
         let key1 = derive_signing_key(alpn, 12345, 3);
         let key2 = derive_signing_key(alpn, 12346, 3);
         assert_ne!(key1.to_bytes(), key2.to_bytes());
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn salt_derivation_is_deterministic() {
-        let alpn = b"/test.Service/1.0";
+        let alpn = b"/test.Service/2.0";
         let minute = 12345u64;
 
         let salt1 = derive_salt(alpn, minute, 3);
@@ -903,10 +903,10 @@ mod tests {
     #[test]
     fn shard_selection_is_stable_and_distinct() {
         let node_id = [42u8; 32];
-        let shards = replica_shards(&node_id, b"/test.Service/1.0");
+        let shards = replica_shards(&node_id, b"/test.Service/2.0");
 
         assert_eq!(shards.len(), DHT_REPLICA_COUNT);
-        assert_eq!(shards, replica_shards(&node_id, b"/test.Service/1.0"));
+        assert_eq!(shards, replica_shards(&node_id, b"/test.Service/2.0"));
         assert_ne!(shards[0], shards[1]);
         assert!(shards.iter().all(|shard| *shard < DHT_SHARD_COUNT));
     }
@@ -932,7 +932,7 @@ mod tests {
         let key = SecretKey::from_bytes(&[7u8; 32]);
         let ad = SignedServiceAd::sign(
             &key,
-            b"/svc.Test/1.0",
+            b"/svc.Test/2.0",
             123,
             4,
             &["prod".to_string()],
@@ -941,19 +941,19 @@ mod tests {
         )
         .expect("ad should serialize");
 
-        assert!(ad.verify(b"/svc.Test/1.0", 123, 4, 1_060));
-        assert!(!ad.verify(b"/svc.Test/1.0", 123, 5, 1_060));
-        assert!(!ad.verify(b"/svc.Other/1.0", 123, 4, 1_060));
+        assert!(ad.verify(b"/svc.Test/2.0", 123, 4, 1_060));
+        assert!(!ad.verify(b"/svc.Test/2.0", 123, 5, 1_060));
+        assert!(!ad.verify(b"/svc.Other/2.0", 123, 4, 1_060));
     }
 
     #[test]
     fn merge_valid_dedupes_and_prefers_newer_ads() {
         let key = SecretKey::from_bytes(&[9u8; 32]);
-        let newer = SignedServiceAd::sign(&key, b"/svc.Test/1.0", 55, 2, &[], 200, 320)
+        let newer = SignedServiceAd::sign(&key, b"/svc.Test/2.0", 55, 2, &[], 200, 320)
             .expect("newer ad should serialize");
         let older = SignedServiceAd::sign(
             &key,
-            b"/svc.Test/1.0",
+            b"/svc.Test/2.0",
             55,
             2,
             &["old".to_string()],
@@ -967,7 +967,7 @@ mod tests {
                 ServiceBucket::new(vec![older]),
                 ServiceBucket::new(vec![newer.clone()]),
             ],
-            b"/svc.Test/1.0",
+            b"/svc.Test/2.0",
             55,
             2,
             210,

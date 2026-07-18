@@ -37,15 +37,18 @@ mod tokens;
 pub use tokens::{TokenBytesError, decode_token_ids, encode_token_ids};
 
 pub use protocol::{
-    AssuranceStrategy, CanonicalizationId, DagCborDecodeError, DagCborEncodeError, DagCborEncoder,
-    Digest, Dtype, Evaluate, EvaluateRequest, EventCommitment, InputCommitment, InputEventBody,
-    InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JsonBytes, OutputEventBody,
-    OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, ParseDtypeError,
-    ProducerId, ProducerSigningKey, PublicKey, RequestCommitment, SchemeId, Signature,
-    SignatureError, SignatureKind, SignedInputEvent, SignedOutputEvent, StreamId,
-    StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
-    output_genesis, verify_input_event_envelopes, verify_input_transcript,
-    verify_output_event_envelopes, verify_output_transcript,
+    AMD_SEV_SNP, APPLE_APP_ATTEST, AssuranceRequirement, CanonicalizationId, ContentId,
+    DagCborDecodeError, DagCborEncodeError, DagCborEncoder, Digest, Dtype, Evaluate,
+    EvaluateProgramManifest, EvaluateRequest, EventCommitment, FetchProgramManifest,
+    InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
+    InputTranscriptBuilder, JobTerms, JsonBytes, OutputEventBody, OutputEventBodyParts,
+    OutputEventEnvelope, OutputTranscriptBuilder, ParseDtypeError, PlatformCredential, ProducerId,
+    ProducerSigningKey, ProgramManifest, ProviderGenesisStatement, ProviderIdentityV1, PublicKey,
+    RequestCommitment, RootKind, RootProof, SchemeId, Signature, SignatureError, SignatureKind,
+    SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StreamId, StreamVerifyError,
+    TPM2_QUOTE, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis, output_genesis,
+    verify_input_event_envelopes, verify_input_transcript, verify_output_event_envelopes,
+    verify_output_transcript,
 };
 pub use protocol::{commitment, digest, signature, tags, value};
 

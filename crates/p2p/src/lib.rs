@@ -57,7 +57,7 @@ pub(crate) mod test_markers {
     pub struct TestService;
     impl ServiceMarker for TestService {
         const NAME: &'static str = "hellas.swarm.v1.Node";
-        const ALPN: &'static str = "/hellas.swarm.v1.Node/1.0";
+        const ALPN: &'static str = "/hellas.swarm.v1.Node/2.0";
         const SERVICE_ID: u32 = 1;
     }
 
