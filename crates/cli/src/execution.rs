@@ -58,7 +58,7 @@ use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
 use hellas_rpc::pb::execute::{
-    self as pb, FinishStatus, RunTicketRequest, WorkEvent, WorkFinished, work_event,
+    self as pb, RunTicketRequest, Ticket, WorkEvent, WorkFinished, work_event,
 };
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "evaluate")]
@@ -113,10 +113,6 @@ pub enum ExecutionError {
     #[cfg(feature = "gateway")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
-    #[error("unknown finish status {value}")]
-    UnknownFinishStatus { value: i32 },
-    #[error("wire finish status is unspecified")]
-    UnspecifiedFinishStatus,
     #[cfg(feature = "gateway")]
     #[error("evaluate transcript verification failed: {source}")]
     EvaluateTranscript {
@@ -309,11 +305,11 @@ impl Outcome {
     }
 }
 
+#[cfg(feature = "gateway")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndOfSequence,
     MaxNewTokens,
-    Cancelled,
 }
 
 // Stream items moved once per chunk; boxing the envelope would trade a
@@ -677,12 +673,16 @@ impl ExecutionRuntime {
         queue_capacity: usize,
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
+        provider_genesis: Vec<u8>,
+        assurance: hellas_rpc::AssuranceRequirement,
     ) -> ExecutionResult<Self> {
         let local_executor = Executor::spawn_with_producer_key(
             ExecutePolicy::Eager,
             queue_capacity,
             supported_dtypes,
             producer_key,
+            provider_genesis,
+            assurance,
         )
         .exec_context("failed to initialize local execution backend")?;
         Ok(Self::local(local_executor))
@@ -853,11 +853,10 @@ pub fn fetch_execution_stream(
                     .create_fetch_ticket(request)
                     .await
                     .exec_context("local create_fetch_ticket failed")?;
-                let request_commitment =
-                    validate_fetch_ticket(&outcome.response, input_commitment)?;
+                let ticket = validate_fetch_ticket(outcome.response, input_commitment)?;
                 let inner = local_execute_fetch_stream(
                     handle,
-                    request_commitment,
+                    ticket,
                     input_commitment,
                     trust,
                     runner_key.clone(),
@@ -879,11 +878,11 @@ pub fn fetch_execution_stream(
                             status,
                         )
                     })?;
-                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
+                let ticket = validate_fetch_ticket(ticket, input_commitment)?;
                 let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 let inner = remote_execute_fetch_stream(
                     execute_transport,
-                    request_commitment,
+                    ticket,
                     input_commitment,
                     trust,
                     runner_key.clone(),
@@ -899,13 +898,13 @@ pub fn fetch_execution_stream(
                         "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
                     )
                 })?;
-                let (target, request_commitment) =
+                let (target, ticket) =
                     discover_and_fetch_quote(&remote.registry, &request, input_commitment, retries)
                         .await?;
                 let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 let inner = remote_execute_fetch_stream(
                     execute_transport,
-                    request_commitment,
+                    ticket,
                     input_commitment,
                     trust,
                     runner_key.clone(),
@@ -1035,13 +1034,13 @@ enum PreparedRoute {
     #[cfg(feature = "evaluate")]
     Local {
         handle: ExecutorHandle,
-        request_commitment: Vec<u8>,
+        ticket: Ticket,
         provenance: ExecutionProvenance,
         runner_key: Arc<ProducerSigningKey>,
     },
     RemoteDirect {
         transport: IrohTransport,
-        request_commitment: Vec<u8>,
+        ticket: Ticket,
         provenance: ExecutionProvenance,
         runner_key: Arc<ProducerSigningKey>,
     },
@@ -1081,7 +1080,7 @@ impl PreparedRoute {
                 })?;
                 Ok(Self::Local {
                     handle,
-                    request_commitment: ticket.request_commitment,
+                    ticket,
                     provenance: outcome.provenance,
                     runner_key,
                 })
@@ -1125,7 +1124,7 @@ impl PreparedRoute {
                 let execute_transport = runtime.remote_transport::<Execute>(target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
-                    request_commitment: ticket.request_commitment,
+                    ticket,
                     provenance,
                     runner_key,
                 })
@@ -1136,12 +1135,12 @@ impl PreparedRoute {
                         "remote dispatch on a local-only runtime; construct via ExecutionRuntime::remote(...)"
                     )
                 })?;
-                let (target, request_commitment, provenance) =
+                let (target, ticket, provenance) =
                     discover_and_quote(&remote.registry, quote_req, *retries).await?;
                 let execute_transport = runtime.remote_transport::<Execute>(&target).await?;
                 Ok(Self::RemoteDirect {
                     transport: execute_transport,
-                    request_commitment,
+                    ticket,
                     provenance,
                     runner_key,
                 })
@@ -1154,16 +1153,16 @@ impl PreparedRoute {
             #[cfg(feature = "evaluate")]
             PreparedRoute::Local {
                 handle,
-                request_commitment,
+                ticket,
                 provenance: _,
                 runner_key,
-            } => local_execute_stream(handle, request_commitment, runner_key).boxed(),
+            } => local_execute_stream(handle, ticket, runner_key).boxed(),
             PreparedRoute::RemoteDirect {
                 transport,
-                request_commitment,
+                ticket,
                 provenance: _,
                 runner_key,
-            } => remote_execute_stream(transport, request_commitment, runner_key).boxed(),
+            } => remote_execute_stream(transport, ticket, runner_key).boxed(),
         }
     }
 }
@@ -1180,7 +1179,7 @@ async fn discover_and_quote(
     registry: &ServiceRegistry,
     quote_req: &QuotePreparedTextRequest,
     retries: usize,
-) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>, ExecutionProvenance)> {
+) -> ExecutionResult<(RemoteNodeTarget, Ticket, ExecutionProvenance)> {
     let mut stream = Box::pin(registry.discover::<Courtesy>());
     let pool = registry.pool::<Courtesy>();
     let mut last_error: Option<ExecutionError> = None;
@@ -1258,7 +1257,7 @@ async fn discover_and_quote(
             };
 
         let target = RemoteNodeTarget::from(peer_id);
-        return Ok((target, ticket.request_commitment, provenance));
+        return Ok((target, ticket, provenance));
     }
 
     Err(last_error.unwrap_or_else(|| {
@@ -1274,7 +1273,7 @@ async fn discover_and_fetch_quote(
     request: &PbFetchRequest,
     input_commitment: InputCommitment,
     retries: usize,
-) -> ExecutionResult<(RemoteNodeTarget, Vec<u8>)> {
+) -> ExecutionResult<(RemoteNodeTarget, Ticket)> {
     use hellas_rpc::services::fetch::FetchClientImpl;
     let mut stream = Box::pin(registry.discover::<Fetch>());
     let pool = registry.pool::<Fetch>();
@@ -1310,8 +1309,8 @@ async fn discover_and_fetch_quote(
         let client = FetchClientImpl::new(transport);
         match client.create_ticket(request.clone()).await {
             Ok(ticket) => {
-                let request_commitment = validate_fetch_ticket(&ticket, input_commitment)?;
-                return Ok((RemoteNodeTarget::from(peer_id), request_commitment));
+                let ticket = validate_fetch_ticket(ticket, input_commitment)?;
+                return Ok((RemoteNodeTarget::from(peer_id), ticket));
             }
             Err(status) => {
                 last_error = Some(ExecutionError::wire(
@@ -1332,9 +1331,9 @@ async fn discover_and_fetch_quote(
 }
 
 fn validate_fetch_ticket(
-    ticket: &pb::Ticket,
+    ticket: pb::Ticket,
     input_commitment: InputCommitment,
-) -> ExecutionResult<Vec<u8>> {
+) -> ExecutionResult<Ticket> {
     let request_commitment: [u8; 32] =
         ticket
             .request_commitment
@@ -1351,20 +1350,14 @@ fn validate_fetch_ticket(
             "fetch ticket request_commitment does not match signed input transcript",
         ));
     }
-    Ok(ticket.request_commitment.clone())
+    Ok(ticket)
 }
 
 fn signed_run_ticket_request(
-    request_commitment: &[u8],
+    ticket: Ticket,
     key: &ProducerSigningKey,
 ) -> ExecutionResult<RunTicketRequest> {
-    let request_commitment: [u8; 32] = request_commitment.try_into().map_err(|_| {
-        ExecutionError::protocol(format!(
-            "ticket request_commitment must be 32 bytes, got {}",
-            request_commitment.len()
-        ))
-    })?;
-    sign_run_ticket(request_commitment, key)
+    sign_run_ticket(ticket, key)
         .map_err(|source| ExecutionError::source("failed to sign run ticket", source))
 }
 
@@ -1388,11 +1381,12 @@ fn evaluate_input_from_request_commitment(
 #[cfg(feature = "evaluate")]
 fn local_execute_stream(
     handle: ExecutorHandle,
-    request_commitment: Vec<u8>,
+    ticket: Ticket,
     runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
-        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
+        let request_commitment = ticket.request_commitment.clone();
+        let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let outcome = handle
             .run_ticket_handle(run_ticket)
             .await
@@ -1426,13 +1420,13 @@ fn local_execute_stream(
 #[cfg(feature = "evaluate")]
 fn local_execute_fetch_stream(
     handle: ExecutorHandle,
-    request_commitment: Vec<u8>,
+    ticket: Ticket,
     input_commitment: InputCommitment,
     trust: ProducerTrust,
     runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
-        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
+        let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let outcome = handle
             .run_ticket_handle(run_ticket)
             .await
@@ -1471,12 +1465,13 @@ fn local_execute_fetch_stream(
 #[cfg(feature = "gateway")]
 fn remote_execute_stream(
     transport: IrohTransport,
-    request_commitment: Vec<u8>,
+    ticket: Ticket,
     runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
-        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
+        let request_commitment = ticket.request_commitment.clone();
+        let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let mut wire = client
             .run_ticket(run_ticket)
             .await
@@ -1511,14 +1506,14 @@ fn remote_execute_stream(
 
 fn remote_execute_fetch_stream(
     transport: IrohTransport,
-    request_commitment: Vec<u8>,
+    ticket: Ticket,
     input_commitment: InputCommitment,
     trust: ProducerTrust,
     runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
-        let run_ticket = signed_run_ticket_request(&request_commitment, runner_key.as_ref())?;
+        let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let mut wire = client
             .run_ticket(run_ticket)
             .await
@@ -1651,7 +1646,6 @@ fn parse_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
 ) -> ExecutionResult<Outcome> {
-    let frame_stop_reason = stop_reason_from_pb(finished.status)?;
     let output_events = finished
         .output_events
         .into_iter()
@@ -1662,28 +1656,7 @@ fn parse_finished(
         .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
     let terminal = output.terminal;
     let terminal_stop_reason = stop_reason_from_evaluate(terminal.stop_reason)?;
-    if terminal_stop_reason != frame_stop_reason {
-        return Err(ExecutionError::protocol(
-            "evaluate terminal stop reason does not match stream finish status",
-        ));
-    }
-    if terminal
-        .usage
-        .is_some_and(|usage| usage.output_units != terminal.final_position)
-    {
-        return Err(ExecutionError::protocol(
-            "evaluate terminal usage output_units does not match final_position",
-        ));
-    }
-    let total_tokens = terminal
-        .usage
-        .map(|usage| usage.total_units)
-        .unwrap_or(terminal.final_position);
-    if finished.total_units != total_tokens {
-        return Err(ExecutionError::protocol(
-            "evaluate terminal usage does not match stream total_units",
-        ));
-    }
+    let total_tokens = terminal.billable_units;
     Ok(Outcome::Completed {
         total_tokens,
         stop_reason: terminal_stop_reason,
@@ -1696,7 +1669,6 @@ fn parse_fetch_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
 ) -> ExecutionResult<FetchOutcome> {
-    stop_reason_from_pb(finished.status)?;
     let output_events = finished
         .output_events
         .into_iter()
@@ -1719,21 +1691,9 @@ fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopR
     match value.as_u8() {
         1 => Ok(StopReason::EndOfSequence),
         2 => Ok(StopReason::MaxNewTokens),
-        3 => Ok(StopReason::Cancelled),
         other => Err(ExecutionError::EvaluateTranscript {
             source: hellas_rpc::evaluate::EvaluateProtocolError::UnknownStopReason(other),
         }),
-    }
-}
-
-fn stop_reason_from_pb(value: i32) -> ExecutionResult<StopReason> {
-    let pb_value =
-        FinishStatus::try_from(value).map_err(|_| ExecutionError::UnknownFinishStatus { value })?;
-    match pb_value {
-        FinishStatus::Unspecified => Err(ExecutionError::UnspecifiedFinishStatus),
-        FinishStatus::EndOfSequence => Ok(StopReason::EndOfSequence),
-        FinishStatus::MaxOutput => Ok(StopReason::MaxNewTokens),
-        FinishStatus::Cancelled => Ok(StopReason::Cancelled),
     }
 }
 
@@ -1790,7 +1750,14 @@ mod tests {
         method: &str,
         payload: &[u8],
     ) -> PbFetchRequest {
-        let events = build_input_events(service, method, payload, caller).unwrap();
+        let events = build_input_events(
+            service,
+            method,
+            payload,
+            hellas_rpc::ContentId::from_bytes([9; 32]),
+            caller,
+        )
+        .unwrap();
         PbFetchRequest {
             input: events.iter().map(input_event_to_pb).collect(),
         }
@@ -1804,9 +1771,8 @@ mod tests {
         let input = verified_fetch_input(request).unwrap().input_commitment;
         let events = build_output_events(input, terminal_payload, producer).unwrap();
         WorkFinished {
-            status: FinishStatus::EndOfSequence as i32,
-            total_units: 0,
             output_events: events.iter().map(output_event_to_pb).collect(),
+            assurance_evidence: Vec::new(),
         }
     }
 
@@ -1823,6 +1789,8 @@ mod tests {
         hellas_rpc::EvaluateRequest {
             text_execution: Digest::from_bytes([9; 32]),
             runner_public_key: runner.public_key(),
+            execution_environment: hellas_rpc::ContentId::from_bytes([8; 32]),
+            nonce: [7; 32],
         }
     }
 
@@ -1867,11 +1835,11 @@ mod tests {
                 final_position: 2,
                 stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
                 text_artifact: Digest::from_bytes([4; 32]),
-                usage: Some(EvaluateUsage {
+                usage: EvaluateUsage {
                     input_units: 3,
                     output_units: 2,
-                    total_units: 5,
-                }),
+                },
+                billable_units: 5,
             })
             .unwrap();
         let mut verifier = EvaluateChunkVerifier::new(input);
@@ -1884,9 +1852,8 @@ mod tests {
 
         let finished = WorkEvent {
             kind: Some(work_event::Kind::Finished(WorkFinished {
-                status: FinishStatus::EndOfSequence as i32,
-                total_units: 5,
                 output_events: output_events.iter().map(output_event_to_pb).collect(),
+                assurance_evidence: Vec::new(),
             })),
         };
 
@@ -1924,6 +1891,7 @@ mod tests {
             FetchTerminalPayload::Finished {
                 stop_reason: WireStopReason::EndOfText,
                 usage: None,
+                billable_units: 0,
             }
         );
         assert_eq!(output_events.len(), 1);
@@ -1982,6 +1950,7 @@ mod tests {
             terminal: FetchTerminalPayload::Finished {
                 stop_reason: WireStopReason::EndOfText,
                 usage: None,
+                billable_units: 0,
             },
         };
 
@@ -2006,6 +1975,7 @@ mod tests {
             terminal: FetchTerminalPayload::Finished {
                 stop_reason: WireStopReason::EndOfText,
                 usage: None,
+                billable_units: 0,
             },
         };
 

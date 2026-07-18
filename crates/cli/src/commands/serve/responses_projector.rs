@@ -2,7 +2,7 @@ use hellas_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseR
 use hellas_adaptors::{OutputEvent, RawRequest, Usage, WireAdaptor};
 use hellas_executor::{
     FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
-    FetchProviderRequest, FetchRequestView, FetchUsage, ProjectedFetch,
+    FetchProviderRequest, FetchRequestView, ProjectedFetch,
 };
 use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 
@@ -50,7 +50,7 @@ fn parse_streaming_request(
 
 struct ResponsesFetchProjector {
     projector: ResponsesSseProjector,
-    usage: Option<FetchUsage>,
+    usage: Option<Usage>,
     terminal_seen: bool,
 }
 
@@ -71,28 +71,30 @@ impl ResponsesFetchProjector {
         for event in events {
             match event {
                 OutputEvent::Usage(usage) => {
-                    self.usage = Some(fetch_usage(usage));
+                    self.usage = Some(usage);
                     projected.push(ProjectedFetch::Event(
                         encode_fetch_event_payload(&OutputEvent::Usage(usage))
                             .map_err(fetch_payload_error)?,
                     ));
                 }
-                OutputEvent::Finished { .. } | OutputEvent::Error { .. } => {
+                OutputEvent::Finished { .. } => {
                     if self.terminal_seen {
                         return Err(FetchProjectionError::failed(
                             "Responses stream emitted multiple terminal events".to_string(),
                         ));
                     }
-                    if let OutputEvent::Finished {
-                        usage: Some(usage), ..
-                    } = &event
-                    {
-                        self.usage = Some(fetch_usage(*usage));
-                    }
+                    let OutputEvent::Finished { stop_reason, usage } = event else {
+                        unreachable!()
+                    };
+                    let usage = usage.or(self.usage);
+                    let event = OutputEvent::Finished { stop_reason, usage };
                     self.terminal_seen = true;
                     projected.push(ProjectedFetch::Terminal(
                         encode_fetch_terminal_payload(&event).map_err(fetch_payload_error)?,
                     ));
+                }
+                OutputEvent::Error { message, .. } => {
+                    return Err(FetchProjectionError::failed(message));
                 }
                 event => {
                     if self.terminal_seen {
@@ -125,18 +127,6 @@ impl FetchProjector for ResponsesFetchProjector {
             .finish()
             .map_err(|err| FetchProjectionError::failed(err.to_string()))?;
         self.project_events(events)
-    }
-
-    fn usage(&self) -> Option<FetchUsage> {
-        self.usage
-    }
-}
-
-fn fetch_usage(usage: Usage) -> FetchUsage {
-    FetchUsage {
-        input_units: usage.input_tokens,
-        output_units: usage.output_tokens,
-        total_units: usage.total_tokens,
     }
 }
 

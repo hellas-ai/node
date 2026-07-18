@@ -57,9 +57,16 @@ pub struct GatewayOptions {
     pub responses_proxy_api_key_env: String,
     pub responses_fetch_route_service: String,
     pub responses_fetch_route_method: String,
+    pub responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
     pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
     pub producer_key_path: Option<PathBuf>,
+    #[cfg(feature = "evaluate")]
+    pub provider_genesis: Option<PathBuf>,
+    #[cfg(feature = "evaluate")]
+    pub assurance_codec: Option<String>,
+    #[cfg(feature = "evaluate")]
+    pub assurance_policy: Option<hellas_rpc::ContentId>,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
     pub wrap_args: Vec<String>,

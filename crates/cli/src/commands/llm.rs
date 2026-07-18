@@ -25,6 +25,9 @@ pub struct ExecuteOptions {
     #[cfg(feature = "evaluate")]
     pub verify_local: bool,
     pub producer_key_path: Option<PathBuf>,
+    pub provider_genesis: Option<PathBuf>,
+    pub assurance_codec: Option<String>,
+    pub assurance_policy: Option<hellas_rpc::ContentId>,
     pub raw: bool,
     /// Ordered preference list. The first entry is what the client *first*
     /// builds the program at; later entries are tried via fallback if the
@@ -78,6 +81,16 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let mut decoder = TextOutputDecoder::new(bootstrap_assets.clone(), &prepared.stop_token_ids);
     let runner_key =
         crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
+    #[cfg(feature = "evaluate")]
+    let provider_terms = if options.local || options.verify_local {
+        Some(crate::identity::load_provider_terms(
+            options.provider_genesis.as_deref(),
+            options.assurance_codec.as_deref(),
+            options.assurance_policy,
+        )?)
+    } else {
+        None
+    };
 
     let last_index = options.dtype.len() - 1;
     for (idx, &dtype) in options.dtype.iter().enumerate() {
@@ -91,6 +104,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
+            let (provider_genesis, assurance) = provider_terms.clone().unwrap();
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
             // the program at the first acceptable entry.
@@ -98,6 +112,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                 hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
                 options.dtype.clone(),
                 runner_key.clone(),
+                provider_genesis,
+                assurance,
             )?
             .with_remote(secret_key.clone())
             .await?

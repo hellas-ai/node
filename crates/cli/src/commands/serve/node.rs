@@ -17,7 +17,6 @@ use hellas_executor::{
     ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
 };
 use hellas_rpc::Dtype;
-use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::serve::AccountingDispatcher;
@@ -26,6 +25,7 @@ use hellas_rpc::services::evaluate::Evaluate;
 use hellas_rpc::services::execute::Execute;
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::services::node::{Node, NodeServer};
+use hellas_rpc::{AssuranceRequirement, ProducerSigningKey};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
@@ -81,6 +81,8 @@ pub(super) struct NodeConfig {
     pub(super) fetch_queue_size: usize,
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
+    pub(super) provider_genesis: Vec<u8>,
+    pub(super) assurance: AssuranceRequirement,
     pub(super) metrics: Arc<ExecutorMetrics>,
 }
 
@@ -91,6 +93,8 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         supported_dtypes: config.supported_dtypes,
         metrics: config.metrics.clone(),
         producer_key: Arc::new(config.producer_key),
+        provider_genesis: Arc::new(config.provider_genesis),
+        assurance: config.assurance,
         fetch_access_policy: config.fetch_access_policy,
         fetch_routes: config.fetch_routes,
         fetch_max_in_flight: config.fetch_max_in_flight,

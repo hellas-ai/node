@@ -90,12 +90,19 @@ impl GatewayState {
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
+            let (provider_genesis, assurance) = crate::identity::load_provider_terms(
+                options.provider_genesis.as_deref(),
+                options.assurance_codec.as_deref(),
+                options.assurance_policy,
+            )?;
             ExecutionRuntime::local(
                 Executor::spawn_with_producer_key(
                     ExecutePolicy::Eager,
                     options.queue_size,
                     vec![options.dtype],
                     runner_key.as_ref().clone(),
+                    provider_genesis,
+                    assurance,
                 )
                 .context("failed to initialize local execution backend")?,
             )
@@ -126,8 +133,17 @@ impl GatewayState {
                         options.node_addrs.clone(),
                         options.retries,
                     ),
-                    &options.responses_fetch_route_service,
-                    &options.responses_fetch_route_method,
+                    (
+                        &options.responses_fetch_route_service,
+                        &options.responses_fetch_route_method,
+                        options
+                            .responses_fetch_execution_environment
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "fetch responses backend requires an execution environment"
+                                )
+                            })?,
+                    ),
                     runner_key.as_ref().clone(),
                     producer_trust,
                     options.responses_fetch_request_overrides.clone(),

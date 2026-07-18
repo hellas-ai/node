@@ -5,10 +5,10 @@ use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
     Provenance,
 };
-use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::fetch::{build_input_events, verify_input_events};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
+use hellas_rpc::{ContentId, ProducerSigningKey};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
 
@@ -23,6 +23,7 @@ pub(super) struct ResponsesFetchBackend {
     route: ExecutionRoute,
     service: String,
     method: String,
+    execution_environment: ContentId,
     caller_key: Arc<ProducerSigningKey>,
     producer_trust: ProducerTrust,
     request_overrides: JsonMap<String, JsonValue>,
@@ -32,17 +33,18 @@ impl ResponsesFetchBackend {
     pub(super) fn new(
         runtime: ExecutionRuntime,
         route: ExecutionRoute,
-        service: &str,
-        method: &str,
+        target: (&str, &str, ContentId),
         caller_key: ProducerSigningKey,
         producer_trust: ProducerTrust,
         request_overrides: JsonMap<String, JsonValue>,
     ) -> Self {
+        let (service, method, execution_environment) = target;
         Self {
             runtime,
             route,
             service: service.to_string(),
             method: method.to_string(),
+            execution_environment,
             caller_key: Arc::new(caller_key),
             producer_trust,
             request_overrides,
@@ -58,6 +60,7 @@ impl ExecutionBackend for ResponsesFetchBackend {
                 &self.service,
                 &self.method,
                 &payload,
+                self.execution_environment,
                 self.caller_key.as_ref(),
             )
             .map_err(|source| {
@@ -85,9 +88,10 @@ fn signed_input_events_with_commitment(
     service: &str,
     method: &str,
     payload: &[u8],
+    execution_environment: ContentId,
     key: &ProducerSigningKey,
 ) -> anyhow::Result<(Vec<hellas_rpc::pb::execute::InputEventEnvelope>, String)> {
-    let events = build_input_events(service, method, payload, key)?;
+    let events = build_input_events(service, method, payload, execution_environment, key)?;
     let input_commitment = verify_input_events(&events)?.input_commitment;
     Ok((
         events.iter().map(input_event_to_pb).collect(),
@@ -201,11 +205,16 @@ mod tests {
     #[test]
     fn signed_input_helper_returns_request_commitment() {
         let key = ProducerSigningKey::from_secret_bytes([3; 32]).unwrap();
-        let (events, commitment) =
-            signed_input_events_with_commitment("codex", "responses", br#"{"input":"hi"}"#, &key)
-                .unwrap();
+        let (events, commitment) = signed_input_events_with_commitment(
+            "codex",
+            "responses",
+            br#"{"input":"hi"}"#,
+            ContentId::from_bytes([9; 32]),
+            &key,
+        )
+        .unwrap();
 
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
         assert_eq!(commitment.len(), 64);
     }
 }
