@@ -7,14 +7,7 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
-[features]
-default = []
-# `From<iroh::EndpointId> for PeerId` so callers can build a PeerId from
-# iroh's EndpointId without a hex round-trip.
-iroh = ["dep:iroh"]
-
 [dependencies]
 hellas-wire = { workspace = true }
-iroh = { workspace = true, optional = true }
 thiserror = { workspace = true }
 web-time = "1"

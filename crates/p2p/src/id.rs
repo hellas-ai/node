@@ -28,13 +28,6 @@ impl From<[u8; 32]> for PeerId {
     }
 }
 
-#[cfg(feature = "iroh")]
-impl From<iroh::EndpointId> for PeerId {
-    fn from(peer_id: iroh::EndpointId) -> Self {
-        Self::from_bytes(*peer_id.as_bytes())
-    }
-}
-
 impl AsRef<[u8; 32]> for PeerId {
     fn as_ref(&self) -> &[u8; 32] {
         self.as_bytes()

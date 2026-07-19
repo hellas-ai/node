@@ -37,13 +37,6 @@ courtesy = ["execute", "evaluate"]
 swarm = []
 all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 
-# Iroh transport binding. Forwards to `hellas-p2p/iroh`, which enables
-# `From<iroh::EndpointId> for PeerId` so consumers can build PeerIds from
-# iroh's EndpointId without a hex round-trip.
-iroh = ["hellas-p2p/iroh"]
-iroh-client = ["iroh"]
-iroh-server = ["iroh"]
-
 [dependencies]
 blake3 = { workspace = true }
 bytes = "1"
