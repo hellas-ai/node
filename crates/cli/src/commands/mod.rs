@@ -6,6 +6,7 @@ pub mod artifact;
 #[cfg(feature = "chain")]
 pub mod chain;
 pub(crate) mod codex_auth;
+#[cfg(feature = "node")]
 pub(crate) mod discovery;
 pub mod fetch;
 #[cfg(feature = "gateway")]

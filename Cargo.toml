@@ -3,6 +3,7 @@ members = [
     "crates/adaptors",
     "crates/chain",
     "crates/cli",
+    "crates/client",
     "crates/executor",
     "crates/kernel",
     "crates/models",
@@ -48,6 +49,7 @@ futures = "0.3"
 half = "2.7.1"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
+hellas-client = { path = "crates/client", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-models = { path = "crates/models", default-features = false }

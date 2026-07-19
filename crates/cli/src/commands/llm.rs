@@ -1,10 +1,10 @@
 use crate::commands::CliResult;
-use crate::execution::{
-    ExecutionEvent, ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, Outcome,
-};
+use crate::execution::{CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome};
+use anyhow::Context;
 use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
-use hellas_executor::ExecutorError;
+use hellas_client::ExecutionRoute;
+use hellas_executor::{Executor, ExecutorError};
 use hellas_models::{ModelAssets, TextOutputDecoder};
 use hellas_rpc::{Dtype, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};
@@ -108,20 +108,24 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
             // the program at the first acceptable entry.
-            ExecutionRuntime::spawn_default_local_with_producer_key(
-                hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
-                options.dtype.clone(),
-                runner_key.clone(),
-                provider_genesis,
-                assurance,
-            )?
+            CliRuntime::local(
+                Executor::spawn_with_producer_key(
+                    hellas_rpc::policy::ExecutePolicy::Eager,
+                    hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+                    options.dtype.clone(),
+                    runner_key.clone(),
+                    provider_genesis,
+                    assurance,
+                )
+                .context("failed to initialize local execution backend")?,
+            )
             .with_remote(secret_key.clone())
             .await?
         } else {
-            ExecutionRuntime::remote(secret_key.clone()).await?
+            CliRuntime::remote(secret_key.clone()).await?
         };
         #[cfg(not(feature = "evaluate"))]
-        let runtime = ExecutionRuntime::remote(secret_key.clone()).await?;
+        let runtime = CliRuntime::remote(secret_key.clone()).await?;
 
         #[cfg(feature = "evaluate")]
         let strategy = if options.verify_local {

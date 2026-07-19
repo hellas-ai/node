@@ -15,7 +15,7 @@ node = ["dep:hellas-executor"]
 # over the Hellas network. Needs model assets (tokenizer, prompt/quote
 # building) but no executor backend; `--local` / `--verify-local` execution
 # of gateway traffic additionally requires `evaluate`.
-gateway = ["dep:chatgrad", "dep:hellas-models"]
+gateway = ["dep:chatgrad", "dep:hellas-models", "hellas-client/evaluate"]
 evaluate = [
     "node",
     "gateway",
@@ -56,6 +56,7 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-adaptors.workspace = true
 hellas-chain = { workspace = true, default-features = false, optional = true }
+hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [

@@ -1,9 +1,6 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
-use crate::execution::{
-    ExecutionRequest, ExecutionRoute, ExecutionRuntime, ExecutionStrategy, PreparedExecution,
-    RemoteNodeTarget,
-};
+use crate::execution::{CliRuntime, ExecutionRequest, ExecutionStrategy, PreparedExecution};
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -14,6 +11,7 @@ use hellas_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
     Message as WireMessage,
 };
+use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
 use hellas_models::ModelAssets;
@@ -47,7 +45,7 @@ pub(super) struct GatewayState {
     pub(super) force_model: Option<String>,
     pub(super) inference_timeout: Duration,
     pub(super) dtype: Dtype,
-    runtime: ExecutionRuntime,
+    runtime: CliRuntime,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     runner_key: Arc<hellas_rpc::ProducerSigningKey>,
@@ -92,7 +90,7 @@ impl GatewayState {
                 options.assurance_codec.as_deref(),
                 options.assurance_policy,
             )?;
-            ExecutionRuntime::local(
+            CliRuntime::local(
                 Executor::spawn_with_producer_key(
                     ExecutePolicy::Eager,
                     options.queue_size,
@@ -106,10 +104,10 @@ impl GatewayState {
             .with_remote(options.secret_key.clone())
             .await?
         } else {
-            ExecutionRuntime::remote(options.secret_key.clone()).await?
+            CliRuntime::remote(options.secret_key.clone()).await?
         };
         #[cfg(not(feature = "evaluate"))]
-        let runtime = ExecutionRuntime::remote(options.secret_key.clone()).await?;
+        let runtime = CliRuntime::remote(options.secret_key.clone()).await?;
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
@@ -117,11 +115,9 @@ impl GatewayState {
                 // no keys configured, only output signed by this gateway's own
                 // producer key verifies.
                 let producer_trust = if options.trusted_producer_public_keys.is_empty() {
-                    crate::execution::ProducerTrust::keys([runner_key.public_key()])
+                    ProducerTrust::keys([runner_key.public_key()])
                 } else {
-                    crate::execution::ProducerTrust::keys(
-                        options.trusted_producer_public_keys.iter().copied(),
-                    )
+                    ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
                 };
                 Some(Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
                     runtime.clone(),
@@ -505,7 +501,7 @@ mod tests {
             force_model: None,
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             dtype: Dtype::F32,
-            runtime: ExecutionRuntime::default(),
+            runtime: CliRuntime::default(),
             responses_proxy: None,
             responses_fetch: None,
             runner_key: Arc::new(
