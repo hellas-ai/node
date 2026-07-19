@@ -27,7 +27,7 @@ pub struct ProviderGenesisStatement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootProof {
     AppleAppAttest(Vec<u8>),
-    Tpm20(Vec<u8>),
+    Tpm20(Signature),
     Software(Signature),
 }
 
@@ -111,7 +111,11 @@ fn encode_signed(e: &mut DagCborEncoder, genesis: &SignedProviderGenesis) {
     encode_statement(e, &genesis.statement);
     match &genesis.root_proof {
         RootProof::AppleAppAttest(proof) => encode_proof(e, 1, proof),
-        RootProof::Tpm20(proof) => encode_proof(e, 2, proof),
+        RootProof::Tpm20(signature) => {
+            e.array(2);
+            e.u64(2);
+            encode_signature(e, signature);
+        }
         RootProof::Software(signature) => {
             e.array(2);
             e.u64(3);
