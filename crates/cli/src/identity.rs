@@ -1,102 +1,115 @@
-use anyhow::Context;
-use hellas_rpc::ProducerSigningKey;
+use anyhow::{Context, bail};
+use hellas_rpc::signature::verify_digest_signature;
 #[cfg(feature = "node")]
 use hellas_rpc::{AssuranceRequirement, ContentId};
+use hellas_rpc::{
+    Digest, PlatformCredential, ProducerSigningKey, ProviderGenesisStatement, PublicKey, RootKind,
+    RootProof, Signature, SignedProviderGenesis,
+};
 use iroh::SecretKey;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
-const PRODUCER_KEY_FILE: &str = "signing-key.secp256k1";
 #[cfg(feature = "node")]
 const ARTIFACT_STORE_DIR: &str = "artifacts";
-const KEY_LEN: usize = 32;
+const VERSION: u8 = 1;
+
+pub(crate) struct LocalIdentity {
+    pub(crate) transport_key: SecretKey,
+    pub(crate) producer_key: ProducerSigningKey,
+    #[cfg(any(feature = "node", test))]
+    pub(crate) genesis: SignedProviderGenesis,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredIdentity {
+    version: u8,
+    root: StoredRoot,
+    producer_key: [u8; 32],
+    transport_key: [u8; 32],
+    installation_nonce: [u8; 32],
+    root_signature: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "secret")]
+enum StoredRoot {
+    Software([u8; 32]),
+}
+
+trait PlatformRoot {
+    fn kind(&self) -> RootKind;
+    fn public_key(&self) -> PublicKey;
+    fn prove(&self, statement: &[u8]) -> anyhow::Result<RootProof>;
+}
+
+struct SoftwareRoot(ProducerSigningKey);
+
+impl PlatformRoot for SoftwareRoot {
+    fn kind(&self) -> RootKind {
+        RootKind::Software
+    }
+
+    fn public_key(&self) -> PublicKey {
+        self.0.public_key()
+    }
+
+    fn prove(&self, statement: &[u8]) -> anyhow::Result<RootProof> {
+        Ok(RootProof::Software(
+            self.0.sign_digest(Digest::hash(statement))?,
+        ))
+    }
+}
 
 #[cfg(feature = "node")]
-pub fn load_provider_terms(
-    genesis: Option<&Path>,
+pub(crate) fn assurance(
     codec: Option<&str>,
     policy: Option<ContentId>,
-) -> anyhow::Result<(Vec<u8>, AssuranceRequirement)> {
-    let path = genesis.context("local provider requires --provider-genesis")?;
-    let genesis = fs::read(path)
-        .with_context(|| format!("failed to read provider genesis {}", path.display()))?;
-    let assurance = AssuranceRequirement::new(
+) -> anyhow::Result<AssuranceRequirement> {
+    AssuranceRequirement::new(
         codec.context("local provider requires --assurance-codec")?,
         policy.context("local provider requires --assurance-policy")?,
-    )?;
-    Ok((genesis, assurance))
+    )
+    .map_err(Into::into)
 }
 
-/// Resolve the identity file path and load or create the secret key.
-///
-/// If `path` is `Some`, uses it directly. Otherwise defaults to `$HOME/.hellas/identity`.
-/// Creates a new random key if the file does not exist, using atomic rename to avoid races.
-pub fn load_or_create(path: Option<&Path>) -> anyhow::Result<SecretKey> {
-    let path = match path {
-        Some(p) => p.to_owned(),
-        None => default_identity_path()?,
-    };
+pub(crate) fn load_or_create(
+    path: Option<&Path>,
+    software_root: bool,
+) -> anyhow::Result<LocalIdentity> {
+    let path = path
+        .map(Path::to_owned)
+        .map(Ok)
+        .unwrap_or_else(default_path)?;
     match fs::read(&path) {
-        Ok(bytes) => load_from_bytes(&path, &bytes),
-        Err(e) if e.kind() == ErrorKind::NotFound => create_new(&path),
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to read identity file {}", path.display()))
+        Ok(bytes) => decode(&path, &bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => create(&path, software_root),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read identity file {}", path.display()))
         }
     }
 }
 
-pub fn load_or_create_producer_key(path: Option<&Path>) -> anyhow::Result<ProducerSigningKey> {
-    let path = match path {
-        Some(p) => p.to_owned(),
-        None => default_producer_key_path()?,
-    };
-    match fs::read(&path) {
-        Ok(bytes) => load_producer_key_from_bytes(&path, &bytes),
-        Err(e) if e.kind() == ErrorKind::NotFound => create_new_producer_key(&path),
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to read producer key file {}", path.display()))
-        }
-    }
-}
-
-/// Load an existing identity file; error if missing.
-///
-/// Unlike `load_or_create`, this never creates a new key. Use this for
-/// read-only queries (e.g. printing the node ID of a running service) to avoid
-/// racing the file creator.
-pub fn load_existing(path: Option<&Path>) -> anyhow::Result<SecretKey> {
-    let path = match path {
-        Some(p) => p.to_owned(),
-        None => default_identity_path()?,
-    };
+pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
+    let path = path
+        .map(Path::to_owned)
+        .map(Ok)
+        .unwrap_or_else(default_path)?;
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to read identity file {}", path.display()))?;
-    load_from_bytes(&path, &bytes)
+    decode(&path, &bytes)
 }
 
-pub fn load_existing_producer_key(path: Option<&Path>) -> anyhow::Result<ProducerSigningKey> {
-    let path = match path {
-        Some(p) => p.to_owned(),
-        None => default_producer_key_path()?,
-    };
-    let bytes = fs::read(&path)
-        .with_context(|| format!("failed to read producer key file {}", path.display()))?;
-    load_producer_key_from_bytes(&path, &bytes)
-}
-
-fn default_identity_path() -> anyhow::Result<PathBuf> {
+fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
 }
 
-fn default_producer_key_path() -> anyhow::Result<PathBuf> {
-    default_hellas_path(PRODUCER_KEY_FILE, "--producer-key-path")
-}
-
 #[cfg(feature = "node")]
-pub fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")
 }
 
@@ -107,128 +120,179 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
-fn load_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<SecretKey> {
-    let bytes: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "identity file at {} has invalid size ({} bytes, expected {KEY_LEN})",
-            path.display(),
-            bytes.len(),
-        )
-    })?;
-    let key = SecretKey::from(bytes);
-    info!(node_id = %key.public(), path = %path.display(), "loaded identity");
-    Ok(key)
+fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
+    require_software_root(software_root)?;
+    let root = SoftwareRoot(ProducerSigningKey::generate());
+    let producer_key = ProducerSigningKey::generate();
+    let transport_key = SecretKey::generate();
+    let installation_nonce = rand::random();
+    let statement = statement(&root, &producer_key, &transport_key, installation_nonce);
+    let genesis = SignedProviderGenesis {
+        root_proof: root.prove(&statement.canonical_bytes())?,
+        statement,
+    };
+    let RootProof::Software(signature) = &genesis.root_proof else {
+        unreachable!("software root returns a software proof")
+    };
+    let stored = StoredIdentity {
+        version: VERSION,
+        root: StoredRoot::Software(root.0.to_secret_bytes()),
+        producer_key: producer_key.to_secret_bytes(),
+        transport_key: transport_key.to_bytes(),
+        installation_nonce,
+        root_signature: signature.bytes().to_vec(),
+    };
+    let identity = LocalIdentity {
+        transport_key,
+        producer_key,
+        #[cfg(any(feature = "node", test))]
+        genesis,
+    };
+    if !persist(path, &stored)? {
+        return load_existing(Some(path));
+    }
+    info!(
+        node_id = %identity.transport_key.public(),
+        producer_id = ?identity.producer_key.producer_id(),
+        path = %path.display(),
+        "created provider identity"
+    );
+    Ok(identity)
 }
 
-fn create_new(path: &Path) -> anyhow::Result<SecretKey> {
+fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
+    if stored.version != VERSION {
+        bail!("unsupported identity version {}", stored.version);
+    }
+    let root = match stored.root {
+        StoredRoot::Software(secret) => SoftwareRoot(
+            ProducerSigningKey::from_secret_bytes(secret).context("invalid software root key")?,
+        ),
+    };
+    let producer_key = ProducerSigningKey::from_secret_bytes(stored.producer_key)
+        .context("invalid producer key")?;
+    let transport_key = SecretKey::from(stored.transport_key);
+    let statement = statement(
+        &root,
+        &producer_key,
+        &transport_key,
+        stored.installation_nonce,
+    );
+    let signature = Signature::Secp256k1(
+        stored
+            .root_signature
+            .as_slice()
+            .try_into()
+            .context("software root signature must be 64 bytes")?,
+    );
+    verify_digest_signature(
+        &statement.root_public_key,
+        &signature,
+        Digest::hash(&statement.canonical_bytes()),
+    )
+    .context("invalid provider genesis root signature")?;
+    Ok(LocalIdentity {
+        transport_key,
+        producer_key,
+        #[cfg(any(feature = "node", test))]
+        genesis: SignedProviderGenesis {
+            statement,
+            root_proof: RootProof::Software(signature),
+        },
+    })
+}
+
+fn statement(
+    root: &impl PlatformRoot,
+    producer: &ProducerSigningKey,
+    transport: &SecretKey,
+    installation_nonce: [u8; 32],
+) -> ProviderGenesisStatement {
+    ProviderGenesisStatement {
+        root_kind: root.kind(),
+        root_public_key: root.public_key(),
+        producer_public_key: producer.public_key(),
+        transport_public_key: PublicKey::Ed25519(*transport.public().as_bytes()),
+        platform_credential: PlatformCredential::Absent,
+        installation_nonce,
+    }
+}
+
+fn decode(path: &Path, bytes: &[u8]) -> anyhow::Result<LocalIdentity> {
+    let stored: StoredIdentity = serde_json::from_slice(bytes)
+        .with_context(|| format!("identity file {} is not version 1", path.display()))?;
+    let identity = materialize(&stored)
+        .with_context(|| format!("invalid identity file {}", path.display()))?;
+    info!(
+        node_id = %identity.transport_key.public(),
+        producer_id = ?identity.producer_key.producer_id(),
+        path = %path.display(),
+        "loaded provider identity"
+    );
+    Ok(identity)
+}
+
+fn persist(path: &Path, stored: &StoredIdentity) -> anyhow::Result<bool> {
     let dir = path
         .parent()
         .context("identity path has no parent directory")?;
-
     create_dir_restricted(dir)
         .with_context(|| format!("failed to create identity directory {}", dir.display()))?;
-
-    let key = SecretKey::generate();
-    let bytes = key.to_bytes();
-
-    // Write to a temp file, then atomic rename. If rename fails because another
-    // process created the file first, read the existing one instead.
-    let tmp_path = dir.join(format!(
-        ".identity.tmp.{}.{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    write_file_restricted(&tmp_path, &bytes)
-        .with_context(|| format!("failed to write temp identity file {}", tmp_path.display()))?;
-
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => {
-            info!(node_id = %key.public(), path = %path.display(), "created new identity");
-            Ok(key)
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create temporary identity in {}", dir.display()))?;
+    #[cfg(unix)]
+    temp.as_file().set_permissions({
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o600)
+    })?;
+    serde_json::to_writer(&mut temp, stored)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => {
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+            Ok(true)
         }
-        Err(e) => {
-            // Clean up temp file on failure.
-            let _ = fs::remove_file(&tmp_path);
-            // If the target appeared (race), read it.
-            if path.exists() {
-                let bytes = fs::read(path)
-                    .with_context(|| format!("failed to read identity file {}", path.display()))?;
-                load_from_bytes(path, &bytes)
-            } else {
-                Err(e)
-                    .with_context(|| format!("failed to persist identity file {}", path.display()))
-            }
-        }
+        Err(_error) if path.exists() => Ok(false),
+        Err(error) => Err(error.error)
+            .with_context(|| format!("failed to persist identity file {}", path.display())),
     }
 }
 
-fn load_producer_key_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<ProducerSigningKey> {
-    let bytes: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "producer key file at {} has invalid size ({} bytes, expected {KEY_LEN})",
-            path.display(),
-            bytes.len(),
-        )
-    })?;
-    let key = ProducerSigningKey::from_secret_bytes(bytes)
-        .with_context(|| format!("producer key file {} is invalid", path.display()))?;
-    info!(
-        producer_id = ?key.producer_id(),
-        path = %path.display(),
-        "loaded producer signing key"
-    );
-    Ok(key)
+#[cfg(target_os = "linux")]
+fn require_software_root(explicit: bool) -> anyhow::Result<()> {
+    require_software_root_at(
+        explicit,
+        Path::new("/sys/class/tpm/tpm0"),
+        &[Path::new("/dev/tpmrm0"), Path::new("/dev/tpm0")],
+    )
 }
 
-fn create_new_producer_key(path: &Path) -> anyhow::Result<ProducerSigningKey> {
-    let dir = path
-        .parent()
-        .context("producer key path has no parent directory")?;
-
-    create_dir_restricted(dir)
-        .with_context(|| format!("failed to create producer key directory {}", dir.display()))?;
-
-    let key = ProducerSigningKey::generate();
-    let bytes = key.to_secret_bytes();
-
-    let tmp_path = dir.join(format!(
-        ".signing-key.secp256k1.tmp.{}.{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    write_file_restricted(&tmp_path, &bytes).with_context(|| {
-        format!(
-            "failed to write temp producer key file {}",
-            tmp_path.display()
-        )
-    })?;
-
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => {
-            info!(
-                producer_id = ?key.producer_id(),
-                path = %path.display(),
-                "created new producer signing key"
-            );
-            Ok(key)
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            if path.exists() {
-                let bytes = fs::read(path).with_context(|| {
-                    format!("failed to read producer key file {}", path.display())
-                })?;
-                load_producer_key_from_bytes(path, &bytes)
-            } else {
-                Err(e).with_context(|| {
-                    format!("failed to persist producer key file {}", path.display())
-                })
-            }
-        }
+#[cfg(target_os = "linux")]
+fn require_software_root_at(explicit: bool, tpm: &Path, devices: &[&Path]) -> anyhow::Result<()> {
+    if explicit || !tpm.exists() {
+        return Ok(());
     }
+    let device = devices
+        .iter()
+        .copied()
+        .find(|path| path.exists())
+        .context("TPM 2.0 is present but has no device node; use --software-root explicitly")?;
+    if let Err(error) = fs::OpenOptions::new().read(true).write(true).open(device) {
+        bail!(
+            "TPM 2.0 is present but {} is inaccessible ({error}); use --software-root explicitly",
+            device.display()
+        );
+    }
+    bail!("TPM 2.0 is present; use --software-root explicitly until TPM root support graduates")
 }
 
-/// Create a directory with restricted permissions (0700 on Unix).
+#[cfg(not(target_os = "linux"))]
+fn require_software_root(_explicit: bool) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -244,159 +308,133 @@ fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write a file with restricted permissions (0600 on Unix).
-fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
 
     #[test]
-    fn creates_new_identity_in_temp_dir() {
+    fn creates_and_reloads_one_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity");
+        let first = load_or_create(Some(&path), true).unwrap();
+        let second = load_or_create(Some(&path), true).unwrap();
 
-        let key = load_or_create(Some(&path)).unwrap();
-
-        assert!(path.exists());
-        let bytes = fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), KEY_LEN);
         assert_eq!(
-            SecretKey::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()).to_bytes(),
-            key.to_bytes()
+            first.transport_key.to_bytes(),
+            second.transport_key.to_bytes()
+        );
+        assert_eq!(
+            first.producer_key.producer_id(),
+            second.producer_key.producer_id()
+        );
+        assert_eq!(first.genesis, second.genesis);
+        assert_eq!(first.genesis.statement.root_kind, RootKind::Software);
+        assert_eq!(
+            first.genesis.statement.transport_public_key,
+            PublicKey::Ed25519(*first.transport_key.public().as_bytes())
+        );
+        assert_eq!(
+            first.genesis.statement.producer_public_key,
+            first.producer_key.public_key()
+        );
+        let other = load_or_create(Some(&dir.path().join("other")), true).unwrap();
+        assert_ne!(
+            first.genesis.statement.installation_nonce,
+            other.genesis.statement.installation_nonce
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_old_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        fs::write(&path, [0; 32]).unwrap();
+        assert!(
+            load_existing(Some(&path))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not version 1")
         );
     }
 
-    #[cfg(feature = "node")]
     #[test]
-    fn creates_new_producer_key_in_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("signing-key.secp256k1");
-
-        let key = load_or_create_producer_key(Some(&path)).unwrap();
-
-        assert!(path.exists());
-        let bytes = fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), KEY_LEN);
-        let reloaded =
-            ProducerSigningKey::from_secret_bytes(<[u8; 32]>::try_from(bytes.as_slice()).unwrap())
-                .unwrap();
-        assert_eq!(reloaded.producer_id(), key.producer_id());
-    }
-
-    #[cfg(feature = "node")]
-    #[test]
-    fn reloads_existing_producer_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("signing-key.secp256k1");
-
-        let key1 = load_or_create_producer_key(Some(&path)).unwrap();
-        let key2 = load_or_create_producer_key(Some(&path)).unwrap();
-
-        assert_eq!(key1.producer_id(), key2.producer_id());
-    }
-
-    #[test]
-    fn reloads_existing_identity() {
+    fn rejects_tampered_root_signature() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity");
-
-        let key1 = load_or_create(Some(&path)).unwrap();
-        let key2 = load_or_create(Some(&path)).unwrap();
-
-        assert_eq!(key1.to_bytes(), key2.to_bytes());
-    }
-
-    #[test]
-    fn rejects_wrong_size_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("identity");
-        fs::write(&path, [0u8; 16]).unwrap();
-
-        let err = load_or_create(Some(&path)).unwrap_err();
-        assert!(err.to_string().contains("invalid size"));
-        assert!(err.to_string().contains("16 bytes"));
+        load_or_create(Some(&path), true).unwrap();
+        let mut stored: StoredIdentity = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored.root_signature[0] ^= 1;
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(load_existing(Some(&path)).is_err());
     }
 
     #[test]
     fn creates_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sub").join("dir").join("identity");
-
-        let _key = load_or_create(Some(&path)).unwrap();
-
+        let path = dir.path().join("sub/dir/identity");
+        load_or_create(Some(&path), true).unwrap();
         assert!(path.exists());
-        assert!(path.parent().unwrap().is_dir());
     }
 
     #[test]
     fn default_path_uses_home() {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: test is single-threaded and restores the value immediately.
         unsafe { env::set_var("HOME", dir.path()) };
-
-        let path = default_identity_path().unwrap();
-        assert_eq!(path, dir.path().join(".hellas").join("identity"));
-
-        let path = default_producer_key_path().unwrap();
-        assert_eq!(
-            path,
-            dir.path().join(".hellas").join("signing-key.secp256k1")
-        );
-
+        assert_eq!(default_path().unwrap(), dir.path().join(".hellas/identity"));
         #[cfg(feature = "node")]
-        {
-            let path = default_artifact_store_path().unwrap();
-            assert_eq!(path, dir.path().join(".hellas").join("artifacts"));
-        }
-
+        assert_eq!(
+            default_artifact_store_path().unwrap(),
+            dir.path().join(".hellas/artifacts")
+        );
         unsafe { env::remove_var("HOME") };
     }
 
     #[test]
-    fn concurrent_creation_produces_valid_key() {
+    fn concurrent_creation_converges() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity");
-
         let handles: Vec<_> = (0..4)
             .map(|_| {
-                let p = path.clone();
-                std::thread::spawn(move || load_or_create(Some(&p)).unwrap().to_bytes())
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    load_or_create(Some(&path), true)
+                        .unwrap()
+                        .transport_key
+                        .to_bytes()
+                })
             })
             .collect();
+        let keys: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(keys.iter().all(|key| key == &keys[0]));
+    }
 
-        let results: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        // All threads should get a valid 32-byte key (the first one created wins).
-        for result in &results {
-            assert_eq!(result.len(), KEY_LEN);
-        }
-        // At most one unique key should exist (all should converge on the same file).
-        // Some threads may have generated their own key before rename, but the file
-        // content should be consistent — all reads after the first create should match.
-        let file_bytes = fs::read(&path).unwrap();
-        let file_key: [u8; 32] = file_bytes.try_into().unwrap();
-        // The last reader should have gotten the persisted key.
-        // (We can't guarantee all threads saw the same key due to create_new vs rename races,
-        // but the file on disk should be a valid 32-byte key.)
-        assert_eq!(file_key.len(), KEY_LEN);
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detected_tpm_requires_explicit_software_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let tpm = dir.path().join("tpm0");
+        fs::write(&tpm, []).unwrap();
+        let missing = dir.path().join("missing");
+        assert!(require_software_root_at(false, &tpm, &[&missing]).is_err());
+        assert!(
+            require_software_root_at(false, &tpm, &[&tpm])
+                .unwrap_err()
+                .to_string()
+                .contains("until TPM root support graduates")
+        );
+        assert!(require_software_root_at(true, &tpm, &[&missing]).is_ok());
     }
 }

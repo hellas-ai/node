@@ -11,7 +11,6 @@ use hellas_rpc::{ContentId, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use tracing::trace;
 
 pub struct ExecuteOptions {
@@ -22,7 +21,7 @@ pub struct ExecuteOptions {
     pub execution_environment: ContentId,
     pub payload: Vec<u8>,
     pub retries: usize,
-    pub producer_key_path: Option<PathBuf>,
+    pub producer_key: ProducerSigningKey,
     pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
 }
 
@@ -30,8 +29,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     serde_json::from_slice::<serde_json::Value>(&options.payload)
         .map_err(|err| anyhow::anyhow!("--payload must be UTF-8 JSON: {err}"))?;
 
-    let caller_key =
-        crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
+    let caller_key = options.producer_key;
 
     // Mirrors the producer-side default for trusted callers: with no keys
     // configured, only output signed by our own producer key verifies.

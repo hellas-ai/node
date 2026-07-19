@@ -3405,6 +3405,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "prometheus-client",
  "qrcode",
+ "rand 0.8.6",
  "reqwest 0.13.1",
  "serde",
  "serde_json",

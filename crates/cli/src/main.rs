@@ -127,18 +127,13 @@ fn default_llm_dtypes(is_local_mode: bool) -> Vec<Dtype> {
 #[command(version)]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Path to node identity file (default: $HOME/.hellas/identity)
+    /// Path to the versioned provider identity (default: $HOME/.hellas/identity)
     #[arg(long = "identity", global = true)]
     identity: Option<PathBuf>,
 
-    /// Path to producer signing key (default: $HOME/.hellas/signing-key.secp256k1)
-    #[arg(long = "producer-key-path", global = true)]
-    producer_key_path: Option<PathBuf>,
-
-    #[cfg(feature = "node")]
-    /// Canonical SignedProviderGenesis bytes served with local quotes.
-    #[arg(long = "provider-genesis", global = true)]
-    provider_genesis: Option<PathBuf>,
+    /// Choose the software platform root when creating an identity.
+    #[arg(long = "software-root", global = true)]
+    software_root: bool,
 
     #[cfg(feature = "node")]
     /// Required assurance evidence codec for local quotes.
@@ -498,9 +493,6 @@ async fn main() {
     } else {
         tracing_config::init_tracing(cli.log_file.as_deref())
     };
-    let producer_key_path = cli.producer_key_path.clone();
-    #[cfg(feature = "node")]
-    let provider_genesis = cli.provider_genesis.clone();
     #[cfg(feature = "node")]
     let assurance_codec = cli.assurance_codec.clone();
     #[cfg(feature = "node")]
@@ -510,8 +502,8 @@ async fn main() {
         command: ProducerKeyCommand::Show,
     } = &cli.command
     {
-        let result = identity::load_existing_producer_key(producer_key_path.as_deref())
-            .and_then(|key| commands::identity::show_producer_key(&key));
+        let result = identity::load_existing(cli.identity.as_deref())
+            .and_then(|identity| commands::identity::show_producer_key(&identity.producer_key));
         tracer_provider.shutdown();
         if let Err(err) = result {
             eprintln!("error: {err:#}");
@@ -545,19 +537,24 @@ async fn main() {
 
     // show-node-id is a read-only query; never create an identity file as a
     // side effect of it (would race with a running service's own creator).
-    let load_identity = match &cli.command {
+    let read_only = matches!(
+        &cli.command,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId,
-        } => identity::load_existing,
-        _ => identity::load_or_create,
-    };
-    let secret_key = match load_identity(cli.identity.as_deref()) {
-        Ok(key) => key,
+        }
+    );
+    let local_identity = match if read_only {
+        identity::load_existing(cli.identity.as_deref())
+    } else {
+        identity::load_or_create(cli.identity.as_deref(), cli.software_root)
+    } {
+        Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
             std::process::exit(1);
         }
     };
+    let secret_key = local_identity.transport_key.clone();
 
     let result = match cli.command {
         #[cfg(feature = "node")]
@@ -574,20 +571,9 @@ async fn main() {
             fetch_max_in_flight,
             fetch_queue_size,
         } => {
-            let producer_key =
-                match identity::load_or_create_producer_key(producer_key_path.as_deref()) {
-                    Ok(key) => key,
-                    Err(err) => {
-                        eprintln!("error: {err:#}");
-                        std::process::exit(1);
-                    }
-                };
-            let (provider_genesis, assurance) = match identity::load_provider_terms(
-                provider_genesis.as_deref(),
-                assurance_codec.as_deref(),
-                assurance_policy,
-            ) {
-                Ok(terms) => terms,
+            let assurance = match identity::assurance(assurance_codec.as_deref(), assurance_policy)
+            {
+                Ok(assurance) => assurance,
                 Err(err) => {
                     eprintln!("error: {err:#}");
                     std::process::exit(1);
@@ -606,8 +592,8 @@ async fn main() {
                 fetch_max_in_flight,
                 fetch_queue_size,
                 secret_key,
-                producer_key,
-                provider_genesis,
+                producer_key: local_identity.producer_key,
+                provider_genesis: local_identity.genesis.canonical_bytes(),
                 assurance,
             })
             .await
@@ -667,9 +653,9 @@ async fn main() {
                 responses_fetch_request_overrides: responses_fetch_request_overrides
                     .unwrap_or_default(),
                 trusted_producer_public_keys,
-                producer_key_path: producer_key_path.clone(),
+                producer_key: local_identity.producer_key,
                 #[cfg(feature = "evaluate")]
-                provider_genesis: provider_genesis.clone(),
+                provider_genesis: local_identity.genesis.canonical_bytes(),
                 #[cfg(feature = "evaluate")]
                 assurance_codec: assurance_codec.clone(),
                 #[cfg(feature = "evaluate")]
@@ -718,8 +704,8 @@ async fn main() {
                     local,
                     verify_local,
                     dtype,
-                    producer_key_path: producer_key_path.clone(),
-                    provider_genesis: provider_genesis.clone(),
+                    producer_key: local_identity.producer_key,
+                    provider_genesis: local_identity.genesis.canonical_bytes(),
                     assurance_codec: assurance_codec.clone(),
                     assurance_policy,
                 },
@@ -757,7 +743,7 @@ async fn main() {
                             execution_environment,
                             payload,
                             retries,
-                            producer_key_path: producer_key_path.clone(),
+                            producer_key: local_identity.producer_key,
                             trusted_producer_public_keys,
                         },
                         secret_key,
@@ -1166,18 +1152,18 @@ mod tests {
     }
 
     #[test]
-    fn producer_key_show_accepts_global_key_path() {
+    fn producer_key_show_accepts_global_identity_path() {
         let cli = Cli::try_parse_from([
             "hellas",
-            "--producer-key-path",
-            "/tmp/hellas-producer-key",
+            "--identity",
+            "/tmp/hellas-identity",
             "producer-key",
             "show",
         ])
         .unwrap();
         assert_eq!(
-            cli.producer_key_path.as_deref(),
-            Some(std::path::Path::new("/tmp/hellas-producer-key"))
+            cli.identity.as_deref(),
+            Some(std::path::Path::new("/tmp/hellas-identity"))
         );
         match cli.command {
             Commands::ProducerKey {

@@ -18,13 +18,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::Stream;
-use hellas_rpc::Dtype;
+use hellas_rpc::{Dtype, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,9 +59,9 @@ pub struct GatewayOptions {
     pub responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
     pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
-    pub producer_key_path: Option<PathBuf>,
+    pub producer_key: ProducerSigningKey,
     #[cfg(feature = "evaluate")]
-    pub provider_genesis: Option<PathBuf>,
+    pub provider_genesis: Vec<u8>,
     #[cfg(feature = "evaluate")]
     pub assurance_codec: Option<String>,
     #[cfg(feature = "evaluate")]
