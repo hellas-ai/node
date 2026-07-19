@@ -1,0 +1,14 @@
+[package]
+name = "hellas-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+blake3.workspace = true
+trait-variant = "0.1"
+
+[dev-dependencies]
+futures.workspace = true
