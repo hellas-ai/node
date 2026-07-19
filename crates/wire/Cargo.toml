@@ -33,7 +33,6 @@ discovery-mdns = [
 mux = []
 ws = ["mux", "dep:tokio-tungstenite"]
 ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
-ws-cf-do = ["mux", "dep:worker"]
 
 [dependencies]
 
@@ -69,7 +68,6 @@ tokio-tungstenite = { version = "0.29", optional = true }
 tracing = { workspace = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-time = "1"
-worker = { version = "0.8", optional = true, default-features = false }
 ws_stream_wasm = { version = "0.7", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

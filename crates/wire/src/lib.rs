@@ -16,7 +16,7 @@ pub mod mux;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 
-#[cfg(any(feature = "ws", feature = "ws-wasm", feature = "ws-cf-do"))]
+#[cfg(any(feature = "ws", feature = "ws-wasm"))]
 pub mod ws;
 
 pub use crate::canonical::{Encode, Writer};
