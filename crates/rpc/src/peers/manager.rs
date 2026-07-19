@@ -401,7 +401,7 @@ pub(super) fn duration_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_markers::TestService as Node;
+    use crate::peers::test_markers::TestService as Node;
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from([byte; 32])
@@ -427,7 +427,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::test_markers::GetNodeInfo>(),
+                RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -456,7 +456,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::test_markers::GetNodeInfo>(),
+                RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -478,7 +478,7 @@ mod tests {
         let permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::test_markers::GetNodeInfo>(),
+                RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -504,7 +504,7 @@ mod tests {
         let mut permit = manager
             .acquire_rpc(
                 id,
-                RequestKind::for_method::<crate::test_markers::GetNodeInfo>(),
+                RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>(),
                 RpcObservation::authenticated_transport("iroh"),
             )
             .expect("request should be admitted");
@@ -549,7 +549,7 @@ mod tests {
             .try_acquire(
                 0,
                 id,
-                RequestKind::for_method::<crate::test_markers::GetNodeInfo>(),
+                RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>(),
             )
             .expect("permit should be admitted");
         // Dropping without release should fire the debug tripwire.

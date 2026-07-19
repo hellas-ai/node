@@ -1,13 +1,11 @@
 [workspace]
 members = [
     "crates/adaptors",
-    "crates/auth",
     "crates/chain",
     "crates/cli",
     "crates/executor",
     "crates/kernel",
     "crates/models",
-    "crates/p2p",
     "crates/rpc",
     "crates/wire",
 ]
@@ -49,12 +47,10 @@ ed25519-dalek = { version = "3.0.0-rc.0", default-features = false }
 futures = "0.3"
 half = "2.7.1"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
-hellas-auth = { path = "crates/auth", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-models = { path = "crates/models", default-features = false }
-hellas-p2p = { path = "crates/p2p", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
 hex = "0.4"

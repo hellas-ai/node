@@ -43,8 +43,6 @@ bytes = "1"
 ed25519-dalek = { workspace = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
-hellas-auth = { workspace = true }
-hellas-p2p = { workspace = true }
 hellas-wire = { workspace = true }
 k256 = { workspace = true }
 p256 = { workspace = true }
@@ -55,6 +53,7 @@ serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
+web-time = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
