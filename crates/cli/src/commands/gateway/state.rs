@@ -76,9 +76,7 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
-        let runner_key = Arc::new(crate::identity::load_or_create_producer_key(
-            options.producer_key_path.as_deref(),
-        )?);
+        let runner_key = Arc::new(options.producer_key.clone());
         let responses_proxy = match options.responses_backend {
             ResponsesBackend::Hellas => None,
             ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
@@ -90,8 +88,7 @@ impl GatewayState {
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
-            let (provider_genesis, assurance) = crate::identity::load_provider_terms(
-                options.provider_genesis.as_deref(),
+            let assurance = crate::identity::assurance(
                 options.assurance_codec.as_deref(),
                 options.assurance_policy,
             )?;
@@ -101,7 +98,7 @@ impl GatewayState {
                     options.queue_size,
                     vec![options.dtype],
                     runner_key.as_ref().clone(),
-                    provider_genesis,
+                    options.provider_genesis.clone(),
                     assurance,
                 )
                 .context("failed to initialize local execution backend")?,

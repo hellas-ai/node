@@ -317,12 +317,7 @@ rec {
       identityPath = mkOption {
         type = types.str;
         default = "/var/lib/hellas-gateway/.hellas/identity";
-        description = "Node identity file used by the HTTP gateway.";
-      };
-      producerKeyPath = mkOption {
-        type = types.str;
-        default = "/var/lib/hellas-gateway/.hellas/signing-key.secp256k1";
-        description = "Producer signing key used by local gateway execution and verification.";
+        description = "Versioned provider identity used by the HTTP gateway.";
       };
       environmentFile = mkOption {
         type = types.nullOr types.str;
@@ -422,8 +417,6 @@ rec {
     [
       "--identity"
       gateway.identityPath
-      "--producer-key-path"
-      gateway.producerKeyPath
       "gateway"
     ]
     ++ [

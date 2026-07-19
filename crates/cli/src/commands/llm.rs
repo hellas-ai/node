@@ -6,11 +6,10 @@ use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_executor::ExecutorError;
 use hellas_models::{ModelAssets, TextOutputDecoder};
-use hellas_rpc::Dtype;
+use hellas_rpc::{Dtype, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct ExecuteOptions {
@@ -24,8 +23,8 @@ pub struct ExecuteOptions {
     pub local: bool,
     #[cfg(feature = "evaluate")]
     pub verify_local: bool,
-    pub producer_key_path: Option<PathBuf>,
-    pub provider_genesis: Option<PathBuf>,
+    pub producer_key: ProducerSigningKey,
+    pub provider_genesis: Vec<u8>,
     pub assurance_codec: Option<String>,
     pub assurance_policy: Option<hellas_rpc::ContentId>,
     pub raw: bool,
@@ -79,15 +78,16 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         bootstrap_assets.prepare_chat(&messages)?
     };
     let mut decoder = TextOutputDecoder::new(bootstrap_assets.clone(), &prepared.stop_token_ids);
-    let runner_key =
-        crate::identity::load_or_create_producer_key(options.producer_key_path.as_deref())?;
+    let runner_key = options.producer_key.clone();
     #[cfg(feature = "evaluate")]
     let provider_terms = if options.local || options.verify_local {
-        Some(crate::identity::load_provider_terms(
-            options.provider_genesis.as_deref(),
-            options.assurance_codec.as_deref(),
-            options.assurance_policy,
-        )?)
+        Some((
+            options.provider_genesis.clone(),
+            crate::identity::assurance(
+                options.assurance_codec.as_deref(),
+                options.assurance_policy,
+            )?,
+        ))
     } else {
         None
     };
