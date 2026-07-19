@@ -3320,7 +3320,6 @@ dependencies = [
  "futures-util",
  "hellas-rpc",
  "serde",
- "serde_ipld_dagcbor",
  "serde_json",
  "thiserror 2.0.18",
 ]
@@ -3387,7 +3386,6 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
- "catgrad",
  "chatgrad",
  "clap",
  "futures",
