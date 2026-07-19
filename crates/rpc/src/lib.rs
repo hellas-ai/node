@@ -11,10 +11,8 @@ pub mod evaluate;
 pub mod fetch;
 #[cfg(feature = "fetch")]
 pub mod output;
-/// Peer registry, admission, and connection directory. Re-exported from
-/// the standalone [`hellas_p2p`] crate; `hellas_rpc::peers::X` paths
-/// remain valid.
-pub use hellas_p2p as peers;
+/// Peer registry, admission, and connection directory module.
+pub mod peers;
 pub mod protocol;
 #[cfg(feature = "execute")]
 pub mod run_ticket;
@@ -24,10 +22,9 @@ pub mod spec;
 pub mod stream;
 pub use spec::ModelSpec;
 
-/// Execution authorization policy. Re-exported from the standalone
-/// [`hellas_auth`] crate; `hellas_rpc::policy::X` paths remain valid.
+/// Execution authorization policy module.
 #[cfg(feature = "execute")]
-pub use hellas_auth as policy;
+pub mod policy;
 
 pub mod provenance;
 

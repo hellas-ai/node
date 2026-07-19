@@ -266,9 +266,9 @@ fn bounded_penalty(count: u64, weight: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DiscoverySource;
-    use crate::TransportSecurity;
-    use crate::test_markers::TestService as NodeService;
+    use crate::peers::DiscoverySource;
+    use crate::peers::TransportSecurity;
+    use crate::peers::test_markers::TestService as NodeService;
     use hellas_wire::ServiceMarker;
 
     fn peer(byte: u8) -> PeerId {
