@@ -1,6 +1,6 @@
 use super::backend::GatewayBackend;
 use super::state::GatewayState;
-use super::wire_adaptor::{backend_wire_response, parse_backend_request};
+use super::dispatch::{backend_wire_response, parse_backend_request};
 use super::{next_id, now_unix};
 use axum::body::Bytes;
 use axum::extract::State;
