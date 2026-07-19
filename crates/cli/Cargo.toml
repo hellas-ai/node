@@ -20,7 +20,6 @@ evaluate = [
     "node",
     "gateway",
     "hellas-executor/evaluate",
-    "dep:catgrad",
     "dep:chatgrad",
     "dep:hellas-models",
 ]
@@ -52,7 +51,6 @@ anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
 base64.workspace = true
-catgrad = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
