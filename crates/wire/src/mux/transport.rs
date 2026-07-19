@@ -18,7 +18,7 @@ use super::state::{Event, Multiplexer, MuxConfig, MuxError};
 use super::stream::MuxStream;
 
 /// Trait for the underlying message-oriented byte pipe (one WS message
-/// = one mux frame). Implemented by ws-native + ws-cf-do adapters.
+/// = one mux frame). Implemented by the ws-native + ws-wasm adapters.
 pub trait MessagePipe: Send + 'static {
     type SendError: std::error::Error + Send + Sync + 'static;
     type RecvError: std::error::Error + Send + Sync + 'static;
