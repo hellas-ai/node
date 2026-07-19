@@ -24,6 +24,7 @@ pub mod anthropic;
 pub mod backend;
 pub mod error;
 pub mod execution;
+mod json;
 pub mod openai;
 pub mod request;
 pub mod wire;
