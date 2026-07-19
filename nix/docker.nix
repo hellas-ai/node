@@ -129,6 +129,7 @@ let
         buildFeatures = [
           "chain"
           "candle-cuda"
+          "otel"
         ];
         doCheck = false;
         nativeBuildInputs =

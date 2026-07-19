@@ -1,5 +1,10 @@
 { self }:
 rec {
+  # The ordinary production CLI: local CPU execution and OTEL, without an
+  # accelerator-specific backend. Accelerator builds remain explicit module
+  # overrides.
+  normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-candle;
+
   # Pick the best available hellas CLI variant for the target system:
   #   Darwin         → cli-candle-metal
   #   Linux + cuda   → cli-candle-cuda  (requires `nixpkgs.config.cudaSupport = true`)
@@ -19,11 +24,6 @@ rec {
       pkgSet.cli-candle-cuda
     else
       pkgSet.cli-candle;
-
-  # Slim gateway-capable CLI: model assets + network routing, no executor
-  # backend. Sufficient for the HTTP gateway unless it runs `--local` /
-  # `--verify-local`, which need an executor (candle) build.
-  pickGatewayPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
 
   renderEnvironment = builtins.mapAttrs (_: toString);
 

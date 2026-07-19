@@ -17,14 +17,12 @@ in
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = hellas.pickCliPackage pkgs;
+      package = hellas.normalCliPackage pkgs;
       packageDescription = ''
-        The hellas CLI used to run the serve daemon. Defaults to the best
-        backend variant for the host: cli-candle-metal on Darwin,
-        cli-candle-cuda when `nixpkgs.config.cudaSupport` is enabled on
-        Linux, otherwise cli-candle. Override to a specific SM build (e.g.
-        `pkgs.hellas.cli-candle-cuda-cuda12-sm80`) to pin a particular GPU
-        generation.
+        The hellas CLI used to run the serve daemon. Defaults to the normal
+        CPU-only, OTEL-capable cli-candle package. Override to an accelerator
+        build such as `pkgs.hellas.cli-candle-cuda-cuda12-sm80` explicitly.
+        The slim `pkgs.hellas.cli` package omits local execution and OTEL.
       '';
     }
     // hellas.serveOptions { inherit lib pkgs; }
@@ -32,12 +30,11 @@ in
       gateway = hellas.gatewayOptions { inherit lib; } // {
         package = mkOption {
           type = types.package;
-          default =
-            if gateway.local || gateway.verifyLocal then cfg.package else hellas.pickGatewayPackage pkgs;
+          default = cfg.package;
           defaultText = lib.literalMD ''
-            The slim gateway CLI (`packages.cli`), or `services.hellas.package`
-            when `gateway.local` / `gateway.verifyLocal` request an in-process
-            executor.
+            `services.hellas.package`: the normal CPU-only, OTEL-capable CLI.
+            Override with `pkgs.hellas.cli` for the slim remote-only build,
+            which intentionally omits OTEL.
           '';
           description = "The hellas CLI used to run the HTTP gateway.";
         };
