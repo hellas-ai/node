@@ -129,7 +129,8 @@ let
       cli = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
         # `gateway` is the slim HTTP gateway: model assets + network routing,
-        # no executor backend. Local execution needs a candle variant.
+        # no executor backend or telemetry exporter. Local execution and OTEL
+        # need a candle variant.
         buildFeatures = [
           "chain"
           "gateway"
@@ -144,6 +145,7 @@ let
         buildFeatures = [
           "chain"
           "candle"
+          "otel"
         ];
       };
     }
@@ -153,6 +155,7 @@ let
         buildFeatures = [
           "chain"
           "candle-metal"
+          "otel"
         ];
       };
     };
