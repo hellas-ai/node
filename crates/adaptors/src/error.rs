@@ -10,8 +10,6 @@ pub enum AdaptorError {
     InvalidRequest(String),
     #[error("unsupported wire feature: {0}")]
     Unsupported(String),
-    #[error("execution projection failed: {0}")]
-    Projection(String),
     #[error("invalid wire response: {0}")]
     InvalidResponse(String),
     #[error("response rendering failed: {0}")]
@@ -25,10 +23,6 @@ impl AdaptorError {
 
     pub fn unsupported(feature: impl Into<String>) -> Self {
         Self::Unsupported(feature.into())
-    }
-
-    pub fn projection(message: impl Into<String>) -> Self {
-        Self::Projection(message.into())
     }
 
     pub fn invalid_response(message: impl Into<String>) -> Self {

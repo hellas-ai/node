@@ -47,8 +47,6 @@ pub enum ExecutorError {
     #[cfg(feature = "evaluate")]
     #[error("LLM error: {0}")]
     Llm(#[from] LLMError),
-    #[error("weights not ready for {0}")]
-    WeightsNotReady(String),
     #[error("weights error: {0}")]
     WeightsError(String),
     #[error("artifact not found: {0}")]
@@ -88,9 +86,7 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::DtypeNotSupported { .. } => WireCode::FailedPrecondition,
         #[cfg(feature = "evaluate")]
         ExecutorError::ModelAssets(model_err) => hellas_models::model_assets_wire_code(model_err),
-        ExecutorError::WeightsNotReady(_) | ExecutorError::State(StateError::QuoteExpired(_)) => {
-            WireCode::FailedPrecondition
-        }
+        ExecutorError::State(StateError::QuoteExpired(_)) => WireCode::FailedPrecondition,
         ExecutorError::PolicyDenied(_) => WireCode::PermissionDenied,
         ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
             WireCode::NotFound

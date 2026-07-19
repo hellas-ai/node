@@ -168,8 +168,7 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
     let status = match error {
         AdaptorError::InvalidJson(_)
         | AdaptorError::InvalidRequest(_)
-        | AdaptorError::Unsupported(_)
-        | AdaptorError::Projection(_) => StatusCode::BAD_REQUEST,
+        | AdaptorError::Unsupported(_) => StatusCode::BAD_REQUEST,
         AdaptorError::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
         AdaptorError::Render(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
