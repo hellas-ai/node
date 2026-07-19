@@ -4,6 +4,7 @@ use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
     StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
+    json::{json_to_wire_string, optional_bool, provenance_json, required_array, required_string},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -580,17 +581,6 @@ fn usage_json(usage: crate::Usage) -> JsonValue {
     })
 }
 
-fn provenance_json(provenance: &crate::Provenance) -> Option<JsonValue> {
-    let mut object = JsonMap::new();
-    if let Some(commitment) = &provenance.call_commitment {
-        object.insert(
-            "commitment".to_string(),
-            JsonValue::String(commitment.clone()),
-        );
-    }
-    (!object.is_empty()).then_some(JsonValue::Object(object))
-}
-
 fn stop_reason_json(stop_reason: StopReason) -> JsonValue {
     let value = match stop_reason {
         StopReason::EndOfText | StopReason::StopSequence | StopReason::Cancelled => "end_turn",
@@ -607,46 +597,12 @@ fn structured_delta_string(delta: crate::StructuredDelta) -> String {
     }
 }
 
-fn json_to_wire_string(value: &JsonValue) -> String {
-    match value {
-        JsonValue::String(value) => value.clone(),
-        _ => serde_json::to_string(value).expect("serializing JSON value cannot fail"),
-    }
-}
-
-fn required_string(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<String> {
-    object
-        .get(key)
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| AdaptorError::invalid_request(format!("missing or invalid `{key}`")))
-}
-
 fn required_u32(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<u32> {
     object
         .get(key)
         .and_then(JsonValue::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| AdaptorError::invalid_request(format!("missing or invalid `{key}`")))
-}
-
-fn optional_bool(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<Option<bool>> {
-    match object.get(key) {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(value) => value
-            .as_bool()
-            .map(Some)
-            .ok_or_else(|| AdaptorError::invalid_request(format!("`{key}` must be a bool"))),
-    }
-}
-
-fn required_array(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<Vec<JsonValue>> {
-    match object.get(key) {
-        Some(JsonValue::Array(values)) => Ok(values.clone()),
-        _ => Err(AdaptorError::invalid_request(format!(
-            "`{key}` must be an array"
-        ))),
-    }
 }
 
 #[cfg(test)]
