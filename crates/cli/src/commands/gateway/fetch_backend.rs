@@ -12,14 +12,12 @@ use hellas_rpc::{ContentId, ProducerSigningKey};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
 
-use crate::execution::{
-    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, ProducerTrust,
-    fetch_execution_stream,
-};
+use crate::execution::{CliRuntime, fetch_execution_stream};
+use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome, ProducerTrust};
 
 #[derive(Clone)]
 pub(super) struct ResponsesFetchBackend {
-    runtime: ExecutionRuntime,
+    runtime: CliRuntime,
     route: ExecutionRoute,
     service: String,
     method: String,
@@ -31,7 +29,7 @@ pub(super) struct ResponsesFetchBackend {
 
 impl ResponsesFetchBackend {
     pub(super) fn new(
-        runtime: ExecutionRuntime,
+        runtime: CliRuntime,
         route: ExecutionRoute,
         target: (&str, &str, ContentId),
         caller_key: ProducerSigningKey,
@@ -100,7 +98,7 @@ fn signed_input_events_with_commitment(
 }
 
 fn fetch_events(
-    runtime: ExecutionRuntime,
+    runtime: CliRuntime,
     route: ExecutionRoute,
     request: FetchRequest,
     trust: ProducerTrust,

@@ -1,0 +1,31 @@
+[package]
+name = "hellas-client"
+description = "Reusable client orchestration for the Hellas protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+iroh = [
+    "dep:async-stream",
+    "dep:futures",
+    "dep:iroh",
+    "dep:iroh-mdns-address-lookup",
+    "hellas-rpc/courtesy",
+    "hellas-wire/iroh",
+    "hellas-wire/discovery-dht",
+    "hellas-wire/discovery-mdns",
+]
+evaluate = ["hellas-rpc/evaluate"]
+
+[dependencies]
+async-stream = { version = "0.3", optional = true }
+futures = { workspace = true, optional = true }
+hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
+hellas-wire.workspace = true
+iroh = { workspace = true, features = ["tls-ring"], optional = true }
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
+thiserror.workspace = true

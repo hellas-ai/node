@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
+use hellas_client::iroh::build_client_registry;
 use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::peers::{DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity};
 use hellas_rpc::services::node::{Node, NodeClientImpl};
@@ -25,7 +26,6 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::commands::CliResult;
-use crate::commands::discovery;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,7 +63,7 @@ pub async fn run(
         .await
         .context("failed to bind iroh endpoint")?;
 
-    let discovery = discovery::build_client_registry(&endpoint)?;
+    let discovery = build_client_registry(&endpoint)?;
     let mut registry = discovery.registry;
     registry.with_pool_options(PoolOptions {
         connect_timeout: CONNECT_TIMEOUT,

@@ -3,7 +3,8 @@ use futures::StreamExt;
 use hellas_adaptors::BackendError;
 use thiserror::Error;
 
-use crate::execution::{ExecutionError, Outcome};
+use crate::execution::Outcome;
+use hellas_client::ClientError;
 use hellas_models::{ModelAssetsError, TextOutputDecoder};
 
 use super::super::state::PreparedGeneration;
@@ -17,7 +18,7 @@ pub(super) enum GenerationEvent {
 #[derive(Debug, Error)]
 pub(super) enum GenerationError {
     #[error("Inference error: {0}")]
-    Execution(#[from] ExecutionError),
+    Execution(#[from] ClientError),
     #[error("Inference error: {0}")]
     Decode(#[from] ModelAssetsError),
     #[error("execution stream ended without terminal outcome")]
