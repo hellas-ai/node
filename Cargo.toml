@@ -6,6 +6,7 @@ members = [
     "crates/client",
     "crates/executor",
     "crates/gateway",
+    "crates/jobs",
     "crates/kernel",
     "crates/models",
     "crates/rpc",
