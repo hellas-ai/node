@@ -14,7 +14,6 @@ evaluate = [
     "dep:catgrad-llm",
     "dep:chatgrad",
     "dep:hellas-models",
-    "hellas-rpc/node",
 ]
 candle = ["evaluate", "catgrad/candle-backend"]
 candle-cuda = ["candle", "catgrad/cuda"]
@@ -33,7 +32,6 @@ futures-core = "0.3"
 futures-util = "0.3"
 hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = [
-    "server",
     "execute",
     "evaluate",
     "fetch",
