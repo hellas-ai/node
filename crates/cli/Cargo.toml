@@ -10,17 +10,16 @@ documentation.workspace = true
 [features]
 default = []
 
-node = ["dep:hellas-executor", "hellas-rpc/server"]
+node = ["dep:hellas-executor"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs) routing generation
 # over the Hellas network. Needs model assets (tokenizer, prompt/quote
 # building) but no executor backend; `--local` / `--verify-local` execution
 # of gateway traffic additionally requires `evaluate`.
-gateway = ["dep:chatgrad", "dep:hellas-models", "hellas-rpc/node"]
+gateway = ["dep:chatgrad", "dep:hellas-models"]
 evaluate = [
     "node",
     "gateway",
     "hellas-executor/evaluate",
-    "hellas-rpc/node",
     "dep:catgrad",
     "dep:chatgrad",
     "dep:hellas-models",

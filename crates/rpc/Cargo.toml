@@ -37,22 +37,12 @@ courtesy = ["execute", "evaluate"]
 swarm = []
 all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 
-# === Other knobs ===========================================================
-# Server-side dispatchers.
-server = []
-
 # Iroh transport binding. Forwards to `hellas-p2p/iroh`, which enables
 # `From<iroh::EndpointId> for PeerId` so consumers can build PeerIds from
 # iroh's EndpointId without a hex round-trip.
 iroh = ["hellas-p2p/iroh"]
 iroh-client = ["iroh"]
 iroh-server = ["iroh"]
-
-# Binary-side bundle for the node binary (executor / model deps).
-# Binary-side bundle for the node binary (server + every protocol). The
-# model-asset and LLM deps that used to live here moved out with the
-# `model` module (now `hellas-models`).
-node = ["server", "all-protocols"]
 
 [dependencies]
 blake3 = { workspace = true }

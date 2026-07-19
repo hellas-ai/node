@@ -35,9 +35,6 @@ ws = ["mux", "dep:tokio-tungstenite"]
 ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 ws-cf-do = ["mux", "dep:worker"]
 
-# Server role (accept side; non-wasm)
-server = []
-
 [dependencies]
 
 # Discovery backend deps (gated behind discovery-{dht,mdns}).
