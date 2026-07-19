@@ -7,7 +7,7 @@ mod provenance_layer;
 mod proxy;
 mod responses;
 mod state;
-mod wire_adaptor;
+mod dispatch;
 mod wrap;
 
 use crate::commands::CliResult;
