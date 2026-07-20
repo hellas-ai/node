@@ -28,7 +28,7 @@ pub use commonware_cryptography::Signer;
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
 use hellas_kernel::{
     Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode,
-    Key as KernelKey,
+    Key as KernelKey, Tx as KernelTx,
 };
 use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value as JsonValue;
@@ -806,6 +806,8 @@ pub enum Transaction {
         /// Owner signature over the merge challenge.
         signature: WebAuthnSignature,
     },
+    /// Canonically encoded transaction for the settlement kernel.
+    Kernel(KernelTx),
 }
 
 fn merge_inputs_are_strictly_sorted(inputs: &[ObjectId]) -> bool {
@@ -891,7 +893,11 @@ fn verify_webauthn_signature(
 }
 
 impl Transaction {
-    /// Verifies the transaction `WebAuthn` signature against `owner`.
+    /// Verifies a legacy transaction `WebAuthn` signature against `owner`.
+    ///
+    /// Kernel transactions deliberately return `false`: they authenticate
+    /// inside kernel [`hellas_kernel::State::apply`] beginning in M4, never at
+    /// this chain-domain signature layer.
     #[must_use]
     pub fn verify_signature(&self, owner: &Address) -> bool {
         match self {
@@ -908,6 +914,7 @@ impl Transaction {
                 let expected = merge_challenge(inputs.as_slice());
                 verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
             }
+            Self::Kernel(_) => false,
         }
     }
 
@@ -917,6 +924,7 @@ impl Transaction {
         match self {
             Self::Transfer { .. } => true,
             Self::MergeCoin { inputs, .. } => merge_inputs_are_strictly_sorted(inputs.as_slice()),
+            Self::Kernel(_) => true,
         }
     }
 }
@@ -986,7 +994,16 @@ impl EncodeSize for Transaction {
             Self::MergeCoin { inputs, signature } => {
                 u8::SIZE + inputs.encode_size() + signature.encode_size()
             }
+            Self::Kernel(tx) => u8::SIZE + tx.encoded_size().encode_size() + tx.encoded_size(),
         }
+    }
+}
+
+struct KernelTransactionWriter<'a, B: ?Sized>(&'a mut B);
+
+impl<B: bytes::BufMut + ?Sized> hellas_kernel::Writer for KernelTransactionWriter<'_, B> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.put_slice(bytes);
     }
 }
 
@@ -1010,6 +1027,11 @@ impl Write for Transaction {
                 inputs.write(buf);
                 signature.write(buf);
             }
+            Self::Kernel(tx) => {
+                2u8.write(buf);
+                tx.encoded_size().write(buf);
+                tx.encode_to(&mut KernelTransactionWriter(buf));
+            }
         }
     }
 }
@@ -1030,6 +1052,17 @@ impl Read for Transaction {
                 inputs: MergeInputs::read_cfg(buf, &(RangeCfg::new(2..=MAX_MERGE_INPUTS), ()))?,
                 signature: WebAuthnSignature::read(buf)?,
             }),
+            2 => {
+                let payload = Bounded::<u8, { KernelTx::MAX_ENCODED_SIZE }>::read_cfg(
+                    buf,
+                    &(RangeCfg::new(0..=KernelTx::MAX_ENCODED_SIZE), ()),
+                )?;
+                KernelTx::decode_exact(payload.as_slice())
+                    .map(Self::Kernel)
+                    .map_err(|_| {
+                        CodecError::Invalid("Transaction", "invalid canonical kernel transaction")
+                    })
+            }
             _ => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -1129,6 +1162,7 @@ pub fn mock_webauthn_sign(
 mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, Encode};
+    use hellas_kernel::test_support::{valid_mutual_close_tx, valid_open_tx};
 
     fn test_merge_inputs(values: &[ObjectId]) -> MergeInputs {
         let mut items = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
@@ -1227,6 +1261,80 @@ mod tests {
         assert_eq!(decoded.encode(), tx.encode());
     }
 
+    fn assert_kernel_codec_roundtrip(kernel_tx: KernelTx) {
+        let expected_payload_len = kernel_tx.encoded_size();
+        let mut canonical = [0_u8; KernelTx::MAX_ENCODED_SIZE];
+        let canonical_len = kernel_tx.write_to(&mut canonical);
+        let tx = Transaction::Kernel(kernel_tx.clone());
+        let encoded = tx.encode();
+        assert_eq!(encoded[0], 2);
+        let mut body = &encoded[1..];
+        assert_eq!(
+            usize::read_cfg(&mut body, &RangeCfg::new(0..=KernelTx::MAX_ENCODED_SIZE),)
+                .expect("kernel payload length"),
+            expected_payload_len
+        );
+        assert_eq!(body, &canonical[..canonical_len]);
+        let decoded = Transaction::decode(encoded).expect("kernel transaction decode");
+        let Transaction::Kernel(decoded) = decoded else {
+            panic!("expected kernel transaction")
+        };
+        assert_eq!(decoded, kernel_tx);
+    }
+
+    #[test]
+    fn kernel_open_codec_roundtrip() {
+        assert_kernel_codec_roundtrip(valid_open_tx().expect("valid kernel open fixture"));
+    }
+
+    #[test]
+    fn kernel_close_codec_roundtrip() {
+        assert_kernel_codec_roundtrip(valid_mutual_close_tx().expect("valid kernel close fixture"));
+    }
+
+    #[test]
+    fn kernel_signature_verification_stays_inside_the_kernel() {
+        let owner = addr_from_signing_key(&secp256r1_key_from_seed(1));
+        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
+        assert!(!tx.verify_signature(&owner));
+    }
+
+    #[test]
+    fn kernel_codec_rejects_over_length_payload() {
+        let mut encoded = BytesMut::new();
+        2u8.write(&mut encoded);
+        (KernelTx::MAX_ENCODED_SIZE + 1).write(&mut encoded);
+        assert!(Transaction::decode(encoded).is_err());
+    }
+
+    #[test]
+    fn kernel_codec_rejects_trailing_garbage_inside_payload() {
+        let kernel_tx = valid_open_tx().expect("valid kernel open fixture");
+        let mut canonical = [0_u8; KernelTx::MAX_ENCODED_SIZE];
+        let canonical_len = kernel_tx.write_to(&mut canonical);
+        let mut encoded = BytesMut::new();
+        2u8.write(&mut encoded);
+        (canonical_len + 1).write(&mut encoded);
+        encoded.extend_from_slice(&canonical[..canonical_len]);
+        encoded.extend_from_slice(&[0xff]);
+        assert!(Transaction::decode(encoded).is_err());
+    }
+
+    #[test]
+    fn transaction_codec_rejects_unknown_tag() {
+        assert!(Transaction::decode([0xff].as_slice()).is_err());
+    }
+
+    #[test]
+    fn transfer_codec_matches_pre_kernel_golden_bytes() {
+        let key = secp256r1_key_from_seed(1);
+        let (_, tx) = sample_transfer(&key);
+        assert_eq!(
+            hex::encode(tx.encode()),
+            "00070707070707070707070707070707070707070707070707070707070707070703e57aa4ea4cd5ed2c6e5b23a5c9895b2ef185df9a63876b948e53179a90727870000000000000000521cf7b0e78dd070f5f3544058cf2b38ea7c2aa724b94d1619ba6123c59c7caa71e37e39da015281fe180e026fefdbafb9bd622d488bdd73659991f0b2afd665325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a226d525768386b6537576541564962714e5171777a2d486771462d554c5a6575697a756c7078584653453541222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
+        );
+    }
+
     #[test]
     fn merge_codec_roundtrip() {
         let key = secp256r1_key_from_seed(1);
@@ -1245,6 +1353,27 @@ mod tests {
         let encoded = tx.encode();
         let decoded = Transaction::decode(encoded).expect("tx decode");
         assert_eq!(decoded.encode(), tx.encode());
+    }
+
+    #[test]
+    fn merge_codec_matches_pre_kernel_golden_bytes() {
+        let key = secp256r1_key_from_seed(1);
+        let mut values = [
+            Digest::from([3; 32]),
+            Digest::from([1; 32]),
+            Digest::from([2; 32]),
+        ];
+        values.sort();
+        let inputs = test_merge_inputs(&values);
+        let challenge = merge_challenge(inputs.as_slice());
+        let tx = Transaction::MergeCoin {
+            inputs,
+            signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
+        };
+        assert_eq!(
+            hex::encode(tx.encode()),
+            "0103010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303a3305f6d5207a36d266e8484ede313ab69280255c7f4b9d10993fc817854acb20707085312612146dedbc66714321677ab71cdc262963b3291571849a127147325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a225363797061444e395263715a615372513164445236753248315346397039524c4e6e4a44746b32376a4b67222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
+        );
     }
 
     #[test]
