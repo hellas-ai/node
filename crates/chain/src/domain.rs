@@ -27,7 +27,7 @@ use commonware_codec::{
 pub use commonware_cryptography::Signer;
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
 use hellas_kernel::{
-    Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode,
+    Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode, Fees,
     Key as KernelKey, Tx as KernelTx,
 };
 use p256::ecdsa::signature::Verifier as _;
@@ -426,6 +426,15 @@ pub const MERGE_TAG: u8 = 0x02;
 pub const MAX_MERGE_INPUTS: usize = 32;
 /// Maximum transactions per block.
 pub const MAX_TXS_PER_BLOCK: usize = 256;
+/// Maximum aggregate encoded transaction bytes admitted to one block.
+///
+/// This proposer-advisory budget leaves 256 KiB beneath the 1 MiB P2P message
+/// ceiling for the block envelope, consensus metadata, and framing overhead.
+/// The transport ceiling and [`MAX_TXS_PER_BLOCK`] are the consensus hard
+/// bounds. Candidates that overflow this budget remain in the mempool.
+pub const MAX_BLOCK_TX_BYTES: usize = 768 * 1024;
+/// Consensus-critical kernel fee schedule compiled into the chain.
+pub const KERNEL_FEES: Fees = Fees::ZERO;
 /// Default genesis allocation balance.
 pub const GENESIS_BALANCE: u64 = 100_000_000;
 /// Minimum `WebAuthn` authenticator data length.
@@ -458,6 +467,20 @@ pub fn output_object_id(tx_digest: &Digest, output_index: u8) -> ObjectId {
     tx_digest.write(&mut buf);
     output_index.write(&mut buf);
     Sha256::hash(&buf)
+}
+
+/// Returns the chain object id for a kernel coin id.
+#[must_use]
+#[cfg(any(feature = "indexer", feature = "validator"))]
+pub(crate) fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
+    ObjectId::from(id.to_bytes())
+}
+
+/// Returns the chain object id for a kernel edge id.
+#[must_use]
+#[cfg(any(feature = "indexer", feature = "validator"))]
+pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
+    ObjectId::from(id.to_bytes())
 }
 
 fn challenge_prefix(buf: &mut BytesMut, tag: u8) {
@@ -567,6 +590,21 @@ pub struct Coin {
     pub value: u64,
 }
 
+impl From<KernelCoin> for Coin {
+    fn from(coin: KernelCoin) -> Self {
+        Self {
+            owner: SettlementKey::from(coin.owner()),
+            value: coin.value(),
+        }
+    }
+}
+
+impl From<Coin> for KernelCoin {
+    fn from(coin: Coin) -> Self {
+        Self::issue(coin.owner.into_kernel(), coin.value)
+    }
+}
+
 /// Kind of object stored in the chain's single object namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -652,7 +690,7 @@ impl Write for Object {
         match self {
             Self::Coin(coin) => {
                 Self::COIN_TAG.write(buf);
-                let kernel_coin = KernelCoin::issue(coin.owner.into_kernel(), coin.value);
+                let kernel_coin = KernelCoin::from(*coin);
                 Self::write_payload(&kernel_coin, buf);
             }
             Self::Edge(edge) => {
@@ -672,10 +710,7 @@ impl Read for Object {
         match tag {
             Self::COIN_TAG => {
                 let coin = Self::read_payload::<KernelCoin>(&payload)?;
-                Ok(Self::Coin(Coin {
-                    owner: SettlementKey::from(coin.owner()),
-                    value: coin.value(),
-                }))
+                Ok(Self::Coin(Coin::from(coin)))
             }
             Self::EDGE_TAG => Ok(Self::Edge(Self::read_payload::<KernelEdge>(&payload)?)),
             _ => Err(CodecError::InvalidEnum(tag)),
@@ -1259,6 +1294,33 @@ mod tests {
         let encoded = tx.encode();
         let decoded = Transaction::decode(encoded).expect("tx decode");
         assert_eq!(decoded.encode(), tx.encode());
+    }
+
+    #[test]
+    fn every_transaction_arm_max_encoding_fits_advisory_block_budget() {
+        let webauthn_max = UserSignature::SIZE
+            + MAX_AUTHENTICATOR_DATA_LEN.encode_size()
+            + MAX_AUTHENTICATOR_DATA_LEN
+            + MAX_CLIENT_DATA_JSON_LEN.encode_size()
+            + MAX_CLIENT_DATA_JSON_LEN;
+        let transfer_max = u8::SIZE + ObjectId::SIZE + Address::SIZE + u64::SIZE + webauthn_max;
+        let merge_max = u8::SIZE
+            + MAX_MERGE_INPUTS.encode_size()
+            + MAX_MERGE_INPUTS * ObjectId::SIZE
+            + webauthn_max;
+        let kernel_max =
+            u8::SIZE + KernelTx::MAX_ENCODED_SIZE.encode_size() + KernelTx::MAX_ENCODED_SIZE;
+
+        for (arm, maximum) in [
+            ("transfer", transfer_max),
+            ("merge", merge_max),
+            ("kernel", kernel_max),
+        ] {
+            assert!(
+                maximum < MAX_BLOCK_TX_BYTES / 8,
+                "{arm} maximum {maximum} is not far below advisory block budget {MAX_BLOCK_TX_BYTES}"
+            );
+        }
     }
 
     fn assert_kernel_codec_roundtrip(kernel_tx: KernelTx) {

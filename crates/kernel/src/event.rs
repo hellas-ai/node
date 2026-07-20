@@ -243,3 +243,78 @@ impl Effect {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "the coherence tests build fixed, statically bounded protocol projections"
+)]
+mod tests {
+    use super::*;
+    use crate::{BlockHeight, Fees, Key, Parties, TermsHash};
+
+    fn assert_coherent(event: &Event, effect: &Effect) {
+        match (event.kind(), effect) {
+            (EventKind::EdgeOpened { inputs, output }, Effect::Open { coins, edge }) => {
+                assert_eq!(inputs, &Change::ids(coins));
+                assert_eq!(*output, edge.0);
+            }
+            (EventKind::EdgeClosed { input, outputs }, Effect::Close { edge, coins }) => {
+                assert_eq!(*input, edge.0);
+                assert_eq!(outputs, &Change::ids(coins));
+            }
+            _ => panic!("event and effect variants diverged"),
+        }
+    }
+
+    fn open_change() -> Change {
+        let maker = Key::from_bytes([0x11; Key::LENGTH]);
+        let taker = Key::from_bytes([0x22; Key::LENGTH]);
+        let first = CoinId::from_bytes([0x31; CoinId::LENGTH]);
+        let second = CoinId::from_bytes([0x32; CoinId::LENGTH]);
+        let mut coin_slots = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
+        coin_slots[0] = (first, Coin::issue(maker, 40));
+        coin_slots[1] = (second, Coin::issue(taker, 60));
+        let coins = List::take(coin_slots, 2);
+        let edge = Edge::open(
+            &coins,
+            Parties::new(maker, taker),
+            TermsHash::from_bytes([0x44; TermsHash::LENGTH]),
+            (0, 0, 0, Fees::ZERO),
+            BlockHeight::new(10),
+        )
+        .expect("coherence edge");
+        Change::open(&coins, (EdgeId::from_bytes([0x51; EdgeId::LENGTH]), edge))
+    }
+
+    #[test]
+    fn open_event_ids_equal_effect_mutation_slots() {
+        let change = open_change();
+        let returned_event = change.event().clone();
+        assert_coherent(&returned_event, &change.effect);
+    }
+
+    #[test]
+    fn close_event_ids_equal_effect_mutation_slots() {
+        let opened = open_change();
+        let Effect::Open { edge, .. } = opened.effect else {
+            unreachable!("open helper produces an open effect")
+        };
+        let maker = Key::from_bytes([0x11; Key::LENGTH]);
+        let taker = Key::from_bytes([0x22; Key::LENGTH]);
+        let mut coin_slots = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
+        coin_slots[0] = (
+            CoinId::from_bytes([0x61; CoinId::LENGTH]),
+            Coin::issue(maker, 40),
+        );
+        coin_slots[1] = (
+            CoinId::from_bytes([0x62; CoinId::LENGTH]),
+            Coin::issue(taker, 60),
+        );
+        let change = Change::close(edge, &List::take(coin_slots, 2));
+        let returned_event = change.event().clone();
+        assert_coherent(&returned_event, &change.effect);
+    }
+}

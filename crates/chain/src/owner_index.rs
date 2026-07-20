@@ -1,6 +1,7 @@
 use crate::HellasBlock;
 use crate::domain::{
-    Address, Coin, ObjectId, SettlementKey, Transaction, genesis_object_id, output_object_id,
+    Address, Coin, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id,
+    edge_object_id, genesis_object_id, output_object_id,
 };
 use commonware_codec::Encode;
 use commonware_consensus::{Block as _, Heightable};
@@ -51,8 +52,12 @@ pub enum OwnerIndexError {
     MergeOverflow,
     #[error("output object collision: {id:?}")]
     OutputCollision { id: ObjectId },
-    #[error("kernel transactions cannot reach the owner index before M4")]
-    KernelTransactionUnsupported,
+    #[error("wrong object kind for {id:?}: expected {expected}, found {actual}")]
+    WrongObjectKind {
+        id: ObjectId,
+        expected: ObjectKind,
+        actual: ObjectKind,
+    },
 }
 
 #[derive(Clone)]
@@ -78,18 +83,19 @@ impl OwnerIndex {
         self.inner.read().expect("owner index lock poisoned").cursor
     }
 
-    pub fn get_coin(&self, object_id: &ObjectId) -> Option<Coin> {
+    pub fn get_coin(&self, object_id: &ObjectId) -> Result<Option<Coin>, OwnerIndexError> {
         self.inner
             .read()
             .expect("owner index lock poisoned")
-            .coins
-            .get(object_id)
-            .cloned()
+            .get_coin(object_id)
     }
 
-    pub fn get_coin_snapshot(&self, object_id: &ObjectId) -> (OwnerCursor, Option<Coin>) {
+    pub fn get_coin_snapshot(
+        &self,
+        object_id: &ObjectId,
+    ) -> (OwnerCursor, Result<Option<Coin>, OwnerIndexError>) {
         let state = self.inner.read().expect("owner index lock poisoned");
-        (state.cursor, state.coins.get(object_id).cloned())
+        (state.cursor, state.get_coin(object_id))
     }
 
     pub fn get_coins_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, u64)> {
@@ -114,6 +120,26 @@ impl OwnerIndex {
             .unwrap_or_default();
         (state.cursor, coins)
     }
+
+    #[cfg(test)]
+    pub(crate) fn all_coins_for_test(&self) -> BTreeMap<ObjectId, Coin> {
+        self.inner
+            .read()
+            .expect("owner index lock poisoned")
+            .coins
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_edge_ids_for_test(&self) -> std::collections::BTreeSet<ObjectId> {
+        self.inner
+            .read()
+            .expect("owner index lock poisoned")
+            .kinds
+            .iter()
+            .filter_map(|(id, kind)| (*kind == ObjectKind::Edge).then_some(*id))
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -122,6 +148,7 @@ struct State {
     genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
     by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
+    kinds: BTreeMap<ObjectId, ObjectKind>,
 }
 
 impl State {
@@ -135,6 +162,21 @@ impl State {
             genesis_allocations,
             coins: BTreeMap::new(),
             by_owner: BTreeMap::new(),
+            kinds: BTreeMap::new(),
+        }
+    }
+
+    fn get_coin(&self, id: &ObjectId) -> Result<Option<Coin>, OwnerIndexError> {
+        if let Some(coin) = self.coins.get(id) {
+            return Ok(Some(*coin));
+        }
+        match self.kinds.get(id).copied() {
+            Some(actual @ ObjectKind::Edge) => Err(OwnerIndexError::WrongObjectKind {
+                id: *id,
+                expected: ObjectKind::Coin,
+                actual,
+            }),
+            Some(ObjectKind::Coin) | None => Ok(None),
         }
     }
 
@@ -193,7 +235,50 @@ impl State {
                 ..
             } => self.apply_transfer(tx, *input, recipient, *amount),
             Transaction::MergeCoin { inputs, .. } => self.apply_merge(tx, inputs.as_slice()),
-            Transaction::Kernel(_) => Err(OwnerIndexError::KernelTransactionUnsupported),
+            Transaction::Kernel(tx) => self.apply_kernel(tx),
+        }
+    }
+
+    fn apply_kernel(&mut self, tx: &hellas_kernel::Tx) -> Result<(), OwnerIndexError> {
+        match tx {
+            hellas_kernel::Tx::Open { funding, terms, .. } => {
+                let edge_id = edge_object_id(hellas_kernel::Tx::edge_id_of(funding, terms));
+                if self.kinds.contains_key(&edge_id) {
+                    return Err(OwnerIndexError::OutputCollision { id: edge_id });
+                }
+                for id in funding.maker().iter().chain(funding.taker()) {
+                    self.remove_coin(&coin_object_id(*id))?;
+                }
+                self.kinds.insert(edge_id, ObjectKind::Edge);
+                Ok(())
+            }
+            hellas_kernel::Tx::Close { input, outputs, .. } => {
+                let edge_id = edge_object_id(*input);
+                match self.kinds.remove(&edge_id) {
+                    Some(ObjectKind::Edge) => {}
+                    Some(actual) => {
+                        return Err(OwnerIndexError::WrongObjectKind {
+                            id: edge_id,
+                            expected: ObjectKind::Edge,
+                            actual,
+                        });
+                    }
+                    None => return Err(OwnerIndexError::ObjectNotFound { id: edge_id }),
+                }
+                for (id, payout) in hellas_kernel::Tx::close_output_ids(*input, outputs)
+                    .iter()
+                    .zip(outputs)
+                {
+                    self.insert_coin(
+                        coin_object_id(*id),
+                        Coin {
+                            owner: SettlementKey::from(payout.owner()),
+                            value: payout.value(),
+                        },
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -225,14 +310,14 @@ impl State {
 
         let tx_digest = Sha256::hash(&tx.encode());
         let recipient_id = output_object_id(&tx_digest, 0);
-        if self.coins.contains_key(&recipient_id) {
+        if self.kinds.contains_key(&recipient_id) {
             return Err(OwnerIndexError::OutputCollision { id: recipient_id });
         }
 
         let change_value = coin.value - amount;
         let change_id = if change_value > 0 {
             let id = output_object_id(&tx_digest, 1);
-            if self.coins.contains_key(&id) || id == recipient_id {
+            if self.kinds.contains_key(&id) || id == recipient_id {
                 return Err(OwnerIndexError::OutputCollision { id });
             }
             Some(id)
@@ -305,7 +390,7 @@ impl State {
 
         let tx_digest = Sha256::hash(&tx.encode());
         let output_id = output_object_id(&tx_digest, 0);
-        if self.coins.contains_key(&output_id) {
+        if self.kinds.contains_key(&output_id) {
             return Err(OwnerIndexError::OutputCollision { id: output_id });
         }
 
@@ -323,7 +408,7 @@ impl State {
     }
 
     fn insert_coin(&mut self, id: ObjectId, coin: Coin) -> Result<(), OwnerIndexError> {
-        if self.coins.contains_key(&id) {
+        if self.kinds.contains_key(&id) {
             return Err(OwnerIndexError::OutputCollision { id });
         }
         self.by_owner
@@ -331,6 +416,7 @@ impl State {
             .or_default()
             .insert(id, coin.value);
         self.coins.insert(id, coin);
+        self.kinds.insert(id, ObjectKind::Coin);
         Ok(())
     }
 
@@ -350,6 +436,7 @@ impl State {
         if remove_owner {
             self.by_owner.remove(&coin.owner);
         }
+        self.kinds.remove(id);
         Ok(coin)
     }
 }
@@ -357,61 +444,22 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{PrivateKey, genesis_object_id};
-    use commonware_consensus::{
-        CertifiableBlock,
-        types::{Epoch, Height, Round, View},
+    use crate::domain::genesis_object_id;
+    use crate::execution::test_support::{
+        index_block, index_genesis as genesis, kernel_fixture, legacy_address as address,
+        validator_key as key,
     };
-    use commonware_cryptography::{Digest as _, Signer as _, ed25519};
+    use commonware_consensus::types::{Epoch, Height, Round, View};
+    use commonware_cryptography::{Digest as _, Signer as _};
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::non_empty_range;
-    use hellas_kernel::test_support::valid_open_tx;
 
-    fn key(seed: u64) -> PrivateKey {
-        ed25519::PrivateKey::from_seed(seed)
-    }
-
-    fn address(seed: u64) -> Address {
-        Address::from(key(seed).public_key())
+    fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
+        index_block(parent, commonware_cryptography::sha256::Digest::EMPTY, txs)
     }
 
     fn settlement(seed: u64) -> SettlementKey {
         SettlementKey::from(address(seed))
-    }
-
-    fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
-        let height = parent.height().get() + 1;
-        let sync_target = crate::execution::store::UtxoSyncTarget::new(
-            Sha256::hash(format!("root-{height}").as_bytes()),
-            non_empty_range!(
-                Location::<mmr::Family>::new(0),
-                Location::<mmr::Family>::new(1)
-            ),
-        );
-        HellasBlock::new(
-            commonware_consensus::simplex::types::Context {
-                round: Round::new(Epoch::zero(), View::new(height)),
-                leader: key(0).public_key(),
-                parent: (parent.context().round.view(), parent.digest()),
-            },
-            parent.digest(),
-            Height::new(height),
-            height,
-            Sha256::hash(format!("state-{height}").as_bytes()),
-            sync_target,
-            txs,
-        )
-    }
-
-    fn genesis() -> HellasBlock {
-        let sync_target = crate::execution::store::UtxoSyncTarget::new(
-            Digest::EMPTY,
-            non_empty_range!(
-                Location::<mmr::Family>::new(0),
-                Location::<mmr::Family>::new(1)
-            ),
-        );
-        HellasBlock::genesis(key(0).public_key(), Digest::EMPTY, sync_target)
     }
 
     #[test]
@@ -433,7 +481,7 @@ mod tests {
             indexer.get_coins_by_owner(&settlement(1)),
             vec![(change_id, 60)]
         );
-        assert_eq!(indexer.get_coin(&input), None);
+        assert_eq!(indexer.get_coin(&input), Ok(None));
     }
 
     #[test]
@@ -462,7 +510,7 @@ mod tests {
             Err(OwnerIndexError::ZeroAmount)
         );
         assert_eq!(indexer.cursor().height, 0);
-        assert_eq!(indexer.get_coin(&genesis_object_id(0)), None);
+        assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
 
         let good_tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
         let recipient_id = output_object_id(&Sha256::hash(&good_tx.encode()), 0);
@@ -491,21 +539,54 @@ mod tests {
             Err(OwnerIndexError::InvalidSignature)
         );
         assert_eq!(indexer.cursor().height, 0);
-        assert_eq!(indexer.get_coin(&genesis_object_id(0)), None);
+        assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
     }
 
     #[test]
-    fn finalized_kernel_transaction_is_typed_pre_m4_error() {
+    fn indexes_kernel_kinds_and_coin_transitions_without_qmdb_classification() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, Vec::new());
-        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
-        let block = block(&genesis, vec![tx]);
-
+        let fixture = kernel_fixture(10).expect("kernel fixture");
+        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
+        let edge_id = edge_object_id(fixture.edge);
         assert_eq!(
-            indexer.apply_finalized(&block),
-            Err(OwnerIndexError::KernelTransactionUnsupported)
+            indexer.apply_finalized(&open_block),
+            Ok(ApplyOutcome::Applied)
         );
-        assert_eq!(indexer.cursor().height, 0);
+        assert_eq!(
+            indexer.all_edge_ids_for_test(),
+            [edge_id].into_iter().collect()
+        );
+        assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
+        assert_eq!(indexer.get_coin(&genesis_object_id(1)), Ok(None));
+        assert_eq!(
+            indexer.get_coin(&edge_id),
+            Err(OwnerIndexError::WrongObjectKind {
+                id: edge_id,
+                expected: ObjectKind::Coin,
+                actual: ObjectKind::Edge,
+            })
+        );
+
+        let close_block = block(
+            &open_block,
+            vec![Transaction::Kernel(fixture.mutual_close.clone())],
+        );
+        assert_eq!(
+            indexer.apply_finalized(&close_block),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert!(indexer.all_edge_ids_for_test().is_empty());
+        for (id, payout) in fixture.payout_ids().iter().zip(&fixture.outputs) {
+            let id = coin_object_id(*id);
+            assert_eq!(
+                indexer.get_coin(&id),
+                Ok(Some(Coin {
+                    owner: SettlementKey::from(payout.owner()),
+                    value: payout.value(),
+                }))
+            );
+        }
     }
 
     #[test]
