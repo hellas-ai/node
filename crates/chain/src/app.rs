@@ -2,17 +2,18 @@ mod block;
 
 pub use block::HellasBlock;
 
-use crate::domain::{Activity, MAX_TXS_PER_BLOCK, PublicKey, Scheme, SettlementKey, Transaction};
-use crate::execution::{
-    execute_all, execute_proposal,
-    store::{UtxoDatabase, UtxoSyncTarget, empty_state},
-};
+use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
+#[cfg(feature = "validator")]
+use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
+use crate::execution::store::{UtxoDatabase, UtxoSyncTarget, empty_state};
+#[cfg(feature = "validator")]
+use crate::execution::{execute_all, execute_proposal};
 use crate::light_client::{ConsensusActivity, ProposalInfo};
 use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
-    CertifiableBlock, Heightable, Reporter,
+    Block as _, CertifiableBlock, Heightable, Reporter,
     simplex::types::{Activity as SimplexActivity, Context, Proposal},
     types::Height,
 };
@@ -137,6 +138,16 @@ where
     }
 }
 
+#[cfg(feature = "validator")]
+fn kernel_context(height: Height, previous_hash: Digest) -> hellas_kernel::Context {
+    hellas_kernel::Context::with_fees(
+        hellas_kernel::BlockHeight::new(height.get()),
+        hellas_kernel::BlockHash::from_bytes(previous_hash.0),
+        KERNEL_FEES,
+    )
+}
+
+#[cfg(feature = "validator")]
 impl<E> StatefulApplication<E> for Application
 where
     E: Rng + Spawner + Metrics + Clock + Storage + Send + Sync + 'static,
@@ -167,11 +178,14 @@ where
         let parent = ancestry.next().await?;
         let candidates = input.snapshot().await;
         let snapshot_len = candidates.len();
+        let block_height = Height::new(parent.height().get() + 1);
+        let block_parent = parent.digest();
         let (batches, txs, retained) = match execute_proposal(
-            parent.height(),
+            kernel_context(block_height, block_parent),
             candidates,
             &self.genesis_allocations,
             MAX_TXS_PER_BLOCK,
+            MAX_BLOCK_TX_BYTES,
             batches,
         )
         .await
@@ -188,8 +202,8 @@ where
         let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
         let block = HellasBlock::new(
             consensus_context,
-            parent.digest(),
-            Height::new(parent.height().get() + 1),
+            block_parent,
+            block_height,
             timestamp,
             merkleized.root(),
             sync_target_from_merkleized(&merkleized),
@@ -220,7 +234,10 @@ where
         }
 
         let batches = execute_all(
-            parent.height(),
+            // `previous_hash` is currently inert in kernel apply. Source it
+            // from the block field so verify and certified replay cannot
+            // diverge when the kernel begins consuming it.
+            kernel_context(block.height(), block.parent()),
             block.txs(),
             &self.genesis_allocations,
             batches,
@@ -253,9 +270,8 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let parent_height = Height::new(block.height().get().saturating_sub(1));
         let batches = execute_all(
-            parent_height,
+            kernel_context(block.height(), block.parent()),
             block.txs(),
             &self.genesis_allocations,
             batches,
@@ -367,5 +383,276 @@ fn convert_activity(activity: &Activity) -> Option<ConsensusActivity> {
         SimplexActivity::Finalize(_)
         | SimplexActivity::ConflictingFinalize(_)
         | SimplexActivity::NullifyFinalize(_) => None,
+    }
+}
+
+#[cfg(all(test, feature = "validator"))]
+mod tests {
+    use super::*;
+    use crate::execution::{
+        store::{UtxoDatabase, utxo_db_config},
+        test_support::{kernel_fixture, run_qmdb, validator_key},
+    };
+    use commonware_consensus::types::{Epoch, Round, View};
+    use commonware_cryptography::Signer as _;
+    use commonware_runtime::{Supervisor as _, tokio};
+    use futures::stream;
+
+    fn next_consensus_context(parent: &HellasBlock) -> Context<Digest, PublicKey> {
+        let height = parent.height().get() + 1;
+        Context {
+            round: Round::new(Epoch::zero(), View::new(height)),
+            leader: validator_key(0).public_key(),
+            parent: (parent.context().round.view(), parent.digest()),
+        }
+    }
+
+    async fn propose_from(
+        app: &mut Application,
+        runtime: &tokio::Context,
+        database: &UtxoDatabase<tokio::Context>,
+        parent: &HellasBlock,
+        candidates: Vec<Transaction>,
+        label: &'static str,
+    ) -> (Proposed<Application, tokio::Context>, Vec<Transaction>) {
+        let mut mempool = Mempool::default();
+        for tx in candidates {
+            mempool.submit(tx).await;
+        }
+        let proposed = app
+            .propose(
+                (runtime.child(label), next_consensus_context(parent)),
+                stream::iter([parent.clone()]),
+                database.new_batches().await,
+                &mut mempool,
+            )
+            .await
+            .expect("application proposal");
+        (proposed, mempool.snapshot().await)
+    }
+
+    async fn verifies_from(
+        app: &mut Application,
+        runtime: &tokio::Context,
+        database: &UtxoDatabase<tokio::Context>,
+        parent: &HellasBlock,
+        block: &HellasBlock,
+        label: &'static str,
+    ) -> bool {
+        app.verify(
+            (runtime.child(label), block.context()),
+            stream::iter([block.clone(), parent.clone()]),
+            database.new_batches().await,
+        )
+        .await
+        .is_some()
+    }
+
+    fn candidate_block(parent: &HellasBlock, tx: Transaction) -> HellasBlock {
+        HellasBlock::new(
+            next_consensus_context(parent),
+            parent.digest(),
+            Height::new(parent.height().get() + 1),
+            parent.timestamp(),
+            parent.state_root(),
+            parent.sync_target(),
+            vec![tx],
+        )
+    }
+
+    #[test]
+    fn kernel_context_binds_block_height_parent_hash_and_consensus_fees() {
+        let parent = Digest::from([0x42; 32]);
+        let context = kernel_context(Height::new(17), parent);
+        assert_eq!(context.block_height(), hellas_kernel::BlockHeight::new(17));
+        assert_eq!(
+            context.previous_hash(),
+            hellas_kernel::BlockHash::from_bytes(parent.0)
+        );
+        assert_eq!(context.fees(), KERNEL_FEES);
+    }
+
+    #[test]
+    fn proposal_and_verify_use_block_height_at_timeout_boundary() {
+        run_qmdb(|runtime| async move {
+            let fixture = kernel_fixture(3).expect("kernel fixture");
+            let mut app = Application::new(
+                runtime.child("app"),
+                validator_key(0).public_key(),
+                fixture.allocations.clone(),
+                "context_boundary_app",
+                ApplicationConfig {
+                    page_cache_size: 1024,
+                    page_cache_count: 8,
+                },
+            )
+            .await;
+            let database_context = runtime.child("database");
+            let database_config = utxo_db_config(&database_context, "context_boundary_db", 1024, 8);
+            let database =
+                <UtxoDatabase<_> as DatabaseSet<_>>::init(database_context, database_config).await;
+            let genesis = app.genesis_block();
+
+            let (open, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &genesis,
+                vec![Transaction::Kernel(fixture.open.clone())],
+                "propose_open",
+            )
+            .await;
+            assert!(remaining.is_empty());
+            assert!(matches!(
+                open.block.txs(),
+                [Transaction::Kernel(tx)] if tx == &fixture.open
+            ));
+            assert!(
+                verifies_from(
+                    &mut app,
+                    &runtime,
+                    &database,
+                    &genesis,
+                    &open.block,
+                    "verify_open",
+                )
+                .await
+            );
+            let Proposed {
+                block: open_block,
+                merkleized,
+            } = open;
+            database.finalize(merkleized).await;
+
+            // Height 2 is timeout - 1: mutual close is accepted, while the
+            // timeout close is time-healing and remains in the mempool.
+            let (mutual_before_timeout, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &open_block,
+                vec![Transaction::Kernel(fixture.mutual_close.clone())],
+                "propose_mutual_before_timeout",
+            )
+            .await;
+            assert!(remaining.is_empty());
+            assert!(matches!(
+                mutual_before_timeout.block.txs(),
+                [Transaction::Kernel(tx)] if tx == &fixture.mutual_close
+            ));
+            assert!(
+                verifies_from(
+                    &mut app,
+                    &runtime,
+                    &database,
+                    &open_block,
+                    &mutual_before_timeout.block,
+                    "verify_mutual_before_timeout",
+                )
+                .await
+            );
+
+            let (timeout_before_height, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &open_block,
+                vec![Transaction::Kernel(fixture.timeout_close.clone())],
+                "propose_timeout_before_height",
+            )
+            .await;
+            assert!(timeout_before_height.block.txs().is_empty());
+            assert!(matches!(
+                remaining.as_slice(),
+                [Transaction::Kernel(tx)] if tx == &fixture.timeout_close
+            ));
+            let early_timeout = candidate_block(
+                &open_block,
+                Transaction::Kernel(fixture.timeout_close.clone()),
+            );
+            assert!(
+                !verifies_from(
+                    &mut app,
+                    &runtime,
+                    &database,
+                    &open_block,
+                    &early_timeout,
+                    "verify_timeout_before_height",
+                )
+                .await
+            );
+
+            let (empty_height_two, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &open_block,
+                Vec::new(),
+                "propose_empty_height_two",
+            )
+            .await;
+            assert!(empty_height_two.block.txs().is_empty());
+            assert!(remaining.is_empty());
+            let Proposed {
+                block: height_two_block,
+                merkleized,
+            } = empty_height_two;
+            database.finalize(merkleized).await;
+
+            // Height 3 is the timeout: mutual close is now ProofExpired and is
+            // dropped, while timeout close becomes admissible.
+            let (mutual_at_timeout, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &height_two_block,
+                vec![Transaction::Kernel(fixture.mutual_close.clone())],
+                "propose_mutual_at_timeout",
+            )
+            .await;
+            assert!(mutual_at_timeout.block.txs().is_empty());
+            assert!(remaining.is_empty());
+            let expired_mutual = candidate_block(
+                &height_two_block,
+                Transaction::Kernel(fixture.mutual_close.clone()),
+            );
+            assert!(
+                !verifies_from(
+                    &mut app,
+                    &runtime,
+                    &database,
+                    &height_two_block,
+                    &expired_mutual,
+                    "verify_mutual_at_timeout",
+                )
+                .await
+            );
+
+            let (timeout_at_height, remaining) = propose_from(
+                &mut app,
+                &runtime,
+                &database,
+                &height_two_block,
+                vec![Transaction::Kernel(fixture.timeout_close.clone())],
+                "propose_timeout_at_height",
+            )
+            .await;
+            assert!(remaining.is_empty());
+            assert!(matches!(
+                timeout_at_height.block.txs(),
+                [Transaction::Kernel(tx)] if tx == &fixture.timeout_close
+            ));
+            assert!(
+                verifies_from(
+                    &mut app,
+                    &runtime,
+                    &database,
+                    &height_two_block,
+                    &timeout_at_height.block,
+                    "verify_timeout_at_height",
+                )
+                .await
+            );
+        });
     }
 }

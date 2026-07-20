@@ -94,6 +94,8 @@ validator = [
     "dep:toml",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
+    "hellas-kernel/secp256k1",
+    "hellas-kernel/webauthn",
 ]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 
@@ -161,4 +163,5 @@ commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-kernel = { workspace = true, features = ["test-support"] }
 proptest = "1.11"
+tempfile = "3"
 test-log = { version = "0.2", features = ["trace"] }

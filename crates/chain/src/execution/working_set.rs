@@ -54,18 +54,6 @@ impl BlockWorkingSet {
     pub fn edge(&self, id: EdgeId) -> Option<Edge> {
         self.edges.get(&id).copied().flatten()
     }
-
-    /// Iterates over every declared coin slot and its current state.
-    /// Used after the kernel commits to replay diffs back into the
-    /// async store.
-    pub fn coin_slots(&self) -> impl Iterator<Item = (CoinId, Option<Coin>)> + '_ {
-        self.coins.iter().map(|(k, v)| (*k, *v))
-    }
-
-    /// Iterates over every declared edge slot and its current state.
-    pub fn edge_slots(&self) -> impl Iterator<Item = (EdgeId, Option<Edge>)> + '_ {
-        self.edges.iter().map(|(k, v)| (*k, *v))
-    }
 }
 
 impl Store for BlockWorkingSet {
@@ -243,21 +231,14 @@ mod tests {
             .apply(ctx, &FakeVerifier, &close)
             .expect("close accepted");
 
-        // -- 5. Drain the working set for replay into the async store.
+        // -- 5. Inspect only the ids named by the authoritative close event.
         let final_set = state.into_store();
-        let live_coins: Vec<_> = final_set
-            .coin_slots()
-            .filter_map(|(id, c)| c.map(|coin| (id, coin)))
-            .collect();
-        let live_edges: Vec<_> = final_set
-            .edge_slots()
-            .filter_map(|(id, e)| e.map(|edge| (id, edge)))
-            .collect();
-
-        // Two output coins (one per party); no live edges (the open
-        // edge was consumed by the close).
-        assert_eq!(live_coins.len(), 2, "expected two payout coins");
-        assert_eq!(live_edges.len(), 0, "expected no live edges");
+        assert!(
+            close_output_ids
+                .iter()
+                .all(|id| final_set.coin(*id).is_some()),
+            "expected every payout coin"
+        );
         assert!(final_set.edge(edge).is_none(), "edge should be consumed");
 
         // Input coins are gone.
