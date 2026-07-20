@@ -1,6 +1,7 @@
 use crate::commands::CliResult;
-use crate::execution::{CliRuntime, fetch_execution_stream};
+use crate::execution::CliRuntime;
 use futures::StreamExt;
+use hellas_client::iroh::fetch_execution_stream;
 use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome, ProducerTrust};
 use hellas_rpc::fetch::build_input_events;
 use hellas_rpc::pb::fetch::FetchRequest;

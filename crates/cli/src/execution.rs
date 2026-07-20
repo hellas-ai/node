@@ -23,35 +23,36 @@
 //! chunk verification live in `hellas-client`; this module retains local
 //! executor dispatch plus model and gateway response shaping.
 
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use async_stream::try_stream;
 #[cfg(feature = "gateway")]
 use chatgrad::PreparedPrompt;
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use futures::StreamExt;
 #[cfg(feature = "gateway")]
 use futures::stream::BoxStream;
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use futures::stream::Stream;
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_client::ClientError as ExecutionError;
 #[cfg(feature = "gateway")]
 use hellas_client::EvaluateChunkVerifier;
 use hellas_client::ExecutionRuntime as ClientExecutionRuntime;
 #[cfg(feature = "gateway")]
 use hellas_client::signed_run_ticket_request;
-use hellas_client::{
-    ClientResult as ExecutionResult, ExecutionRoute, FetchExecutionEvent, ProducerTrust,
-    verified_fetch_input,
-};
-#[cfg(feature = "evaluate")]
-use hellas_client::{validate_fetch_ticket, verify_fetch_work_event};
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
+use hellas_client::{ClientResult as ExecutionResult, ExecutionRoute};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ExecutorHandle;
 #[cfg(feature = "gateway")]
 use hellas_models::ModelAssets;
 #[cfg(feature = "gateway")]
 use hellas_rpc::Digest;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
+#[cfg(feature = "gateway")]
 use hellas_rpc::InputCommitment;
 #[cfg(feature = "gateway")]
 use hellas_rpc::OutputEventEnvelope;
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_rpc::ProducerSigningKey;
 #[cfg(feature = "gateway")]
 use hellas_rpc::evaluate::{
@@ -65,7 +66,6 @@ use hellas_rpc::pb::courtesy::{
 use hellas_rpc::pb::execute::Ticket;
 #[cfg(feature = "gateway")]
 use hellas_rpc::pb::execute::{WorkEvent, WorkFinished, work_event};
-use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 #[cfg(feature = "gateway")]
 use hellas_rpc::provenance::ExecutionProvenance;
 #[cfg(feature = "gateway")]
@@ -78,6 +78,7 @@ use hellas_wire::WireStatus;
 use hellas_wire::iroh::IrohTransport;
 #[cfg(feature = "evaluate")]
 use std::error::Error as StdError;
+#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use std::sync::Arc;
 #[cfg(feature = "evaluate")]
 use tokio_stream::wrappers::ReceiverStream;
@@ -286,89 +287,6 @@ impl ExecutionRequest {
             tokio::pin!(inner);
             while let Some(event) = inner.next().await {
                 yield event?;
-            }
-        }
-    }
-}
-
-pub fn fetch_execution_stream(
-    runtime: CliRuntime,
-    request: PbFetchRequest,
-    route: ExecutionRoute,
-    trust: ProducerTrust,
-    runner_key: Arc<ProducerSigningKey>,
-) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
-    try_stream! {
-        let input_commitment = verified_fetch_input(&request)?.input_commitment;
-        match route {
-            ExecutionRoute::Local => {
-                #[cfg(not(feature = "evaluate"))]
-                Err(ExecutionError::protocol(
-                    "local execution requested but no local executor is configured",
-                ))?;
-                #[cfg(feature = "evaluate")]
-                {
-                let handle = require_local_executor(&runtime)?;
-                let outcome = handle
-                    .create_fetch_ticket(request)
-                    .await
-                    .exec_context("local create_fetch_ticket failed")?;
-                let ticket = validate_fetch_ticket(outcome.response, input_commitment)?;
-                let inner = local_execute_fetch_stream(
-                    handle,
-                    ticket,
-                    input_commitment,
-                    trust,
-                    runner_key.clone(),
-                );
-                tokio::pin!(inner);
-                while let Some(event) = inner.next().await {
-                    yield event?;
-                }
-                }
-            }
-            ExecutionRoute::RemoteDirect(target) => {
-                let ticket = hellas_client::iroh::fetch_quote(
-                    &runtime,
-                    &target,
-                    request,
-                    input_commitment,
-                )
-                .await?;
-                let execute_transport = hellas_client::iroh::execute_transport(&runtime, &target).await?;
-                let inner = hellas_client::iroh::execute_fetch_stream(
-                    execute_transport,
-                    ticket,
-                    input_commitment,
-                    trust,
-                    runner_key.clone(),
-                );
-                tokio::pin!(inner);
-                while let Some(event) = inner.next().await {
-                    yield event?;
-                }
-            }
-            ExecutionRoute::RemoteDiscovery { retries } => {
-                let (target, ticket) =
-                    hellas_client::iroh::discover_and_fetch_quote(
-                        runtime.remote_registry()?,
-                        &request,
-                        input_commitment,
-                        retries,
-                    )
-                    .await?;
-                let execute_transport = hellas_client::iroh::execute_transport(&runtime, &target).await?;
-                let inner = hellas_client::iroh::execute_fetch_stream(
-                    execute_transport,
-                    ticket,
-                    input_commitment,
-                    trust,
-                    runner_key.clone(),
-                );
-                tokio::pin!(inner);
-                while let Some(event) = inner.next().await {
-                    yield event?;
-                }
             }
         }
     }
@@ -639,48 +557,6 @@ fn local_execute_stream(
         // Keep the handle alive for the lifetime of the stream so the
         // worker's per-execution sender doesn't trip the channel-closed
         // cancel path before the terminal event flushes.
-        drop(handle);
-    }
-}
-
-#[cfg(feature = "evaluate")]
-fn local_execute_fetch_stream(
-    handle: ExecutorHandle,
-    ticket: Ticket,
-    input_commitment: InputCommitment,
-    trust: ProducerTrust,
-    runner_key: Arc<ProducerSigningKey>,
-) -> impl Stream<Item = ExecutionResult<FetchExecutionEvent>> + Send {
-    try_stream! {
-        let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
-        let outcome = handle
-            .run_ticket_handle(run_ticket)
-            .await
-            .exec_context("failed to start local fetch execution stream")?;
-        let _provenance = outcome.provenance;
-        let mut events = ReceiverStream::new(outcome.events);
-        let mut got_terminal = false;
-        let mut verifier = hellas_client::FetchChunkVerifier::new(input_commitment, trust);
-        while let Some(item) = events.next().await {
-            let wire = item
-                .map_err(|status: WireStatus| ExecutionError::wire("local fetch execution stream failed", status))?;
-            let event = verify_fetch_work_event(
-                &mut verifier,
-                wire,
-                input_commitment,
-            )?;
-            let is_done = matches!(event, FetchExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
-            }
-        }
-        if !got_terminal {
-            Err(ExecutionError::protocol(
-                "local fetch execution stream ended without terminal outcome"
-            ))?;
-        }
         drop(handle);
     }
 }

@@ -15,8 +15,6 @@ pub mod identity;
 #[cfg(feature = "evaluate")]
 pub mod llm;
 pub mod monitor;
-#[cfg(any(feature = "node", feature = "gateway"))]
-pub(crate) mod openai_responses_stream;
 pub mod rpc;
 #[cfg(feature = "node")]
 pub mod serve;

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use hellas_rpc::InputCommitment;
 use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::pb::fetch::FetchRequest;
@@ -11,6 +10,7 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::{Courtesy, QuotePreparedText};
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::{Fetch, FetchClientImpl};
+use hellas_rpc::{InputCommitment, ProducerSigningKey};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, ServiceRegistry};
 use hellas_wire::{Metadata, ServiceMarker, WireStatus};
@@ -19,7 +19,7 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use crate::error::ClientContext;
 use crate::{
     ClientError, ClientResult, ExecutionRuntime, FetchChunkVerifier, FetchExecutionEvent,
-    ProducerTrust, Route, signed_run_ticket_request, validate_fetch_ticket,
+    ProducerTrust, Route, signed_run_ticket_request, validate_fetch_ticket, verified_fetch_input,
     verify_fetch_work_event,
 };
 
@@ -367,13 +367,73 @@ pub async fn discover_and_fetch_quote(
     }))
 }
 
+pub fn fetch_execution_stream<L: Send + Sync>(
+    runtime: ExecutionRuntime<L>,
+    request: FetchRequest,
+    route: ExecutionRoute,
+    trust: ProducerTrust,
+    runner_key: Arc<ProducerSigningKey>,
+) -> impl Stream<Item = ClientResult<FetchExecutionEvent>> + Send {
+    try_stream! {
+        let input_commitment = verified_fetch_input(&request)?.input_commitment;
+        match route {
+            ExecutionRoute::Local => Err(ClientError::protocol(
+                "local fetch execution requires an embedded executor",
+            ))?,
+            ExecutionRoute::RemoteDirect(target) => {
+                let ticket = fetch_quote(
+                    &runtime,
+                    &target,
+                    request,
+                    input_commitment,
+                )
+                .await?;
+                let execute_transport = execute_transport(&runtime, &target).await?;
+                let inner = execute_fetch_stream(
+                    execute_transport,
+                    ticket,
+                    input_commitment,
+                    trust,
+                    runner_key.clone(),
+                );
+                futures::pin_mut!(inner);
+                while let Some(event) = inner.next().await {
+                    yield event?;
+                }
+            }
+            ExecutionRoute::RemoteDiscovery { retries } => {
+                let (target, ticket) =
+                    discover_and_fetch_quote(
+                        runtime.remote_registry()?,
+                        &request,
+                        input_commitment,
+                        retries,
+                    )
+                    .await?;
+                let execute_transport = execute_transport(&runtime, &target).await?;
+                let inner = execute_fetch_stream(
+                    execute_transport,
+                    ticket,
+                    input_commitment,
+                    trust,
+                    runner_key.clone(),
+                );
+                futures::pin_mut!(inner);
+                while let Some(event) = inner.next().await {
+                    yield event?;
+                }
+            }
+        }
+    }
+}
+
 /// Run a fetch ticket over an already-dialed Execute transport.
 pub fn execute_fetch_stream(
     transport: IrohTransport,
     ticket: Ticket,
     input_commitment: InputCommitment,
     trust: ProducerTrust,
-    runner_key: Arc<hellas_rpc::ProducerSigningKey>,
+    runner_key: Arc<ProducerSigningKey>,
 ) -> impl Stream<Item = ClientResult<FetchExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
