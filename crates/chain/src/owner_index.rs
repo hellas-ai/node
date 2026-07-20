@@ -51,6 +51,8 @@ pub enum OwnerIndexError {
     MergeOverflow,
     #[error("output object collision: {id:?}")]
     OutputCollision { id: ObjectId },
+    #[error("kernel transactions cannot reach the owner index before M4")]
+    KernelTransactionUnsupported,
 }
 
 #[derive(Clone)]
@@ -191,6 +193,7 @@ impl State {
                 ..
             } => self.apply_transfer(tx, *input, recipient, *amount),
             Transaction::MergeCoin { inputs, .. } => self.apply_merge(tx, inputs.as_slice()),
+            Transaction::Kernel(_) => Err(OwnerIndexError::KernelTransactionUnsupported),
         }
     }
 
@@ -362,6 +365,7 @@ mod tests {
     use commonware_cryptography::{Digest as _, Signer as _, ed25519};
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::non_empty_range;
+    use hellas_kernel::test_support::valid_open_tx;
 
     fn key(seed: u64) -> PrivateKey {
         ed25519::PrivateKey::from_seed(seed)
@@ -488,6 +492,20 @@ mod tests {
         );
         assert_eq!(indexer.cursor().height, 0);
         assert_eq!(indexer.get_coin(&genesis_object_id(0)), None);
+    }
+
+    #[test]
+    fn finalized_kernel_transaction_is_typed_pre_m4_error() {
+        let genesis = genesis();
+        let indexer = OwnerIndex::new(&genesis, Vec::new());
+        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
+        let block = block(&genesis, vec![tx]);
+
+        assert_eq!(
+            indexer.apply_finalized(&block),
+            Err(OwnerIndexError::KernelTransactionUnsupported)
+        );
+        assert_eq!(indexer.cursor().height, 0);
     }
 
     #[test]

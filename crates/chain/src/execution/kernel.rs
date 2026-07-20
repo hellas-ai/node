@@ -42,6 +42,8 @@ pub enum ExecutionError {
     OutputCollision { id: ObjectId },
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("kernel transactions cannot execute before M4")]
+    KernelTransactionUnsupported,
 }
 
 impl ExecutionError {
@@ -339,6 +341,7 @@ where
             );
             Ok(batches)
         }
+        Transaction::Kernel(_) => Err((batches, ExecutionError::KernelTransactionUnsupported)),
     }
 }
 

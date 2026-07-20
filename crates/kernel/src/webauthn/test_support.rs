@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use super::{AT, ED, MIN_AUTH_DATA_LEN, UP, WebAuthnError, base64url_32, p256_key};
 use crate::{
-    CloseKind, CoinId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash, Payout, ProtocolCode, Terms, Tx,
+    Auth, CloseKind, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
+    MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash, Payout, Proof, ProtocolCode, Terms, Tx,
     WebAuthnAssertion, consts::P256_COORDINATE_LENGTH, context::BlockHeight,
 };
 
@@ -227,6 +227,43 @@ pub fn valid_mutual_close_assertion() -> Result<WebAuthnFixture, SoftPasskeyErro
     })
 }
 
+/// Builds a complete valid kernel open transaction using deterministic
+/// software-passkey authorizations for both parties.
+///
+/// # Errors
+///
+/// Returns [`SoftPasskeyError`] if deterministic signing or bounded fixture
+/// assembly fails.
+pub fn valid_open_tx() -> Result<Tx, SoftPasskeyError> {
+    let context = fixture_context()?;
+    let maker_auth = Auth::webauthn(context.passkey.sign(context.open_hash)?);
+    let taker_auth = Auth::webauthn(context.other.sign(context.open_hash)?);
+    Ok(Tx::open(
+        context.funding,
+        context.terms,
+        maker_auth,
+        taker_auth,
+    ))
+}
+
+/// Builds a complete valid kernel mutual-close transaction using
+/// deterministic software-passkey authorizations for both parties.
+///
+/// # Errors
+///
+/// Returns [`SoftPasskeyError`] if deterministic signing or bounded fixture
+/// assembly fails.
+pub fn valid_mutual_close_tx() -> Result<Tx, SoftPasskeyError> {
+    let context = fixture_context()?;
+    let maker_auth = Auth::webauthn(context.passkey.sign(context.mutual_close_hash)?);
+    let taker_auth = Auth::webauthn(context.other.sign(context.mutual_close_hash)?);
+    Ok(Tx::close(
+        context.edge,
+        Proof::mutual(maker_auth, taker_auth),
+        context.outputs,
+    ))
+}
+
 /// Builds all named invalid v1 assertions and their exact expected errors.
 ///
 /// # Errors
@@ -360,6 +397,11 @@ const fn invalid_fixture(
 
 struct FixtureContext {
     passkey: SoftPasskey,
+    other: SoftPasskey,
+    funding: Funding,
+    terms: Terms,
+    outputs: List<Payout, MAX_EDGE_OUTPUTS>,
+    edge: EdgeId,
     open_hash: PayloadHash,
     mutual_close_hash: PayloadHash,
 }
@@ -396,6 +438,11 @@ fn fixture_context() -> Result<FixtureContext, SoftPasskeyError> {
 
     Ok(FixtureContext {
         passkey,
+        other,
+        funding,
+        terms,
+        outputs,
+        edge,
         open_hash,
         mutual_close_hash,
     })

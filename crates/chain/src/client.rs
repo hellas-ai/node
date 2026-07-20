@@ -187,7 +187,7 @@ impl LightClient for RemoteLightClient {
     fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send {
         let client = self.client.clone();
         async move {
-            let req = transaction_to_proto(tx);
+            let req = transaction_to_proto(tx)?;
             client.submit_tx(req).await.map_err(QueryError::from)?;
             Ok(())
         }
@@ -327,7 +327,7 @@ fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, Q
     })
 }
 
-fn transaction_to_proto(tx: Transaction) -> SubmitTxRequest {
+fn transaction_to_proto(tx: Transaction) -> Result<SubmitTxRequest, QueryError> {
     let signature_to_der = |signature: &DomainWebAuthnSignature| {
         let raw = signature.signature.encode();
         let parsed = P256Signature::from_slice(raw.as_ref())
@@ -361,13 +361,15 @@ fn transaction_to_proto(tx: Transaction) -> SubmitTxRequest {
                 }),
             })
         }
+        Transaction::Kernel(_) => return Err(QueryError::KernelSubmissionUnsupported),
     };
-    SubmitTxRequest { tx: Some(tx_oneof) }
+    Ok(SubmitTxRequest { tx: Some(tx_oneof) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_kernel::test_support::valid_open_tx;
 
     fn proto_block(block: Vec<u8>, payload: Digest) -> hellas_rpc::pb::chain::FinalizedBlock {
         hellas_rpc::pb::chain::FinalizedBlock {
@@ -401,5 +403,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn kernel_transaction_is_not_encoded_into_legacy_submit_proto() {
+        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
+        assert!(matches!(
+            transaction_to_proto(tx),
+            Err(QueryError::KernelSubmissionUnsupported)
+        ));
     }
 }

@@ -116,6 +116,8 @@ pub enum QueryError {
     Remote(String),
     #[error("connection failed: {0}")]
     Connect(String),
+    #[error("kernel transaction submission is unavailable until M5")]
+    KernelSubmissionUnsupported,
 }
 
 impl From<QueryError> for WireStatus {
@@ -133,6 +135,10 @@ impl From<QueryError> for WireStatus {
             ),
             QueryError::Remote(message) => WireStatus::new(WireCode::Unavailable, message),
             QueryError::Connect(message) => WireStatus::new(WireCode::Unavailable, message),
+            QueryError::KernelSubmissionUnsupported => WireStatus::new(
+                WireCode::Unimplemented,
+                "kernel transaction submission is unavailable until M5",
+            ),
         }
     }
 }

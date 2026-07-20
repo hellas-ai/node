@@ -376,6 +376,8 @@ fn webauthn_signature_from_proto(
 }
 
 fn transaction_from_proto(request: pb::SubmitTxRequest) -> Result<Transaction, WireStatus> {
+    // The SubmitTx proto deliberately remains legacy-only until M5; kernel
+    // transactions enter the chain domain codec in M3b but not this boundary.
     match request
         .tx
         .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing transaction"))?
@@ -440,26 +442,6 @@ fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
 fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
     GetLatestBlockResponse {
         latest: latest.map(latest_block_to_proto),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owner_query_accepts_raw_non_p256_settlement_key() {
-        let raw = vec![0xa5; SettlementKey::LENGTH];
-        let key = settlement_key_from_bytes(raw.clone(), "owner").expect("raw settlement key");
-        assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
-        assert!(Address::try_from(key).is_err());
-    }
-
-    #[test]
-    fn owner_query_rejects_wrong_settlement_key_length() {
-        let err = settlement_key_from_bytes(vec![0; SettlementKey::LENGTH - 1], "owner")
-            .expect_err("short settlement key");
-        assert_eq!(err.code(), WireCode::InvalidArgument);
     }
 }
 
@@ -579,5 +561,25 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
         event: Some(event),
         relay_timestamps: Vec::new(),
         edge_colo: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_query_accepts_raw_non_p256_settlement_key() {
+        let raw = vec![0xa5; SettlementKey::LENGTH];
+        let key = settlement_key_from_bytes(raw.clone(), "owner").expect("raw settlement key");
+        assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
+        assert!(Address::try_from(key).is_err());
+    }
+
+    #[test]
+    fn owner_query_rejects_wrong_settlement_key_length() {
+        let err = settlement_key_from_bytes(vec![0; SettlementKey::LENGTH - 1], "owner")
+            .expect_err("short settlement key");
+        assert_eq!(err.code(), WireCode::InvalidArgument);
     }
 }
