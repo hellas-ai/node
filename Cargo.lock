@@ -3406,6 +3406,7 @@ dependencies = [
  "hellas-client",
  "hellas-executor",
  "hellas-gateway",
+ "hellas-kernel",
  "hellas-models",
  "hellas-rpc",
  "hellas-wire",

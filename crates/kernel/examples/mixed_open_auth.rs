@@ -18,7 +18,7 @@
 //! Build and run with:
 //!
 //! ```sh
-//! cargo run --example mixed_open_auth --features secp256k1,test-support
+//! cargo run --example mixed_open_auth --features secp256k1,webauthn
 //! ```
 
 #![allow(clippy::alloc_instead_of_core)]
@@ -34,7 +34,7 @@ mod support;
 
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, Fees, Funding, Genesis, Parties, Proof, ProtocolCode,
-    Secp256k1Verifier, Terms, Tx, test_support::SoftPasskey,
+    Secp256k1Verifier, SoftPasskey, Terms, Tx,
 };
 use support::{
     apply_one, coin_id, context, context_fee, empty_party, genesis, lifetime_fee, party_one,

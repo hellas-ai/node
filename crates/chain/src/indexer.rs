@@ -474,72 +474,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ThresholdVariant;
-    use crate::{
-        Application, ApplicationConfig, CONSENSUS_NAMESPACE, ConsensusInfo,
-        consensus::ConsensusVerifier,
-    };
-    use commonware_codec::Encode;
+    use crate::execution::test_support::{ConsensusFixture, consensus_fixture, finalization};
+    use crate::{Application, ApplicationConfig};
     use commonware_consensus::{
         simplex::types::{Context, Finalize, Proposal},
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer as _, bls12381::dkg::feldman_desmedt::deal, ed25519};
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-    use commonware_utils::{N3f1, ordered::Set};
-    use rand::{SeedableRng, rngs::StdRng};
-
-    struct ConsensusFixture {
-        schemes: Vec<Scheme>,
-        assembler: Scheme,
-        verifier: ConsensusVerifier,
-        leaders: Vec<PublicKey>,
-    }
-
-    fn consensus_fixture(seed: u64) -> ConsensusFixture {
-        let private_keys = (0..4)
-            .map(|offset| ed25519::PrivateKey::from_seed(seed + offset))
-            .collect::<Vec<_>>();
-        let leaders = private_keys
-            .iter()
-            .map(|key| key.public_key())
-            .collect::<Vec<_>>();
-        let participants = Set::try_from(leaders.clone()).expect("unique participants");
-        let mut rng = StdRng::seed_from_u64(seed);
-        let (output, shares) =
-            deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants.clone())
-                .expect("threshold deal");
-        let polynomial = output.public().clone();
-        let schemes = private_keys
-            .iter()
-            .map(|key| {
-                let share = shares.get_value(&key.public_key()).expect("share").clone();
-                Scheme::signer(
-                    CONSENSUS_NAMESPACE,
-                    participants.clone(),
-                    polynomial.clone(),
-                    share,
-                )
-                .expect("scheme")
-            })
-            .collect::<Vec<_>>();
-        let assembler = Scheme::verifier(CONSENSUS_NAMESPACE, participants, polynomial);
-        let info = ConsensusInfo {
-            validators: leaders
-                .iter()
-                .map(|public_key| hex::encode(public_key.encode()))
-                .collect(),
-            threshold_identity: assembler.identity().encode().to_vec(),
-        };
-        let verifier = ConsensusVerifier::new(&info).expect("verifier");
-        ConsensusFixture {
-            schemes,
-            assembler,
-            verifier,
-            leaders,
-        }
-    }
 
     async fn genesis(
         context: deterministic::Context,
@@ -575,17 +517,6 @@ mod tests {
             parent.sync_target(),
             Vec::new(),
         )
-    }
-
-    fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> Finalization {
-        let context = block.context();
-        let proposal = Proposal::new(context.round, context.parent.0, block.digest());
-        let votes = fixture
-            .schemes
-            .iter()
-            .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("finalize vote"))
-            .collect::<Vec<_>>();
-        Finalization::from_finalizes(&fixture.assembler, &votes, &Sequential).expect("finalization")
     }
 
     async fn setup(

@@ -5,10 +5,8 @@
 #![allow(clippy::indexing_slicing)]
 
 use hellas_kernel::{
-    Decode, Encode, WebAuthnAssertion, WebAuthnError,
-    test_support::{
-        SoftPasskey, negative_assertions, valid_mutual_close_assertion, valid_open_assertion,
-    },
+    Decode, Encode, SoftPasskey, WebAuthnAssertion, WebAuthnError,
+    test_support::{negative_assertions, valid_mutual_close_assertion, valid_open_assertion},
     verify_webauthn_assertion,
 };
 

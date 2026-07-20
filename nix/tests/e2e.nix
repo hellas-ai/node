@@ -12,6 +12,9 @@ let
   gatewayPort = 8080;
   chainRpcPort = 31246;
   chainOwner = "wic3EQ9UxhwPSctsVsqdK9fpqivx6bMLpZZEyVD3MYeH";
+  chainSettlementMaker = "21tzoXVq7aGx61bNRTPDVn9hJhszdDA4CPcp9LYZL8ffT";
+  chainSettlementTaker = "236h7pukvqi6u8ADu53erbWyLYXNyNEuB9BRNMXtVKUfZ";
+  chainSettlementNative = "jesTu2BpszP8DKSoi1R5G6ggjHrsrVnboLdx6V47vkoR";
 
   responsesMock = pkgs.writeText "responses-mock.py" ''
     import json
@@ -118,6 +121,111 @@ let
       hellasPackage
     ];
   };
+
+  chainValidatorFollowerPrelude =
+    {
+      homePrefix,
+      validatorLog,
+      followerLog,
+      allocations,
+      validatorSeed,
+      startPort,
+      metricsPort,
+      followerPartitionPrefix,
+    }:
+    let
+      allocationArgs = lib.concatMapStringsSep " " (
+        allocation: "--genesis-allocation ${allocation}"
+      ) allocations;
+    in
+    ''
+      import time
+
+      cli = "${validatorPackage}/bin/hellas-cli"
+      rpc = "ws://127.0.0.1:${toString chainRpcPort}"
+      home = "HOME=${homePrefix}/client-home"
+      validator_log = "${validatorLog}"
+      follower_log = "${followerLog}"
+
+      def parse_fields(output):
+          fields = {}
+          for line in output.splitlines():
+              parts = line.split(" ", 1)
+              if len(parts) == 2:
+                  fields[parts[0]] = parts[1]
+          return fields
+
+      def latest_block():
+          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} latest-block")
+          fields = parse_fields(output)
+          assert "height" in fields and int(fields["height"]) > 0, output
+          assert "payload" in fields, output
+          return fields
+
+      def follower_height():
+          output = machine.succeed(f"cat {follower_log} || true")
+          heights = []
+          for line in output.splitlines():
+              parts = line.split()
+              if len(parts) == 3 and parts[0] == "height" and parts[2] in ["Applied", "Duplicate"]:
+                  heights.append(int(parts[1]))
+          return max(heights) if heights else 0
+
+      def follower_activity_events():
+          output = machine.succeed(f"cat {follower_log} || true")
+          return sum(1 for line in output.splitlines() if line.startswith("activity finalization "))
+
+      def wait_for_follower_stream_ready():
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              output = machine.succeed(f"cat {follower_log} || true")
+              if "activity stream subscribed" in output:
+                  return
+              time.sleep(1)
+          follower = machine.succeed(f"cat {follower_log} || true")
+          validator = machine.succeed(f"cat {validator_log} || true")
+          raise Exception(
+              f"follower did not subscribe to activity stream\n"
+              f"follower:\n{follower}\nvalidator:\n{validator}"
+          )
+
+      start_all()
+      machine.succeed(
+          "mkdir -p ${homePrefix}/validator-home ${homePrefix}/client-home "
+          "${homePrefix}/follower-home ${homePrefix}/follower-store"
+      )
+      machine.succeed(
+          f"HOME=${homePrefix}/validator-home {cli} chain validator config "
+          "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
+          "--ws-bind 127.0.0.1:${toString chainRpcPort} "
+          "--metrics-port ${toString metricsPort} ${allocationArgs} "
+          "> ${homePrefix}/validator.toml"
+      )
+      machine.succeed(
+          f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
+      )
+      machine.succeed(
+          f"HOME=${homePrefix}/validator-home RUST_LOG=info {cli} chain validator run "
+          f"--config ${homePrefix}/validator.toml "
+          f"> {validator_log} 2>&1 & echo $! > ${homePrefix}/validator.pid"
+      )
+      try:
+          machine.wait_for_open_port(${toString chainRpcPort})
+      except Exception:
+          print(machine.succeed(f"cat {validator_log} || true"))
+          raise
+      machine.succeed(
+          f"HOME=${homePrefix}/follower-home RUST_LOG=info {cli} chain indexer follow "
+          f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
+          "--partition-prefix ${followerPartitionPrefix} "
+          f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
+      )
+      machine.wait_until_succeeds(
+          f"{home} {cli} chain query --rpc {rpc} latest-block "
+          f"> ${homePrefix}/latest.log && grep -Eq '^height [1-9][0-9]*$' ${homePrefix}/latest.log"
+      )
+      wait_for_follower_stream_ready()
+    '';
 in
 {
   discovery-monitor = pkgs.testers.runNixOSTest {
@@ -211,50 +319,17 @@ in
       ];
     };
     testScript = ''
-      import time
-
-      cli = "${validatorPackage}/bin/hellas-cli"
-      rpc = "ws://127.0.0.1:${toString chainRpcPort}"
+      ${chainValidatorFollowerPrelude {
+        homePrefix = "/tmp/chain-e2e";
+        validatorLog = "/tmp/chain-e2e/validator.log";
+        followerLog = "/tmp/chain-e2e/follower.log";
+        allocations = [ "${chainOwner}:424242" ];
+        validatorSeed = 7;
+        startPort = 31200;
+        metricsPort = 39200;
+        followerPartitionPrefix = "chain-e2e-follower";
+      }}
       owner = "${chainOwner}"
-
-      def parse_fields(output):
-          fields = {}
-          for line in output.splitlines():
-              parts = line.split(" ", 1)
-              if len(parts) == 2:
-                  fields[parts[0]] = parts[1]
-          return fields
-
-      def latest_block():
-          output = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} latest-block")
-          fields = parse_fields(output)
-          assert "height" in fields and int(fields["height"]) > 0, output
-          assert "payload" in fields, output
-          return fields
-
-      def follower_height():
-          output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
-          heights = []
-          for line in output.splitlines():
-              parts = line.split()
-              if len(parts) == 3 and parts[0] == "height" and parts[2] in ["Applied", "Duplicate"]:
-                  heights.append(int(parts[1]))
-          return max(heights) if heights else 0
-
-      def follower_activity_events():
-          output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
-          return sum(1 for line in output.splitlines() if line.startswith("activity finalization "))
-
-      def wait_for_follower_stream_ready():
-          deadline = time.time() + 60
-          while time.time() < deadline:
-              output = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
-              if "activity stream subscribed" in output:
-                  return
-              time.sleep(1)
-          follower = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
-          validator = machine.succeed("cat /tmp/chain-e2e/validator.log || true")
-          raise Exception(f"follower did not subscribe to activity stream\nfollower:\n{follower}\nvalidator:\n{validator}")
 
       def wait_for_follower_stream(baseline, baseline_events):
           deadline = time.time() + 60
@@ -265,39 +340,10 @@ in
               if remote > baseline and local > baseline and events > baseline_events:
                   return local
               time.sleep(1)
-          follower = machine.succeed("cat /tmp/chain-e2e/follower.log || true")
-          validator = machine.succeed("cat /tmp/chain-e2e/validator.log || true")
+          follower = machine.succeed(f"cat {follower_log} || true")
+          validator = machine.succeed(f"cat {validator_log} || true")
           raise Exception(f"follower did not advance past {baseline}: remote={remote} local={local} events={events}\nfollower:\n{follower}\nvalidator:\n{validator}")
 
-      start_all()
-
-      machine.succeed("mkdir -p /tmp/chain-e2e/validator-home /tmp/chain-e2e/client-home /tmp/chain-e2e/follower-home /tmp/chain-e2e/follower-store")
-      machine.succeed(
-          f"HOME=/tmp/chain-e2e/validator-home {cli} chain validator config "
-          "-n 1 --seed 7 --start-port 31200 "
-          "--ws-bind 127.0.0.1:${toString chainRpcPort} "
-          "--metrics-port 39200 "
-          f"--genesis-allocation {owner}:424242 "
-          "> /tmp/chain-e2e/validator.toml"
-      )
-      machine.succeed(f"{cli} chain validator check-config --config /tmp/chain-e2e/validator.toml | grep -Fx ok")
-      machine.succeed(
-          f"HOME=/tmp/chain-e2e/validator-home RUST_LOG=info {cli} chain validator run "
-          "--config /tmp/chain-e2e/validator.toml "
-          "> /tmp/chain-e2e/validator.log 2>&1 & echo $! > /tmp/chain-e2e/validator.pid"
-      )
-      machine.wait_for_open_port(${toString chainRpcPort})
-      machine.succeed(
-          f"HOME=/tmp/chain-e2e/follower-home RUST_LOG=info {cli} chain indexer follow "
-          f"--rpc {rpc} --storage-dir /tmp/chain-e2e/follower-store "
-          "--partition-prefix chain-e2e-follower "
-          "> /tmp/chain-e2e/follower.log 2>&1 & echo $! > /tmp/chain-e2e/follower.pid"
-      )
-      machine.wait_until_succeeds(
-          f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} latest-block "
-          "> /tmp/chain-e2e/latest.log && grep -Eq '^height [1-9][0-9]*$' /tmp/chain-e2e/latest.log"
-      )
-      wait_for_follower_stream_ready()
       baseline = follower_height()
       baseline_events = follower_activity_events()
       advanced = wait_for_follower_stream(baseline, baseline_events)
@@ -307,26 +353,226 @@ in
       height = int(latest["height"])
       payload = latest["payload"]
 
-      by_height = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalized-block --height {height}")
+      by_height = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalized-block --height {height}")
       assert f"height {height}" in by_height.splitlines(), by_height
       assert f"payload {payload}" in by_height.splitlines(), by_height
       assert any(line.startswith("block ") for line in by_height.splitlines()), by_height
 
-      by_payload = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalized-block --payload {payload}")
+      by_payload = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalized-block --payload {payload}")
       assert f"height {height}" in by_payload.splitlines(), by_payload
       assert f"payload {payload}" in by_payload.splitlines(), by_payload
 
-      finalization = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} finalization --payload {payload}").strip()
+      finalization = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalization --payload {payload}").strip()
       assert len(finalization) > 64 and all(c in "0123456789abcdef" for c in finalization), finalization
 
-      validators = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} validators")
+      validators = machine.succeed(f"{home} {cli} chain query --rpc {rpc} validators")
       assert validators.strip(), validators
 
-      coins = machine.succeed(f"HOME=/tmp/chain-e2e/client-home {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
+      coins = machine.succeed(f"{home} {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
       coin_lines = [line for line in coins.splitlines() if line.endswith(" 424242")]
       assert len(coin_lines) == 1, coins
 
       machine.succeed("kill $(cat /tmp/chain-e2e/follower.pid) $(cat /tmp/chain-e2e/validator.pid)")
+    '';
+  };
+
+  chain-edge-settlement = pkgs.testers.runNixOSTest {
+    name = "hellas-chain-edge-settlement";
+    nodes.machine = _: {
+      config = lib.mkMerge [
+        (mkBaseNode validatorPackage)
+        {
+          virtualisation.cores = 2;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+    testScript = ''
+      ${chainValidatorFollowerPrelude {
+        homePrefix = "/tmp/chain-settlement";
+        validatorLog = "/tmp/chain-settlement/validator.log";
+        followerLog = "/tmp/chain-settlement/follower.log";
+        allocations = [
+          "${chainSettlementMaker}:100"
+          "${chainSettlementTaker}:100"
+        ];
+        validatorSeed = 17;
+        startPort = 31300;
+        metricsPort = 39300;
+        followerPartitionPrefix = "chain-settlement-follower";
+      }}
+      import re
+
+      maker = "${chainSettlementMaker}"
+      taker = "${chainSettlementTaker}"
+      native = "${chainSettlementNative}"
+
+      def coin_map(owner):
+          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
+          coins = {}
+          for line in output.splitlines():
+              parts = line.split()
+              if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{64}", parts[0]) and parts[1].isdigit():
+                  coins[parts[0]] = int(parts[1])
+          return coins, output
+
+      def wait_coin(owner, value):
+          deadline = time.time() + 90
+          while time.time() < deadline:
+              coins, output = coin_map(owner)
+              matches = [object_id for object_id, amount in coins.items() if amount == value]
+              if len(matches) == 1:
+                  return matches[0]
+              time.sleep(1)
+          raise Exception(f"owner {owner} did not acquire one {value}-value coin:\n{output}")
+
+      def edge_output(edge_id):
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              payload = latest_block()["payload"]
+              status, output = machine.execute(
+                  f"{home} {cli} chain query --rpc {rpc} edge --object-id {edge_id} --payload {payload}"
+              )
+              if status == 0:
+                  return output
+              time.sleep(1)
+          raise Exception(f"edge query did not reach an indexed snapshot:\n{output}")
+
+      def wait_edge(edge_id, present):
+          try:
+              deadline = time.time() + 90
+              while time.time() < deadline:
+                  output = edge_output(edge_id)
+                  found = any(line.startswith("value ") for line in output.splitlines())
+                  absent = "none" in output.splitlines()
+                  if (present and found) or (not present and absent):
+                      return int(latest_block()["height"])
+                  time.sleep(1)
+              raise Exception(f"edge {edge_id} presence did not become {present}:\n{output}")
+          except Exception as err:
+              validator = machine.succeed(f"tail -200 {validator_log} || true")
+              raise Exception(
+                  f"wait_edge({edge_id}, {present}) failed: {err}\nvalidator:\n{validator}"
+              ) from err
+
+      def follower_progress():
+          return follower_height(), follower_activity_events()
+
+      def wait_follower(baseline):
+          deadline = time.time() + 90
+          while time.time() < deadline:
+              height = follower_height()
+              events = follower_activity_events()
+              if height > baseline[0] and events > baseline[1]:
+                  return
+              time.sleep(1)
+          follower = machine.succeed(f"cat {follower_log} || true")
+          validator = machine.succeed(f"cat {validator_log} || true")
+          raise Exception(
+              f"follower did not advance after transition from height {baseline[0]} "
+              f"and {baseline[1]} activity events\n"
+              f"follower:\n{follower}\nvalidator:\n{validator}"
+          )
+
+      machine.succeed(
+          "printf '0000000000000000000000000000000000000000000000000000000000000001\\n' "
+          "> /tmp/chain-settlement/maker.key"
+      )
+      machine.succeed(
+          "printf '0000000000000000000000000000000000000000000000000000000000000002\\n' "
+          "> /tmp/chain-settlement/taker.key"
+      )
+      machine.succeed(
+          "printf '0000000000000000000000000000000000000000000000000000000000000001\\n' "
+          "> /tmp/chain-settlement/native.key"
+      )
+      # Scenario A: two genesis P-256 owners open with WebAuthn and mutually close.
+      maker_genesis = wait_coin(maker, 100)
+      taker_genesis = wait_coin(taker, 100)
+      height = int(latest_block()["height"])
+      baseline = follower_progress()
+      opened = machine.succeed(
+          f"{home} {cli} chain open --rpc {rpc} "
+          "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
+          "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
+          f"--maker-funding {maker_genesis} --taker-funding {taker_genesis} "
+          f"--protocol 1 --timeout {height + 1000000} "
+          f"--timeout-payout {maker}:100 --timeout-payout {taker}:100"
+      )
+      edge_a = parse_fields(opened)["edge_id"]
+      wait_edge(edge_a, True)
+      wait_follower(baseline)
+      edge_state = edge_output(edge_a)
+      assert f"maker {maker}" in edge_state.splitlines(), edge_state
+      assert f"taker {taker}" in edge_state.splitlines(), edge_state
+
+      baseline = follower_progress()
+      machine.succeed(
+          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
+          f"--payout {maker}:80 --payout {taker}:70 --payout {native}:50 "
+          "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
+          "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
+      )
+      wait_edge(edge_a, False)
+      wait_follower(baseline)
+      maker_coin = wait_coin(maker, 80)
+      assert wait_coin(taker, 70)
+      native_coin = wait_coin(native, 50)
+
+      # Scenario B: the untagged k1 payout funds an all-native edge and close.
+      height = int(latest_block()["height"])
+      baseline = follower_progress()
+      opened = machine.succeed(
+          f"{home} {cli} chain open --rpc {rpc} "
+          "--maker-key /tmp/chain-settlement/native.key --maker-auth native "
+          "--taker-key /tmp/chain-settlement/native.key --taker-auth native "
+          f"--maker-funding {native_coin} --protocol 2 --timeout {height + 1000000} "
+          f"--timeout-payout {native}:50"
+      )
+      edge_b = parse_fields(opened)["edge_id"]
+      wait_edge(edge_b, True)
+      wait_follower(baseline)
+
+      baseline = follower_progress()
+      machine.succeed(
+          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_b} --kind mutual "
+          f"--payout {native}:50 "
+          "--maker-key /tmp/chain-settlement/native.key --maker-auth native "
+          "--taker-key /tmp/chain-settlement/native.key --taker-auth native"
+      )
+      wait_edge(edge_b, False)
+      wait_follower(baseline)
+      assert wait_coin(native, 50)
+
+      # Scenario C: canonical Terms are persisted at Open and revealed at timeout.
+      height = int(latest_block()["height"])
+      timeout = height + 2000
+      baseline = follower_progress()
+      opened = machine.succeed(
+          f"{home} {cli} chain open --rpc {rpc} "
+          "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
+          "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
+          f"--maker-funding {maker_coin} --protocol 3 --timeout {timeout} "
+          f"--timeout-payout {maker}:80 --terms-out /tmp/chain-settlement/timeout.terms"
+      )
+      edge_c = parse_fields(opened)["edge_id"]
+      wait_edge(edge_c, True)
+      wait_follower(baseline)
+      while int(latest_block()["height"]) < timeout:
+          time.sleep(1)
+
+      baseline = follower_progress()
+      machine.succeed(
+          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_c} --kind timeout "
+          f"--payout {maker}:80 --terms-file /tmp/chain-settlement/timeout.terms"
+      )
+      wait_edge(edge_c, False)
+      wait_follower(baseline)
+      assert wait_coin(maker, 80)
+
+      machine.succeed(
+          "kill $(cat /tmp/chain-settlement/follower.pid) $(cat /tmp/chain-settlement/validator.pid)"
+      )
     '';
   };
 }

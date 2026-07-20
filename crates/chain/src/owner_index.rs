@@ -535,7 +535,7 @@ mod tests {
     use commonware_cryptography::{Digest as _, Signer as _};
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::non_empty_range;
-    use hellas_kernel::test_support::SoftPasskey;
+    use hellas_kernel::SoftPasskey;
     use hellas_kernel::{
         Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, Terms, Tx,
     };
