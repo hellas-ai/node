@@ -12,7 +12,7 @@ use crate::{
         Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
         encode_envelope, tag,
     },
-    consts::MAX_WEBAUTHN_DATA_LENGTH,
+    consts::{MAX_WEBAUTHN_DATA_LENGTH, P256_COORDINATE_LENGTH},
     list::List,
     primitive::Sig,
 };
@@ -23,14 +23,13 @@ pub type WebAuthnData = List<u8, MAX_WEBAUTHN_DATA_LENGTH>;
 
 const NATIVE_TAG: u8 = 0;
 const WEBAUTHN_TAG: u8 = 1;
-const P256_COORDINATE_LENGTH: usize = 32;
 
-/// `WebAuthn` assertion used to authorize one edge open.
+/// `WebAuthn` assertion used to authorize one canonical kernel payload.
 ///
 /// The assertion carries the P-256 signature components, the P-256 public key
 /// coordinates, and the raw `WebAuthn` bytes signed by the authenticator. The
 /// kernel verifier expects `clientDataJSON.challenge` to equal the base64url
-/// encoding of the canonical open hash.
+/// encoding of the canonical open or mutual-close payload hash.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct WebAuthnAssertion {
     r: [u8; P256_COORDINATE_LENGTH],
@@ -41,7 +40,7 @@ pub struct WebAuthnAssertion {
 }
 
 impl WebAuthnAssertion {
-    /// Creates a `WebAuthn` open assertion from canonical components.
+    /// Creates a `WebAuthn` authorization assertion from canonical components.
     #[must_use]
     pub const fn new(
         r: [u8; P256_COORDINATE_LENGTH],

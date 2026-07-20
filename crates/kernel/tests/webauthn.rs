@@ -1,6 +1,6 @@
-//! Kernel-level `WebAuthn` open authorization tests.
+//! Kernel-level `WebAuthn` authorization tests.
 
-#![cfg(feature = "webauthn")]
+#![cfg(feature = "test-support")]
 #![allow(clippy::alloc_instead_of_core)]
 #![allow(clippy::disallowed_types)]
 #![allow(clippy::expect_used)]
@@ -12,12 +12,10 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason,
-    Key, List, MAX_EDGE_OUTPUTS, MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash, Payout,
-    ProtocolCode, Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Terms, Tx,
-    WebAuthnAssertion, WebAuthnData, p256_key, verify_webauthn_assertion,
+    Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, ProtocolCode, Seal,
+    SealPublicInputs, SealVerifier, Sig, SigVerifier, Terms, Tx, test_support::SoftPasskey,
+    verify_webauthn_assertion,
 };
-use p256::ecdsa::{Signature as P256Signature, SigningKey, signature::hazmat::PrehashSigner};
-use sha2::{Digest, Sha256};
 use support::{FixedStore, coin_id, list, state};
 
 const CONTEXT: Context = Context::new(
@@ -53,8 +51,8 @@ impl SealVerifier for MixedVerifier {
     }
 }
 
-fn keypair(seed: u8) -> SigningKey {
-    SigningKey::from_slice(&[seed; 32]).expect("seed is a valid P-256 scalar")
+fn keypair(seed: u8) -> SoftPasskey {
+    SoftPasskey::from_secret_scalar([seed; 32]).expect("seed is a valid P-256 scalar")
 }
 
 fn make_terms(maker: Key, protocol: u8) -> Terms {
@@ -67,66 +65,14 @@ fn funding() -> Funding {
     Funding::new(list(&[MAKER_COIN]), list(&[TAKER_COIN]))
 }
 
-fn sign_webauthn(
-    signing_key: &SigningKey,
-    hash: PayloadHash,
-    origin: &str,
-) -> (WebAuthnAssertion, Key) {
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-    let mut pub_key_x = [0_u8; PayloadHash::LENGTH];
-    let mut pub_key_y = [0_u8; PayloadHash::LENGTH];
-    pub_key_x.copy_from_slice(point.x().expect("P-256 point has x-coordinate"));
-    pub_key_y.copy_from_slice(point.y().expect("P-256 point has y-coordinate"));
-    let key = p256_key(&pub_key_x, &pub_key_y).expect("valid P-256 key");
-
-    let mut authenticator_data = [0_u8; 37];
-    authenticator_data[0..32].copy_from_slice(&[0xaa; 32]);
-    authenticator_data[32] = 0x01;
-
-    let challenge = base64url_32(hash.as_bytes());
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"{origin}","crossOrigin":false}}"#
-    );
-
-    let client_data_hash = Sha256::digest(client_data_json.as_bytes());
-    let mut hasher = Sha256::new();
-    hasher.update(authenticator_data);
-    hasher.update(client_data_hash);
-    let message_hash = hasher.finalize();
-
-    let signature: P256Signature = signing_key
-        .sign_prehash(&message_hash)
-        .expect("P-256 prehash signing succeeds");
-    let signature = signature.normalize_s().unwrap_or(signature);
-    let sig_bytes = signature.to_bytes();
-    let mut r = [0_u8; PayloadHash::LENGTH];
-    let mut s = [0_u8; PayloadHash::LENGTH];
-    r.copy_from_slice(&sig_bytes[..PayloadHash::LENGTH]);
-    s.copy_from_slice(&sig_bytes[PayloadHash::LENGTH..]);
-
-    let mut data = [0_u8; MAX_WEBAUTHN_DATA_LENGTH];
-    data[..authenticator_data.len()].copy_from_slice(&authenticator_data);
-    let client_data = client_data_json.as_bytes();
-    let len = authenticator_data.len() + client_data.len();
-    data[authenticator_data.len()..len].copy_from_slice(client_data);
-    let webauthn_data: WebAuthnData =
-        List::new(data, len).expect("test WebAuthn payload fits kernel bound");
-
-    (
-        WebAuthnAssertion::new(r, s, pub_key_x, pub_key_y, webauthn_data),
-        key,
-    )
-}
-
 #[test]
 fn webauthn_open_auth_is_checked_in_kernel() {
     let maker_sk = keypair(1);
-    let maker_key = p256_key_from_signing_key(&maker_sk);
+    let maker_key = maker_sk.party_key();
     let funding = funding();
     let terms = make_terms(maker_key, 1);
     let hash = Tx::open_hash(&funding, &terms);
-    let (maker_assertion, _) = sign_webauthn(&maker_sk, hash, "https://not-hellas.invalid");
+    let maker_assertion = maker_sk.sign(hash).expect("fixture signing succeeds");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(
@@ -156,13 +102,13 @@ fn webauthn_open_auth_is_checked_in_kernel() {
 #[test]
 fn webauthn_open_rejects_wrong_challenge() {
     let maker_sk = keypair(1);
-    let maker_key = p256_key_from_signing_key(&maker_sk);
+    let maker_key = maker_sk.party_key();
     let funding = funding();
     let terms = make_terms(maker_key, 1);
     let wrong_terms = make_terms(maker_key, 2);
     let hash = Tx::open_hash(&funding, &terms);
     let wrong_hash = Tx::open_hash(&funding, &wrong_terms);
-    let (maker_assertion, _) = sign_webauthn(&maker_sk, wrong_hash, "https://example.invalid");
+    let maker_assertion = maker_sk.sign(wrong_hash).expect("fixture signing succeeds");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(
@@ -192,12 +138,12 @@ fn webauthn_open_rejects_wrong_challenge() {
 fn webauthn_open_rejects_assertion_from_wrong_party_key() {
     let maker_sk = keypair(1);
     let wrong_sk = keypair(9);
-    let maker_key = p256_key_from_signing_key(&maker_sk);
+    let maker_key = maker_sk.party_key();
     let funding = funding();
     let terms = make_terms(maker_key, 1);
     let hash = Tx::open_hash(&funding, &terms);
-    let (maker_assertion, assertion_key) =
-        sign_webauthn(&wrong_sk, hash, "https://wallet.example.invalid");
+    let maker_assertion = wrong_sk.sign(hash).expect("fixture signing succeeds");
+    let assertion_key = wrong_sk.party_key();
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = Tx::open(
@@ -251,7 +197,7 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
 
     let (maker_sk, maker_key) = secp_keypair(3);
     let taker_sk = keypair(4);
-    let taker_key = p256_key_from_signing_key(&taker_sk);
+    let taker_key = taker_sk.party_key();
     let funding = funding();
     let outputs = support::payouts(&[(maker_key, 7), (taker_key, 8)]);
     let terms = Terms::basic(
@@ -262,8 +208,8 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     );
     let terms_hash = terms.hash();
     let open_hash = Tx::open_hash(&funding, &terms);
-    let (taker_assertion, assertion_key) =
-        sign_webauthn(&taker_sk, open_hash, "https://wallet.example.invalid");
+    let taker_assertion = taker_sk.sign(open_hash).expect("fixture signing succeeds");
+    let assertion_key = taker_sk.party_key();
     let edge = Tx::edge_id_of(&funding, &terms);
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
@@ -292,8 +238,7 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     );
 
     let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
-    let (taker_close_assertion, _) =
-        sign_webauthn(&taker_sk, close_hash, "https://wallet.example.invalid");
+    let taker_close_assertion = taker_sk.sign(close_hash).expect("fixture signing succeeds");
     let close = Tx::close(
         edge,
         Proof::mutual(
@@ -321,34 +266,4 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
             .map(hellas_kernel::Coin::value),
         Some(8),
     );
-}
-
-fn p256_key_from_signing_key(signing_key: &SigningKey) -> Key {
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-    let mut pub_key_x = [0_u8; PayloadHash::LENGTH];
-    let mut pub_key_y = [0_u8; PayloadHash::LENGTH];
-    pub_key_x.copy_from_slice(point.x().expect("P-256 point has x-coordinate"));
-    pub_key_y.copy_from_slice(point.y().expect("P-256 point has y-coordinate"));
-    p256_key(&pub_key_x, &pub_key_y).expect("valid P-256 key")
-}
-
-fn base64url_32(input: &[u8; PayloadHash::LENGTH]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(43);
-    let mut i = 0;
-    while i + 3 <= input.len() {
-        let bits =
-            (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
-        out.push(char::from(TABLE[((bits >> 18) & 0x3f) as usize]));
-        out.push(char::from(TABLE[((bits >> 12) & 0x3f) as usize]));
-        out.push(char::from(TABLE[((bits >> 6) & 0x3f) as usize]));
-        out.push(char::from(TABLE[(bits & 0x3f) as usize]));
-        i += 3;
-    }
-    let bits = (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8);
-    out.push(char::from(TABLE[((bits >> 18) & 0x3f) as usize]));
-    out.push(char::from(TABLE[((bits >> 12) & 0x3f) as usize]));
-    out.push(char::from(TABLE[((bits >> 6) & 0x3f) as usize]));
-    out
 }

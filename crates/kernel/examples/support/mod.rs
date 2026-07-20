@@ -10,13 +10,6 @@ use hellas_kernel::{
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
-#[cfg(feature = "webauthn")]
-use hellas_kernel::{MAX_WEBAUTHN_DATA_LENGTH, WebAuthnAssertion, WebAuthnData, p256_key};
-#[cfg(feature = "webauthn")]
-use p256::ecdsa::{Signature as P256Signature, SigningKey, signature::hazmat::PrehashSigner};
-#[cfg(feature = "webauthn")]
-use sha2::{Digest, Sha256};
-
 #[derive(Debug, Default)]
 pub(crate) struct MemStore {
     coins: BTreeMap<CoinId, Coin>,
@@ -143,91 +136,6 @@ pub(crate) fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
     let message = Message::from_digest(hash.to_bytes());
     let signature = secp.sign_ecdsa(message, secret);
     Sig::from_bytes(signature.serialize_compact())
-}
-
-#[cfg(feature = "webauthn")]
-pub(crate) fn p256_signing_key(seed: u8) -> SigningKey {
-    SigningKey::from_slice(&[seed; 32]).expect("seed is a valid P-256 scalar")
-}
-
-#[cfg(feature = "webauthn")]
-pub(crate) fn p256_public_key(signing_key: &SigningKey) -> (Key, [u8; 32], [u8; 32]) {
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-    let mut pub_key_x = [0_u8; PayloadHash::LENGTH];
-    let mut pub_key_y = [0_u8; PayloadHash::LENGTH];
-    pub_key_x.copy_from_slice(point.x().expect("P-256 point has x-coordinate"));
-    pub_key_y.copy_from_slice(point.y().expect("P-256 point has y-coordinate"));
-    let key = p256_key(&pub_key_x, &pub_key_y).expect("valid P-256 key");
-    (key, pub_key_x, pub_key_y)
-}
-
-#[cfg(feature = "webauthn")]
-pub(crate) fn webauthn_assertion(
-    signing_key: &SigningKey,
-    hash: PayloadHash,
-    origin: &str,
-) -> (WebAuthnAssertion, Key) {
-    let (key, pub_key_x, pub_key_y) = p256_public_key(signing_key);
-
-    let mut authenticator_data = [0_u8; 37];
-    authenticator_data[0..32].copy_from_slice(&[0xaa; 32]);
-    authenticator_data[32] = 0x01;
-
-    let challenge = base64url_32(hash.as_bytes());
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"{origin}","crossOrigin":false}}"#
-    );
-
-    let client_data_hash = Sha256::digest(client_data_json.as_bytes());
-    let mut hasher = Sha256::new();
-    hasher.update(authenticator_data);
-    hasher.update(client_data_hash);
-    let message_hash = hasher.finalize();
-
-    let signature: P256Signature = signing_key
-        .sign_prehash(&message_hash)
-        .expect("P-256 prehash signing succeeds");
-    let signature = signature.normalize_s().unwrap_or(signature);
-    let sig_bytes = signature.to_bytes();
-    let mut r = [0_u8; PayloadHash::LENGTH];
-    let mut s = [0_u8; PayloadHash::LENGTH];
-    r.copy_from_slice(&sig_bytes[..PayloadHash::LENGTH]);
-    s.copy_from_slice(&sig_bytes[PayloadHash::LENGTH..]);
-
-    let mut data = [0_u8; MAX_WEBAUTHN_DATA_LENGTH];
-    data[..authenticator_data.len()].copy_from_slice(&authenticator_data);
-    let client_data = client_data_json.as_bytes();
-    let len = authenticator_data.len() + client_data.len();
-    data[authenticator_data.len()..len].copy_from_slice(client_data);
-    let webauthn_data: WebAuthnData =
-        List::new(data, len).expect("example WebAuthn payload fits kernel bound");
-
-    (
-        WebAuthnAssertion::new(r, s, pub_key_x, pub_key_y, webauthn_data),
-        key,
-    )
-}
-
-#[cfg(feature = "webauthn")]
-fn base64url_32(input: &[u8; PayloadHash::LENGTH]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(43);
-    let mut i = 0;
-    while i + 3 <= input.len() {
-        let bits =
-            (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
-        out.push(char::from(TABLE[((bits >> 18) & 0x3f) as usize]));
-        out.push(char::from(TABLE[((bits >> 12) & 0x3f) as usize]));
-        out.push(char::from(TABLE[((bits >> 6) & 0x3f) as usize]));
-        out.push(char::from(TABLE[(bits & 0x3f) as usize]));
-        i += 3;
-    }
-    let bits = (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8);
-    out.push(char::from(TABLE[((bits >> 18) & 0x3f) as usize]));
-    out.push(char::from(TABLE[((bits >> 12) & 0x3f) as usize]));
-    out.push(char::from(TABLE[((bits >> 6) & 0x3f) as usize]));
-    out
 }
 
 pub(crate) const fn context(height: u64, hash_byte: u8, fees: Fees) -> Context {

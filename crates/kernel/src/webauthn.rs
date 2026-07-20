@@ -30,9 +30,14 @@ use p256::{
 use sha2::{Digest, Sha256};
 
 use crate::{
+    consts::P256_COORDINATE_LENGTH,
     primitive::{Key, PayloadHash},
     tx::WebAuthnAssertion,
 };
+
+/// Deterministic passkey builders and v1 wire fixtures for integration tests.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 const MIN_AUTH_DATA_LEN: usize = 37;
 const UP: u8 = 0x01;
@@ -47,7 +52,7 @@ const P256_N_HALF: [u8; 32] = [
     0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31, 0x92, 0xa8,
 ];
 
-/// Reason a `WebAuthn` open assertion failed verification.
+/// Reason a `WebAuthn` authorization assertion failed verification.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum WebAuthnError {
     /// `authenticatorData || clientDataJSON` is too short to contain both
@@ -63,7 +68,7 @@ pub enum WebAuthnError {
     InvalidClientDataJson,
     /// `clientDataJSON.type` is not `webauthn.get`.
     InvalidClientDataType,
-    /// `clientDataJSON.challenge` does not match the expected open hash.
+    /// `clientDataJSON.challenge` does not match the expected payload hash.
     InvalidChallenge,
     /// `clientDataJSON` is missing a required top-level field.
     MissingClientDataField,
@@ -111,8 +116,8 @@ pub fn verify_webauthn_assertion(
 /// Returns [`WebAuthnError::InvalidPublicKey`] if the coordinates do not
 /// encode a valid P-256 public key.
 pub fn p256_key(
-    pub_key_x: &[u8; PayloadHash::LENGTH],
-    pub_key_y: &[u8; PayloadHash::LENGTH],
+    pub_key_x: &[u8; P256_COORDINATE_LENGTH],
+    pub_key_y: &[u8; P256_COORDINATE_LENGTH],
 ) -> Result<Key, WebAuthnError> {
     let verifying_key = verifying_key(pub_key_x, pub_key_y)?;
     let encoded = verifying_key.to_encoded_point(true);
@@ -127,13 +132,13 @@ pub fn p256_key(
 }
 
 fn verifying_key(
-    pub_key_x: &[u8; PayloadHash::LENGTH],
-    pub_key_y: &[u8; PayloadHash::LENGTH],
+    pub_key_x: &[u8; P256_COORDINATE_LENGTH],
+    pub_key_y: &[u8; P256_COORDINATE_LENGTH],
 ) -> Result<VerifyingKey, WebAuthnError> {
     let mut encoded = [0_u8; 65];
     let (tag, coords) = encoded.split_at_mut(1);
     tag.fill(0x04);
-    let (xs, ys) = coords.split_at_mut(PayloadHash::LENGTH);
+    let (xs, ys) = coords.split_at_mut(P256_COORDINATE_LENGTH);
     xs.copy_from_slice(pub_key_x);
     ys.copy_from_slice(pub_key_y);
     let point = EncodedPoint::from_bytes(encoded).map_err(|_| WebAuthnError::InvalidPublicKey)?;
@@ -150,7 +155,7 @@ fn verify_p256_signature(
 
     let verifying_key = verifying_key(assertion.pub_key_x(), assertion.pub_key_y())?;
     let mut sig = [0_u8; 64];
-    let (r_half, s_half) = sig.split_at_mut(PayloadHash::LENGTH);
+    let (r_half, s_half) = sig.split_at_mut(P256_COORDINATE_LENGTH);
     r_half.copy_from_slice(assertion.r());
     s_half.copy_from_slice(assertion.s());
     let signature = P256Signature::from_slice(&sig).map_err(|_| WebAuthnError::InvalidSignature)?;
@@ -680,6 +685,7 @@ mod tests {
             Err(WebAuthnError::ExtensionsUnsupported),
         );
         assert!(message_hash_with_flags(UP, GOOD_CLIENT_DATA).is_ok());
+        assert!(message_hash_with_flags(UV, GOOD_CLIENT_DATA).is_ok());
     }
 
     #[test]

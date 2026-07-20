@@ -28,6 +28,9 @@ pub(crate) const ID_LENGTH: usize = HASH_LENGTH;
 /// x-coordinate) used by native secp256k1 keys and passkey P-256 keys.
 pub(crate) const KEY_LENGTH: usize = 33;
 
+/// Length of each P-256 affine coordinate and compact signature scalar.
+pub(crate) const P256_COORDINATE_LENGTH: usize = 32;
+
 /// Length of a compact ECDSA settlement signature: `r ‖ s`, 32 bytes
 /// each, no DER framing.
 pub(crate) const SIG_LENGTH: usize = 64;
@@ -39,7 +42,7 @@ pub(crate) const SIG_LENGTH: usize = 64;
 pub(crate) const SEAL_LENGTH: usize = 32;
 
 /// Maximum bytes of `authenticatorData || clientDataJSON` carried by one
-/// `WebAuthn` open assertion.
+/// `WebAuthn` authorization assertion.
 ///
 /// Mirrors Tempo's 2 KiB bound: large enough for browser-produced
 /// assertion metadata, small enough to keep every kernel transaction
