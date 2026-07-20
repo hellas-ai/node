@@ -11,14 +11,12 @@ documentation.workspace = true
 default = []
 
 node = ["dep:hellas-executor"]
-# HTTP gateway front-end (OpenAI/Anthropic/plain APIs) routing generation
-# over the Hellas network. Needs model assets (tokenizer, prompt/quote
-# building) but no executor backend; `--local` / `--verify-local` execution
-# of gateway traffic additionally requires `evaluate`.
-gateway = ["dep:chatgrad", "dep:hellas-models", "hellas-client/evaluate"]
+# HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
+gateway = ["dep:hellas-gateway"]
 evaluate = [
     "node",
     "gateway",
+    "hellas-gateway/evaluate",
     "hellas-executor/evaluate",
     "dep:chatgrad",
     "dep:hellas-models",
@@ -32,7 +30,7 @@ validator = ["indexer", "hellas-chain/validator"]
 
 # OpenTelemetry / OTLP exporter + iroh-internal metrics. When off, none of the
 # opentelemetry crates compile, the trace context propagation paths in
-# `execution.rs` / `serve/node.rs` collapse to identity, and iroh's metrics
+# `serve/node.rs` collapse to identity, and iroh's metrics
 # module is not built.
 otel = [
     "dep:opentelemetry",
@@ -58,6 +56,7 @@ hellas-adaptors.workspace = true
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
+hellas-gateway = { workspace = true, optional = true }
 hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
@@ -86,7 +85,6 @@ tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true }
-tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true

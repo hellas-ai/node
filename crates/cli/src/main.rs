@@ -11,9 +11,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 mod commands;
-mod execution;
 mod identity;
-#[cfg(any(feature = "node", feature = "gateway"))]
+#[cfg(feature = "node")]
 mod metrics;
 mod tracing_config;
 
@@ -88,7 +87,7 @@ enum GatewayResponsesBackend {
 }
 
 #[cfg(feature = "gateway")]
-impl From<GatewayResponsesBackend> for commands::gateway::ResponsesBackend {
+impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     fn from(value: GatewayResponsesBackend) -> Self {
         match value {
             GatewayResponsesBackend::Hellas => Self::Hellas,
@@ -627,7 +626,7 @@ async fn main() {
             wrap,
             wrap_args,
         } => {
-            commands::gateway::run(commands::gateway::GatewayOptions {
+            hellas_gateway::run(hellas_gateway::GatewayOptions {
                 host,
                 port,
                 node_id,

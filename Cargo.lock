@@ -3389,6 +3389,7 @@ dependencies = [
  "hellas-chain",
  "hellas-client",
  "hellas-executor",
+ "hellas-gateway",
  "hellas-models",
  "hellas-rpc",
  "hellas-wire",
@@ -3410,7 +3411,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
- "tower",
  "tracing",
  "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
@@ -3455,6 +3455,33 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "hellas-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "chatgrad",
+ "futures",
+ "hellas-adaptors",
+ "hellas-client",
+ "hellas-executor",
+ "hellas-models",
+ "hellas-rpc",
+ "hellas-wire",
+ "iroh",
+ "prometheus-client",
+ "reqwest 0.13.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
