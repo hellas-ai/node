@@ -1,12 +1,10 @@
-use crate::domain::{
-    Address, PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
-};
+use crate::domain::{PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant};
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
     Mempool, OwnerIndex, UtxoDb,
     config::{
         Config, ConfigError, GenesisEntry, PeerEntry, ValidatorConfig, encode_private_key,
-        encode_threshold_polynomial, encode_threshold_share,
+        encode_threshold_polynomial, encode_threshold_share, parse_genesis_settlement_key,
     },
     init_block_store, init_finalization_store,
     rpc::LocalLightClient,
@@ -290,9 +288,8 @@ fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
             "genesis allocation must have the form address:balance".to_string(),
         )
     })?;
-    let address = address.parse::<Address>().map_err(|err| {
-        ValidatorError::InvalidSetup(format!("invalid genesis allocation address: {err}"))
-    })?;
+    let address = parse_genesis_settlement_key(address)
+        .map_err(|err| ValidatorError::InvalidSetup(err.to_string()))?;
     let balance = balance.parse::<u64>().map_err(|err| {
         ValidatorError::InvalidSetup(format!("invalid genesis allocation balance: {err}"))
     })?;
@@ -300,6 +297,36 @@ fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
         address: address.to_string(),
         balance,
     })
+}
+
+#[cfg(test)]
+mod genesis_allocation_tests {
+    use super::*;
+    use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+
+    #[test]
+    fn rejects_non_p256_settlement_key() {
+        let key = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
+        let err = match parse_genesis_allocation(&format!("{key}:10")) {
+            Ok(_) => panic!("non-P-256 genesis owner was accepted"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ValidatorError::InvalidSetup(message)
+                if message.contains(&key.to_string()) && message.contains("P-256")
+        ));
+    }
+
+    #[test]
+    fn accepts_p256_settlement_key() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(11));
+        let key = SettlementKey::from(address);
+        let entry =
+            parse_genesis_allocation(&format!("{key}:10")).expect("valid P-256 genesis owner");
+        assert_eq!(entry.address, key.to_string());
+        assert_eq!(entry.balance, 10);
+    }
 }
 
 fn env_non_empty(key: &str) -> Option<String> {

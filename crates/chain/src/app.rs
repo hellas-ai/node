@@ -2,7 +2,7 @@ mod block;
 
 pub use block::HellasBlock;
 
-use crate::domain::{Activity, Address, MAX_TXS_PER_BLOCK, PublicKey, Scheme, Transaction};
+use crate::domain::{Activity, MAX_TXS_PER_BLOCK, PublicKey, Scheme, SettlementKey, Transaction};
 use crate::execution::{
     execute_all, execute_proposal,
     store::{UtxoDatabase, UtxoSyncTarget, empty_state},
@@ -77,7 +77,7 @@ impl Mempool {
 #[derive(Clone)]
 pub struct Application {
     genesis: HellasBlock,
-    genesis_allocations: Arc<Vec<(Address, u64)>>,
+    genesis_allocations: Arc<Vec<(SettlementKey, u64)>>,
     finalized_height: Registered<Gauge>,
     owner_index: OwnerIndex,
 }
@@ -94,7 +94,7 @@ impl Application {
     pub async fn new<E>(
         context: E,
         genesis_leader: PublicKey,
-        genesis_allocations: Vec<(Address, u64)>,
+        genesis_allocations: Vec<(SettlementKey, u64)>,
         partition_prefix: &str,
         config: ApplicationConfig,
     ) -> Self

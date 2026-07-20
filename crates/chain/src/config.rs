@@ -1,5 +1,6 @@
 use crate::domain::{
-    Address as UserAddress, AddressError, PublicKey, ThresholdPolynomial, ThresholdShare,
+    Address as UserAddress, PublicKey, SettlementKey as UserSettlementKey, SettlementKeyError,
+    ThresholdPolynomial, ThresholdShare,
 };
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;
@@ -30,8 +31,14 @@ pub enum ConfigError {
     InvalidAddress(#[from] std::net::AddrParseError),
     #[error("duplicate keys in peer address map")]
     DuplicatePeerAddressKeys,
-    #[error("invalid genesis address: {0}")]
-    InvalidGenesisAddress(#[from] AddressError),
+    #[error("invalid genesis settlement key `{entry}`: {source}")]
+    InvalidGenesisSettlementKey {
+        entry: String,
+        #[source]
+        source: SettlementKeyError,
+    },
+    #[error("genesis settlement key `{entry}` is not a valid P-256 address")]
+    InvalidGenesisP256SettlementKey { entry: String },
     #[error("duplicate addresses in genesis allocations")]
     DuplicateGenesisAddresses,
     #[error("failed to read credential {path}: {source}")]
@@ -216,21 +223,34 @@ impl ValidatorConfig {
         Ok(true)
     }
 
-    pub fn genesis_allocations(&self) -> Result<Vec<(UserAddress, u64)>, ConfigError> {
-        let mut allocations: Vec<(UserAddress, u64)> = self
+    pub fn genesis_allocations(&self) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
+        let mut allocations: Vec<(UserSettlementKey, u64)> = self
             .genesis_allocations
             .iter()
-            .map(|entry| -> Result<(UserAddress, u64), ConfigError> {
-                let address: UserAddress = entry.address.parse()?;
-                Ok((address, entry.balance))
+            .map(|entry| -> Result<(UserSettlementKey, u64), ConfigError> {
+                let key = parse_genesis_settlement_key(&entry.address)?;
+                Ok((key, entry.balance))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        allocations.sort_by_key(|entry| entry.0);
         if allocations.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(ConfigError::DuplicateGenesisAddresses);
         }
         Ok(allocations)
     }
+}
+
+pub(crate) fn parse_genesis_settlement_key(entry: &str) -> Result<UserSettlementKey, ConfigError> {
+    let key = entry
+        .parse()
+        .map_err(|source| ConfigError::InvalidGenesisSettlementKey {
+            entry: entry.to_string(),
+            source,
+        })?;
+    UserAddress::try_from(key).map_err(|_| ConfigError::InvalidGenesisP256SettlementKey {
+        entry: entry.to_string(),
+    })?;
+    Ok(key)
 }
 
 pub fn encode_private_key(key: &ed25519::PrivateKey) -> String {
@@ -243,4 +263,51 @@ pub fn encode_threshold_share(share: &ThresholdShare) -> String {
 
 pub fn encode_threshold_polynomial(polynomial: &ThresholdPolynomial) -> String {
     hex::encode(polynomial.encode())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+
+    fn config_with_genesis(address: String) -> ValidatorConfig {
+        ValidatorConfig {
+            private_key: String::new(),
+            threshold_share: String::new(),
+            threshold_polynomial: String::new(),
+            listen_port: 0,
+            metrics_port: None,
+            ws_bind: None,
+            explorer_url: None,
+            genesis_allocations: vec![GenesisEntry {
+                address,
+                balance: 10,
+            }],
+            peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn genesis_allocations_reject_non_p256_settlement_key() {
+        let entry = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]).to_string();
+        let err = config_with_genesis(entry.clone())
+            .genesis_allocations()
+            .expect_err("non-P-256 genesis owner");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidGenesisP256SettlementKey { entry: actual } if actual == entry
+        ));
+    }
+
+    #[test]
+    fn genesis_allocations_accept_p256_settlement_key() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
+        let key = SettlementKey::from(address);
+        assert_eq!(
+            config_with_genesis(key.to_string())
+                .genesis_allocations()
+                .expect("valid P-256 genesis owner"),
+            vec![(key, 10)]
+        );
+    }
 }

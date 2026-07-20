@@ -583,7 +583,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             .map(|s| !s.send_queue.iter().any(|f| matches!(f, Frame::Body(_))))
             .unwrap_or(false)
     }
-
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use crate::domain::Bounded;
 use crate::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, MAX_MERGE_INPUTS, ObjectId, Transaction,
+    Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
     UserPublicKey, UserSignature, WebAuthnSignature,
 };
 use crate::{
@@ -244,7 +244,7 @@ where
     ) -> impl Future<Output = Result<GetCoinsByOwnerResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
-            let owner = address_from_bytes(request.owner, "owner")?;
+            let owner = settlement_key_from_bytes(request.owner, "owner")?;
             let response = match client
                 .get_coins_by_owner(owner)
                 .await
@@ -324,6 +324,20 @@ fn address_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Address, Wi
                 format!("{field} must be a valid public key"),
             )
         })
+}
+
+fn settlement_key_from_bytes(
+    bytes: Vec<u8>,
+    field: &'static str,
+) -> Result<SettlementKey, WireStatus> {
+    let len = bytes.len();
+    let raw: [u8; SettlementKey::LENGTH] = bytes.try_into().map_err(|_| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!("{field} must be {} bytes, got {len}", SettlementKey::LENGTH),
+        )
+    })?;
+    Ok(SettlementKey::from_bytes(raw))
 }
 
 fn user_signature_from_der(bytes: &[u8]) -> Result<UserSignature, WireStatus> {
@@ -413,7 +427,7 @@ fn merge_from_proto(tx: MergeCoinTx) -> Result<Transaction, WireStatus> {
 fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
     match coin {
         Some(Coin { owner, value }) => GetCoinResponse {
-            owner: Some(owner.public_key().encode().to_vec()),
+            owner: Some(owner.to_bytes().to_vec()),
             value: Some(value),
         },
         None => GetCoinResponse {
@@ -426,6 +440,26 @@ fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
 fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
     GetLatestBlockResponse {
         latest: latest.map(latest_block_to_proto),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_query_accepts_raw_non_p256_settlement_key() {
+        let raw = vec![0xa5; SettlementKey::LENGTH];
+        let key = settlement_key_from_bytes(raw.clone(), "owner").expect("raw settlement key");
+        assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
+        assert!(Address::try_from(key).is_err());
+    }
+
+    #[test]
+    fn owner_query_rejects_wrong_settlement_key_length() {
+        let err = settlement_key_from_bytes(vec![0; SettlementKey::LENGTH - 1], "owner")
+            .expect_err("short settlement key");
+        assert_eq!(err.code(), WireCode::InvalidArgument);
     }
 }
 

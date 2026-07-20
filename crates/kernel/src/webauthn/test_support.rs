@@ -118,7 +118,7 @@ impl SoftPasskey {
     }
 }
 
-/// Named valid WebAuthn v1 fixture.
+/// Named valid `WebAuthn` v1 fixture.
 #[derive(Debug, Clone)]
 pub struct WebAuthnFixture {
     name: &'static str,
@@ -153,7 +153,7 @@ impl WebAuthnFixture {
     }
 }
 
-/// Named invalid WebAuthn v1 fixture with its pinned verifier error.
+/// Named invalid `WebAuthn` v1 fixture with its pinned verifier error.
 #[derive(Debug, Clone)]
 pub struct InvalidWebAuthnFixture {
     name: &'static str,
@@ -233,6 +233,10 @@ pub fn valid_mutual_close_assertion() -> Result<WebAuthnFixture, SoftPasskeyErro
 ///
 /// Returns [`SoftPasskeyError`] if deterministic signing or bounded fixture
 /// assembly fails.
+#[allow(
+    clippy::large_stack_arrays,
+    reason = "the no-alloc fixture API returns one compile-time bounded array"
+)]
 pub fn negative_assertions()
 -> Result<[InvalidWebAuthnFixture; WEBAUTHN_NEGATIVE_FIXTURE_COUNT], SoftPasskeyError> {
     let context = fixture_context()?;
@@ -338,7 +342,7 @@ pub fn negative_assertions()
     ])
 }
 
-fn invalid_fixture(
+const fn invalid_fixture(
     name: &'static str,
     assertion: WebAuthnAssertion,
     party_key: Key,

@@ -1,5 +1,7 @@
 use crate::HellasBlock;
-use crate::domain::{Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id};
+use crate::domain::{
+    Address, Coin, ObjectId, SettlementKey, Transaction, genesis_object_id, output_object_id,
+};
 use commonware_codec::Encode;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
@@ -57,7 +59,7 @@ pub struct OwnerIndex {
 }
 
 impl OwnerIndex {
-    pub fn new(genesis: &HellasBlock, genesis_allocations: Vec<(Address, u64)>) -> Self {
+    pub fn new(genesis: &HellasBlock, genesis_allocations: Vec<(SettlementKey, u64)>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(State::new(genesis, genesis_allocations))),
         }
@@ -88,7 +90,7 @@ impl OwnerIndex {
         (state.cursor, state.coins.get(object_id).cloned())
     }
 
-    pub fn get_coins_by_owner(&self, owner: &Address) -> Vec<(ObjectId, u64)> {
+    pub fn get_coins_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, u64)> {
         self.inner
             .read()
             .expect("owner index lock poisoned")
@@ -100,7 +102,7 @@ impl OwnerIndex {
 
     pub fn get_coins_by_owner_snapshot(
         &self,
-        owner: &Address,
+        owner: &SettlementKey,
     ) -> (OwnerCursor, Vec<(ObjectId, u64)>) {
         let state = self.inner.read().expect("owner index lock poisoned");
         let coins = state
@@ -115,13 +117,13 @@ impl OwnerIndex {
 #[derive(Clone)]
 struct State {
     cursor: OwnerCursor,
-    genesis_allocations: Vec<(Address, u64)>,
+    genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
-    by_owner: BTreeMap<Address, BTreeMap<ObjectId, u64>>,
+    by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
 }
 
 impl State {
-    fn new(genesis: &HellasBlock, genesis_allocations: Vec<(Address, u64)>) -> Self {
+    fn new(genesis: &HellasBlock, genesis_allocations: Vec<(SettlementKey, u64)>) -> Self {
         Self {
             cursor: OwnerCursor {
                 height: genesis.height().get(),
@@ -204,7 +206,8 @@ impl State {
             .get(&input)
             .cloned()
             .ok_or(OwnerIndexError::ObjectNotFound { id: input })?;
-        if !tx.verify_signature(&coin.owner) {
+        let owner = Address::try_from(coin.owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
+        if !tx.verify_signature(&owner) {
             return Err(OwnerIndexError::InvalidSignature);
         }
         if amount == 0 {
@@ -238,7 +241,7 @@ impl State {
         self.insert_coin(
             recipient_id,
             Coin {
-                owner: recipient.clone(),
+                owner: SettlementKey::from(recipient),
                 value: amount,
             },
         )?;
@@ -283,7 +286,7 @@ impl State {
                     return Err(OwnerIndexError::MergeOwnerMismatch);
                 }
             } else {
-                owner = Some(coin.owner.clone());
+                owner = Some(coin.owner);
             }
             total = total
                 .checked_add(coin.value)
@@ -292,7 +295,8 @@ impl State {
         let Some(owner) = owner else {
             return Err(OwnerIndexError::MergeOwnerMismatch);
         };
-        if !tx.verify_signature(&owner) {
+        let address = Address::try_from(owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
+        if !tx.verify_signature(&address) {
             return Err(OwnerIndexError::InvalidSignature);
         }
 
@@ -320,7 +324,7 @@ impl State {
             return Err(OwnerIndexError::OutputCollision { id });
         }
         self.by_owner
-            .entry(coin.owner.clone())
+            .entry(coin.owner)
             .or_default()
             .insert(id, coin.value);
         self.coins.insert(id, coin);
@@ -367,6 +371,10 @@ mod tests {
         Address::from(key(seed).public_key())
     }
 
+    fn settlement(seed: u64) -> SettlementKey {
+        SettlementKey::from(address(seed))
+    }
+
     fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
         let height = parent.height().get() + 1;
         let sync_target = crate::execution::store::UtxoSyncTarget::new(
@@ -405,7 +413,7 @@ mod tests {
     #[test]
     fn indexes_finalized_owner_transitions() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         let input = genesis_object_id(0);
         let tx = Transaction::transfer(&key(1), input, address(2), 40).unwrap();
         let recipient_id = output_object_id(&Sha256::hash(&tx.encode()), 0);
@@ -414,11 +422,11 @@ mod tests {
 
         assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
         assert_eq!(
-            indexer.get_coins_by_owner(&address(2)),
+            indexer.get_coins_by_owner(&settlement(2)),
             vec![(recipient_id, 40)]
         );
         assert_eq!(
-            indexer.get_coins_by_owner(&address(1)),
+            indexer.get_coins_by_owner(&settlement(1)),
             vec![(change_id, 60)]
         );
         assert_eq!(indexer.get_coin(&input), None);
@@ -427,21 +435,21 @@ mod tests {
     #[test]
     fn duplicate_finalized_block_is_idempotent() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         let tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
         let block = block(&genesis, vec![tx]);
 
         assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
-        let before = indexer.get_coins_by_owner(&address(1));
+        let before = indexer.get_coins_by_owner(&settlement(1));
 
         assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Duplicate));
-        assert_eq!(indexer.get_coins_by_owner(&address(1)), before);
+        assert_eq!(indexer.get_coins_by_owner(&settlement(1)), before);
     }
 
     #[test]
     fn rejected_block_does_not_mutate_index() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         let bad_tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 0).unwrap();
         let bad_block = block(&genesis, vec![bad_tx]);
 
@@ -461,9 +469,25 @@ mod tests {
             Ok(ApplyOutcome::Applied)
         );
         assert_eq!(
-            indexer.get_coins_by_owner(&address(2)),
+            indexer.get_coins_by_owner(&settlement(2)),
             vec![(recipient_id, 40)]
         );
+    }
+
+    #[test]
+    fn legacy_transfer_cannot_spend_non_p256_settlement_key() {
+        let genesis = genesis();
+        let invalid_owner = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
+        let indexer = OwnerIndex::new(&genesis, vec![(invalid_owner, 100)]);
+        let tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
+        let block = block(&genesis, vec![tx]);
+
+        assert_eq!(
+            indexer.apply_finalized(&block),
+            Err(OwnerIndexError::InvalidSignature)
+        );
+        assert_eq!(indexer.cursor().height, 0);
+        assert_eq!(indexer.get_coin(&genesis_object_id(0)), None);
     }
 
     #[test]
@@ -475,34 +499,34 @@ mod tests {
         let tx2 = Transaction::transfer(&key(1), change_id, address(3), 25).unwrap();
         let block2 = block(&block1, vec![tx2]);
 
-        let incremental = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let incremental = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         incremental.apply_finalized(&block1).unwrap();
         incremental.apply_finalized(&block2).unwrap();
 
-        let replayed = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let replayed = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         for block in [&block1, &block2] {
             replayed.apply_finalized(block).unwrap();
         }
 
         assert_eq!(replayed.cursor(), incremental.cursor());
         assert_eq!(
-            replayed.get_coins_by_owner(&address(1)),
-            incremental.get_coins_by_owner(&address(1))
+            replayed.get_coins_by_owner(&settlement(1)),
+            incremental.get_coins_by_owner(&settlement(1))
         );
         assert_eq!(
-            replayed.get_coins_by_owner(&address(2)),
-            incremental.get_coins_by_owner(&address(2))
+            replayed.get_coins_by_owner(&settlement(2)),
+            incremental.get_coins_by_owner(&settlement(2))
         );
         assert_eq!(
-            replayed.get_coins_by_owner(&address(3)),
-            incremental.get_coins_by_owner(&address(3))
+            replayed.get_coins_by_owner(&settlement(3)),
+            incremental.get_coins_by_owner(&settlement(3))
         );
     }
 
     #[test]
     fn rejects_parent_mismatch() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(address(1), 100)]);
+        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
         let bad_parent = Sha256::hash(b"bad-parent");
         let sync_target = crate::execution::store::UtxoSyncTarget::new(
             Sha256::hash(b"root-1"),

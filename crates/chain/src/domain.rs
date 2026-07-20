@@ -26,6 +26,10 @@ use commonware_codec::{
 /// Signing helper for domain key types.
 pub use commonware_cryptography::Signer;
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
+use hellas_kernel::{
+    Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode,
+    Key as KernelKey,
+};
 use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256 as Sha2};
@@ -115,6 +119,148 @@ impl Read for Address {
 
     fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self(UserPublicKey::read(buf)?))
+    }
+}
+
+/// Raw compressed settlement key used for stored object ownership.
+///
+/// Unlike [`Address`], this type does not validate a curve. Both compressed
+/// P-256 and compressed secp256k1 keys are 33-byte settlement keys. Legacy
+/// [`Transaction::Transfer`] and [`Transaction::MergeCoin`] verification
+/// explicitly converts a stored key back to [`Address`] and rejects keys that
+/// are not valid P-256 encodings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SettlementKey(KernelKey);
+
+impl SettlementKey {
+    /// Raw encoded key length.
+    pub const LENGTH: usize = KernelKey::LENGTH;
+
+    /// Creates a settlement key without curve validation.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
+        Self(KernelKey::from_bytes(bytes))
+    }
+
+    /// Returns the raw key bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
+        self.0.to_bytes()
+    }
+
+    /// Borrows the raw key bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
+        self.0.as_bytes()
+    }
+
+    /// Returns the kernel settlement key.
+    #[must_use]
+    pub const fn into_kernel(self) -> KernelKey {
+        self.0
+    }
+}
+
+impl From<KernelKey> for SettlementKey {
+    fn from(key: KernelKey) -> Self {
+        Self(key)
+    }
+}
+
+impl From<SettlementKey> for KernelKey {
+    fn from(key: SettlementKey) -> Self {
+        key.0
+    }
+}
+
+impl From<&Address> for SettlementKey {
+    fn from(address: &Address) -> Self {
+        let mut bytes = [0_u8; Self::LENGTH];
+        bytes.copy_from_slice(address.public_key().as_ref());
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<Address> for SettlementKey {
+    fn from(address: Address) -> Self {
+        Self::from(&address)
+    }
+}
+
+impl TryFrom<&SettlementKey> for Address {
+    type Error = AddressError;
+
+    fn try_from(key: &SettlementKey) -> Result<Self, Self::Error> {
+        UserPublicKey::decode(key.as_bytes().as_slice())
+            .map(Self)
+            .map_err(|_| AddressError::InvalidKey)
+    }
+}
+
+impl TryFrom<SettlementKey> for Address {
+    type Error = AddressError;
+
+    fn try_from(key: SettlementKey) -> Result<Self, Self::Error> {
+        Self::try_from(&key)
+    }
+}
+
+impl AsRef<[u8]> for SettlementKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl core::fmt::Display for SettlementKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&bs58::encode(self.as_bytes()).into_string())
+    }
+}
+
+impl core::str::FromStr for SettlementKey {
+    type Err = SettlementKeyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = bs58::decode(s)
+            .into_vec()
+            .map_err(SettlementKeyError::Base58)?;
+        let actual = bytes.len();
+        let bytes: [u8; Self::LENGTH] = bytes
+            .try_into()
+            .map_err(|_| SettlementKeyError::InvalidLength { actual })?;
+        Ok(Self::from_bytes(bytes))
+    }
+}
+
+/// Settlement-key parsing error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SettlementKeyError {
+    /// Invalid base58 encoding.
+    #[error("invalid base58: {0}")]
+    Base58(bs58::decode::Error),
+    /// The decoded key was not exactly 33 bytes.
+    #[error("settlement key must be 33 bytes, got {actual}")]
+    InvalidLength {
+        /// Decoded byte length.
+        actual: usize,
+    },
+}
+
+impl FixedSize for SettlementKey {
+    const SIZE: usize = Self::LENGTH;
+}
+
+impl Write for SettlementKey {
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        buf.put_slice(self.as_bytes());
+    }
+}
+
+impl Read for SettlementKey {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        Ok(Self::from_bytes(<[u8; Self::LENGTH]>::read(buf)?))
     }
 }
 
@@ -410,37 +556,151 @@ pub fn rp_id_hash_from_origin(origin: &str) -> Option<[u8; 32]> {
     lower_host_hash(url.host_str()?)
 }
 
-// --- Coin (gated) ---
+// --- Stored objects (gated) ---
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Chain coin object.
 pub struct Coin {
     /// Coin owner.
-    pub owner: Address,
+    pub owner: SettlementKey,
     /// Coin value.
     pub value: u64,
 }
 
-impl FixedSize for Coin {
-    const SIZE: usize = Address::SIZE + u64::SIZE;
+/// Kind of object stored in the chain's single object namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// Owner-controlled coin.
+    Coin,
+    /// Kernel settlement edge.
+    Edge,
 }
 
-impl Write for Coin {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.owner.write(buf);
-        self.value.write(buf);
+impl core::fmt::Display for ObjectKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Coin => f.write_str("coin"),
+            Self::Edge => f.write_str("edge"),
+        }
     }
 }
 
-impl Read for Coin {
+/// Object stored under a chain object id.
+///
+/// The commonware fixed-size representation is a one-byte kind followed by
+/// the selected kernel canonical payload, then zero padding through the
+/// maximum payload size. There is no independent chain encoding for either
+/// arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Object {
+    /// Coin payload.
+    Coin(Coin),
+    /// Edge payload.
+    Edge(KernelEdge),
+}
+
+impl Object {
+    const COIN_TAG: u8 = 0;
+    const EDGE_TAG: u8 = 1;
+
+    /// Fixed payload area following the one-byte object-kind tag.
+    pub const PAYLOAD_SIZE: usize = if KernelCoin::MAX_ENCODED_SIZE > KernelEdge::MAX_ENCODED_SIZE {
+        KernelCoin::MAX_ENCODED_SIZE
+    } else {
+        KernelEdge::MAX_ENCODED_SIZE
+    };
+
+    /// Returns the stored object's kind.
+    #[must_use]
+    pub const fn kind(&self) -> ObjectKind {
+        match self {
+            Self::Coin(_) => ObjectKind::Coin,
+            Self::Edge(_) => ObjectKind::Edge,
+        }
+    }
+
+    fn write_payload<T: KernelEncode>(value: &T, buf: &mut impl bytes::BufMut) {
+        let mut payload = [0_u8; Self::PAYLOAD_SIZE];
+        let written = value.write_to(&mut payload);
+        debug_assert!(written <= Self::PAYLOAD_SIZE);
+        buf.put_slice(&payload);
+    }
+
+    fn read_payload<T: KernelDecode>(payload: &[u8]) -> Result<T, CodecError> {
+        let (value, consumed) = T::decode(payload)
+            .map_err(|_| CodecError::Invalid("Object", "invalid kernel canonical payload"))?;
+        let padding = payload.get(consumed..).ok_or(CodecError::Invalid(
+            "Object",
+            "invalid kernel decode length",
+        ))?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(CodecError::Invalid(
+                "Object",
+                "non-zero canonical payload padding",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+impl FixedSize for Object {
+    const SIZE: usize = u8::SIZE + Self::PAYLOAD_SIZE;
+}
+
+impl Write for Object {
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        match self {
+            Self::Coin(coin) => {
+                Self::COIN_TAG.write(buf);
+                let kernel_coin = KernelCoin::issue(coin.owner.into_kernel(), coin.value);
+                Self::write_payload(&kernel_coin, buf);
+            }
+            Self::Edge(edge) => {
+                Self::EDGE_TAG.write(buf);
+                Self::write_payload(edge, buf);
+            }
+        }
+    }
+}
+
+impl Read for Object {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self {
-            owner: Address::read(buf)?,
-            value: u64::read(buf)?,
-        })
+        let tag = u8::read(buf)?;
+        let payload = <[u8; Self::PAYLOAD_SIZE]>::read(buf)?;
+        match tag {
+            Self::COIN_TAG => {
+                let coin = Self::read_payload::<KernelCoin>(&payload)?;
+                Ok(Self::Coin(Coin {
+                    owner: SettlementKey::from(coin.owner()),
+                    value: coin.value(),
+                }))
+            }
+            Self::EDGE_TAG => Ok(Self::Edge(Self::read_payload::<KernelEdge>(&payload)?)),
+            _ => Err(CodecError::InvalidEnum(tag)),
+        }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_edge() -> KernelEdge {
+    let mut bytes = Vec::with_capacity(KernelEdge::MAX_ENCODED_SIZE);
+    bytes.extend_from_slice(&[1, 5]);
+    bytes.extend_from_slice(&100_u64.to_be_bytes());
+    bytes.extend_from_slice(&10_u64.to_be_bytes());
+    bytes.extend_from_slice(&[1, 2]);
+    for value in [1_u64, 2, 3, 4] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    bytes.extend_from_slice(&[1, 1]);
+    bytes.extend_from_slice(&99_u64.to_be_bytes());
+    bytes.extend_from_slice(&[1, 3]);
+    bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
+    bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
+    bytes.extend_from_slice(&[4; 32]);
+    assert_eq!(bytes.len(), KernelEdge::MAX_ENCODED_SIZE);
+    KernelEdge::decode_exact(&bytes).expect("test edge must use the kernel canonical layout")
 }
 
 // --- WebAuthnSignature (gated) ---
@@ -894,12 +1154,68 @@ mod tests {
     }
 
     #[test]
-    fn coin_codec_roundtrip() {
-        let owner = addr_from_signing_key(&secp256r1_key_from_seed(1));
-        let coin = Coin { owner, value: 123 };
-        let encoded = coin.encode();
-        let decoded = Coin::decode(encoded).expect("coin decode");
-        assert_eq!(decoded, coin);
+    fn object_coin_codec_uses_kernel_canonical_payload_and_zero_padding() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(1));
+        let owner = SettlementKey::from(&address);
+        let object = Object::Coin(Coin { owner, value: 123 });
+        let encoded = object.encode();
+
+        let kernel_coin = KernelCoin::issue(owner.into_kernel(), 123);
+        let mut canonical = [0_u8; KernelCoin::MAX_ENCODED_SIZE];
+        let canonical_len = kernel_coin.write_to(&mut canonical);
+
+        assert_eq!(encoded.len(), Object::SIZE);
+        assert_eq!(encoded[0], Object::COIN_TAG);
+        assert_eq!(&encoded[1..1 + canonical_len], &canonical);
+        assert!(encoded[1 + canonical_len..].iter().all(|byte| *byte == 0));
+        assert_eq!(Object::decode(encoded).expect("object decode"), object);
+    }
+
+    #[test]
+    fn object_edge_codec_uses_kernel_canonical_payload() {
+        let edge = test_edge();
+        let object = Object::Edge(edge);
+        let encoded = object.encode();
+        let mut canonical = [0_u8; KernelEdge::MAX_ENCODED_SIZE];
+        let canonical_len = edge.write_to(&mut canonical);
+
+        assert_eq!(canonical_len, Object::PAYLOAD_SIZE);
+        assert_eq!(encoded[0], Object::EDGE_TAG);
+        assert_eq!(&encoded[1..], &canonical);
+        assert_eq!(Object::decode(encoded).expect("object decode"), object);
+    }
+
+    #[test]
+    fn object_codec_rejects_non_zero_padding() {
+        let object = Object::Coin(Coin {
+            owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+            value: 7,
+        });
+        let mut encoded = object.encode().to_vec();
+        let last = encoded.len() - 1;
+        encoded[last] = 1;
+        assert!(Object::decode(encoded.as_slice()).is_err());
+    }
+
+    #[test]
+    fn settlement_key_base58_roundtrip_does_not_validate_a_curve() {
+        let key = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
+        assert_eq!(key.encode().as_ref(), key.as_bytes());
+        assert_eq!(
+            SettlementKey::decode(key.as_bytes().as_slice()).expect("raw settlement key"),
+            key
+        );
+        let encoded = key.to_string();
+        let decoded: SettlementKey = encoded.parse().expect("base58 settlement key");
+        assert_eq!(decoded, key);
+        assert_eq!(Address::try_from(decoded), Err(AddressError::InvalidKey));
+    }
+
+    #[test]
+    fn address_converts_to_and_from_settlement_key() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(42));
+        let key = SettlementKey::from(&address);
+        assert_eq!(Address::try_from(key), Ok(address));
     }
 
     #[test]

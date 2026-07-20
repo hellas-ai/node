@@ -1,5 +1,8 @@
 use super::store::UtxoDatabase;
-use crate::domain::{Address, Coin, ObjectId, Transaction, genesis_object_id, output_object_id};
+use crate::domain::{
+    Address, Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, genesis_object_id,
+    output_object_id,
+};
 use commonware_codec::Encode;
 use commonware_consensus::types::Height;
 use commonware_cryptography::{Hasher, Sha256};
@@ -13,6 +16,12 @@ type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;
 pub enum ExecutionError {
     #[error("object not found: {id:?}")]
     ObjectNotFound { id: ObjectId },
+    #[error("wrong object kind for {id:?}: expected {expected}, found {actual}")]
+    WrongObjectKind {
+        id: ObjectId,
+        expected: ObjectKind,
+        actual: ObjectKind,
+    },
     #[error("invalid signature")]
     InvalidSignature,
     #[error("insufficient balance: available={available} requested={requested}")]
@@ -49,6 +58,22 @@ fn storage_err<E: core::fmt::Debug>(err: E) -> ExecutionError {
     ExecutionError::Storage(format!("{err:?}"))
 }
 
+fn require_coin(id: ObjectId, object: Option<Object>) -> Result<Coin, ExecutionError> {
+    match object {
+        Some(Object::Coin(coin)) => Ok(coin),
+        Some(object) => Err(ExecutionError::WrongObjectKind {
+            id,
+            expected: ObjectKind::Coin,
+            actual: object.kind(),
+        }),
+        None => Err(ExecutionError::ObjectNotFound { id }),
+    }
+}
+
+fn legacy_owner_address(owner: SettlementKey) -> Result<Address, ExecutionError> {
+    Address::try_from(owner).map_err(|_| ExecutionError::InvalidSignature)
+}
+
 async fn object_exists<E>(batches: &Batch<E>, id: &ObjectId) -> Result<bool, ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
@@ -63,7 +88,7 @@ where
 pub async fn execute_all<E>(
     parent_height: Height,
     txs: &[Transaction],
-    genesis_allocations: &[(Address, u64)],
+    genesis_allocations: &[(SettlementKey, u64)],
     batches: Batch<E>,
 ) -> Result<Batch<E>, ExecutionError>
 where
@@ -82,7 +107,7 @@ where
 pub async fn execute_proposal<E>(
     parent_height: Height,
     candidates: Vec<Transaction>,
-    genesis_allocations: &[(Address, u64)],
+    genesis_allocations: &[(SettlementKey, u64)],
     max_txs: usize,
     batches: Batch<E>,
 ) -> Result<(Batch<E>, Vec<Transaction>, Vec<Transaction>), ExecutionError>
@@ -123,7 +148,7 @@ where
 
 fn maybe_seed_genesis<E>(
     parent_height: Height,
-    genesis_allocations: &[(Address, u64)],
+    genesis_allocations: &[(SettlementKey, u64)],
     mut batches: Batch<E>,
 ) -> Batch<E>
 where
@@ -143,10 +168,10 @@ where
         };
         let id = genesis_object_id(validator_index);
         let coin = Coin {
-            owner: owner.clone(),
+            owner: *owner,
             value: *balance,
         };
-        batches = batches.write(id, Some(coin));
+        batches = batches.write(id, Some(Object::Coin(coin)));
     }
     batches
 }
@@ -165,12 +190,19 @@ where
             amount,
             ..
         } => {
-            let coin = match batches.get(input).await.map_err(storage_err) {
-                Ok(Some(coin)) => coin,
-                Ok(None) => return Err((batches, ExecutionError::ObjectNotFound { id: *input })),
+            let object = match batches.get(input).await.map_err(storage_err) {
+                Ok(object) => object,
                 Err(err) => return Err((batches, err)),
             };
-            if !tx.verify_signature(&coin.owner) {
+            let coin = match require_coin(*input, object) {
+                Ok(coin) => coin,
+                Err(err) => return Err((batches, err)),
+            };
+            let owner = match legacy_owner_address(coin.owner) {
+                Ok(owner) => owner,
+                Err(err) => return Err((batches, err)),
+            };
+            if !tx.verify_signature(&owner) {
                 return Err((batches, ExecutionError::InvalidSignature));
             }
             if *amount == 0 {
@@ -221,19 +253,19 @@ where
             batches = batches.write(*input, None);
             batches = batches.write(
                 recipient_id,
-                Some(Coin {
-                    owner: recipient.clone(),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from(recipient),
                     value: *amount,
-                }),
+                })),
             );
 
             if let Some(change_id) = change_id {
                 batches = batches.write(
                     change_id,
-                    Some(Coin {
+                    Some(Object::Coin(Coin {
                         owner: coin.owner,
                         value: change_value,
-                    }),
+                    })),
                 );
             }
             Ok(batches)
@@ -251,14 +283,15 @@ where
                 }
             }
 
-            let mut owner: Option<Address> = None;
+            let mut owner: Option<SettlementKey> = None;
             let mut total = 0u64;
             for input in inputs {
-                let coin = match batches.get(input).await.map_err(storage_err) {
-                    Ok(Some(coin)) => coin,
-                    Ok(None) => {
-                        return Err((batches, ExecutionError::ObjectNotFound { id: *input }));
-                    }
+                let object = match batches.get(input).await.map_err(storage_err) {
+                    Ok(object) => object,
+                    Err(err) => return Err((batches, err)),
+                };
+                let coin = match require_coin(*input, object) {
+                    Ok(coin) => coin,
                     Err(err) => return Err((batches, err)),
                 };
                 if let Some(expected_owner) = owner.as_ref() {
@@ -266,7 +299,7 @@ where
                         return Err((batches, ExecutionError::MergeOwnerMismatch));
                     }
                 } else {
-                    owner = Some(coin.owner.clone());
+                    owner = Some(coin.owner);
                 }
                 total = match total.checked_add(coin.value) {
                     Some(total) => total,
@@ -276,7 +309,11 @@ where
             let Some(owner) = owner else {
                 return Err((batches, ExecutionError::MergeOwnerMismatch));
             };
-            if !tx.verify_signature(&owner) {
+            let address = match legacy_owner_address(owner) {
+                Ok(address) => address,
+                Err(err) => return Err((batches, err)),
+            };
+            if !tx.verify_signature(&address) {
                 return Err((batches, ExecutionError::InvalidSignature));
             }
 
@@ -295,12 +332,41 @@ where
             }
             batches = batches.write(
                 output_id,
-                Some(Coin {
+                Some(Object::Coin(Coin {
                     owner,
                     value: total,
-                }),
+                })),
             );
             Ok(batches)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_in_coin_slot_is_typed_and_non_transient() {
+        let id = ObjectId::from([0x44; 32]);
+        let err = require_coin(id, Some(Object::Edge(crate::domain::test_edge())))
+            .expect_err("edge is not a coin");
+        assert_eq!(
+            err,
+            ExecutionError::WrongObjectKind {
+                id,
+                expected: ObjectKind::Coin,
+                actual: ObjectKind::Edge,
+            }
+        );
+        assert!(!err.is_transient_for_mempool());
+    }
+
+    #[test]
+    fn non_p256_owner_is_invalid_not_transient() {
+        let owner = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
+        let err = legacy_owner_address(owner).expect_err("not a P-256 point");
+        assert_eq!(err, ExecutionError::InvalidSignature);
+        assert!(!err.is_transient_for_mempool());
     }
 }

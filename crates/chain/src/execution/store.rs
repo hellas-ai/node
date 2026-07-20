@@ -1,4 +1,4 @@
-use crate::domain::{Coin, ObjectId};
+use crate::domain::{Object, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_glue::stateful::db::{ManagedDb, Shared};
 use commonware_parallel::Sequential;
@@ -14,7 +14,7 @@ use commonware_storage::{
 };
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
-pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Coin, Sha256, EightCap, Sequential>;
+pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightCap, Sequential>;
 pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
@@ -45,15 +45,15 @@ pub fn utxo_db_config(
 
     FixedConfig {
         merkle_config: MmrConfig {
-            journal_partition: format!("{partition_prefix}_utxo_mmr_journal"),
-            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata"),
+            journal_partition: format!("{partition_prefix}_utxo_mmr_journal_v2"),
+            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata_v2"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
             strategy: Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedLogConfig {
-            partition: format!("{partition_prefix}_utxo_log_journal"),
+            partition: format!("{partition_prefix}_utxo_log_journal_v2"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache,
             write_buffer: WRITE_BUFFER,
