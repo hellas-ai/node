@@ -61,7 +61,7 @@ impl Mempool {
         self.inner.lock().await.push_back(tx);
     }
 
-    async fn snapshot(&self) -> Vec<Transaction> {
+    pub(crate) async fn snapshot(&self) -> Vec<Transaction> {
         self.inner.lock().await.iter().cloned().collect()
     }
 

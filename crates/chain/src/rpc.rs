@@ -1,13 +1,13 @@
 //! Local implementation of the light-client query interface.
 
-use crate::domain::{Coin, ObjectId, SettlementKey, Transaction};
+use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use crate::{
     app::Mempool,
     execution::store::{UtxoDatabase, root as utxo_root},
     indexer::ChainIndexer,
     light_client::{
-        ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins,
-        QueryError,
+        ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock, FinalizedBlockQuery,
+        LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
     },
     owner_index::{OwnerIndex, OwnerIndexError},
 };
@@ -50,6 +50,46 @@ fn owner_lookup_error(error: OwnerIndexError) -> QueryError {
     }
 }
 
+async fn get_edge_at(
+    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
+    owner_index: &OwnerIndex,
+    payload: Digest,
+    object_id: ObjectId,
+) -> Result<Option<EdgeLookup>, QueryError> {
+    let cursor = owner_index.cursor();
+    if cursor.height == 0 {
+        return Ok(None);
+    }
+    if cursor.payload != payload {
+        return Err(QueryError::StateUnavailable(
+            "edge queries only support the latest indexed payload".to_string(),
+        ));
+    }
+
+    let reader = databases.read().await;
+    let state_root = reader.root();
+    if state_root != cursor.state_root {
+        return Err(QueryError::StateUnavailable(
+            "owner index and object store roots disagree".to_string(),
+        ));
+    }
+    let edge = match reader
+        .get(&object_id)
+        .await
+        .map_err(|error| QueryError::StateUnavailable(format!("edge read failed: {error:?}")))?
+    {
+        Some(Object::Edge(edge)) => Some(EdgeState::from(edge)),
+        Some(Object::Coin(_)) => {
+            return Err(QueryError::WrongObjectKind {
+                expected: ObjectKind::Edge,
+                actual: ObjectKind::Coin,
+            });
+        }
+        None => None,
+    };
+    Ok(Some(EdgeLookup { state_root, edge }))
+}
+
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
         Ok(Some(utxo_root(&self.databases).await))
@@ -77,6 +117,14 @@ impl LightClient for LocalLightClient {
             ));
         }
         coin.map_err(owner_lookup_error)
+    }
+
+    async fn get_edge(
+        &self,
+        payload: Digest,
+        object_id: ObjectId,
+    ) -> Result<Option<EdgeLookup>, QueryError> {
+        get_edge_at(&self.databases, &self.owner_index, payload, object_id).await
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -130,12 +178,54 @@ impl LightClient for LocalLightClient {
             coins,
         }))
     }
+
+    async fn get_edges_by_owner(
+        &self,
+        owner: SettlementKey,
+    ) -> Result<Option<OwnerEdges>, QueryError> {
+        let (cursor, edges) = self.owner_index.get_edges_by_owner_snapshot(&owner);
+        if cursor.height == 0 {
+            return Ok(None);
+        }
+        let Some(finalization) = self.chain_indexer.get_finalization(cursor.payload).await? else {
+            return Err(QueryError::StateUnavailable(
+                "owner index cursor finalization is unavailable".to_string(),
+            ));
+        };
+        Ok(Some(OwnerEdges {
+            snapshot: LatestBlock {
+                height: cursor.height,
+                payload: cursor.payload,
+                state_root: cursor.state_root,
+                finalization,
+            },
+            edges: edges
+                .into_iter()
+                .map(|(object_id, edge)| EdgeRecord {
+                    object_id,
+                    maker: edge.maker,
+                    taker: edge.taker,
+                })
+                .collect(),
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ObjectKind;
+    use crate::{
+        domain::{KERNEL_FEES, ObjectKind, Transaction, edge_object_id, genesis_object_id},
+        execution::{
+            execute_all,
+            store::utxo_db_config,
+            test_support::{index_block, index_genesis, kernel_fixture, legacy_address, run_qmdb},
+        },
+        owner_index::ApplyOutcome,
+    };
+    use commonware_cryptography::Digestible as _;
+    use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
+    use hellas_kernel::{BlockHash, BlockHeight, Context as KernelContext};
 
     #[test]
     fn owner_index_wrong_kind_maps_structurally() {
@@ -152,5 +242,106 @@ mod tests {
                 actual: ObjectKind::Edge,
             }
         ));
+    }
+
+    #[test]
+    fn get_edge_reads_qmdb_with_served_root_and_typed_kind() {
+        run_qmdb(|runtime| async move {
+            let config = utxo_db_config(&runtime, "rpc_get_edge", 1024, 8);
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+            let fixture = kernel_fixture(3).expect("kernel fixture");
+            let mut allocations = fixture.allocations.clone();
+            allocations.push((SettlementKey::from(legacy_address(41)), 7));
+            let genesis = index_genesis();
+            let uninitialized_index = OwnerIndex::new(&genesis, allocations.clone());
+            assert!(matches!(
+                get_edge_at(
+                    &database,
+                    &uninitialized_index,
+                    Digest::from([0x10; 32]),
+                    ObjectId::from([0x20; 32]),
+                )
+                .await,
+                Ok(None)
+            ));
+
+            let transactions = vec![Transaction::Kernel(fixture.open.clone())];
+            let batches = database.new_batches().await;
+            let batches = execute_all(
+                KernelContext::with_fees(
+                    BlockHeight::new(1),
+                    BlockHash::from_bytes([0; BlockHash::LENGTH]),
+                    KERNEL_FEES,
+                ),
+                &transactions,
+                &allocations,
+                batches,
+            )
+            .await
+            .expect("open executes");
+            let merkleized = batches.merkleize().await.expect("state merkleizes");
+            let state_root = merkleized.root();
+            database.finalize(merkleized).await;
+
+            let index = OwnerIndex::new(&genesis, allocations.clone());
+            let block = index_block(&genesis, state_root, transactions.clone());
+            assert_eq!(index.apply_finalized(&block), Ok(ApplyOutcome::Applied));
+            let payload = block.digest();
+            let edge_id = edge_object_id(fixture.edge);
+            let expected_edge = match database
+                .read()
+                .await
+                .get(&edge_id)
+                .await
+                .expect("edge read")
+            {
+                Some(Object::Edge(edge)) => EdgeState::from(edge),
+                other => panic!("expected stored edge, found {other:?}"),
+            };
+
+            let found = get_edge_at(&database, &index, payload, edge_id)
+                .await
+                .expect("edge lookup")
+                .expect("indexed state is available");
+            assert_eq!(found.state_root, state_root);
+            assert_eq!(found.edge, Some(expected_edge));
+
+            let absent = get_edge_at(&database, &index, payload, ObjectId::from([0xa5; 32]))
+                .await
+                .expect("absent edge lookup")
+                .expect("indexed state is available");
+            assert_eq!(absent.state_root, state_root);
+            assert_eq!(absent.edge, None);
+
+            assert!(matches!(
+                get_edge_at(&database, &index, Digest::from([0x44; 32]), edge_id,).await,
+                Err(QueryError::StateUnavailable(_))
+            ));
+
+            assert!(matches!(
+                get_edge_at(&database, &index, payload, genesis_object_id(2)).await,
+                Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Edge,
+                    actual: ObjectKind::Coin,
+                })
+            ));
+
+            let mismatched_index = OwnerIndex::new(&genesis, allocations);
+            let mismatched_block = index_block(&genesis, Digest::from([0x55; 32]), transactions);
+            assert_eq!(
+                mismatched_index.apply_finalized(&mismatched_block),
+                Ok(ApplyOutcome::Applied)
+            );
+            assert!(matches!(
+                get_edge_at(
+                    &database,
+                    &mismatched_index,
+                    mismatched_block.digest(),
+                    edge_id,
+                )
+                .await,
+                Err(QueryError::StateUnavailable(_))
+            ));
+        });
     }
 }

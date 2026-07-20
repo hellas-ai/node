@@ -60,8 +60,9 @@ pub use indexer::{
 };
 #[cfg(any(feature = "client", feature = "wasm-client", feature = "server"))]
 pub use light_client::{
-    ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
-    LightClient, OwnerCoins, ProposalInfo, QueryError,
+    ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
+    FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, ProposalInfo,
+    QueryError,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
