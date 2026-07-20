@@ -6,7 +6,10 @@
 //! and the position of the payout in the close.
 
 use crate::{
-    canonical::{Decode, DecodeError, Encode, Writer},
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
     object::Coin,
     primitive::{CoinId, EdgeId, Key},
 };
@@ -19,11 +22,12 @@ pub struct Payout {
 }
 
 impl Encode for Payout {
-    const MAX_ENCODED_SIZE: usize = Key::LENGTH + 8;
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + Key::MAX_ENCODED_SIZE + u64::MAX_ENCODED_SIZE;
     fn encoded_size(&self) -> usize {
         Self::MAX_ENCODED_SIZE
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::PAYOUT);
         self.owner.encode_to(writer);
         self.value.encode_to(writer);
     }
@@ -31,13 +35,10 @@ impl Encode for Payout {
 
 impl Decode for Payout {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
-        let (owner, n) = Key::decode(buf)?;
-        let rest = buf.get(n..).ok_or(DecodeError::InsufficientBytes {
-            needed: n,
-            got: buf.len(),
-        })?;
-        let (value, m) = u64::decode(rest)?;
-        Ok((Self { owner, value }, n + m))
+        let mut consumed = decode_envelope(buf, tag::PAYOUT)?;
+        let owner = decode_field(buf, &mut consumed)?;
+        let value = decode_field(buf, &mut consumed)?;
+        Ok((Self { owner, value }, consumed))
     }
 }
 

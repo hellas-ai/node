@@ -12,7 +12,10 @@
 //! separately.
 
 use crate::{
-    canonical::{Encode, Writer},
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
     consts::MAX_EDGE_OUTPUTS,
     context::BlockHeight,
     list::List,
@@ -45,6 +48,8 @@ enum TermsBody {
         timeout_outputs: List<Payout, MAX_EDGE_OUTPUTS>,
     },
 }
+
+const BASIC_TAG: u8 = 0;
 
 impl Terms {
     /// Creates basic terms.
@@ -119,10 +124,33 @@ impl TermsBody {
     }
 }
 
+impl Encode for Terms {
+    const MAX_ENCODED_SIZE: usize = TermsBody::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        self.body.encoded_size()
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        self.body.encode_to(writer);
+    }
+}
+
+impl Decode for Terms {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (body, consumed) = TermsBody::decode(buf)?;
+        let hash = body.compute_hash();
+        Ok((Self { body, hash }, consumed))
+    }
+}
+
 impl Encode for TermsBody {
-    // Max size: 1 (protocol) + 33 + 33 (parties) + 8 (timeout) + List<Payout, MAX>
-    const MAX_ENCODED_SIZE: usize =
-        1 + 33 + 33 + 8 + <List<Payout, MAX_EDGE_OUTPUTS> as Encode>::MAX_ENCODED_SIZE;
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE
+        + u8::MAX_ENCODED_SIZE
+        + ProtocolCode::MAX_ENCODED_SIZE
+        + Parties::MAX_ENCODED_SIZE
+        + BlockHeight::MAX_ENCODED_SIZE
+        + <List<Payout, MAX_EDGE_OUTPUTS> as Encode>::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
         match self {
@@ -132,10 +160,11 @@ impl Encode for TermsBody {
                 timeout,
                 timeout_outputs,
             } => {
-                protocol.encoded_size()
-                    + parties.maker().encoded_size()
-                    + parties.taker().encoded_size()
-                    + timeout.get().encoded_size()
+                ENVELOPE_SIZE
+                    + u8::MAX_ENCODED_SIZE
+                    + protocol.encoded_size()
+                    + parties.encoded_size()
+                    + timeout.encoded_size()
                     + timeout_outputs.encoded_size()
             }
         }
@@ -149,12 +178,38 @@ impl Encode for TermsBody {
                 timeout,
                 timeout_outputs,
             } => {
+                encode_envelope(writer, tag::TERMS);
+                BASIC_TAG.encode_to(writer);
                 protocol.encode_to(writer);
-                parties.maker().encode_to(writer);
-                parties.taker().encode_to(writer);
-                timeout.get().encode_to(writer);
+                parties.encode_to(writer);
+                timeout.encode_to(writer);
                 timeout_outputs.encode_to(writer);
             }
+        }
+    }
+}
+
+impl Decode for TermsBody {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::TERMS)?;
+        let variant = decode_field::<u8>(buf, &mut consumed)?;
+        match variant {
+            BASIC_TAG => {
+                let protocol = decode_field(buf, &mut consumed)?;
+                let parties = decode_field(buf, &mut consumed)?;
+                let timeout = decode_field(buf, &mut consumed)?;
+                let timeout_outputs = decode_field(buf, &mut consumed)?;
+                Ok((
+                    Self::Basic {
+                        protocol,
+                        parties,
+                        timeout,
+                        timeout_outputs,
+                    },
+                    consumed,
+                ))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
         }
     }
 }
@@ -206,16 +261,24 @@ mod tests {
 
         assert_eq!(
             TermsBody::MAX_ENCODED_SIZE,
-            1 + Key::LENGTH + Key::LENGTH + 8 + 8 + MAX_EDGE_OUTPUTS * (Key::LENGTH + 8),
+            ENVELOPE_SIZE
+                + u8::MAX_ENCODED_SIZE
+                + ProtocolCode::MAX_ENCODED_SIZE
+                + Parties::MAX_ENCODED_SIZE
+                + BlockHeight::MAX_ENCODED_SIZE
+                + <usize as Encode>::MAX_ENCODED_SIZE
+                + MAX_EDGE_OUTPUTS * Payout::MAX_ENCODED_SIZE,
         );
         assert_eq!(body.encoded_size(), writer.position());
         assert_eq!(body.encoded_size(), TermsBody::MAX_ENCODED_SIZE);
-        let maker_start = 1;
+        let maker_start =
+            ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + ProtocolCode::MAX_ENCODED_SIZE + ENVELOPE_SIZE;
         let taker_start = maker_start + Key::LENGTH;
-        let timeout_start = taker_start + Key::LENGTH;
+        let parties_end = taker_start + Key::LENGTH;
 
-        assert_eq!(buf[0], 1);
+        assert_eq!(&buf[..4], &[1, tag::TERMS, BASIC_TAG, 1]);
+        assert_eq!(&buf[4..maker_start], &[1, tag::PARTIES]);
         assert_eq!(&buf[maker_start..taker_start], maker.as_bytes());
-        assert_eq!(&buf[taker_start..timeout_start], taker.as_bytes());
+        assert_eq!(&buf[taker_start..parties_end], taker.as_bytes());
     }
 }

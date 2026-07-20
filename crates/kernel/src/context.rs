@@ -21,6 +21,10 @@
 //!   quorum-signed seals expresses that policy inside the verifier
 //!   impls; [`Context`] stays oblivious.
 
+use crate::canonical::{
+    Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+    encode_envelope, tag,
+};
 use crate::consts::HASH_LENGTH;
 
 /// Hash of the previous finalized block.
@@ -188,6 +192,33 @@ impl Fees {
     }
 }
 
+impl Encode for Fees {
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + 4 * u64::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::FEES);
+        self.base.encode_to(writer);
+        self.slot.encode_to(writer);
+        self.proof.encode_to(writer);
+        self.lifetime.encode_to(writer);
+    }
+}
+
+impl Decode for Fees {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::FEES)?;
+        let base = decode_field(buf, &mut consumed)?;
+        let slot = decode_field(buf, &mut consumed)?;
+        let proof = decode_field(buf, &mut consumed)?;
+        let lifetime = decode_field(buf, &mut consumed)?;
+        Ok((Self::new(base, slot, proof, lifetime), consumed))
+    }
+}
+
 /// Monotonic finalized block height.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlockHeight(u64);
@@ -203,6 +234,27 @@ impl BlockHeight {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+impl Encode for BlockHeight {
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + u64::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::BLOCK_HEIGHT);
+        self.0.encode_to(writer);
+    }
+}
+
+impl Decode for BlockHeight {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::BLOCK_HEIGHT)?;
+        let value = decode_field(buf, &mut consumed)?;
+        Ok((Self::new(value), consumed))
     }
 }
 

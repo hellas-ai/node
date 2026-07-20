@@ -19,7 +19,10 @@ pub use self::{
 };
 
 use crate::{
-    canonical::Encode,
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
     consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS},
     context::{Context, Cost},
     error::{ApplyError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason, KernelResult},
@@ -31,6 +34,9 @@ use crate::{
     terms::Terms,
     verifier::{SealPublicInputs, SealVerifier, SigVerifier},
 };
+
+const OPEN_TAG: u8 = 0;
+const CLOSE_TAG: u8 = 1;
 
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
@@ -190,6 +196,89 @@ impl Tx {
                 proof,
                 outputs,
             } => apply_close(*input, proof, outputs, context, verifier, batch),
+        }
+    }
+}
+
+impl Encode for Tx {
+    const MAX_ENCODED_SIZE: usize = {
+        let open = Funding::MAX_ENCODED_SIZE + Terms::MAX_ENCODED_SIZE + 2 * Auth::MAX_ENCODED_SIZE;
+        let close = EdgeId::MAX_ENCODED_SIZE + Proof::MAX_ENCODED_SIZE + Payouts::MAX_ENCODED_SIZE;
+        let max_body = if open > close { open } else { close };
+        ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + max_body
+    };
+
+    fn encoded_size(&self) -> usize {
+        ENVELOPE_SIZE
+            + u8::MAX_ENCODED_SIZE
+            + match self {
+                Self::Open {
+                    funding,
+                    terms,
+                    maker_auth,
+                    taker_auth,
+                } => {
+                    funding.encoded_size()
+                        + terms.encoded_size()
+                        + maker_auth.encoded_size()
+                        + taker_auth.encoded_size()
+                }
+                Self::Close {
+                    input,
+                    proof,
+                    outputs,
+                } => input.encoded_size() + proof.encoded_size() + outputs.encoded_size(),
+            }
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::TX);
+        match self {
+            Self::Open {
+                funding,
+                terms,
+                maker_auth,
+                taker_auth,
+            } => {
+                OPEN_TAG.encode_to(writer);
+                funding.encode_to(writer);
+                terms.encode_to(writer);
+                maker_auth.encode_to(writer);
+                taker_auth.encode_to(writer);
+            }
+            Self::Close {
+                input,
+                proof,
+                outputs,
+            } => {
+                CLOSE_TAG.encode_to(writer);
+                input.encode_to(writer);
+                proof.encode_to(writer);
+                outputs.encode_to(writer);
+            }
+        }
+    }
+}
+
+impl Decode for Tx {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::TX)?;
+        let variant = decode_field::<u8>(buf, &mut consumed)?;
+        match variant {
+            OPEN_TAG => {
+                let funding = decode_field(buf, &mut consumed)?;
+                let terms = decode_field(buf, &mut consumed)?;
+                let maker_auth = decode_field(buf, &mut consumed)?;
+                let taker_auth = decode_field(buf, &mut consumed)?;
+                Ok((Self::open(funding, terms, maker_auth, taker_auth), consumed))
+            }
+            CLOSE_TAG => {
+                let input = decode_field(buf, &mut consumed)?;
+                let proof = decode_field(buf, &mut consumed)?;
+                let outputs = decode_field(buf, &mut consumed)?;
+                Ok((Self::close(input, proof, outputs), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
         }
     }
 }

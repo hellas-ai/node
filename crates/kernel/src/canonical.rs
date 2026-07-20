@@ -3,11 +3,10 @@
 //! Every kernel value that participates in a hash commitment or that
 //! gets stored at the chain boundary implements [`Encode`]. Values that
 //! can also be reconstructed from canonical bytes additionally implement
-//! [`Decode`]. The split is deliberate: hash newtypes ([`crate::CoinId`],
-//! [`crate::EdgeId`], [`crate::TermsHash`], [`crate::PayloadHash`]) impl
-//! `Encode` only — you can serialize a hash you already hold, you cannot
-//! deserialize one in isolation. The hash discipline is enforced at the
-//! type system level.
+//! [`Decode`]. Opaque hash newtypes ([`crate::CoinId`], [`crate::EdgeId`],
+//! [`crate::TermsHash`], [`crate::PayloadHash`]) decode through their
+//! `from_bytes` reconstitution paths; their canonical bytes remain the fixed
+//! 32-byte commitment payload.
 //!
 //! Hash inputs and serialization inputs are unified. The bytes a value
 //! emits via `encode_to` are *the* canonical bytes; commitments are
@@ -17,10 +16,34 @@
 //! The encoding is hand-rolled byte concatenation in a documented order
 //! per type. No allocator. No format negotiation. `MAX_ENCODED_SIZE` is
 //! a compile-time bound per type so callers can stack-allocate buffers.
+//!
+//! Composite values start with a two-byte envelope: canonical format version
+//! `1`, followed by a globally unique type tag. Tagged enums then carry a
+//! third byte selecting the variant. Primitive integers and byte newtypes stay
+//! fixed-width and untagged so they remain suitable as fields and hash inputs.
 
 #![allow(clippy::redundant_pub_crate)]
 
 use crate::primitive::Party;
+
+pub(crate) const ENVELOPE_SIZE: usize = 2;
+const FORMAT_VERSION: u8 = 1;
+
+pub(crate) mod tag {
+    pub(crate) const BLOCK_HEIGHT: u8 = 1;
+    pub(crate) const FEES: u8 = 2;
+    pub(crate) const PARTIES: u8 = 3;
+    pub(crate) const COIN: u8 = 4;
+    pub(crate) const EDGE: u8 = 5;
+    pub(crate) const FUNDING: u8 = 6;
+    pub(crate) const PAYOUT: u8 = 7;
+    pub(crate) const SEAL: u8 = 8;
+    pub(crate) const WEBAUTHN_ASSERTION: u8 = 9;
+    pub(crate) const AUTH: u8 = 10;
+    pub(crate) const TERMS: u8 = 11;
+    pub(crate) const PROOF: u8 = 12;
+    pub(crate) const TX: u8 = 13;
+}
 
 /// Streaming destination for [`Encode`] output.
 ///
@@ -108,6 +131,8 @@ pub trait Encode {
 
     /// Writes the canonical byte representation into a slice.
     ///
+    /// `buf` must be at least [`Self::MAX_ENCODED_SIZE`] bytes long.
+    ///
     /// Returns the number of bytes written. Default impl uses
     /// [`BufferWriter`].
     fn write_to(&self, buf: &mut [u8]) -> usize {
@@ -129,6 +154,28 @@ pub trait Decode: Sized {
     /// Returns [`DecodeError`] when the input bytes are malformed (too
     /// short, invalid variant tag, list length exceeds the type bound).
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError>;
+
+    /// Parses one complete canonical value and rejects trailing bytes.
+    ///
+    /// Nested codecs use [`Self::decode`] so they can continue with later
+    /// fields. Chain and persistence boundaries should use `decode_exact` so
+    /// alternate encodings cannot hide data after an otherwise valid value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] when decoding fails or when `buf` contains
+    /// bytes after the decoded value.
+    fn decode_exact(buf: &[u8]) -> Result<Self, DecodeError> {
+        let (value, consumed) = Self::decode(buf)?;
+        match buf.len().checked_sub(consumed) {
+            Some(0) => Ok(value),
+            Some(remaining) => Err(DecodeError::TrailingBytes { remaining }),
+            None => Err(DecodeError::InvalidConsumption {
+                consumed,
+                available: buf.len(),
+            }),
+        }
+    }
 }
 
 /// Reason a [`Decode`] attempt failed.
@@ -141,7 +188,7 @@ pub enum DecodeError {
         /// Bytes the decoder saw.
         got: usize,
     },
-    /// Variant tag byte does not match any defined variant.
+    /// Format version, type tag, or variant tag is not recognized here.
     InvalidTag {
         /// Unrecognized tag byte.
         tag: u8,
@@ -153,6 +200,78 @@ pub enum DecodeError {
         /// Maximum the type permits.
         max: usize,
     },
+    /// A nested decoder reported consuming more bytes than were available.
+    InvalidConsumption {
+        /// Bytes the nested decoder reported consuming.
+        consumed: usize,
+        /// Bytes available to that decoder.
+        available: usize,
+    },
+    /// A complete-value decoder found bytes after the canonical value.
+    TrailingBytes {
+        /// Number of unconsumed bytes.
+        remaining: usize,
+    },
+}
+
+pub(crate) fn encode_envelope<W: Writer + ?Sized>(writer: &mut W, type_tag: u8) {
+    writer.write(&[FORMAT_VERSION, type_tag]);
+}
+
+pub(crate) fn decode_envelope(buf: &[u8], expected_tag: u8) -> Result<usize, DecodeError> {
+    let (header, consumed) = decode_fixed::<{ ENVELOPE_SIZE }>(buf)?;
+    let version = header
+        .first()
+        .copied()
+        .ok_or(DecodeError::InsufficientBytes {
+            needed: ENVELOPE_SIZE,
+            got: 0,
+        })?;
+    if version != FORMAT_VERSION {
+        return Err(DecodeError::InvalidTag { tag: version });
+    }
+    let type_tag = header
+        .get(1)
+        .copied()
+        .ok_or(DecodeError::InsufficientBytes {
+            needed: ENVELOPE_SIZE,
+            got: 1,
+        })?;
+    if type_tag != expected_tag {
+        return Err(DecodeError::InvalidTag { tag: type_tag });
+    }
+    Ok(consumed)
+}
+
+pub(crate) fn decode_field<T: Decode>(buf: &[u8], consumed: &mut usize) -> Result<T, DecodeError> {
+    let rest = buf
+        .get(*consumed..)
+        .ok_or(DecodeError::InvalidConsumption {
+            consumed: *consumed,
+            available: buf.len(),
+        })?;
+    let (value, field_consumed) = T::decode(rest)?;
+    if field_consumed > rest.len() {
+        return Err(DecodeError::InvalidConsumption {
+            consumed: field_consumed,
+            available: rest.len(),
+        });
+    }
+    *consumed += field_consumed;
+    Ok(value)
+}
+
+/// Reads `N` canonical bytes without allocating.
+pub(crate) fn decode_fixed<const N: usize>(buf: &[u8]) -> Result<([u8; N], usize), DecodeError> {
+    let Some(head) = buf.get(..N) else {
+        return Err(DecodeError::InsufficientBytes {
+            needed: N,
+            got: buf.len(),
+        });
+    };
+    let mut bytes = [0_u8; N];
+    bytes.copy_from_slice(head);
+    Ok((bytes, N))
 }
 
 // -- BLAKE3 commitment over canonical bytes ----------------------------------
@@ -188,6 +307,24 @@ impl Decode for u8 {
             got: buf.len(),
         })?;
         Ok((byte, 1))
+    }
+}
+
+impl<const N: usize> Encode for [u8; N] {
+    const MAX_ENCODED_SIZE: usize = N;
+
+    fn encoded_size(&self) -> usize {
+        N
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        writer.write(self);
+    }
+}
+
+impl<const N: usize> Decode for [u8; N] {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        decode_fixed(buf)
     }
 }
 
@@ -319,14 +456,7 @@ impl<T: Decode + Copy + Default, const N: usize> Decode for crate::List<T, N> {
         }
         let mut items = [T::default(); N];
         for slot in items.iter_mut().take(len) {
-            // Guards against a buggy item decoder over-reporting `n`.
-            let rest = buf.get(consumed..).ok_or(DecodeError::InsufficientBytes {
-                needed: consumed,
-                got: buf.len(),
-            })?;
-            let (item, n) = T::decode(rest)?;
-            *slot = item;
-            consumed += n;
+            *slot = decode_field(buf, &mut consumed)?;
         }
         // Type bound: `len <= N`, so `List::take` is exact.
         Ok((Self::take(items, len), consumed))

@@ -27,7 +27,7 @@
 
 use core::fmt;
 
-use crate::canonical::{Decode, DecodeError, Encode, Writer};
+use crate::canonical::{Decode, DecodeError, Encode, Writer, decode_fixed};
 use crate::consts::{HASH_LENGTH, ID_LENGTH, KEY_LENGTH, SIG_LENGTH};
 
 /// Settlement public key controlling owner-only objects.
@@ -149,8 +149,11 @@ impl Encode for CoinId {
     }
 }
 
-// CoinId deliberately does *not* implement `Decode`. Construction is
-// canonical-derivation-only.
+impl Decode for CoinId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        decode_fixed::<{ Self::LENGTH }>(buf).map(|(bytes, n)| (Self::from_bytes(bytes), n))
+    }
+}
 
 /// Stable identifier for an edge object.
 ///
@@ -197,8 +200,11 @@ impl Encode for EdgeId {
     }
 }
 
-// EdgeId deliberately does *not* implement `Decode`. Construction is
-// canonical-derivation-only.
+impl Decode for EdgeId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        decode_fixed::<{ Self::LENGTH }>(buf).map(|(bytes, n)| (Self::from_bytes(bytes), n))
+    }
+}
 
 /// Commitment to the open terms of an edge.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -238,7 +244,11 @@ impl Encode for TermsHash {
     }
 }
 
-// TermsHash deliberately does *not* implement `Decode`.
+impl Decode for TermsHash {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        decode_fixed::<{ Self::LENGTH }>(buf).map(|(bytes, n)| (Self::from_bytes(bytes), n))
+    }
+}
 
 /// Commitment to one concrete transaction authorization payload.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -278,7 +288,11 @@ impl Encode for PayloadHash {
     }
 }
 
-// PayloadHash deliberately does *not* implement `Decode`.
+impl Decode for PayloadHash {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        decode_fixed::<{ Self::LENGTH }>(buf).map(|(bytes, n)| (Self::from_bytes(bytes), n))
+    }
+}
 
 /// Compact settlement signature bytes.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -424,20 +438,6 @@ impl Party {
             _ => None,
         }
     }
-}
-
-/// Reads `N` canonical bytes from `buf`. Helper for fixed-shape byte
-/// newtype `Decode` impls.
-fn decode_fixed<const N: usize>(buf: &[u8]) -> Result<([u8; N], usize), DecodeError> {
-    let Some(head) = buf.get(..N) else {
-        return Err(DecodeError::InsufficientBytes {
-            needed: N,
-            got: buf.len(),
-        });
-    };
-    let mut bytes = [0_u8; N];
-    bytes.copy_from_slice(head);
-    Ok((bytes, N))
 }
 
 impl fmt::Display for Key {
