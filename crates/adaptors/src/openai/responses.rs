@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
-    AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
+    AdaptorError, AdaptorResult, BackendError, CanonicalExecution, ContentPart, ExecutionRequest,
     ExecutionResult, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem, RawRequest,
-    ReasoningOptions, RenderContext, ResponseFormat, StopReason, StructuredDelta, TextChannel,
-    ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
-    WireAdaptor, WireEventData, WireIngress, WireResponse, WireStreamEvent,
+    ReasoningOptions, RenderContext, ResponseFormat, SseDecoder, StopReason, StructuredDelta,
+    TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind,
+    ToolSpec, Usage, WireAdaptor, WireEventData, WireIngress, WireResponse, WireStreamEvent,
     json::{
         optional_array, optional_bool, optional_f32, optional_string, optional_u32,
         provenance_json, required_string,
@@ -300,6 +300,57 @@ pub struct ResponsesIngressState {
     saw_text_delta: bool,
     saw_reasoning_delta: bool,
     saw_tool_call: bool,
+}
+
+pub struct ResponsesSseProjector {
+    adaptor: OpenAiResponsesAdaptor,
+    parsed: ParsedResponseRequest,
+    state: ResponsesIngressState,
+    decoder: SseDecoder,
+}
+
+impl ResponsesSseProjector {
+    pub fn new(parsed: ParsedResponseRequest) -> Self {
+        let adaptor = OpenAiResponsesAdaptor;
+        let state = adaptor.initial_ingress_state(&parsed);
+        Self {
+            adaptor,
+            parsed,
+            state,
+            decoder: SseDecoder::new(),
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<OutputEvent>, BackendError> {
+        let frames = self
+            .decoder
+            .push(bytes)
+            .map_err(|err| BackendError::failed(err.to_string()))?;
+        self.decode_frames(frames)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<OutputEvent>, BackendError> {
+        let frames = self
+            .decoder
+            .finish()
+            .map_err(|err| BackendError::failed(err.to_string()))?;
+        self.decode_frames(frames)
+    }
+
+    fn decode_frames(
+        &mut self,
+        frames: Vec<WireStreamEvent>,
+    ) -> Result<Vec<OutputEvent>, BackendError> {
+        let mut output = Vec::new();
+        for frame in frames {
+            output.extend(
+                self.adaptor
+                    .decode_stream_event(&self.parsed, &mut self.state, frame)
+                    .map_err(|err| BackendError::failed(err.to_string()))?,
+            );
+        }
+        Ok(output)
+    }
 }
 
 impl WireIngress for OpenAiResponsesAdaptor {

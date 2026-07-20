@@ -12,7 +12,8 @@ use hellas_rpc::{ContentId, ProducerSigningKey};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
 
-use crate::execution::{CliRuntime, fetch_execution_stream};
+use crate::execution::CliRuntime;
+use hellas_client::iroh::fetch_execution_stream;
 use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome, ProducerTrust};
 
 #[derive(Clone)]

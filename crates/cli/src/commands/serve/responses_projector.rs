@@ -1,12 +1,12 @@
-use hellas_adaptors::openai::responses::{OpenAiResponsesAdaptor, ParsedResponseRequest};
+use hellas_adaptors::openai::responses::{
+    OpenAiResponsesAdaptor, ParsedResponseRequest, ResponsesSseProjector,
+};
 use hellas_adaptors::{OutputEvent, RawRequest, Usage, WireAdaptor};
 use hellas_executor::{
     FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
     FetchProviderRequest, FetchRequestView, ProjectedFetch,
 };
 use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
-
-use crate::commands::openai_responses_stream::ResponsesSseProjector;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ResponsesFetchProjectorFactory;
