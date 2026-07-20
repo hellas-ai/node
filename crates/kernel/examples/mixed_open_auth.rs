@@ -18,7 +18,7 @@
 //! Build and run with:
 //!
 //! ```sh
-//! cargo run --example mixed_open_auth --features secp256k1,webauthn
+//! cargo run --example mixed_open_auth --features secp256k1,test-support
 //! ```
 
 #![allow(clippy::alloc_instead_of_core)]
@@ -34,12 +34,11 @@ mod support;
 
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, Fees, Funding, Genesis, Parties, Proof, ProtocolCode,
-    Secp256k1Verifier, Terms, Tx,
+    Secp256k1Verifier, Terms, Tx, test_support::SoftPasskey,
 };
 use support::{
-    apply_one, coin_id, context, context_fee, empty_party, genesis, lifetime_fee, p256_public_key,
-    p256_signing_key, party_one, payouts2, print_live_coins, schedule_fee, secp_keypair, secp_sign,
-    summarize, webauthn_assertion,
+    apply_one, coin_id, context, context_fee, empty_party, genesis, lifetime_fee, party_one,
+    payouts2, print_live_coins, schedule_fee, secp_keypair, secp_sign, summarize,
 };
 
 const FEES: Fees = Fees::new(1, 1, 2, 1);
@@ -48,8 +47,8 @@ const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 fn main() {
     let verifier = Secp256k1Verifier::new();
     let (maker_secret, maker_key) = secp_keypair(3);
-    let taker_passkey = p256_signing_key(4);
-    let (taker_key, _, _) = p256_public_key(&taker_passkey);
+    let taker_passkey = SoftPasskey::from_secret_scalar([4; 32]).expect("fixture scalar is valid");
+    let taker_key = taker_passkey.party_key();
 
     let maker_coin = coin_id(0xc1);
     let open_context = context(1, 0x30, FEES);
@@ -66,9 +65,9 @@ fn main() {
     let funding = Funding::new(party_one(maker_coin), empty_party());
     let edge_id = Tx::edge_id_of(&funding, &terms);
     let open_hash = Tx::open_hash(&funding, &terms);
-    let (taker_assertion, assertion_key) =
-        webauthn_assertion(&taker_passkey, open_hash, "https://wallet.example.invalid");
-    assert_eq!(assertion_key, taker_key);
+    let taker_assertion = taker_passkey
+        .sign(open_hash)
+        .expect("fixture signing succeeds");
 
     let open = Tx::open(
         funding,
@@ -105,8 +104,9 @@ fn main() {
     // the close payload hash the same way it authorized the open.
     let mutual_outputs = payouts2(maker_key, 30, taker_key, 15);
     let close_hash = Tx::payload_hash(edge_id, CloseKind::Mutual, terms.hash(), &mutual_outputs);
-    let (taker_close_assertion, _) =
-        webauthn_assertion(&taker_passkey, close_hash, "https://wallet.example.invalid");
+    let taker_close_assertion = taker_passkey
+        .sign(close_hash)
+        .expect("fixture signing succeeds");
     let close = Tx::close(
         edge_id,
         Proof::mutual(

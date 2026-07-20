@@ -97,5 +97,7 @@ pub use terms::Terms;
 pub use tx::{Auth, CloseKind, Funding, Payout, Proof, Seal, Tx, WebAuthnAssertion, WebAuthnData};
 pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};
+#[cfg(feature = "test-support")]
+pub use webauthn::test_support;
 #[cfg(feature = "webauthn")]
 pub use webauthn::{WebAuthnError, p256_key, verify_webauthn_assertion};
