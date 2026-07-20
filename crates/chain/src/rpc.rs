@@ -1,6 +1,6 @@
 //! Local implementation of the light-client query interface.
 
-use crate::domain::{Address, Coin, ObjectId, Transaction};
+use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use crate::{
     app::Mempool,
     execution::store::{UtxoDatabase, root as utxo_root},
@@ -41,6 +41,35 @@ impl LocalLightClient {
     }
 }
 
+fn coin_from_index_miss(object: Option<Object>) -> Result<Option<Coin>, QueryError> {
+    match object {
+        Some(Object::Coin(_)) => Ok(None),
+        Some(object) => Err(QueryError::WrongObjectKind {
+            expected: ObjectKind::Coin,
+            actual: object.kind(),
+        }),
+        None => Ok(None),
+    }
+}
+
+async fn resolve_indexed_coin<F, Fut>(
+    indexed_coin: Option<Coin>,
+    load_object: F,
+) -> Result<Option<Coin>, QueryError>
+where
+    F: FnOnce() -> Fut,
+    Fut: core::future::Future<Output = Result<Option<Object>, QueryError>>,
+{
+    if let Some(coin) = indexed_coin {
+        return Ok(Some(coin));
+    }
+
+    // M3a consistency shim: the owner index is authoritative for coin values,
+    // while QMDB classifies index misses. Retire this when M4 gives the index
+    // an object-kind map.
+    coin_from_index_miss(load_object().await?)
+}
+
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
         Ok(Some(utxo_root(&self.databases).await))
@@ -67,7 +96,17 @@ impl LightClient for LocalLightClient {
                 "coin queries only support the latest indexed payload".to_string(),
             ));
         }
-        Ok(coin)
+        resolve_indexed_coin(coin, || async {
+            self.databases
+                .read()
+                .await
+                .get(&object_id)
+                .await
+                .map_err(|err| {
+                    QueryError::StateUnavailable(format!("object lookup failed: {err:?}"))
+                })
+        })
+        .await
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -98,7 +137,10 @@ impl LightClient for LocalLightClient {
         Ok(self.consensus_info.clone())
     }
 
-    async fn get_coins_by_owner(&self, owner: Address) -> Result<Option<OwnerCoins>, QueryError> {
+    async fn get_coins_by_owner(
+        &self,
+        owner: SettlementKey,
+    ) -> Result<Option<OwnerCoins>, QueryError> {
         let (cursor, coins) = self.owner_index.get_coins_by_owner_snapshot(&owner);
         if cursor.height == 0 {
             return Ok(None);
@@ -117,5 +159,38 @@ impl LightClient for LocalLightClient {
             },
             coins,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_coin_edge_result_is_typed_wrong_kind() {
+        let err = coin_from_index_miss(Some(Object::Edge(crate::domain::test_edge())))
+            .expect_err("edge must not look missing");
+        assert!(matches!(
+            err,
+            QueryError::WrongObjectKind {
+                expected: ObjectKind::Coin,
+                actual: ObjectKind::Edge,
+            }
+        ));
+    }
+
+    #[test]
+    fn get_coin_uses_index_value_without_loading_qmdb() {
+        let indexed = Coin {
+            owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+            value: 17,
+        };
+        let result = futures::executor::block_on(resolve_indexed_coin(Some(indexed), || async {
+            Err(QueryError::StateUnavailable(
+                "QMDB must not be loaded for an indexed coin".to_string(),
+            ))
+        }))
+        .expect("indexed coin must win");
+        assert_eq!(result, Some(indexed));
     }
 }

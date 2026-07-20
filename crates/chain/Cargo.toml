@@ -15,6 +15,7 @@ domain = [
     "dep:bytes",
     "dep:commonware-codec",
     "dep:commonware-cryptography",
+    "dep:hellas-kernel",
     "dep:p256",
     "dep:serde_json",
     "dep:sha2",
@@ -61,7 +62,6 @@ indexer = [
     "dep:thiserror",
     "dep:tokio",
     "dep:tracing",
-    "dep:hellas-kernel",
     "domain-consensus",
 ]
 server = [

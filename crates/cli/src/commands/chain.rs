@@ -2,7 +2,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use hellas_chain::domain::{Address, Digest};
+use hellas_chain::domain::{Digest, SettlementKey};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, client::RemoteLightClient};
 
 use crate::commands::CliResult;
@@ -208,8 +208,8 @@ async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
         }
         QueryCommand::CoinsByOwner { owner } => {
             let owner = owner
-                .parse::<Address>()
-                .map_err(|err| anyhow::anyhow!("invalid owner address: {err}"))?;
+                .parse::<SettlementKey>()
+                .map_err(|err| anyhow::anyhow!("invalid owner settlement key: {err}"))?;
             match client.get_coins_by_owner(owner).await? {
                 Some(owner_coins) => {
                     println!("height {}", owner_coins.snapshot.height);

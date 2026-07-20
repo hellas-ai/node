@@ -32,8 +32,12 @@ impl Coin {
         Self { owner, value }
     }
 
-    /// Issues a coin from raw operation payload.
-    pub(super) const fn issue(owner: Key, value: u64) -> Self {
+    /// Issues a coin from a trusted host state transition.
+    ///
+    /// This is an issuance path, not a persistence reconstitution path:
+    /// stored coins must still be reconstructed through [`Decode`].
+    #[must_use]
+    pub const fn issue(owner: Key, value: u64) -> Self {
         Self::new(owner, value)
     }
 

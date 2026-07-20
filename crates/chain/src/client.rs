@@ -1,5 +1,5 @@
 use crate::domain::{
-    Address, Coin, DecodeExt, Digest, Encode, ObjectId, Transaction, UserPublicKey,
+    Coin, Digest, Encode, ObjectId, SettlementKey, Transaction,
     WebAuthnSignature as DomainWebAuthnSignature,
 };
 use crate::{
@@ -115,10 +115,16 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             match (response.owner, response.value) {
                 (Some(owner_bytes), Some(value)) => {
-                    let pk = UserPublicKey::decode(owner_bytes.as_slice())
-                        .map_err(|_| QueryError::Remote("invalid owner key".to_string()))?;
+                    let actual = owner_bytes.len();
+                    let raw: [u8; SettlementKey::LENGTH] =
+                        owner_bytes.try_into().map_err(|_| {
+                            QueryError::Remote(format!(
+                                "owner settlement key was {} bytes, got {actual}",
+                                SettlementKey::LENGTH
+                            ))
+                        })?;
                     Ok(Some(Coin {
-                        owner: Address::from(pk),
+                        owner: SettlementKey::from_bytes(raw),
                         value,
                     }))
                 }
@@ -219,14 +225,14 @@ impl LightClient for RemoteLightClient {
 
     fn get_coins_by_owner(
         &self,
-        owner: Address,
+        owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
         let client = self.client.clone();
         let verifier = self.verifier.clone();
         async move {
             let resp = client
                 .get_coins_by_owner(GetCoinsByOwnerRequest {
-                    owner: owner.public_key().encode().to_vec(),
+                    owner: owner.to_bytes().to_vec(),
                 })
                 .await
                 .map_err(QueryError::from)?;

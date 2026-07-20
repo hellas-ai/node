@@ -1,5 +1,28 @@
-use crate::domain::{Address, Coin, Digest, ObjectId, Transaction};
+use crate::domain::{Coin, Digest, ObjectId, ObjectKind, SettlementKey, Transaction};
 use hellas_wire::{WireCode, WireStatus};
+
+const WRONG_OBJECT_KIND_V1_PREFIX: &str = "hellas.wrong-object-kind.v1;expected=";
+
+fn wrong_object_kind_message(expected: ObjectKind, actual: ObjectKind) -> String {
+    format!("{WRONG_OBJECT_KIND_V1_PREFIX}{expected};actual={actual}")
+}
+
+fn parse_object_kind(value: &str) -> Option<ObjectKind> {
+    match value {
+        "coin" => Some(ObjectKind::Coin),
+        "edge" => Some(ObjectKind::Edge),
+        _ => None,
+    }
+}
+
+fn parse_wrong_object_kind(message: &str) -> Option<QueryError> {
+    let fields = message.strip_prefix(WRONG_OBJECT_KIND_V1_PREFIX)?;
+    let (expected, actual) = fields.split_once(";actual=")?;
+    Some(QueryError::WrongObjectKind {
+        expected: parse_object_kind(expected)?,
+        actual: parse_object_kind(actual)?,
+    })
+}
 
 /// Flattened proposal metadata for the activity stream.
 #[derive(Clone, Debug)]
@@ -84,6 +107,11 @@ pub enum QueryError {
     ChannelClosed,
     #[error("state unavailable: {0}")]
     StateUnavailable(String),
+    #[error("wrong object kind: expected {expected}, found {actual}")]
+    WrongObjectKind {
+        expected: ObjectKind,
+        actual: ObjectKind,
+    },
     #[error("remote rpc error: {0}")]
     Remote(String),
     #[error("connection failed: {0}")]
@@ -99,6 +127,10 @@ impl From<QueryError> for WireStatus {
             QueryError::StateUnavailable(message) => {
                 WireStatus::new(WireCode::FailedPrecondition, message)
             }
+            QueryError::WrongObjectKind { expected, actual } => WireStatus::new(
+                WireCode::Aborted,
+                wrong_object_kind_message(expected, actual),
+            ),
             QueryError::Remote(message) => WireStatus::new(WireCode::Unavailable, message),
             QueryError::Connect(message) => WireStatus::new(WireCode::Unavailable, message),
         }
@@ -111,6 +143,10 @@ impl From<WireStatus> for QueryError {
             WireCode::FailedPrecondition | WireCode::OutOfRange => {
                 QueryError::StateUnavailable(status.message().to_string())
             }
+            // Chain RPC reserves Aborted for the versioned wrong-object-kind
+            // semantic until a later proto can carry these fields directly.
+            WireCode::Aborted => parse_wrong_object_kind(status.message())
+                .unwrap_or_else(|| QueryError::Remote(status.to_string())),
             _ => QueryError::Remote(status.to_string()),
         }
     }
@@ -153,6 +189,35 @@ pub trait LightClient: Clone + Send + Sync + 'static {
 
     fn get_coins_by_owner(
         &self,
-        owner: Address,
+        owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrong_kind_survives_wire_status_mapping() {
+        for (expected, actual) in [
+            (ObjectKind::Coin, ObjectKind::Edge),
+            (ObjectKind::Edge, ObjectKind::Coin),
+        ] {
+            let status = WireStatus::from(QueryError::WrongObjectKind { expected, actual });
+            assert_eq!(status.code(), WireCode::Aborted);
+            assert!(matches!(
+                QueryError::from(status),
+                QueryError::WrongObjectKind {
+                    expected: decoded_expected,
+                    actual: decoded_actual,
+                } if decoded_expected == expected && decoded_actual == actual
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_aborted_status_is_not_invented_as_a_wrong_kind() {
+        let err = QueryError::from(WireStatus::new(WireCode::Aborted, "not structured"));
+        assert!(matches!(err, QueryError::Remote(_)));
+    }
 }
