@@ -613,17 +613,20 @@ mod tests {
     async fn read_objects(
         database: &UtxoDatabase<tokio::Context>,
         ids: &BTreeSet<ObjectId>,
-    ) -> (BTreeMap<ObjectId, Coin>, BTreeSet<ObjectId>) {
+    ) -> (
+        BTreeMap<ObjectId, Coin>,
+        BTreeMap<ObjectId, hellas_kernel::Edge>,
+    ) {
         let reader = database.read().await;
         let mut coins = BTreeMap::new();
-        let mut edges = BTreeSet::new();
+        let mut edges = BTreeMap::new();
         for id in ids {
             match reader.get(id).await.expect("QMDB object read") {
                 Some(Object::Coin(coin)) => {
                     coins.insert(*id, coin);
                 }
-                Some(Object::Edge(_)) => {
-                    edges.insert(*id);
+                Some(Object::Edge(edge)) => {
+                    edges.insert(*id, edge);
                 }
                 None => {}
             }
@@ -635,19 +638,41 @@ mod tests {
         database: &UtxoDatabase<tokio::Context>,
         index: &OwnerIndex,
         known_ids: &[ObjectId],
+        known_edge_owners: &[SettlementKey],
     ) {
         let indexed_coins = index.all_coins_for_test();
-        let indexed_edge_ids = index.all_edge_ids_for_test();
+        let indexed_edges = index.all_edges_for_test();
         // QMDB does not expose a full object iterator. Probe every id derived
         // from the applied transaction graph plus every id known to the index,
         // so index-only extras cannot hide from this state-set comparison.
         let mut probe_ids: BTreeSet<_> = known_ids.iter().copied().collect();
         probe_ids.extend(indexed_coins.keys().copied());
-        probe_ids.extend(indexed_edge_ids.iter().copied());
+        probe_ids.extend(indexed_edges.keys().copied());
 
-        let (coins, edge_ids) = read_objects(database, &probe_ids).await;
+        let (coins, edges) = read_objects(database, &probe_ids).await;
         assert_eq!(indexed_coins, coins);
-        assert_eq!(indexed_edge_ids, edge_ids);
+        assert_eq!(
+            indexed_edges.keys().copied().collect::<BTreeSet<_>>(),
+            edges.keys().copied().collect::<BTreeSet<_>>()
+        );
+
+        let mut edge_owners: BTreeSet<_> = known_edge_owners.iter().copied().collect();
+        for (id, edge) in &edges {
+            let indexed = crate::owner_index::IndexedEdge::from(edge.parties());
+            assert_eq!(indexed_edges.get(id), Some(&indexed));
+            edge_owners.insert(indexed.maker);
+            edge_owners.insert(indexed.taker);
+        }
+        for owner in edge_owners {
+            let expected: Vec<_> = edges
+                .iter()
+                .filter_map(|(id, edge)| {
+                    let indexed = crate::owner_index::IndexedEdge::from(edge.parties());
+                    (owner == indexed.maker || owner == indexed.taker).then_some((*id, indexed))
+                })
+                .collect();
+            assert_eq!(index.get_edges_by_owner(&owner), expected);
+        }
     }
 
     #[test]
@@ -778,6 +803,14 @@ mod tests {
             known_ids.extend_from_slice(&timeout_payout_ids);
             known_ids.sort_unstable();
             known_ids.dedup();
+            let mutual_parties = mutual.terms.parties();
+            let timeout_parties = timeout.terms.parties();
+            let known_edge_owners = [
+                SettlementKey::from(mutual_parties.maker()),
+                SettlementKey::from(mutual_parties.taker()),
+                SettlementKey::from(timeout_parties.maker()),
+                SettlementKey::from(timeout_parties.taker()),
+            ];
             let genesis = index_genesis();
             let index = OwnerIndex::new(&genesis, allocations.clone());
             let first_txs = vec![
@@ -792,7 +825,7 @@ mod tests {
                 index.apply_finalized(&first_block),
                 Ok(ApplyOutcome::Applied)
             );
-            assert_index_matches_qmdb(&database, &index, &known_ids).await;
+            assert_index_matches_qmdb(&database, &index, &known_ids, &known_edge_owners).await;
 
             let second_txs = vec![Transaction::Kernel(mutual.mutual_close.clone())];
             let second_root =
@@ -802,7 +835,7 @@ mod tests {
                 index.apply_finalized(&second_block),
                 Ok(ApplyOutcome::Applied)
             );
-            assert_index_matches_qmdb(&database, &index, &known_ids).await;
+            assert_index_matches_qmdb(&database, &index, &known_ids, &known_edge_owners).await;
 
             let third_txs = Vec::new();
             let third_root =
@@ -812,7 +845,7 @@ mod tests {
                 index.apply_finalized(&third_block),
                 Ok(ApplyOutcome::Applied)
             );
-            assert_index_matches_qmdb(&database, &index, &known_ids).await;
+            assert_index_matches_qmdb(&database, &index, &known_ids, &known_edge_owners).await;
 
             let fourth_txs = vec![Transaction::Kernel(timeout.timeout_close.clone())];
             let fourth_root =
@@ -822,7 +855,7 @@ mod tests {
                 index.apply_finalized(&fourth_block),
                 Ok(ApplyOutcome::Applied)
             );
-            assert_index_matches_qmdb(&database, &index, &known_ids).await;
+            assert_index_matches_qmdb(&database, &index, &known_ids, &known_edge_owners).await;
         });
     }
 

@@ -94,6 +94,51 @@ pub struct OwnerCoins {
     pub coins: Vec<(ObjectId, u64)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeState {
+    pub value: u64,
+    pub reserve: u64,
+    pub close_fees: hellas_kernel::Fees,
+    pub timeout: hellas_kernel::BlockHeight,
+    pub maker: SettlementKey,
+    pub taker: SettlementKey,
+    pub terms_hash: hellas_kernel::TermsHash,
+}
+
+impl From<hellas_kernel::Edge> for EdgeState {
+    fn from(edge: hellas_kernel::Edge) -> Self {
+        let parties = edge.parties();
+        Self {
+            value: edge.value(),
+            reserve: edge.reserve(),
+            close_fees: edge.close_fees(),
+            timeout: edge.timeout(),
+            maker: SettlementKey::from(parties.maker()),
+            taker: SettlementKey::from(parties.taker()),
+            terms_hash: edge.terms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeLookup {
+    pub state_root: Digest,
+    pub edge: Option<EdgeState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeRecord {
+    pub object_id: ObjectId,
+    pub maker: SettlementKey,
+    pub taker: SettlementKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerEdges {
+    pub snapshot: LatestBlock,
+    pub edges: Vec<EdgeRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsensusInfo {
     pub validators: Vec<String>,
@@ -116,8 +161,6 @@ pub enum QueryError {
     Remote(String),
     #[error("connection failed: {0}")]
     Connect(String),
-    #[error("kernel transaction submission is unavailable until M5")]
-    KernelSubmissionUnsupported,
 }
 
 impl From<QueryError> for WireStatus {
@@ -135,10 +178,6 @@ impl From<QueryError> for WireStatus {
             ),
             QueryError::Remote(message) => WireStatus::new(WireCode::Unavailable, message),
             QueryError::Connect(message) => WireStatus::new(WireCode::Unavailable, message),
-            QueryError::KernelSubmissionUnsupported => WireStatus::new(
-                WireCode::Unimplemented,
-                "kernel transaction submission is unavailable until M5",
-            ),
         }
     }
 }
@@ -173,6 +212,12 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Coin>, QueryError>> + Send;
 
+    fn get_edge(
+        &self,
+        payload: Digest,
+        object_id: ObjectId,
+    ) -> impl Future<Output = Result<Option<EdgeLookup>, QueryError>> + Send;
+
     fn get_finalization(
         &self,
         payload: Digest,
@@ -197,6 +242,11 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         &self,
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send;
+
+    fn get_edges_by_owner(
+        &self,
+        owner: SettlementKey,
+    ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send;
 }
 
 #[cfg(test)]

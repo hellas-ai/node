@@ -61,11 +61,26 @@ pub enum QueryCommand {
         #[arg(long)]
         payload: String,
     },
+    /// Look up a kernel edge by object ID at an indexed payload
+    Edge {
+        /// Hex-encoded 32-byte object ID
+        #[arg(long)]
+        object_id: String,
+        /// Hex-encoded finalized payload to query
+        #[arg(long)]
+        payload: String,
+    },
     /// List all known validators
     Validators,
     /// List coins owned by an address
     CoinsByOwner {
-        /// Base58-encoded secp256r1 public key address
+        /// Base58-encoded settlement key
+        #[arg(long)]
+        owner: String,
+    },
+    /// List edge records associated with a settlement key
+    EdgesByOwner {
+        /// Base58-encoded settlement key
         #[arg(long)]
         owner: String,
     },
@@ -201,6 +216,31 @@ async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
                 None => println!("none"),
             }
         }
+        QueryCommand::Edge { object_id, payload } => {
+            let object_id = parse_hex_digest(&object_id, "object_id")?;
+            let payload = parse_hex_digest(&payload, "payload")?;
+            match client.get_edge(payload, object_id).await? {
+                Some(lookup) => {
+                    println!("state_root {}", hex::encode(lookup.state_root));
+                    match lookup.edge {
+                        Some(edge) => {
+                            println!("value {}", edge.value);
+                            println!("reserve {}", edge.reserve);
+                            println!("close_fee_base {}", edge.close_fees.base());
+                            println!("close_fee_slot {}", edge.close_fees.slot());
+                            println!("close_fee_proof {}", edge.close_fees.proof());
+                            println!("close_fee_lifetime {}", edge.close_fees.lifetime());
+                            println!("timeout {}", edge.timeout.get());
+                            println!("maker {}", edge.maker);
+                            println!("taker {}", edge.taker);
+                            println!("terms_hash {}", hex::encode(edge.terms_hash.to_bytes()));
+                        }
+                        None => println!("none"),
+                    }
+                }
+                None => println!("none"),
+            }
+        }
         QueryCommand::Validators => {
             for validator in client.get_validators().await? {
                 println!("{validator}");
@@ -224,6 +264,34 @@ async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
                     );
                     for (object_id, value) in owner_coins.coins {
                         println!("{} {}", hex::encode(object_id), value);
+                    }
+                }
+                None => println!("none"),
+            }
+        }
+        QueryCommand::EdgesByOwner { owner } => {
+            let owner = owner
+                .parse::<SettlementKey>()
+                .map_err(|err| anyhow::anyhow!("invalid owner settlement key: {err}"))?;
+            match client.get_edges_by_owner(owner).await? {
+                Some(owner_edges) => {
+                    println!("height {}", owner_edges.snapshot.height);
+                    println!("payload {}", hex::encode(owner_edges.snapshot.payload));
+                    println!(
+                        "state_root {}",
+                        hex::encode(owner_edges.snapshot.state_root)
+                    );
+                    println!(
+                        "finalization {}",
+                        hex::encode(owner_edges.snapshot.finalization)
+                    );
+                    for edge in owner_edges.edges {
+                        println!(
+                            "{} {} {}",
+                            hex::encode(edge.object_id),
+                            edge.maker,
+                            edge.taker
+                        );
                     }
                 }
                 None => println!("none"),

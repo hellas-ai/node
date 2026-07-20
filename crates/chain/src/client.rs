@@ -3,16 +3,18 @@ use crate::domain::{
     WebAuthnSignature as DomainWebAuthnSignature,
 };
 use crate::{
-    ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
-    LightClient, OwnerCoins, QueryError,
+    ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
+    FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
+use hellas_kernel::{Decode as _, Encode as _};
 use hellas_rpc::{
     call::StreamingCall,
     pb::{chain::*, services::light_client::LightClientClientImpl},
 };
 use hellas_wire::mux::MuxTransport;
 use p256::ecdsa::Signature as P256Signature;
+use std::collections::BTreeSet;
 
 /// Wire-backed light client that connects to a remote validator or relay.
 #[derive(Clone)]
@@ -130,6 +132,24 @@ impl LightClient for RemoteLightClient {
                 }
                 _ => Ok(None),
             }
+        }
+    }
+
+    fn get_edge(
+        &self,
+        payload: Digest,
+        object_id: ObjectId,
+    ) -> impl Future<Output = Result<Option<EdgeLookup>, QueryError>> + Send {
+        let client = self.client.clone();
+        async move {
+            let response = client
+                .get_edge(GetEdgeRequest {
+                    payload: payload.to_vec(),
+                    object_id: object_id.to_vec(),
+                })
+                .await
+                .map_err(QueryError::from)?;
+            edge_lookup_from_proto(response)
         }
     }
 
@@ -258,6 +278,113 @@ impl LightClient for RemoteLightClient {
             Ok(Some(OwnerCoins { snapshot, coins }))
         }
     }
+
+    fn get_edges_by_owner(
+        &self,
+        owner: SettlementKey,
+    ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send {
+        let client = self.client.clone();
+        let verifier = self.verifier.clone();
+        async move {
+            let resp = client
+                .get_edges_by_owner(GetEdgesByOwnerRequest {
+                    owner: owner.to_bytes().to_vec(),
+                })
+                .await
+                .map_err(QueryError::from)?;
+            owner_edges_from_proto(owner, resp, verifier.as_ref())
+        }
+    }
+}
+
+fn edge_lookup_from_proto(response: GetEdgeResponse) -> Result<Option<EdgeLookup>, QueryError> {
+    match response.state_root {
+        Some(state_root) => Ok(Some(EdgeLookup {
+            state_root: digest_from_wire(state_root, "state_root")?,
+            edge: response.edge.map(edge_state_from_proto).transpose()?,
+        })),
+        None if response.edge.is_none() => Ok(None),
+        None => Err(QueryError::Remote(
+            "GetEdgeResponse had an edge without a state root".to_string(),
+        )),
+    }
+}
+
+fn owner_edges_from_proto(
+    owner: SettlementKey,
+    response: GetEdgesByOwnerResponse,
+    verifier: Option<&ConsensusVerifier>,
+) -> Result<Option<OwnerEdges>, QueryError> {
+    let Some(snapshot) = response.snapshot else {
+        if response.edges.is_empty() {
+            return Ok(None);
+        }
+        return Err(QueryError::Remote(
+            "GetEdgesByOwnerResponse had edges without a snapshot".to_string(),
+        ));
+    };
+    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    let mut seen = BTreeSet::new();
+    let mut edges = Vec::with_capacity(response.edges.len());
+    for edge in response.edges {
+        let edge = EdgeRecord {
+            object_id: digest_from_wire(edge.object_id, "object_id")?,
+            maker: settlement_key_from_wire(edge.maker, "maker")?,
+            taker: settlement_key_from_wire(edge.taker, "taker")?,
+        };
+        if edge.maker != owner && edge.taker != owner {
+            return Err(QueryError::Remote(
+                "GetEdgesByOwnerResponse contained an edge unrelated to the requested owner"
+                    .to_string(),
+            ));
+        }
+        if !seen.insert(edge.object_id) {
+            return Err(QueryError::Remote(
+                "GetEdgesByOwnerResponse contained a duplicate object_id".to_string(),
+            ));
+        }
+        edges.push(edge);
+    }
+    Ok(Some(OwnerEdges { snapshot, edges }))
+}
+
+fn digest_from_wire(bytes: Vec<u8>, field: &'static str) -> Result<Digest, QueryError> {
+    let actual = bytes.len();
+    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
+        QueryError::Remote(format!("{field} was expected to be 32 bytes, got {actual}"))
+    })?;
+    Ok(Digest::from(raw))
+}
+
+fn settlement_key_from_wire(
+    bytes: Vec<u8>,
+    field: &'static str,
+) -> Result<SettlementKey, QueryError> {
+    let actual = bytes.len();
+    let raw: [u8; SettlementKey::LENGTH] = bytes.try_into().map_err(|_| {
+        QueryError::Remote(format!(
+            "{field} settlement key was expected to be {} bytes, got {actual}",
+            SettlementKey::LENGTH
+        ))
+    })?;
+    Ok(SettlementKey::from_bytes(raw))
+}
+
+fn edge_state_from_proto(edge: hellas_rpc::pb::chain::EdgeState) -> Result<EdgeState, QueryError> {
+    let fees = edge
+        .close_fees
+        .ok_or_else(|| QueryError::Remote("edge close_fees were missing".to_string()))?;
+    let terms_hash = hellas_kernel::TermsHash::decode_exact(&edge.terms_hash)
+        .map_err(|_| QueryError::Remote("terms_hash was not 32 canonical bytes".to_string()))?;
+    Ok(EdgeState {
+        value: edge.value,
+        reserve: edge.reserve,
+        close_fees: hellas_kernel::Fees::new(fees.base, fees.slot, fees.proof, fees.lifetime),
+        timeout: hellas_kernel::BlockHeight::new(edge.timeout),
+        maker: settlement_key_from_wire(edge.maker, "maker")?,
+        taker: settlement_key_from_wire(edge.taker, "taker")?,
+        terms_hash,
+    })
 }
 
 fn verified_latest_block_from_proto(
@@ -361,7 +488,12 @@ fn transaction_to_proto(tx: Transaction) -> Result<SubmitTxRequest, QueryError> 
                 }),
             })
         }
-        Transaction::Kernel(_) => return Err(QueryError::KernelSubmissionUnsupported),
+        Transaction::Kernel(tx) => {
+            let mut bytes = vec![0_u8; hellas_kernel::Tx::MAX_ENCODED_SIZE];
+            let written = tx.write_to(&mut bytes);
+            bytes.truncate(written);
+            submit_tx_request::Tx::KernelTx(bytes)
+        }
     };
     Ok(SubmitTxRequest { tx: Some(tx_oneof) })
 }
@@ -371,15 +503,47 @@ mod tests {
     use super::*;
     use hellas_kernel::test_support::valid_open_tx;
 
+    fn proto_snapshot() -> FinalizedSnapshot {
+        FinalizedSnapshot {
+            height: 7,
+            payload: Digest::from([2u8; 32]).to_vec(),
+            state_root: Digest::from([1u8; 32]).to_vec(),
+            finalization: vec![1],
+        }
+    }
+
     fn proto_block(block: Vec<u8>, payload: Digest) -> hellas_rpc::pb::chain::FinalizedBlock {
         hellas_rpc::pb::chain::FinalizedBlock {
             snapshot: Some(FinalizedSnapshot {
-                height: 7,
                 payload: payload.to_vec(),
-                state_root: Digest::from([1u8; 32]).to_vec(),
-                finalization: vec![1],
+                ..proto_snapshot()
             }),
             block,
+        }
+    }
+
+    fn proto_edge_state() -> hellas_rpc::pb::chain::EdgeState {
+        hellas_rpc::pb::chain::EdgeState {
+            value: 100,
+            reserve: 4,
+            close_fees: Some(KernelFees {
+                base: 1,
+                slot: 2,
+                proof: 3,
+                lifetime: 4,
+            }),
+            timeout: 9,
+            maker: vec![3; SettlementKey::LENGTH],
+            taker: vec![4; SettlementKey::LENGTH],
+            terms_hash: vec![5; hellas_kernel::TermsHash::LENGTH],
+        }
+    }
+
+    fn proto_edge_record(object_id: u8, maker: SettlementKey, taker: SettlementKey) -> EdgeEntry {
+        EdgeEntry {
+            object_id: vec![object_id; 32],
+            maker: maker.to_bytes().to_vec(),
+            taker: taker.to_bytes().to_vec(),
         }
     }
 
@@ -406,11 +570,115 @@ mod tests {
     }
 
     #[test]
-    fn kernel_transaction_is_not_encoded_into_legacy_submit_proto() {
-        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
-        assert!(matches!(
-            transaction_to_proto(tx),
-            Err(QueryError::KernelSubmissionUnsupported)
-        ));
+    fn kernel_transaction_uses_canonical_submit_payload() {
+        let kernel = valid_open_tx().expect("valid kernel open fixture");
+        let request = transaction_to_proto(Transaction::Kernel(kernel.clone()))
+            .expect("kernel transaction encodes");
+        let Some(submit_tx_request::Tx::KernelTx(bytes)) = request.tx else {
+            panic!("expected kernel transaction arm")
+        };
+        assert_eq!(hellas_kernel::Tx::decode_exact(&bytes), Ok(kernel));
+    }
+
+    #[test]
+    fn remote_edge_decode_rejects_malformed_presence_and_required_fields() {
+        assert!(
+            edge_lookup_from_proto(GetEdgeResponse {
+                edge: None,
+                state_root: Some(vec![0; 31]),
+            })
+            .is_err()
+        );
+
+        let mut missing_fees = proto_edge_state();
+        missing_fees.close_fees = None;
+        assert!(
+            edge_lookup_from_proto(GetEdgeResponse {
+                edge: Some(missing_fees),
+                state_root: Some(vec![0; 32]),
+            })
+            .is_err()
+        );
+
+        assert!(
+            edge_lookup_from_proto(GetEdgeResponse {
+                edge: Some(proto_edge_state()),
+                state_root: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_owner_edges_decode_records_and_reject_malformed_keys() {
+        let owner = SettlementKey::from_bytes([7; SettlementKey::LENGTH]);
+        let taker = SettlementKey::from_bytes([8; SettlementKey::LENGTH]);
+        let decoded = owner_edges_from_proto(
+            owner,
+            GetEdgesByOwnerResponse {
+                snapshot: Some(proto_snapshot()),
+                edges: vec![proto_edge_record(9, owner, taker)],
+            },
+            None,
+        )
+        .expect("valid owner edge response")
+        .expect("snapshot is present");
+        assert_eq!(
+            decoded.edges,
+            vec![EdgeRecord {
+                object_id: Digest::from([9; 32]),
+                maker: owner,
+                taker,
+            }]
+        );
+
+        let mut malformed_maker = proto_edge_record(9, owner, taker);
+        malformed_maker.maker.pop();
+        let mut malformed_taker = proto_edge_record(9, owner, taker);
+        malformed_taker.taker.pop();
+        for malformed in [malformed_maker, malformed_taker] {
+            assert!(
+                owner_edges_from_proto(
+                    owner,
+                    GetEdgesByOwnerResponse {
+                        snapshot: Some(proto_snapshot()),
+                        edges: vec![malformed],
+                    },
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_owner_edges_reject_duplicates_and_unrelated_records() {
+        let owner = SettlementKey::from_bytes([7; SettlementKey::LENGTH]);
+        let taker = SettlementKey::from_bytes([8; SettlementKey::LENGTH]);
+        let duplicate = proto_edge_record(9, owner, taker);
+        assert!(
+            owner_edges_from_proto(
+                owner,
+                GetEdgesByOwnerResponse {
+                    snapshot: Some(proto_snapshot()),
+                    edges: vec![duplicate.clone(), duplicate],
+                },
+                None,
+            )
+            .is_err()
+        );
+
+        let maker = SettlementKey::from_bytes([6; SettlementKey::LENGTH]);
+        assert!(
+            owner_edges_from_proto(
+                owner,
+                GetEdgesByOwnerResponse {
+                    snapshot: Some(proto_snapshot()),
+                    edges: vec![proto_edge_record(9, maker, taker)],
+                },
+                None,
+            )
+            .is_err()
+        );
     }
 }

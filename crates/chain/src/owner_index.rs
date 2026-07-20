@@ -7,9 +7,24 @@ use commonware_codec::Encode;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedEdge {
+    pub maker: SettlementKey,
+    pub taker: SettlementKey,
+}
+
+impl From<hellas_kernel::Parties> for IndexedEdge {
+    fn from(parties: hellas_kernel::Parties) -> Self {
+        Self {
+            maker: SettlementKey::from(parties.maker()),
+            taker: SettlementKey::from(parties.taker()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerCursor {
@@ -98,6 +113,26 @@ impl OwnerIndex {
         (state.cursor, state.get_coin(object_id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn get_edges_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, IndexedEdge)> {
+        self.get_edges_by_owner_snapshot(owner).1
+    }
+
+    pub fn get_edges_by_owner_snapshot(
+        &self,
+        owner: &SettlementKey,
+    ) -> (OwnerCursor, Vec<(ObjectId, IndexedEdge)>) {
+        let state = self.inner.read().expect("owner index lock poisoned");
+        let edges = state
+            .edges_by_owner
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| state.edges.get(id).map(|edge| (*id, *edge)))
+            .collect();
+        (state.cursor, edges)
+    }
+
     pub fn get_coins_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, u64)> {
         self.inner
             .read()
@@ -131,14 +166,12 @@ impl OwnerIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn all_edge_ids_for_test(&self) -> std::collections::BTreeSet<ObjectId> {
+    pub(crate) fn all_edges_for_test(&self) -> BTreeMap<ObjectId, IndexedEdge> {
         self.inner
             .read()
             .expect("owner index lock poisoned")
-            .kinds
-            .iter()
-            .filter_map(|(id, kind)| (*kind == ObjectKind::Edge).then_some(*id))
-            .collect()
+            .edges
+            .clone()
     }
 }
 
@@ -148,6 +181,8 @@ struct State {
     genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
     by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
+    edges: BTreeMap<ObjectId, IndexedEdge>,
+    edges_by_owner: BTreeMap<SettlementKey, BTreeSet<ObjectId>>,
     kinds: BTreeMap<ObjectId, ObjectKind>,
 }
 
@@ -162,6 +197,8 @@ impl State {
             genesis_allocations,
             coins: BTreeMap::new(),
             by_owner: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            edges_by_owner: BTreeMap::new(),
             kinds: BTreeMap::new(),
         }
     }
@@ -249,22 +286,11 @@ impl State {
                 for id in funding.maker().iter().chain(funding.taker()) {
                     self.remove_coin(&coin_object_id(*id))?;
                 }
-                self.kinds.insert(edge_id, ObjectKind::Edge);
-                Ok(())
+                self.insert_edge(edge_id, terms.parties().into())
             }
             hellas_kernel::Tx::Close { input, outputs, .. } => {
                 let edge_id = edge_object_id(*input);
-                match self.kinds.remove(&edge_id) {
-                    Some(ObjectKind::Edge) => {}
-                    Some(actual) => {
-                        return Err(OwnerIndexError::WrongObjectKind {
-                            id: edge_id,
-                            expected: ObjectKind::Edge,
-                            actual,
-                        });
-                    }
-                    None => return Err(OwnerIndexError::ObjectNotFound { id: edge_id }),
-                }
+                self.remove_edge(&edge_id)?;
                 for (id, payout) in hellas_kernel::Tx::close_output_ids(*input, outputs)
                     .iter()
                     .zip(outputs)
@@ -439,6 +465,62 @@ impl State {
         self.kinds.remove(id);
         Ok(coin)
     }
+
+    fn insert_edge(&mut self, id: ObjectId, edge: IndexedEdge) -> Result<(), OwnerIndexError> {
+        if self.kinds.contains_key(&id) {
+            return Err(OwnerIndexError::OutputCollision { id });
+        }
+        self.edges_by_owner
+            .entry(edge.maker)
+            .or_default()
+            .insert(id);
+        self.edges_by_owner
+            .entry(edge.taker)
+            .or_default()
+            .insert(id);
+        self.edges.insert(id, edge);
+        self.kinds.insert(id, ObjectKind::Edge);
+        Ok(())
+    }
+
+    fn remove_edge(&mut self, id: &ObjectId) -> Result<IndexedEdge, OwnerIndexError> {
+        let edge = match self.edges.remove(id) {
+            Some(edge) => edge,
+            None => {
+                return match self.kinds.get(id).copied() {
+                    Some(actual @ ObjectKind::Coin) => Err(OwnerIndexError::WrongObjectKind {
+                        id: *id,
+                        expected: ObjectKind::Edge,
+                        actual,
+                    }),
+                    Some(ObjectKind::Edge) | None => {
+                        Err(OwnerIndexError::ObjectNotFound { id: *id })
+                    }
+                };
+            }
+        };
+        for owner in [edge.maker, edge.taker]
+            .into_iter()
+            .take(if edge.maker == edge.taker { 1 } else { 2 })
+        {
+            let remove_owner = {
+                let owned = self
+                    .edges_by_owner
+                    .get_mut(&owner)
+                    .expect("owner index missing active edge owner");
+                assert!(
+                    owned.remove(id),
+                    "owner index active edge missing from owner set"
+                );
+                owned.is_empty()
+            };
+            if remove_owner {
+                self.edges_by_owner.remove(&owner);
+            }
+        }
+        self.kinds.remove(id);
+        Ok(edge)
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +535,10 @@ mod tests {
     use commonware_cryptography::{Digest as _, Signer as _};
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::non_empty_range;
+    use hellas_kernel::test_support::SoftPasskey;
+    use hellas_kernel::{
+        Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, Terms, Tx,
+    };
 
     fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
         index_block(parent, commonware_cryptography::sha256::Digest::EMPTY, txs)
@@ -543,19 +629,28 @@ mod tests {
     }
 
     #[test]
-    fn indexes_kernel_kinds_and_coin_transitions_without_qmdb_classification() {
+    fn indexes_kernel_edge_parties_and_coin_transitions() {
         let genesis = genesis();
         let fixture = kernel_fixture(10).expect("kernel fixture");
         let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
         let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
         let edge_id = edge_object_id(fixture.edge);
+        let indexed_edge = IndexedEdge::from(fixture.terms.parties());
         assert_eq!(
             indexer.apply_finalized(&open_block),
             Ok(ApplyOutcome::Applied)
         );
         assert_eq!(
-            indexer.all_edge_ids_for_test(),
-            [edge_id].into_iter().collect()
+            indexer.all_edges_for_test().get(&edge_id).copied(),
+            Some(indexed_edge)
+        );
+        assert_eq!(
+            indexer.get_edges_by_owner(&indexed_edge.maker),
+            vec![(edge_id, indexed_edge)]
+        );
+        assert_eq!(
+            indexer.get_edges_by_owner(&indexed_edge.taker),
+            vec![(edge_id, indexed_edge)]
         );
         assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
         assert_eq!(indexer.get_coin(&genesis_object_id(1)), Ok(None));
@@ -576,7 +671,9 @@ mod tests {
             indexer.apply_finalized(&close_block),
             Ok(ApplyOutcome::Applied)
         );
-        assert!(indexer.all_edge_ids_for_test().is_empty());
+        assert_eq!(indexer.all_edges_for_test().get(&edge_id).copied(), None);
+        assert!(indexer.get_edges_by_owner(&indexed_edge.maker).is_empty());
+        assert!(indexer.get_edges_by_owner(&indexed_edge.taker).is_empty());
         for (id, payout) in fixture.payout_ids().iter().zip(&fixture.outputs) {
             let id = coin_object_id(*id);
             assert_eq!(
@@ -587,6 +684,103 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn same_party_edge_has_one_owner_membership_and_closes_cleanly() {
+        let genesis = genesis();
+        let template = kernel_fixture(10).expect("kernel fixture");
+        let passkey = SoftPasskey::from_secret_scalar([11; 32]).expect("same-party passkey");
+        let party = passkey.party_key();
+        let owner = SettlementKey::from(party);
+        let mut payout_values = [Payout::default(); MAX_EDGE_OUTPUTS];
+        *payout_values.first_mut().expect("first payout slot") = Payout::new(party, 40);
+        *payout_values.get_mut(1).expect("second payout slot") = Payout::new(party, 60);
+        let outputs = List::take(payout_values, 2);
+        let terms = Terms::basic(
+            template.terms.protocol(),
+            Parties::new(party, party),
+            template.terms.timeout(),
+            outputs.clone(),
+        );
+        let funding = template.funding;
+        let edge = Tx::edge_id_of(&funding, &terms);
+        let open_hash = Tx::open_hash(&funding, &terms);
+        let open = Tx::open(
+            funding,
+            terms.clone(),
+            Auth::webauthn(passkey.sign(open_hash).expect("maker assertion")),
+            Auth::webauthn(passkey.sign(open_hash).expect("taker assertion")),
+        );
+        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+        let close = Tx::close(
+            edge,
+            Proof::mutual(
+                Auth::webauthn(passkey.sign(close_hash).expect("maker close assertion")),
+                Auth::webauthn(passkey.sign(close_hash).expect("taker close assertion")),
+            ),
+            outputs,
+        );
+        let indexer = OwnerIndex::new(&genesis, vec![(owner, 40), (owner, 60)]);
+        let open_block = block(&genesis, vec![Transaction::Kernel(open)]);
+        let edge_id = edge_object_id(edge);
+        let indexed = IndexedEdge::from(terms.parties());
+
+        assert_eq!(
+            indexer.apply_finalized(&open_block),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(indexer.get_edges_by_owner(&owner), vec![(edge_id, indexed)]);
+
+        let close_block = block(&open_block, vec![Transaction::Kernel(close)]);
+        assert_eq!(
+            indexer.apply_finalized(&close_block),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert!(indexer.get_edges_by_owner(&owner).is_empty());
+        assert_eq!(indexer.all_edges_for_test().get(&edge_id).copied(), None);
+    }
+
+    #[test]
+    fn duplicate_kernel_open_is_atomic_output_collision() {
+        let genesis = genesis();
+        let fixture = kernel_fixture(10).expect("kernel fixture");
+        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
+        assert_eq!(
+            indexer.apply_finalized(&open_block),
+            Ok(ApplyOutcome::Applied)
+        );
+        let cursor = indexer.cursor();
+        let edge_id = edge_object_id(fixture.edge);
+        let edge = indexer.all_edges_for_test().get(&edge_id).copied();
+        let maker_edges = indexer.get_edges_by_owner(&fixture.maker);
+
+        let duplicate = block(&open_block, vec![Transaction::Kernel(fixture.open)]);
+        assert_eq!(
+            indexer.apply_finalized(&duplicate),
+            Err(OwnerIndexError::OutputCollision { id: edge_id })
+        );
+        assert_eq!(indexer.cursor(), cursor);
+        assert_eq!(indexer.all_edges_for_test().get(&edge_id).copied(), edge);
+        assert_eq!(indexer.get_edges_by_owner(&fixture.maker), maker_edges);
+    }
+
+    #[test]
+    fn close_of_unknown_edge_is_typed_and_does_not_mutate() {
+        let genesis = genesis();
+        let fixture = kernel_fixture(10).expect("kernel fixture");
+        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let edge_id = edge_object_id(fixture.edge);
+        let close_block = block(&genesis, vec![Transaction::Kernel(fixture.mutual_close)]);
+
+        assert_eq!(
+            indexer.apply_finalized(&close_block),
+            Err(OwnerIndexError::ObjectNotFound { id: edge_id })
+        );
+        assert_eq!(indexer.cursor().height, 0);
+        assert_eq!(indexer.all_edges_for_test().get(&edge_id).copied(), None);
+        assert!(indexer.get_edges_by_owner(&fixture.maker).is_empty());
     }
 
     #[test]
