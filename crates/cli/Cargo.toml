@@ -24,7 +24,13 @@ evaluate = [
 candle = ["evaluate", "hellas-executor/candle"]
 candle-cuda = ["candle", "hellas-executor/candle-cuda"]
 candle-metal = ["candle", "hellas-executor/candle-metal"]
-chain = ["dep:hellas-chain", "hellas-chain/client"]
+chain = [
+    "dep:hellas-chain",
+    "dep:hellas-kernel",
+    "hellas-chain/client",
+    "hellas-kernel/secp256k1",
+    "hellas-kernel/webauthn",
+]
 indexer = ["chain", "hellas-chain/indexer"]
 validator = ["indexer", "hellas-chain/validator"]
 
@@ -57,6 +63,7 @@ hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
+hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",

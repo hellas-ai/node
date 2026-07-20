@@ -90,7 +90,7 @@ pub use list::List;
 pub use object::{Coin, Edge, Genesis, Parties};
 pub use primitive::{CoinId, EdgeId, Key, Party, PayloadHash, ProtocolCode, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]
-pub use secp256k1::Secp256k1Verifier;
+pub use secp256k1::{Secp256k1Signer, Secp256k1SignerError, Secp256k1Verifier};
 pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::Terms;
@@ -100,4 +100,6 @@ pub use view::{Snapshot, View};
 #[cfg(feature = "test-support")]
 pub use webauthn::test_support;
 #[cfg(feature = "webauthn")]
-pub use webauthn::{WebAuthnError, p256_key, verify_webauthn_assertion};
+pub use webauthn::{
+    SoftPasskey, SoftPasskeyError, WebAuthnError, p256_key, verify_webauthn_assertion,
+};

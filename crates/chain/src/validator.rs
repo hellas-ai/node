@@ -954,11 +954,18 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
         let marshal_handle = marshal_actor.start(stateful_mailbox.clone(), buffer, resolver);
         let stateful_handle = stateful_actor.start();
-        let engine_handle = simplex_engine.start(vote, certificate, consensus_resolver);
 
         let databases = stateful_mailbox.subscribe_databases().await;
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
+
+        // Simplex can immediately ask Marshal for its proposal parent. That
+        // lookup uses the broadcast buffer, whose peer subscription is served
+        // only after the network starts below. If it overtakes Stateful's
+        // startup block lookup, startup waits in a circle. Start consensus only
+        // once the application database handoff is complete.
+        let engine_handle = simplex_engine.start(vote, certificate, consensus_resolver);
+
         let rpc_handle = if let Some(addr) = ws_bind_addr {
             let light_client = LocalLightClient::new(
                 databases.clone(),

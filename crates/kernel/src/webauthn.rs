@@ -35,9 +35,13 @@ use crate::{
     tx::WebAuthnAssertion,
 };
 
+mod soft_passkey;
+
 /// Deterministic passkey builders and v1 wire fixtures for integration tests.
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+pub use soft_passkey::{SoftPasskey, SoftPasskeyError};
 
 const MIN_AUTH_DATA_LEN: usize = 37;
 const UP: u8 = 0x01;

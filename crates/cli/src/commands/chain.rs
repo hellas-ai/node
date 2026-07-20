@@ -1,10 +1,15 @@
-#[cfg(any(feature = "indexer", feature = "validator"))]
-use std::path::PathBuf;
+use std::time::Duration;
+use std::{fs, path::PathBuf};
 
-use clap::Subcommand;
-use hellas_chain::domain::{Digest, SettlementKey};
-use hellas_chain::{FinalizedBlockQuery, LightClient as _, client::RemoteLightClient};
+use clap::{Args, Subcommand, ValueEnum};
+use hellas_chain::domain::{Digest, SettlementKey, Transaction};
+use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
+use hellas_kernel::{
+    BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
+    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
+};
 
+use self::signer::{AuthScheme, DevSigner};
 use crate::commands::CliResult;
 
 #[derive(Subcommand)]
@@ -17,6 +22,10 @@ pub enum ChainCommand {
         #[command(subcommand)]
         query: QueryCommand,
     },
+    /// Sign and submit a kernel edge Open transaction
+    Open(OpenArgs),
+    /// Sign and submit a kernel edge Close transaction
+    Close(CloseArgs),
     /// Run or manage a local indexer
     #[cfg(feature = "indexer")]
     Indexer {
@@ -29,6 +38,80 @@ pub enum ChainCommand {
         #[command(subcommand)]
         command: ValidatorCommand,
     },
+}
+
+#[derive(Args)]
+pub struct OpenArgs {
+    /// Chain light-client RPC endpoint
+    #[arg(long)]
+    rpc: String,
+    /// Maker secret-scalar file path (32 raw bytes or 64 hex digits)
+    #[arg(long)]
+    maker_key: PathBuf,
+    /// Maker authorization scheme
+    #[arg(long, value_enum)]
+    maker_auth: AuthScheme,
+    /// Taker secret-scalar file path (32 raw bytes or 64 hex digits)
+    #[arg(long)]
+    taker_key: PathBuf,
+    /// Taker authorization scheme
+    #[arg(long, value_enum)]
+    taker_auth: AuthScheme,
+    /// Maker funding coin ID; repeat or comma-separate values
+    #[arg(long = "maker-funding", value_delimiter = ',')]
+    maker_funding: Vec<String>,
+    /// Taker funding coin ID; repeat or comma-separate values
+    #[arg(long = "taker-funding", value_delimiter = ',')]
+    taker_funding: Vec<String>,
+    /// Chain-version-local protocol code
+    #[arg(long)]
+    protocol: u8,
+    /// Earliest block height at which the timeout close is valid
+    #[arg(long)]
+    timeout: u64,
+    /// Committed timeout payout as SETTLEMENT_KEY:VALUE; repeat or comma-separate values
+    #[arg(long = "timeout-payout", value_delimiter = ',')]
+    timeout_payouts: Vec<String>,
+    /// Write the exact canonical Terms reveal needed by a future timeout close
+    #[arg(long)]
+    terms_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct CloseArgs {
+    /// Chain light-client RPC endpoint
+    #[arg(long)]
+    rpc: String,
+    /// Hex-encoded kernel edge ID
+    #[arg(long)]
+    edge_id: String,
+    /// Close proof kind
+    #[arg(long, value_enum)]
+    kind: CloseKind,
+    /// Close payout as SETTLEMENT_KEY:VALUE; repeat or comma-separate values
+    #[arg(long = "payout", value_delimiter = ',')]
+    payouts: Vec<String>,
+    /// Maker secret-scalar file path; required for a mutual close
+    #[arg(long)]
+    maker_key: Option<PathBuf>,
+    /// Maker authorization scheme; required for a mutual close
+    #[arg(long, value_enum)]
+    maker_auth: Option<AuthScheme>,
+    /// Taker secret-scalar file path; required for a mutual close
+    #[arg(long)]
+    taker_key: Option<PathBuf>,
+    /// Taker authorization scheme; required for a mutual close
+    #[arg(long, value_enum)]
+    taker_auth: Option<AuthScheme>,
+    /// Canonical Terms file written by Open; required for a timeout close
+    #[arg(long)]
+    terms_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CloseKind {
+    Mutual,
+    Timeout,
 }
 
 #[derive(Subcommand)]
@@ -153,6 +236,8 @@ pub enum ValidatorCommand {
 pub async fn run(command: ChainCommand) -> CliResult {
     match command {
         ChainCommand::Query { rpc, query } => run_query(rpc, query).await,
+        ChainCommand::Open(args) => run_open(args).await,
+        ChainCommand::Close(args) => run_close(args).await,
         #[cfg(feature = "indexer")]
         ChainCommand::Indexer { command } => run_indexer(command).await,
         #[cfg(feature = "validator")]
@@ -171,9 +256,7 @@ pub fn command_owns_tracing(command: &ChainCommand) -> bool {
 }
 
 async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
-    let client = RemoteLightClient::connect(rpc).await?;
-    let consensus_info = client.get_consensus_info().await?;
-    let client = client.with_consensus_info(&consensus_info)?;
+    let client = connect_verified(rpc).await?;
     match query {
         QueryCommand::LatestBlock => match client.get_latest_block().await? {
             Some(block) => {
@@ -301,6 +384,223 @@ async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
     Ok(())
 }
 
+async fn run_open(args: OpenArgs) -> CliResult {
+    let maker = DevSigner::load(args.maker_auth, &args.maker_key)?;
+    let taker = DevSigner::load(args.taker_auth, &args.taker_key)?;
+    let funding = Funding::new(
+        parse_coin_ids(&args.maker_funding, "maker funding")?,
+        parse_coin_ids(&args.taker_funding, "taker funding")?,
+    );
+    let timeout_outputs = parse_payouts(&args.timeout_payouts, "timeout payout")?;
+    let terms = Terms::basic(
+        ProtocolCode::new(args.protocol),
+        Parties::new(maker.party_key(), taker.party_key()),
+        BlockHeight::new(args.timeout),
+        timeout_outputs,
+    );
+    let edge_id = Tx::edge_id_of(&funding, &terms);
+    let open_hash = Tx::open_hash(&funding, &terms);
+    let tx = Tx::open(
+        funding,
+        terms.clone(),
+        maker.sign(open_hash)?,
+        taker.sign(open_hash)?,
+    );
+
+    // Persist the reveal before submission. A failed submission leaves only a
+    // harmless public terms file; a successful submission can never strand a
+    // timeout edge because its reveal failed to reach disk afterward.
+    if let Some(path) = args.terms_out {
+        write_terms(&path, &terms)?;
+    }
+    connect_verified(args.rpc)
+        .await?
+        .submit_tx(Transaction::Kernel(tx))
+        .await?;
+
+    println!("edge_id {}", hex::encode(edge_id.to_bytes()));
+    println!("terms_hash {}", hex::encode(terms.hash().to_bytes()));
+    println!("maker {}", SettlementKey::from(maker.party_key()));
+    println!("taker {}", SettlementKey::from(taker.party_key()));
+    Ok(())
+}
+
+async fn run_close(args: CloseArgs) -> CliResult {
+    let edge_id = parse_edge_id(&args.edge_id)?;
+    let outputs = parse_payouts(&args.payouts, "payout")?;
+    let client = connect_verified(args.rpc).await?;
+    let edge = get_live_edge(&client, edge_id).await?;
+
+    let proof = match args.kind {
+        CloseKind::Mutual => {
+            if args.terms_file.is_some() {
+                anyhow::bail!("--terms-file is only valid with --kind timeout");
+            }
+            let maker = load_mutual_signer("maker", args.maker_auth, args.maker_key.as_deref())?;
+            let taker = load_mutual_signer("taker", args.taker_auth, args.taker_key.as_deref())?;
+            if SettlementKey::from(maker.party_key()) != edge.maker {
+                anyhow::bail!("maker key file does not control the live edge maker");
+            }
+            if SettlementKey::from(taker.party_key()) != edge.taker {
+                anyhow::bail!("taker key file does not control the live edge taker");
+            }
+            let hash =
+                Tx::payload_hash(edge_id, KernelCloseKind::Mutual, edge.terms_hash, &outputs);
+            Proof::mutual(maker.sign(hash)?, taker.sign(hash)?)
+        }
+        CloseKind::Timeout => {
+            if args.maker_key.is_some()
+                || args.maker_auth.is_some()
+                || args.taker_key.is_some()
+                || args.taker_auth.is_some()
+            {
+                anyhow::bail!("signer options are only valid with --kind mutual");
+            }
+            let path = args
+                .terms_file
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--terms-file is required with --kind timeout"))?;
+            let terms = read_terms(path)?;
+            if terms.hash() != edge.terms_hash {
+                anyhow::bail!("terms file does not match the live edge commitment");
+            }
+            if terms.timeout_outputs() != &outputs {
+                anyhow::bail!("timeout payouts do not match the committed Terms file");
+            }
+            Proof::timeout(terms)
+        }
+    };
+
+    let output_ids = Tx::close_output_ids(edge_id, &outputs);
+    client
+        .submit_tx(Transaction::Kernel(Tx::close(edge_id, proof, outputs)))
+        .await?;
+    println!("edge_id {}", hex::encode(edge_id.to_bytes()));
+    for output_id in output_ids {
+        println!("payout_id {}", hex::encode(output_id.to_bytes()));
+    }
+    Ok(())
+}
+
+async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
+    let client = RemoteLightClient::connect(rpc).await?;
+    let consensus_info = client.get_consensus_info().await?;
+    Ok(client.with_consensus_info(&consensus_info)?)
+}
+
+async fn get_live_edge(
+    client: &RemoteLightClient,
+    edge_id: EdgeId,
+) -> CliResult<hellas_chain::EdgeState> {
+    const SNAPSHOT_RETRIES: usize = 40;
+    const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+    for attempt in 0..SNAPSHOT_RETRIES {
+        let latest = client
+            .get_latest_block()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("chain has no finalized block"))?;
+        match client
+            .get_edge(latest.payload, Digest::from(edge_id.to_bytes()))
+            .await
+        {
+            Ok(Some(lookup)) => {
+                return lookup
+                    .edge
+                    .ok_or_else(|| anyhow::anyhow!("edge does not exist"));
+            }
+            Ok(None) => {}
+            Err(QueryError::StateUnavailable(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if attempt + 1 < SNAPSHOT_RETRIES {
+            tokio::time::sleep(SNAPSHOT_RETRY_DELAY).await;
+        }
+    }
+    Err(anyhow::anyhow!("edge state is not indexed yet"))
+}
+
+fn load_mutual_signer(
+    party: &'static str,
+    scheme: Option<AuthScheme>,
+    path: Option<&std::path::Path>,
+) -> CliResult<DevSigner> {
+    let scheme = scheme.ok_or_else(|| anyhow::anyhow!("--{party}-auth is required"))?;
+    let path = path.ok_or_else(|| anyhow::anyhow!("--{party}-key is required"))?;
+    DevSigner::load(scheme, path)
+}
+
+fn parse_coin_ids(
+    raw: &[String],
+    field: &'static str,
+) -> CliResult<List<CoinId, MAX_PARTY_INPUTS>> {
+    if raw.len() > MAX_PARTY_INPUTS {
+        anyhow::bail!(
+            "{field} accepts at most {MAX_PARTY_INPUTS} coin ids, got {}",
+            raw.len()
+        );
+    }
+    let mut ids = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS];
+    for (slot, value) in ids.iter_mut().zip(raw) {
+        *slot = CoinId::from_bytes(parse_hex_32(value, field)?);
+    }
+    List::new(ids, raw.len()).ok_or_else(|| anyhow::anyhow!("{field} exceeded its kernel bound"))
+}
+
+fn parse_payouts(raw: &[String], field: &'static str) -> CliResult<List<Payout, MAX_EDGE_OUTPUTS>> {
+    if raw.len() > MAX_EDGE_OUTPUTS {
+        anyhow::bail!(
+            "{field} accepts at most {MAX_EDGE_OUTPUTS} entries, got {}",
+            raw.len()
+        );
+    }
+    let mut payouts = [Payout::default(); MAX_EDGE_OUTPUTS];
+    for (slot, value) in payouts.iter_mut().zip(raw) {
+        let (owner, value) = value
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("{field} must have the form SETTLEMENT_KEY:VALUE"))?;
+        let owner = owner
+            .parse::<SettlementKey>()
+            .map_err(|error| anyhow::anyhow!("invalid {field} settlement key: {error}"))?;
+        let value = value
+            .parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("invalid {field} value: {error}"))?;
+        *slot = Payout::new(owner.into_kernel(), value);
+    }
+    List::new(payouts, raw.len())
+        .ok_or_else(|| anyhow::anyhow!("{field} exceeded its kernel bound"))
+}
+
+fn parse_edge_id(raw: &str) -> CliResult<EdgeId> {
+    Ok(EdgeId::from_bytes(parse_hex_32(raw, "edge_id")?))
+}
+
+fn parse_hex_32(raw: &str, field: &'static str) -> CliResult<[u8; 32]> {
+    let bytes =
+        hex::decode(raw).map_err(|error| anyhow::anyhow!("bad hex for {field}: {error}"))?;
+    let actual = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{field} must be 32 bytes, got {actual}"))
+}
+
+fn write_terms(path: &std::path::Path, terms: &Terms) -> CliResult {
+    let mut bytes = vec![0_u8; Terms::MAX_ENCODED_SIZE];
+    let len = terms.write_to(&mut bytes);
+    bytes.truncate(len);
+    fs::write(path, bytes)
+        .map_err(|error| anyhow::anyhow!("failed to write terms file {}: {error}", path.display()))
+}
+
+fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
+    let bytes = fs::read(path).map_err(|error| {
+        anyhow::anyhow!("failed to read terms file {}: {error}", path.display())
+    })?;
+    Terms::decode_exact(&bytes).map_err(|error| {
+        anyhow::anyhow!("invalid canonical terms file {}: {error:?}", path.display())
+    })
+}
+
 #[cfg(feature = "indexer")]
 async fn run_indexer(command: IndexerCommand) -> CliResult {
     match command {
@@ -372,12 +672,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
 }
 
 fn parse_hex_digest(raw: &str, field: &'static str) -> CliResult<Digest> {
-    let bytes = hex::decode(raw).map_err(|err| anyhow::anyhow!("bad hex for {field}: {err}"))?;
-    let len = bytes.len();
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("{field} must be 32 bytes, got {len}"))?;
-    Ok(Digest::from(raw))
+    Ok(Digest::from(parse_hex_32(raw, field)?))
 }
 
 fn finalized_block_query(
@@ -393,5 +688,190 @@ fn finalized_block_query(
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
             "--height and --payload are mutually exclusive"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_kernel::Key;
+
+    #[test]
+    fn canonical_terms_file_round_trips_and_rejects_trailing_bytes() {
+        let owner = SettlementKey::from(Key::from_bytes([2; Key::LENGTH]));
+        let payouts =
+            parse_payouts(&[format!("{owner}:42")], "timeout payout").expect("valid payout");
+        let terms = Terms::basic(
+            ProtocolCode::new(7),
+            Parties::new(owner.into_kernel(), owner.into_kernel()),
+            BlockHeight::new(99),
+            payouts,
+        );
+        let directory = tempfile::tempdir().expect("temporary terms directory");
+        let path = directory.path().join("edge.terms");
+        write_terms(&path, &terms).expect("write terms");
+        assert_eq!(read_terms(&path).expect("read terms"), terms);
+
+        let mut bytes = fs::read(&path).expect("read terms bytes");
+        bytes.push(0);
+        fs::write(&path, bytes).expect("write trailing byte");
+        assert!(read_terms(&path).is_err());
+    }
+
+    #[test]
+    fn funding_and_payout_parsers_enforce_kernel_bounds() {
+        let too_many = vec!["00".repeat(CoinId::LENGTH); MAX_PARTY_INPUTS + 1];
+        assert!(parse_coin_ids(&too_many, "maker funding").is_err());
+
+        let owner = SettlementKey::from(Key::from_bytes([2; Key::LENGTH]));
+        let too_many = vec![format!("{owner}:1"); MAX_EDGE_OUTPUTS + 1];
+        assert!(parse_payouts(&too_many, "payout").is_err());
+    }
+}
+
+mod signer {
+    //! File-backed development signers for kernel settlement transactions.
+    //!
+    //! This is deliberately a CLI-edge facility, not wallet key custody. Secret
+    //! material is read only from the file paths supplied to the chain commands;
+    //! no command accepts a scalar value directly.
+
+    use std::{fs, path::Path};
+
+    use anyhow::{Context as _, Result, anyhow};
+    use clap::ValueEnum;
+    use hellas_kernel::{Auth, Key, PayloadHash, Secp256k1Signer, SoftPasskey};
+
+    const SCALAR_LENGTH: usize = 32;
+
+    /// Kernel authorization scheme produced by the development signer.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+    pub(crate) enum AuthScheme {
+        /// Portable P-256 WebAuthn envelope defined by the kernel wire v1 spec.
+        Webauthn,
+        /// Compact secp256k1 ECDSA signature over the canonical payload hash.
+        Native,
+    }
+
+    /// One file-backed kernel signer.
+    pub(crate) enum DevSigner {
+        Webauthn(SoftPasskey),
+        Native(Secp256k1Signer),
+    }
+
+    impl DevSigner {
+        /// Loads one exact 32-byte scalar from `path`.
+        ///
+        /// Files may contain either 32 raw bytes or 64 ASCII hexadecimal digits
+        /// with surrounding ASCII whitespace. The scalar itself is never accepted
+        /// as a command-line value.
+        pub(crate) fn load(scheme: AuthScheme, path: &Path) -> Result<Self> {
+            let scalar = read_scalar(path)?;
+            match scheme {
+                AuthScheme::Webauthn => Self::webauthn(scalar),
+                AuthScheme::Native => Self::native(scalar),
+            }
+        }
+
+        fn webauthn(scalar: [u8; SCALAR_LENGTH]) -> Result<Self> {
+            SoftPasskey::from_secret_scalar(scalar)
+                .map(Self::Webauthn)
+                .map_err(|_| anyhow!("P-256 key file contains an invalid secret scalar"))
+        }
+
+        fn native(scalar: [u8; SCALAR_LENGTH]) -> Result<Self> {
+            Secp256k1Signer::from_secret_scalar(scalar)
+                .map(Self::Native)
+                .map_err(|_| anyhow!("secp256k1 key file contains an invalid secret scalar"))
+        }
+
+        /// Returns the compressed settlement key controlled by this signer.
+        pub(crate) const fn party_key(&self) -> Key {
+            match self {
+                Self::Webauthn(signer) => signer.party_key(),
+                Self::Native(signer) => signer.party_key(),
+            }
+        }
+
+        /// Signs one canonical kernel authorization payload.
+        pub(crate) fn sign(&self, hash: PayloadHash) -> Result<Auth> {
+            match self {
+                Self::Webauthn(signer) => signer
+                    .sign(hash)
+                    .map(Auth::webauthn)
+                    .map_err(|error| anyhow!("kernel WebAuthn signing failed: {error:?}")),
+                Self::Native(signer) => Ok(Auth::native(signer.sign(hash))),
+            }
+        }
+    }
+
+    fn read_scalar(path: &Path) -> Result<[u8; SCALAR_LENGTH]> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read key file {}", path.display()))?;
+        let trimmed = bytes.trim_ascii();
+        let material =
+            if trimmed.len() == 2 * SCALAR_LENGTH && trimmed.iter().all(u8::is_ascii_hexdigit) {
+                hex::decode(trimmed)
+                    .with_context(|| format!("invalid hex key file {}", path.display()))?
+            } else {
+                bytes
+            };
+        let actual = material.len();
+        material.try_into().map_err(|_| {
+            anyhow!(
+                "key file {} must contain 32 raw bytes or 64 hex digits, got {actual} bytes",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
+
+        fn key_file(contents: &[u8]) -> tempfile::NamedTempFile {
+            let file = tempfile::NamedTempFile::new().expect("temporary key file");
+            fs::write(file.path(), contents).expect("write temporary key");
+            file
+        }
+
+        #[test]
+        fn native_signer_uses_compact_secp256k1_over_payload_hash() {
+            let file =
+                key_file(b"0000000000000000000000000000000000000000000000000000000000000001\n");
+            let signer = DevSigner::load(AuthScheme::Native, file.path()).expect("native signer");
+            let expected: [u8; Key::LENGTH] =
+                hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                    .expect("public key hex")
+                    .try_into()
+                    .expect("public key length");
+            assert_eq!(signer.party_key().to_bytes(), expected);
+            let hash = PayloadHash::default();
+            let auth = signer.sign(hash).expect("native auth");
+            assert!(Secp256k1Verifier::new().verify_auth(&auth, signer.party_key(), hash));
+        }
+
+        #[test]
+        fn malformed_key_file_is_rejected_without_scalar_cli_fallback() {
+            let file = key_file(b"not-a-secret-scalar");
+            let error = match DevSigner::load(AuthScheme::Native, file.path()) {
+                Ok(_) => panic!("malformed key was accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("key file"));
+        }
+
+        #[test]
+        fn validator_kernel_accepts_both_cli_auth_envelopes() {
+            let hash = PayloadHash::default();
+            for scheme in [AuthScheme::Webauthn, AuthScheme::Native] {
+                let file =
+                    key_file(b"0000000000000000000000000000000000000000000000000000000000000001\n");
+                let signer = DevSigner::load(scheme, file.path()).expect("CLI signer");
+                let auth = signer.sign(hash).expect("CLI auth");
+                assert!(Secp256k1Verifier::new().verify_auth(&auth, signer.party_key(), hash));
+            }
+        }
     }
 }

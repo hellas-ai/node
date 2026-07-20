@@ -13,7 +13,7 @@ mod support;
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason,
     Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, ProtocolCode, Seal,
-    SealPublicInputs, SealVerifier, Sig, SigVerifier, Terms, Tx, test_support::SoftPasskey,
+    SealPublicInputs, SealVerifier, Sig, SigVerifier, SoftPasskey, Terms, Tx,
     verify_webauthn_assertion,
 };
 use support::{FixedStore, coin_id, list, state};

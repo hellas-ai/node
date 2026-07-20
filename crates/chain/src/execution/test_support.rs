@@ -1,21 +1,93 @@
 use crate::HellasBlock;
-use crate::domain::{Address, ObjectId, PrivateKey, SettlementKey, Transaction, genesis_object_id};
+use crate::consensus::{ConsensusVerifier, Finalization};
+use crate::domain::{
+    Address, ObjectId, PrivateKey, PublicKey, Scheme, SettlementKey, ThresholdVariant, Transaction,
+    genesis_object_id,
+};
 use crate::execution::store::UtxoSyncTarget;
+use crate::{CONSENSUS_NAMESPACE, ConsensusInfo};
+use commonware_codec::Encode;
 use commonware_consensus::{
     CertifiableBlock, Heightable,
-    simplex::types::Context,
+    simplex::types::{Context, Finalize, Proposal},
     types::{Epoch, Height, Round, View},
 };
-use commonware_cryptography::{Digest as _, Digestible, Signer as _, ed25519};
+use commonware_cryptography::{
+    Digest as _, Digestible, Signer as _, bls12381::dkg::feldman_desmedt::deal, ed25519,
+};
+use commonware_parallel::Sequential;
 use commonware_runtime::{Runner as _, tokio};
 use commonware_storage::{merkle::Location, mmr};
-use commonware_utils::non_empty_range;
+use commonware_utils::{N3f1, non_empty_range, ordered::Set};
 use core::future::Future;
-use hellas_kernel::test_support::{SoftPasskey, SoftPasskeyError};
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
+    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, SoftPasskey, SoftPasskeyError, Terms,
+    Tx,
 };
+use rand::{SeedableRng, rngs::StdRng};
+
+pub(crate) struct ConsensusFixture {
+    pub(crate) schemes: Vec<Scheme>,
+    pub(crate) assembler: Scheme,
+    pub(crate) verifier: ConsensusVerifier,
+    pub(crate) leaders: Vec<PublicKey>,
+}
+
+pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
+    let private_keys = (0..4)
+        .map(|offset| ed25519::PrivateKey::from_seed(seed + offset))
+        .collect::<Vec<_>>();
+    let leaders = private_keys
+        .iter()
+        .map(|key| key.public_key())
+        .collect::<Vec<_>>();
+    let participants = Set::try_from(leaders.clone()).expect("unique participants");
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (output, shares) =
+        deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants.clone())
+            .expect("threshold deal");
+    let polynomial = output.public().clone();
+    let schemes = private_keys
+        .iter()
+        .map(|key| {
+            let share = shares.get_value(&key.public_key()).expect("share").clone();
+            Scheme::signer(
+                CONSENSUS_NAMESPACE,
+                participants.clone(),
+                polynomial.clone(),
+                share,
+            )
+            .expect("scheme")
+        })
+        .collect::<Vec<_>>();
+    let assembler = Scheme::verifier(CONSENSUS_NAMESPACE, participants, polynomial);
+    let info = ConsensusInfo {
+        validators: leaders
+            .iter()
+            .map(|public_key| hex::encode(public_key.encode()))
+            .collect(),
+        threshold_identity: assembler.identity().encode().to_vec(),
+    };
+    let verifier = ConsensusVerifier::new(&info).expect("verifier");
+    ConsensusFixture {
+        schemes,
+        assembler,
+        verifier,
+        leaders,
+    }
+}
+
+pub(crate) fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> Finalization {
+    let context = block.context();
+    let proposal = Proposal::new(context.round, context.parent.0, block.digest());
+    let votes = fixture
+        .schemes
+        .iter()
+        .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("finalize vote"))
+        .collect::<Vec<_>>();
+    Finalization::from_finalizes(&fixture.assembler, &votes, &Sequential).expect("finalization")
+}
 
 pub(crate) fn run_qmdb<F, Fut, T>(test: F) -> T
 where
