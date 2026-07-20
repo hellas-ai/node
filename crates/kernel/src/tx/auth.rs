@@ -8,14 +8,22 @@
 //! party key used for funding ownership, terms, and payouts.
 
 use crate::{
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
     consts::MAX_WEBAUTHN_DATA_LENGTH,
     list::List,
-    primitive::{PayloadHash, Sig},
+    primitive::Sig,
 };
 
 /// Bounded `authenticatorData || clientDataJSON` bytes from a `WebAuthn`
 /// assertion.
 pub type WebAuthnData = List<u8, MAX_WEBAUTHN_DATA_LENGTH>;
+
+const NATIVE_TAG: u8 = 0;
+const WEBAUTHN_TAG: u8 = 1;
+const P256_COORDINATE_LENGTH: usize = 32;
 
 /// `WebAuthn` assertion used to authorize one edge open.
 ///
@@ -25,10 +33,10 @@ pub type WebAuthnData = List<u8, MAX_WEBAUTHN_DATA_LENGTH>;
 /// encoding of the canonical open hash.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct WebAuthnAssertion {
-    r: [u8; PayloadHash::LENGTH],
-    s: [u8; PayloadHash::LENGTH],
-    pub_key_x: [u8; PayloadHash::LENGTH],
-    pub_key_y: [u8; PayloadHash::LENGTH],
+    r: [u8; P256_COORDINATE_LENGTH],
+    s: [u8; P256_COORDINATE_LENGTH],
+    pub_key_x: [u8; P256_COORDINATE_LENGTH],
+    pub_key_y: [u8; P256_COORDINATE_LENGTH],
     webauthn_data: WebAuthnData,
 }
 
@@ -36,10 +44,10 @@ impl WebAuthnAssertion {
     /// Creates a `WebAuthn` open assertion from canonical components.
     #[must_use]
     pub const fn new(
-        r: [u8; PayloadHash::LENGTH],
-        s: [u8; PayloadHash::LENGTH],
-        pub_key_x: [u8; PayloadHash::LENGTH],
-        pub_key_y: [u8; PayloadHash::LENGTH],
+        r: [u8; P256_COORDINATE_LENGTH],
+        s: [u8; P256_COORDINATE_LENGTH],
+        pub_key_x: [u8; P256_COORDINATE_LENGTH],
+        pub_key_y: [u8; P256_COORDINATE_LENGTH],
         webauthn_data: WebAuthnData,
     ) -> Self {
         Self {
@@ -53,25 +61,25 @@ impl WebAuthnAssertion {
 
     /// Returns the P-256 signature `r` scalar bytes.
     #[must_use]
-    pub const fn r(&self) -> &[u8; PayloadHash::LENGTH] {
+    pub const fn r(&self) -> &[u8; P256_COORDINATE_LENGTH] {
         &self.r
     }
 
     /// Returns the P-256 signature `s` scalar bytes.
     #[must_use]
-    pub const fn s(&self) -> &[u8; PayloadHash::LENGTH] {
+    pub const fn s(&self) -> &[u8; P256_COORDINATE_LENGTH] {
         &self.s
     }
 
     /// Returns the P-256 public key x-coordinate.
     #[must_use]
-    pub const fn pub_key_x(&self) -> &[u8; PayloadHash::LENGTH] {
+    pub const fn pub_key_x(&self) -> &[u8; P256_COORDINATE_LENGTH] {
         &self.pub_key_x
     }
 
     /// Returns the P-256 public key y-coordinate.
     #[must_use]
-    pub const fn pub_key_y(&self) -> &[u8; PayloadHash::LENGTH] {
+    pub const fn pub_key_y(&self) -> &[u8; P256_COORDINATE_LENGTH] {
         &self.pub_key_y
     }
 
@@ -79,6 +87,45 @@ impl WebAuthnAssertion {
     #[must_use]
     pub const fn webauthn_data(&self) -> &WebAuthnData {
         &self.webauthn_data
+    }
+}
+
+impl Encode for WebAuthnAssertion {
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE
+        + 4 * <[u8; P256_COORDINATE_LENGTH] as Encode>::MAX_ENCODED_SIZE
+        + <WebAuthnData as Encode>::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        ENVELOPE_SIZE
+            + self.r.encoded_size()
+            + self.s.encoded_size()
+            + self.pub_key_x.encoded_size()
+            + self.pub_key_y.encoded_size()
+            + self.webauthn_data.encoded_size()
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::WEBAUTHN_ASSERTION);
+        self.r.encode_to(writer);
+        self.s.encode_to(writer);
+        self.pub_key_x.encode_to(writer);
+        self.pub_key_y.encode_to(writer);
+        self.webauthn_data.encode_to(writer);
+    }
+}
+
+impl Decode for WebAuthnAssertion {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::WEBAUTHN_ASSERTION)?;
+        let r = decode_field(buf, &mut consumed)?;
+        let s = decode_field(buf, &mut consumed)?;
+        let pub_key_x = decode_field(buf, &mut consumed)?;
+        let pub_key_y = decode_field(buf, &mut consumed)?;
+        let webauthn_data = decode_field(buf, &mut consumed)?;
+        Ok((
+            Self::new(r, s, pub_key_x, pub_key_y, webauthn_data),
+            consumed,
+        ))
     }
 }
 
@@ -111,6 +158,52 @@ impl Auth {
     #[must_use]
     pub const fn webauthn(assertion: WebAuthnAssertion) -> Self {
         Self::WebAuthn(assertion)
+    }
+}
+
+impl Encode for Auth {
+    const MAX_ENCODED_SIZE: usize =
+        ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + WebAuthnAssertion::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        ENVELOPE_SIZE
+            + u8::MAX_ENCODED_SIZE
+            + match self {
+                Self::Native(sig) => sig.encoded_size(),
+                Self::WebAuthn(assertion) => assertion.encoded_size(),
+            }
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::AUTH);
+        match self {
+            Self::Native(sig) => {
+                NATIVE_TAG.encode_to(writer);
+                sig.encode_to(writer);
+            }
+            Self::WebAuthn(assertion) => {
+                WEBAUTHN_TAG.encode_to(writer);
+                assertion.encode_to(writer);
+            }
+        }
+    }
+}
+
+impl Decode for Auth {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::AUTH)?;
+        let variant = decode_field::<u8>(buf, &mut consumed)?;
+        match variant {
+            NATIVE_TAG => {
+                let sig = decode_field(buf, &mut consumed)?;
+                Ok((Self::native(sig), consumed))
+            }
+            WEBAUTHN_TAG => {
+                let assertion = decode_field(buf, &mut consumed)?;
+                Ok((Self::webauthn(assertion), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
+        }
     }
 }
 

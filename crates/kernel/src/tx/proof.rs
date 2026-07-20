@@ -12,11 +12,21 @@
 //! verifier impl (or to its own inline check for Timeout).
 
 #[cfg(any(test, feature = "placeholders"))]
+use crate::primitive::{PayloadHash, ProtocolCode};
 use crate::{
-    canonical::Encode,
-    primitive::{PayloadHash, ProtocolCode},
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
+    consts::SEAL_LENGTH,
+    context::Cost,
+    terms::Terms,
+    tx::Auth,
 };
-use crate::{consts::SEAL_LENGTH, context::Cost, terms::Terms, tx::Auth};
+
+const MUTUAL_TAG: u8 = 0;
+const TIMEOUT_TAG: u8 = 1;
+const VIOLATION_TAG: u8 = 2;
 
 /// Universal close witness kind.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -63,19 +73,19 @@ impl Seal {
     /// Encoded length of a compact dispute seal.
     pub const LENGTH: usize = SEAL_LENGTH;
 
-    /// Creates a dispute seal from canonical bytes.
+    /// Creates a dispute seal from its fixed-width payload bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
     }
 
-    /// Returns the canonical byte representation.
+    /// Returns the fixed-width payload bytes, without the codec envelope.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
         self.0
     }
 
-    /// Borrows the canonical byte representation.
+    /// Borrows the fixed-width payload bytes, without the codec envelope.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
         &self.0
@@ -96,6 +106,28 @@ impl Seal {
         kind.tag().encode_to(&mut hasher);
         hash.encode_to(&mut hasher);
         Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl Encode for Seal {
+    const MAX_ENCODED_SIZE: usize =
+        ENVELOPE_SIZE + <[u8; Self::LENGTH] as Encode>::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::SEAL);
+        self.0.encode_to(writer);
+    }
+}
+
+impl Decode for Seal {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::SEAL)?;
+        let bytes = decode_field(buf, &mut consumed)?;
+        Ok((Self::from_bytes(bytes), consumed))
     }
 }
 
@@ -169,5 +201,78 @@ impl Proof {
     #[must_use]
     pub const fn cost(&self) -> Cost {
         Cost::new(0, 0, self.kind().proofs())
+    }
+}
+
+impl Encode for Proof {
+    const MAX_ENCODED_SIZE: usize = {
+        let mutual = 2 * Auth::MAX_ENCODED_SIZE;
+        let timeout = Terms::MAX_ENCODED_SIZE;
+        let violation = Terms::MAX_ENCODED_SIZE + Seal::MAX_ENCODED_SIZE;
+        let max_terms = if timeout > violation {
+            timeout
+        } else {
+            violation
+        };
+        let max_body = if mutual > max_terms {
+            mutual
+        } else {
+            max_terms
+        };
+        ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + max_body
+    };
+
+    fn encoded_size(&self) -> usize {
+        ENVELOPE_SIZE
+            + u8::MAX_ENCODED_SIZE
+            + match self {
+                Self::Mutual { maker, taker } => maker.encoded_size() + taker.encoded_size(),
+                Self::Timeout { terms } => terms.encoded_size(),
+                Self::Violation { terms, seal } => terms.encoded_size() + seal.encoded_size(),
+            }
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::PROOF);
+        match self {
+            Self::Mutual { maker, taker } => {
+                MUTUAL_TAG.encode_to(writer);
+                maker.encode_to(writer);
+                taker.encode_to(writer);
+            }
+            Self::Timeout { terms } => {
+                TIMEOUT_TAG.encode_to(writer);
+                terms.encode_to(writer);
+            }
+            Self::Violation { terms, seal } => {
+                VIOLATION_TAG.encode_to(writer);
+                terms.encode_to(writer);
+                seal.encode_to(writer);
+            }
+        }
+    }
+}
+
+impl Decode for Proof {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::PROOF)?;
+        let variant = decode_field::<u8>(buf, &mut consumed)?;
+        match variant {
+            MUTUAL_TAG => {
+                let maker = decode_field(buf, &mut consumed)?;
+                let taker = decode_field(buf, &mut consumed)?;
+                Ok((Self::mutual(maker, taker), consumed))
+            }
+            TIMEOUT_TAG => {
+                let terms = decode_field(buf, &mut consumed)?;
+                Ok((Self::timeout(terms), consumed))
+            }
+            VIOLATION_TAG => {
+                let terms = decode_field(buf, &mut consumed)?;
+                let seal = decode_field(buf, &mut consumed)?;
+                Ok((Self::violation(terms, seal), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
+        }
     }
 }
