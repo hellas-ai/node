@@ -3,13 +3,25 @@ use std::process::Stdio;
 use anyhow::Context;
 use tokio::process::{Child, Command};
 
-use crate::commands::CliResult;
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::ffi::{c_int, c_ulong};
+
+    pub const PR_SET_PDEATHSIG: c_int = 1;
+    pub const SIGTERM: c_ulong = 15;
+
+    unsafe extern "C" {
+        pub fn prctl(option: c_int, ...) -> c_int;
+        pub fn getppid() -> c_int;
+        pub fn _exit(status: c_int) -> !;
+    }
+}
 
 /// Spawn the wrapped command. The child inherits this process's stdio so
 /// shell redirection on the wrapped command works as the user expects, and
 /// is configured with `kill_on_drop(true)` so dropping the returned `Child`
 /// (e.g. on gateway shutdown) tears it down too.
-pub fn spawn(cmd: &str, args: &[String], base_url: &str) -> CliResult<Child> {
+pub fn spawn(cmd: &str, args: &[String], base_url: &str) -> anyhow::Result<Child> {
     let mut command = Command::new(cmd);
     command
         .args(args)
@@ -27,14 +39,14 @@ pub fn spawn(cmd: &str, args: &[String], base_url: &str) -> CliResult<Child> {
     #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+            if linux::prctl(linux::PR_SET_PDEATHSIG, linux::SIGTERM) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // Race window: if the parent already died between fork and prctl,
             // the signal will never fire. Re-check; bail if we're now reparented
             // to init.
-            if libc::getppid() == 1 {
-                libc::_exit(0);
+            if linux::getppid() == 1 {
+                linux::_exit(0);
             }
             Ok(())
         });

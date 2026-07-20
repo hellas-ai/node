@@ -1,10 +1,10 @@
 use crate::commands::CliResult;
-use crate::execution::{CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome};
 use anyhow::Context;
 use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_client::ExecutionRoute;
 use hellas_executor::{Executor, ExecutorError};
+use hellas_gateway::{CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome};
 use hellas_models::{ModelAssets, TextOutputDecoder};
 use hellas_rpc::{Dtype, ProducerSigningKey};
 use iroh::{EndpointId, SecretKey};

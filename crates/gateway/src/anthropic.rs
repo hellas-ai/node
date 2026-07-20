@@ -1,7 +1,7 @@
 use super::backend::GatewayBackend;
+use super::dispatch::{backend_wire_response, parse_backend_request};
 use super::next_id;
 use super::state::GatewayState;
-use super::dispatch::{backend_wire_response, parse_backend_request};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;

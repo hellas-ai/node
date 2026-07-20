@@ -1,16 +1,20 @@
+#[macro_use]
+extern crate tracing;
+
 mod anthropic;
 mod backend;
+mod dispatch;
+mod execution;
 mod fetch_backend;
+mod metrics;
 mod openai;
 mod plain;
 mod provenance_layer;
 mod proxy;
 mod responses;
 mod state;
-mod dispatch;
 mod wrap;
 
-use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -29,6 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::GatewayState;
+
+pub use execution::{
+    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome, PreparedExecution,
+    StopReason,
+};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -78,7 +87,7 @@ pub enum ResponsesBackend {
     Fetch,
 }
 
-pub async fn run(options: GatewayOptions) -> CliResult<()> {
+pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
     let app = Router::new()
@@ -182,7 +191,7 @@ pub async fn run(options: GatewayOptions) -> CliResult<()> {
 /// asked for that exact port). Without it, try 8080 first and fall back to
 /// an OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
 /// fresh one.
-async fn bind_gateway(host: &str, port: Option<u16>) -> CliResult<tokio::net::TcpListener> {
+async fn bind_gateway(host: &str, port: Option<u16>) -> anyhow::Result<tokio::net::TcpListener> {
     if let Some(p) = port {
         let addr = format!("{host}:{p}");
         return tokio::net::TcpListener::bind(&addr)

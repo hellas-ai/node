@@ -23,66 +23,41 @@
 //! chunk verification live in `hellas-client`; this module retains local
 //! executor dispatch plus model and gateway response shaping.
 
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use async_stream::try_stream;
-#[cfg(feature = "gateway")]
 use chatgrad::PreparedPrompt;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use futures::StreamExt;
-#[cfg(feature = "gateway")]
 use futures::stream::BoxStream;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use futures::stream::Stream;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_client::ClientError as ExecutionError;
-#[cfg(feature = "gateway")]
 use hellas_client::EvaluateChunkVerifier;
 use hellas_client::ExecutionRuntime as ClientExecutionRuntime;
-#[cfg(feature = "gateway")]
 use hellas_client::signed_run_ticket_request;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_client::{ClientResult as ExecutionResult, ExecutionRoute};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ExecutorHandle;
-#[cfg(feature = "gateway")]
 use hellas_models::ModelAssets;
-#[cfg(feature = "gateway")]
 use hellas_rpc::Digest;
-#[cfg(feature = "gateway")]
 use hellas_rpc::InputCommitment;
-#[cfg(feature = "gateway")]
 use hellas_rpc::OutputEventEnvelope;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_rpc::ProducerSigningKey;
-#[cfg(feature = "gateway")]
 use hellas_rpc::evaluate::{
     EvaluateStopReason, verify_output_events as verify_evaluate_output_events,
 };
-#[cfg(feature = "gateway")]
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_rpc::pb::execute::Ticket;
-#[cfg(feature = "gateway")]
 use hellas_rpc::pb::execute::{WorkEvent, WorkFinished, work_event};
-#[cfg(feature = "gateway")]
 use hellas_rpc::provenance::ExecutionProvenance;
-#[cfg(feature = "gateway")]
 use hellas_rpc::services::execute::ExecuteClientImpl;
-#[cfg(feature = "gateway")]
 use hellas_rpc::stream::output_event_from_pb;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use hellas_wire::WireStatus;
-#[cfg(feature = "gateway")]
 use hellas_wire::iroh::IrohTransport;
 #[cfg(feature = "evaluate")]
 use std::error::Error as StdError;
-#[cfg(any(feature = "gateway", feature = "evaluate"))]
 use std::sync::Arc;
 #[cfg(feature = "evaluate")]
 use tokio_stream::wrappers::ReceiverStream;
-#[cfg(feature = "gateway")]
 use tracing::instrument;
 
 #[cfg(feature = "evaluate")]
@@ -100,7 +75,6 @@ where
     }
 }
 
-#[cfg(feature = "gateway")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStrategy {
     Run(ExecutionRoute),
@@ -111,15 +85,14 @@ pub enum ExecutionStrategy {
 }
 
 #[cfg(feature = "evaluate")]
-pub(crate) type CliRuntime = ClientExecutionRuntime<ExecutorHandle>;
+pub type CliRuntime = ClientExecutionRuntime<ExecutorHandle>;
 #[cfg(not(feature = "evaluate"))]
-pub(crate) type CliRuntime = ClientExecutionRuntime;
+pub type CliRuntime = ClientExecutionRuntime<()>;
 
 // ---------------------------------------------------------------------------
 // Stream item types
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 /// One observation from a streaming execution. Stream protocol: zero or
 /// more `Chunk` events, terminated by exactly one `Done`.
 #[derive(Debug, Clone)]
@@ -133,7 +106,6 @@ pub enum ExecutionEvent {
     Done(Outcome),
 }
 
-#[cfg(feature = "gateway")]
 /// Terminal verdict of an execution.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -150,7 +122,6 @@ pub enum Outcome {
     },
 }
 
-#[cfg(feature = "gateway")]
 impl Outcome {
     /// Cumulative token count at the moment the run terminated.
     /// Authoritative for usage frames on both Completed and Failed.
@@ -162,7 +133,6 @@ impl Outcome {
     }
 }
 
-#[cfg(feature = "gateway")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndOfSequence,
@@ -180,7 +150,6 @@ fn require_local_executor(runtime: &CliRuntime) -> ExecutionResult<ExecutorHandl
 // ExecutionRequest — public entry point
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 pub struct ExecutionRequest {
     runtime: CliRuntime,
     quote_req: QuotePreparedTextRequest,
@@ -188,7 +157,6 @@ pub struct ExecutionRequest {
     runner_key: Arc<ProducerSigningKey>,
 }
 
-#[cfg(feature = "gateway")]
 impl ExecutionRequest {
     pub fn new(
         runtime: CliRuntime,
@@ -296,13 +264,11 @@ impl ExecutionRequest {
 // PreparedExecution — primary + optional shadow for Verify
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
 }
 
-#[cfg(feature = "gateway")]
 impl PreparedExecution {
     /// See [`PreparedRoute::provenance`] — this delegates to the primary
     /// route. Shadow's provenance is intentionally not exposed (verify is
@@ -348,7 +314,6 @@ impl PreparedExecution {
 
 /// Run the shadow stream to completion (discarding its chunks), extract
 /// its terminal outcome, and return the reconciled outcome.
-#[cfg(feature = "gateway")]
 async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
     let primary_digest = match &primary {
         Outcome::Completed { text_artifact, .. } => *text_artifact,
@@ -383,7 +348,6 @@ async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResu
 }
 
 /// Consume a stream to its terminal `Done`, discarding chunks.
-#[cfg(feature = "gateway")]
 async fn drain_to_outcome(
     stream: impl Stream<Item = ExecutionResult<ExecutionEvent>>,
 ) -> ExecutionResult<Outcome> {
@@ -402,7 +366,6 @@ async fn drain_to_outcome(
 // PreparedRoute
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 #[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
     #[cfg(feature = "evaluate")]
@@ -420,7 +383,6 @@ enum PreparedRoute {
     },
 }
 
-#[cfg(feature = "gateway")]
 impl PreparedRoute {
     fn provenance(&self) -> Option<&ExecutionProvenance> {
         match self {
@@ -565,7 +527,6 @@ fn local_execute_stream(
 // Remote execute streams — dial Execute service via IrohTransport
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 fn remote_execute_stream(
     transport: IrohTransport,
     ticket: Ticket,
@@ -612,7 +573,6 @@ fn remote_execute_stream(
 // WorkEvent → execution events
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gateway")]
 fn convert_wire_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
@@ -649,7 +609,6 @@ fn convert_wire_event(
     }
 }
 
-#[cfg(feature = "gateway")]
 fn parse_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
@@ -673,7 +632,6 @@ fn parse_finished(
     })
 }
 
-#[cfg(feature = "gateway")]
 fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopReason> {
     match value.as_u8() {
         1 => Ok(StopReason::EndOfSequence),

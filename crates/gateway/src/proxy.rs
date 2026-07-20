@@ -1,4 +1,3 @@
-use crate::commands::http_client;
 use axum::body::Bytes;
 use futures::StreamExt;
 use hellas_adaptors::openai::responses::{
@@ -12,6 +11,14 @@ use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value as JsonValue;
 use std::time::Duration;
+
+fn http_client(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(request_timeout)
+        .build()
+        .expect("HTTP client configuration is valid")
+}
 
 #[derive(Clone)]
 pub(super) struct ResponsesProxy {

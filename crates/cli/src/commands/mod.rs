@@ -9,8 +9,6 @@ pub(crate) mod codex_auth;
 #[cfg(feature = "node")]
 pub(crate) mod discovery;
 pub mod fetch;
-#[cfg(feature = "gateway")]
-pub mod gateway;
 pub mod identity;
 #[cfg(feature = "evaluate")]
 pub mod llm;

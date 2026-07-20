@@ -86,10 +86,8 @@ impl GatewayState {
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
-            let assurance = crate::identity::assurance(
-                options.assurance_codec.as_deref(),
-                options.assurance_policy,
-            )?;
+            let assurance =
+                assurance(options.assurance_codec.as_deref(), options.assurance_policy)?;
             CliRuntime::local(
                 Executor::spawn_with_producer_key(
                     ExecutePolicy::Eager,
@@ -340,6 +338,18 @@ impl GatewayState {
         )
         .await
     }
+}
+
+#[cfg(feature = "evaluate")]
+fn assurance(
+    codec: Option<&str>,
+    policy: Option<hellas_rpc::ContentId>,
+) -> anyhow::Result<hellas_rpc::AssuranceRequirement> {
+    hellas_rpc::AssuranceRequirement::new(
+        codec.context("local provider requires --assurance-codec")?,
+        policy.context("local provider requires --assurance-policy")?,
+    )
+    .map_err(Into::into)
 }
 
 fn wire_tools_to_raw(req: &WireExecutionRequest) -> Vec<serde_json::Value> {
