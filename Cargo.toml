@@ -37,20 +37,20 @@ catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat
 catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
 clap = { version = "4", features = ["derive"] }
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", branch = "main", default-features = false }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", branch = "main", default-features = false }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", branch = "main" }
+commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f", default-features = false }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f", default-features = false }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
 dirs = "6"
-ed25519-dalek = { version = "3.0.0-rc.0", default-features = false }
+ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3"
 half = "2.7.1"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
@@ -77,10 +77,10 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
     "reqwest-rustls-webpki-roots",
 ] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-prometheus-client = "0.24"
-rand = "0.8"
-rand_core = "0.6"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+prometheus-client = "0.25"
+rand = "0.10"
+rand_core = "0.10"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "webpki-roots",

@@ -1,5 +1,6 @@
-use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+use k256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
 use k256::ecdsa::{Signature as K256Signature, SigningKey};
+use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -282,7 +283,7 @@ pub fn verify_digest_signature(
                 .map_err(|error| SignatureError::P256(error.to_string()))?;
             let signature = p256::ecdsa::Signature::from_slice(signature)
                 .map_err(|error| SignatureError::P256(error.to_string()))?;
-            if signature.normalize_s().is_some() {
+            if signature.normalize_s() != signature {
                 return Err(SignatureError::HighS);
             }
             key.verify_prehash(digest.as_bytes(), &signature)
@@ -333,6 +334,7 @@ impl From<k256::elliptic_curve::Error> for SignatureError {
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
 
     #[test]
     fn all_schemes_verify_protocol_digest() {
@@ -359,18 +361,12 @@ mod tests {
         verify_digest_signature(
             &PublicKey::P256(
                 p256.verifying_key()
-                    .to_encoded_point(true)
+                    .to_sec1_point(true)
                     .as_bytes()
                     .try_into()
                     .unwrap(),
             ),
-            &Signature::P256(
-                p256_signature
-                    .normalize_s()
-                    .unwrap_or(p256_signature)
-                    .to_bytes()
-                    .into(),
-            ),
+            &Signature::P256(p256_signature.normalize_s().to_bytes().into()),
             digest,
         )
         .unwrap();

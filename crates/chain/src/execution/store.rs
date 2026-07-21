@@ -2,8 +2,9 @@ use crate::domain::{Object, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_glue::stateful::db::{ManagedDb, Shared};
 use commonware_parallel::Sequential;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Storage, buffer::paged::CacheRef};
+use commonware_runtime::{BufferPooler, Spawner, buffer::paged::CacheRef};
 use commonware_storage::{
+    Context as StorageContext,
     journal::contiguous::fixed::Config as FixedLogConfig,
     mmr::{self, full::Config as MmrConfig},
     qmdb::{
@@ -21,6 +22,7 @@ pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
+const INIT_BUFFER: NonZeroUsize = NonZeroUsize::new(1 << 21).unwrap();
 
 pub const DEFAULT_PAGE_CACHE_SIZE: NonZeroU16 = NonZeroU16::new(4096).unwrap();
 pub const DEFAULT_PAGE_CACHE_COUNT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
@@ -52,6 +54,8 @@ pub fn utxo_db_config(
         },
         translator: EightCap,
         init_cache_size: None,
+        init_buffer: INIT_BUFFER,
+        init_concurrency: (),
     }
 }
 
@@ -62,7 +66,7 @@ pub async fn empty_state<E>(
     page_cache_count: usize,
 ) -> (Digest, UtxoSyncTarget)
 where
-    E: Storage + Clock + Metrics + BufferPooler,
+    E: StorageContext + Spawner,
 {
     let config = utxo_db_config(
         &context,

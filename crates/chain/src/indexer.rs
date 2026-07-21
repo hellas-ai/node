@@ -25,7 +25,7 @@ use commonware_resolver::{Fetch, Resolver, TargetedResolver};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, tokio};
 use commonware_storage::archive::immutable;
 use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVec};
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
 
@@ -330,7 +330,7 @@ pub async fn spawn_follower_indexer<E>(
     genesis_block: HellasBlock,
 ) -> Result<(ChainIndexer, Handle<()>), IngestError>
 where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRngCore,
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
 {
     let finalizations_by_height = init_finalization_store(
         context.child("finalizations_by_height"),

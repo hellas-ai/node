@@ -24,7 +24,7 @@
 //! different products; do not wire one where the other is expected.
 
 use p256::{
-    EncodedPoint,
+    Sec1Point,
     ecdsa::{Signature as P256Signature, VerifyingKey, signature::hazmat::PrehashVerifier},
 };
 use sha2::{Digest, Sha256};
@@ -124,7 +124,7 @@ pub fn p256_key(
     pub_key_y: &[u8; P256_COORDINATE_LENGTH],
 ) -> Result<Key, WebAuthnError> {
     let verifying_key = verifying_key(pub_key_x, pub_key_y)?;
-    let encoded = verifying_key.to_encoded_point(true);
+    let encoded = verifying_key.to_sec1_point(true);
     let bytes = encoded.as_bytes();
     if bytes.len() != Key::LENGTH {
         return Err(WebAuthnError::InvalidPublicKey);
@@ -145,8 +145,8 @@ fn verifying_key(
     let (xs, ys) = coords.split_at_mut(P256_COORDINATE_LENGTH);
     xs.copy_from_slice(pub_key_x);
     ys.copy_from_slice(pub_key_y);
-    let point = EncodedPoint::from_bytes(encoded).map_err(|_| WebAuthnError::InvalidPublicKey)?;
-    VerifyingKey::from_encoded_point(&point).map_err(|_| WebAuthnError::InvalidPublicKey)
+    let point = Sec1Point::from_bytes(encoded).map_err(|_| WebAuthnError::InvalidPublicKey)?;
+    VerifyingKey::from_sec1_point(&point).map_err(|_| WebAuthnError::InvalidPublicKey)
 }
 
 fn verify_p256_signature(
