@@ -1176,7 +1176,7 @@ pub fn mock_webauthn_sign_with_origin(
     msg[authenticator_data.len()..].copy_from_slice(&client_hash);
 
     let signed: p256::ecdsa::Signature = key.sign(&msg);
-    let normalized = signed.normalize_s().unwrap_or(signed);
+    let normalized = signed.normalize_s();
     let Ok(signature) = UserSignature::decode(normalized.to_bytes().as_ref()) else {
         return None;
     };

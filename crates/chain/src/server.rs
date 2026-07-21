@@ -380,7 +380,7 @@ fn user_signature_from_der(bytes: &[u8]) -> Result<UserSignature, WireStatus> {
             "signature must be valid DER-encoded P-256 ECDSA",
         )
     })?;
-    let normalized = signature.normalize_s().unwrap_or(signature);
+    let normalized = signature.normalize_s();
     UserSignature::decode(normalized.to_bytes().as_ref()).map_err(|_| {
         WireStatus::new(
             WireCode::InvalidArgument,

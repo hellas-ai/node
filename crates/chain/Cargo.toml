@@ -146,9 +146,7 @@ hex = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
-p256 = { version = "0.13", optional = true, default-features = false, features = [
-    "ecdsa",
-] }
+p256 = { workspace = true, optional = true }
 prometheus-client = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }

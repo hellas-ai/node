@@ -70,7 +70,7 @@ let
       lockFile = ../Cargo.lock;
       outputHashes = {
         "catgrad-0.2.1" = "sha256-O/H2WGacF9Z4ZA6TXpYaGsgy6pWZAW71zvfE2Xyl2ZU=";
-        "commonware-actor-2026.5.0" = "sha256-wp7bGvjfw6/1EbN5aeA8xsXvIvYx6IRlDaSSJtAgbRo=";
+        "commonware-actor-2026.7.0" = "sha256-LEVuwzWlttz1znLpe0bmEV/Gk+7v9BI9/Un25tR7naM=";
       };
     };
     inherit stdenv;

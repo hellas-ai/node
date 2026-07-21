@@ -22,10 +22,8 @@ use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
-use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::metrics::Registered,
-};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
+use commonware_runtime::{Spawner, telemetry::metrics::Registered};
+use commonware_storage::{Context as StorageContext, mmr::Location, qmdb::sync::Target};
 use commonware_utils::{SystemTimeExt, non_empty_range};
 use futures::{Stream, StreamExt};
 use prometheus_client::metrics::gauge::Gauge;
@@ -102,7 +100,7 @@ impl Application {
         config: ApplicationConfig,
     ) -> Self
     where
-        E: Storage + Clock + Metrics + BufferPooler,
+        E: StorageContext + Spawner,
     {
         let finalized_height = context.register(
             "finalized_height",
@@ -133,7 +131,7 @@ fn sync_target_from_merkleized<E>(
     merkleized: &<UtxoDatabase<E> as DatabaseSet<E>>::Merkleized,
 ) -> UtxoSyncTarget
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let bounds = merkleized.bounds();
     Target {
@@ -154,7 +152,7 @@ fn kernel_context(height: Height, previous_hash: Digest) -> hellas_kernel::Conte
 #[cfg(feature = "validator")]
 impl<E> StatefulApplication<E> for Application
 where
-    E: Rng + Spawner + Metrics + Clock + Storage + Send + Sync + 'static,
+    E: Rng + Spawner + StorageContext + Send + Sync + 'static,
 {
     type SigningScheme = Scheme;
     type Context = Context<Digest, PublicKey>;
@@ -173,7 +171,7 @@ where
     async fn propose(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Self::Block> + Send,
+        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
@@ -220,7 +218,7 @@ where
     async fn verify(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Self::Block> + Send,
+        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let (runtime, consensus_context) = context;
@@ -429,7 +427,7 @@ mod tests {
         let proposed = app
             .propose(
                 (runtime.child(label), next_consensus_context(parent)),
-                stream::iter([parent.clone()]),
+                stream::iter([Arc::new(parent.clone())]),
                 database.new_batches().await,
                 &mut mempool,
             )
@@ -448,7 +446,7 @@ mod tests {
     ) -> bool {
         app.verify(
             (runtime.child(label), block.context()),
-            stream::iter([block.clone(), parent.clone()]),
+            stream::iter([Arc::new(block.clone()), Arc::new(parent.clone())]),
             database.new_batches().await,
         )
         .await

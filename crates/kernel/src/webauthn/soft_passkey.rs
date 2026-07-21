@@ -62,7 +62,7 @@ impl SoftPasskey {
     ) -> Result<Self, SoftPasskeyError> {
         let signing_key = SigningKey::from_slice(&secret_scalar)
             .map_err(|_| SoftPasskeyError::InvalidSecretScalar)?;
-        let point = signing_key.verifying_key().to_encoded_point(false);
+        let point = signing_key.verifying_key().to_sec1_point(false);
         let x = point.x().ok_or(SoftPasskeyError::InvalidPublicKey)?;
         let y = point.y().ok_or(SoftPasskeyError::InvalidPublicKey)?;
         let mut pub_key_x = [0_u8; P256_COORDINATE_LENGTH];
@@ -168,7 +168,7 @@ pub(super) fn sign_assertion_data(
         .signing_key
         .sign_prehash(&message_hash)
         .map_err(|_| SoftPasskeyError::SigningFailed)?;
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     let signature_bytes = signature.to_bytes();
     let (r_bytes, s_bytes) = signature_bytes.split_at(P256_COORDINATE_LENGTH);
     let mut r = [0_u8; P256_COORDINATE_LENGTH];

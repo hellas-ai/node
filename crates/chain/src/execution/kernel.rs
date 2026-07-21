@@ -7,7 +7,8 @@ use crate::domain::{
 use commonware_codec::{Encode, EncodeSize};
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::Spawner;
+use commonware_storage::Context as StorageContext;
 use hellas_kernel::{
     ApplyError, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event, EventKind,
     InvalidProofReason, State, Tx as KernelTx,
@@ -97,7 +98,7 @@ fn legacy_owner_address(owner: SettlementKey) -> Result<Address, ExecutionError>
 
 async fn object_exists<E>(batches: &Batch<E>, id: &ObjectId) -> Result<bool, ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     batches
         .get(id)
@@ -114,7 +115,7 @@ pub async fn execute_all<E>(
     batches: Batch<E>,
 ) -> Result<Batch<E>, ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     for tx in txs {
@@ -136,7 +137,7 @@ pub async fn execute_proposal<E>(
     batches: Batch<E>,
 ) -> Result<(Batch<E>, Vec<Transaction>, Vec<Transaction>), ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     let mut included = Vec::new();
@@ -181,7 +182,7 @@ fn maybe_seed_genesis<E>(
     mut batches: Batch<E>,
 ) -> Batch<E>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     if context.block_height().get() != 1 {
         return batches;
@@ -212,7 +213,7 @@ async fn apply_transaction<E>(
     tx: &Transaction,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     match tx {
         Transaction::Transfer {
@@ -379,7 +380,7 @@ async fn load_coin_slot<E>(
     id: CoinId,
 ) -> Result<(), ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let object_id = coin_object_id(id);
     let coin = match batches.get(&object_id).await.map_err(storage_err)? {
@@ -403,7 +404,7 @@ async fn load_edge_slot<E>(
     id: EdgeId,
 ) -> Result<(), ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let object_id = edge_object_id(id);
     let edge = match batches.get(&object_id).await.map_err(storage_err)? {
@@ -426,7 +427,7 @@ async fn load_kernel_slots<E>(
     tx: &KernelTx,
 ) -> Result<BlockWorkingSet, ExecutionError>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let mut working = BlockWorkingSet::new();
     match tx {
@@ -486,7 +487,7 @@ fn replay_kernel_event<E>(
     event: &Event,
 ) -> (Batch<E>, Option<ExecutionError>)
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     // Event order is the consensus-authoritative diff. Never enumerate the
     // HashMaps in BlockWorkingSet: their iteration order is process-local.
@@ -588,7 +589,7 @@ async fn apply_kernel_transaction<E>(
     tx: &KernelTx,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: StorageContext + Spawner + Send + Sync + 'static,
 {
     if let Err(err) = check_open(context, tx) {
         return Err((batches, err));

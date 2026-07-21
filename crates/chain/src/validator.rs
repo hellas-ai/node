@@ -41,10 +41,7 @@ use futures::FutureExt;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use prometheus_client::metrics::gauge::Gauge;
-use rand::{
-    RngCore, SeedableRng,
-    rngs::{OsRng, StdRng},
-};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
@@ -69,7 +66,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    rand::rng().fill_bytes(&mut raw);
     ed25519::PrivateKey::decode(raw.as_slice())
         .expect("decoding 32 random bytes as an ed25519 private key should always succeed")
 }
@@ -90,7 +87,7 @@ fn deal_threshold_shares(
             deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants)
         }
         None => {
-            let mut rng = OsRng;
+            let mut rng: StdRng = rand::make_rng();
             deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants)
         }
     }
@@ -945,7 +942,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             certification_timeout: chain_config.certification_timeout,
             timeout_retry: chain_config.nullify_retry,
             activity_timeout: ViewDelta::new(chain_config.activity_timeout),
-            skip_timeout: ViewDelta::new(chain_config.skip_timeout),
+            skip_timeout: chain_config.skip_timeout,
             fetch_timeout: chain_config.fetch_timeout,
             fetch_concurrent,
             forwarding: ForwardingPolicy::Disabled,

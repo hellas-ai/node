@@ -6,7 +6,6 @@ mod full {
     use commonware_consensus::simplex::types::Finalization as SimplexFinalization;
     use commonware_cryptography::{certificate::Verifier as _, sha256::Digest};
     use commonware_parallel::Sequential;
-    use rand::rngs::OsRng;
     use thiserror::Error;
 
     pub type Finalization = SimplexFinalization<Scheme, Digest>;
@@ -69,7 +68,7 @@ mod full {
             if finalization.proposal.payload != expected_payload {
                 return Err(ConsensusVerificationError::PayloadMismatch);
             }
-            let mut rng = OsRng;
+            let mut rng = rand::rng();
             if !finalization.verify(&mut rng, &self.scheme, &Sequential) {
                 return Err(ConsensusVerificationError::VerificationFailed);
             }
@@ -98,7 +97,6 @@ mod light {
         sha256::Digest,
     };
     use commonware_parallel::Sequential;
-    use rand::rngs::OsRng;
     use thiserror::Error;
 
     type ConsensusIdentity = <ThresholdVariant as Variant>::Public;
@@ -224,7 +222,7 @@ mod light {
                 ),
             ];
 
-            let mut rng = OsRng;
+            let mut rng = rand::rng();
             if batch::verify_same_signer::<_, ThresholdVariant, _>(
                 &mut rng,
                 &self.identity,
