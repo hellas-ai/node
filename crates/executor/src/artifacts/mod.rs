@@ -11,9 +11,9 @@ use crate::state::{ArtifactStoreConfig, Invocation, ModelLocator, QuotePlan};
 mod schema;
 
 use schema::{
-    BoundTermId, Canonical, CanonicalDecode, Digest as ArtifactDigest, InputAddressed,
-    OutputAddressed, SourceRef, TextArtifact, TextArtifactId, TextExecution, TextExecutionId,
-    TextPolicy, TextPolicyId, TextSource, TextState, TextStateId, TokenId, TokenIds, TokenIdsId,
+    BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
+    TextArtifact, TextArtifactId, TextExecution, TextExecutionId, TextPolicy, TextPolicyId,
+    TextSource, TextState, TextStateId, TokenId, TokenIds, TokenIdsId,
 };
 
 const EVALUATE_INDEX_FILE: &str = "evaluate-index.json";
@@ -47,11 +47,7 @@ impl ArtifactBlobStore {
         Ok(Self::Fs(store))
     }
 
-    async fn insert_canonical(
-        &self,
-        digest: ArtifactDigest,
-        bytes: &[u8],
-    ) -> Result<(), ExecutorError> {
+    async fn insert_canonical(&self, digest: Digest, bytes: &[u8]) -> Result<(), ExecutorError> {
         let expected = iroh_hash(digest);
         let tag = match self {
             Self::Memory(store) => store.add_slice(bytes).await,
@@ -70,10 +66,7 @@ impl ArtifactBlobStore {
         Ok(())
     }
 
-    async fn get_canonical(
-        &self,
-        digest: ArtifactDigest,
-    ) -> Result<Option<Vec<u8>>, ExecutorError> {
+    async fn get_canonical(&self, digest: Digest) -> Result<Option<Vec<u8>>, ExecutorError> {
         let hash = iroh_hash(digest);
         let has_blob = match self {
             Self::Memory(store) => store.has(hash).await,
@@ -91,7 +84,7 @@ impl ArtifactBlobStore {
         .map_err(|err| ExecutorError::ArtifactStore(format!("blob read failed: {err}")))?
         .to_vec();
 
-        if ArtifactDigest::from_canonical_bytes(&bytes) != digest {
+        if Digest::hash(&bytes) != digest {
             return Err(ExecutorError::ArtifactStore(format!(
                 "blob store returned bytes that do not match requested digest {digest}"
             )));
@@ -148,7 +141,7 @@ pub(crate) struct ResolvedEvaluateExecution {
 pub(crate) struct EvaluateArtifactStore {
     blob_store: ArtifactBlobStore,
     index_path: Option<PathBuf>,
-    canonical_blobs: HashMap<ArtifactDigest, Vec<u8>>,
+    canonical_blobs: HashMap<Digest, Vec<u8>>,
     bound_terms: HashMap<BoundTermId, ModelLocator>,
     token_ids: HashMap<TokenIdsId, TokenIds>,
     policies: HashMap<TextPolicyId, TextPolicy>,
@@ -218,8 +211,7 @@ impl EvaluateArtifactStore {
         plan: &QuotePlan,
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let execution_environment = plan.execution_environment;
-        let bound_term_id =
-            BoundTermId::from_digest(to_artifact_digest(execution_environment.digest()));
+        let bound_term_id = BoundTermId::from_digest(execution_environment.digest());
         if let Entry::Vacant(entry) = self.bound_terms.entry(bound_term_id) {
             entry.insert(plan.locator.clone());
             self.persist_evaluate_index()?;
@@ -227,7 +219,7 @@ impl EvaluateArtifactStore {
 
         let from = match plan.initial_artifact_id {
             Some(artifact_id) => {
-                let artifact_id = TextArtifactId::from_digest(to_artifact_digest(artifact_id));
+                let artifact_id = TextArtifactId::from_digest(artifact_id);
                 let _ = self.materialize_artifact(artifact_id).await?;
                 SourceRef::output(artifact_id)
             }
@@ -246,7 +238,7 @@ impl EvaluateArtifactStore {
         let execution = TextExecution::new(from, prompt_tokens_id, policy_id);
         let execution_id = self.insert_text_execution(execution).await?;
         let evaluate_request = EvaluateRequest {
-            text_execution: from_artifact_digest(execution_id.digest()),
+            text_execution: execution_id.digest(),
             runner_public_key: plan.runner_public_key,
             execution_environment,
             nonce: rand::random(),
@@ -263,8 +255,7 @@ impl EvaluateArtifactStore {
         &mut self,
         evaluate_request: EvaluateRequest,
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
-        let execution_id =
-            TextExecutionId::from_digest(to_artifact_digest(evaluate_request.text_execution));
+        let execution_id = TextExecutionId::from_digest(evaluate_request.text_execution);
         let execution = self.text_execution(execution_id).await?;
         let source = self.materialize_source(execution.from()).await?;
         if source.execution_environment != evaluate_request.execution_environment {
@@ -304,16 +295,15 @@ impl EvaluateArtifactStore {
         &mut self,
         bytes: Vec<u8>,
     ) -> Result<Digest, ExecutorError> {
-        let digest = ArtifactDigest::from_canonical_bytes(&bytes);
+        let digest = Digest::hash(&bytes);
         if !self.canonical_blobs.contains_key(&digest) {
             self.blob_store.insert_canonical(digest, &bytes).await?;
             self.canonical_blobs.insert(digest, bytes);
         }
-        Ok(from_artifact_digest(digest))
+        Ok(digest)
     }
 
     pub async fn get_canonical_bytes(&mut self, digest: Digest) -> Result<Vec<u8>, ExecutorError> {
-        let digest = to_artifact_digest(digest);
         if let Some(bytes) = self.canonical_blobs.get(&digest) {
             return Ok(bytes.clone());
         }
@@ -332,8 +322,7 @@ impl EvaluateArtifactStore {
         invocation: &Invocation,
         output_tokens: &[u32],
     ) -> Result<Digest, ExecutorError> {
-        let execution_id =
-            TextExecutionId::from_digest(to_artifact_digest(evaluate_request.text_execution));
+        let execution_id = TextExecutionId::from_digest(evaluate_request.text_execution);
         let _ = self.text_execution(execution_id).await?;
 
         let generated_tokens_id = self
@@ -356,7 +345,7 @@ impl EvaluateArtifactStore {
             entry.insert(artifact_id);
             self.persist_evaluate_index()?;
         }
-        Ok(from_artifact_digest(artifact_id.digest()))
+        Ok(artifact_id.digest())
     }
 
     async fn materialize_source(
@@ -548,7 +537,7 @@ impl EvaluateArtifactStore {
 
     async fn decode_canonical<T: CanonicalDecode>(
         &mut self,
-        digest: ArtifactDigest,
+        digest: Digest,
         kind: &str,
     ) -> Result<T, ExecutorError> {
         let bytes = self.load_canonical(digest, kind).await?;
@@ -559,7 +548,7 @@ impl EvaluateArtifactStore {
 
     async fn load_canonical(
         &mut self,
-        digest: ArtifactDigest,
+        digest: Digest,
         kind: &str,
     ) -> Result<Vec<u8>, ExecutorError> {
         if let Some(bytes) = self.canonical_blobs.get(&digest) {
@@ -619,7 +608,7 @@ impl EvaluateArtifactStore {
 
     async fn insert_canonical(
         &mut self,
-        digest: ArtifactDigest,
+        digest: Digest,
         value: &impl Canonical,
     ) -> Result<(), ExecutorError> {
         if self.canonical_blobs.contains_key(&digest) {
@@ -645,7 +634,7 @@ impl EvaluateArtifactStore {
     }
 }
 
-fn canonical_type_mismatch(kind: &str, digest: ArtifactDigest) -> ExecutorError {
+fn canonical_type_mismatch(kind: &str, digest: Digest) -> ExecutorError {
     ExecutorError::ArtifactStore(format!(
         "decoded {kind} artifact does not re-address to requested digest {digest}"
     ))
@@ -790,7 +779,7 @@ impl PersistedEvaluateIndex {
     }
 }
 
-fn parse_artifact_digest(raw: &str, field: &str) -> Result<ArtifactDigest, ExecutorError> {
+fn parse_artifact_digest(raw: &str, field: &str) -> Result<Digest, ExecutorError> {
     if raw.len() != 64 {
         return Err(ExecutorError::ArtifactStore(format!(
             "invalid {field} digest length {}, expected 64 hex chars",
@@ -803,7 +792,7 @@ fn parse_artifact_digest(raw: &str, field: &str) -> Result<ArtifactDigest, Execu
         let low = hex_value(chunk[1]).ok_or_else(|| invalid_hex(field, raw))?;
         bytes[index] = (high << 4) | low;
     }
-    Ok(ArtifactDigest::from_bytes(bytes))
+    Ok(Digest::from_bytes(bytes))
 }
 
 fn invalid_hex(field: &str, raw: &str) -> ExecutorError {
@@ -838,15 +827,7 @@ fn text_policy(invocation: &Invocation) -> Result<TextPolicy, ExecutorError> {
     Ok(TextPolicy::new(invocation.max_new_tokens, stop_token_ids))
 }
 
-fn to_artifact_digest(digest: Digest) -> ArtifactDigest {
-    ArtifactDigest::from_bytes(digest.into_bytes())
-}
-
-fn from_artifact_digest(digest: ArtifactDigest) -> Digest {
-    Digest::from_bytes(*digest.as_bytes())
-}
-
-fn iroh_hash(digest: ArtifactDigest) -> iroh_blobs::Hash {
+fn iroh_hash(digest: Digest) -> iroh_blobs::Hash {
     iroh_blobs::Hash::from_bytes(*digest.as_bytes())
 }
 
@@ -938,8 +919,7 @@ mod tests {
             .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
             .await
             .unwrap();
-        let first_execution =
-            TextExecutionId::from_digest(to_artifact_digest(first.evaluate_request.text_execution));
+        let first_execution = TextExecutionId::from_digest(first.evaluate_request.text_execution);
         let prompt_tokens = store.insert_token_ids(TokenIds::from([20])).await.unwrap();
         let policy = store
             .insert_policy(TextPolicy::from_u32_stop_tokens(4, []))
@@ -948,7 +928,7 @@ mod tests {
         let lazy = TextExecution::new(SourceRef::input(first_execution), prompt_tokens, policy);
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let resolved = store
-            .resolve_evaluate_request(evaluate_request(from_artifact_digest(lazy_id.digest())))
+            .resolve_evaluate_request(evaluate_request(lazy_id.digest()))
             .await
             .unwrap();
 
@@ -959,8 +939,7 @@ mod tests {
     async fn lazy_input_rejects_metadata_that_does_not_realize_execution() {
         let mut store = EvaluateArtifactStore::default();
         let first = store.record_prepared_text(&plan()).await.unwrap();
-        let first_execution =
-            TextExecutionId::from_digest(to_artifact_digest(first.evaluate_request.text_execution));
+        let first_execution = TextExecutionId::from_digest(first.evaluate_request.text_execution);
         let first_execution_value = store.text_execution(first_execution).await.unwrap();
         let identity_id = match first_execution_value.from() {
             SourceRef::Output(id) => *id,
@@ -977,7 +956,7 @@ mod tests {
         let lazy = TextExecution::new(SourceRef::input(first_execution), prompt_tokens, policy);
         let lazy_id = store.insert_text_execution(lazy).await.unwrap();
         let err = store
-            .resolve_evaluate_request(evaluate_request(from_artifact_digest(lazy_id.digest())))
+            .resolve_evaluate_request(evaluate_request(lazy_id.digest()))
             .await
             .unwrap_err();
 
@@ -1002,7 +981,7 @@ mod tests {
         let bytes = tokens.canonical_bytes();
         let digest = store.publish_canonical_bytes(bytes.clone()).await.unwrap();
 
-        assert_eq!(digest, from_artifact_digest(tokens.output_id().digest()));
+        assert_eq!(digest, tokens.output_id().digest());
         assert_eq!(store.get_canonical_bytes(digest).await.unwrap(), bytes);
     }
 
@@ -1063,9 +1042,7 @@ mod tests {
                 .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
                 .await
                 .unwrap();
-            first_execution = TextExecutionId::from_digest(to_artifact_digest(
-                first.evaluate_request.text_execution,
-            ));
+            first_execution = TextExecutionId::from_digest(first.evaluate_request.text_execution);
             store.shutdown().await.unwrap();
         }
 
@@ -1081,7 +1058,7 @@ mod tests {
             let lazy = TextExecution::new(SourceRef::input(first_execution), prompt_tokens, policy);
             let lazy_id = store.insert_text_execution(lazy).await.unwrap();
             let resolved = store
-                .resolve_evaluate_request(evaluate_request(from_artifact_digest(lazy_id.digest())))
+                .resolve_evaluate_request(evaluate_request(lazy_id.digest()))
                 .await
                 .unwrap();
 
