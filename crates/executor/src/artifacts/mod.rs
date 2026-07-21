@@ -12,7 +12,7 @@ mod schema;
 use schema::{
     BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
     TextArtifact, TextArtifactId, TextExecution, TextExecutionId, TextPolicy, TextPolicyId,
-    TextSource, TextState, TextStateId, TokenId, TokenIds, TokenIdsId,
+    TextSource, TextState, TextStateId, TokenIds, TokenIdsId,
 };
 
 const CANONICAL_PARTITION: &str = "evaluate_canonical";
@@ -211,7 +211,7 @@ impl EvaluateArtifactStore {
 
         let prompt_tokens = TokenIds::from(plan.invocation.input_ids.clone());
         let prompt_tokens_id = self.insert_token_ids(prompt_tokens).await?;
-        let policy = text_policy(&plan.invocation)?;
+        let policy = text_policy(&plan.invocation);
         let policy_id = self.insert_policy(policy).await?;
         let execution = TextExecution::new(from, prompt_tokens_id, policy_id);
         let execution_id = self.insert_text_execution(execution).await?;
@@ -250,15 +250,8 @@ impl EvaluateArtifactStore {
         let stop_token_ids = policy
             .stop_token_ids()
             .iter()
-            .map(|token| {
-                i32::try_from(token.as_u32()).map_err(|_| {
-                    ExecutorError::InvalidTokenPayload(format!(
-                        "stop token id {} exceeds i32 range",
-                        token.as_u32()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|token| token.as_u32())
+            .collect();
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
@@ -748,15 +741,11 @@ fn token_ids_to_u32(tokens: &TokenIds) -> Vec<u32> {
         .collect()
 }
 
-fn text_policy(invocation: &Invocation) -> Result<TextPolicy, ExecutorError> {
-    let stop_token_ids = invocation
-        .stop_token_ids
-        .iter()
-        .copied()
-        .map(TokenId::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| ExecutorError::InvalidTokenPayload(err.to_string()))?;
-    Ok(TextPolicy::new(invocation.max_new_tokens, stop_token_ids))
+fn text_policy(invocation: &Invocation) -> TextPolicy {
+    TextPolicy::from_u32_stop_tokens(
+        invocation.max_new_tokens,
+        invocation.stop_token_ids.iter().copied(),
+    )
 }
 
 #[cfg(test)]

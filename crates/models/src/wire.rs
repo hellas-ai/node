@@ -10,14 +10,14 @@ use crate::ModelAssetsError;
 pub fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
     match err {
         ModelAssetsError::Spec(_)
-        | ModelAssetsError::ParseModelConfig { .. }
-        | ModelAssetsError::ConstructModelConfig { .. }
+        | ModelAssetsError::Model(_)
+        | ModelAssetsError::ParseModelMetadata { .. }
+        | ModelAssetsError::InvalidModelIndex
         | ModelAssetsError::InvalidProgramGraph
         | ModelAssetsError::UnresolvedRevision
-        | ModelAssetsError::NegativePromptTokenId { .. }
+        | ModelAssetsError::MissingChatTemplate
         | ModelAssetsError::NegativeStopTokenId { .. }
-        | ModelAssetsError::TokenBytes { .. }
-        | ModelAssetsError::OutputTokenOutOfRange { .. } => WireCode::InvalidArgument,
+        | ModelAssetsError::TokenBytes { .. } => WireCode::InvalidArgument,
         _ => WireCode::Internal,
     }
 }

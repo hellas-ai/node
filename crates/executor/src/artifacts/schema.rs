@@ -346,7 +346,6 @@ impl TextPolicy {
         }
     }
 
-    #[cfg(test)]
     pub fn from_u32_stop_tokens(
         max_new_tokens: u32,
         stop_token_ids: impl IntoIterator<Item = u32>,

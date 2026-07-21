@@ -1,7 +1,6 @@
 use crate::executor::ExecutorMessage;
+use crate::model::{GenerationTermination, ModelEngine};
 use crate::state::{Invocation, ModelLocator, StopReason};
-use chatgrad::PreparedPrompt;
-use chatgrad::run::{GenerationControl, GenerationTermination, ModelEngine};
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
@@ -47,21 +46,17 @@ struct DecodeOutcome {
     output_tokens: Vec<u32>,
 }
 
-struct SensitivePreparedPrompt(PreparedPrompt);
+struct SensitiveInputIds(Vec<u32>);
 
-impl SensitivePreparedPrompt {
-    fn new(input_ids: Vec<i32>, stop_token_ids: Vec<i32>) -> Self {
-        Self(PreparedPrompt::new(input_ids, stop_token_ids))
-    }
-
-    fn prompt(&self) -> &PreparedPrompt {
-        &self.0
+impl SensitiveInputIds {
+    fn new(input_ids: Vec<u32>) -> Self {
+        Self(input_ids)
     }
 }
 
-impl Drop for SensitivePreparedPrompt {
+impl Drop for SensitiveInputIds {
     fn drop(&mut self) {
-        self.0.input_ids.zeroize();
+        self.0.zeroize();
     }
 }
 
@@ -209,26 +204,19 @@ fn run_job(
         "execute worker starting"
     );
 
-    let engine = match engines.get(&locator) {
-        Some(engine) => engine.clone(),
-        None => {
-            let backend = crate::backend::create_backend()?;
-            let engine = ModelEngine::new_with_backend(
-                &locator.model_id,
-                &locator.revision,
-                backend,
-                true,
-                hellas_models::to_catgrad_dtype(locator.dtype),
-            )
-            .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
-            engines.insert(locator.clone(), engine.clone());
-            engine
-        }
-    };
-    let prepared = SensitivePreparedPrompt::new(
-        input_ids_to_i32(&invocation.input_ids)?,
-        invocation.stop_token_ids,
-    );
+    if !engines.contains_key(&locator) {
+        let backend = crate::backend::create_backend()?;
+        let engine = ModelEngine::load(
+            &locator.model_id,
+            &locator.revision,
+            backend,
+            hellas_models::to_catgrad_dtype(locator.dtype),
+        )
+        .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
+        engines.insert(locator.clone(), engine);
+    }
+    let engine = engines.get(&locator).expect("loaded model engine missing");
+    let input_ids = SensitiveInputIds::new(invocation.input_ids);
     let batch_size = usize::try_from(stream_batch_size.max(1))
         .unwrap_or(usize::MAX)
         .max(1);
@@ -237,24 +225,25 @@ fn run_job(
     let mut generated = 0u64;
     let mut progress_error = None;
 
-    let generated_output = engine
-        .generate_tokens_from_prepared(prepared.prompt(), invocation.max_new_tokens, |token| {
-            generated = generated.saturating_add(1);
-            output_tokens.push(token.token_id);
-            pending.push(token.token_id);
-            if pending.len() >= batch_size
-                && let Err(err) = on_progress(generated, std::mem::take(&mut pending))
-            {
-                progress_error = Some(err);
-                cancel.cancel();
-                return Ok(GenerationControl::Cancel);
-            }
-            if cancel.is_cancelled() {
-                Ok(GenerationControl::Cancel)
-            } else {
-                Ok(GenerationControl::Continue)
-            }
-        })
+    let termination = engine
+        .generate(
+            &input_ids.0,
+            &invocation.stop_token_ids,
+            invocation.max_new_tokens,
+            |token| {
+                generated = generated.saturating_add(1);
+                output_tokens.push(token);
+                pending.push(token);
+                if pending.len() >= batch_size
+                    && let Err(err) = on_progress(generated, std::mem::take(&mut pending))
+                {
+                    progress_error = Some(err);
+                    cancel.cancel();
+                    return false;
+                }
+                !cancel.is_cancelled()
+            },
+        )
         .map_err(|err| crate::ExecutorError::WeightsError(err.to_string()))?;
 
     if let Some(err) = progress_error {
@@ -265,7 +254,7 @@ fn run_job(
         on_progress(generated, pending)?;
     }
 
-    let stop_reason = match generated_output.termination {
+    let stop_reason = match termination {
         GenerationTermination::Stop => StopReason::EndOfSequence,
         GenerationTermination::MaxTokens => StopReason::MaxNewTokens,
         GenerationTermination::Cancelled => StopReason::Cancelled,
@@ -275,20 +264,6 @@ fn run_job(
         stop_reason,
         output_tokens,
     })
-}
-
-fn input_ids_to_i32(input_ids: &[u32]) -> Result<Vec<i32>, crate::ExecutorError> {
-    input_ids
-        .iter()
-        .copied()
-        .map(|token| {
-            i32::try_from(token).map_err(|_| {
-                crate::ExecutorError::InvalidTokenPayload(format!(
-                    "token id {token} exceeds i32 range"
-                ))
-            })
-        })
-        .collect()
 }
 
 fn make_on_progress<'a, 'b>(

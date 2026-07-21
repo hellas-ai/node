@@ -6,9 +6,6 @@ use crate::execution::{
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chatgrad::PreparedPrompt;
-use chatgrad::types::Message;
-use chatgrad::types::openai;
 use hellas_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
     Message as WireMessage,
@@ -16,7 +13,7 @@ use hellas_adaptors::{
 use hellas_client::{ExecutionRoute, ProducerTrust, ProviderTrustAnchor, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
-use hellas_models::ModelAssets;
+use hellas_models::{ChatMessage, ModelAssets, PreparedPrompt};
 use hellas_rpc::Dtype;
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
@@ -66,7 +63,7 @@ pub(super) struct PreparedGeneration {
     /// in-band SSE `hellas-provenance` event.
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
-    pub(super) stop_token_ids: Vec<i32>,
+    pub(super) stop_token_ids: Vec<u32>,
     pub(super) assets: Arc<ModelAssets>,
     pub(super) inference_timeout: Duration,
 }
@@ -320,8 +317,7 @@ impl GatewayState {
                 ),
             })?,
             Input::Messages(messages) => {
-                let messages = wire_messages_to_openai(messages)?;
-                let messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
+                let messages = wire_messages_to_template(messages)?;
                 let tools = wire_tools_to_raw(req);
                 assets
                     .prepare_chat_with_options(
@@ -335,8 +331,7 @@ impl GatewayState {
                     })?
             }
             Input::Items(items) => {
-                let messages = wire_items_to_openai_messages(items)?;
-                let messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
+                let messages = wire_items_to_template_messages(items)?;
                 let tools = wire_tools_to_raw(req);
                 assets
                     .prepare_chat_with_options(
@@ -370,64 +365,57 @@ fn wire_tools_to_raw(req: &WireExecutionRequest) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn wire_messages_to_openai(
-    messages: &[WireMessage],
-) -> Result<Vec<openai::ChatMessage>, HttpError> {
+fn wire_messages_to_template(messages: &[WireMessage]) -> Result<Vec<ChatMessage>, HttpError> {
     messages
         .iter()
         .map(|message| {
             let content = content_parts_to_text(&message.content)?;
-            Ok(openai::ChatMessage::builder()
-                .role(message.role.clone())
-                .content(Some(openai::MessageContent::Text(content)))
-                .name(message.name.clone())
-                .build())
+            Ok(ChatMessage {
+                role: message.role.clone(),
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: message.name.clone(),
+            })
         })
         .collect()
 }
 
-fn wire_items_to_openai_messages(
-    items: &[InputItem],
-) -> Result<Vec<openai::ChatMessage>, HttpError> {
+fn wire_items_to_template_messages(items: &[InputItem]) -> Result<Vec<ChatMessage>, HttpError> {
     let mut out = Vec::new();
     for item in items {
         match item {
             InputItem::Message(message) => {
-                out.extend(wire_messages_to_openai(std::slice::from_ref(message))?);
+                out.extend(wire_messages_to_template(std::slice::from_ref(message))?);
             }
             InputItem::ToolCall {
                 id,
                 name,
                 arguments,
             } => {
-                out.push(
-                    openai::ChatMessage::builder()
-                        .role("assistant".to_string())
-                        .content(None)
-                        .tool_calls(Some(vec![serde_json::json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
-                            }
-                        })]))
-                        .build(),
-                );
+                out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: vec![serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    })],
+                    tool_call_id: None,
+                    name: None,
+                });
             }
             InputItem::ToolResult { call_id, output } => {
-                out.push(
-                    openai::ChatMessage::builder()
-                        .role("tool".to_string())
-                        .content(Some(openai::MessageContent::Text(content_parts_to_text(
-                            output,
-                        )?)))
-                        .tool_call_id(Some(call_id.clone()))
-                        .build(),
-                );
+                out.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(content_parts_to_text(output)?),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id.clone()),
+                    name: None,
+                });
             }
             InputItem::Raw(value) => {
-                out.push(openai::ChatMessage::user(value.to_string()));
+                out.push(ChatMessage::user(value.to_string()));
             }
         }
     }

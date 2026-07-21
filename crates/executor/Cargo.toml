@@ -12,7 +12,7 @@ default = ["evaluate", "candle"]
 evaluate = [
     "dep:catgrad",
     "dep:catgrad-llm",
-    "dep:chatgrad",
+    "dep:catgrad-llm-models",
     "dep:commonware-runtime",
     "dep:hellas-models",
 ]
@@ -27,7 +27,7 @@ catgrad = { workspace = true, default-features = false, features = [
     "serde",
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
-chatgrad = { workspace = true, default-features = false, optional = true }
+catgrad-llm-models = { workspace = true, default-features = false, optional = true }
 commonware-runtime = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"

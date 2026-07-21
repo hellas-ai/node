@@ -24,7 +24,6 @@
 //! executor dispatch plus model and gateway response shaping.
 
 use async_stream::try_stream;
-use chatgrad::PreparedPrompt;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use futures::stream::Stream;
@@ -35,7 +34,7 @@ use hellas_client::signed_run_ticket_request;
 use hellas_client::{ClientResult as ExecutionResult, ExecutionRoute};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ExecutorHandle;
-use hellas_models::ModelAssets;
+use hellas_models::{ModelAssets, PreparedPrompt};
 use hellas_rpc::Digest;
 use hellas_rpc::InputCommitment;
 use hellas_rpc::OutputEventEnvelope;
@@ -192,9 +191,7 @@ impl ExecutionRequest {
         strategy: ExecutionStrategy,
         runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
-        let quote = assets
-            .prepare_quote(&prepared_prompt)
-            .map_err(ExecutionError::external)?;
+        let quote = assets.prepare_quote(&prepared_prompt);
         let quote_req = QuotePreparedTextRequest {
             huggingface_model_id: quote.huggingface_model_id,
             huggingface_revision: quote.huggingface_revision,

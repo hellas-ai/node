@@ -21,6 +21,8 @@ mod fetch_projection;
 mod fetch_provider;
 mod fetch_registry;
 mod metrics;
+#[cfg(feature = "evaluate")]
+mod model;
 mod scheme;
 mod state;
 #[cfg(feature = "evaluate")]

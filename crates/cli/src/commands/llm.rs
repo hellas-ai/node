@@ -1,6 +1,5 @@
 use crate::commands::CliResult;
 use anyhow::Context;
-use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_client::ExecutionRoute;
 use hellas_executor::{Executor, ExecutorError};
@@ -8,7 +7,7 @@ use hellas_gateway::{
     CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
     Outcome,
 };
-use hellas_models::{ModelAssets, TextOutputDecoder};
+use hellas_models::{ChatMessage, ModelAssets, TextOutputDecoder};
 use hellas_rpc::{Assurance, ContentId, Dtype, ProducerSigningKey, Retention};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
@@ -85,7 +84,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     // `assets` we use here is throwaway; we reload per attempt below to get
     // the dtype-specific courtesy request construction needs.
     let bootstrap_assets = Arc::new(ModelAssets::load(&options.model, options.dtype[0])?);
-    let messages = vec![Message::openai(ChatMessage::user(&options.prompt))];
+    let messages = vec![ChatMessage::user(&options.prompt)];
     let prepared = if options.raw || !bootstrap_assets.has_chat_template() {
         if options.raw {
             info!("executing raw prompt without chat template");
