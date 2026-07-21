@@ -1,4 +1,11 @@
 use anyhow::{Context, bail};
+#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+use hellas_attestation::{
+    AppleAppAttest, AppleCredential, RegisteredAppleCredential, apple_credential_identity,
+    client_data_hash, verify_apple_assertion,
+};
+#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+use hellas_rpc::DagCborEncoder;
 use hellas_rpc::signature::verify_digest_signature;
 #[cfg(feature = "node")]
 use hellas_rpc::{AssuranceRequirement, ContentId};
@@ -39,29 +46,36 @@ struct StoredIdentity {
 #[serde(tag = "kind", content = "secret")]
 enum StoredRoot {
     Software([u8; 32]),
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    AppleAppAttest {
+        key: String,
+        attestation: Vec<u8>,
+        client_data_hash: [u8; 32],
+    },
 }
 
-trait PlatformRoot {
-    fn kind(&self) -> RootKind;
-    fn public_key(&self) -> PublicKey;
-    fn prove(&self, statement: &[u8]) -> anyhow::Result<RootProof>;
+enum PlatformRoot {
+    Software(ProducerSigningKey),
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    AppleAppAttest {
+        service: AppleAppAttest,
+        credential: AppleCredential,
+        public_key: [u8; 33],
+        rp_id_hash: [u8; 32],
+    },
 }
 
-struct SoftwareRoot(ProducerSigningKey);
-
-impl PlatformRoot for SoftwareRoot {
-    fn kind(&self) -> RootKind {
-        RootKind::Software
-    }
-
-    fn public_key(&self) -> PublicKey {
-        self.0.public_key()
-    }
-
+impl PlatformRoot {
     fn prove(&self, statement: &[u8]) -> anyhow::Result<RootProof> {
-        Ok(RootProof::Software(
-            self.0.sign_digest(Digest::hash(statement))?,
-        ))
+        match self {
+            Self::Software(key) => Ok(RootProof::Software(
+                key.sign_digest(Digest::hash(statement))?,
+            )),
+            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+            Self::AppleAppAttest { service, .. } => Ok(RootProof::AppleAppAttest(
+                service.assertion(client_data_hash(statement))?,
+            )),
+        }
     }
 }
 
@@ -120,27 +134,61 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
+fn create_root(explicit: bool, _installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
+    require_software_root(explicit)?;
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    if !explicit {
+        let mut e = DagCborEncoder::new();
+        e.array(2);
+        e.str("hellas.apple.app-attest.enrollment.v1");
+        e.bytes(&_installation_nonce);
+        let (service, credential) = AppleAppAttest::create(client_data_hash(&e.into_bytes()))?;
+        let (public_key, rp_id_hash) = apple_credential_identity(&credential.attestation)?;
+        return Ok(PlatformRoot::AppleAppAttest {
+            service,
+            credential,
+            public_key,
+            rp_id_hash,
+        });
+    }
+    Ok(PlatformRoot::Software(ProducerSigningKey::generate()))
+}
+
 fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
-    require_software_root(software_root)?;
-    let root = SoftwareRoot(ProducerSigningKey::generate());
     let producer_key = ProducerSigningKey::generate();
     let transport_key = SecretKey::generate();
     let installation_nonce = rand::random();
+    let root = create_root(software_root, installation_nonce)?;
     let statement = statement(&root, &producer_key, &transport_key, installation_nonce);
     let genesis = SignedProviderGenesis {
         root_proof: root.prove(&statement.canonical_bytes())?,
         statement,
     };
-    let RootProof::Software(signature) = &genesis.root_proof else {
-        unreachable!("software root returns a software proof")
+    let root_signature = match &genesis.root_proof {
+        RootProof::AppleAppAttest(proof) => proof.clone(),
+        RootProof::Software(signature) => signature.bytes().to_vec(),
+        RootProof::Tpm20(_) => unreachable!(),
+    };
+    let stored_root = match &root {
+        PlatformRoot::Software(key) => StoredRoot::Software(key.to_secret_bytes()),
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        PlatformRoot::AppleAppAttest {
+            service,
+            credential,
+            ..
+        } => StoredRoot::AppleAppAttest {
+            key: service.key().into(),
+            attestation: credential.attestation.clone(),
+            client_data_hash: credential.client_data_hash,
+        },
     };
     let stored = StoredIdentity {
         version: VERSION,
-        root: StoredRoot::Software(root.0.to_secret_bytes()),
+        root: stored_root,
         producer_key: producer_key.to_secret_bytes(),
         transport_key: transport_key.to_bytes(),
         installation_nonce,
-        root_signature: signature.bytes().to_vec(),
+        root_signature,
     };
     let identity = LocalIdentity {
         transport_key,
@@ -164,10 +212,28 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     if stored.version != VERSION {
         bail!("unsupported identity version {}", stored.version);
     }
-    let root = match stored.root {
-        StoredRoot::Software(secret) => SoftwareRoot(
-            ProducerSigningKey::from_secret_bytes(secret).context("invalid software root key")?,
+    let root = match &stored.root {
+        StoredRoot::Software(secret) => PlatformRoot::Software(
+            ProducerSigningKey::from_secret_bytes(*secret).context("invalid software root key")?,
         ),
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        StoredRoot::AppleAppAttest {
+            key,
+            attestation,
+            client_data_hash: challenge,
+        } => {
+            let credential = AppleCredential {
+                attestation: attestation.clone(),
+                client_data_hash: *challenge,
+            };
+            let (public_key, rp_id_hash) = apple_credential_identity(attestation)?;
+            PlatformRoot::AppleAppAttest {
+                service: AppleAppAttest::load(key.clone(), credential.content_id()),
+                credential,
+                public_key,
+                rp_id_hash,
+            }
+        }
     };
     let producer_key = ProducerSigningKey::from_secret_bytes(stored.producer_key)
         .context("invalid producer key")?;
@@ -178,42 +244,83 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         &transport_key,
         stored.installation_nonce,
     );
-    let signature = Signature::Secp256k1(
-        stored
-            .root_signature
-            .as_slice()
-            .try_into()
-            .context("software root signature must be 64 bytes")?,
-    );
-    verify_digest_signature(
-        &statement.root_public_key,
-        &signature,
-        Digest::hash(&statement.canonical_bytes()),
-    )
-    .context("invalid provider genesis root signature")?;
+    let root_proof = match &root {
+        PlatformRoot::Software(_) => {
+            let signature = Signature::Secp256k1(
+                stored
+                    .root_signature
+                    .as_slice()
+                    .try_into()
+                    .context("software root signature must be 64 bytes")?,
+            );
+            verify_digest_signature(
+                &statement.root_public_key,
+                &signature,
+                Digest::hash(&statement.canonical_bytes()),
+            )
+            .context("invalid provider genesis root signature")?;
+            RootProof::Software(signature)
+        }
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        PlatformRoot::AppleAppAttest {
+            credential,
+            public_key,
+            rp_id_hash,
+            ..
+        } => {
+            verify_apple_assertion(
+                &stored.root_signature,
+                &client_data_hash(&statement.canonical_bytes()),
+                &RegisteredAppleCredential {
+                    id: credential.content_id(),
+                    public_key: *public_key,
+                    rp_id_hash: *rp_id_hash,
+                },
+            )
+            .context("invalid provider genesis root assertion")?;
+            RootProof::AppleAppAttest(stored.root_signature.clone())
+        }
+    };
     Ok(LocalIdentity {
         transport_key,
         producer_key,
         #[cfg(any(feature = "node", test))]
         genesis: SignedProviderGenesis {
             statement,
-            root_proof: RootProof::Software(signature),
+            root_proof,
         },
     })
 }
 
 fn statement(
-    root: &impl PlatformRoot,
+    root: &PlatformRoot,
     producer: &ProducerSigningKey,
     transport: &SecretKey,
     installation_nonce: [u8; 32],
 ) -> ProviderGenesisStatement {
+    let (root_kind, root_public_key, platform_credential) = match root {
+        PlatformRoot::Software(key) => (
+            RootKind::Software,
+            key.public_key(),
+            PlatformCredential::Absent,
+        ),
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        PlatformRoot::AppleAppAttest {
+            credential,
+            public_key,
+            ..
+        } => (
+            RootKind::SecureEnclave,
+            PublicKey::P256(*public_key),
+            PlatformCredential::Registered(credential.content_id()),
+        ),
+    };
     ProviderGenesisStatement {
-        root_kind: root.kind(),
-        root_public_key: root.public_key(),
+        root_kind,
+        root_public_key,
         producer_public_key: producer.public_key(),
         transport_public_key: PublicKey::Ed25519(*transport.public().as_bytes()),
-        platform_credential: PlatformCredential::Absent,
+        platform_credential,
         installation_nonce,
     }
 }

@@ -10,6 +10,8 @@ documentation.workspace = true
 [features]
 default = []
 
+apple-app-attest = ["dep:hellas-attestation", "hellas-attestation/apple-app-attest"]
+
 node = ["dep:hellas-executor"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
 gateway = ["dep:hellas-gateway"]
@@ -59,6 +61,7 @@ chatgrad = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-adaptors.workspace = true
+hellas-attestation = { workspace = true, optional = true }
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
