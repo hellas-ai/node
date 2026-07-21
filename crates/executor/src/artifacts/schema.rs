@@ -497,15 +497,30 @@ impl TextOutput {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextArtifact {
-    Identity { bound_term: BoundTermId },
+    Identity {
+        bound_term: BoundTermId,
+        model_id: String,
+        revision: String,
+        dtype: String,
+    },
     Output(TextOutput),
 }
 
 impl TextArtifact {
-    pub const fn identity(bound_term: BoundTermId) -> Self {
-        Self::Identity { bound_term }
+    pub fn identity(
+        bound_term: BoundTermId,
+        model_id: impl Into<String>,
+        revision: impl Into<String>,
+        dtype: impl Into<String>,
+    ) -> Self {
+        Self::Identity {
+            bound_term,
+            model_id: model_id.into(),
+            revision: revision.into(),
+            dtype: dtype.into(),
+        }
     }
 
     pub const fn output(
@@ -526,10 +541,18 @@ impl TextArtifact {
 impl Canonical for TextArtifact {
     fn encode(&self, encoder: &mut DagCborEncoder) {
         match self {
-            Self::Identity { bound_term } => {
-                encoder.array(2);
+            Self::Identity {
+                bound_term,
+                model_id,
+                revision,
+                dtype,
+            } => {
+                encoder.array(5);
                 encoder.str(TEXT_ARTIFACT_IDENTITY_SCHEMA);
                 encoder.bytes(bound_term.as_bytes());
+                encoder.str(model_id);
+                encoder.str(revision);
+                encoder.str(dtype);
             }
             Self::Output(output) => {
                 encoder.array(5);
@@ -642,14 +665,17 @@ fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact
     let len = decoder.array_len()?;
     match decoder.str()? {
         TEXT_ARTIFACT_IDENTITY_SCHEMA => {
-            if len != 2 {
+            if len != 5 {
                 return Err(DecodeError::new(format!(
-                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 2, got {len}"
+                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 5, got {len}"
                 )));
             }
-            Ok(TextArtifact::identity(BoundTermId::from_bytes(
-                decoder.bytes_32()?,
-            )))
+            Ok(TextArtifact::identity(
+                BoundTermId::from_bytes(decoder.bytes_32()?),
+                decoder.str()?,
+                decoder.str()?,
+                decoder.str()?,
+            ))
         }
         TEXT_ARTIFACT_OUTPUT_SCHEMA => {
             if len != 5 {
@@ -869,7 +895,8 @@ mod tests {
 
     #[test]
     fn identity_is_output_addressed_genesis() {
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
+        let other_model = TextArtifact::identity(output_id::<BoundTerm>(7), "other", "main", "f32");
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let execution = TextExecution::new(
@@ -878,6 +905,7 @@ mod tests {
             policy,
         );
 
+        assert_ne!(identity.output_id(), other_model.output_id());
         assert_ne!(
             execution.input_id().as_bytes(),
             identity.output_id().as_bytes()
@@ -886,7 +914,7 @@ mod tests {
 
     #[test]
     fn execution_input_id_changes_when_source_changes() {
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let first = TextExecution::new(
@@ -902,7 +930,10 @@ mod tests {
     #[test]
     fn output_artifact_id_changes_when_generated_tokens_change() {
         let execution = TextExecution::new(
-            SourceRef::output(TextArtifact::identity(output_id::<BoundTerm>(7)).output_id()),
+            SourceRef::output(
+                TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32")
+                    .output_id(),
+            ),
             TokenIds::from([1]).output_id(),
             TextPolicy::from_u32_stop_tokens(4, []).output_id(),
         )
@@ -943,7 +974,7 @@ mod tests {
             state
         );
 
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
         assert_eq!(
             TextArtifact::from_canonical_bytes(&identity.canonical_bytes()).unwrap(),
             identity

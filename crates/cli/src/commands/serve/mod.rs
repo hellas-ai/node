@@ -1,5 +1,9 @@
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
+#[cfg(feature = "evaluate")]
+use commonware_runtime::Runner as _;
+#[cfg(feature = "evaluate")]
+use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
     CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
@@ -50,11 +54,39 @@ pub struct ServeOptions {
 }
 
 pub async fn run(options: ServeOptions) -> CliResult<()> {
-    let preload_models = dedupe_preload_models(options.preload_models);
     let artifact_store_path = options
         .artifact_store_path
+        .clone()
         .map(Ok)
         .unwrap_or_else(crate::identity::default_artifact_store_path)?;
+    #[cfg(feature = "evaluate")]
+    {
+        let storage_path = artifact_store_path.join("evaluate");
+        return tokio::task::spawn_blocking(move || {
+            commonware_runtime::tokio::Runner::new(
+                commonware_runtime::tokio::Config::new().with_storage_directory(storage_path),
+            )
+            .start(move |context| {
+                run_with_store(
+                    options,
+                    artifact_store_path,
+                    ArtifactStoreConfig::new(context),
+                )
+            })
+        })
+        .await
+        .context("artifact storage runtime failed")?;
+    }
+    #[cfg(not(feature = "evaluate"))]
+    run_with_store(options, artifact_store_path).await
+}
+
+async fn run_with_store(
+    options: ServeOptions,
+    artifact_store_path: PathBuf,
+    #[cfg(feature = "evaluate")] artifact_store: ArtifactStoreConfig,
+) -> CliResult<()> {
+    let preload_models = dedupe_preload_models(options.preload_models);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
         let mut buf = [0u8; 16];
@@ -93,6 +125,8 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         open_identity: options.open_identity,
         assurance: options.assurance,
         metrics: metrics.clone(),
+        #[cfg(feature = "evaluate")]
+        artifact_store,
     })
     .await
     .context("failed to start node server")?;

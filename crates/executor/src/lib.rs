@@ -1,10 +1,12 @@
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "evaluate")]
 mod error;
 pub use error::{BackendInitError, ExecutorError, StateError};
 
+#[cfg(feature = "evaluate")]
+mod artifact_store;
+#[cfg(feature = "evaluate")]
 mod artifacts;
 
 #[cfg(feature = "evaluate")]
@@ -24,11 +26,14 @@ mod state;
 #[cfg(feature = "evaluate")]
 mod worker;
 
+#[cfg(feature = "evaluate")]
+pub use artifact_store::ArtifactStoreConfig;
 pub use chain::{
     ChainView, FakeChainView, HeightStream, StakedProvider, acceptance_from_pb, acceptance_to_pb,
     kernel_signer,
 };
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
+pub use fetch::FetchTranscriptStoreBackend;
 pub use fetch_policy::{
     CallerAccess, FetchAccessError, FetchAccessPolicy, FetchAdmission, FetchQuotaReservation,
     FetchQuotaStoreBackend, FetchRoute, FetchRouteGrant, FetchRoutePolicy, RequestRateLimit,
@@ -48,7 +53,6 @@ pub use hellas_rpc::services::evaluate::EvaluateServer;
 pub use hellas_rpc::services::execute::ExecuteServer;
 pub use hellas_rpc::services::fetch::FetchServer;
 pub use metrics::ExecutorMetrics;
-pub use state::ArtifactStoreConfig;
 
 #[cfg(feature = "evaluate")]
 pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;

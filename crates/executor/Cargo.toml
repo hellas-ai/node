@@ -13,6 +13,7 @@ evaluate = [
     "dep:catgrad",
     "dep:catgrad-llm",
     "dep:chatgrad",
+    "dep:commonware-runtime",
     "dep:hellas-models",
 ]
 candle = ["evaluate", "catgrad/candle-backend"]
@@ -27,6 +28,7 @@ catgrad = { workspace = true, default-features = false, features = [
 ], optional = true }
 catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
+commonware-runtime = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
 hellas-chain = { workspace = true, features = ["client"] }
