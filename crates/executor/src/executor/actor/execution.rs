@@ -847,7 +847,7 @@ mod tests {
 
     fn test_assurance() -> hellas_rpc::AssuranceRequirement {
         hellas_rpc::AssuranceRequirement::new(
-            hellas_rpc::TPM2_QUOTE,
+            hellas_rpc::APPLE_APP_ATTEST,
             hellas_rpc::ContentId::from_bytes([8; 32]),
         )
         .unwrap()

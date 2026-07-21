@@ -737,7 +737,7 @@ mod tests {
                 producer_key,
                 genesis: Arc::new(b"genesis".to_vec()),
                 assurance: hellas_rpc::AssuranceRequirement::new(
-                    hellas_rpc::TPM2_QUOTE,
+                    hellas_rpc::APPLE_APP_ATTEST,
                     hellas_rpc::ContentId::from_bytes([8; 32]),
                 )
                 .unwrap(),

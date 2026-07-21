@@ -1,8 +1,6 @@
 use crate::{ContentId, DagCborEncoder, RequestCommitment};
 
 pub const APPLE_APP_ATTEST: &str = "apple.app-attest.v1";
-pub const AMD_SEV_SNP: &str = "amd.sev-snp.v1";
-pub const TPM2_QUOTE: &str = "tpm2.quote.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssuranceRequirement {
@@ -13,7 +11,7 @@ pub struct AssuranceRequirement {
 impl AssuranceRequirement {
     pub fn new(codec: impl Into<String>, policy: ContentId) -> Result<Self, JobTermsError> {
         let codec = codec.into();
-        if !matches!(codec.as_str(), APPLE_APP_ATTEST | AMD_SEV_SNP | TPM2_QUOTE) {
+        if codec != APPLE_APP_ATTEST {
             return Err(JobTermsError::UnknownCodec(codec));
         }
         Ok(Self { codec, policy })

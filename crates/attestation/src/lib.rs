@@ -2,8 +2,6 @@
 mod apple;
 #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
 mod apple_macos;
-mod snp;
-mod tpm;
 
 use std::future::Future;
 
@@ -19,16 +17,7 @@ pub use apple::{
 };
 #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
 pub use apple_macos::{AppleAppAttest, client_data_hash};
-pub use snp::{
-    SnpClaims, SnpCollateral, SnpEndorsement, SnpPolicy, SnpVerdict, appraise_snp, verify_snp,
-};
-pub use tpm::{
-    RegisteredTpmCredential, TpmClaims, TpmPolicy, TpmVerdict, appraise_tpm, tpm_evidence,
-    verify_tpm,
-};
 
-pub const SNP_STATEMENT_V1: &str = "hellas.attestation.amd.sev-snp.statement.v1";
-pub const TPM_STATEMENT_V1: &str = "hellas.attestation.tpm2.quote.statement.v1";
 #[cfg(feature = "apple-app-attest")]
 pub const APPLE_STATEMENT_V1: &str = "hellas.attestation.apple.app-attest.statement.v1";
 
@@ -51,25 +40,6 @@ impl Binding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnchorTime(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Validity {
-    NotYetValid,
-    Current,
-    Expired,
-}
-
-impl Validity {
-    fn at(anchor: AnchorTime, not_before: u64, not_after: u64) -> Self {
-        if anchor.0 < not_before {
-            Self::NotYetValid
-        } else if anchor.0 > not_after {
-            Self::Expired
-        } else {
-            Self::Current
-        }
-    }
-}
 
 pub trait Attester {
     fn attest(
@@ -139,8 +109,6 @@ pub enum AttestationError {
     Binding,
     #[error("evidence signature is invalid")]
     Signature,
-    #[error("event log does not match the quoted PCR digest")]
-    EventLog,
     #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
     #[error("Apple App Attest failed: {0}")]
     Platform(String),
@@ -150,9 +118,11 @@ pub enum AttestationError {
 mod tests {
     use super::*;
     use hellas_rpc::{
-        AMD_SEV_SNP, CanonicalizationId, Digest, InputCommitment, OutputTranscriptBuilder,
+        APPLE_APP_ATTEST, CanonicalizationId, Digest, InputCommitment, OutputTranscriptBuilder,
         ProducerSigningKey, SchemeId,
     };
+
+    const TEST_STATEMENT: &str = "hellas.attestation.test.statement.v1";
 
     #[tokio::test]
     async fn attested_preserves_signed_value_and_binds_terminal() {
@@ -168,10 +138,10 @@ mod tests {
         let finished = Attested {
             signed: events,
             attester: MockAttester {
-                codec: AMD_SEV_SNP,
+                codec: APPLE_APP_ATTEST,
                 credential: Vec::new(),
             },
-            statement_tag: SNP_STATEMENT_V1,
+            statement_tag: TEST_STATEMENT,
         }
         .finish()
         .await
@@ -181,7 +151,7 @@ mod tests {
         let evidence = &finished.assurance_evidence[0];
         assert_eq!(
             evidence.proof,
-            Binding::new(SNP_STATEMENT_V1, terminal).as_bytes()
+            Binding::new(TEST_STATEMENT, terminal).as_bytes()
         );
     }
 }
