@@ -121,7 +121,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             // Embedded executor accepts the full preference list so a future
             // dialer can pin any of them. The CLI itself only ever builds
             // the program at the first acceptable entry.
-            CliRuntime::local(
+            let runtime = CliRuntime::local(
                 Executor::spawn_with_producer_key(
                     hellas_rpc::policy::ExecutePolicy::Eager,
                     hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
@@ -131,9 +131,12 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                     assurance,
                 )
                 .context("failed to initialize local execution backend")?,
-            )
-            .with_remote(secret_key.clone())
-            .await?
+            );
+            if options.verify_local {
+                runtime.with_remote(secret_key.clone()).await?
+            } else {
+                runtime
+            }
         } else {
             CliRuntime::remote(secret_key.clone()).await?
         };
