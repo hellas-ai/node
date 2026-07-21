@@ -6,12 +6,12 @@
 //! assembly to them.
 
 mod assets;
-mod config;
 mod hf;
+mod prompt;
 
 use std::path::PathBuf;
 
-use catgrad_llm::LLMError;
+use catgrad_llm_models::ModelError;
 use hf_hub::api::sync::ApiError;
 use thiserror::Error;
 use tokenizers::Error as TokenizerError;
@@ -19,7 +19,8 @@ use tokenizers::Error as TokenizerError;
 use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{
-    ModelAssets, PreparedQuote, TextOutputDecoder, program_manifest, to_catgrad_dtype,
+    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, TextOutputDecoder, program_manifest,
+    to_catgrad_dtype,
 };
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
@@ -28,55 +29,54 @@ type Result<T> = std::result::Result<T, ModelAssetsError>;
 pub enum ModelAssetsError {
     #[error(transparent)]
     Spec(#[from] ModelSpecError),
+    #[error(transparent)]
+    Model(#[from] ModelError),
     #[error("failed to initialize Hugging Face API")]
     BuildHfApi {
         #[source]
         source: ApiError,
     },
     #[error("failed to fetch {file} for {model_id}@{revision}")]
-    FetchModelMetadata {
+    FetchModelAsset {
         model_id: String,
         revision: String,
-        file: &'static str,
+        file: String,
         #[source]
         source: ApiError,
     },
-    #[error("failed to read model config {path:?}")]
-    ReadModelConfig {
+    #[error("failed to read model asset {path:?}")]
+    ReadAsset {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse model config JSON")]
-    ParseModelConfig {
+    #[error("failed to parse model metadata JSON")]
+    ParseModelMetadata {
         #[source]
         source: serde_json::Error,
     },
-    #[error("failed to construct model config")]
-    ConstructModelConfig {
-        #[source]
-        source: LLMError,
-    },
+    #[error("model.safetensors.index.json has no valid weight_map")]
+    InvalidModelIndex,
     #[error("failed to load tokenizer {path:?}")]
     LoadTokenizer {
         path: PathBuf,
         #[source]
         source: TokenizerError,
     },
-    #[error("failed to prepare prompt request")]
-    PreparePromptRequest {
+    #[error("model has no chat template")]
+    MissingChatTemplate,
+    #[error("failed to render model chat template")]
+    RenderChatTemplate {
         #[source]
-        source: LLMError,
+        source: minijinja::Error,
     },
-    #[error("negative prompt token id {token} cannot be encoded")]
-    NegativePromptTokenId { token: i32 },
+    #[error("failed to tokenize prompt")]
+    TokenizePrompt {
+        #[source]
+        source: TokenizerError,
+    },
     #[error("negative stop token id {token} cannot be encoded")]
     NegativeStopTokenId { token: i32 },
-    #[error("failed to build program model")]
-    BuildProgramModel {
-        #[source]
-        source: LLMError,
-    },
     #[error("failed to serialize program")]
     SerializeProgram {
         #[source]
@@ -84,12 +84,6 @@ pub enum ModelAssetsError {
     },
     #[error("program graph does not match its declared type")]
     InvalidProgramGraph,
-    #[error("failed to read manifest asset {path:?}")]
-    ReadManifestAsset {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("model cache path has no immutable revision")]
     UnresolvedRevision,
     #[error("failed to decode tokens")]
@@ -101,13 +95,6 @@ pub enum ModelAssetsError {
     TokenBytes {
         #[from]
         source: TokenBytesError,
-    },
-    #[error("output token id {token} exceeds i32 range")]
-    OutputTokenOutOfRange { token: u32 },
-    #[error("failed to detokenize streamed output")]
-    Detokenize {
-        #[source]
-        source: LLMError,
     },
 }
 

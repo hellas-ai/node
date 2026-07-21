@@ -1,19 +1,16 @@
 use std::sync::Arc;
 
-use catgrad_llm::utils::{
-    get_model, get_model_architecture, get_model_chat_template, get_model_files,
-};
-use catgrad_llm::{Detokenizer, LLMError};
-use chatgrad::types::Message;
-use chatgrad::{PreparedPrompt, RenderChatTemplateOptions};
+use catgrad_llm_models::utils::{get_model, get_model_architecture};
 use hellas_rpc::{ContentId, DagCborEncoder, Dtype, EvaluateProgramManifest};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::config::encode_i32_tokens;
-use super::hf::get_model_metadata_files;
+use super::hf::{get_model_metadata_files, get_program_files};
+use super::prompt::render_chat_prompt;
 use super::{ModelAssetsError, Result};
 use hellas_rpc::{decode_token_ids, spec::ModelSpec};
+
+pub use super::prompt::{ChatMessage, PreparedPrompt};
 
 pub fn program_manifest(
     model: &str,
@@ -22,8 +19,7 @@ pub fn program_manifest(
 ) -> Result<EvaluateProgramManifest> {
     let spec = ModelSpec::parse(model)?;
     let (mut weight_paths, config_path, tokenizer_path, tokenizer_config_path) =
-        get_model_files(&spec.id, &spec.revision)
-            .map_err(|source| ModelAssetsError::BuildProgramModel { source })?;
+        get_program_files(&spec)?;
     weight_paths.sort();
     let weights = weight_paths
         .iter()
@@ -31,9 +27,8 @@ pub fn program_manifest(
         .collect::<Result<Vec<_>>>()?;
     let config_bytes = read_asset(&config_path)?;
     let config: Value = serde_json::from_slice(&config_bytes)
-        .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
-    let graph = get_model(&config, 1, None, to_catgrad_dtype(dtype))
-        .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?
+        .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;
+    let graph = get_model(&config, 1, None, to_catgrad_dtype(dtype))?
         .term()
         .ok_or(ModelAssetsError::InvalidProgramGraph)?;
     let graph = ContentId::hash(
@@ -73,7 +68,7 @@ fn read_content_id(path: &std::path::Path) -> Result<ContentId> {
 }
 
 fn read_asset(path: &std::path::Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|source| ModelAssetsError::ReadManifestAsset {
+    std::fs::read(path).map_err(|source| ModelAssetsError::ReadAsset {
         path: path.to_path_buf(),
         source,
     })
@@ -97,34 +92,31 @@ pub struct ModelAssets {
     tokenizer: Arc<Tokenizer>,
     tokenizer_config: Arc<Value>,
     chat_template: Option<Arc<str>>,
-    stop_token_ids: Arc<[i32]>,
+    stop_token_ids: Arc<[u32]>,
     dtype: Dtype,
 }
 
 impl ModelAssets {
     pub fn load(model_name: &str, dtype: Dtype) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
-        let (config_path, tokenizer_path, tokenizer_config_path) =
+        let (config_path, tokenizer_path, tokenizer_config_path, chat_template_path) =
             get_model_metadata_files(&model)?;
-        let config_bytes =
-            std::fs::read(&config_path).map_err(|source| ModelAssetsError::ReadModelConfig {
-                path: config_path.clone(),
-                source,
-            })?;
+        let config_bytes = read_asset(&config_path)?;
         let config: Value = serde_json::from_slice(&config_bytes)
-            .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
-        let tokenizer_config_bytes = std::fs::read(&tokenizer_config_path).map_err(|source| {
-            ModelAssetsError::ReadModelConfig {
-                path: tokenizer_config_path.clone(),
-                source,
-            }
-        })?;
+            .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;
+        let tokenizer_config_bytes = read_asset(&tokenizer_config_path)?;
         let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
-            .map_err(|source| ModelAssetsError::ParseModelConfig { source })?;
+            .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;
 
-        let graph_model = get_model(&config, 1, None, to_catgrad_dtype(dtype))
-            .map_err(|source| ModelAssetsError::ConstructModelConfig { source })?;
-        let stop_token_ids: Vec<i32> = graph_model.config().get_eos_token_ids();
+        let graph_model = get_model(&config, 1, None, to_catgrad_dtype(dtype))?;
+        let stop_token_ids = graph_model
+            .config()
+            .get_eos_token_ids()
+            .into_iter()
+            .map(|token| {
+                u32::try_from(token).map_err(|_| ModelAssetsError::NegativeStopTokenId { token })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|source| {
             ModelAssetsError::LoadTokenizer {
@@ -133,9 +125,18 @@ impl ModelAssets {
             }
         })?;
 
-        let chat_template = get_model_chat_template(&model.id, &model.revision)
-            .ok()
-            .map(Arc::<str>::from);
+        let chat_template = match chat_template_path {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|source| ModelAssetsError::ReadAsset { path, source })?,
+            ),
+            None => tokenizer_config
+                .get("chat_template")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+        .map(sanitize_chat_template)
+        .map(Arc::<str>::from);
 
         Ok(Self {
             model,
@@ -153,70 +154,48 @@ impl ModelAssets {
     /// Assembling the wire `QuotePreparedTextRequest` (start marker,
     /// runner key) is the caller's job — the model layer owns no protocol
     /// shape.
-    pub fn prepare_quote(&self, prepared_prompt: &PreparedPrompt) -> Result<PreparedQuote> {
-        let prompt_token_ids = encode_i32_tokens(&prepared_prompt.input_ids, |token| {
-            ModelAssetsError::NegativePromptTokenId { token }
-        })?;
-        let stop_token_ids = encode_i32_tokens(&prepared_prompt.stop_token_ids, |token| {
-            ModelAssetsError::NegativeStopTokenId { token }
-        })?;
-        Ok(PreparedQuote {
+    pub fn prepare_quote(&self, prepared_prompt: &PreparedPrompt) -> PreparedQuote {
+        PreparedQuote {
             huggingface_model_id: self.model.id.clone(),
             huggingface_revision: self.model.revision.clone(),
-            prompt_token_ids,
-            stop_token_ids,
+            prompt_token_ids: prepared_prompt.input_ids.clone(),
+            stop_token_ids: prepared_prompt.stop_token_ids.clone(),
             accept_dtype: self.dtype.as_wire().to_string(),
-        })
+        }
     }
 
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
     }
 
-    pub fn prepare_chat(&self, messages: &[Message]) -> Result<PreparedPrompt> {
-        let template = self.chat_template.as_deref().ok_or_else(|| {
-            ModelAssetsError::PreparePromptRequest {
-                source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
-            }
-        })?;
-        PreparedPrompt::from_messages(
-            self.tokenizer.as_ref(),
-            template,
-            &self.tokenizer_config,
-            messages,
-            &self.stop_token_ids,
-        )
-        .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+    pub fn prepare_chat(&self, messages: &[ChatMessage]) -> Result<PreparedPrompt> {
+        self.prepare_chat_with_options(messages, None, false)
     }
 
     pub fn prepare_chat_with_options(
         &self,
-        messages: &[Message],
+        messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
     ) -> Result<PreparedPrompt> {
-        let template = self.chat_template.as_deref().ok_or_else(|| {
-            ModelAssetsError::PreparePromptRequest {
-                source: LLMError::InvalidModelConfig("model has no chat template".to_string()),
-            }
-        })?;
-        PreparedPrompt::from_messages_with_options(
-            self.tokenizer.as_ref(),
+        let template = self
+            .chat_template
+            .as_deref()
+            .ok_or(ModelAssetsError::MissingChatTemplate)?;
+        let prompt = render_chat_prompt(
             template,
             &self.tokenizer_config,
             messages,
-            &self.stop_token_ids,
-            RenderChatTemplateOptions {
-                enable_thinking,
-                tools,
-            },
+            tools,
+            enable_thinking,
         )
-        .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+        .map_err(|source| ModelAssetsError::RenderChatTemplate { source })?;
+        self.prepare_plain(&prompt)
     }
 
     pub fn prepare_plain(&self, prompt: &str) -> Result<PreparedPrompt> {
         PreparedPrompt::from_prompt(self.tokenizer.as_ref(), prompt, &self.stop_token_ids)
-            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+            .map_err(|source| ModelAssetsError::TokenizePrompt { source })
     }
 
     pub fn decode_tokens(&self, token_ids: &[u32]) -> Result<String> {
@@ -225,14 +204,14 @@ impl ModelAssets {
             .map_err(|source| ModelAssetsError::DecodeTokens { source })
     }
 
-    pub fn stop_token_ids(&self) -> &[i32] {
+    pub fn stop_token_ids(&self) -> &[u32] {
         &self.stop_token_ids
     }
 
     pub fn architecture(&self) -> Result<String> {
         get_model_architecture(&self.config)
             .map(str::to_string)
-            .map_err(|source| ModelAssetsError::PreparePromptRequest { source })
+            .map_err(Into::into)
     }
 }
 
@@ -241,30 +220,22 @@ impl ModelAssets {
 /// The decoder preserves detokenizer state across chunks, including partial
 /// byte sequences and stop-token handling.
 pub struct TextOutputDecoder {
-    decoder: Detokenizer<'static>,
+    assets: Arc<ModelAssets>,
+    stop_token_ids: Vec<u32>,
+    token_ids: Vec<u32>,
+    decoded: String,
+    stopped: bool,
 }
 
 impl TextOutputDecoder {
-    pub fn new(assets: Arc<ModelAssets>, stop_token_ids: &[i32]) -> Self {
-        let decoder = Detokenizer::new(
-            move |token_ids| {
-                let token_ids: Vec<u32> = token_ids
-                    .iter()
-                    .map(|&token| {
-                        u32::try_from(token).map_err(|_| {
-                            LLMError::TokenizerError(format!(
-                                "negative token id {token} cannot be decoded"
-                            ))
-                        })
-                    })
-                    .collect::<catgrad_llm::Result<_>>()?;
-                assets
-                    .decode_tokens(&token_ids)
-                    .map_err(|err| LLMError::TokenizerError(err.to_string()))
-            },
-            stop_token_ids,
-        );
-        Self { decoder }
+    pub fn new(assets: Arc<ModelAssets>, stop_token_ids: &[u32]) -> Self {
+        Self {
+            assets,
+            stop_token_ids: stop_token_ids.to_vec(),
+            token_ids: Vec::new(),
+            decoded: String::new(),
+            stopped: false,
+        }
     }
 
     pub fn for_model(assets: Arc<ModelAssets>) -> Self {
@@ -273,16 +244,36 @@ impl TextOutputDecoder {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
-        let token_ids: Vec<i32> = decode_token_ids(bytes)?
-            .into_iter()
-            .map(|token| {
-                i32::try_from(token).map_err(|_| ModelAssetsError::OutputTokenOutOfRange { token })
-            })
-            .collect::<std::result::Result<_, _>>()?;
-        self.decoder
-            .push_tokens(&token_ids)
-            .map_err(|source| ModelAssetsError::Detokenize { source })
+        if self.stopped {
+            return Ok(String::new());
+        }
+        let previous_len = self.token_ids.len();
+        for token in decode_token_ids(bytes)? {
+            if self.stop_token_ids.contains(&token) {
+                self.stopped = true;
+                break;
+            }
+            self.token_ids.push(token);
+        }
+        if self.token_ids.len() == previous_len {
+            return Ok(String::new());
+        }
+        let next = self.assets.decode_tokens(&self.token_ids)?;
+        let delta = next
+            .strip_prefix(&self.decoded)
+            .unwrap_or(&next)
+            .to_string();
+        self.decoded = next;
+        Ok(delta)
     }
+}
+
+fn sanitize_chat_template(template: String) -> String {
+    template
+        .replace("{% generation %}", "")
+        .replace("{%- generation -%}", "")
+        .replace("{% endgeneration %}", "")
+        .replace("{%- endgeneration -%}", "")
 }
 
 pub fn to_catgrad_dtype(dtype: Dtype) -> catgrad::prelude::Dtype {
@@ -292,5 +283,64 @@ pub fn to_catgrad_dtype(dtype: Dtype) -> catgrad::prelude::Dtype {
         Dtype::BF16 => catgrad::prelude::Dtype::BF16,
         Dtype::F8 => catgrad::prelude::Dtype::F8,
         Dtype::U32 => catgrad::prelude::Dtype::U32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokenizers::models::wordlevel::WordLevel;
+
+    #[test]
+    fn streamed_decoder_preserves_state_and_suppresses_stop_tokens() {
+        let tokenizer = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_string(), 0),
+                    ("hello".to_string(), 1),
+                    ("world".to_string(), 2),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let assets = Arc::new(ModelAssets {
+            model: ModelSpec::parse("test/model").unwrap(),
+            config: Value::Null,
+            tokenizer: Arc::new(Tokenizer::new(tokenizer)),
+            tokenizer_config: Arc::new(Value::Null),
+            chat_template: None,
+            stop_token_ids: Arc::from([99]),
+            dtype: Dtype::F32,
+        });
+        let mut decoder = TextOutputDecoder::new(assets, &[99]);
+        assert_eq!(
+            decoder
+                .push_bytes(&hellas_rpc::encode_token_ids(&[1]))
+                .unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            decoder
+                .push_bytes(&hellas_rpc::encode_token_ids(&[2, 99, 1]))
+                .unwrap(),
+            " world"
+        );
+        assert_eq!(
+            decoder
+                .push_bytes(&hellas_rpc::encode_token_ids(&[1]))
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn strips_generation_markers_from_hugging_face_templates() {
+        assert_eq!(
+            sanitize_chat_template("a{% generation %}b{%- endgeneration -%}c".to_string()),
+            "abc"
+        );
     }
 }

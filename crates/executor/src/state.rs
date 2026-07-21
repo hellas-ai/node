@@ -56,7 +56,7 @@ impl ModelLocator {
 pub struct Invocation {
     pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,
-    pub stop_token_ids: Vec<i32>,
+    pub stop_token_ids: Vec<u32>,
 }
 
 #[cfg(feature = "evaluate")]
@@ -104,18 +104,7 @@ impl QuotePlan {
                 "prompt is empty after decoding".to_string(),
             ));
         }
-        let stop_token_ids = request
-            .stop_token_ids
-            .iter()
-            .copied()
-            .map(|token| {
-                i32::try_from(token).map_err(|_| {
-                    ExecutorError::InvalidTokenPayload(format!(
-                        "stop token id {token} exceeds i32 range"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let stop_token_ids = request.stop_token_ids;
         let initial_artifact_id = parse_evaluate_start(request.start)?;
         let runner_public_key = request
             .runner_public_key

@@ -31,11 +31,11 @@ blake3 = "1"
 bytes = "1"
 cc = "1"
 ciborium = "0.2"
-catgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false, features = [
+catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false, features = [
     "serde",
 ] }
-catgrad-llm = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
-chatgrad = { git = "https://github.com/georgewhewell/catgrad", branch = "grw/feat/chat-types-on-chatgrad", default-features = false }
+catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
+catgrad-llm-models = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
 clap = { version = "4", features = ["derive"] }
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }

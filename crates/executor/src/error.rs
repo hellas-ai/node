@@ -1,5 +1,3 @@
-#[cfg(feature = "evaluate")]
-use catgrad_llm::LLMError;
 use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
 
@@ -44,9 +42,6 @@ pub enum ExecutorError {
     #[cfg(feature = "evaluate")]
     #[error(transparent)]
     ModelAssets(#[from] ModelAssetsError),
-    #[cfg(feature = "evaluate")]
-    #[error("LLM error: {0}")]
-    Llm(#[from] LLMError),
     #[error("weights error: {0}")]
     WeightsError(String),
     #[error("artifact not found: {0}")]
@@ -91,8 +86,6 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
             WireCode::NotFound
         }
-        #[cfg(feature = "evaluate")]
-        ExecutorError::Llm(_) => WireCode::Internal,
         ExecutorError::ChannelClosed
         | ExecutorError::BackendInit(_)
         | ExecutorError::WeightsError(_)

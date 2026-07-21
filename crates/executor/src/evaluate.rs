@@ -5,8 +5,7 @@ use std::time::Instant;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
-use chatgrad::types;
-use hellas_models::{ModelAssets, PreparedQuote};
+use hellas_models::{ChatMessage, ModelAssets, PreparedQuote};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
@@ -384,7 +383,7 @@ impl SchemeEngine for EvaluateEngine {
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
         let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
-        let quote = assets.prepare_quote(&prepared)?;
+        let quote = assets.prepare_quote(&prepared);
         let prepared_request = quote_prepared_text_request(
             quote,
             request.max_new_tokens,
@@ -418,24 +417,22 @@ impl SchemeEngine for EvaluateEngine {
             dtype,
         )?;
 
-        let mut messages: Vec<types::Message> = Vec::new();
+        let mut messages = Vec::new();
         if !request.system_prompt.is_empty() {
-            messages.push(types::Message::openai(types::openai::ChatMessage::system(
-                &request.system_prompt,
-            )));
+            messages.push(ChatMessage::system(&request.system_prompt));
         }
         for m in &request.messages {
             let msg = match m.role.as_str() {
-                "assistant" => types::openai::ChatMessage::assistant(&m.content),
-                _ => types::openai::ChatMessage::user(&m.content),
+                "assistant" => ChatMessage::assistant(&m.content),
+                _ => ChatMessage::user(&m.content),
             };
-            messages.push(types::Message::openai(msg));
+            messages.push(msg);
         }
         let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
         let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
-        let quote = assets.prepare_quote(&prepared)?;
+        let quote = assets.prepare_quote(&prepared);
         let prepared_request = quote_prepared_text_request(
             quote,
             request.max_new_tokens,
