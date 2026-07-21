@@ -36,22 +36,6 @@ pub use crate::StateError;
 pub(crate) const QUOTE_AMOUNT: u64 = 1000;
 pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ArtifactStoreConfig {
-    Memory,
-    Fs(std::path::PathBuf),
-}
-
-impl ArtifactStoreConfig {
-    pub fn memory() -> Self {
-        Self::Memory
-    }
-
-    pub fn fs(path: impl Into<std::path::PathBuf>) -> Self {
-        Self::Fs(path.into())
-    }
-}
-
 #[cfg(feature = "evaluate")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ModelLocator {

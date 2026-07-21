@@ -3,6 +3,8 @@ mod quote;
 
 use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
+use crate::artifact_store::ArtifactStoreConfig;
+#[cfg(feature = "evaluate")]
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
@@ -10,11 +12,11 @@ use crate::chain::{ChainView, StakedProvider};
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
-use crate::fetch_policy::{FetchAccessPolicy, FetchQuotaStoreBackend};
+use crate::fetch_policy::FetchAccessPolicy;
 use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::SchemeEngine;
-use crate::state::{ArtifactStoreConfig, ExecutorState};
+use crate::state::ExecutorState;
 use futures_util::StreamExt as _;
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
@@ -64,6 +66,8 @@ pub struct ExecutorSpawnConfig {
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
+    pub fetch_store: FetchTranscriptStoreBackend,
+    #[cfg(feature = "evaluate")]
     pub artifact_store: ArtifactStoreConfig,
     /// The staked pairing plus its chain view. `Some` makes every
     /// execution require an admissible client-signed job acceptance,
@@ -155,8 +159,6 @@ impl Executor {
     pub async fn spawn_configured(
         config: ExecutorSpawnConfig,
     ) -> Result<ExecutorHandle, ExecutorError> {
-        let fetch_store = fetch_store_from_artifact_config(&config.artifact_store);
-        let fetch_quota_store = fetch_quota_store_from_artifact_config(&config.artifact_store);
         #[cfg(feature = "evaluate")]
         let artifacts = EvaluateArtifactStore::open(config.artifact_store).await?;
         Self::spawn_runtime(ExecutorRuntimeConfig {
@@ -169,13 +171,13 @@ impl Executor {
                 genesis: config.provider_genesis,
                 assurance: config.assurance,
             },
-            fetch_access_policy: config.fetch_access_policy.with_store(fetch_quota_store),
+            fetch_access_policy: config.fetch_access_policy,
             fetch_routes: config.fetch_routes,
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             #[cfg(feature = "evaluate")]
             artifacts,
-            fetch_store,
+            fetch_store: config.fetch_store,
             staked: config.staked,
         })
     }
@@ -379,20 +381,4 @@ impl Executor {
 
 fn evaluate_disabled() -> ExecutorError {
     ExecutorError::PolicyDenied("evaluate scheme is not enabled on this node".to_string())
-}
-
-fn fetch_store_from_artifact_config(config: &ArtifactStoreConfig) -> FetchTranscriptStoreBackend {
-    match config {
-        ArtifactStoreConfig::Memory => FetchTranscriptStoreBackend::memory(),
-        ArtifactStoreConfig::Fs(path) => {
-            FetchTranscriptStoreBackend::fs(path.join("fetch-transcripts"))
-        }
-    }
-}
-
-fn fetch_quota_store_from_artifact_config(config: &ArtifactStoreConfig) -> FetchQuotaStoreBackend {
-    match config {
-        ArtifactStoreConfig::Memory => FetchQuotaStoreBackend::memory(),
-        ArtifactStoreConfig::Fs(path) => FetchQuotaStoreBackend::fs(path.join("fetch-quota")),
-    }
 }

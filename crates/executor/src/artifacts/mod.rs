@@ -1,12 +1,11 @@
-use std::collections::{HashMap, hash_map::Entry};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::ExecutorError;
 use hellas_rpc::{ContentId, Digest, EvaluateRequest};
-use serde::{Deserialize, Serialize};
 
-use crate::state::{ArtifactStoreConfig, Invocation, ModelLocator, QuotePlan};
+use crate::artifact_store::{ArtifactStorage, ArtifactStoreConfig};
+use crate::state::{Invocation, ModelLocator, QuotePlan};
 
 mod schema;
 
@@ -16,120 +15,8 @@ use schema::{
     TextSource, TextState, TextStateId, TokenId, TokenIds, TokenIdsId,
 };
 
-const EVALUATE_INDEX_FILE: &str = "evaluate-index.json";
-
-enum ArtifactBlobStore {
-    Memory(iroh_blobs::store::mem::MemStore),
-    Fs(iroh_blobs::store::fs::FsStore),
-}
-
-impl Default for ArtifactBlobStore {
-    fn default() -> Self {
-        Self::memory()
-    }
-}
-
-impl ArtifactBlobStore {
-    fn memory() -> Self {
-        Self::Memory(iroh_blobs::store::mem::MemStore::default())
-    }
-
-    async fn fs(path: impl AsRef<Path>) -> Result<Self, ExecutorError> {
-        let path = path.as_ref();
-        let store = iroh_blobs::store::fs::FsStore::load(path)
-            .await
-            .map_err(|err| {
-                ExecutorError::ArtifactStore(format!(
-                    "failed to open artifact blob store {}: {err}",
-                    path.display()
-                ))
-            })?;
-        Ok(Self::Fs(store))
-    }
-
-    async fn insert_canonical(&self, digest: Digest, bytes: &[u8]) -> Result<(), ExecutorError> {
-        let expected = iroh_hash(digest);
-        let tag = match self {
-            Self::Memory(store) => store.add_slice(bytes).await,
-            Self::Fs(store) => store.add_slice(bytes).await,
-        }
-        .map_err(|err| ExecutorError::ArtifactStore(format!("blob insert failed: {err}")))?;
-
-        if tag.hash != expected {
-            return Err(ExecutorError::ArtifactStore(format!(
-                "blob store hash mismatch: expected {}, got {}",
-                expected.to_hex(),
-                tag.hash.to_hex()
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn get_canonical(&self, digest: Digest) -> Result<Option<Vec<u8>>, ExecutorError> {
-        let hash = iroh_hash(digest);
-        let has_blob = match self {
-            Self::Memory(store) => store.has(hash).await,
-            Self::Fs(store) => store.has(hash).await,
-        }
-        .map_err(|err| ExecutorError::ArtifactStore(format!("blob lookup failed: {err}")))?;
-        if !has_blob {
-            return Ok(None);
-        }
-
-        let bytes = match self {
-            Self::Memory(store) => store.get_bytes(hash).await,
-            Self::Fs(store) => store.get_bytes(hash).await,
-        }
-        .map_err(|err| ExecutorError::ArtifactStore(format!("blob read failed: {err}")))?
-        .to_vec();
-
-        if Digest::hash(&bytes) != digest {
-            return Err(ExecutorError::ArtifactStore(format!(
-                "blob store returned bytes that do not match requested digest {digest}"
-            )));
-        }
-
-        Ok(Some(bytes))
-    }
-
-    #[cfg(test)]
-    async fn shutdown(&self) -> Result<(), ExecutorError> {
-        match self {
-            Self::Memory(store) => store.shutdown().await,
-            Self::Fs(store) => store.shutdown().await,
-        }
-        .map_err(|err| ExecutorError::ArtifactStore(format!("blob store shutdown failed: {err}")))
-    }
-}
-
-#[derive(Default)]
-struct EvaluateIndexData {
-    bound_terms: HashMap<BoundTermId, ModelLocator>,
-    outputs_by_execution: HashMap<TextExecutionId, TextArtifactId>,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct PersistedEvaluateIndex {
-    #[serde(default)]
-    bound_terms: Vec<PersistedBoundTerm>,
-    #[serde(default)]
-    outputs_by_execution: Vec<PersistedExecutionOutput>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedBoundTerm {
-    bound_term: String,
-    model_id: String,
-    revision: String,
-    dtype: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedExecutionOutput {
-    execution: String,
-    artifact: String,
-}
+const CANONICAL_PARTITION: &str = "evaluate_canonical";
+const EXECUTION_OUTPUT_PARTITION: &str = "evaluate_execution_outputs";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedEvaluateExecution {
@@ -139,10 +26,10 @@ pub(crate) struct ResolvedEvaluateExecution {
 }
 
 pub(crate) struct EvaluateArtifactStore {
-    blob_store: ArtifactBlobStore,
-    index_path: Option<PathBuf>,
+    storage: Option<Arc<dyn ArtifactStorage>>,
+    canonical_keys: HashSet<Digest>,
+    execution_output_keys: HashSet<TextExecutionId>,
     canonical_blobs: HashMap<Digest, Vec<u8>>,
-    bound_terms: HashMap<BoundTermId, ModelLocator>,
     token_ids: HashMap<TokenIdsId, TokenIds>,
     policies: HashMap<TextPolicyId, TextPolicy>,
     text_executions: HashMap<TextExecutionId, TextExecution>,
@@ -181,11 +68,6 @@ impl EvaluateArtifactStores {
         &mut self.retained
     }
 
-    #[cfg(test)]
-    async fn shutdown(&self) -> Result<(), ExecutorError> {
-        self.ephemeral.shutdown().await?;
-        self.retained.shutdown().await
-    }
 }
 
 struct MaterializedTextSource {
@@ -202,45 +84,103 @@ impl Default for EvaluateArtifactStore {
 
 impl EvaluateArtifactStore {
     pub(crate) fn memory() -> Self {
-        Self::new(ArtifactBlobStore::memory())
+        Self::new(None)
     }
 
     pub(crate) async fn open(config: ArtifactStoreConfig) -> Result<Self, ExecutorError> {
-        match config {
-            ArtifactStoreConfig::Memory => Ok(Self::memory()),
-            ArtifactStoreConfig::Fs(path) => {
-                let index_path = path.join(EVALUATE_INDEX_FILE);
-                let index = load_evaluate_index(&index_path)?;
-                Ok(Self::with_index(
-                    ArtifactBlobStore::fs(path).await?,
-                    Some(index_path),
-                    index,
-                ))
-            }
-        }
-    }
-
-    fn new(blob_store: ArtifactBlobStore) -> Self {
-        Self::with_index(blob_store, None, EvaluateIndexData::default())
-    }
-
-    fn with_index(
-        blob_store: ArtifactBlobStore,
-        index_path: Option<PathBuf>,
-        index: EvaluateIndexData,
-    ) -> Self {
-        Self {
-            blob_store,
-            index_path,
+        let Some(storage) = config.storage() else {
+            return Ok(Self::memory());
+        };
+        let canonical_keys = scan_digests(&storage, CANONICAL_PARTITION).await?;
+        let execution_output_keys = scan_digests(&storage, EXECUTION_OUTPUT_PARTITION)
+            .await?
+            .into_iter()
+            .map(TextExecutionId::from_digest)
+            .collect();
+        Ok(Self {
+            storage: Some(storage),
+            canonical_keys,
+            execution_output_keys,
             canonical_blobs: HashMap::new(),
-            bound_terms: index.bound_terms,
             token_ids: HashMap::new(),
             policies: HashMap::new(),
             text_executions: HashMap::new(),
             text_states: HashMap::new(),
             text_artifacts: HashMap::new(),
-            outputs_by_execution: index.outputs_by_execution,
+            outputs_by_execution: HashMap::new(),
+        })
+    }
+
+    fn new(storage: Option<Arc<dyn ArtifactStorage>>) -> Self {
+        Self {
+            storage,
+            canonical_keys: HashSet::new(),
+            execution_output_keys: HashSet::new(),
+            canonical_blobs: HashMap::new(),
+            token_ids: HashMap::new(),
+            policies: HashMap::new(),
+            text_executions: HashMap::new(),
+            text_states: HashMap::new(),
+            text_artifacts: HashMap::new(),
+            outputs_by_execution: HashMap::new(),
         }
+    }
+
+    async fn persist_blob(&mut self, digest: Digest, bytes: &[u8]) -> Result<(), ExecutorError> {
+        if Digest::hash(bytes) != digest {
+            return Err(ExecutorError::ArtifactStore(format!(
+                "canonical bytes do not match digest {digest}"
+            )));
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        let existing = storage
+            .write_once(
+                CANONICAL_PARTITION,
+                digest.as_bytes().to_vec(),
+                bytes.to_vec(),
+            )
+            .await
+            .map_err(storage_error)?;
+        if let Some(existing) = existing
+            && existing != bytes
+        {
+            if Digest::hash(&existing) == digest {
+                return Err(ExecutorError::ArtifactStore(format!(
+                    "stored artifact {digest} has conflicting canonical bytes"
+                )));
+            }
+            storage
+                .replace(
+                    CANONICAL_PARTITION,
+                    digest.as_bytes().to_vec(),
+                    bytes.to_vec(),
+                )
+                .await
+                .map_err(storage_error)?;
+        }
+        self.canonical_keys.insert(digest);
+        Ok(())
+    }
+
+    async fn read_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, ExecutorError> {
+        if !self.canonical_keys.contains(&digest) {
+            return Ok(None);
+        }
+        let storage = self.storage.as_ref().ok_or_else(|| {
+            ExecutorError::ArtifactStore("canonical artifact storage is unavailable".to_string())
+        })?;
+        let bytes = storage
+            .read(CANONICAL_PARTITION, digest.as_bytes().to_vec())
+            .await
+            .map_err(storage_error)?;
+        if Digest::hash(&bytes) != digest {
+            return Err(ExecutorError::ArtifactStore(format!(
+                "stored artifact does not match requested digest {digest}"
+            )));
+        }
+        Ok(Some(bytes))
     }
 
     pub async fn record_prepared_text(
@@ -249,10 +189,6 @@ impl EvaluateArtifactStore {
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let execution_environment = plan.execution_environment;
         let bound_term_id = BoundTermId::from_digest(execution_environment.digest());
-        if let Entry::Vacant(entry) = self.bound_terms.entry(bound_term_id) {
-            entry.insert(plan.locator.clone());
-            self.persist_evaluate_index()?;
-        }
 
         let from = match plan.initial_artifact_id {
             Some(artifact_id) => {
@@ -261,7 +197,12 @@ impl EvaluateArtifactStore {
                 SourceRef::output(artifact_id)
             }
             None => {
-                let identity = TextArtifact::identity(bound_term_id);
+                let identity = TextArtifact::identity(
+                    bound_term_id,
+                    &plan.locator.model_id,
+                    &plan.locator.revision,
+                    plan.locator.dtype.as_wire(),
+                );
                 let identity_id = identity.output_id();
                 self.insert_text_artifact(identity).await?;
                 SourceRef::output(identity_id)
@@ -336,7 +277,7 @@ impl EvaluateArtifactStore {
     ) -> Result<Digest, ExecutorError> {
         let digest = Digest::hash(&bytes);
         if !self.canonical_blobs.contains_key(&digest) {
-            self.blob_store.insert_canonical(digest, &bytes).await?;
+            self.persist_blob(digest, &bytes).await?;
             self.canonical_blobs.insert(digest, bytes);
         }
         Ok(digest)
@@ -347,8 +288,7 @@ impl EvaluateArtifactStore {
             return Ok(bytes.clone());
         }
         let bytes = self
-            .blob_store
-            .get_canonical(digest)
+            .read_blob(digest)
             .await?
             .ok_or_else(|| ExecutorError::ArtifactNotFound(digest.to_string()))?;
         self.canonical_blobs.insert(digest, bytes.clone());
@@ -380,9 +320,11 @@ impl EvaluateArtifactStore {
             generated_tokens_id,
         );
         let artifact_id = self.insert_text_artifact(artifact).await?;
-        if let Entry::Vacant(entry) = self.outputs_by_execution.entry(execution_id) {
-            entry.insert(artifact_id);
-            self.persist_evaluate_index()?;
+        if !self.outputs_by_execution.contains_key(&execution_id) {
+            let stored = self
+                .persist_execution_output(execution_id, artifact_id)
+                .await?;
+            self.outputs_by_execution.insert(execution_id, stored);
         }
         Ok(artifact_id.digest())
     }
@@ -393,7 +335,7 @@ impl EvaluateArtifactStore {
     ) -> Result<MaterializedTextSource, ExecutorError> {
         match source {
             SourceRef::Input(execution_id) => {
-                let artifact_id = self.output_artifact_for_execution(*execution_id)?;
+                let artifact_id = self.output_artifact_for_execution(*execution_id).await?;
                 self.materialize_execution_output(*execution_id, artifact_id)
                     .await
             }
@@ -424,10 +366,19 @@ impl EvaluateArtifactStore {
         artifact: TextArtifact,
     ) -> Result<MaterializedTextSource, ExecutorError> {
         match artifact {
-            TextArtifact::Identity { bound_term } => {
-                let locator = self.bound_term_locator(bound_term)?;
+            TextArtifact::Identity {
+                bound_term,
+                model_id,
+                revision,
+                dtype,
+            } => {
+                let dtype = parse_identity_dtype(&dtype)?;
                 Ok(MaterializedTextSource {
-                    locator,
+                    locator: ModelLocator {
+                        model_id,
+                        revision,
+                        dtype,
+                    },
                     execution_environment: hellas_rpc::ContentId::from_bytes(
                         *bound_term.as_bytes(),
                     ),
@@ -456,7 +407,7 @@ impl EvaluateArtifactStore {
         let mut source = source;
         loop {
             let (artifact_id, expected_execution) = match source {
-                SourceRef::Input(id) => (self.output_artifact_for_execution(id)?, Some(id)),
+                SourceRef::Input(id) => (self.output_artifact_for_execution(id).await?, Some(id)),
                 SourceRef::Output(id) => (id, None),
             };
             let artifact = self.text_artifact(artifact_id).await?;
@@ -464,9 +415,18 @@ impl EvaluateArtifactStore {
                 validate_execution_output_mapping(expected_execution, artifact_id, &artifact)?;
             }
             match artifact {
-                TextArtifact::Identity { bound_term } => {
+                TextArtifact::Identity {
+                    bound_term,
+                    model_id,
+                    revision,
+                    dtype,
+                } => {
                     return Ok((
-                        self.bound_term_locator(bound_term)?,
+                        ModelLocator {
+                            model_id,
+                            revision,
+                            dtype: parse_identity_dtype(&dtype)?,
+                        },
                         ContentId::from_bytes(*bound_term.as_bytes()),
                     ));
                 }
@@ -481,24 +441,28 @@ impl EvaluateArtifactStore {
         }
     }
 
-    fn bound_term_locator(&self, bound_term: BoundTermId) -> Result<ModelLocator, ExecutorError> {
-        self.bound_terms.get(&bound_term).cloned().ok_or_else(|| {
-            ExecutorError::InvalidQuoteRequest(format!("missing bound term metadata {bound_term}"))
-        })
-    }
-
-    fn output_artifact_for_execution(
-        &self,
+    async fn output_artifact_for_execution(
+        &mut self,
         execution_id: TextExecutionId,
     ) -> Result<TextArtifactId, ExecutorError> {
-        self.outputs_by_execution
-            .get(&execution_id)
-            .copied()
-            .ok_or_else(|| {
-                ExecutorError::InvalidQuoteRequest(format!(
-                    "lazy evaluate source {execution_id} has no cached output artifact"
-                ))
-            })
+        if let Some(artifact) = self.outputs_by_execution.get(&execution_id) {
+            return Ok(*artifact);
+        }
+        if !self.execution_output_keys.contains(&execution_id) {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "lazy evaluate source {execution_id} has no cached output artifact"
+            )));
+        }
+        let storage = self.storage.as_ref().ok_or_else(|| {
+            ExecutorError::ArtifactStore("execution output storage is unavailable".to_string())
+        })?;
+        let bytes = storage
+            .read(EXECUTION_OUTPUT_PARTITION, execution_id.as_bytes().to_vec())
+            .await
+            .map_err(storage_error)?;
+        let artifact = decode_artifact_id(&bytes, execution_id)?;
+        self.outputs_by_execution.insert(execution_id, artifact);
+        Ok(artifact)
     }
 
     async fn token_ids(&mut self, id: TokenIdsId) -> Result<TokenIds, ExecutorError> {
@@ -562,7 +526,7 @@ impl EvaluateArtifactStore {
 
     async fn text_artifact(&mut self, id: TextArtifactId) -> Result<TextArtifact, ExecutorError> {
         if let Some(value) = self.text_artifacts.get(&id) {
-            return Ok(*value);
+            return Ok(value.clone());
         }
         let value = self
             .decode_canonical::<TextArtifact>(id.digest(), "TextArtifact")
@@ -570,7 +534,7 @@ impl EvaluateArtifactStore {
         if value.output_id() != id {
             return Err(canonical_type_mismatch("TextArtifact", id.digest()));
         }
-        self.text_artifacts.insert(id, value);
+        self.text_artifacts.insert(id, value.clone());
         Ok(value)
     }
 
@@ -593,13 +557,9 @@ impl EvaluateArtifactStore {
         if let Some(bytes) = self.canonical_blobs.get(&digest) {
             return Ok(bytes.clone());
         }
-        let bytes = self
-            .blob_store
-            .get_canonical(digest)
-            .await?
-            .ok_or_else(|| {
-                ExecutorError::InvalidQuoteRequest(format!("missing {kind} artifact {digest}"))
-            })?;
+        let bytes = self.read_blob(digest).await?.ok_or_else(|| {
+            ExecutorError::InvalidQuoteRequest(format!("missing {kind} artifact {digest}"))
+        })?;
         self.canonical_blobs.insert(digest, bytes.clone());
         Ok(bytes)
     }
@@ -655,21 +615,45 @@ impl EvaluateArtifactStore {
         }
 
         let bytes = value.canonical_bytes();
-        self.blob_store.insert_canonical(digest, &bytes).await?;
+        self.persist_blob(digest, &bytes).await?;
         self.canonical_blobs.insert(digest, bytes);
         Ok(())
     }
 
-    fn persist_evaluate_index(&self) -> Result<(), ExecutorError> {
-        let Some(path) = &self.index_path else {
-            return Ok(());
+    async fn persist_execution_output(
+        &mut self,
+        execution: TextExecutionId,
+        artifact: TextArtifactId,
+    ) -> Result<TextArtifactId, ExecutorError> {
+        let Some(storage) = &self.storage else {
+            return Ok(artifact);
         };
-        persist_evaluate_index(path, self)
-    }
-
-    #[cfg(test)]
-    async fn shutdown(&self) -> Result<(), ExecutorError> {
-        self.blob_store.shutdown().await
+        let existing = storage
+            .write_once(
+                EXECUTION_OUTPUT_PARTITION,
+                execution.as_bytes().to_vec(),
+                encode_artifact_id(artifact),
+            )
+            .await
+            .map_err(storage_error)?;
+        self.execution_output_keys.insert(execution);
+        let Some(existing) = existing else {
+            return Ok(artifact);
+        };
+        match decode_artifact_id(&existing, execution) {
+            Ok(existing) => Ok(existing),
+            Err(_) => {
+                storage
+                    .replace(
+                        EXECUTION_OUTPUT_PARTITION,
+                        execution.as_bytes().to_vec(),
+                        encode_artifact_id(artifact),
+                    )
+                    .await
+                    .map_err(storage_error)?;
+                Ok(artifact)
+            }
+        }
     }
 }
 
@@ -696,155 +680,64 @@ fn validate_execution_output_mapping(
     }
 }
 
-fn load_evaluate_index(path: &Path) -> Result<EvaluateIndexData, ExecutorError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(EvaluateIndexData::default());
-        }
-        Err(err) => {
-            return Err(ExecutorError::ArtifactStore(format!(
-                "failed to read evaluate artifact index {}: {err}",
-                path.display()
-            )));
-        }
-    };
-    let persisted: PersistedEvaluateIndex = serde_json::from_slice(&bytes).map_err(|err| {
+fn parse_identity_dtype(dtype: &str) -> Result<hellas_rpc::Dtype, ExecutorError> {
+    dtype.parse().map_err(|err| {
         ExecutorError::ArtifactStore(format!(
-            "failed to decode evaluate artifact index {}: {err}",
-            path.display()
-        ))
-    })?;
-    persisted.try_into_index()
-}
-
-fn persist_evaluate_index(path: &Path, store: &EvaluateArtifactStore) -> Result<(), ExecutorError> {
-    let persisted = PersistedEvaluateIndex::from_store(store);
-    let bytes = serde_json::to_vec_pretty(&persisted).map_err(|err| {
-        ExecutorError::ArtifactStore(format!("failed to encode evaluate artifact index: {err}"))
-    })?;
-    let parent = path.parent().ok_or_else(|| {
-        ExecutorError::ArtifactStore(format!(
-            "evaluate artifact index path {} has no parent",
-            path.display()
-        ))
-    })?;
-    fs::create_dir_all(parent).map_err(|err| {
-        ExecutorError::ArtifactStore(format!(
-            "failed to create evaluate artifact index directory {}: {err}",
-            parent.display()
-        ))
-    })?;
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp.{}",
-        EVALUATE_INDEX_FILE,
-        std::process::id()
-    ));
-    fs::write(&tmp, bytes).map_err(|err| {
-        ExecutorError::ArtifactStore(format!(
-            "failed to write evaluate artifact index temp file {}: {err}",
-            tmp.display()
-        ))
-    })?;
-    fs::rename(&tmp, path).map_err(|err| {
-        let _ = fs::remove_file(&tmp);
-        ExecutorError::ArtifactStore(format!(
-            "failed to persist evaluate artifact index {}: {err}",
-            path.display()
+            "invalid dtype {dtype:?} in identity artifact: {err}"
         ))
     })
 }
 
-impl PersistedEvaluateIndex {
-    fn from_store(store: &EvaluateArtifactStore) -> Self {
-        let mut bound_terms: Vec<_> = store
-            .bound_terms
-            .iter()
-            .map(|(bound_term, locator)| PersistedBoundTerm {
-                bound_term: bound_term.to_string(),
-                model_id: locator.model_id.clone(),
-                revision: locator.revision.clone(),
-                dtype: locator.dtype.as_wire().to_string(),
-            })
-            .collect();
-        bound_terms.sort_by(|a, b| a.bound_term.cmp(&b.bound_term));
-
-        let mut outputs_by_execution: Vec<_> = store
-            .outputs_by_execution
-            .iter()
-            .map(|(execution, artifact)| PersistedExecutionOutput {
-                execution: execution.to_string(),
-                artifact: artifact.to_string(),
-            })
-            .collect();
-        outputs_by_execution.sort_by(|a, b| a.execution.cmp(&b.execution));
-
-        Self {
-            bound_terms,
-            outputs_by_execution,
-        }
-    }
-
-    fn try_into_index(self) -> Result<EvaluateIndexData, ExecutorError> {
-        let mut index = EvaluateIndexData::default();
-        for entry in self.bound_terms {
-            let bound_term =
-                BoundTermId::from_digest(parse_artifact_digest(&entry.bound_term, "bound_term")?);
-            let dtype = entry.dtype.parse::<hellas_rpc::Dtype>().map_err(|err| {
+async fn scan_digests(
+    storage: &Arc<dyn ArtifactStorage>,
+    partition: &'static str,
+) -> Result<HashSet<Digest>, ExecutorError> {
+    storage
+        .scan(partition)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|name| {
+            let len = name.len();
+            let bytes = name.try_into().map_err(|_| {
                 ExecutorError::ArtifactStore(format!(
-                    "invalid dtype {:?} in evaluate artifact index: {err}",
-                    entry.dtype
+                    "invalid {partition} key length {len}, expected 32"
                 ))
             })?;
-            index.bound_terms.insert(
-                bound_term,
-                ModelLocator {
-                    model_id: entry.model_id,
-                    revision: entry.revision,
-                    dtype,
-                },
-            );
-        }
-
-        for entry in self.outputs_by_execution {
-            let execution =
-                TextExecutionId::from_digest(parse_artifact_digest(&entry.execution, "execution")?);
-            let artifact =
-                TextArtifactId::from_digest(parse_artifact_digest(&entry.artifact, "artifact")?);
-            index.outputs_by_execution.insert(execution, artifact);
-        }
-
-        Ok(index)
-    }
+            Ok(Digest::from_bytes(bytes))
+        })
+        .collect()
 }
 
-fn parse_artifact_digest(raw: &str, field: &str) -> Result<Digest, ExecutorError> {
-    if raw.len() != 64 {
+fn decode_artifact_id(
+    bytes: &[u8],
+    execution: TextExecutionId,
+) -> Result<TextArtifactId, ExecutorError> {
+    let record: &[u8; 64] = bytes.try_into().map_err(|_| {
+        ExecutorError::ArtifactStore(format!(
+            "invalid output mapping for {execution}: expected 64 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    let artifact: [u8; 32] = record[..32].try_into().expect("fixed record prefix");
+    let checksum: [u8; 32] = record[32..].try_into().expect("fixed record suffix");
+    if Digest::hash(&artifact) != Digest::from_bytes(checksum) {
         return Err(ExecutorError::ArtifactStore(format!(
-            "invalid {field} digest length {}, expected 64 hex chars",
-            raw.len()
+            "invalid output mapping checksum for {execution}"
         )));
     }
-    let mut bytes = [0u8; 32];
-    for (index, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-        let high = hex_value(chunk[0]).ok_or_else(|| invalid_hex(field, raw))?;
-        let low = hex_value(chunk[1]).ok_or_else(|| invalid_hex(field, raw))?;
-        bytes[index] = (high << 4) | low;
-    }
-    Ok(Digest::from_bytes(bytes))
+    Ok(TextArtifactId::from_bytes(artifact))
 }
 
-fn invalid_hex(field: &str, raw: &str) -> ExecutorError {
-    ExecutorError::ArtifactStore(format!("invalid {field} digest hex {raw:?}"))
+fn encode_artifact_id(artifact: TextArtifactId) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(artifact.as_bytes());
+    bytes.extend_from_slice(Digest::hash(artifact.as_bytes()).as_bytes());
+    bytes
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+fn storage_error(message: String) -> ExecutorError {
+    ExecutorError::ArtifactStore(message)
 }
 
 fn token_ids_to_u32(tokens: &TokenIds) -> Vec<u32> {
@@ -866,13 +759,12 @@ fn text_policy(invocation: &Invocation) -> Result<TextPolicy, ExecutorError> {
     Ok(TextPolicy::new(invocation.max_new_tokens, stop_token_ids))
 }
 
-fn iroh_hash(digest: Digest) -> iroh_blobs::Hash {
-    iroh_blobs::Hash::from_bytes(*digest.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_runtime::{
+        Blob as _, Runner as _, Storage as _, Supervisor as _, deterministic,
+    };
     use hellas_rpc::Dtype;
 
     fn runner_public_key() -> hellas_rpc::PublicKey {
@@ -1028,94 +920,115 @@ mod tests {
         assert_eq!(store.get_canonical_bytes(digest).await.unwrap(), bytes);
     }
 
-    #[tokio::test]
-    async fn retention_routes_prompt_artifacts_away_from_filesystem_and_courtesy_store() {
-        let path = temp_artifact_store_path("retention");
-        fs::create_dir_all(&path).unwrap();
-        let retained = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
-            .await
-            .unwrap();
-        let mut stores = EvaluateArtifactStores::new(retained);
-        let before = filesystem_snapshot(&path);
+    #[test]
+    fn retention_routes_prompt_artifacts_away_from_persistent_and_courtesy_storage() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context.child("retained"));
+            let retained = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+            let mut stores = EvaluateArtifactStores::new(retained);
 
-        let mut ephemeral_plan = plan();
-        ephemeral_plan.retention = hellas_rpc::Retention::Ephemeral;
-        let ephemeral = stores
-            .for_retention(ephemeral_plan.retention)
-            .record_prepared_text(&ephemeral_plan)
-            .await
-            .unwrap();
-        stores
-            .for_retention(ephemeral_plan.retention)
-            .record_completed_text(
-                &ephemeral.evaluate_request,
-                &ephemeral.invocation,
-                &[10, 11],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(filesystem_snapshot(&path), before);
-        assert!(
-            stores
-                .retained()
-                .get_canonical_bytes(ephemeral.evaluate_request.text_execution)
+            let mut ephemeral_plan = plan();
+            ephemeral_plan.retention = hellas_rpc::Retention::Ephemeral;
+            let ephemeral = stores
+                .for_retention(ephemeral_plan.retention)
+                .record_prepared_text(&ephemeral_plan)
                 .await
-                .is_err(),
-            "ephemeral token graph must not be exposed by Courtesy GetArtifact"
-        );
-
-        let retained_plan = plan();
-        let retained = stores
-            .for_retention(retained_plan.retention)
-            .record_prepared_text(&retained_plan)
-            .await
-            .unwrap();
-        stores
-            .for_retention(retained_plan.retention)
-            .record_completed_text(&retained.evaluate_request, &retained.invocation, &[10, 11])
-            .await
-            .unwrap();
-
-        assert_ne!(filesystem_snapshot(&path), before);
-        assert!(path.join(EVALUATE_INDEX_FILE).is_file());
-        assert!(
+                .unwrap();
             stores
-                .retained()
-                .get_canonical_bytes(retained.evaluate_request.text_execution)
+                .for_retention(ephemeral_plan.retention)
+                .record_completed_text(
+                    &ephemeral.evaluate_request,
+                    &ephemeral.invocation,
+                    &[10, 11],
+                )
                 .await
-                .is_ok(),
-            "retained artifacts remain available through Courtesy GetArtifact"
-        );
+                .unwrap();
 
-        stores.shutdown().await.unwrap();
-        fs::remove_dir_all(path).unwrap();
+            assert!(
+                stores
+                    .retained()
+                    .get_canonical_bytes(ephemeral.evaluate_request.text_execution)
+                    .await
+                    .is_err(),
+                "ephemeral token graph must not be exposed by Courtesy GetArtifact"
+            );
+            let mut reopened = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+            assert!(
+                reopened
+                    .get_canonical_bytes(ephemeral.evaluate_request.text_execution)
+                    .await
+                    .is_err(),
+                "ephemeral token graph must not enter persistent storage"
+            );
+
+            let retained_plan = plan();
+            let retained = stores
+                .for_retention(retained_plan.retention)
+                .record_prepared_text(&retained_plan)
+                .await
+                .unwrap();
+            stores
+                .for_retention(retained_plan.retention)
+                .record_completed_text(
+                    &retained.evaluate_request,
+                    &retained.invocation,
+                    &[10, 11],
+                )
+                .await
+                .unwrap();
+
+            let mut reopened = EvaluateArtifactStore::open(config).await.unwrap();
+            assert!(
+                reopened
+                    .get_canonical_bytes(retained.evaluate_request.text_execution)
+                    .await
+                    .is_ok(),
+                "retained artifacts must remain available from persistent storage"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn fs_store_reopens_typed_artifacts_from_canonical_blobs() {
-        let path = temp_artifact_store_path("reopen");
-        let _ = std::fs::remove_dir_all(&path);
+    #[test]
+    fn commonware_store_rejects_corrupt_canonical_blob() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context.child("artifacts"));
+            let digest = {
+                let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                store
+                    .publish_canonical_bytes(b"valid".to_vec())
+                    .await
+                    .unwrap()
+            };
+            let (blob, _) = context
+                .open(CANONICAL_PARTITION, digest.as_bytes())
+                .await
+                .unwrap();
+            blob.resize(0).await.unwrap();
+            blob.write_at_sync(0, b"corrupt".to_vec()).await.unwrap();
 
-        let first_artifact;
-        let first_request;
-        {
-            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
-                .await
-                .unwrap();
-            let first = store.record_prepared_text(&plan()).await.unwrap();
-            first_artifact = store
-                .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
-                .await
-                .unwrap();
-            first_request = first.evaluate_request;
-            store.shutdown().await.unwrap();
-        }
+            let mut store = EvaluateArtifactStore::open(config).await.unwrap();
+            let err = store.get_canonical_bytes(digest).await.unwrap_err();
+            assert!(err.to_string().contains("does not match requested digest"));
+        });
+    }
 
-        {
-            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
-                .await
-                .unwrap();
+    #[test]
+    fn commonware_store_reopens_typed_artifacts_from_canonical_blobs() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context);
+            let first_artifact;
+            let first_request;
+            {
+                let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                let first = store.record_prepared_text(&plan()).await.unwrap();
+                first_artifact = store
+                    .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
+                    .await
+                    .unwrap();
+                first_request = first.evaluate_request;
+            }
+
+            let mut store = EvaluateArtifactStore::open(config).await.unwrap();
             let resolved = store.resolve_evaluate_request(first_request).await.unwrap();
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3]);
 
@@ -1128,35 +1041,26 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
-            store.shutdown().await.unwrap();
-        }
-
-        let _ = std::fs::remove_dir_all(&path);
+        });
     }
 
-    #[tokio::test]
-    async fn fs_store_reopens_cached_lazy_substitutions() {
-        let path = temp_artifact_store_path("lazy");
-        let _ = std::fs::remove_dir_all(&path);
+    #[test]
+    fn commonware_store_reopens_cached_lazy_substitutions() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context);
+            let first_execution;
+            {
+                let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                let first = store.record_prepared_text(&plan()).await.unwrap();
+                store
+                    .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
+                    .await
+                    .unwrap();
+                first_execution =
+                    TextExecutionId::from_digest(first.evaluate_request.text_execution);
+            }
 
-        let first_execution;
-        {
-            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
-                .await
-                .unwrap();
-            let first = store.record_prepared_text(&plan()).await.unwrap();
-            store
-                .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
-                .await
-                .unwrap();
-            first_execution = TextExecutionId::from_digest(first.evaluate_request.text_execution);
-            store.shutdown().await.unwrap();
-        }
-
-        {
-            let mut store = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
-                .await
-                .unwrap();
+            let mut store = EvaluateArtifactStore::open(config).await.unwrap();
             let prompt_tokens = store.insert_token_ids(TokenIds::from([20])).await.unwrap();
             let policy = store
                 .insert_policy(TextPolicy::from_u32_stop_tokens(4, []))
@@ -1170,45 +1074,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
-            store.shutdown().await.unwrap();
-        }
-
-        let _ = std::fs::remove_dir_all(&path);
+        });
     }
 
-    fn temp_artifact_store_path(test: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "hellas-executor-artifacts-{test}-{}-{nanos}",
-            std::process::id()
-        ))
-    }
-
-    fn filesystem_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        fn visit(root: &Path, path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
-            let mut entries = fs::read_dir(path)
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            entries.sort_by_key(std::fs::DirEntry::file_name);
-            for entry in entries {
-                let path = entry.path();
-                if path.is_dir() {
-                    visit(root, &path, files);
-                } else {
-                    files.push((
-                        path.strip_prefix(root).unwrap().to_path_buf(),
-                        fs::read(path).unwrap(),
-                    ));
-                }
-            }
-        }
-
-        let mut files = Vec::new();
-        visit(root, root, &mut files);
-        files
-    }
 }

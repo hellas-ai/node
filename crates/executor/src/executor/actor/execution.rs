@@ -1086,7 +1086,7 @@ mod tests {
         FetchAccessPolicy, FetchProjectionError, FetchProjectionSession, FetchProjector,
         FetchProjectorFactory, FetchProvider, FetchProviderFuture, FetchProviderRequest,
         FetchProviderStream, FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
-        MockFetchProvider, ProjectedFetch,
+        FetchTranscriptStoreBackend, MockFetchProvider, ProjectedFetch,
     };
     use futures_util::stream;
     use hellas_rpc::Dtype;
@@ -2129,7 +2129,8 @@ mod tests {
             fetch_routes: test_routes("echo", "run", provider, Arc::new(TestFetchProjectorFactory)),
             fetch_max_in_flight,
             fetch_queue_capacity,
-            artifact_store: ArtifactStoreConfig::Memory,
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+            artifact_store: ArtifactStoreConfig::memory(),
             staked: None,
         })
         .await
@@ -2310,7 +2311,8 @@ mod tests {
             ),
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            artifact_store: ArtifactStoreConfig::Fs(dir.clone()),
+            fetch_store: FetchTranscriptStoreBackend::fs(dir.join("fetch-transcripts")),
+            artifact_store: ArtifactStoreConfig::memory(),
             staked: None,
         })
         .await
@@ -2375,7 +2377,8 @@ mod tests {
             ),
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            artifact_store: ArtifactStoreConfig::Memory,
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+            artifact_store: ArtifactStoreConfig::memory(),
             staked: None,
         })
         .await

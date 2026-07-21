@@ -12,9 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+#[cfg(feature = "evaluate")]
+use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
-    ArtifactStoreConfig, CourtesyServer, EvaluateServer, ExecuteServer, Executor, ExecutorMetrics,
-    ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
+    CourtesyServer, EvaluateServer, ExecuteServer, Executor, ExecutorMetrics, ExecutorSpawnConfig,
+    FetchAccessPolicy, FetchQuotaStoreBackend, FetchRouteRegistry, FetchServer,
+    FetchTranscriptStoreBackend,
 };
 use hellas_rpc::Dtype;
 use hellas_rpc::open::OpenDispatcher;
@@ -87,9 +90,18 @@ pub(super) struct NodeConfig {
     pub(super) open_identity: Arc<ProviderOpenIdentity>,
     pub(super) assurance: Assurance,
     pub(super) metrics: Arc<ExecutorMetrics>,
+    #[cfg(feature = "evaluate")]
+    pub(super) artifact_store: ArtifactStoreConfig,
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
+    let fetch_store =
+        FetchTranscriptStoreBackend::fs(config.artifact_store_path.join("fetch-transcripts"));
+    let fetch_access_policy = config
+        .fetch_access_policy
+        .with_store(FetchQuotaStoreBackend::fs(
+            config.artifact_store_path.join("fetch-quota"),
+        ));
     let handle = Executor::spawn_configured(ExecutorSpawnConfig {
         execute_policy: config.execute_policy,
         queue_capacity: config.queue_size,
@@ -98,11 +110,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         producer_key: Arc::new(config.producer_key),
         provider_genesis: Arc::new(config.provider_genesis),
         assurance: config.assurance,
-        fetch_access_policy: config.fetch_access_policy,
+        fetch_access_policy,
         fetch_routes: config.fetch_routes,
         fetch_max_in_flight: config.fetch_max_in_flight,
         fetch_queue_capacity: config.fetch_queue_size,
-        artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
+        fetch_store,
+        #[cfg(feature = "evaluate")]
+        artifact_store: config.artifact_store,
         staked: None,
     })
     .await
