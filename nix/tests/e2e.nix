@@ -450,9 +450,13 @@ in
                   time.sleep(1)
               raise Exception(f"edge {edge_id} presence did not become {present}:\n{output}")
           except Exception as err:
-              validator = machine.succeed(f"tail -200 {validator_log} || true")
+              procs = machine.succeed("ps aux | grep -i hellas | grep -v grep || true")
+              follower = machine.succeed(f"tail -40 {follower_log} || true")
+              dmesg = machine.succeed("dmesg | tail -15 || true")
+              validator = machine.succeed(f"tail -60 {validator_log} || true")
               raise Exception(
-                  f"wait_edge({edge_id}, {present}) failed: {err}\nvalidator:\n{validator}"
+                  f"wait_edge({edge_id}, {present}) failed: {err}\n"
+                  f"procs:\n{procs}\nfollower:\n{follower}\ndmesg:\n{dmesg}\nvalidator:\n{validator}"
               ) from err
 
       def follower_progress():
