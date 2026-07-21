@@ -205,7 +205,7 @@ mod tests {
                 request: RequestCommitment::from_digest(Digest::from_bytes([7; 32])),
                 provider_genesis: ContentId::hash(&genesis),
                 assurance: AssuranceRequirement::new(
-                    crate::protocol::job::TPM2_QUOTE,
+                    crate::protocol::job::APPLE_APP_ATTEST,
                     ContentId::from_bytes([8; 32]),
                 )
                 .unwrap(),

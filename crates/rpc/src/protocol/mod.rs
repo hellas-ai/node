@@ -19,7 +19,7 @@ pub use identity::{
     PlatformCredential, ProviderGenesisStatement, ProviderIdentityV1, RootKind, RootProof,
     SignedProviderGenesis,
 };
-pub use job::{AMD_SEV_SNP, APPLE_APP_ATTEST, AssuranceRequirement, JobTerms, TPM2_QUOTE};
+pub use job::{APPLE_APP_ATTEST, AssuranceRequirement, JobTerms};
 pub use manifest::{EvaluateProgramManifest, FetchProgramManifest, ProgramManifest};
 pub use schemes::evaluate::{Evaluate, EvaluateRequest};
 pub use signature::{

@@ -78,7 +78,6 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
 ] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 prometheus-client = "0.24"
 rand = "0.8"
 rand_core = "0.6"

@@ -12,23 +12,24 @@ default = []
 apple-app-attest = [
     "dep:cc",
     "dep:ciborium",
+    "dep:p256",
     "dep:rustls-pki-types",
     "dep:rustls-webpki",
     "dep:serde",
     "dep:serde_bytes",
+    "dep:sha2",
     "dep:x509-cert",
 ]
 
 [dependencies]
 ciborium = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute"] }
-p256.workspace = true
-p384.workspace = true
+p256 = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 rustls-webpki = { workspace = true, default-features = false, features = ["ring", "std"], optional = true }
 serde = { workspace = true, optional = true }
 serde_bytes = { workspace = true, optional = true }
-sha2.workspace = true
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 x509-cert = { workspace = true, optional = true }
 

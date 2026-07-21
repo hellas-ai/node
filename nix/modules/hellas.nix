@@ -187,7 +187,7 @@ rec {
       assuranceCodec = mkOption {
         type = types.nullOr types.str;
         default = null;
-        example = "tpm2.quote.v1";
+        example = "apple.app-attest.v1";
         description = "Assurance evidence codec the local provider requires of jobs (--assurance-codec). Required by the CLI when serving.";
       };
       assurancePolicy = mkOption {
