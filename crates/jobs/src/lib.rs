@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use hellas_xet::XetHash;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JobSpec(Vec<u8>);
 
@@ -31,15 +33,15 @@ impl From<&[u8]> for JobSpec {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct JobId([u8; 32]);
+pub struct JobId(XetHash);
 
 impl JobId {
     pub fn from_spec(spec: &JobSpec) -> Self {
-        Self(*blake3::hash(spec.canonical_bytes()).as_bytes())
+        Self(XetHash::hash(spec.canonical_bytes()))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 

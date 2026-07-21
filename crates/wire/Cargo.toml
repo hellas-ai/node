@@ -45,11 +45,11 @@ ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 
 # Discovery backend deps (gated behind discovery-{dht,mdns}).
 async-stream = { version = "0.3", optional = true }
-blake3 = { workspace = true }
 bytes = "1"
 data-encoding = { version = "2", optional = true }
 futures = "0.3"
 futures-core = "0.3"
+hellas-xet = { workspace = true, features = ["chunking"] }
 
 # Optional transport deps
 iroh = { workspace = true, optional = true }

@@ -207,7 +207,7 @@ impl Encode for ServiceSchema {
 }
 
 impl MethodSchema {
-    pub fn digest(&self) -> [u8; 32] {
+    pub fn digest(&self) -> hellas_xet::XetHash {
         crate::canonical::hash(METHOD_DOMAIN, self)
     }
 
@@ -215,17 +215,19 @@ impl MethodSchema {
     /// in the OpenFrame.
     pub fn method_id(&self) -> u32 {
         let d = self.digest();
+        let d = d.as_bytes();
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
     }
 }
 
 impl ServiceSchema {
-    pub fn digest(&self) -> [u8; 32] {
+    pub fn digest(&self) -> hellas_xet::XetHash {
         crate::canonical::hash(SERVICE_DOMAIN, self)
     }
 
     pub fn service_id(&self) -> u32 {
         let d = self.digest();
+        let d = d.as_bytes();
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
     }
 }
@@ -291,10 +293,10 @@ mod tests {
     fn method_digest_is_pinned() {
         let m = sample_method();
         assert_eq!(
-            hex(&m.digest()),
-            "f871f1b997a9126e9091c64573f48c6d03da21195e0c3b3258c11865cc978fd7",
+            hex(m.digest().as_bytes()),
+            "4340d63be2be56ee9dfacec6f9733462d3fccc2ad91e735fe11f88a0da8a04f6",
         );
-        assert_eq!(m.method_id(), 0xb9f171f8);
+        assert_eq!(m.method_id(), 0x3bd64043);
     }
 
     /// Same contract as [`method_digest_is_pinned`], for SERVICE_ID.
@@ -305,9 +307,9 @@ mod tests {
             methods: vec![sample_method()],
         };
         assert_eq!(
-            hex(&s.digest()),
-            "b44b68e822aa2a26a1ce863a62809716ee58c1b110bc651c381dcf35984a243f",
+            hex(s.digest().as_bytes()),
+            "9c6b97cfe5a023f13a4674661bbd857f55408016f8d7289dc849a0c9677bbfde",
         );
-        assert_eq!(s.service_id(), 0xe8684bb4);
+        assert_eq!(s.service_id(), 0xcf976b9c);
     }
 }

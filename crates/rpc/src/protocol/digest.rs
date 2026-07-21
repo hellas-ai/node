@@ -1,38 +1,11 @@
-use serde::de::{Error as DeError, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 use crate::tags;
+use hellas_xet::XetHashError;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Digest([u8; 32]);
-
-impl Digest {
-    pub const LEN: usize = 32;
-
-    pub fn hash(bytes: &[u8]) -> Self {
-        Self::from_bytes(*blake3::hash(bytes).as_bytes())
-    }
-
-    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
-        &self.0
-    }
-
-    pub fn into_bytes(self) -> [u8; Self::LEN] {
-        self.0
-    }
-
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, DigestError> {
-        let bytes: [u8; Self::LEN] = bytes
-            .try_into()
-            .map_err(|_| DigestError::WrongLength { len: bytes.len() })?;
-        Ok(Self(bytes))
-    }
-}
+pub use hellas_xet::XetHash as Digest;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -47,7 +20,7 @@ impl ContentId {
         Self(Digest::from_bytes(bytes))
     }
 
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, DigestError> {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, XetHashError> {
         Digest::from_slice(bytes).map(Self)
     }
 
@@ -60,96 +33,37 @@ impl ContentId {
     }
 }
 
+impl FromStr for ContentId {
+    type Err = XetHashError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
 impl fmt::Debug for ContentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ContentId").field(&self.0).finish()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("ContentId").field(&self.0).finish()
     }
 }
 
 impl fmt::Display for ContentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DigestError {
-    #[error("digest must be 32 bytes, got {len}")]
-    WrongLength { len: usize },
-}
-
-impl fmt::Debug for Digest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Digest(")?;
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        write!(f, ")")
-    }
-}
-
-impl fmt::Display for Digest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Serialize for Digest {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Digest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct DigestVisitor;
-
-        impl Visitor<'_> for DigestVisitor {
-            type Value = Digest;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a 32-byte digest")
-            }
-
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Digest::from_slice(v).map_err(E::custom)
-            }
-
-            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                self.visit_bytes(&v)
-            }
-        }
-
-        deserializer.deserialize_bytes(DigestVisitor)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
 pub fn hash_tuple(tag: &str, fields: &[&[u8]]) -> Digest {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(tags::HASH_TUPLE_V2.as_bytes());
-    hasher.update(&(tag.len() as u32).to_be_bytes());
-    hasher.update(tag.as_bytes());
-    hasher.update(&(fields.len() as u32).to_be_bytes());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(tags::HASH_TUPLE_V2.as_bytes());
+    bytes.extend_from_slice(&(tag.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(tag.as_bytes());
+    bytes.extend_from_slice(&(fields.len() as u32).to_be_bytes());
     for field in fields {
-        hasher.update(&(field.len() as u64).to_be_bytes());
-        hasher.update(field);
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
     }
-    Digest::from_bytes(*hasher.finalize().as_bytes())
+    Digest::hash(&bytes)
 }
 
 #[cfg(test)]
@@ -164,10 +78,10 @@ mod tests {
     }
 
     #[test]
-    fn digest_hash_is_blake3_of_exact_bytes() {
+    fn digest_hash_is_xet_file_hash() {
         assert_eq!(
-            Digest::hash(b"abc").as_bytes(),
-            blake3::hash(b"abc").as_bytes()
+            Digest::hash(b"abc"),
+            hellas_xet::file_hash(&hellas_xet::chunk(b"abc"))
         );
     }
 

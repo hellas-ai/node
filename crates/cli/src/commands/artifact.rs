@@ -30,8 +30,8 @@ pub enum ArtifactCommand {
         node_id: EndpointId,
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
-        /// 32-byte artifact digest as hex
-        digest: String,
+        /// Artifact Xet hash.
+        digest: Digest,
         #[arg(short = 'o', long = "output")]
         output: PathBuf,
     },
@@ -76,11 +76,10 @@ async fn put(
 async fn get(
     node_id: EndpointId,
     node_addrs: Vec<SocketAddr>,
-    digest: String,
+    digest: Digest,
     output: PathBuf,
     secret_key: SecretKey,
 ) -> CliResult<()> {
-    let digest = parse_digest_hex(&digest)?;
     let client = connect_courtesy(node_id, node_addrs, secret_key).await?;
     let response = client
         .get_artifact(GetArtifactRequest {
@@ -116,17 +115,4 @@ async fn connect_courtesy(
         .await
         .with_context(|| format!("failed to connect to {node_id}"))?;
     Ok(CourtesyClientImpl::new(IrohTransport::new(connection)))
-}
-
-fn parse_digest_hex(raw: &str) -> CliResult<Digest> {
-    let raw = raw.trim();
-    if raw.len() != 64 {
-        bail!("artifact digest must be 64 hex chars, got {}", raw.len());
-    }
-    let mut bytes = [0u8; 32];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16)
-            .with_context(|| format!("invalid hex in artifact digest at position {}", i * 2))?;
-    }
-    Ok(Digest::from_bytes(bytes))
 }

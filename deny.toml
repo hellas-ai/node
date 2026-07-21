@@ -1,7 +1,5 @@
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2023-0089", reason = "Transitive through postcard/iroh; no safe upgrade is available." },
-    { id = "RUSTSEC-2024-0370", reason = "Transitive through iroh-blobs; no safe upgrade is available." },
     { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
     { id = "RUSTSEC-2025-0119", reason = "Transitive through hf-hub/tokenizers; no safe upgrade is available." },
 ]

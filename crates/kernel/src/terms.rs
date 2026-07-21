@@ -125,7 +125,7 @@ impl Terms {
         Self { body, hash }
     }
 
-    /// Returns the canonical BLAKE3 commitment for these terms.
+    /// Returns the canonical Xet commitment for these terms.
     ///
     /// Computed once at construction; this is a field load.
     #[must_use]
@@ -205,7 +205,7 @@ impl TermsBody {
             Self::Basic { .. } => crate::consts::TERMS_BASIC,
             Self::StakeBond(_) => crate::consts::TERMS_STAKE_BOND,
         };
-        TermsHash::from_bytes(crate::canonical::hash(domain, self))
+        TermsHash::from_bytes(crate::canonical::hash(domain, self).into_bytes())
     }
 }
 
@@ -410,7 +410,7 @@ mod tests {
         let bond = sample_bond();
         let terms = Terms::stake_bond(bond.clone());
 
-        let expected = TermsHash::from_bytes(hash(TERMS_STAKE_BOND, &terms.body));
+        let expected = TermsHash::from_bytes(hash(TERMS_STAKE_BOND, &terms.body).into_bytes());
         assert_eq!(terms.hash(), expected);
         assert_eq!(terms.as_stake_bond(), Some(&bond));
         assert_eq!(terms.protocol(), bond.protocol);
@@ -463,7 +463,7 @@ mod tests {
             outputs,
         );
 
-        let expected = TermsHash::from_bytes(hash(TERMS_BASIC, &terms.body));
+        let expected = TermsHash::from_bytes(hash(TERMS_BASIC, &terms.body).into_bytes());
         assert_eq!(terms.hash(), expected);
     }
 

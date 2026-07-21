@@ -267,15 +267,8 @@ struct FetchManifest {
 }
 
 fn parse_content_id(raw: &str) -> CliResult<ContentId> {
-    if raw.len() != 64 {
-        bail!("ContentId must be 64 hex characters");
-    }
-    let mut bytes = [0; 32];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&raw[index * 2..index * 2 + 2], 16)
-            .with_context(|| format!("invalid ContentId hex at byte {index}"))?;
-    }
-    Ok(ContentId::from_bytes(bytes))
+    raw.parse()
+        .with_context(|| format!("invalid ContentId {raw:?}"))
 }
 
 #[derive(Debug, Deserialize)]

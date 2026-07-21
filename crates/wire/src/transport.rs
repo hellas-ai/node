@@ -180,7 +180,7 @@ pub trait ServiceMarker {
     const NAME: &'static str;
     /// Wire ALPN derived from `NAME` (e.g. `/hellas.swarm.v1.Node/2.0`).
     const ALPN: &'static str;
-    /// Truncated 32-bit service id (blake3-of-schema, low 4 bytes LE).
+    /// Truncated 32-bit service id (Xet hash of schema, low 4 bytes LE).
     const SERVICE_ID: u32;
 }
 
@@ -195,7 +195,7 @@ pub trait MethodMarker {
 
     /// Method name as it appears in the `.proto` (e.g. `"GetNodeInfo"`).
     const NAME: &'static str;
-    /// Truncated 32-bit method id (blake3-of-MethodSchema, low 4 bytes LE).
+    /// Truncated 32-bit method id (Xet hash of `MethodSchema`, low 4 bytes LE).
     const METHOD_ID: u32;
     /// True for `stream Foo` requests.
     const REQUEST_STREAMING: bool;

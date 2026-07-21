@@ -381,7 +381,10 @@ enum Commands {
         #[arg(long = "responses-fetch-route-method", default_value = "responses")]
         responses_fetch_route_method: String,
         /// Fetch ProgramManifest ContentId expected from the provider route.
-        #[arg(long = "responses-fetch-execution-environment", value_parser = parse_content_id_hex, required_if_eq("responses_backend", "fetch"))]
+        #[arg(
+            long = "responses-fetch-execution-environment",
+            required_if_eq("responses_backend", "fetch")
+        )]
         responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
         /// JSON object merged into OpenAI Responses requests before signing
         /// and sending them through Fetch.
@@ -482,7 +485,7 @@ enum Commands {
         #[arg(long)]
         method: String,
         /// Fetch ProgramManifest ContentId expected from the provider route.
-        #[arg(long = "execution-environment", value_parser = parse_content_id_hex)]
+        #[arg(long = "execution-environment")]
         execution_environment: hellas_rpc::ContentId,
         /// Exact UTF-8 JSON payload bytes.
         #[arg(
@@ -1210,7 +1213,7 @@ mod tests {
                     },
             } => {
                 assert!(node_addrs.is_empty());
-                assert_eq!(parsed_digest, digest);
+                assert_eq!(parsed_digest, hellas_rpc::Digest::ZERO);
                 assert_eq!(output, std::path::Path::new("/tmp/artifact.cbor"));
             }
             _ => panic!("expected artifact get command"),
