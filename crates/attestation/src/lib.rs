@@ -1,3 +1,7 @@
+#[cfg(feature = "apple-app-attest")]
+mod apple;
+#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+mod apple_macos;
 mod snp;
 mod tpm;
 
@@ -7,6 +11,14 @@ use hellas_rpc::pb::execute::{AssuranceEvidence, WorkFinished};
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{DagCborEncoder, Digest, EventCommitment, OutputEventEnvelope};
 
+#[cfg(feature = "apple-app-attest")]
+pub use apple::{
+    AppleClaims, AppleCredential, ApplePolicy, AppleVerdict, RegisteredAppleCredential,
+    apple_credential_identity, appraise_apple, register_apple, verify_apple,
+    verify_apple_assertion,
+};
+#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+pub use apple_macos::{AppleAppAttest, client_data_hash};
 pub use snp::{
     SnpClaims, SnpCollateral, SnpEndorsement, SnpPolicy, SnpVerdict, appraise_snp, verify_snp,
 };
@@ -17,6 +29,8 @@ pub use tpm::{
 
 pub const SNP_STATEMENT_V1: &str = "hellas.attestation.amd.sev-snp.statement.v1";
 pub const TPM_STATEMENT_V1: &str = "hellas.attestation.tpm2.quote.statement.v1";
+#[cfg(feature = "apple-app-attest")]
+pub const APPLE_STATEMENT_V1: &str = "hellas.attestation.apple.app-attest.statement.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Binding(Digest);
@@ -127,6 +141,9 @@ pub enum AttestationError {
     Signature,
     #[error("event log does not match the quoted PCR digest")]
     EventLog,
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    #[error("Apple App Attest failed: {0}")]
+    Platform(String),
 }
 
 #[cfg(test)]

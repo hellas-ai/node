@@ -7,12 +7,34 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = []
+apple-app-attest = [
+    "dep:cc",
+    "dep:ciborium",
+    "dep:rustls-pki-types",
+    "dep:rustls-webpki",
+    "dep:serde",
+    "dep:serde_bytes",
+    "dep:x509-cert",
+]
+
 [dependencies]
+ciborium = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute"] }
 p256.workspace = true
 p384.workspace = true
+rustls-pki-types = { workspace = true, optional = true }
+rustls-webpki = { workspace = true, default-features = false, features = ["ring", "std"], optional = true }
+serde = { workspace = true, optional = true }
+serde_bytes = { workspace = true, optional = true }
 sha2.workspace = true
 thiserror.workspace = true
+x509-cert = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64.workspace = true
 tokio.workspace = true
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
