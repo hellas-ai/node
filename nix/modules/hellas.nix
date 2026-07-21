@@ -184,6 +184,18 @@ rec {
         default = null;
         description = "Optional Prometheus metrics port.";
       };
+      assuranceCodec = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "tpm2.quote.v1";
+        description = "Assurance evidence codec the local provider requires of jobs (--assurance-codec). Required by the CLI when serving.";
+      };
+      assurancePolicy = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "0000000000000000000000000000000000000000000000000000000000000000";
+        description = "Content ID of the assurance policy document (--assurance-policy). Required by the CLI when serving.";
+      };
       graffiti = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -388,6 +400,8 @@ rec {
     ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
     ++ optArg "--metrics-port" serve.metricsPort
+    ++ optArg "--assurance-codec" serve.assuranceCodec
+    ++ optArg "--assurance-policy" serve.assurancePolicy
     ++ optArg "--graffiti" serve.graffiti
     ++ lib.concatMap (model: [
       "--preload"
