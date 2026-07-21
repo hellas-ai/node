@@ -20,7 +20,8 @@
         ${package}/bin/hellas-cli gateway --help | grep -F -- "--wrap"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--preload"
 
-        head -c 32 /dev/zero > "$TMPDIR/identity"
+        ${package}/bin/hellas-cli --identity "$TMPDIR/identity" --software-root \
+          monitor --timeout-secs 1 >/dev/null 2>&1 || true
         ${package}/bin/hellas-cli --identity "$TMPDIR/identity" identity show-node-id \
           | grep -E '^[0-9a-f]{64}$'
 
