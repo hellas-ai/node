@@ -14,7 +14,6 @@ default = []
 # thus the wasm light client) carries it unconditionally.
 domain = [
     "dep:base64ct",
-    "dep:blake3",
     "dep:bs58",
     "dep:bytes",
     "dep:commonware-codec",
@@ -109,16 +108,15 @@ validator = [
     "dep:toml",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
-    "dep:blake3",
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 
 [dependencies]
+hellas-xet = { workspace = true }
 axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
-blake3 = { workspace = true, optional = true }
 bs58 = { version = "0.5", optional = true }
 bytes = { workspace = true, optional = true }
 commonware-actor = { workspace = true, optional = true }

@@ -23,6 +23,8 @@ use crate::{
     terms::Terms,
     tx::Auth,
 };
+#[cfg(any(test, feature = "placeholders"))]
+use hellas_xet::SingleChunkHasher;
 
 const MUTUAL_TAG: u8 = 0;
 const TIMEOUT_TAG: u8 = 1;
@@ -170,12 +172,12 @@ impl Seal {
     #[cfg(any(test, feature = "placeholders"))]
     #[must_use]
     pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: PayloadHash) -> Self {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::SEAL_PLACEHOLDER);
         protocol.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         hash.encode_to(&mut hasher);
-        Self(*hasher.finalize().as_bytes())
+        Self(hasher.finalize().into_bytes())
     }
 }
 

@@ -28,7 +28,6 @@ documentation = "https://docs.rs"
 [workspace.dependencies]
 axum = "0.8"
 base64 = "0.22"
-blake3 = "1"
 bytes = "1"
 cc = "1"
 ciborium = "0.2"
@@ -65,11 +64,11 @@ hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-models = { path = "crates/models", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
+hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh = { version = "1", default-features = false }
 iroh-base = { version = "1", default-features = false }
-iroh-blobs = { version = "0.103", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [

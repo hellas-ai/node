@@ -26,6 +26,7 @@
 //!   one of these commitments as a field.
 
 use core::fmt;
+use hellas_xet::{SingleChunkHasher, XetHash};
 
 use crate::canonical::{Decode, DecodeError, Encode, Writer, decode_fixed};
 use crate::consts::{HASH_LENGTH, ID_LENGTH, KEY_LENGTH, SIG_LENGTH};
@@ -84,13 +85,13 @@ impl Decode for Key {
 /// Coin ids are derived as `H(coin_tag ‖ ...)`. Their byte representation
 /// cannot collide with that of an [`EdgeId`] under this domain separation.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CoinId([u8; Self::LENGTH]);
+pub struct CoinId(XetHash);
 
 impl CoinId {
     /// Encoded length of a coin identifier.
     pub const LENGTH: usize = ID_LENGTH;
 
-    pub(crate) const ZERO: Self = Self([0; Self::LENGTH]);
+    pub(crate) const ZERO: Self = Self(XetHash::ZERO);
 
     /// Reconstructs a coin id from canonical bytes.
     ///
@@ -102,19 +103,19 @@ impl CoinId {
     /// for producing fresh ids.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
-        Self(bytes)
+        Self(XetHash::from_bytes(bytes))
     }
 
     /// Returns the canonical byte representation.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
-        self.0
+        self.0.into_bytes()
     }
 
     /// Borrows the canonical byte representation.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
-        &self.0
+        self.0.as_bytes()
     }
 
     /// Derives the canonical id for a genesis coin allocation.
@@ -130,12 +131,12 @@ impl CoinId {
 
     /// Derives the canonical id for one close payout coin.
     pub(crate) fn payout(edge: EdgeId, index: usize, owner: Key) -> Self {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::COIN_PAYOUT);
         edge.encode_to(&mut hasher);
         index.encode_to(&mut hasher);
         owner.encode_to(&mut hasher);
-        Self(*hasher.finalize().as_bytes())
+        Self(hasher.finalize())
     }
 }
 
@@ -145,7 +146,7 @@ impl Encode for CoinId {
         Self::LENGTH
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        writer.write(&self.0);
+        writer.write(self.0.as_bytes());
     }
 }
 
@@ -160,7 +161,7 @@ impl Decode for CoinId {
 /// Edge ids are derived as `H(edge_tag ‖ ...)`. Their byte representation
 /// cannot collide with that of a [`CoinId`] under this domain separation.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EdgeId([u8; Self::LENGTH]);
+pub struct EdgeId(XetHash);
 
 impl EdgeId {
     /// Encoded length of an edge identifier.
@@ -174,19 +175,19 @@ impl EdgeId {
     /// kernel's canonical derivation site (`Tx::edge_id_of`).
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
-        Self(bytes)
+        Self(XetHash::from_bytes(bytes))
     }
 
     /// Returns the canonical byte representation.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
-        self.0
+        self.0.into_bytes()
     }
 
     /// Borrows the canonical byte representation.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 
@@ -196,7 +197,7 @@ impl Encode for EdgeId {
         Self::LENGTH
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        writer.write(&self.0);
+        writer.write(self.0.as_bytes());
     }
 }
 
@@ -208,7 +209,7 @@ impl Decode for EdgeId {
 
 /// Commitment to the open terms of an edge.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TermsHash([u8; Self::LENGTH]);
+pub struct TermsHash(XetHash);
 
 impl TermsHash {
     /// Encoded length of a terms commitment.
@@ -224,19 +225,19 @@ impl TermsHash {
     /// because ids are derived, never received.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
-        Self(bytes)
+        Self(XetHash::from_bytes(bytes))
     }
 
     /// Returns the canonical byte representation.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
-        self.0
+        self.0.into_bytes()
     }
 
     /// Borrows the canonical byte representation.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 
@@ -246,7 +247,7 @@ impl Encode for TermsHash {
         Self::LENGTH
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        writer.write(&self.0);
+        writer.write(self.0.as_bytes());
     }
 }
 
@@ -258,7 +259,7 @@ impl Decode for TermsHash {
 
 /// Commitment to one concrete transaction authorization payload.
 #[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PayloadHash([u8; Self::LENGTH]);
+pub struct PayloadHash(XetHash);
 
 impl PayloadHash {
     /// Encoded length of a payload commitment.
@@ -274,19 +275,19 @@ impl PayloadHash {
     /// signature only ever attests to the hash that was signed.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
-        Self(bytes)
+        Self(XetHash::from_bytes(bytes))
     }
 
     /// Returns the canonical byte representation.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
-        self.0
+        self.0.into_bytes()
     }
 
     /// Borrows the canonical byte representation.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 
@@ -296,7 +297,7 @@ impl Encode for PayloadHash {
         Self::LENGTH
     }
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        writer.write(&self.0);
+        writer.write(self.0.as_bytes());
     }
 }
 
@@ -357,12 +358,12 @@ impl Sig {
 
     #[cfg(any(test, feature = "placeholders"))]
     fn half(key: Key, hash: PayloadHash, index: u8) -> [u8; PayloadHash::LENGTH] {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::SIG_PLACEHOLDER);
         index.encode_to(&mut hasher);
         key.encode_to(&mut hasher);
         hash.encode_to(&mut hasher);
-        *hasher.finalize().as_bytes()
+        hasher.finalize().into_bytes()
     }
 }
 

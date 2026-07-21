@@ -103,7 +103,7 @@ pub mod services {
 }
 
 /// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
-/// schema encoding → truncated blake3. If one of these assertions fails,
+/// schema encoding → truncated Xet hash. If one of these assertions fails,
 /// either the canonical encoding or the proto definition changed — both
 /// rotate the ID, and deployed nodes will refuse this build's calls on
 /// the affected methods. Update a pin only as a deliberate protocol break.
@@ -118,27 +118,27 @@ mod id_pins {
         use super::services::execute::{Execute, Receipt, RunTicket, Settle};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xa82c0f94);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xd2d6478a);
-        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0xbbb5f3e6);
-        assert_eq!(<Settle as MethodMarker>::METHOD_ID, 0xc678dd9f);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xb19f1af1);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x15fc7c7c);
+        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0x2f653b89);
+        assert_eq!(<Settle as MethodMarker>::METHOD_ID, 0x7720bf9e);
     }
 
     #[cfg(feature = "evaluate")]
     #[test]
     fn evaluate_ids_are_stable() {
         use super::services::evaluate::{CreateTicket, Evaluate};
-        assert_eq!(<Evaluate as ServiceMarker>::SERVICE_ID, 0xbe10d224);
-        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xee83d084);
+        assert_eq!(<Evaluate as ServiceMarker>::SERVICE_ID, 0x70872e46);
+        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xcf212df5);
     }
 
     #[cfg(feature = "fetch")]
     #[test]
     fn fetch_ids_are_stable() {
         use super::services::fetch::{CreateTicket, Fetch, Open};
-        assert_eq!(<Fetch as ServiceMarker>::SERVICE_ID, 0x8472b96a);
-        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x4c386ff8);
-        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xb232c2a7);
+        assert_eq!(<Fetch as ServiceMarker>::SERVICE_ID, 0x4e98fdd1);
+        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x55da4412);
+        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0x39183beb);
     }
 
     #[cfg(feature = "courtesy")]
@@ -147,18 +147,18 @@ mod id_pins {
         use super::services::courtesy::{
             Courtesy, Open, QuoteChatPrompt, QuotePreparedText, QuotePrompt,
         };
-        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0x360d5775);
-        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xea3c6fa1);
-        assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x991a7eb2);
-        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0xad5deb50);
-        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0x6d37221c);
+        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xfcc334c3);
+        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x18351e7d);
+        assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x58689a09);
+        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0x6174018e);
+        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0xae272694);
     }
 
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{GetStateRoot, LightClient};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xf750f32b);
-        assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0x4a19b4e6);
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x32f4970a);
+        assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
     }
 }

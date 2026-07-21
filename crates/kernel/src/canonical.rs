@@ -10,7 +10,7 @@
 //!
 //! Hash inputs and serialization inputs are unified. The bytes a value
 //! emits via `encode_to` are *the* canonical bytes; commitments are
-//! `BLAKE3(domain ‖ encode_to(value))`. Round-tripping through
+//! the Xet file hash of `domain ‖ encode_to(value)`. Round-tripping through
 //! `encode_to` / `decode` preserves hash by construction.
 //!
 //! The encoding is hand-rolled byte concatenation in a documented order
@@ -47,15 +47,14 @@ pub(crate) mod tag {
 
 /// Streaming destination for [`Encode`] output.
 ///
-/// Implemented for raw byte buffers (via [`BufferWriter`]) and for
-/// `blake3::Hasher` so that the same `encode_to` body can drive both
-/// serialization and hashing without an intermediate buffer.
+/// Implemented for raw byte buffers and the allocation-free Xet single-chunk
+/// hasher so one `encode_to` body drives serialization and hashing.
 pub trait Writer {
     /// Appends `bytes` to the destination.
     fn write(&mut self, bytes: &[u8]);
 }
 
-impl Writer for blake3::Hasher {
+impl Writer for hellas_xet::SingleChunkHasher {
     fn write(&mut self, bytes: &[u8]) {
         self.update(bytes);
     }
@@ -274,18 +273,18 @@ pub(crate) fn decode_fixed<const N: usize>(buf: &[u8]) -> Result<([u8; N], usize
     Ok((bytes, N))
 }
 
-// -- BLAKE3 commitment over canonical bytes ----------------------------------
+// -- Xet commitment over canonical bytes -------------------------------------
 
-/// Computes the canonical BLAKE3 commitment over `value`'s bytes with
-/// domain separation.
+/// Computes the canonical Xet commitment over `value`'s bytes with domain
+/// separation.
 ///
 /// All kernel commitments funnel through this function. The protocol
-/// hash binding is `BLAKE3(domain ‖ value.encode_to(...))`.
-pub(crate) fn hash<T: Encode + ?Sized>(domain: &[u8], value: &T) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
+/// hash binding is the Xet file hash of `domain ‖ value.encode_to(...)`.
+pub(crate) fn hash<T: Encode + ?Sized>(domain: &[u8], value: &T) -> hellas_xet::XetHash {
+    let mut hasher = hellas_xet::SingleChunkHasher::new();
     hasher.update(domain);
     value.encode_to(&mut hasher);
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
 // -- Primitive impls ---------------------------------------------------------
@@ -460,5 +459,49 @@ impl<T: Decode + Copy + Default, const N: usize> Decode for crate::List<T, N> {
         }
         // Type bound: `len <= N`, so `List::take` is exact.
         Ok((Self::take(items, len), consumed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Encode;
+    use crate::consts::{
+        CLOSE, COIN_GENESIS, COIN_PAYOUT, EDGE_OPEN, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, OPEN,
+        SEAL_PLACEHOLDER, SIG_PLACEHOLDER, TERMS_BASIC,
+    };
+    use crate::{CoinId, EdgeId, Key, List, PayloadHash, Payout, ProtocolCode, Terms, TermsHash};
+
+    #[test]
+    fn every_commitment_preimage_fits_one_xet_chunk() {
+        let lengths = [
+            COIN_GENESIS.len() + u32::MAX_ENCODED_SIZE,
+            COIN_PAYOUT.len()
+                + EdgeId::MAX_ENCODED_SIZE
+                + usize::MAX_ENCODED_SIZE
+                + Key::MAX_ENCODED_SIZE,
+            EDGE_OPEN.len()
+                + TermsHash::MAX_ENCODED_SIZE
+                + 2 * <List<CoinId, MAX_PARTY_INPUTS>>::MAX_ENCODED_SIZE,
+            TERMS_BASIC.len() + Terms::MAX_ENCODED_SIZE,
+            OPEN.len() + EdgeId::MAX_ENCODED_SIZE,
+            CLOSE.len()
+                + EdgeId::MAX_ENCODED_SIZE
+                + u8::MAX_ENCODED_SIZE
+                + TermsHash::MAX_ENCODED_SIZE
+                + <List<Payout, MAX_EDGE_OUTPUTS>>::MAX_ENCODED_SIZE,
+            SIG_PLACEHOLDER.len()
+                + u8::MAX_ENCODED_SIZE
+                + Key::MAX_ENCODED_SIZE
+                + PayloadHash::MAX_ENCODED_SIZE,
+            SEAL_PLACEHOLDER.len()
+                + ProtocolCode::MAX_ENCODED_SIZE
+                + u8::MAX_ENCODED_SIZE
+                + PayloadHash::MAX_ENCODED_SIZE,
+        ];
+        assert!(
+            lengths
+                .into_iter()
+                .all(|length| length < hellas_xet::MIN_CHUNK_SIZE)
+        );
     }
 }

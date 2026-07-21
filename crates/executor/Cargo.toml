@@ -41,7 +41,6 @@ hellas-rpc = { workspace = true, features = [
     "courtesy",
 ] }
 hellas-wire = { workspace = true }
-iroh-blobs = { workspace = true, features = ["fs-store"] }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

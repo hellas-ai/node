@@ -681,7 +681,7 @@ impl JobAcceptanceContext {
     /// Canonical digest both parties sign at acceptance.
     #[must_use]
     pub fn digest(&self) -> PayloadHash {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = hellas_xet::SingleChunkHasher::new();
         hasher.write(JOB_ACCEPTANCE_DOMAIN);
         self.bond_edge.encode_to(&mut hasher);
         self.bond_terms.encode_to(&mut hasher);
@@ -691,7 +691,7 @@ impl JobAcceptanceContext {
         self.environment.encode_to(&mut hasher);
         self.price.encode_to(&mut hasher);
         self.terminal_deadline.encode_to(&mut hasher);
-        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(hasher.finalize().into_bytes())
     }
 }
 
@@ -709,11 +709,11 @@ impl JobResultContext {
     /// Canonical digest the provider signs at terminal output.
     #[must_use]
     pub fn digest(&self) -> PayloadHash {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = hellas_xet::SingleChunkHasher::new();
         hasher.write(JOB_RESULT_DOMAIN);
         self.acceptance.encode_to(&mut hasher);
         self.transcript.encode_to(&mut hasher);
-        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(hasher.finalize().into_bytes())
     }
 }
 
@@ -745,11 +745,11 @@ impl FraudArtifact {
     /// context digests under a dedicated domain.
     #[must_use]
     pub fn seal(&self) -> Seal {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = hellas_xet::SingleChunkHasher::new();
         hasher.write(PREVERIFIED_SEAL_DOMAIN);
         self.acceptance.digest().encode_to(&mut hasher);
         self.result.digest().encode_to(&mut hasher);
-        Seal::from_bytes(*hasher.finalize().as_bytes())
+        Seal::from_bytes(hasher.finalize().into_bytes())
     }
 
     /// Checks that this artifact is bound to the violation close's
@@ -796,10 +796,10 @@ fn paid_solely_to(outputs: &List<Payout, MAX_EDGE_OUTPUTS>, key: Key) -> bool {
 /// unforgeable from anything the client has already published.
 #[must_use]
 pub fn receipt_request_digest(acceptance: PayloadHash) -> PayloadHash {
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = hellas_xet::SingleChunkHasher::new();
     hasher.write(RECEIPT_REQUEST_DOMAIN);
     acceptance.encode_to(&mut hasher);
-    PayloadHash::from_bytes(*hasher.finalize().as_bytes())
+    PayloadHash::from_bytes(hasher.finalize().into_bytes())
 }
 
 /// The stake-bond party convention: the maker funds the stake.

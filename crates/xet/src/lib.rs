@@ -4,6 +4,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::{fmt, str::FromStr};
+#[cfg(feature = "serde")]
+use serde::de::Visitor;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Key used by Xet Protocol v1.1.0 for chunk (leaf) hashes.
 pub const DATA_KEY: [u8; 32] = [
@@ -42,24 +46,42 @@ const ZERO_KEY: [u8; 32] = [0; 32];
 pub struct XetHash([u8; 32]);
 
 impl XetHash {
+    /// Size of a Xet hash in bytes.
+    pub const LEN: usize = 32;
+
     /// The all-zero hash used by Xet for an empty chunk sequence.
-    pub const ZERO: Self = Self([0; 32]);
+    pub const ZERO: Self = Self([0; Self::LEN]);
+
+    /// Computes the Xet file hash of `bytes`.
+    #[cfg(feature = "chunking")]
+    #[must_use]
+    pub fn hash(bytes: &[u8]) -> Self {
+        file_hash(&chunk(bytes))
+    }
 
     /// Wraps raw BLAKE3 digest bytes.
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
+    }
+
+    /// Wraps a 32-byte Xet hash from a slice.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, XetHashError> {
+        let bytes = bytes
+            .try_into()
+            .map_err(|_| XetHashError::WrongLength { len: bytes.len() })?;
+        Ok(Self(bytes))
     }
 
     /// Returns the raw BLAKE3 digest bytes.
     #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
     }
 
     /// Consumes the hash and returns its raw BLAKE3 digest bytes.
     #[must_use]
-    pub const fn into_bytes(self) -> [u8; 32] {
+    pub const fn into_bytes(self) -> [u8; Self::LEN] {
         self.0
     }
 
@@ -111,36 +133,90 @@ impl fmt::Debug for XetHash {
     }
 }
 
-/// Error returned when parsing a non-canonical Xet hexadecimal hash.
+/// Error returned for an invalid binary or textual Xet hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ParseXetHashError;
+pub enum XetHashError {
+    /// A binary hash had the wrong number of bytes.
+    WrongLength { len: usize },
+    /// A textual hash was not 64 hexadecimal characters.
+    InvalidHex,
+}
 
-impl fmt::Display for ParseXetHashError {
+impl fmt::Display for XetHashError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("invalid Xet hash: expected 64 hexadecimal characters")
+        match self {
+            Self::WrongLength { len } => write!(formatter, "Xet hash must be 32 bytes, got {len}"),
+            Self::InvalidHex => {
+                formatter.write_str("invalid Xet hash: expected 64 hexadecimal characters")
+            }
+        }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for ParseXetHashError {}
+impl std::error::Error for XetHashError {}
 
 impl FromStr for XetHash {
-    type Err = ParseXetHashError;
+    type Err = XetHashError;
 
     fn from_str(hex: &str) -> Result<Self, Self::Err> {
         if hex.len() != 64 {
-            return Err(ParseXetHashError);
+            return Err(XetHashError::InvalidHex);
         }
 
         let mut raw = [0; 32];
         for (limb_index, limb) in hex.as_bytes().chunks_exact(16).enumerate() {
             for byte_index in 0..8 {
-                let high = decode_hex(limb[byte_index * 2]).ok_or(ParseXetHashError)?;
-                let low = decode_hex(limb[byte_index * 2 + 1]).ok_or(ParseXetHashError)?;
+                let high = decode_hex(limb[byte_index * 2]).ok_or(XetHashError::InvalidHex)?;
+                let low = decode_hex(limb[byte_index * 2 + 1]).ok_or(XetHashError::InvalidHex)?;
                 raw[limb_index * 8 + 7 - byte_index] = (high << 4) | low;
             }
         }
         Ok(Self(raw))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for XetHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for XetHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct XetHashVisitor;
+
+        impl Visitor<'_> for XetHashVisitor {
+            type Value = XetHash;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a 32-byte Xet hash")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                XetHash::from_slice(bytes).map_err(E::custom)
+            }
+
+            fn visit_byte_buf<E>(self, bytes: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        deserializer.deserialize_bytes(XetHashVisitor)
     }
 }
 
@@ -174,6 +250,56 @@ impl Chunk {
 #[must_use]
 pub fn chunk_hash(bytes: &[u8]) -> XetHash {
     XetHash::from(*blake3::keyed_hash(&DATA_KEY, bytes).as_bytes())
+}
+
+/// Allocation-free Xet file hasher for inputs smaller than one minimum chunk.
+///
+/// Xet cannot cut an input below [`MIN_CHUNK_SIZE`], so such an input has one
+/// DATA-keyed leaf whose hash is finalized with the zero file key. Writing
+/// more bytes is a programming error; arbitrary inputs use [`XetHash::hash`].
+pub struct SingleChunkHasher {
+    leaf: blake3::Hasher,
+    len: usize,
+}
+
+impl Default for SingleChunkHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SingleChunkHasher {
+    /// Creates an empty single-chunk file hasher.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            leaf: blake3::Hasher::new_keyed(&DATA_KEY),
+            len: 0,
+        }
+    }
+
+    /// Appends bytes to the single Xet chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the total input reaches [`MIN_CHUNK_SIZE`].
+    pub fn update(&mut self, bytes: &[u8]) {
+        assert!(
+            self.len < MIN_CHUNK_SIZE && bytes.len() < MIN_CHUNK_SIZE - self.len,
+            "single Xet chunk must be smaller than MIN_CHUNK_SIZE"
+        );
+        self.len += bytes.len();
+        self.leaf.update(bytes);
+    }
+
+    /// Finalizes the Xet file hash.
+    #[must_use]
+    pub fn finalize(self) -> XetHash {
+        if self.len == 0 {
+            return XetHash::ZERO;
+        }
+        XetHash::from(*blake3::keyed_hash(&ZERO_KEY, self.leaf.finalize().as_bytes()).as_bytes())
+    }
 }
 
 /// Splits `bytes` with Xet's GearHash CDC and returns its chunk descriptors.
@@ -323,4 +449,25 @@ fn write_decimal(buffer: &mut [u8], position: &mut usize, value: u64) {
     let digits = &digits[digit_start..];
     buffer[*position..*position + digits.len()].copy_from_slice(digits);
     *position += digits.len();
+}
+
+#[cfg(all(test, feature = "chunking"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_chunk_hasher_matches_full_file_hash() {
+        for len in [0, 3, MIN_CHUNK_SIZE - 1] {
+            let bytes: Vec<_> = (0..len).map(|index| index as u8).collect();
+            let mut hasher = SingleChunkHasher::new();
+            hasher.update(&bytes);
+            if len == MIN_CHUNK_SIZE - 1 {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hasher.update(&[0])))
+                        .is_err()
+                );
+            }
+            assert_eq!(hasher.finalize(), XetHash::hash(&bytes));
+        }
+    }
 }

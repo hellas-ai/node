@@ -11,6 +11,8 @@ mod funding;
 mod payout;
 mod proof;
 
+use hellas_xet::SingleChunkHasher;
+
 pub use self::{
     auth::{Auth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
@@ -141,10 +143,10 @@ impl Tx {
     /// edge's open, etc.).
     #[must_use]
     pub fn open_hash(funding: &Funding, terms: &Terms) -> PayloadHash {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::OPEN);
         Self::edge_id_of(funding, terms).encode_to(&mut hasher);
-        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(hasher.finalize().into_bytes())
     }
 
     /// Returns the canonical ids of the payout coins a close would produce.
@@ -170,13 +172,13 @@ impl Tx {
         terms: TermsHash,
         outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
     ) -> PayloadHash {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::CLOSE);
         input.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         terms.encode_to(&mut hasher);
         outputs.encode_to(&mut hasher);
-        PayloadHash::from_bytes(*hasher.finalize().as_bytes())
+        PayloadHash::from_bytes(hasher.finalize().into_bytes())
     }
 
     /// Returns the deterministic resource cost of this transaction.
@@ -342,7 +344,7 @@ where
     let parties = terms.parties();
     // Run every cheap structural / arithmetic check before the
     // signature verifier. The verifier is the most expensive piece of
-    // the open path (BLAKE3 + two SigVerifier calls, potentially real
+    // the open path (Xet hash + two SigVerifier calls, potentially real
     // ECDSA); under DoS pressure we don't want a tx that fails
     // cheaply on owner-match or insufficient funding to also pay for
     // crypto.
@@ -658,12 +660,12 @@ fn close_coins(input: EdgeId, outputs: &Payouts) -> CloseCoins {
 }
 
 fn edge_id(funding: &Funding, terms_hash: TermsHash) -> EdgeId {
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = SingleChunkHasher::new();
     hasher.update(crate::consts::EDGE_OPEN);
     terms_hash.encode_to(&mut hasher);
     funding.maker().encode_to(&mut hasher);
     funding.taker().encode_to(&mut hasher);
-    EdgeId::from_bytes(*hasher.finalize().as_bytes())
+    EdgeId::from_bytes(hasher.finalize().into_bytes())
 }
 
 const fn invalid_open(output: EdgeId, reason: InvalidOpenReason) -> ApplyError {

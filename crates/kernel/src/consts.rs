@@ -3,7 +3,7 @@
 //! All chain-version constants in one place.
 //!
 //! Changing any value here is a **protocol-incompatible change**. Every
-//! deployment must agree on these, and every BLAKE3 commitment computed
+//! deployment must agree on these, and every Xet commitment computed
 //! by the kernel depends on them — coin ids, edge ids, terms commitments,
 //! and close hashes would all shift under a different choice of sizes
 //! or domain separators.
@@ -13,14 +13,14 @@
 
 // ── Identifier and hash sizes (bytes) ─────────────────────────────────
 
-/// Length of every kernel hash output. BLAKE3-256 produces a 32-byte
+/// Length of every kernel hash output. Xet produces a 32-byte
 /// digest; every commitment ([`crate::TermsHash`], [`crate::PayloadHash`])
 /// and every derived identifier ([`crate::CoinId`], [`crate::EdgeId`],
 /// [`crate::BlockHash`]) is this size.
 pub(crate) const HASH_LENGTH: usize = 32;
 
 /// Length of a kernel object identifier. Equal to [`HASH_LENGTH`] because
-/// every id is derived as a BLAKE3 commitment over canonical fields.
+/// every id is derived as a Xet commitment over canonical fields.
 pub(crate) const ID_LENGTH: usize = HASH_LENGTH;
 
 /// Length of a compressed settlement key. 33 bytes is the SEC1
@@ -70,9 +70,9 @@ pub const MAX_EDGE_INPUTS: usize = MAX_PARTY_INPUTS * 2;
 /// fanout. Raising this is also a chain-version change.
 pub const MAX_EDGE_OUTPUTS: usize = 4;
 
-// ── Domain separators (BLAKE3 binding prefixes) ───────────────────────
+// ── Domain separators (Xet binding prefixes) ─────────────────────────
 //
-// Every kernel hash is computed as `BLAKE3(domain ‖ canonical_bytes)`
+// Every kernel hash is the Xet file hash of `domain ‖ canonical_bytes`
 // where `domain` is one of the byte strings below. Changing any of
 // these strings breaks compatibility with every previously-committed
 // hash.

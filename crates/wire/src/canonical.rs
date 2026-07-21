@@ -5,21 +5,20 @@
 //! and `hellas-wire` depends on the kernel directly.
 //!
 //! The bytes emitted by `Encode::encode_to` are the canonical commitment
-//! input. Hashes funnel through `hash(domain, value)` so commitments are
-//! `BLAKE3(domain ‖ value.encode_to(...))`.
+//! input. Hashes funnel through `hash(domain, value)` so commitments use the
+//! Xet file hash of `domain ‖ value.encode_to(...)`.
 
 /// Streaming destination for [`Encode`] output.
 ///
-/// Implemented for raw byte buffers (via [`BufferWriter`]) and for
-/// `blake3::Hasher` so the same `encode_to` body drives both
-/// serialization and hashing without an intermediate buffer.
+/// Implemented for raw byte buffers and `Vec<u8>` so the same `encode_to`
+/// body drives serialization and hashing.
 pub trait Writer {
     fn write(&mut self, bytes: &[u8]);
 }
 
-impl Writer for blake3::Hasher {
+impl Writer for Vec<u8> {
     fn write(&mut self, bytes: &[u8]) {
-        self.update(bytes);
+        self.extend_from_slice(bytes);
     }
 }
 
@@ -62,12 +61,12 @@ pub trait Encode {
     }
 }
 
-/// `BLAKE3(domain ‖ value.encode_to(...))`.
-pub fn hash<T: Encode + ?Sized>(domain: &[u8], value: &T) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(domain);
-    value.encode_to(&mut hasher);
-    *hasher.finalize().as_bytes()
+/// Xet file hash of `domain ‖ value.encode_to(...)`.
+pub fn hash<T: Encode + ?Sized>(domain: &[u8], value: &T) -> hellas_xet::XetHash {
+    let mut bytes = Vec::with_capacity(domain.len() + value.encoded_size());
+    bytes.extend_from_slice(domain);
+    value.encode_to(&mut bytes);
+    hellas_xet::XetHash::hash(&bytes)
 }
 
 // -- Primitives --------------------------------------------------------------

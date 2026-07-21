@@ -20,7 +20,7 @@ test-support = ["placeholders", "webauthn"]
 webauthn = ["dep:p256", "dep:sha2"]
 
 [dependencies]
-blake3 = { version = "1", default-features = false }
+hellas-xet = { workspace = true }
 k256 = { version = "0.13", default-features = false, features = [
     "ecdsa",
 ], optional = true }

@@ -9,7 +9,7 @@ use super::parse_allow_patterns;
 pub enum ExecutePattern {
     /// `hf/<glob>` matches on the `HuggingFace` model ID.
     HuggingFace(String),
-    /// `graph/<glob>` matches on the blake3 graph hash.
+    /// `graph/<glob>` matches on the Xet graph hash.
     Graph(String),
 }
 
