@@ -22,7 +22,6 @@ candle-metal = ["candle", "catgrad/metal"]
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
-blake3 = { workspace = true }
 catgrad = { workspace = true, default-features = false, features = [
     "serde",
 ], optional = true }

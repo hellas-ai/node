@@ -1,5 +1,6 @@
 //! Content-addressed evaluate artifact schema.
 
+use hellas_rpc::{DagCborEncoder, Digest};
 use std::{format, marker::PhantomData, str, string::String, vec::Vec};
 
 const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
@@ -10,38 +11,6 @@ const TEXT_EXECUTION_SCHEMA: &str = "hellas.evaluate.text.execution.v1";
 const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
 const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v1";
 const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Digest([u8; 32]);
-
-impl Digest {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-}
-
-impl core::fmt::Display for Digest {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl core::fmt::Debug for Digest {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Digest({self})")
-    }
-}
 
 pub trait Canonical {
     fn encode(&self, encoder: &mut DagCborEncoder);
@@ -64,7 +33,7 @@ pub trait InputAddressed: Canonical {
     where
         Self: Sized,
     {
-        InputId::from_digest(Digest::from_canonical_bytes(&self.canonical_bytes()))
+        InputId::from_digest(Digest::hash(&self.canonical_bytes()))
     }
 }
 
@@ -73,7 +42,7 @@ pub trait OutputAddressed: Canonical {
     where
         Self: Sized,
     {
-        OutputId::from_digest(Digest::from_canonical_bytes(&self.canonical_bytes()))
+        OutputId::from_digest(Digest::hash(&self.canonical_bytes()))
     }
 }
 
@@ -698,65 +667,6 @@ fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact
         other => Err(DecodeError::new(format!(
             "unexpected text artifact schema tag {other:?}"
         ))),
-    }
-}
-
-#[derive(Debug)]
-pub struct DagCborEncoder {
-    bytes: Vec<u8>,
-}
-
-impl DagCborEncoder {
-    pub fn new() -> Self {
-        Self { bytes: Vec::new() }
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    pub fn array(&mut self, len: u64) {
-        self.header(4, len);
-    }
-
-    pub fn bytes(&mut self, value: &[u8]) {
-        self.header(2, value.len() as u64);
-        self.bytes.extend_from_slice(value);
-    }
-
-    pub fn str(&mut self, value: &str) {
-        self.header(3, value.len() as u64);
-        self.bytes.extend_from_slice(value.as_bytes());
-    }
-
-    pub fn u64(&mut self, value: u64) {
-        self.header(0, value);
-    }
-
-    fn header(&mut self, major: u8, value: u64) {
-        let major = major << 5;
-        match value {
-            0..=23 => self.bytes.push(major | value as u8),
-            24..=0xff => self.bytes.extend_from_slice(&[major | 24, value as u8]),
-            0x100..=0xffff => {
-                self.bytes.push(major | 25);
-                self.bytes.extend_from_slice(&(value as u16).to_be_bytes());
-            }
-            0x1_0000..=0xffff_ffff => {
-                self.bytes.push(major | 26);
-                self.bytes.extend_from_slice(&(value as u32).to_be_bytes());
-            }
-            _ => {
-                self.bytes.push(major | 27);
-                self.bytes.extend_from_slice(&value.to_be_bytes());
-            }
-        }
-    }
-}
-
-impl Default for DagCborEncoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
