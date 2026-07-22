@@ -1,13 +1,40 @@
 use hellas_rpc::evaluate::{
-    EvaluateTokenDelta, TOKEN_DELTA_EVENT_KIND, decode_token_delta_payload,
-    output_canonicalization, verify_terminal_continuation,
+    EvaluateOutput, EvaluateTokenDelta, TOKEN_DELTA_EVENT_KIND, decode_token_delta_payload,
+    output_canonicalization, verify_output_events, verify_terminal_continuation,
 };
+use hellas_rpc::pb::execute::{WorkEvent, work_event};
+use hellas_rpc::stream::output_event_from_pb;
 use hellas_rpc::{
     Assurance, Digest, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, PublicKey,
     StreamId, output_genesis, scheme_id,
 };
 
 use crate::{ClientError, ClientResult};
+
+/// One verified observation from an evaluate execution stream.
+#[derive(Debug, Clone)]
+pub enum EvaluateExecutionEvent {
+    Chunk {
+        /// Cumulative token position after this chunk.
+        position: u64,
+        /// Little-endian `u32` token IDs, ready for `DecodeTokens`.
+        tokens: Vec<u8>,
+    },
+    Done(EvaluateOutcome),
+}
+
+/// Terminal result of a verified evaluate execution stream.
+#[derive(Debug, Clone)]
+pub enum EvaluateOutcome {
+    Completed {
+        output: EvaluateOutput,
+        output_events: Vec<OutputEventEnvelope>,
+    },
+    Failed {
+        position: u64,
+        error: String,
+    },
+}
 
 pub struct EvaluateChunkVerifier {
     input: InputCommitment,
@@ -143,6 +170,58 @@ pub fn evaluate_input_from_request_commitment(
     Ok(InputCommitment::from_digest(Digest::from_bytes(digest)))
 }
 
+/// Decode and verify one evaluate [`WorkEvent`].
+///
+/// This is transport-neutral: callers may obtain events through iroh,
+/// WebSocket, an in-process executor, or any other Hellas `StreamTransport`.
+pub fn verify_evaluate_work_event(
+    verifier: &mut EvaluateChunkVerifier,
+    event: WorkEvent,
+    input_commitment: InputCommitment,
+) -> ClientResult<EvaluateExecutionEvent> {
+    let Some(event) = event.kind else {
+        return Err(ClientError::protocol("wire event with no body"));
+    };
+    match event {
+        work_event::Kind::Chunk(chunk) => {
+            let output_event = chunk.output_event.ok_or_else(|| {
+                ClientError::protocol("evaluate work chunk missing signed output event")
+            })?;
+            let output_event = output_event_from_pb(output_event).map_err(|source| {
+                ClientError::source("evaluate output event decode failed", source)
+            })?;
+            let (position, delta) = verifier.verify_chunk(output_event)?;
+            Ok(EvaluateExecutionEvent::Chunk {
+                position,
+                tokens: delta.token_bytes(),
+            })
+        }
+        work_event::Kind::Finished(finished) => {
+            let output_events = finished
+                .output_events
+                .into_iter()
+                .map(output_event_from_pb)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| {
+                    ClientError::source("evaluate output event decode failed", source)
+                })?;
+            verifier.verify_terminal(&output_events)?;
+            let output = verify_output_events(input_commitment, &output_events)
+                .map_err(|source| ClientError::EvaluateTranscript { source })?;
+            Ok(EvaluateExecutionEvent::Done(EvaluateOutcome::Completed {
+                output,
+                output_events,
+            }))
+        }
+        work_event::Kind::Failed(failed) => {
+            Ok(EvaluateExecutionEvent::Done(EvaluateOutcome::Failed {
+                position: failed.position,
+                error: failed.error,
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +229,8 @@ mod tests {
         EvaluateOutputTranscriptBuilder, EvaluateProtocolError, EvaluateStopReason,
         EvaluateTerminal, EvaluateUsage, input_commitment,
     };
+    use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFinished, work_event};
+    use hellas_rpc::stream::output_event_to_pb;
     use hellas_rpc::{ContentId, EvaluateRequest, ProducerSigningKey};
 
     const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
@@ -207,5 +288,67 @@ mod tests {
             source: EvaluateProtocolError::UnknownStopReason(9),
         };
         assert!(error.to_string().contains("evaluate transcript"));
+    }
+
+    #[test]
+    fn work_events_are_verified_end_to_end() {
+        let runner = key(1);
+        let producer = key(2);
+        let request = EvaluateRequest {
+            text_execution: Digest::from_bytes([9; 32]),
+            runner_public_key: runner.public_key(),
+            execution_environment: ContentId::from_bytes([8; 32]),
+            nonce: [7; 32],
+        };
+        let input = hellas_rpc::evaluate::input_commitment(&request);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let chunk = builder.push_token_delta(vec![10, 11]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 2,
+                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                text_artifact: Digest::from_bytes([4; 32]),
+                usage: EvaluateUsage {
+                    input_units: 3,
+                    output_units: 2,
+                },
+                billable_units: 5,
+            })
+            .unwrap();
+
+        let mut verifier = EvaluateChunkVerifier::new(input);
+        let event = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Chunk(WorkChunk {
+                    output_event: Some(output_event_to_pb(&chunk)),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            EvaluateExecutionEvent::Chunk {
+                position: 2,
+                ref tokens
+            } if tokens.len() == 8
+        ));
+
+        let event = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Finished(WorkFinished {
+                    output_events: output_events.iter().map(output_event_to_pb).collect(),
+                    assurance_evidence: Vec::new(),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            EvaluateExecutionEvent::Done(EvaluateOutcome::Completed { .. })
+        ));
     }
 }

@@ -10,7 +10,10 @@ mod run_ticket;
 
 pub use error::{ClientError, ClientResult};
 #[cfg(feature = "evaluate")]
-pub use evaluate::{EvaluateChunkVerifier, evaluate_input_from_request_commitment};
+pub use evaluate::{
+    EvaluateChunkVerifier, EvaluateExecutionEvent, EvaluateOutcome,
+    evaluate_input_from_request_commitment, verify_evaluate_work_event,
+};
 pub use fetch::{
     FetchChunkVerifier, FetchExecutionEvent, FetchOutcome, ProducerTrust, parse_fetch_finished,
     validate_fetch_ticket, verified_fetch_input, verify_fetch_work_event,
