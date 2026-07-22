@@ -63,6 +63,14 @@ impl RemoteLightClient {
             .await
             .map_err(QueryError::from)
     }
+
+    /// Fetch transport/version metadata from the connected validator path.
+    pub async fn get_relay_info(&self) -> Result<GetRelayInfoResponse, QueryError> {
+        self.client
+            .get_relay_info(GetRelayInfoRequest {})
+            .await
+            .map_err(QueryError::from)
+    }
 }
 
 impl LightClient for RemoteLightClient {

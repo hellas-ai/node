@@ -762,6 +762,20 @@ impl WebAuthnSignature {
             client_data_json: byte_list_from_slice(client_data_json)?,
         })
     }
+
+    /// Builds a bounded signature payload from the DER encoding returned by
+    /// `AuthenticatorAssertionResponse.signature`.
+    #[must_use]
+    pub fn from_der(
+        signature_der: &[u8],
+        authenticator_data: &[u8],
+        client_data_json: &[u8],
+    ) -> Option<Self> {
+        let signature = p256::ecdsa::Signature::from_der(signature_der).ok()?;
+        let signature = signature.normalize_s();
+        let signature = UserSignature::decode(signature.to_bytes().as_ref()).ok()?;
+        Self::new(signature, authenticator_data, client_data_json)
+    }
 }
 
 impl EncodeSize for WebAuthnSignature {
@@ -1226,6 +1240,21 @@ mod tests {
                 signature,
             },
         )
+    }
+
+    #[test]
+    fn webauthn_signature_accepts_browser_der() {
+        let key = secp256r1_key_from_seed(17);
+        let challenge = Digest::from([9; 32]);
+        let original = mock_webauthn_sign(&key, &challenge).unwrap();
+        let signature = p256::ecdsa::Signature::from_slice(original.signature.as_ref()).unwrap();
+        let decoded = WebAuthnSignature::from_der(
+            signature.to_der().as_bytes(),
+            original.authenticator_data.as_slice(),
+            original.client_data_json.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(decoded, original);
     }
 
     #[test]
