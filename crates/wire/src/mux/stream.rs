@@ -133,6 +133,17 @@ pub struct MuxRecvHalf {
     done: bool,
 }
 
+impl Drop for MuxRecvHalf {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.cmd_tx.send(Command::Reset {
+                slot: self.slot,
+                code: WireCode::Cancelled,
+            });
+        }
+    }
+}
+
 impl FuturesStream for MuxRecvHalf {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -171,5 +182,34 @@ impl crate::transport::RecvHalf for MuxRecvHalf {
             code,
         });
         self.done = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_live_receive_half_cancels_its_mux_slot() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (_recv_tx, recv_rx) = mpsc::unbounded_channel();
+        let (_trailer_tx, trailer_rx) = oneshot::channel();
+        let recv = MuxRecvHalf {
+            slot: 6,
+            cmd_tx,
+            recv_rx,
+            trailer_rx: Some(trailer_rx),
+            trailer: None,
+            done: false,
+        };
+
+        drop(recv);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(Command::Reset {
+                slot: 6,
+                code: WireCode::Cancelled,
+            })
+        ));
     }
 }
