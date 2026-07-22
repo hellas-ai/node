@@ -22,7 +22,7 @@ use hellas_rpc::pb::{
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
-use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus, mux::MuxTransport};
+use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use p256::ecdsa::Signature as P256Signature;
 use std::{io, net::SocketAddr, pin::Pin};
 use tokio::{
@@ -36,7 +36,7 @@ use tracing::{info, warn};
 
 type ActivityStream =
     Pin<Box<dyn Stream<Item = Result<ActivityEvent, WireStatus>> + Send + 'static>>;
-type ServerError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type LightClientServerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct LightClientRpc<T> {
@@ -85,18 +85,55 @@ where
 async fn serve_connection<T>(
     stream: TcpStream,
     service: LightClientRpc<T>,
-) -> Result<(), ServerError>
+) -> Result<(), LightClientServerError>
 where
     T: LightClientApi,
 {
     let ws = accept_async(stream).await?;
     let transport = hellas_wire::ws::accept_upgraded(ws, None);
-    let dispatch = LightClientServer(service);
+    serve_light_client_transport(transport, service).await
+}
+
+/// Serve the typed light-client API over any inbound-stream transport.
+///
+/// Each RPC is dispatched in its own task. Server-streaming calls can remain
+/// open indefinitely and must not block unary calls on other mux streams.
+pub async fn serve_light_client_transport<T, C>(
+    transport: T,
+    service: LightClientRpc<C>,
+) -> Result<(), LightClientServerError>
+where
+    T: StreamTransport + Send + Sync + 'static,
+    T::Stream: 'static,
+    <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
+    <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
+    C: LightClientApi,
+{
+    let mut calls = tokio::task::JoinSet::new();
     while let Some(inbound) = transport.accept().await? {
-        <LightClientServer<LightClientRpc<T>> as Dispatcher<MuxTransport>>::dispatch(
-            &dispatch, inbound,
-        )
-        .await?;
+        let dispatch = LightClientServer(service.clone());
+        calls.spawn(async move {
+            <LightClientServer<LightClientRpc<C>> as Dispatcher<T>>::dispatch(&dispatch, inbound)
+                .await
+        });
+
+        while let Some(result) = calls.try_join_next() {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "light client rpc failed"),
+                Err(error) => warn!(%error, "light client rpc task failed"),
+            }
+        }
+    }
+
+    calls.abort_all();
+    while let Some(result) = calls.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "light client rpc failed"),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => warn!(%error, "light client rpc task failed"),
+        }
     }
     Ok(())
 }
@@ -664,6 +701,7 @@ mod tests {
     use crate::{Mempool, OwnerCoins, light_client::QueryError};
     use hellas_kernel::Encode as _;
     use hellas_kernel::test_support::valid_open_tx;
+    use std::time::Duration;
 
     #[derive(Clone, Default)]
     struct MempoolClient {
@@ -718,7 +756,7 @@ mod tests {
         }
 
         async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
-            panic!("unused test method")
+            Ok(vec!["validator-a".to_string()])
         }
 
         async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
@@ -761,10 +799,11 @@ mod tests {
             .await
             .expect("canonical kernel transaction is accepted");
         let pending = mempool.snapshot().await;
-        assert!(matches!(
-            pending.as_slice(),
-            [Transaction::Kernel(pending_tx)] if pending_tx == &tx
-        ));
+        assert_eq!(pending.len(), 1);
+        let Transaction::Kernel(pending_tx) = &pending[0] else {
+            panic!("pending transaction was not a kernel transaction")
+        };
+        assert_eq!(pending_tx, &tx);
 
         let mut trailing = canonical;
         trailing.push(0);
@@ -779,6 +818,33 @@ mod tests {
             assert_eq!(error.code(), WireCode::InvalidArgument);
         }
         assert_eq!(mempool.snapshot().await.len(), 1);
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn activity_stream_does_not_block_unary_requests() {
+        use crate::{LightClient as _, client::RemoteLightClient};
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (activity_tx, _activity_rx) = broadcast::channel(8);
+        let server = spawn_light_client_server(addr, MempoolClient::default(), activity_tx)
+            .await
+            .unwrap();
+        let client = RemoteLightClient::connect(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let _activity = client.subscribe_activity(Vec::new()).await.unwrap();
+
+        let validators = tokio::time::timeout(Duration::from_secs(1), client.get_validators())
+            .await
+            .expect("unary request was blocked behind activity stream")
+            .unwrap();
+        assert_eq!(validators, ["validator-a"]);
+
+        server.abort();
     }
 
     #[tokio::test]

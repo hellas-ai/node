@@ -70,4 +70,6 @@ pub use light_client::{
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 #[cfg(feature = "server")]
-pub use server::spawn_light_client_server;
+pub use server::{
+    LightClientRpc, LightClientServerError, serve_light_client_transport, spawn_light_client_server,
+};
