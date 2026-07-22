@@ -206,12 +206,9 @@ pub enum ValidatorCommand {
         /// Validator addresses in index order
         #[arg(long, value_delimiter = ',')]
         addresses: Option<Vec<String>>,
-        /// Chain light-client WebSocket bind address
-        #[arg(long)]
-        ws_bind: Option<String>,
-        /// Explorer WebSocket URL
-        #[arg(long)]
-        ws_push: Option<String>,
+        /// Relay or indexer WebSocket origins to serve through
+        #[arg(long = "relay-url", value_delimiter = ',')]
+        relay_urls: Vec<String>,
         /// Prometheus metrics port
         #[arg(long)]
         metrics_port: Option<u16>,
@@ -647,8 +644,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             start_port,
             seed,
             addresses,
-            ws_bind,
-            ws_push,
+            relay_urls,
             metrics_port,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
@@ -657,8 +653,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             start_port,
             seed,
             addresses,
-            ws_bind,
-            ws_push,
+            relay_urls,
             metrics_port,
             genesis_allocations,
         },
