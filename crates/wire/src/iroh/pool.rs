@@ -39,6 +39,7 @@ use ::iroh::{Endpoint, EndpointId};
 // Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic provides a
 // mutex-fallback so embedded targets still compile.
 use portable_atomic::{AtomicU64, Ordering};
+use web_time::Instant;
 
 use crate::iroh::transport::IrohTransport;
 use crate::transport::ServiceMarker;
@@ -94,9 +95,8 @@ impl From<::iroh::endpoint::ConnectError> for PoolError {
 #[derive(Clone)]
 struct CachedConn {
     connection: Connection,
-    /// Using `std::time::Instant` is fine — the pool only runs on native
-    /// (the iroh transport is gated on `cfg(not(wasm))` upstream).
-    last_used: std::time::Instant,
+    /// Monotonic on native and browsers.
+    last_used: Instant,
 }
 
 struct Inner {
@@ -285,7 +285,7 @@ impl Pool {
             peer_id,
             CachedConn {
                 connection: conn.clone(),
-                last_used: std::time::Instant::now(),
+                last_used: Instant::now(),
             },
         );
         Ok(conn)
@@ -334,7 +334,7 @@ impl Inner {
             cache.remove(&peer_id);
             return None;
         }
-        entry.last_used = std::time::Instant::now();
+        entry.last_used = Instant::now();
         Some(entry.connection.clone())
     }
 
@@ -342,7 +342,7 @@ impl Inner {
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let idle_timeout = self.options.idle_timeout;
         cache.retain(|_, c| {
             if c.connection.close_reason().is_some() {
