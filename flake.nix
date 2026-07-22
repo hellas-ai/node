@@ -69,6 +69,7 @@
       };
 
       nixosModules.hellas = import ./nix/modules/nixos.nix { inherit self; };
+      nixosModules.validators = import ./nix/modules/validators.nix { inherit self; };
       nixosModules.default = self.nixosModules.hellas;
 
       homeManagerModules.hellas = import ./nix/modules/home-manager.nix { inherit self; };
