@@ -8,6 +8,7 @@ use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
+pub use hellas_genesis::{Genesis, GenesisAllocation as GenesisEntry, GenesisValidator};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -27,6 +28,17 @@ pub enum ConfigError {
     MissingDataDirectory,
     #[error("duplicate public keys in config")]
     DuplicatePublicKeys,
+    #[error("invalid genesis document")]
+    Genesis(#[from] hellas_genesis::GenesisError),
+    #[error("validator identity is not in the genesis committee")]
+    MissingLocalValidator,
+    #[error("configured peer identities do not match the genesis committee")]
+    PeerSetMismatch,
+    #[error("network `{configured}` is not supported by this binary; expected `{supported}`")]
+    UnsupportedNetwork {
+        configured: String,
+        supported: &'static str,
+    },
     #[error("invalid network address")]
     InvalidAddress(#[from] std::net::AddrParseError),
     #[error("duplicate keys in peer address map")]
@@ -112,8 +124,7 @@ pub struct ValidatorConfig {
     pub ws_bind: Option<String>,
     #[serde(default)]
     pub explorer_url: Option<String>,
-    #[serde(default)]
-    pub genesis_allocations: Vec<GenesisEntry>,
+    pub genesis: Genesis,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -123,13 +134,18 @@ pub struct PeerEntry {
     pub address: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct GenesisEntry {
-    pub address: String,
-    pub balance: u64,
-}
-
 impl ValidatorConfig {
+    pub fn validate_genesis(&self) -> Result<(), ConfigError> {
+        self.genesis.validate()?;
+        if self.genesis.network_id != hellas_genesis::DEFAULT_NETWORK_ID {
+            return Err(ConfigError::UnsupportedNetwork {
+                configured: self.genesis.network_id.clone(),
+                supported: hellas_genesis::DEFAULT_NETWORK_ID,
+            });
+        }
+        Ok(())
+    }
+
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
         let bytes = hex::decode(&self.private_key)?;
         Ok(ed25519::PrivateKey::decode(bytes.as_slice())?)
@@ -142,7 +158,7 @@ impl ValidatorConfig {
 
     pub fn decode_threshold_polynomial(&self) -> Result<ThresholdPolynomial, ConfigError> {
         let bytes = hex::decode(&self.threshold_polynomial)?;
-        let total = u32::try_from(self.peers.len() + 1).unwrap_or(u32::MAX);
+        let total = u32::try_from(self.genesis.validators.len()).unwrap_or(u32::MAX);
         let max_participants = NonZeroU32::new(total).unwrap_or(NonZeroU32::MIN);
         Ok(ThresholdPolynomial::decode_cfg(
             bytes.as_slice(),
@@ -161,21 +177,23 @@ impl ValidatorConfig {
     }
 
     pub fn participants(&self) -> Result<Set<PublicKey>, ConfigError> {
+        self.validate_genesis()?;
         let me = self.public_key()?;
-        let mut keys: Vec<PublicKey> = self
-            .peers
+        let keys: Vec<PublicKey> = self
+            .genesis
+            .validators
             .iter()
-            .map(|p| -> Result<PublicKey, ConfigError> {
-                let bytes = hex::decode(&p.public_key)?;
+            .map(|validator| -> Result<PublicKey, ConfigError> {
+                let bytes = hex::decode(&validator.public_key)?;
                 let key: PublicKey = PublicKey::decode(bytes.as_slice())?;
                 Ok(key)
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
-        keys.push(me);
-        match Set::try_from(keys) {
-            Ok(set) => Ok(set),
-            Err(_) => Err(ConfigError::DuplicatePublicKeys),
+        let set = Set::try_from(keys).map_err(|_| ConfigError::DuplicatePublicKeys)?;
+        if set.position(&me).is_none() {
+            return Err(ConfigError::MissingLocalValidator);
         }
+        Ok(set)
     }
 
     pub fn peer_address_map(&self) -> Result<Map<PublicKey, P2pAddress>, ConfigError> {
@@ -193,10 +211,17 @@ impl ValidatorConfig {
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
         entries.push((me, P2pAddress::Symmetric(listen)));
-        match Map::try_from(entries) {
-            Ok(map) => Ok(map),
-            Err(_) => Err(ConfigError::DuplicatePeerAddressKeys),
+        let configured = Set::try_from(
+            entries
+                .iter()
+                .map(|(public_key, _)| public_key.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| ConfigError::DuplicatePeerAddressKeys)?;
+        if configured != self.participants()? {
+            return Err(ConfigError::PeerSetMismatch);
         }
+        Map::try_from(entries).map_err(|_| ConfigError::DuplicatePeerAddressKeys)
     }
 
     /// Overlay `private_key`, `threshold_share`, and `threshold_polynomial` from
@@ -224,8 +249,10 @@ impl ValidatorConfig {
     }
 
     pub fn genesis_allocations(&self) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
+        self.validate_genesis()?;
         let mut allocations: Vec<(UserSettlementKey, u64)> = self
-            .genesis_allocations
+            .genesis
+            .allocations
             .iter()
             .map(|entry| -> Result<(UserSettlementKey, u64), ConfigError> {
                 let key = parse_genesis_settlement_key(&entry.address)?;
@@ -271,18 +298,28 @@ mod tests {
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
 
     fn config_with_genesis(address: String) -> ValidatorConfig {
+        let private_key = ed25519::PrivateKey::from_seed(1);
+        let public_key = hex::encode(private_key.public_key().encode());
         ValidatorConfig {
-            private_key: String::new(),
+            private_key: encode_private_key(&private_key),
             threshold_share: String::new(),
             threshold_polynomial: String::new(),
             listen_port: 0,
             metrics_port: None,
             ws_bind: None,
             explorer_url: None,
-            genesis_allocations: vec![GenesisEntry {
-                address,
-                balance: 10,
-            }],
+            genesis: Genesis {
+                schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
+                network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
+                validators: vec![GenesisValidator {
+                    public_key,
+                    label: "validator-0".to_string(),
+                }],
+                allocations: vec![GenesisEntry {
+                    address,
+                    balance: 10,
+                }],
+            },
             peers: Vec::new(),
         }
     }
@@ -309,5 +346,46 @@ mod tests {
                 .expect("valid P-256 genesis owner"),
             vec![(key, 10)]
         );
+    }
+
+    #[test]
+    fn genesis_committee_must_include_local_identity() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
+        let mut config = config_with_genesis(SettlementKey::from(address).to_string());
+        let other = ed25519::PrivateKey::from_seed(2);
+        config.genesis.validators[0].public_key = hex::encode(other.public_key().encode());
+
+        assert!(matches!(
+            config.participants(),
+            Err(ConfigError::MissingLocalValidator)
+        ));
+    }
+
+    #[test]
+    fn peer_topology_must_cover_exact_genesis_committee() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
+        let mut config = config_with_genesis(SettlementKey::from(address).to_string());
+        let other = ed25519::PrivateKey::from_seed(2);
+        config.genesis.validators.push(GenesisValidator {
+            public_key: hex::encode(other.public_key().encode()),
+            label: "validator-1".to_string(),
+        });
+
+        assert!(matches!(
+            config.peer_address_map(),
+            Err(ConfigError::PeerSetMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_network_id_the_transaction_domain_does_not_support() {
+        let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
+        let mut config = config_with_genesis(SettlementKey::from(address).to_string());
+        config.genesis.network_id = "hellas-testnet-1".to_string();
+
+        assert!(matches!(
+            config.validate_genesis(),
+            Err(ConfigError::UnsupportedNetwork { .. })
+        ));
     }
 }

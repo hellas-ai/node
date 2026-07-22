@@ -16,6 +16,8 @@ pub mod config;
 mod consensus;
 #[cfg(feature = "domain")]
 pub mod domain;
+#[cfg(feature = "domain")]
+pub use hellas_genesis as genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
 #[cfg(feature = "validator")]

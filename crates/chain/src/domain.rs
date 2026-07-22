@@ -373,7 +373,7 @@ pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Diges
 /// `WebAuthn` policy version.
 pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
 /// Chain identifier committed into `WebAuthn` challenges.
-pub const WEBAUTHN_CHAIN_ID: &[u8] = b"hellas-devnet-1";
+pub const WEBAUTHN_CHAIN_ID: &[u8] = hellas_genesis::DEFAULT_NETWORK_ID.as_bytes();
 /// Whether `WebAuthn` user presence is required.
 pub const WEBAUTHN_REQUIRE_UP: bool = true;
 /// Whether `WebAuthn` user verification is required.
