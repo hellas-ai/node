@@ -6,6 +6,7 @@ pub mod error;
 pub mod frame;
 pub mod latency;
 pub mod metadata;
+pub mod relay_auth;
 pub mod schema;
 pub mod status;
 pub mod transport;
