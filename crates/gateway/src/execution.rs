@@ -28,10 +28,13 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use futures::stream::Stream;
 use hellas_client::ClientError as ExecutionError;
-use hellas_client::EvaluateChunkVerifier;
 use hellas_client::ExecutionRuntime as ClientExecutionRuntime;
 use hellas_client::signed_run_ticket_request;
 use hellas_client::{ClientResult as ExecutionResult, ExecutionRoute};
+use hellas_client::{
+    EvaluateChunkVerifier, EvaluateExecutionEvent as ClientEvaluateEvent,
+    EvaluateOutcome as ClientEvaluateOutcome, verify_evaluate_work_event,
+};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ExecutorHandle;
 use hellas_models::{ModelAssets, PreparedPrompt};
@@ -40,17 +43,14 @@ use hellas_rpc::InputCommitment;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::Retention;
-use hellas_rpc::evaluate::{
-    EvaluateStopReason, verify_output_events as verify_evaluate_output_events,
-};
+use hellas_rpc::evaluate::EvaluateStopReason;
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
 };
 use hellas_rpc::pb::execute::Ticket;
-use hellas_rpc::pb::execute::{WorkEvent, WorkFinished, work_event};
+use hellas_rpc::pb::execute::WorkEvent;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::execute::ExecuteClientImpl;
-use hellas_rpc::stream::output_event_from_pb;
 use hellas_wire::WireStatus;
 use hellas_wire::iroh::IrohTransport;
 #[cfg(feature = "evaluate")]
@@ -629,59 +629,23 @@ fn convert_wire_event(
     input_commitment: InputCommitment,
     verifier: &mut EvaluateChunkVerifier,
 ) -> ExecutionResult<ExecutionEvent> {
-    let Some(event) = event.kind else {
-        return Err(ExecutionError::protocol("wire event with no body"));
-    };
-    match event {
-        work_event::Kind::Chunk(chunk) => {
-            let output_event = chunk.output_event.ok_or_else(|| {
-                ExecutionError::protocol("evaluate work chunk missing signed output event")
-            })?;
-            let output_event = output_event_from_pb(output_event).map_err(|source| {
-                ExecutionError::source("evaluate output event decode failed", source)
-            })?;
-            let (position, delta) = verifier.verify_chunk(output_event)?;
-            Ok(ExecutionEvent::Chunk {
-                position,
-                tokens: delta.token_bytes(),
-            })
+    match verify_evaluate_work_event(verifier, event, input_commitment)? {
+        ClientEvaluateEvent::Chunk { position, tokens } => {
+            Ok(ExecutionEvent::Chunk { position, tokens })
         }
-        work_event::Kind::Finished(finished) => {
-            let outcome = parse_finished(finished, input_commitment, verifier.assurance())?;
-            if let Outcome::Completed { output_events, .. } = &outcome {
-                verifier.verify_terminal(output_events)?;
-            }
-            Ok(ExecutionEvent::Done(outcome))
-        }
-        work_event::Kind::Failed(failed) => Ok(ExecutionEvent::Done(Outcome::Failed {
-            position: failed.position,
-            error: failed.error,
+        ClientEvaluateEvent::Done(ClientEvaluateOutcome::Completed {
+            output,
+            output_events,
+        }) => Ok(ExecutionEvent::Done(Outcome::Completed {
+            total_tokens: output.terminal.billable_units,
+            stop_reason: stop_reason_from_evaluate(output.terminal.stop_reason)?,
+            text_artifact: output.terminal.text_artifact,
+            output_events,
         })),
+        ClientEvaluateEvent::Done(ClientEvaluateOutcome::Failed { position, error }) => {
+            Ok(ExecutionEvent::Done(Outcome::Failed { position, error }))
+        }
     }
-}
-
-fn parse_finished(
-    finished: WorkFinished,
-    input_commitment: InputCommitment,
-    assurance: hellas_rpc::Assurance,
-) -> ExecutionResult<Outcome> {
-    let output_events = finished
-        .output_events
-        .into_iter()
-        .map(output_event_from_pb)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| ExecutionError::source("evaluate output event decode failed", source))?;
-    let output = verify_evaluate_output_events(input_commitment, assurance, &output_events)
-        .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
-    let terminal = output.terminal;
-    let terminal_stop_reason = stop_reason_from_evaluate(terminal.stop_reason)?;
-    let total_tokens = terminal.billable_units;
-    Ok(Outcome::Completed {
-        total_tokens,
-        stop_reason: terminal_stop_reason,
-        text_artifact: terminal.text_artifact,
-        output_events,
-    })
 }
 
 fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopReason> {
@@ -712,7 +676,7 @@ mod tests {
         EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
         input_commitment as evaluate_input_commitment,
     };
-    use hellas_rpc::pb::execute::WorkChunk;
+    use hellas_rpc::pb::execute::{WorkChunk, WorkFinished, work_event};
     use hellas_rpc::stream::output_event_to_pb;
 
     fn key(byte: u8) -> ProducerSigningKey {
