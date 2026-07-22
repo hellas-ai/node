@@ -25,7 +25,7 @@ let
     types
     ;
 
-  cfg = config.services.hellas-validators;
+  cfg = config.services.hellas-chain-validators;
 
   mkOtelEnv =
     validator:
@@ -198,7 +198,7 @@ let
   enabledValidators = filterAttrs (_: validator: validator.enable) cfg;
 in
 {
-  options.services.hellas-validators = mkOption {
+  options.services.hellas-chain-validators = mkOption {
     type = types.attrsOf (types.submodule validatorOptions);
     default = { };
     description = "Hellas validator clusters keyed by deployment name.";
@@ -210,15 +210,15 @@ in
         {
           assertion =
             validator.addresses == [ ] || builtins.length validator.addresses == validator.totalValidators;
-          message = "services.hellas-validators.${name}.addresses must contain one entry per validator.";
+          message = "services.hellas-chain-validators.${name}.addresses must contain one entry per validator.";
         }
         {
           assertion = validator.genesis == null || validator.seed != null;
-          message = "services.hellas-validators.${name}.genesis requires a deterministic seed.";
+          message = "services.hellas-chain-validators.${name}.genesis requires a deterministic seed.";
         }
         {
           assertion = validator.genesis == null || validator.genesisAllocations == [ ];
-          message = "services.hellas-validators.${name} cannot combine genesis with genesisAllocations.";
+          message = "services.hellas-chain-validators.${name} cannot combine genesis with genesisAllocations.";
         }
       ]) enabledValidators
     );
