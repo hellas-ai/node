@@ -34,15 +34,27 @@ impl RemoteLightClient {
     /// Connect to a WebSocket endpoint.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, QueryError> {
         let addr = addr.into();
-        #[cfg(not(target_family = "wasm"))]
-        let transport = hellas_wire::ws::connect(&addr)
-            .await
-            .map_err(|e| QueryError::Connect(e.to_string()))?;
         #[cfg(target_family = "wasm")]
-        let transport = hellas_wire::ws::wasm::connect(&addr)
-            .await
-            .map_err(|e| QueryError::Connect(e.to_string()))?;
-        Ok(Self::new(transport))
+        {
+            let transport = hellas_wire::ws::wasm::connect(&addr)
+                .await
+                .map_err(|e| QueryError::Connect(e.to_string()))?;
+            Ok(Self::new(transport))
+        }
+        #[cfg(all(not(target_family = "wasm"), feature = "client"))]
+        {
+            let transport = hellas_wire::ws::connect(&addr)
+                .await
+                .map_err(|e| QueryError::Connect(e.to_string()))?;
+            Ok(Self::new(transport))
+        }
+        #[cfg(all(not(target_family = "wasm"), not(feature = "client")))]
+        {
+            let _ = addr;
+            Err(QueryError::Connect(
+                "the wasm-client feature can only connect on a wasm target".to_string(),
+            ))
+        }
     }
 
     /// Configure this client to verify finalized snapshots.
