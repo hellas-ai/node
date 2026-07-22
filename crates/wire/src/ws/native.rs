@@ -12,7 +12,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::Request};
 
 use crate::clock::DefaultClock;
 use crate::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
@@ -88,12 +88,30 @@ where
 /// in client role. The caller polls `transport.open(...)` / `accept()`
 /// as usual; the mux's spawned I/O loop drives the WebSocket.
 pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
-    let (ws, _resp) = tokio_tungstenite::connect_async(url)
+    connect_with_role(url, Role::Client).await
+}
+
+/// Dial a WebSocket as the HTTP client while serving inbound mux streams.
+///
+/// Transport direction and mux role are deliberately separate concepts. A
+/// validator connecting out to a relay is the HTTP/WebSocket client, but the
+/// relay opens RPC streams toward it, so the validator must own the mux server
+/// role. The request form lets callers add authenticated-upgrade headers before
+/// dialing.
+pub async fn connect_server(request: Request<()>) -> Result<WsTransport, WsError> {
+    connect_with_role(request, Role::Server).await
+}
+
+async fn connect_with_role(
+    request: impl IntoClientRequest + Unpin,
+    role: Role,
+) -> Result<WsTransport, WsError> {
+    let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| WsError::Connect(format!("{e}")))?;
     let pipe = WsPipe::new(ws);
     let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
-        Role::Client,
+        role,
         DefaultClock,
         MuxConfig::default(),
         pipe,
@@ -131,3 +149,37 @@ const _: fn() = || {
     fn assert_pipe_error<T: StdError + Send + Sync + 'static>() {}
     assert_pipe_error::<WsError>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Metadata, StreamTransport};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn dialed_server_accepts_stream_opened_by_websocket_acceptor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
+                Role::Client,
+                DefaultClock,
+                MuxConfig::default(),
+                WsPipe::new(ws),
+                None,
+            );
+            transport.open(0xfeed_beef, Metadata::new()).await.unwrap()
+        });
+
+        let request = format!("ws://{addr}").into_client_request().unwrap();
+        let validator = connect_server(request).await.unwrap();
+        let inbound = validator.accept().await.unwrap().unwrap();
+
+        assert_eq!(inbound.method_id, 0xfeed_beef);
+        drop(inbound);
+        relay.await.unwrap();
+    }
+}
