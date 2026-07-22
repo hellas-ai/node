@@ -3,8 +3,9 @@ use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
     Mempool, OwnerIndex, UtxoDb,
     config::{
-        Config, ConfigError, GenesisEntry, PeerEntry, ValidatorConfig, encode_private_key,
-        encode_threshold_polynomial, encode_threshold_share, parse_genesis_settlement_key,
+        Config, ConfigError, Genesis, GenesisEntry, GenesisValidator, PeerEntry, ValidatorConfig,
+        encode_private_key, encode_threshold_polynomial, encode_threshold_share,
+        parse_genesis_settlement_key,
     },
     init_block_store, init_finalization_store,
     rpc::LocalLightClient,
@@ -269,7 +270,19 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
         ws_bind,
         explorer_url: ws_push,
-        genesis_allocations,
+        genesis: Genesis {
+            schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
+            network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
+            validators: keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| GenesisValidator {
+                    public_key: hex::encode(key.public_key().encode()),
+                    label: format!("validator-{index}"),
+                })
+                .collect(),
+            allocations: genesis_allocations,
+        },
         peers,
     };
     config.genesis_allocations()?;

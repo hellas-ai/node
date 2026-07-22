@@ -20,6 +20,7 @@ domain = [
     "dep:commonware-codec",
     "dep:commonware-cryptography",
     "dep:hellas-kernel",
+    "dep:hellas-genesis",
     "dep:p256",
     "dep:serde_json",
     "dep:sha2",
@@ -140,6 +141,7 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
     "sink",
 ] }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
+hellas-genesis = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
