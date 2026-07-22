@@ -31,6 +31,8 @@ pub mod light_client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod owner_index;
 #[cfg(feature = "validator")]
+pub mod relay;
+#[cfg(feature = "validator")]
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;

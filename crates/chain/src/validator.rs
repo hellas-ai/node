@@ -8,8 +8,9 @@ use crate::{
         parse_genesis_settlement_key,
     },
     init_block_store, init_finalization_store,
+    relay::{authenticated_relay_request, serve_light_client_relay},
     rpc::LocalLightClient,
-    spawn_light_client_server, utxo_db_config,
+    utxo_db_config,
 };
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
@@ -47,6 +48,7 @@ use std::io;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
@@ -118,8 +120,8 @@ pub enum ValidatorError {
     NonUtf8StorageDirectory(PathBuf),
     #[error("failed to replay owner index: {0}")]
     OwnerIndex(String),
-    #[error("failed to bind RPC server at {addr}: {source}")]
-    RpcBind { addr: SocketAddr, source: io::Error },
+    #[error("invalid relay configuration")]
+    Relay(#[from] crate::relay::RelayConnectError),
 }
 
 #[derive(Debug)]
@@ -130,8 +132,7 @@ pub enum Command {
         start_port: u16,
         seed: Option<u64>,
         addresses: Option<Vec<String>>,
-        ws_bind: Option<String>,
-        ws_push: Option<String>,
+        relay_urls: Vec<String>,
         metrics_port: Option<u16>,
         genesis_allocations: Vec<String>,
     },
@@ -151,8 +152,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             start_port,
             seed,
             addresses,
-            ws_bind,
-            ws_push,
+            relay_urls,
             metrics_port,
             genesis_allocations,
         } => setup(SetupArgs {
@@ -161,8 +161,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             start_port,
             seed,
             addresses,
-            ws_bind,
-            ws_push,
+            relay_urls,
             metrics_port,
             genesis_allocations,
         }),
@@ -177,8 +176,7 @@ struct SetupArgs {
     start_port: u16,
     seed: Option<u64>,
     addresses: Option<Vec<String>>,
-    ws_bind: Option<String>,
-    ws_push: Option<String>,
+    relay_urls: Vec<String>,
     metrics_port: Option<u16>,
     genesis_allocations: Vec<String>,
 }
@@ -190,8 +188,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         start_port,
         seed,
         addresses,
-        ws_bind,
-        ws_push,
+        relay_urls,
         metrics_port,
         genesis_allocations,
     } = args;
@@ -268,8 +265,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
         listen_port: start_port + validator as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
-        ws_bind,
-        explorer_url: ws_push,
+        relay_urls,
         genesis: Genesis {
             schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
             network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
@@ -563,7 +559,7 @@ enum ShutdownTrigger {
     Signal(&'static str),
     NetworkExited,
     EngineExited,
-    RpcExited,
+    RelayExited,
 }
 
 async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
@@ -620,20 +616,39 @@ async fn replay_owner_index(
 
 /// Run all `ValidatorConfig` validations the runtime would perform at startup.
 /// Used by `validator check-config` and by `nix build` via runCommand.
+fn validate_relay_urls(
+    validator_config: &ValidatorConfig,
+    private_key: &ed25519::PrivateKey,
+) -> Result<(), ValidatorError> {
+    let mut seen = BTreeSet::new();
+    for relay_url in &validator_config.relay_urls {
+        let request = authenticated_relay_request(
+            relay_url,
+            &validator_config.genesis,
+            private_key,
+            0,
+            [0; hellas_wire::relay_auth::NONCE_BYTES],
+        )?;
+        let canonical = request.uri().to_string();
+        if !seen.insert(canonical) {
+            return Err(ValidatorError::InvalidSetup(format!(
+                "duplicate relay URL: {relay_url}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let validator_config: ValidatorConfig = toml::from_str(&config_str)?;
-    validator_config.decode_private_key()?;
+    let private_key = validator_config.decode_private_key()?;
     validator_config.decode_threshold_share()?;
     validator_config.decode_threshold_polynomial()?;
     validator_config.participants()?;
     validator_config.peer_address_map()?;
     validator_config.genesis_allocations()?;
-    if let Some(ws_bind) = &validator_config.ws_bind {
-        ws_bind.parse::<SocketAddr>().map_err(|err| {
-            ValidatorError::InvalidSetup(format!("invalid ws_bind address: {err}"))
-        })?;
-    }
+    validate_relay_urls(&validator_config, &private_key)?;
     println!("ok");
     Ok(())
 }
@@ -662,6 +677,8 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
     let participants = validator_config.participants()?;
     let peer_map = validator_config.peer_address_map()?;
+    validate_relay_urls(&validator_config, &private_key)?;
+    let relay_private_key = private_key.clone();
 
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", validator_config.listen_port).parse()?;
 
@@ -696,15 +713,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let metrics_addr = validator_config
         .metrics_port
         .map(|metrics_port| format!("0.0.0.0:{metrics_port}").parse())
-        .transpose()?;
-    let ws_bind_addr = validator_config
-        .ws_bind
-        .as_ref()
-        .map(|addr| {
-            addr.parse::<SocketAddr>().map_err(|err| {
-                ValidatorError::InvalidSetup(format!("invalid ws_bind address: {err}"))
-            })
-        })
         .transpose()?;
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)
@@ -976,31 +984,52 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         // once the application database handoff is complete.
         let engine_handle = simplex_engine.start(vote, certificate, consensus_resolver);
 
-        let rpc_handle = if let Some(addr) = ws_bind_addr {
-            let light_client = LocalLightClient::new(
-                databases.clone(),
-                owner_index.clone(),
-                mempool.clone(),
-                ChainIndexer::new(marshal_mailbox.clone()),
-                consensus_info.clone(),
-            );
-            Some(
-                spawn_light_client_server(addr, light_client, activity_tx.clone())
-                    .await
-                    .unwrap_or_else(|source| {
-                        panic!("{}", ValidatorError::RpcBind { addr, source })
-                    }),
-            )
-        } else {
-            None
-        };
-
-        if let Some(explorer_url) = &validator_config.explorer_url {
-            warn!(
-                %explorer_url,
-                "explorer_url is not implemented",
-            );
-        }
+        let light_client = LocalLightClient::new(
+            databases.clone(),
+            owner_index.clone(),
+            mempool.clone(),
+            ChainIndexer::new(marshal_mailbox.clone()),
+            consensus_info.clone(),
+        );
+        let relay_handles: Vec<_> = validator_config
+            .relay_urls
+            .iter()
+            .cloned()
+            .map(|relay_url| {
+                let genesis = validator_config.genesis.clone();
+                let private_key = relay_private_key.clone();
+                let light_client = light_client.clone();
+                let activity_tx = activity_tx.clone();
+                ::tokio::spawn(async move {
+                    let mut retry = Duration::from_secs(1);
+                    loop {
+                        let connected_at = Instant::now();
+                        info!(%relay_url, "connecting light client relay");
+                        match serve_light_client_relay(
+                            &relay_url,
+                            &genesis,
+                            &private_key,
+                            light_client.clone(),
+                            activity_tx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => warn!(%relay_url, "light client relay disconnected"),
+                            Err(error) => {
+                                warn!(%relay_url, %error, "light client relay connection failed");
+                            }
+                        }
+                        let next_retry = if connected_at.elapsed() >= Duration::from_secs(60) {
+                            Duration::from_secs(1)
+                        } else {
+                            retry.saturating_mul(2).min(Duration::from_secs(30))
+                        };
+                        ::tokio::time::sleep(retry).await;
+                        retry = next_retry;
+                    }
+                })
+            })
+            .collect();
 
         // Start networking only after the app + consensus engine are initialized.
         let network_handle = network.start();
@@ -1024,9 +1053,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
-        let rpc_waiter =
-            rpc_handle.map(|handle| handle.map(|_| ShutdownTrigger::RpcExited).boxed());
-
         let mut waiters = vec![
             signal_waiter,
             network_waiter,
@@ -1036,9 +1062,11 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             stateful_waiter,
             qmdb_resolver_waiter,
         ];
-        if let Some(rpc_waiter) = rpc_waiter {
-            waiters.push(rpc_waiter);
-        }
+        waiters.extend(
+            relay_handles
+                .into_iter()
+                .map(|handle| handle.map(|_| ShutdownTrigger::RelayExited).boxed()),
+        );
 
         let (trigger, _, _) = futures::future::select_all(waiters).await;
 
@@ -1053,8 +1081,8 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");
             }
-            ShutdownTrigger::RpcExited => {
-                warn!("RPC task exited unexpectedly; triggering shutdown");
+            ShutdownTrigger::RelayExited => {
+                warn!("relay task exited unexpectedly; triggering shutdown");
             }
         }
 

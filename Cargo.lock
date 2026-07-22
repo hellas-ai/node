@@ -3461,6 +3461,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "dirs",
+ "ed25519-dalek",
  "futures",
  "futures-util",
  "hellas-genesis",

@@ -178,6 +178,7 @@ url = { version = "2", optional = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-kernel = { workspace = true, features = ["test-support"] }
+ed25519-dalek.workspace = true
 itf = "0.4"
 proptest = "1.11"
 serde = { workspace = true, features = ["derive"] }

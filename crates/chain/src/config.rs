@@ -121,9 +121,7 @@ pub struct ValidatorConfig {
     #[serde(default)]
     pub metrics_port: Option<u16>,
     #[serde(default)]
-    pub ws_bind: Option<String>,
-    #[serde(default)]
-    pub explorer_url: Option<String>,
+    pub relay_urls: Vec<String>,
     pub genesis: Genesis,
     pub peers: Vec<PeerEntry>,
 }
@@ -306,8 +304,7 @@ mod tests {
             threshold_polynomial: String::new(),
             listen_port: 0,
             metrics_port: None,
-            ws_bind: None,
-            explorer_url: None,
+            relay_urls: Vec::new(),
             genesis: Genesis {
                 schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
                 network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
