@@ -601,10 +601,31 @@ async fn main() {
         return;
     }
 
+    // Chain commands carry their own authentication material and transport.
+    // Running them must not create an unrelated provider identity as a side
+    // effect; in particular, validator config generation runs in a pure Nix
+    // build where there is deliberately no writable home directory.
+    #[cfg(feature = "chain")]
+    let command = match cli.command {
+        Commands::Chain { command } => {
+            let result = commands::chain::run(command).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        command => command,
+    };
+
+    #[cfg(not(feature = "chain"))]
+    let command = cli.command;
+
     // show-node-id is a read-only query; never create an identity file as a
     // side effect of it (would race with a running service's own creator).
     let read_only = matches!(
-        &cli.command,
+        &command,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId,
         }
@@ -633,7 +654,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let result = match cli.command {
+    let result = match command {
         #[cfg(feature = "node")]
         Commands::Serve {
             port,
@@ -749,7 +770,7 @@ async fn main() {
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
         #[cfg(feature = "chain")]
-        Commands::Chain { command } => commands::chain::run(command).await,
+        Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         #[cfg(feature = "evaluate")]
         Commands::Llm {
             node_id,
