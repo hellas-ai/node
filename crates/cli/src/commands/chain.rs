@@ -212,6 +212,9 @@ pub enum ValidatorCommand {
         /// Prometheus metrics port
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// Canonical genesis JSON; validator identities must match --seed
+        #[arg(long)]
+        genesis: Option<PathBuf>,
         /// Genesis allocation as address:balance
         #[arg(long = "genesis-allocation")]
         genesis_allocations: Vec<String>,
@@ -646,6 +649,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            genesis,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
             validators,
@@ -655,6 +659,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            genesis,
             genesis_allocations,
         },
         ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run { config },

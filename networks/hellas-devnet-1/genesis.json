@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "network_id": "hellas-devnet-1",
+  "validators": [
+    {
+      "public_key": "ae3a9bc6eb721b7b8a34d23aa0d5b1623e89bc6f092815ea13b92f79a39c7d38",
+      "label": "validator-0"
+    },
+    {
+      "public_key": "80c02edc00c6b43231858aa5dd6c1911d7e489e470218da82193a470dfce50cf",
+      "label": "validator-1"
+    },
+    {
+      "public_key": "8e1ea87cdb41614693298cb65ebfa8c3e6d09dc9f358321d8e533a8813e75bc4",
+      "label": "validator-2"
+    },
+    {
+      "public_key": "f9e83545c23f527cadf1aa3063d21962eb33a4ae4d54ade6af7448e1fd5b8719",
+      "label": "validator-3"
+    },
+    {
+      "public_key": "2f52436ff3b44d61fe5bad64c5ba346720cc55303fa04e01ad3f3ed599abd029",
+      "label": "validator-4"
+    },
+    {
+      "public_key": "9a28e6f9a4f3fd261ac8d76188347cd5d78fa57985f336be3a0b4a82d854f0da",
+      "label": "validator-5"
+    }
+  ],
+  "allocations": [
+    {
+      "address": "21tzoXVq7aGx61bNRTPDVn9hJhszdDA4CPcp9LYZL8ffT",
+      "balance": 1000000
+    },
+    {
+      "address": "236h7pukvqi6u8ADu53erbWyLYXNyNEuB9BRNMXtVKUfZ",
+      "balance": 1000000
+    }
+  ]
+}
