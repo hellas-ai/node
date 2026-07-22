@@ -20,10 +20,15 @@ use crate::transport::PeerIdentity;
 
 use super::WsTransport;
 
-/// Mux slot capacity for native ws connections. Native is typically
-/// the relay end of a browser ↔ relay link, so we size for the
-/// browser's footprint.
+/// Mux slot capacity for ordinary native WebSocket connections.
 const NATIVE_MUX_N: usize = 128;
+
+/// Mux slot capacity for a validator's aggregated relay connection.
+///
+/// A relay folds streams from many browser connections into this one mux, so
+/// sizing it like one browser would cap the entire validator at 64 concurrent
+/// requests. The relay-facing transport gets 1,024 client-owned (even) slots.
+const RELAY_MUX_N: usize = 2048;
 
 /// Errors surfaced by the WS adapter. Wrap tungstenite's error type
 /// (which is not `Send + Sync + 'static` by accident — it is) so the
@@ -88,7 +93,7 @@ where
 /// in client role. The caller polls `transport.open(...)` / `accept()`
 /// as usual; the mux's spawned I/O loop drives the WebSocket.
 pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
-    connect_with_role(url, Role::Client).await
+    connect_with_role::<NATIVE_MUX_N>(url, Role::Client).await
 }
 
 /// Dial a WebSocket as the HTTP client while serving inbound mux streams.
@@ -99,10 +104,10 @@ pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
 /// role. The request form lets callers add authenticated-upgrade headers before
 /// dialing.
 pub async fn connect_server(request: Request<()>) -> Result<WsTransport, WsError> {
-    connect_with_role(request, Role::Server).await
+    connect_with_role::<RELAY_MUX_N>(request, Role::Server).await
 }
 
-async fn connect_with_role(
+async fn connect_with_role<const N: usize>(
     request: impl IntoClientRequest + Unpin,
     role: Role,
 ) -> Result<WsTransport, WsError> {
@@ -110,7 +115,7 @@ async fn connect_with_role(
         .await
         .map_err(|e| WsError::Connect(format!("{e}")))?;
     let pipe = WsPipe::new(ws);
-    let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
+    let transport = MuxTransport::spawn::<N, DefaultClock, _>(
         role,
         DefaultClock,
         MuxConfig::default(),
