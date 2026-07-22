@@ -167,6 +167,10 @@ mod tests {
         let headers = request.headers();
         assert_eq!(headers[NETWORK_HEADER], genesis.network_id);
         let public_key_hex = headers[VALIDATOR_HEADER].to_str().unwrap();
+        assert_eq!(
+            public_key_hex,
+            "10a1860ee01fa0dad17543b41fa56f4e098708100019f5f7cec1fc59b2cc0fec"
+        );
         assert_eq!(request.uri().path(), format!("/relay/{public_key_hex}"));
         let public_key_bytes: [u8; 32] = hex::decode(public_key_hex).unwrap().try_into().unwrap();
         let timestamp_ms = headers[TIMESTAMP_HEADER].to_str().unwrap().parse().unwrap();
@@ -187,6 +191,10 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+        assert_eq!(
+            hex::encode(signature_bytes),
+            "9b62b03a2214d15382dbd48439ff22ead585b655daa10caf5ff003db9d945a79736faeb0d9df84de1ba412a44cf952999f01fcb735df7f0ffc21bf0151eb9508"
+        );
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
 
