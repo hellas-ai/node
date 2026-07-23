@@ -206,8 +206,9 @@ pub fn verify_evaluate_work_event(
                     ClientError::source("evaluate output event decode failed", source)
                 })?;
             verifier.verify_terminal(&output_events)?;
-            let output = verify_output_events(input_commitment, &output_events)
-                .map_err(|source| ClientError::EvaluateTranscript { source })?;
+            let output =
+                verify_output_events(input_commitment, verifier.assurance(), &output_events)
+                    .map_err(|source| ClientError::EvaluateTranscript { source })?;
             Ok(EvaluateExecutionEvent::Done(EvaluateOutcome::Completed {
                 output,
                 output_events,
@@ -299,9 +300,11 @@ mod tests {
             runner_public_key: runner.public_key(),
             execution_environment: ContentId::from_bytes([8; 32]),
             nonce: [7; 32],
+            assurance: TEST_ASSURANCE,
+            retain: true,
         };
         let input = hellas_rpc::evaluate::input_commitment(&request);
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let chunk = builder.push_token_delta(vec![10, 11]).unwrap();
         let output_events = builder
             .finish(EvaluateTerminal {
@@ -316,7 +319,7 @@ mod tests {
             })
             .unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input);
+        let mut verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE);
         let event = verify_evaluate_work_event(
             &mut verifier,
             WorkEvent {

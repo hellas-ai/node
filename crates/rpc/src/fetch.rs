@@ -529,7 +529,7 @@ mod tests {
 
         assert_eq!(
             commitment.digest().to_string(),
-            "707775ab9509186b6cfd49cd281515e86eb0a5719da9d052db9d47df0d6e7177"
+            "88391071758ee944f6f1da90c88a4e37216fe2e4764b70c2fce74e4a28181fba"
         );
     }
 

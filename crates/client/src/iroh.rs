@@ -1019,7 +1019,7 @@ mod tests {
         let signing_key = P256SigningKey::from_bytes((&[7; 32]).into()).unwrap();
         let public_key = signing_key
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .unwrap();

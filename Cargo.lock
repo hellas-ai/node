@@ -2147,7 +2147,7 @@ checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.118",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3557,7 +3557,7 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "p256",
- "rand 0.8.6",
+ "rand 0.10.2",
  "serde",
  "serde_bytes",
  "serde_json",
