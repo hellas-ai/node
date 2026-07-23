@@ -205,7 +205,7 @@ fn public_key(
     }
     let key =
         VerifyingKey::from_sec1_bytes(public_key).map_err(|_| AttestationError::Credential)?;
-    key.to_encoded_point(true)
+    key.to_sec1_point(true)
         .as_bytes()
         .try_into()
         .map_err(|_| AttestationError::Credential)

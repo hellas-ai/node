@@ -1033,7 +1033,7 @@ mod tests {
             id: hellas_rpc::ContentId::from_bytes([9; 32]),
             public_key: signing_key
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes()
                 .try_into()
                 .unwrap(),

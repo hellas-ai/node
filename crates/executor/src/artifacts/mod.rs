@@ -67,7 +67,6 @@ impl EvaluateArtifactStores {
     pub(crate) fn retained(&mut self) -> &mut EvaluateArtifactStore {
         &mut self.retained
     }
-
 }
 
 struct MaterializedTextSource {
@@ -958,11 +957,7 @@ mod tests {
                 .unwrap();
             stores
                 .for_retention(retained_plan.retention)
-                .record_completed_text(
-                    &retained.evaluate_request,
-                    &retained.invocation,
-                    &[10, 11],
-                )
+                .record_completed_text(&retained.evaluate_request, &retained.invocation, &[10, 11])
                 .await
                 .unwrap();
 
@@ -1065,5 +1060,4 @@ mod tests {
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
         });
     }
-
 }
