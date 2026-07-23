@@ -1,4 +1,7 @@
-use crate::domain::{PublicKey, Scheme, ThresholdPolynomial, ThresholdShare, ThresholdVariant};
+use crate::domain::{
+    Address, PublicKey, Scheme, SettlementKey, ThresholdPolynomial, ThresholdShare,
+    ThresholdVariant, UserPublicKey,
+};
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
     Mempool, OwnerIndex, UtxoDb,
@@ -128,6 +131,18 @@ pub enum ValidatorError {
 
 #[derive(Debug)]
 pub enum Command {
+    GenerateNetwork {
+        network_id: String,
+        validators: u32,
+        labels: Vec<String>,
+        addresses: Vec<String>,
+        start_port: u16,
+        metrics_base_port: u16,
+        relay_urls: Vec<String>,
+        genesis_allocations: Vec<String>,
+        treasury_balance: Option<u64>,
+        output_dir: PathBuf,
+    },
     Config {
         validators: u32,
         validator: u32,
@@ -149,6 +164,29 @@ pub enum Command {
 
 pub fn run_command(command: Command) -> Result<(), ValidatorError> {
     match command {
+        Command::GenerateNetwork {
+            network_id,
+            validators,
+            labels,
+            addresses,
+            start_port,
+            metrics_base_port,
+            relay_urls,
+            genesis_allocations,
+            treasury_balance,
+            output_dir,
+        } => generate_network(GenerateNetworkArgs {
+            network_id,
+            validators,
+            labels,
+            addresses,
+            start_port,
+            metrics_base_port,
+            relay_urls,
+            genesis_allocations,
+            treasury_balance,
+            output_dir,
+        }),
         Command::Config {
             validators,
             validator,
@@ -185,6 +223,167 @@ struct SetupArgs {
     metrics_port: Option<u16>,
     genesis: Option<PathBuf>,
     genesis_allocations: Vec<String>,
+}
+
+struct GenerateNetworkArgs {
+    network_id: String,
+    validators: u32,
+    labels: Vec<String>,
+    addresses: Vec<String>,
+    start_port: u16,
+    metrics_base_port: u16,
+    relay_urls: Vec<String>,
+    genesis_allocations: Vec<String>,
+    treasury_balance: Option<u64>,
+    output_dir: PathBuf,
+}
+
+fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
+    let GenerateNetworkArgs {
+        network_id,
+        validators,
+        labels,
+        addresses,
+        start_port,
+        metrics_base_port,
+        relay_urls,
+        genesis_allocations,
+        treasury_balance,
+        output_dir,
+    } = args;
+
+    if validators == 0 {
+        return Err(ValidatorError::InvalidSetup(
+            "need at least one validator".to_string(),
+        ));
+    }
+    let validator_count = validators as usize;
+    if labels.len() != validator_count {
+        return Err(ValidatorError::InvalidSetup(format!(
+            "--labels must have exactly {validators} entries, got {}",
+            labels.len(),
+        )));
+    }
+    if addresses.len() != validator_count {
+        return Err(ValidatorError::InvalidSetup(format!(
+            "--addresses must have exactly {validators} entries, got {}",
+            addresses.len(),
+        )));
+    }
+    let last_p2p_offset = u16::try_from(validator_count.saturating_sub(1))
+        .map_err(|_| ValidatorError::InvalidSetup("too many validators".to_string()))?;
+    start_port
+        .checked_add(last_p2p_offset)
+        .ok_or_else(|| ValidatorError::InvalidSetup("P2P port range overflow".to_string()))?;
+    metrics_base_port
+        .checked_add(last_p2p_offset)
+        .ok_or_else(|| ValidatorError::InvalidSetup("metrics port range overflow".to_string()))?;
+
+    let keys = (0..validators)
+        .map(|_| random_private_key())
+        .collect::<Vec<_>>();
+    let participants = Set::try_from(
+        keys.iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<PublicKey>>(),
+    )
+    .map_err(|_| {
+        ValidatorError::InvalidSetup("generated duplicate validator identity keys".to_string())
+    })?;
+    let (threshold_polynomial, threshold_shares) = deal_threshold_shares(None, participants)?;
+
+    let mut allocations = genesis_allocations
+        .iter()
+        .map(|raw| parse_genesis_allocation(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    let treasury_key = treasury_balance.map(|balance| {
+        let signing_key = loop {
+            let mut raw = [0u8; 32];
+            rand::rng().fill_bytes(&mut raw);
+            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&raw) {
+                break key;
+            }
+        };
+        allocations.push(GenesisEntry {
+            address: SettlementKey::from(Address::from(UserPublicKey::from(
+                signing_key.verifying_key().to_owned(),
+            )))
+            .to_string(),
+            balance,
+        });
+        signing_key
+    });
+    let genesis = Genesis {
+        schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
+        network_id,
+        validators: keys
+            .iter()
+            .zip(labels)
+            .map(|(key, label)| GenesisValidator {
+                public_key: hex::encode(key.public_key().encode()),
+                label,
+            })
+            .collect(),
+        allocations,
+    };
+    genesis.validate().map_err(ConfigError::from)?;
+
+    std::fs::create_dir(&output_dir)?;
+    let mut genesis_json = serde_json::to_vec_pretty(&genesis)?;
+    genesis_json.push(b'\n');
+    std::fs::write(output_dir.join("genesis.json"), genesis_json)?;
+    if let Some(treasury_key) = treasury_key {
+        let path = output_dir.join("treasury.key");
+        std::fs::write(&path, treasury_key.to_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    for (index, my_key) in keys.iter().enumerate() {
+        let my_public_key = my_key.public_key();
+        let my_threshold_share = threshold_shares.get_value(&my_public_key).ok_or_else(|| {
+            ValidatorError::InvalidSetup(
+                "missing threshold share for generated validator".to_string(),
+            )
+        })?;
+        let peers = keys
+            .iter()
+            .enumerate()
+            .filter(|(peer_index, _)| *peer_index != index)
+            .map(|(peer_index, key)| PeerEntry {
+                public_key: hex::encode(key.public_key().encode()),
+                address: format!(
+                    "{}:{}",
+                    addresses[peer_index],
+                    start_port + peer_index as u16
+                ),
+            })
+            .collect();
+        let config = ValidatorConfig {
+            private_key: encode_private_key(my_key),
+            threshold_share: encode_threshold_share(my_threshold_share),
+            threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
+            listen_port: start_port + index as u16,
+            metrics_port: Some(metrics_base_port + index as u16),
+            relay_urls: relay_urls.clone(),
+            genesis: genesis.clone(),
+            peers,
+        };
+        let rendered = toml::to_string_pretty(&config)?;
+        let path = output_dir.join(format!("validator-{index}.toml"));
+        std::fs::write(&path, rendered)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    println!("{}", output_dir.join("genesis.json").display());
+    Ok(())
 }
 
 fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
@@ -684,9 +883,13 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
 
-    // Prefer systemd-supplied credentials; otherwise keys come from the TOML — fine for dev/test,
-    // never for production. eprintln! because tracing isn't initialized yet at this point.
-    if !validator_config.load_credentials()? {
+    // A production deployment can either load the complete TOML as a systemd
+    // credential or overlay the three key fields onto a public template.
+    // Development configs may still contain key material directly.
+    let config_is_credential = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .is_some_and(|directory| config_path.parent() == Some(directory.as_path()));
+    if !config_is_credential && !validator_config.load_credentials()? {
         eprintln!(
             "WARNING: CREDENTIALS_DIRECTORY not set; using key material from {}. \
              Production must supply keys via systemd LoadCredential.",

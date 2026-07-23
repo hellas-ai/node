@@ -147,6 +147,16 @@ let
           default = [ ];
           description = "Inline allocations for ad-hoc networks without a genesis file.";
         };
+        runtimeConfigFiles = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          description = ''
+            Complete validator TOML files supplied at runtime, one per local
+            node, normally from sops-nix. Each file is copied into the
+            service's private systemd credential directory and never enters
+            the Nix store.
+          '';
+        };
         logLevel = mkOption {
           type = types.str;
           default = "info";
@@ -220,6 +230,24 @@ in
           assertion = validator.genesis == null || validator.genesisAllocations == [ ];
           message = "services.hellas-chain-validators.${name} cannot combine genesis with genesisAllocations.";
         }
+        {
+          assertion =
+            validator.runtimeConfigFiles == [ ]
+            || builtins.length validator.runtimeConfigFiles == validator.nodes;
+          message = "services.hellas-chain-validators.${name}.runtimeConfigFiles must contain one file per local node.";
+        }
+        {
+          assertion =
+            validator.runtimeConfigFiles == [ ]
+            || (
+              validator.seed == null
+              && validator.genesis == null
+              && validator.genesisAllocations == [ ]
+              && validator.addresses == [ ]
+              && validator.relayUrls == [ ]
+            );
+          message = "services.hellas-chain-validators.${name}.runtimeConfigFiles cannot be combined with generated-config options.";
+        }
       ]) enabledValidators
     );
 
@@ -241,7 +269,11 @@ in
               index = validator.nodeOffset + localIndex;
               serviceName = "hellas-validator-${name}-node${toString index}";
               stateDirectory = "hellas-validator-${name}/node${toString index}";
-              configFile = mkConfigFile validator index;
+              usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
+              configFile =
+                if usesRuntimeConfig
+                then "%d/validator-config"
+                else mkConfigFile validator index;
             in
             {
               name = serviceName;
@@ -298,6 +330,11 @@ in
                     "~@resources"
                   ];
                   UMask = "0077";
+                }
+                // optionalAttrs usesRuntimeConfig {
+                  LoadCredential = [
+                    "validator-config:${builtins.elemAt validator.runtimeConfigFiles localIndex}"
+                  ];
                 }
                 // optionalAttrs (validator.memoryMax != null) { MemoryMax = validator.memoryMax; }
                 // optionalAttrs (validator.stateGeneration > 0) {
