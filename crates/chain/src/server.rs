@@ -24,7 +24,12 @@ use hellas_rpc::pb::{
 };
 use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use p256::ecdsa::Signature as P256Signature;
-use std::{io, net::SocketAddr, pin::Pin};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
@@ -636,6 +641,14 @@ fn activity_is_requested(urgent_events: &[i32], activity: &ConsensusActivity) ->
     urgent_events.is_empty() || urgent_events.contains(&activity_kind(activity))
 }
 
+fn unix_time_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
     let event = match activity {
         ConsensusActivity::Notarize {
@@ -690,7 +703,9 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
     };
     ActivityEvent {
         event: Some(event),
-        relay_timestamps: Vec::new(),
+        // The validator is the first observer in the transport path. Relays
+        // may append later observations, preserving this source timestamp.
+        relay_timestamps: vec![unix_time_ms()],
         edge_colo: String::new(),
     }
 }
@@ -1055,5 +1070,20 @@ mod tests {
         let err = settlement_key_from_bytes(vec![0; SettlementKey::LENGTH - 1], "owner")
             .expect_err("short settlement key");
         assert_eq!(err.code(), WireCode::InvalidArgument);
+    }
+
+    #[test]
+    fn activity_event_contains_validator_observation_timestamp() {
+        let before = unix_time_ms();
+        let event = activity_to_proto(ConsensusActivity::Nullify {
+            epoch: 1,
+            view: 2,
+            signer: 3,
+            signature: vec![4],
+        });
+        let after = unix_time_ms();
+
+        assert_eq!(event.relay_timestamps.len(), 1);
+        assert!((before..=after).contains(&event.relay_timestamps[0]));
     }
 }

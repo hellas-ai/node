@@ -350,6 +350,10 @@ fn proposal_info(p: &Proposal<Digest>) -> ProposalInfo {
 }
 
 fn certificate_signers() -> Vec<u32> {
+    // The recovered BLS threshold certificate is deliberately
+    // non-attributable: it proves a quorum signed, but does not retain a
+    // signer bitmap. Consumers that need identities must subscribe to the
+    // individual Notarize/Nullify activity emitted alongside certificates.
     Vec::new()
 }
 
