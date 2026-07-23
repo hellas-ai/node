@@ -189,6 +189,39 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
+    /// Generate one cryptographically random validator configuration per committee member
+    GenerateNetwork {
+        /// Stable lowercase network identifier
+        #[arg(long)]
+        network_id: String,
+        /// Total number of validators in the network
+        #[arg(short = 'n', long)]
+        validators: u32,
+        /// Validator labels in canonical committee order
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// Validator addresses in canonical committee order
+        #[arg(long, value_delimiter = ',')]
+        addresses: Vec<String>,
+        /// Starting consensus P2P port
+        #[arg(long, default_value = "3000")]
+        start_port: u16,
+        /// Starting Prometheus metrics port
+        #[arg(long, default_value = "9090")]
+        metrics_base_port: u16,
+        /// Relay or indexer WebSocket origins to serve through
+        #[arg(long = "relay-url", value_delimiter = ',')]
+        relay_urls: Vec<String>,
+        /// Genesis allocation as address:balance
+        #[arg(long = "genesis-allocation")]
+        genesis_allocations: Vec<String>,
+        /// Generate a new P-256 treasury key and allocate this balance to it
+        #[arg(long)]
+        treasury_balance: Option<u64>,
+        /// New directory that will receive genesis.json and validator-N.toml
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     /// Generate a TOML config for one validator
     Config {
         /// Total number of validators in the network
@@ -641,6 +674,29 @@ fn follower_status_sink() -> hellas_chain::follower::FollowerStatusSink {
 #[cfg(feature = "validator")]
 async fn run_validator(command: ValidatorCommand) -> CliResult {
     let command = match command {
+        ValidatorCommand::GenerateNetwork {
+            network_id,
+            validators,
+            labels,
+            addresses,
+            start_port,
+            metrics_base_port,
+            relay_urls,
+            genesis_allocations,
+            treasury_balance,
+            output_dir,
+        } => hellas_chain::validator::Command::GenerateNetwork {
+            network_id,
+            validators,
+            labels,
+            addresses,
+            start_port,
+            metrics_base_port,
+            relay_urls,
+            genesis_allocations,
+            treasury_balance,
+            output_dir,
+        },
         ValidatorCommand::Config {
             validators,
             validator,
