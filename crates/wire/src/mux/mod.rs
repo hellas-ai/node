@@ -17,17 +17,14 @@ pub mod stream;
 pub mod transport;
 
 pub use slot::{Role, SlotIndex, SlotState, StreamSlot};
-pub use state::{Event, Multiplexer, MuxConfig, MuxError};
+pub use state::{Event, Multiplexer, MuxConfig, MuxError, SendBodyOutcome};
 pub use stream::{MuxRecvHalf, MuxSendHalf, MuxStream, MuxStreamError};
 pub use transport::{MessagePipe, MuxTransport, MuxTransportError};
 pub use wire::{KeyedFrame, StreamKey, decode_keyed_frame, encode_keyed_frame};
 
-/// Default body-frame max in bytes. Configurable per-transport.
-pub const DEFAULT_BODY_FRAME_MAX: usize = 1024 * 1024; // 1 MiB
-
-/// Default initial credit per direction per stream.
-pub const DEFAULT_INITIAL_CREDIT: u32 = 64 * 1024; // 64 KiB
-
-/// Default credit-update threshold: replenish when `local_recv_credit`
-/// drops below half of initial.
-pub const DEFAULT_CREDIT_REFILL_RATIO: u32 = 2;
+/// Default maximum unconsumed body bytes per direction per stream.
+///
+/// A body is atomic at the RPC layer, so the window is also the maximum
+/// body-frame size. Keeping those as one value makes it impossible to
+/// configure a body that can never acquire enough credit to be sent.
+pub const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024; // 1 MiB

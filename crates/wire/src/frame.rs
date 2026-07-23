@@ -372,7 +372,8 @@ pub(crate) fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>, Fr
 /// frame length and tarpitting our read loop into unbounded buffer
 /// growth.
 ///
-/// This is intentionally NOT coupled to `MuxConfig::body_frame_max`.
+/// The mux applies its tighter per-stream window before constructing a Body;
+/// this decoder cap is only a hard wire-allocation ceiling.
 /// The mux's body-frame cap is a flow-control knob; this cap is the
 /// parser's escape hatch. They differ in concern and lifecycle.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;

@@ -55,6 +55,10 @@ pub(crate) enum Command {
         slot: SlotIndex,
         code: WireCode,
     },
+    Consumed {
+        slot: SlotIndex,
+        bytes: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -113,9 +117,10 @@ impl MuxTransport {
             mux,
             pipe,
             cmd_rx,
-            cmd_tx: cmd_tx.clone(),
+            cmd_tx: cmd_tx.downgrade(),
             inbound_tx,
             slot_to_chans: Default::default(),
+            pending_sends: Default::default(),
             peer,
         };
         spawn(Box::pin(driver.run()));
@@ -155,13 +160,23 @@ struct MuxDriver<const N: usize, C: Clock + Clone, P: MessagePipe> {
     mux: Multiplexer<N, C>,
     pipe: P,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
-    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Weak by design: the driver must not keep its own command channel
+    /// alive. Real transport/stream owners hold the strong senders.
+    cmd_tx: mpsc::WeakUnboundedSender<Command>,
     inbound_tx: mpsc::UnboundedSender<Inbound<MuxStream>>,
     /// Per-slot channels owned by application halves. `Body`/`End`/
     /// `Reset` events are forwarded into the slot's recv channel; the
     /// I/O loop sends Body acks to the slot's send-side oneshots.
     slot_to_chans: std::collections::HashMap<SlotIndex, SlotChannels>,
+    /// At most one blocked send per slot; `SendHalf::send_body` takes
+    /// `&mut self`, so well-formed callers cannot create a second one.
+    pending_sends: std::collections::HashMap<SlotIndex, PendingSend>,
     peer: Option<PeerIdentity>,
+}
+
+struct PendingSend {
+    payload: Bytes,
+    reply: oneshot::Sender<Result<(), MuxError>>,
 }
 
 struct SlotChannels {
@@ -182,7 +197,9 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                     Ok(None) | Err(_) => break,
                 },
             }
-            self.flush_outbound().await;
+            if !self.flush_outbound().await {
+                break;
+            }
         }
     }
 
@@ -193,18 +210,25 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 headers,
                 reply,
             } => {
-                let result = self.mux.open(method_id, headers).map(|slot| {
-                    let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-                    let (trailer_tx, trailer_rx) = oneshot::channel();
-                    self.slot_to_chans.insert(
-                        slot,
-                        SlotChannels {
-                            recv_tx,
-                            trailer_tx: Some(trailer_tx),
-                        },
-                    );
-                    MuxStream::new(slot, self.cmd_tx_clone(), recv_rx, trailer_rx)
-                });
+                let result = self
+                    .cmd_tx_clone()
+                    .ok_or(MuxError::Protocol(
+                        "transport owner disappeared while opening stream",
+                    ))
+                    .and_then(|cmd_tx| {
+                        self.mux.open(method_id, headers).map(|slot| {
+                            let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+                            let (trailer_tx, trailer_rx) = oneshot::channel();
+                            self.slot_to_chans.insert(
+                                slot,
+                                SlotChannels {
+                                    recv_tx,
+                                    trailer_tx: Some(trailer_tx),
+                                },
+                            );
+                            MuxStream::new(slot, cmd_tx, recv_rx, trailer_rx)
+                        })
+                    });
                 let _ = reply.send(result);
             }
             Command::SendBody {
@@ -212,8 +236,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 payload,
                 reply,
             } => {
-                let r = self.mux.send_body(slot, payload);
-                let _ = reply.send(r);
+                self.start_send(slot, payload, reply);
             }
             Command::CloseSend {
                 slot,
@@ -224,13 +247,88 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 let _ = reply.send(r);
             }
             Command::Reset { slot, code } => {
+                self.fail_pending_send(slot);
                 self.mux.reset(slot, code);
+            }
+            Command::Consumed { slot, bytes } => {
+                if let Err(error) = self.mux.consume(slot, bytes) {
+                    tracing::warn!("mux consume error: {error}");
+                }
             }
         }
     }
 
-    fn cmd_tx_clone(&self) -> mpsc::UnboundedSender<Command> {
-        self.cmd_tx.clone()
+    fn cmd_tx_clone(&self) -> Option<mpsc::UnboundedSender<Command>> {
+        self.cmd_tx.upgrade()
+    }
+
+    fn start_send(
+        &mut self,
+        slot: SlotIndex,
+        payload: Bytes,
+        reply: oneshot::Sender<Result<(), MuxError>>,
+    ) {
+        if self.pending_sends.contains_key(&slot) {
+            let _ = reply.send(Err(MuxError::Protocol(
+                "concurrent send_body calls on one stream",
+            )));
+            return;
+        }
+        match self.mux.try_send_body(slot, payload) {
+            Ok(super::state::SendBodyOutcome::Accepted) => {
+                let _ = reply.send(Ok(()));
+            }
+            Ok(super::state::SendBodyOutcome::Blocked(payload)) => {
+                self.pending_sends
+                    .insert(slot, PendingSend { payload, reply });
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    /// Retry one send after peer credit arrives or the staged Body drains.
+    /// Returns true when a new Body was accepted and needs flushing.
+    fn retry_pending_send(&mut self, slot: SlotIndex) -> bool {
+        let Some(pending) = self.pending_sends.remove(&slot) else {
+            return false;
+        };
+        match self.mux.try_send_body(slot, pending.payload) {
+            Ok(super::state::SendBodyOutcome::Accepted) => {
+                let _ = pending.reply.send(Ok(()));
+                true
+            }
+            Ok(super::state::SendBodyOutcome::Blocked(payload)) => {
+                self.pending_sends.insert(
+                    slot,
+                    PendingSend {
+                        payload,
+                        reply: pending.reply,
+                    },
+                );
+                false
+            }
+            Err(error) => {
+                let _ = pending.reply.send(Err(error));
+                false
+            }
+        }
+    }
+
+    fn retry_pending_sends(&mut self) -> bool {
+        let slots: Vec<_> = self.pending_sends.keys().copied().collect();
+        let mut accepted = false;
+        for slot in slots {
+            accepted |= self.retry_pending_send(slot);
+        }
+        accepted
+    }
+
+    fn fail_pending_send(&mut self, slot: SlotIndex) {
+        if let Some(pending) = self.pending_sends.remove(&slot) {
+            let _ = pending.reply.send(Err(MuxError::SlotClosed(slot)));
+        }
     }
 
     async fn handle_inbound(&mut self, bytes: Bytes) {
@@ -253,6 +351,10 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 method_id,
                 headers,
             } => {
+                let Some(cmd_tx) = self.cmd_tx_clone() else {
+                    self.mux.reset(slot, WireCode::Cancelled);
+                    return;
+                };
                 let (recv_tx, recv_rx) = mpsc::unbounded_channel();
                 let (trailer_tx, trailer_rx) = oneshot::channel();
                 self.slot_to_chans.insert(
@@ -262,7 +364,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                         trailer_tx: Some(trailer_tx),
                     },
                 );
-                let stream = MuxStream::new(slot, self.cmd_tx_clone(), recv_rx, trailer_rx);
+                let stream = MuxStream::new(slot, cmd_tx, recv_rx, trailer_rx);
                 let inbound = Inbound {
                     method_id,
                     headers,
@@ -281,8 +383,14 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 let _ = self.inbound_tx.send(inbound);
             }
             Event::BodyChunk { slot, payload } => {
-                if let Some(chans) = self.slot_to_chans.get(&slot) {
-                    let _ = chans.recv_tx.send(Ok(payload));
+                let delivered = self
+                    .slot_to_chans
+                    .get(&slot)
+                    .is_some_and(|chans| chans.recv_tx.send(Ok(payload)).is_ok());
+                if !delivered {
+                    self.slot_to_chans.remove(&slot);
+                    self.fail_pending_send(slot);
+                    self.mux.reset(slot, WireCode::Cancelled);
                 }
             }
             Event::EndStream { slot, trailer } => {
@@ -293,31 +401,134 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 }
             }
             Event::ResetStream { slot, code } => {
+                self.fail_pending_send(slot);
                 if let Some(mut chans) = self.slot_to_chans.remove(&slot)
                     && let Some(t) = chans.trailer_tx.take()
                 {
                     let _ = t.send(crate::metadata::Trailer::from_status(code, "reset"));
                 }
             }
-            Event::PeerCredit { .. } => {
-                // Credit replenishment is internal flow control; the
-                // mux state machine already records it. Body sends
-                // that were blocked retry via the SendBody command
-                // path (caller polls).
+            Event::PeerCredit { slot, .. } => {
+                self.retry_pending_send(slot);
             }
         }
     }
 
-    async fn flush_outbound(&mut self) {
-        // Replenish credit BEFORE draining outbound so the Credit
-        // frames ship in this same flush. (Doing this after the drain
-        // would defer the Credit frame to the next inbound activity.)
-        let _credit_slots = self.mux.prepare_credit_updates();
-        while let Some(bytes) = self.mux.next_outbound() {
-            if let Err(e) = self.pipe.send_message(bytes).await {
-                tracing::warn!("pipe send: {e}");
-                break;
+    /// Flush staged frames, then retry sends that were waiting only for the
+    /// one-frame staging slot to drain. Credit-blocked sends remain pending
+    /// until their peer's Credit event arrives.
+    async fn flush_outbound(&mut self) -> bool {
+        loop {
+            while let Some(bytes) = self.mux.next_outbound() {
+                if let Err(e) = self.pipe.send_message(bytes).await {
+                    tracing::warn!("pipe send: {e}");
+                    return false;
+                }
+            }
+            if !self.retry_pending_sends() {
+                return true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::DefaultClock;
+    use crate::frame::{CreditFrame, Frame};
+    use crate::mux::{SendBodyOutcome, StreamKey, encode_keyed_frame};
+
+    struct IdlePipe {
+        recv_rx: mpsc::UnboundedReceiver<Bytes>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl MessagePipe for IdlePipe {
+        type SendError = std::io::Error;
+        type RecvError = std::io::Error;
+
+        async fn send_message(&mut self, _bytes: Bytes) -> Result<(), Self::SendError> {
+            Ok(())
+        }
+
+        async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
+            Ok(self.recv_rx.recv().await)
+        }
+    }
+
+    impl Drop for IdlePipe {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_send_resumes_when_peer_credit_arrives() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+        let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
+        let mut driver = MuxDriver::<8, _, _> {
+            mux: Multiplexer::new(Role::Client, DefaultClock, MuxConfig { stream_window: 8 }),
+            pipe: IdlePipe {
+                recv_rx: wire_rx,
+                dropped: None,
+            },
+            cmd_rx,
+            cmd_tx: cmd_tx.downgrade(),
+            inbound_tx,
+            slot_to_chans: Default::default(),
+            pending_sends: Default::default(),
+            peer: None,
+        };
+
+        let slot = driver.mux.open(7, Metadata::new()).unwrap();
+        driver.mux.next_outbound().expect("open frame");
+        assert!(matches!(
+            driver
+                .mux
+                .try_send_body(slot, Bytes::from_static(b"123456")),
+            Ok(SendBodyOutcome::Accepted)
+        ));
+        driver.mux.next_outbound().expect("first body");
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        driver.start_send(slot, Bytes::from_static(b"abcdef"), reply_tx);
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let credit = encode_keyed_frame(
+            StreamKey::new(slot, 1),
+            &Frame::Credit(CreditFrame {
+                additional_bytes: 6,
+            }),
+        );
+        driver.handle_inbound(credit).await;
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_last_transport_owner_drops_the_pipe() {
+        let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let transport = MuxTransport::spawn::<8, _, _>(
+            Role::Client,
+            DefaultClock,
+            MuxConfig::default(),
+            IdlePipe {
+                recv_rx: wire_rx,
+                dropped: Some(dropped_tx),
+            },
+            None,
+        );
+
+        drop(transport);
+        dropped_rx
+            .await
+            .expect("driver must terminate when its final owner disappears");
     }
 }

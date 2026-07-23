@@ -153,7 +153,15 @@ impl FuturesStream for MuxRecvHalf {
             return Poll::Ready(None);
         }
         match this.recv_rx.poll_recv(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(Ok(bytes))) => {
+                let consumed = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                let _ = this.cmd_tx.send(Command::Consumed {
+                    slot: this.slot,
+                    bytes: consumed,
+                });
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
             Poll::Ready(None) => {
                 // Channel closed — trailer should arrive on trailer_rx.
                 this.done = true;

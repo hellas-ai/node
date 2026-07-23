@@ -62,7 +62,7 @@ pub struct StreamSlot {
     /// Bytes we are willing to receive from peer. Decremented on
     /// inbound Body; replenished by sending Credit frames.
     pub local_recv_credit: u32,
-    /// Initial local recv credit (used to decide when to refill).
+    /// Maximum unconsumed body bytes accepted from the peer.
     pub local_credit_high_water: u32,
     /// Per-slot outbound staging queue. Bounded at SLOT_QUEUE_CAP.
     /// Credit frames are pushed to the FRONT so they ship ahead of
@@ -70,11 +70,10 @@ pub struct StreamSlot {
     /// send queue can perpetually defer its Credit frame and let the
     /// peer stall at zero credit.
     ///
-    /// Body sends still respect the single-frame backpressure contract
-    /// on the `SendHalf` API: `send_body()` blocks if a Body is
-    /// already queued. The queue exists so the state machine can layer
-    /// internal control frames (Credit, End, Reset) on top without
-    /// stomping the in-flight Body.
+    /// Body sends still respect the single-frame backpressure contract.
+    /// The async transport driver waits when a Body is already queued or
+    /// peer credit is exhausted. This queue only layers internal control
+    /// frames (Credit, End, Reset) around that one Body.
     pub send_queue: std::collections::VecDeque<Frame>,
     /// Whether we've observed the peer's terminal frame (End or Reset).
     pub peer_terminal: bool,
@@ -86,15 +85,15 @@ impl StreamSlot {
     /// A freshly-opened slot. Local vs remote origin is not tracked — it
     /// drives no logic and never survived hibernation. `generation` is
     /// bumped by the allocator before the slot is published.
-    pub fn open(method_id: u32, opened_at: Instant, initial_credit: u32) -> Self {
+    pub fn open(method_id: u32, opened_at: Instant, stream_window: u32) -> Self {
         Self {
             generation: 0,
             method_id,
             opened_at,
             deadline: None,
-            peer_recv_credit: initial_credit,
-            local_recv_credit: initial_credit,
-            local_credit_high_water: initial_credit,
+            peer_recv_credit: stream_window,
+            local_recv_credit: stream_window,
+            local_credit_high_water: stream_window,
             send_queue: std::collections::VecDeque::with_capacity(SLOT_QUEUE_CAP),
             peer_terminal: false,
             local_terminal: false,
