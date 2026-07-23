@@ -12,17 +12,15 @@ use super::wire::{StreamKey, decode_keyed_frame, encode_keyed_frame};
 
 #[derive(Clone, Copy, Debug)]
 pub struct MuxConfig {
-    pub initial_credit: u32,
-    pub credit_refill_ratio: u32,
-    pub body_frame_max: usize,
+    /// Maximum unconsumed body bytes in either direction on one stream.
+    /// This is also the maximum size of one atomic Body frame.
+    pub stream_window: u32,
 }
 
 impl Default for MuxConfig {
     fn default() -> Self {
         Self {
-            initial_credit: super::DEFAULT_INITIAL_CREDIT,
-            credit_refill_ratio: super::DEFAULT_CREDIT_REFILL_RATIO,
-            body_frame_max: super::DEFAULT_BODY_FRAME_MAX,
+            stream_window: super::DEFAULT_STREAM_WINDOW,
         }
     }
 }
@@ -61,14 +59,23 @@ pub enum MuxError {
     AtCapacity,
     #[error("slot {0} is closed")]
     SlotClosed(SlotIndex),
-    #[error("slot {0} has insufficient credit")]
-    NoCredit(SlotIndex),
     #[error("payload {len} exceeds body-frame max {limit}")]
     BodyTooLarge { len: usize, limit: usize },
     #[error("frame: {0}")]
     Frame(#[from] crate::frame::FrameError),
     #[error("protocol error: {0}")]
     Protocol(&'static str),
+}
+
+/// Result of attempting to hand one Body to the sans-I/O mux.
+///
+/// `Blocked` is readiness, not failure. The async transport driver owns the
+/// payload and completes the caller's future once peer credit or queue space
+/// becomes available.
+#[derive(Debug)]
+pub enum SendBodyOutcome {
+    Accepted,
+    Blocked(Bytes),
 }
 
 pub struct Multiplexer<const N: usize, C: Clock> {
@@ -193,7 +200,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         let next_gen = prev_gen.wrapping_add(1);
 
         let now = self.clock.now();
-        let mut slot = StreamSlot::open(method_id, now, self.config.initial_credit);
+        let mut slot = StreamSlot::open(method_id, now, self.config.stream_window);
         slot.generation = next_gen;
         // Queue the OPEN frame for scheduler.
         slot.send_queue
@@ -203,13 +210,20 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         Ok(idx)
     }
 
-    /// Queue a body chunk on this slot. Decrements peer-credit. Errors
-    /// if slot is closed, send-half is closed, or insufficient credit.
-    pub fn send_body(&mut self, idx: SlotIndex, payload: Bytes) -> Result<(), MuxError> {
-        if payload.len() > self.config.body_frame_max {
+    /// Try to queue one body chunk on this slot.
+    ///
+    /// Closed streams and invalid frames are errors. Exhausted peer credit or
+    /// the previous Body still occupying the one-frame staging slot are
+    /// transient readiness states returned as [`SendBodyOutcome::Blocked`].
+    pub fn try_send_body(
+        &mut self,
+        idx: SlotIndex,
+        payload: Bytes,
+    ) -> Result<SendBodyOutcome, MuxError> {
+        if payload.len() > self.config.stream_window as usize {
             return Err(MuxError::BodyTooLarge {
                 len: payload.len(),
-                limit: self.config.body_frame_max,
+                limit: self.config.stream_window as usize,
             });
         }
         let slot = self
@@ -219,22 +233,20 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             return Err(MuxError::SlotClosed(idx));
         }
         if (slot.peer_recv_credit as usize) < payload.len() {
-            return Err(MuxError::NoCredit(idx));
+            return Ok(SendBodyOutcome::Blocked(payload));
         }
-        // SendHalf single-frame contract: only one Body may be in flight
-        // at a time per slot. The caller waits for poll_ready. Control
-        // frames the state machine emits internally (Credit/End/Reset)
-        // can still slot in alongside.
+        // SendHalf single-frame contract: only one Body may be staged per
+        // slot. The async driver retains and retries a blocked payload.
         let has_body_queued = slot.send_queue.iter().any(|f| matches!(f, Frame::Body(_)));
         if has_body_queued {
-            return Err(MuxError::Protocol("send while previous body still queued"));
+            return Ok(SendBodyOutcome::Blocked(payload));
         }
         if slot.send_queue.len() >= crate::mux::slot::SLOT_QUEUE_CAP {
             return Err(MuxError::Protocol("send queue full"));
         }
         slot.peer_recv_credit -= payload.len() as u32;
         slot.send_queue.push_back(Frame::Body(payload));
-        Ok(())
+        Ok(SendBodyOutcome::Accepted)
     }
 
     /// Close the send side. Optionally with a trailer.
@@ -278,46 +290,41 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
             .push_front(Frame::Reset(ResetFrame { code }));
     }
 
-    /// Examine slots and queue Credit frames where local_recv_credit has
-    /// fallen below threshold. Returns the slots that were credited.
+    /// Return receive credit after the application takes ownership of a Body.
     ///
-    /// Credit frames are pushed to the FRONT of the slot's send queue
-    /// so they ship before any queued Body frames — otherwise a slot
-    /// with a backed-up send queue could perpetually defer its Credit
-    /// and let the peer stall at zero credit.
-    pub fn prepare_credit_updates(&mut self) -> Vec<SlotIndex> {
-        let mut updated = Vec::new();
-        let refill_ratio = self.config.credit_refill_ratio;
-        for idx in 0..N {
-            let Some(slot) = self.streams[idx].as_mut() else {
-                continue;
-            };
-            // Skip slots where the peer has already terminated sending:
-            // is_closed() (both directions terminal) OR peer_terminal
-            // alone (we're half-closed-remote — peer won't send more
-            // body, so additional credit is wasted bytes on the wire).
-            if slot.is_closed() || slot.peer_terminal {
-                continue;
-            }
-            // If a Credit frame is already queued for this slot, no-op.
-            let already_has_credit = slot
-                .send_queue
-                .iter()
-                .any(|f| matches!(f, Frame::Credit(_)));
-            if already_has_credit {
-                continue;
-            }
-            let threshold = slot.local_credit_high_water / refill_ratio;
-            if slot.local_recv_credit < threshold {
-                let add = slot.local_credit_high_water - slot.local_recv_credit;
-                slot.local_recv_credit = slot.local_credit_high_water;
-                slot.send_queue.push_front(Frame::Credit(CreditFrame {
-                    additional_bytes: add,
-                }));
-                updated.push(idx as SlotIndex);
-            }
+    /// Credit is tied to consumption rather than socket receipt, so the
+    /// advertised window genuinely bounds bytes queued inside the transport.
+    /// Multiple consumption notifications that arrive before the next wire
+    /// flush are coalesced into one Credit frame.
+    pub fn consume(&mut self, idx: SlotIndex, bytes: u32) -> Result<(), MuxError> {
+        if bytes == 0 {
+            return Ok(());
         }
-        updated
+        let Some(slot) = self.slot_mut(idx) else {
+            // A peer may send Body followed by End before the application
+            // polls the buffered Body. No credit is useful after reclamation.
+            return Ok(());
+        };
+        if slot.peer_terminal {
+            return Ok(());
+        }
+        let available = slot.local_credit_high_water - slot.local_recv_credit;
+        if bytes > available {
+            return Err(MuxError::Protocol("consumed more body bytes than received"));
+        }
+        slot.local_recv_credit += bytes;
+        if let Some(Frame::Credit(credit)) = slot
+            .send_queue
+            .iter_mut()
+            .find(|frame| matches!(frame, Frame::Credit(_)))
+        {
+            credit.additional_bytes = credit.additional_bytes.saturating_add(bytes);
+        } else {
+            slot.send_queue.push_front(Frame::Credit(CreditFrame {
+                additional_bytes: bytes,
+            }));
+        }
+        Ok(())
     }
 
     // -- I/O surface ---------------------------------------------------------
@@ -468,7 +475,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 }
             }
             let now = self.clock.now();
-            let mut slot = StreamSlot::open(open.method_id, now, self.config.initial_credit);
+            let mut slot = StreamSlot::open(open.method_id, now, self.config.stream_window);
             slot.generation = keyed.key.generation;
             self.streams[idx as usize] = Some(slot);
             // The fresh slot record overwrites a Closed predecessor.
@@ -522,12 +529,9 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
                 // to the application; recv_buf is dead code in the
                 // events-flow path.
                 //
-                // Credit does NOT refill here. `prepare_credit_updates`
-                // runs after each `recv()` in the driver loop and
-                // queues a `Frame::Credit` once `local_recv_credit`
-                // drops below `local_credit_high_water /
-                // credit_refill_ratio`. The driver ships the Credit
-                // frame on the very next outbound flush.
+                // Credit does not refill here. The receive half returns it
+                // through `consume()` only when the application polls this
+                // Body from its transport queue.
                 events.push(Event::BodyChunk { slot: idx, payload });
             }
             Frame::End(end) => {
@@ -565,24 +569,6 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         }
         Ok(events)
     }
-
-    /// Inspect a slot's current peer-receive credit. Useful for the
-    /// SendHalf to decide whether `poll_ready` should return Ready.
-    pub fn peer_credit(&self, idx: SlotIndex) -> u32 {
-        self.slot(idx).map(|s| s.peer_recv_credit).unwrap_or(0)
-    }
-
-    /// Whether this slot is ready to accept another `send_body` /
-    /// `close_send`. `false` means a frame is already queued and the
-    /// caller must wait for `next_outbound` to drain it.
-    pub fn send_ready(&self, idx: SlotIndex) -> bool {
-        // Ready iff no Body is currently queued (the SendHalf
-        // single-frame contract — internal Credit/End/Reset frames
-        // don't count against the body backpressure window).
-        self.slot(idx)
-            .map(|s| !s.send_queue.iter().any(|f| matches!(f, Frame::Body(_))))
-            .unwrap_or(false)
-    }
 }
 
 #[cfg(test)]
@@ -610,6 +596,17 @@ mod tests {
         all_events
     }
 
+    fn queue_body<const N: usize>(
+        mux: &mut Multiplexer<N, DefaultClock>,
+        slot: SlotIndex,
+        payload: Bytes,
+    ) {
+        assert!(matches!(
+            mux.try_send_body(slot, payload),
+            Ok(SendBodyOutcome::Accepted)
+        ));
+    }
+
     #[test]
     fn open_send_close_roundtrip() {
         let (mut client, mut server) = pair::<32>();
@@ -628,9 +625,7 @@ mod tests {
             _ => panic!("expected NewIncomingStream"),
         }
 
-        client
-            .send_body(slot, Bytes::from_static(b"hello"))
-            .unwrap();
+        queue_body(&mut client, slot, Bytes::from_static(b"hello"));
         let events = drain(&mut client, &mut server);
         match &events[0] {
             Event::BodyChunk { slot: s, payload } => {
@@ -710,85 +705,42 @@ mod tests {
     }
 
     #[test]
-    fn credit_ships_ahead_of_queued_body() {
-        // Credit frame must be
-        // emitted ahead of queued Body frames so the peer doesn't
-        // stall at zero credit waiting for our send queue to drain.
-        let cfg = MuxConfig {
-            initial_credit: 100,
-            credit_refill_ratio: 2, // threshold = 50
-            body_frame_max: 1024,
-        };
+    fn credit_returns_only_after_application_consumption() {
+        let cfg = MuxConfig { stream_window: 8 };
         let mut client: Multiplexer<32, _> = Multiplexer::new(Role::Client, DefaultClock, cfg);
         let mut server: Multiplexer<32, _> = Multiplexer::new(Role::Server, DefaultClock, cfg);
         let s = client.open(0x1, Metadata::new()).unwrap();
         drain(&mut client, &mut server);
 
-        // Client sends 60 bytes (drops server's local credit to 40,
-        // below the 50-byte threshold).
-        client
-            .send_body(s, Bytes::copy_from_slice(&[0u8; 60]))
-            .unwrap();
-        drain(&mut client, &mut server);
-
-        // Now server queues a Body of its own outbound (to simulate
-        // a backed-up send queue) THEN runs prepare_credit_updates.
-        // The Credit frame must end up at the FRONT of the queue,
-        // ahead of the Body, so it ships first.
-        let body_to_send: Bytes = Bytes::copy_from_slice(&[1u8; 20]);
-        // Server is even-parity-less; it dispatches inbound. To make
-        // it send out, give it its own outbound stream by acting as
-        // role::Server opening server-side. But we just need to
-        // verify the priority via the slot queue, not the wire trip.
-        // Drain whatever's queued first.
-        let credited = server.prepare_credit_updates();
+        queue_body(&mut client, s, Bytes::from_static(b"123456"));
+        let events = drain(&mut client, &mut server);
+        assert!(matches!(
+            &events[..],
+            [Event::BodyChunk { payload, .. }] if payload.as_ref() == b"123456"
+        ));
         assert!(
-            credited.contains(&s),
-            "credit-update must fire when local_recv_credit drops below threshold"
+            server.next_outbound().is_none(),
+            "socket receipt alone must not return credit"
         );
 
-        // The next outbound from server must be a Credit frame.
-        let bytes = server.next_outbound().expect("credit frame must ship");
-        let keyed = decode_keyed_frame(&bytes).unwrap();
-        assert!(
-            matches!(keyed.frame, Frame::Credit(_)),
-            "first outbound after prepare_credit_updates must be Credit, got {:?}",
-            keyed.frame
-        );
-        let _ = body_to_send;
-    }
-
-    #[test]
-    fn credit_priority_over_existing_queued_frames() {
-        // Build a slot with a Body already queued, then call
-        // prepare_credit_updates. The Credit frame must push to the
-        // front of the queue and ship BEFORE the Body.
-        let cfg = MuxConfig {
-            initial_credit: 100,
-            credit_refill_ratio: 2,
-            body_frame_max: 1024,
-        };
-        let mut client: Multiplexer<32, _> = Multiplexer::new(Role::Client, DefaultClock, cfg);
-        let mut server: Multiplexer<32, _> = Multiplexer::new(Role::Server, DefaultClock, cfg);
-        let s = client.open(0x1, Metadata::new()).unwrap();
-        drain(&mut client, &mut server);
-        // Saturate server's local credit (force it below threshold).
-        client
-            .send_body(s, Bytes::copy_from_slice(&[0u8; 60]))
-            .unwrap();
-        drain(&mut client, &mut server);
-        // Reset to give server's slot a fresh body queue (server-side
-        // doesn't have a way to send_body to client without role
-        // gymnastics; we directly poke the slot queue to simulate
-        // a backed-up outbound).
-        // Push a fake Body into the slot's queue manually.
-        // Then run prepare_credit_updates and verify Credit comes out
-        // ahead of the Body.
-        server.prepare_credit_updates();
-        // Drain — first frame must be Credit, NOT Body.
-        let first = server.next_outbound().expect("first frame");
-        let keyed = decode_keyed_frame(&first).unwrap();
-        assert!(matches!(keyed.frame, Frame::Credit(_)));
+        assert!(matches!(
+            client.try_send_body(s, Bytes::from_static(b"abcdef")),
+            Ok(SendBodyOutcome::Blocked(_))
+        ));
+        server.consume(s, 6).unwrap();
+        let credit = server.next_outbound().expect("consumption returns credit");
+        let decoded = decode_keyed_frame(&credit).unwrap();
+        assert!(matches!(
+            decoded.frame,
+            Frame::Credit(CreditFrame {
+                additional_bytes: 6
+            })
+        ));
+        client.recv(&credit).unwrap();
+        assert!(matches!(
+            client.try_send_body(s, Bytes::from_static(b"abcdef")),
+            Ok(SendBodyOutcome::Accepted)
+        ));
     }
 
     #[test]
@@ -799,7 +751,7 @@ mod tests {
         drain(&mut client, &mut server);
 
         // Send a body, encode it, but withhold delivery to server.
-        client.send_body(s1, Bytes::from_static(b"x")).unwrap();
+        queue_body(&mut client, s1, Bytes::from_static(b"x"));
         let stale_bytes = client.next_outbound().unwrap();
 
         // Now reset and reuse the slot.
