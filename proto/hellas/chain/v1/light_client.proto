@@ -239,6 +239,8 @@ message ActivityEvent {
     NullificationEvent nullification = 4;
     FinalizationEvent finalization = 5;
   }
+  // Ordered unix-millisecond observation times along the delivery path.
+  // The validator always records index 0; typed relays may append their own.
   repeated uint64 relay_timestamps = 7;
   string edge_colo = 8;
 }
