@@ -10,9 +10,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
-pub const DEFAULT_NETWORK_ID: &str = "hellas-devnet-1";
-pub const HELLAS_DEVNET_1_JSON: &str =
-    include_str!("../../../networks/hellas-devnet-1/genesis.json");
+pub const DEFAULT_NETWORK_ID: &str = "hellas-mainnet-1";
+pub const DEFAULT_GENESIS_JSON: &str =
+    include_str!("../../../networks/hellas-mainnet-1/genesis.json");
 
 const PUBLIC_KEY_HEX_BYTES: usize = 64;
 const MAX_NETWORK_ID_BYTES: usize = 63;
@@ -165,12 +165,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_devnet_genesis_is_valid() {
-        let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+    fn canonical_default_genesis_is_valid() {
+        let genesis: Genesis = serde_json::from_str(DEFAULT_GENESIS_JSON).unwrap();
         genesis.validate().unwrap();
         assert_eq!(genesis.network_id, DEFAULT_NETWORK_ID);
         assert_eq!(genesis.validators.len(), 6);
-        assert_eq!(genesis.allocations.len(), 2);
+        assert_eq!(genesis.allocations.len(), 1);
     }
 
     #[test]

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "network_id": "hellas-mainnet-1",
+  "validators": [
+    {
+      "public_key": "92eccf4566df0dfe4a9c5ce8c3b0a4475b87ae73381f43667c0d0b12c1af2367",
+      "label": "fsn1"
+    },
+    {
+      "public_key": "6a614e7ac05fb62d15f054d1251528719c97f4a8c2c15d562b4af6af4fe09096",
+      "label": "nbg1"
+    },
+    {
+      "public_key": "cdc3bf468b66b00c7679eb5a462045fcb18278441f904a98d1c4155cb1544c5e",
+      "label": "hel"
+    },
+    {
+      "public_key": "547bb44b5e51b0b8f53554749224d2319422c8f00bff6a2d83c1d5a6140f0b17",
+      "label": "ash"
+    },
+    {
+      "public_key": "2c7a97687359cdbe6fa87528ffd343c220365d3f1ec60c3ebd4483675ee9ef46",
+      "label": "hil"
+    },
+    {
+      "public_key": "e18963fca359f6cef9b729683f07eaeded9febab0c6ead53808aa2b18d765151",
+      "label": "sin"
+    }
+  ],
+  "allocations": [
+    {
+      "address": "sLDMvbSnuucqFZG7agd9wKecfWj8QVtXBQ9KeJG2Desv",
+      "balance": 1000000000
+    }
+  ]
+}
