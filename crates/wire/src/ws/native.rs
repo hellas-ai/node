@@ -111,6 +111,9 @@ async fn connect_with_role<const N: usize>(
     request: impl IntoClientRequest + Unpin,
     role: Role,
 ) -> Result<WsTransport, WsError> {
+    #[cfg(feature = "ws-rustls")]
+    ensure_rustls_crypto_provider()?;
+
     let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| WsError::Connect(format!("{e}")))?;
@@ -123,6 +126,20 @@ async fn connect_with_role<const N: usize>(
         None,
     );
     Ok(transport)
+}
+
+#[cfg(feature = "ws-rustls")]
+fn ensure_rustls_crypto_provider() -> Result<(), WsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A larger application may link both Rustls backends through unrelated
+        // dependencies. Rustls deliberately refuses to guess in that case, so
+        // install one explicitly unless the application already chose one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    rustls::crypto::CryptoProvider::get_default()
+        .map(|_| ())
+        .ok_or_else(|| WsError::Connect("failed to install a Rustls crypto provider".to_string()))
 }
 
 /// Wrap an already-upgraded `WebSocketStream` as a server-side
@@ -161,6 +178,13 @@ mod tests {
     use crate::{Metadata, StreamTransport};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    #[cfg(feature = "ws-rustls")]
+    #[test]
+    fn tls_feature_installs_a_process_crypto_provider() {
+        ensure_rustls_crypto_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[tokio::test]
     async fn dialed_server_accepts_stream_opened_by_websocket_acceptor() {
