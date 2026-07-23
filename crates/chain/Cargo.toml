@@ -30,7 +30,7 @@ domain = [
 ]
 # Consensus wiring aliases in the domain module (threshold scheme types).
 domain-consensus = ["domain", "dep:commonware-consensus"]
-client = ["client-core", "hellas-wire/ws"]
+client = ["client-core", "hellas-wire/ws-rustls"]
 client-core = [
     "dep:hellas-rpc",
     "hellas-rpc/chain",
