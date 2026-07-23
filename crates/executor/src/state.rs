@@ -27,8 +27,8 @@ use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{AssuranceRequirement, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
+use hellas_rpc::{Assurance, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
+use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, Retention};
 use uuid::Uuid;
 
 pub use crate::StateError;
@@ -82,6 +82,8 @@ pub(crate) struct QuotePlan {
     pub invocation: Invocation,
     pub initial_artifact_id: Option<Digest>,
     pub runner_public_key: PublicKey,
+    pub assurance: Assurance,
+    pub retention: Retention,
 }
 
 #[cfg(feature = "evaluate")]
@@ -141,6 +143,9 @@ impl QuotePlan {
                     ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
                 })
             })?;
+        let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
+            .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
+        let retention = Retention::from_retain(request.retain.unwrap_or(true));
 
         let locator = ModelLocator {
             model_id: model_id.to_string(),
@@ -166,6 +171,8 @@ impl QuotePlan {
             },
             initial_artifact_id,
             runner_public_key,
+            assurance,
+            retention,
         })
     }
 }
@@ -213,6 +220,8 @@ pub(crate) fn evaluate_request_to_pb(request: &EvaluateRequest) -> PbEvaluateReq
         runner_public_key: Some(public_key_to_pb(&request.runner_public_key)),
         execution_environment: request.execution_environment.as_bytes().to_vec(),
         nonce: request.nonce.to_vec(),
+        assurance: request.assurance.to_byte().into(),
+        retain: Some(request.retain),
     }
 }
 
@@ -241,6 +250,9 @@ pub(crate) fn evaluate_request_from_pb(
             },
         )?,
         nonce: bytes32(&request.nonce, "nonce")?,
+        assurance: hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
+            .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?,
+        retain: request.retain.unwrap_or(true),
     })
 }
 
@@ -297,7 +309,7 @@ pub struct QuoteRecord {
 pub(crate) fn quote_ticket(
     request: RequestCommitment,
     provider_genesis: &[u8],
-    assurance: AssuranceRequirement,
+    assurance: Assurance,
 ) -> Result<(JobTerms, hellas_rpc::pb::execute::Ticket), ExecutorError> {
     let terms = JobTerms {
         request,
@@ -314,10 +326,10 @@ pub(crate) fn quote_ticket(
 pub(crate) fn validate_job_terms(
     terms: &JobTerms,
     provider_genesis: &[u8],
-    assurance: &AssuranceRequirement,
+    assurance: Assurance,
 ) -> Result<(), ExecutorError> {
     if terms.provider_genesis != ContentId::hash(provider_genesis)
-        || terms.assurance != *assurance
+        || terms.assurance != assurance
         || terms.amount != QUOTE_AMOUNT
         || terms.ttl_ms != QUOTE_TTL.as_millis() as u64
     {

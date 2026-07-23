@@ -4,7 +4,6 @@ use std::any::Any;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
-use hellas_rpc::PublicKey;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, ListModelsResponse, PutArtifactRequest,
     PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
@@ -12,6 +11,7 @@ use hellas_rpc::pb::courtesy::{
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::Ticket;
+use hellas_rpc::{Assurance, PublicKey};
 
 use crate::executor::{ExecuteOutcome, TicketOutcome};
 use crate::state::ExecutorState;
@@ -86,6 +86,7 @@ pub trait SchemeEngine: Send + Sync {
         &self,
         _request_commitment: [u8; 32],
         _runner_public_key: &PublicKey,
+        _assurance: Assurance,
     ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
         Ok(None)
     }

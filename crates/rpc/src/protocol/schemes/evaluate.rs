@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentId, DagCborEncoder, Digest, PublicKey, RequestCommitment};
+use crate::{
+    Assurance, ContentId, DagCborEncoder, Digest, PublicKey, RequestCommitment, Retention,
+};
+
+const fn retain_by_default() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateRequest {
@@ -9,6 +15,15 @@ pub struct EvaluateRequest {
     pub runner_public_key: PublicKey,
     pub execution_environment: ContentId,
     pub nonce: [u8; 32],
+    pub assurance: Assurance,
+    #[serde(default = "retain_by_default")]
+    pub retain: bool,
+}
+
+impl EvaluateRequest {
+    pub const fn retention(&self) -> Retention {
+        Retention::from_retain(self.retain)
+    }
 }
 
 pub struct Evaluate;
@@ -16,13 +31,15 @@ pub struct Evaluate;
 impl Evaluate {
     pub fn commit_request(request: &EvaluateRequest) -> RequestCommitment {
         let mut encoder = DagCborEncoder::new();
-        encoder.array(6);
-        encoder.str("hellas.evaluate.request.v2");
+        encoder.array(8);
+        encoder.str("hellas.evaluate.request.v3");
         encoder.bytes(request.text_execution.as_bytes());
         encoder.bytes(request.execution_environment.as_bytes());
         encoder.bytes(&request.nonce);
         encoder.u64(request.runner_public_key.kind().to_byte() as u64);
         encoder.bytes(request.runner_public_key.bytes());
+        encoder.u64(request.assurance.to_byte() as u64);
+        encoder.u64(request.retain as u64);
         RequestCommitment::from_canonical_bytes(&encoder.into_bytes())
     }
 }
@@ -46,12 +63,16 @@ mod tests {
             runner_public_key: key(1),
             execution_environment: ContentId::from_bytes([5; 32]),
             nonce: [6; 32],
+            assurance: Assurance::ProducerSigned,
+            retain: true,
         };
         let second = EvaluateRequest {
             text_execution,
             runner_public_key: key(2),
             execution_environment: ContentId::from_bytes([5; 32]),
             nonce: [6; 32],
+            assurance: Assurance::ProducerSigned,
+            retain: true,
         };
 
         assert_ne!(
@@ -63,6 +84,22 @@ mod tests {
         assert_ne!(
             Evaluate::commit_request(&first),
             Evaluate::commit_request(&third)
+        );
+        let mut fourth = first.clone();
+        fourth.assurance = Assurance::AppleAppAttest;
+        assert_ne!(
+            Evaluate::commit_request(&first),
+            Evaluate::commit_request(&fourth)
+        );
+        let mut fifth = first.clone();
+        fifth.retain = false;
+        assert_ne!(
+            Evaluate::commit_request(&first),
+            Evaluate::commit_request(&fifth)
+        );
+        assert_eq!(
+            Evaluate::commit_request(&first).digest().to_string(),
+            "6efaa8860931732c923032bbfb69c0f69cb0f8fe68217fd7a7b4cf1f31631956"
         );
     }
 }

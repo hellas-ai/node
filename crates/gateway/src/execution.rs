@@ -40,6 +40,7 @@ use hellas_rpc::Digest;
 use hellas_rpc::InputCommitment;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProducerSigningKey;
+use hellas_rpc::Retention;
 use hellas_rpc::evaluate::{
     EvaluateStopReason, verify_output_events as verify_evaluate_output_events,
 };
@@ -146,6 +147,24 @@ fn require_local_executor(runtime: &CliRuntime) -> ExecutionResult<ExecutorHandl
     })
 }
 
+fn ticket_assurance(ticket: &Ticket) -> ExecutionResult<hellas_rpc::Assurance> {
+    hellas_rpc::run_ticket::job_terms_from_pb(ticket)
+        .map(|terms| terms.assurance)
+        .map_err(|source| ExecutionError::source("invalid evaluate ticket terms", source))
+}
+
+fn validate_evaluate_ticket(ticket: &Ticket, requested: i32) -> ExecutionResult<()> {
+    let requested = hellas_rpc::run_ticket::assurance_from_pb(requested)
+        .map_err(|source| ExecutionError::source("invalid requested assurance", source))?;
+    if ticket_assurance(ticket)? == requested {
+        Ok(())
+    } else {
+        Err(ExecutionError::protocol(
+            "evaluate ticket assurance does not match request",
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExecutionRequest — public entry point
 // ---------------------------------------------------------------------------
@@ -157,12 +176,19 @@ pub struct ExecutionRequest {
     runner_key: Arc<ProducerSigningKey>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionRequestOptions {
+    pub max_seq: u32,
+    pub assurance: hellas_rpc::Assurance,
+    pub retention: Retention,
+}
+
 impl ExecutionRequest {
     pub fn new(
         runtime: CliRuntime,
         assets: Arc<ModelAssets>,
         prepared_prompt: PreparedPrompt,
-        max_seq: u32,
+        options: ExecutionRequestOptions,
         strategy: ExecutionStrategy,
         runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
@@ -173,13 +199,15 @@ impl ExecutionRequest {
             huggingface_model_id: quote.huggingface_model_id,
             huggingface_revision: quote.huggingface_revision,
             prompt_token_ids: quote.prompt_token_ids,
-            max_new_tokens: max_seq,
+            max_new_tokens: options.max_seq,
             stop_token_ids: quote.stop_token_ids,
             start: Some(EvaluateStart {
                 kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
             accept_dtypes: vec![quote.accept_dtype],
             runner_public_key: Some(hellas_client::runner_public_key(&runner_key)),
+            assurance: options.assurance.to_byte().into(),
+            retain: Some(options.retention.should_retain()),
         };
         Ok(Self {
             runtime,
@@ -421,6 +449,24 @@ impl PreparedRoute {
                             "local quote_prepared_text response missing ticket",
                         )
                     })?;
+                    let evaluate_response =
+                        outcome.response.evaluate_request.as_ref().ok_or_else(|| {
+                            ExecutionError::protocol(
+                                "local quote_prepared_text response missing evaluate_request",
+                            )
+                        })?;
+                    if evaluate_response.assurance != quote_req.assurance {
+                        return Err(ExecutionError::protocol(
+                            "evaluate response assurance does not match request",
+                        ));
+                    }
+                    if evaluate_response.retain.unwrap_or(true) != quote_req.retain.unwrap_or(true)
+                    {
+                        return Err(ExecutionError::protocol(
+                            "evaluate response retention does not match request",
+                        ));
+                    }
+                    validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                     Ok(Self::Local {
                         handle,
                         ticket,
@@ -432,6 +478,7 @@ impl PreparedRoute {
             ExecutionRoute::RemoteDirect(target) => {
                 let (ticket, provenance) =
                     hellas_client::iroh::quote_prepared_text(runtime, target, quote_req).await?;
+                validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                 let execute_transport =
                     hellas_client::iroh::execute_transport(runtime, target).await?;
                 Ok(Self::RemoteDirect {
@@ -441,13 +488,18 @@ impl PreparedRoute {
                     runner_key,
                 })
             }
-            ExecutionRoute::RemoteDiscovery { retries } => {
+            ExecutionRoute::RemoteDiscovery {
+                retries,
+                provider_trust,
+            } => {
                 let (target, ticket, provenance) = hellas_client::iroh::discover_and_quote(
                     runtime.remote_registry()?,
                     quote_req,
                     *retries,
+                    provider_trust,
                 )
                 .await?;
+                validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                 let execute_transport =
                     hellas_client::iroh::execute_transport(runtime, &target).await?;
                 Ok(Self::RemoteDirect {
@@ -491,6 +543,7 @@ fn local_execute_stream(
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let request_commitment = ticket.request_commitment.clone();
+        let assurance = ticket_assurance(&ticket)?;
         let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let outcome = handle
             .run_ticket_handle(run_ticket)
@@ -501,7 +554,7 @@ fn local_execute_stream(
         let mut got_terminal = false;
         let input_commitment =
             hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
-        let mut verifier = EvaluateChunkVerifier::new(input_commitment);
+        let mut verifier = EvaluateChunkVerifier::new(input_commitment, assurance);
         while let Some(item) = events.next().await {
             let wire = item
                 .map_err(|status: WireStatus| ExecutionError::wire("local execution stream failed", status))?;
@@ -535,6 +588,7 @@ fn remote_execute_stream(
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
         let request_commitment = ticket.request_commitment.clone();
+        let assurance = ticket_assurance(&ticket)?;
         let run_ticket = signed_run_ticket_request(ticket, runner_key.as_ref())?;
         let mut wire = client
             .run_ticket(run_ticket)
@@ -543,7 +597,7 @@ fn remote_execute_stream(
         let mut got_terminal = false;
         let input_commitment =
             hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
-        let mut verifier = EvaluateChunkVerifier::new(input_commitment);
+        let mut verifier = EvaluateChunkVerifier::new(input_commitment, assurance);
         while let Some(item) = wire.next().await {
             let event = convert_wire_event(
                 item.map_err(|status: WireStatus| ExecutionError::wire("remote execute stream failed", status))?,
@@ -596,7 +650,7 @@ fn convert_wire_event(
             })
         }
         work_event::Kind::Finished(finished) => {
-            let outcome = parse_finished(finished, input_commitment)?;
+            let outcome = parse_finished(finished, input_commitment, verifier.assurance())?;
             if let Outcome::Completed { output_events, .. } = &outcome {
                 verifier.verify_terminal(output_events)?;
             }
@@ -612,6 +666,7 @@ fn convert_wire_event(
 fn parse_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
+    assurance: hellas_rpc::Assurance,
 ) -> ExecutionResult<Outcome> {
     let output_events = finished
         .output_events
@@ -619,7 +674,7 @@ fn parse_finished(
         .map(output_event_from_pb)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| ExecutionError::source("evaluate output event decode failed", source))?;
-    let output = verify_evaluate_output_events(input_commitment, &output_events)
+    let output = verify_evaluate_output_events(input_commitment, assurance, &output_events)
         .map_err(|source| ExecutionError::EvaluateTranscript { source })?;
     let terminal = output.terminal;
     let terminal_stop_reason = stop_reason_from_evaluate(terminal.stop_reason)?;
@@ -673,6 +728,8 @@ mod tests {
             runner_public_key: runner.public_key(),
             execution_environment: hellas_rpc::ContentId::from_bytes([8; 32]),
             nonce: [7; 32],
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            retain: true,
         }
     }
 
@@ -682,10 +739,10 @@ mod tests {
         let producer = key(2);
         let request = evaluate_request(&runner);
         let input = evaluate_input_commitment(&request);
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, request.assurance, &producer);
         let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input);
+        let mut verifier = EvaluateChunkVerifier::new(input, request.assurance);
         let event = WorkEvent {
             kind: Some(work_event::Kind::Chunk(WorkChunk {
                 output_event: Some(output_event_to_pb(&token_event)),
@@ -708,7 +765,7 @@ mod tests {
         let producer = key(2);
         let request = evaluate_request(&runner);
         let input = evaluate_input_commitment(&request);
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, request.assurance, &producer);
         let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
         let output_events = builder
             .finish(EvaluateTerminal {
@@ -722,7 +779,7 @@ mod tests {
                 billable_units: 5,
             })
             .unwrap();
-        let mut verifier = EvaluateChunkVerifier::new(input);
+        let mut verifier = EvaluateChunkVerifier::new(input, request.assurance);
         let chunk = WorkEvent {
             kind: Some(work_event::Kind::Chunk(WorkChunk {
                 output_event: Some(output_event_to_pb(&token_event)),

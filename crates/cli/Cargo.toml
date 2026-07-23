@@ -10,7 +10,9 @@ documentation.workspace = true
 [features]
 default = []
 
-apple-app-attest = ["dep:hellas-attestation", "hellas-attestation/apple-app-attest"]
+# Enables macOS provider-side enrollment/signing. Client-side verification is
+# always present because remote confidential-open supports Apple providers.
+apple-app-attest = []
 
 node = ["dep:hellas-executor"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
@@ -61,7 +63,7 @@ chatgrad = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hellas-adaptors.workspace = true
-hellas-attestation = { workspace = true, optional = true }
+hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
@@ -98,3 +100,9 @@ tokio-stream = { workspace = true }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+ciborium.workspace = true
+p256.workspace = true
+serde_bytes.workspace = true
+sha2.workspace = true

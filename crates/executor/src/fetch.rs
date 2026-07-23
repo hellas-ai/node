@@ -51,7 +51,7 @@ impl FetchTranscript {
         if input.input_commitment != self.input_commitment {
             return Err(FetchTranscriptError::InputCommitmentMismatch);
         }
-        let output = verify_output_events(input.input_commitment, &self.output)?;
+        let output = verify_output_events(input.input_commitment, input.assurance, &self.output)?;
         if output.producer_key != *producer_key {
             return Err(FetchTranscriptError::ProducerKeyMismatch);
         }
@@ -63,9 +63,11 @@ impl FetchTranscript {
 pub struct FetchQuote {
     pub input_commitment: InputCommitment,
     pub caller_key: PublicKey,
+    pub assurance: hellas_rpc::Assurance,
     pub service: String,
     pub method: String,
     pub input: Vec<InputEventEnvelope>,
+    pub retention: hellas_rpc::Retention,
 }
 
 impl FetchQuote {
@@ -73,9 +75,11 @@ impl FetchQuote {
         Self {
             input_commitment: verified.input_commitment,
             caller_key: verified.caller_key,
+            assurance: verified.assurance,
             service: verified.service.clone(),
             method: verified.method.clone(),
             input,
+            retention: verified.retention,
         }
     }
 }
@@ -502,13 +506,15 @@ where
         if !self.caller_policy.is_authorized(&quote.caller_key) {
             return Err(FetchStateError::UnauthorizedCaller);
         }
-        if self.store.get_completed(quote.input_commitment)?.is_some() {
+        if quote.retention.should_retain()
+            && self.store.get_completed(quote.input_commitment)?.is_some()
+        {
             return Ok((quote, verified));
         }
         // A durable running marker without a completed transcript means a
         // previous process may have reached the paid provider before
         // crashing. Deny before quoting; an operator must resolve it.
-        if self.store.has_running(quote.input_commitment)? {
+        if quote.retention.should_retain() && self.store.has_running(quote.input_commitment)? {
             return Err(FetchStateError::Indeterminate);
         }
         self.insert_quote(quote.clone())?;
@@ -516,7 +522,15 @@ where
     }
 
     pub fn queue(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
-        if self.store.get_completed(input)?.is_some() {
+        let retention = match self.tickets.get(&input) {
+            Some(FetchTicketState::Quoted(quote))
+            | Some(FetchTicketState::Queued(quote))
+            | Some(FetchTicketState::Running(quote)) => quote.retention,
+            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
+            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
+            None => return Err(FetchStateError::NotFound),
+        };
+        if retention.should_retain() && self.store.get_completed(input)?.is_some() {
             return Err(FetchStateError::AlreadyCompleted);
         }
         let state = self
@@ -565,7 +579,15 @@ where
     }
 
     pub fn start(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
-        if self.store.get_completed(input)?.is_some() {
+        let retention = match self.tickets.get(&input) {
+            Some(FetchTicketState::Quoted(quote))
+            | Some(FetchTicketState::Queued(quote))
+            | Some(FetchTicketState::Running(quote)) => quote.retention,
+            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
+            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
+            None => return Err(FetchStateError::NotFound),
+        };
+        if retention.should_retain() && self.store.get_completed(input)?.is_some() {
             return Err(FetchStateError::AlreadyCompleted);
         }
         let state = self
@@ -579,15 +601,17 @@ where
                 // transition: the provider can never be called without a
                 // record that the call may have happened, and two processes
                 // sharing a store cannot both win the same ticket.
-                match self
-                    .store
-                    .put_running(input, &FetchRunningRecord::from_quote(&quote))
-                {
-                    Ok(()) => {}
-                    Err(FetchStoreError::AlreadyExists) => {
-                        return Err(FetchStateError::Indeterminate);
+                if quote.retention.should_retain() {
+                    match self
+                        .store
+                        .put_running(input, &FetchRunningRecord::from_quote(&quote))
+                    {
+                        Ok(()) => {}
+                        Err(FetchStoreError::AlreadyExists) => {
+                            return Err(FetchStateError::Indeterminate);
+                        }
+                        Err(err) => return Err(err.into()),
                     }
-                    Err(err) => return Err(err.into()),
                 }
                 *state = FetchTicketState::Running(quote.clone());
                 Ok(quote)
@@ -641,10 +665,13 @@ where
             return Err(FetchStateError::QuoteMismatch);
         }
 
-        self.store.put_completed(&transcript)?;
-        // Hygiene only: every check consults the completed transcript before
-        // the running marker, so a leftover marker cannot change behavior.
-        let _ = self.store.remove_running(input);
+        if quote.retention.should_retain() {
+            self.store.put_completed(&transcript)?;
+            // Hygiene only: every check consults the completed transcript
+            // before the running marker, so a leftover marker cannot change
+            // behavior.
+            let _ = self.store.remove_running(input);
+        }
         self.tickets
             .insert(input, FetchTicketState::Completed(transcript));
         Ok(())
@@ -775,7 +802,9 @@ pub enum FetchStoreError {
 mod tests {
     use super::*;
     use hellas_rpc::ProducerSigningKey;
-    use hellas_rpc::fetch::{build_input_events, build_output_events, verify_input_events};
+    use hellas_rpc::fetch::{
+        build_input_events_with_retention, build_output_events, verify_input_events,
+    };
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
@@ -795,16 +824,24 @@ mod tests {
     }
 
     fn sample_transcript() -> (FetchQuote, FetchTranscript, PublicKey, PublicKey) {
+        sample_transcript_with_retention(hellas_rpc::Retention::Retain)
+    }
+
+    fn sample_transcript_with_retention(
+        retention: hellas_rpc::Retention,
+    ) -> (FetchQuote, FetchTranscript, PublicKey, PublicKey) {
         let caller = key(1);
         let producer = key(2);
         let producer_key = producer.public_key();
 
-        let input_events = build_input_events(
+        let input_events = build_input_events_with_retention(
             "openai",
             "responses",
             br#"{"model":"gpt-test"}"#,
             hellas_rpc::ContentId::from_bytes([9; 32]),
+            hellas_rpc::Assurance::ProducerSigned,
             &caller,
+            retention,
         )
         .unwrap();
         let verified = verify_input_events(&input_events).unwrap();
@@ -812,6 +849,7 @@ mod tests {
         let quote = FetchQuote::from_verified(&verified, input_events);
         let output_events = build_output_events(
             verified.input_commitment,
+            verified.assurance,
             br#"{"status":"completed"}"#,
             &producer,
         )
@@ -841,6 +879,38 @@ mod tests {
         let verified = transcript.verify(&producer).unwrap();
 
         assert_eq!(verified.caller_key, caller);
+    }
+
+    #[test]
+    fn retention_gates_running_and_completed_fetch_files() {
+        let dir = root("retention");
+        let store = fs_store(&dir);
+        let (quote, transcript, caller, producer) =
+            sample_transcript_with_retention(hellas_rpc::Retention::Ephemeral);
+        let input = quote.input_commitment;
+        let mut state = trusted_state(store.clone(), caller);
+
+        state.quote_input(quote.input).unwrap();
+        state.start(input).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        state
+            .complete_output(input, transcript.output_events().to_vec(), &producer)
+            .unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(state.replay_completed(input, &producer).is_ok());
+
+        let (quote, transcript, caller, producer) = sample_transcript();
+        let input = quote.input_commitment;
+        let mut retained_state = trusted_state(store, caller);
+        retained_state.quote_input(quote.input).unwrap();
+        retained_state.start(input).unwrap();
+        assert!(dir.join(format!("{}.running", input.digest())).is_file());
+        retained_state
+            .complete_output(input, transcript.output_events().to_vec(), &producer)
+            .unwrap();
+        assert!(dir.join(format!("{}.dagcbor", input.digest())).is_file());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

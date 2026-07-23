@@ -532,6 +532,27 @@ where
     Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
+    dispatch_unary_with_context::<T, M, _, _, _>(inbound, |request, _context| handler(request))
+        .await
+}
+
+/// Context-aware unary dispatch. This is used by connection-bound protocols
+/// such as confidential open; the exporter remains transport-provided and is
+/// never decoded from request bytes.
+pub async fn dispatch_unary_with_context<T, M, F, Fut, RespOrTrailer>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message,
+    F: FnOnce(M::Request, hellas_wire::TransportContext) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
+{
+    let context = inbound.context;
     let (mut send, recv) = WireStream::split(inbound.stream);
     let mut recv = Box::pin(recv);
     let req_bytes = match recv.next().await {
@@ -542,7 +563,7 @@ where
     let request = M::Request::decode(&req_bytes[..])
         .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
-    match handler(request).await {
+    match handler(request, context).await {
         Ok(result) => {
             let WithTrailer { response, metadata } = result.into();
             let mut buf = BytesMut::with_capacity(response.encoded_len());

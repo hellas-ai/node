@@ -35,8 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use self::state::GatewayState;
 
 pub use execution::{
-    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome, PreparedExecution,
-    StopReason,
+    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
+    Outcome, PreparedExecution, StopReason,
 };
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -68,13 +68,11 @@ pub struct GatewayOptions {
     pub responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
     pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
+    pub provider_trust: hellas_client::ProviderTrustAnchor,
     pub producer_key: ProducerSigningKey,
     #[cfg(feature = "evaluate")]
     pub provider_genesis: Vec<u8>,
-    #[cfg(feature = "evaluate")]
-    pub assurance_codec: Option<String>,
-    #[cfg(feature = "evaluate")]
-    pub assurance_policy: Option<hellas_rpc::ContentId>,
+    pub assurance: hellas_rpc::Assurance,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
     pub wrap_args: Vec<String>,

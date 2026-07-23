@@ -4,9 +4,12 @@ use chatgrad::types::{Message, openai::ChatMessage};
 use futures::StreamExt;
 use hellas_client::ExecutionRoute;
 use hellas_executor::{Executor, ExecutorError};
-use hellas_gateway::{CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionStrategy, Outcome};
+use hellas_gateway::{
+    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
+    Outcome,
+};
 use hellas_models::{ModelAssets, TextOutputDecoder};
-use hellas_rpc::{Dtype, ProducerSigningKey};
+use hellas_rpc::{Assurance, ContentId, Dtype, ProducerSigningKey, Retention};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -25,9 +28,12 @@ pub struct ExecuteOptions {
     pub verify_local: bool,
     pub producer_key: ProducerSigningKey,
     pub provider_genesis: Vec<u8>,
-    pub assurance_codec: Option<String>,
-    pub assurance_policy: Option<hellas_rpc::ContentId>,
+    pub expected_provider_genesis: Option<ContentId>,
+    pub apple_app_attest_app_id: Option<String>,
+    pub apple_app_attest_cdhashes: Vec<[u8; 32]>,
+    pub assurance: Assurance,
     pub raw: bool,
+    pub retain: bool,
     /// Ordered preference list. The first entry is what the client *first*
     /// builds the program at; later entries are tried via fallback if the
     /// remote executor refuses with `DtypeNotSupported`. For `--local` /
@@ -60,6 +66,20 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     if options.dtype.is_empty() {
         anyhow::bail!("--dtype must list at least one of f32, f16, bf16");
     }
+    #[cfg(feature = "evaluate")]
+    let uses_remote = !options.local || options.verify_local;
+    #[cfg(not(feature = "evaluate"))]
+    let uses_remote = true;
+    let provider_trust = if uses_remote {
+        Some(crate::identity::provider_trust(
+            options.expected_provider_genesis,
+            options.assurance,
+            options.apple_app_attest_app_id.clone(),
+            options.apple_app_attest_cdhashes.clone(),
+        )?)
+    } else {
+        None
+    };
 
     // Pre-tokenize the prompt once. Tokenization is dtype-independent, so the
     // `assets` we use here is throwaway; we reload per attempt below to get
@@ -81,13 +101,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let runner_key = options.producer_key.clone();
     #[cfg(feature = "evaluate")]
     let provider_terms = if options.local || options.verify_local {
-        Some((
-            options.provider_genesis.clone(),
-            crate::identity::assurance(
-                options.assurance_codec.as_deref(),
-                options.assurance_policy,
-            )?,
-        ))
+        Some((options.provider_genesis.clone(), options.assurance))
     } else {
         None
     };
@@ -137,6 +151,9 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                     options.node_id,
                     options.node_addrs.clone(),
                     options.retries,
+                    provider_trust
+                        .clone()
+                        .expect("remote route requires provider trust"),
                 ),
                 shadow: ExecutionRoute::Local,
             }
@@ -150,6 +167,9 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                 options.node_id,
                 options.node_addrs.clone(),
                 options.retries,
+                provider_trust
+                    .clone()
+                    .expect("remote route requires provider trust"),
             ))
         };
         #[cfg(not(feature = "evaluate"))]
@@ -157,13 +177,20 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             options.node_id,
             options.node_addrs.clone(),
             options.retries,
+            provider_trust
+                .clone()
+                .expect("remote route requires provider trust"),
         ));
 
         let request = ExecutionRequest::new(
             runtime,
             assets,
             prepared.clone(),
-            options.max_seq,
+            ExecutionRequestOptions {
+                max_seq: options.max_seq,
+                assurance: options.assurance,
+                retention: Retention::from_retain(options.retain),
+            },
             strategy,
             runner_key.clone(),
         )?;

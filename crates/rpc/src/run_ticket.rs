@@ -1,12 +1,11 @@
 use crate::pb::execute::{
-    AssuranceRequirement as PbAssuranceRequirement, JobTerms as PbJobTerms,
-    PublicKey as PbPublicKey, RunTicketRequest, Signature as PbSignature, Ticket, public_key,
-    signature,
+    JobTerms as PbJobTerms, PublicKey as PbPublicKey, RunTicketRequest, Signature as PbSignature,
+    Ticket, public_key, signature,
 };
 use crate::signature::verify_digest_signature;
 use crate::{
-    AssuranceRequirement, ContentId, Digest, JobTerms, ProducerSigningKey, PublicKey,
-    RequestCommitment, Signature, SignatureError, hash_tuple, tags,
+    Assurance, ContentId, Digest, JobTerms, ProducerSigningKey, PublicKey, RequestCommitment,
+    Signature, SignatureError, hash_tuple, tags,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,10 +25,7 @@ pub fn ticket_to_pb(
         request_commitment: terms.request.as_bytes().to_vec(),
         terms: Some(PbJobTerms {
             provider_genesis: terms.provider_genesis.as_bytes().to_vec(),
-            assurance: Some(PbAssuranceRequirement {
-                codec: terms.assurance.codec().to_string(),
-                policy: terms.assurance.policy().as_bytes().to_vec(),
-            }),
+            assurance: terms.assurance.to_byte().into(),
             amount: terms.amount,
             ttl_ms: terms.ttl_ms,
         }),
@@ -53,15 +49,7 @@ pub fn job_terms_from_pb(ticket: &Ticket) -> Result<JobTerms, RunTicketAuthError
     if ContentId::hash(&ticket.provider_genesis) != provider_genesis {
         return Err(RunTicketAuthError::ProviderGenesisMismatch);
     }
-    let assurance = terms
-        .assurance
-        .as_ref()
-        .ok_or(RunTicketAuthError::MissingAssurance)?;
-    let assurance = AssuranceRequirement::new(
-        assurance.codec.clone(),
-        ContentId::from_bytes(fixed("assurance policy ContentId", &assurance.policy)?),
-    )
-    .map_err(|error| RunTicketAuthError::InvalidAssurance(error.to_string()))?;
+    let assurance = assurance_from_pb(terms.assurance)?;
     Ok(JobTerms {
         request,
         provider_genesis,
@@ -154,6 +142,11 @@ pub fn signature_from_pb(value: PbSignature) -> Result<Signature, RunTicketAuthE
     }
 }
 
+pub fn assurance_from_pb(value: i32) -> Result<Assurance, RunTicketAuthError> {
+    let byte = u8::try_from(value).map_err(|_| RunTicketAuthError::UnknownAssurance(value))?;
+    Assurance::from_byte(byte).map_err(|_| RunTicketAuthError::UnknownAssurance(value))
+}
+
 fn fixed<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], RunTicketAuthError> {
     bytes
         .try_into()
@@ -170,8 +163,6 @@ pub enum RunTicketAuthError {
     MissingTicket,
     #[error("run ticket is missing job terms")]
     MissingTerms,
-    #[error("run ticket is missing assurance requirement")]
-    MissingAssurance,
     #[error("run ticket is missing public_key")]
     MissingPublicKey,
     #[error("run ticket public_key has no kind")]
@@ -188,8 +179,8 @@ pub enum RunTicketAuthError {
     },
     #[error("ticket provider genesis does not match its ContentId")]
     ProviderGenesisMismatch,
-    #[error("invalid assurance requirement: {0}")]
-    InvalidAssurance(String),
+    #[error("unknown assurance tag {0}")]
+    UnknownAssurance(i32),
     #[error("run ticket signature verification failed: {0}")]
     Signature(#[from] SignatureError),
 }
@@ -204,11 +195,7 @@ mod tests {
             JobTerms {
                 request: RequestCommitment::from_digest(Digest::from_bytes([7; 32])),
                 provider_genesis: ContentId::hash(&genesis),
-                assurance: AssuranceRequirement::new(
-                    crate::protocol::job::APPLE_APP_ATTEST,
-                    ContentId::from_bytes([8; 32]),
-                )
-                .unwrap(),
+                assurance: Assurance::AppleAppAttest,
                 amount: 10,
                 ttl_ms: 20,
             },
@@ -222,7 +209,18 @@ mod tests {
         let key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
         let verified = verify_run_ticket(&sign_run_ticket(ticket(), &key).unwrap()).unwrap();
         assert_eq!(verified.terms.request.as_bytes(), &[7; 32]);
+        assert_eq!(verified.terms.assurance, Assurance::AppleAppAttest);
         assert_eq!(verified.public_key, key.public_key());
+    }
+
+    #[test]
+    fn unknown_assurance_is_rejected() {
+        let mut ticket = ticket();
+        ticket.terms.as_mut().unwrap().assurance = 99;
+        assert!(matches!(
+            job_terms_from_pb(&ticket).unwrap_err(),
+            RunTicketAuthError::UnknownAssurance(99)
+        ));
     }
 
     #[test]

@@ -17,6 +17,20 @@ fi
 test -n "$identity"
 test ! -e "$app"
 security cms -D -i "$profile" | plutil -extract Entitlements xml1 -o "$entitlements" -
+for entitlement in \
+    com.apple.security.get-task-allow \
+    com.apple.security.cs.allow-jit \
+    com.apple.security.cs.allow-dyld-environment-variables \
+    com.apple.security.cs.disable-library-validation \
+    com.apple.security.cs.allow-unsigned-executable-memory \
+    com.apple.security.cs.disable-executable-page-protection \
+    com.apple.security.cs.debugger
+do
+    if /usr/libexec/PlistBuddy -c "Print :$entitlement" "$entitlements" >/dev/null 2>&1; then
+        echo "error: forbidden runtime-relaxation entitlement: $entitlement" >&2
+        exit 1
+    fi
+done
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.devicecheck.app-attest-opt-in:0' "$entitlements")" = CDhash
 application_id=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$entitlements")
 bundle_id=${application_id#*.}

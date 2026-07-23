@@ -22,8 +22,9 @@ impl GatewayBackend {
     }
 
     async fn prepare(&self, request: &BackendRequest) -> Result<PreparedGeneration, BackendError> {
+        let retention = super::fetch_backend::retention_from_json(request.raw.value())?;
         self.state
-            .prepare_wire_execution(&request.execution)
+            .prepare_wire_execution(&request.execution, retention)
             .await
             .map_err(|err| {
                 if err.status.is_client_error() {

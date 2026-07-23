@@ -184,17 +184,13 @@ rec {
         default = null;
         description = "Optional Prometheus metrics port.";
       };
-      assuranceCodec = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "apple.app-attest.v1";
-        description = "Assurance evidence codec the local provider requires of jobs (--assurance-codec). Required by the CLI when serving.";
-      };
-      assurancePolicy = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "0000000000000000000000000000000000000000000000000000000000000000";
-        description = "Content ID of the assurance policy document (--assurance-policy). Required by the CLI when serving.";
+      assurance = mkOption {
+        type = types.enum [
+          "producer-signed"
+          "apple-app-attest"
+        ];
+        default = "producer-signed";
+        description = "Assurance requested from and served by the execution provider.";
       };
       graffiti = mkOption {
         type = types.nullOr types.str;
@@ -326,6 +322,14 @@ rec {
         default = [ ];
         description = "Compressed secp256k1 producer public keys trusted to sign Fetch output when responsesBackend is fetch. Empty trusts only the gateway's own producer key.";
       };
+      assurance = mkOption {
+        type = types.enum [
+          "producer-signed"
+          "apple-app-attest"
+        ];
+        default = "producer-signed";
+        description = "Assurance requested from the selected execution provider.";
+      };
       identityPath = mkOption {
         type = types.str;
         default = "/var/lib/hellas-gateway/.hellas/identity";
@@ -400,8 +404,10 @@ rec {
     ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
     ++ optArg "--metrics-port" serve.metricsPort
-    ++ optArg "--assurance-codec" serve.assuranceCodec
-    ++ optArg "--assurance-policy" serve.assurancePolicy
+    ++ [
+      "--assurance"
+      serve.assurance
+    ]
     ++ optArg "--graffiti" serve.graffiti
     ++ lib.concatMap (model: [
       "--preload"
@@ -432,6 +438,8 @@ rec {
       "--identity"
       gateway.identityPath
       "gateway"
+      "--assurance"
+      gateway.assurance
     ]
     ++ [
       "--host"

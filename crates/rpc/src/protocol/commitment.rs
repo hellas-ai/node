@@ -5,29 +5,67 @@ use std::fmt;
 use crate::digest::Digest;
 use crate::tags;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
-pub enum SchemeId {
-    Evaluate = tags::SCHEME_EVALUATE,
-    Fetch = tags::SCHEME_FETCH,
+pub enum Assurance {
+    #[default]
+    ProducerSigned = tags::ASSURANCE_PRODUCER_SIGNED,
+    AppleAppAttest = tags::ASSURANCE_APPLE_APP_ATTEST,
 }
 
-impl SchemeId {
+impl Assurance {
     pub const fn to_byte(self) -> u8 {
         self as u8
     }
 
     pub fn from_byte(byte: u8) -> Result<Self, TagError> {
         match byte {
-            tags::SCHEME_EVALUATE => Ok(Self::Evaluate),
-            tags::SCHEME_FETCH => Ok(Self::Fetch),
+            tags::ASSURANCE_PRODUCER_SIGNED => Ok(Self::ProducerSigned),
+            tags::ASSURANCE_APPLE_APP_ATTEST => Ok(Self::AppleAppAttest),
+            _ => Err(TagError::UnknownAssurance(byte)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Evaluate,
+    Fetch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SchemeId(u8);
+
+impl SchemeId {
+    pub const fn to_byte(self) -> u8 {
+        self.0
+    }
+
+    pub fn from_byte(byte: u8) -> Result<Self, TagError> {
+        match byte {
+            tags::SCHEME_EVALUATE_PRODUCER_SIGNED
+            | tags::SCHEME_FETCH_PRODUCER_SIGNED
+            | tags::SCHEME_EVALUATE_APPLE_APP_ATTEST
+            | tags::SCHEME_FETCH_APPLE_APP_ATTEST => Ok(Self(byte)),
             _ => Err(TagError::UnknownScheme(byte)),
         }
     }
 }
 
+pub const fn scheme_id(operation: Operation, assurance: Assurance) -> SchemeId {
+    let tag = match (operation, assurance) {
+        (Operation::Evaluate, Assurance::ProducerSigned) => tags::SCHEME_EVALUATE_PRODUCER_SIGNED,
+        (Operation::Fetch, Assurance::ProducerSigned) => tags::SCHEME_FETCH_PRODUCER_SIGNED,
+        (Operation::Evaluate, Assurance::AppleAppAttest) => tags::SCHEME_EVALUATE_APPLE_APP_ATTEST,
+        (Operation::Fetch, Assurance::AppleAppAttest) => tags::SCHEME_FETCH_APPLE_APP_ATTEST,
+    };
+    SchemeId(tag)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TagError {
+    #[error("unknown assurance tag byte 0x{0:02x}")]
+    UnknownAssurance(u8),
     #[error("unknown scheme id byte 0x{0:02x}")]
     UnknownScheme(u8),
 }
@@ -79,6 +117,7 @@ macro_rules! impl_u8_serde {
     };
 }
 
+impl_u8_serde!(Assurance, Assurance::from_byte);
 impl_u8_serde!(SchemeId, SchemeId::from_byte);
 
 macro_rules! digest_commitment {
@@ -120,6 +159,29 @@ mod tests {
         assert_eq!(
             RequestCommitment::from_canonical_bytes(bytes).as_bytes(),
             Digest::hash(bytes).as_bytes()
+        );
+    }
+
+    #[test]
+    fn assurance_and_scheme_tags_are_pinned() {
+        assert_eq!(Assurance::default(), Assurance::ProducerSigned);
+        assert_eq!(Assurance::ProducerSigned.to_byte(), 0x00);
+        assert_eq!(Assurance::AppleAppAttest.to_byte(), 0x01);
+        assert_eq!(
+            scheme_id(Operation::Evaluate, Assurance::ProducerSigned).to_byte(),
+            0x00
+        );
+        assert_eq!(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned).to_byte(),
+            0x01
+        );
+        assert_eq!(
+            scheme_id(Operation::Evaluate, Assurance::AppleAppAttest).to_byte(),
+            0x02
+        );
+        assert_eq!(
+            scheme_id(Operation::Fetch, Assurance::AppleAppAttest).to_byte(),
+            0x03
         );
     }
 }

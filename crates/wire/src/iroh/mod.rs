@@ -12,4 +12,4 @@ pub use stream::{IrohRecvHalf, IrohSendHalf, IrohStream};
 pub use swarm::{
     DiscoveredPeer, Discovery, Peer, PeerExchangeBackend, ServiceRegistry, StaticBackend,
 };
-pub use transport::{IrohTransport, IrohTransportError};
+pub use transport::{IrohTransport, IrohTransportError, OPEN_EXPORTER_LABEL, OPEN_EXPORTER_LEN};

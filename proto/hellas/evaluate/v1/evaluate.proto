@@ -17,4 +17,8 @@ message EvaluateRequest {
   .hellas.v1.PublicKey runner_public_key = 2;
   bytes execution_environment = 3; // ProgramManifest ContentId
   bytes nonce = 4; // exactly 32 bytes
+  .hellas.v1.Assurance assurance = 5;
+  // Whether the provider may persist prompt- or token-bearing artifacts.
+  // Absence preserves the historical default: retain.
+  optional bool retain = 6;
 }

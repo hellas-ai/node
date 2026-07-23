@@ -14,6 +14,8 @@ mod commands;
 mod identity;
 #[cfg(feature = "node")]
 mod metrics;
+#[cfg(feature = "node")]
+mod platform_hardening;
 mod tracing_config;
 
 #[cfg(any(feature = "node", feature = "gateway"))]
@@ -50,6 +52,34 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
 
 fn parse_content_id_hex(s: &str) -> Result<hellas_rpc::ContentId, String> {
     parse_hex_array::<32>(s).map(hellas_rpc::ContentId::from_bytes)
+}
+
+fn parse_assurance(s: &str) -> Result<hellas_rpc::Assurance, String> {
+    match s {
+        "producer-signed" => Ok(hellas_rpc::Assurance::ProducerSigned),
+        "apple-app-attest" => Ok(hellas_rpc::Assurance::AppleAppAttest),
+        _ => Err("assurance must be producer-signed or apple-app-attest".to_string()),
+    }
+}
+
+#[cfg(feature = "node")]
+fn validate_serve_assurance(
+    software_root: bool,
+    assurance: hellas_rpc::Assurance,
+    root_kind: Option<hellas_rpc::RootKind>,
+) -> Result<(), String> {
+    if assurance == hellas_rpc::Assurance::AppleAppAttest
+        && (software_root
+            || root_kind.is_some_and(|kind| kind != hellas_rpc::RootKind::SecureEnclave))
+    {
+        Err(
+            "Apple App Attest assurance requires a Secure Enclave root; \
+             --software-root cannot be used"
+                .to_owned(),
+        )
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "gateway")]
@@ -134,15 +164,32 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
-    #[cfg(feature = "node")]
-    /// Required assurance evidence codec for local quotes.
-    #[arg(long = "assurance-codec", global = true)]
-    assurance_codec: Option<String>,
+    /// Assurance requested from and served by execution providers.
+    #[arg(
+        long,
+        global = true,
+        default_value = "producer-signed",
+        value_parser = parse_assurance
+    )]
+    assurance: hellas_rpc::Assurance,
 
-    #[cfg(feature = "node")]
-    /// Assurance policy ContentId for local quotes.
-    #[arg(long = "assurance-policy", global = true, value_parser = parse_content_id_hex)]
-    assurance_policy: Option<hellas_rpc::ContentId>,
+    /// Out-of-band ContentId pin for the remote provider's canonical enrollment bundle.
+    #[arg(long = "provider-genesis", global = true, value_parser = parse_content_id_hex)]
+    provider_genesis: Option<hellas_rpc::ContentId>,
+
+    /// Apple App Attest application CDhashes trusted for confidential open.
+    /// Repeat the flag or pass a comma-separated list of 32-byte hex values.
+    #[arg(
+        long = "apple-app-attest-cdhashes",
+        global = true,
+        value_delimiter = ',',
+        value_parser = parse_hex_array::<32>
+    )]
+    apple_app_attest_cdhashes: Vec<[u8; 32]>,
+
+    /// Apple App Attest application identity in <teamID>.<bundleID> form.
+    #[arg(long = "apple-app-attest-app-id", global = true)]
+    apple_app_attest_app_id: Option<String>,
 
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
@@ -389,6 +436,9 @@ enum Commands {
         /// Pass the prompt through unchanged instead of applying the model chat template
         #[arg(long = "raw", default_value_t = false)]
         raw: bool,
+        /// Allow the provider to retain prompt- and token-bearing artifacts.
+        #[arg(long = "retain", default_value_t = true, action = clap::ArgAction::Set)]
+        retain: bool,
         /// Maximum number of new tokens to generate
         #[arg(long = "max-seq", default_value_t = 16)]
         max_seq: u32,
@@ -447,6 +497,9 @@ enum Commands {
         /// Max execution retries on failure (discovery path only)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
+        /// Allow the provider to retain the signed input/output transcript.
+        #[arg(long = "retain", default_value_t = true, action = clap::ArgAction::Set)]
+        retain: bool,
         /// Producer public keys trusted to sign Fetch output. Repeat or
         /// comma-separate compressed secp256k1 keys as hex (see
         /// `producer-key show`). Defaults to this node's own producer key.
@@ -487,15 +540,29 @@ async fn main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
+    #[cfg(feature = "node")]
+    if matches!(&cli.command, Commands::Serve { .. })
+        && let Err(error) = validate_serve_assurance(cli.software_root, cli.assurance, None)
+    {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "node")]
+    if matches!(&cli.command, Commands::Serve { .. })
+        && let Err(err) = platform_hardening::harden_provider_process()
+    {
+        eprintln!("error: failed to harden provider process: {err}");
+        std::process::exit(1);
+    }
     let tracer_provider = if command_owns_tracing(&cli.command) {
         tracing_config::TracerGuard::noop()
     } else {
         tracing_config::init_tracing(cli.log_file.as_deref())
     };
-    #[cfg(feature = "node")]
-    let assurance_codec = cli.assurance_codec.clone();
-    #[cfg(feature = "node")]
-    let assurance_policy = cli.assurance_policy;
+    let assurance = cli.assurance;
+    let expected_provider_genesis = cli.provider_genesis;
+    let apple_app_attest_cdhashes = cli.apple_app_attest_cdhashes;
+    let apple_app_attest_app_id = cli.apple_app_attest_app_id;
 
     if let Commands::ProducerKey {
         command: ProducerKeyCommand::Show,
@@ -554,6 +621,17 @@ async fn main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
+    #[cfg(feature = "node")]
+    if matches!(&cli.command, Commands::Serve { .. })
+        && let Err(error) = validate_serve_assurance(
+            cli.software_root,
+            assurance,
+            Some(local_identity.genesis.statement.root_kind),
+        )
+    {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
 
     let result = match cli.command {
         #[cfg(feature = "node")]
@@ -570,14 +648,6 @@ async fn main() {
             fetch_max_in_flight,
             fetch_queue_size,
         } => {
-            let assurance = match identity::assurance(assurance_codec.as_deref(), assurance_policy)
-            {
-                Ok(assurance) => assurance,
-                Err(err) => {
-                    eprintln!("error: {err:#}");
-                    std::process::exit(1);
-                }
-            };
             commands::serve::run(commands::serve::ServeOptions {
                 port,
                 execute_policy,
@@ -591,8 +661,9 @@ async fn main() {
                 fetch_max_in_flight,
                 fetch_queue_size,
                 secret_key,
+                open_identity: local_identity.open_identity(),
                 producer_key: local_identity.producer_key,
-                provider_genesis: local_identity.genesis.canonical_bytes(),
+                provider_genesis: local_identity.enrollment.canonical_bytes(),
                 assurance,
             })
             .await
@@ -626,43 +697,50 @@ async fn main() {
             wrap,
             wrap_args,
         } => {
-            hellas_gateway::run(hellas_gateway::GatewayOptions {
-                host,
-                port,
-                node_id,
-                node_addrs,
-                #[cfg(feature = "evaluate")]
-                local,
-                #[cfg(feature = "evaluate")]
-                verify_local,
-                verify,
-                #[cfg(feature = "evaluate")]
-                queue_size,
-                retries,
-                default_max_tokens,
-                force_model,
-                metrics_port,
-                dtype,
-                responses_backend: responses_backend.into(),
-                responses_proxy_url,
-                responses_proxy_api_key_env,
-                responses_fetch_route_service,
-                responses_fetch_route_method,
-                responses_fetch_execution_environment,
-                responses_fetch_request_overrides: responses_fetch_request_overrides
-                    .unwrap_or_default(),
-                trusted_producer_public_keys,
-                producer_key: local_identity.producer_key,
-                #[cfg(feature = "evaluate")]
-                provider_genesis: local_identity.genesis.canonical_bytes(),
-                #[cfg(feature = "evaluate")]
-                assurance_codec: assurance_codec.clone(),
-                #[cfg(feature = "evaluate")]
-                assurance_policy,
-                secret_key,
-                wrap,
-                wrap_args,
-            })
+            async {
+                let provider_trust = identity::provider_trust(
+                    expected_provider_genesis,
+                    assurance,
+                    apple_app_attest_app_id.clone(),
+                    apple_app_attest_cdhashes.clone(),
+                )?;
+                hellas_gateway::run(hellas_gateway::GatewayOptions {
+                    host,
+                    port,
+                    node_id,
+                    node_addrs,
+                    #[cfg(feature = "evaluate")]
+                    local,
+                    #[cfg(feature = "evaluate")]
+                    verify_local,
+                    verify,
+                    #[cfg(feature = "evaluate")]
+                    queue_size,
+                    retries,
+                    default_max_tokens,
+                    force_model,
+                    metrics_port,
+                    dtype,
+                    responses_backend: responses_backend.into(),
+                    responses_proxy_url,
+                    responses_proxy_api_key_env,
+                    responses_fetch_route_service,
+                    responses_fetch_route_method,
+                    responses_fetch_execution_environment,
+                    responses_fetch_request_overrides: responses_fetch_request_overrides
+                        .unwrap_or_default(),
+                    trusted_producer_public_keys,
+                    provider_trust,
+                    producer_key: local_identity.producer_key,
+                    #[cfg(feature = "evaluate")]
+                    provider_genesis: local_identity.enrollment.canonical_bytes(),
+                    assurance,
+                    secret_key,
+                    wrap,
+                    wrap_args,
+                })
+                .await
+            }
             .await
         }
         Commands::Rpc {
@@ -679,6 +757,7 @@ async fn main() {
             model,
             prompt,
             raw,
+            retain,
             max_seq,
             retries,
             local,
@@ -698,15 +777,18 @@ async fn main() {
                     model,
                     prompt,
                     raw,
+                    retain,
                     max_seq,
                     retries,
                     local,
                     verify_local,
                     dtype,
                     producer_key: local_identity.producer_key,
-                    provider_genesis: local_identity.genesis.canonical_bytes(),
-                    assurance_codec: assurance_codec.clone(),
-                    assurance_policy,
+                    provider_genesis: local_identity.enrollment.canonical_bytes(),
+                    expected_provider_genesis,
+                    apple_app_attest_app_id: apple_app_attest_app_id.clone(),
+                    apple_app_attest_cdhashes: apple_app_attest_cdhashes.clone(),
+                    assurance,
                 },
                 secret_key,
             )
@@ -721,6 +803,7 @@ async fn main() {
             payload,
             payload_file,
             retries,
+            retain,
             trusted_producer_public_keys,
         } => {
             let payload = match (payload, payload_file) {
@@ -742,8 +825,13 @@ async fn main() {
                             execution_environment,
                             payload,
                             retries,
+                            retain,
                             producer_key: local_identity.producer_key,
                             trusted_producer_public_keys,
+                            expected_provider_genesis,
+                            apple_app_attest_app_id,
+                            apple_app_attest_cdhashes,
+                            assurance,
                         },
                         secret_key,
                     )
@@ -814,6 +902,23 @@ mod tests {
             Commands::Llm { raw, .. } => assert!(raw),
             _ => panic!("expected llm command"),
         }
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn llm_retention_defaults_on_and_can_be_disabled() {
+        let default = Cli::try_parse_from(["hellas", "llm", "-p", "hello"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Commands::Llm { retain: true, .. }
+        ));
+
+        let disabled =
+            Cli::try_parse_from(["hellas", "llm", "--retain=false", "-p", "hello"]).unwrap();
+        assert!(matches!(
+            disabled.command,
+            Commands::Llm { retain: false, .. }
+        ));
     }
 
     #[cfg(feature = "evaluate")]
@@ -909,21 +1014,101 @@ mod tests {
             "0909090909090909090909090909090909090909090909090909090909090909",
             "--payload",
             r#"{"x":1}"#,
+            "--assurance",
+            "apple-app-attest",
         ])
         .unwrap();
+        assert_eq!(cli.assurance, hellas_rpc::Assurance::AppleAppAttest);
         match cli.command {
             Commands::Fetch {
                 service,
                 method,
                 payload,
+                retain,
                 ..
             } => {
                 assert_eq!(service, "echo");
                 assert_eq!(method, "run");
                 assert_eq!(payload.as_deref(), Some(r#"{"x":1}"#));
+                assert!(retain);
             }
             _ => panic!("expected fetch command"),
         }
+    }
+
+    #[test]
+    fn requester_accepts_provider_pin_and_apple_cdhash_allowlist() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "fetch",
+            "--service",
+            "echo",
+            "--method",
+            "run",
+            "--execution-environment",
+            "0909090909090909090909090909090909090909090909090909090909090909",
+            "--payload",
+            r#"{"x":1}"#,
+            "--provider-genesis",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--apple-app-attest-app-id",
+            "2F53L9ZR3N.ai.hellas.app",
+            "--apple-app-attest-cdhashes",
+            "2222222222222222222222222222222222222222222222222222222222222222,3333333333333333333333333333333333333333333333333333333333333333",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.provider_genesis,
+            Some(hellas_rpc::ContentId::from_bytes([0x11; 32]))
+        );
+        assert_eq!(
+            cli.apple_app_attest_app_id.as_deref(),
+            Some("2F53L9ZR3N.ai.hellas.app")
+        );
+        assert_eq!(cli.apple_app_attest_cdhashes, vec![[0x22; 32], [0x33; 32]]);
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn serve_rejects_software_root_with_apple_assurance() {
+        assert!(
+            validate_serve_assurance(true, hellas_rpc::Assurance::AppleAppAttest, None).is_err()
+        );
+        assert!(
+            validate_serve_assurance(
+                false,
+                hellas_rpc::Assurance::AppleAppAttest,
+                Some(hellas_rpc::RootKind::Software),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_serve_assurance(
+                false,
+                hellas_rpc::Assurance::AppleAppAttest,
+                Some(hellas_rpc::RootKind::SecureEnclave),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn fetch_retention_can_be_disabled() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "fetch",
+            "--service",
+            "echo",
+            "--method",
+            "run",
+            "--execution-environment",
+            "0909090909090909090909090909090909090909090909090909090909090909",
+            "--payload",
+            r#"{"x":1}"#,
+            "--retain=false",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Commands::Fetch { retain: false, .. }));
     }
 
     #[test]

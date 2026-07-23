@@ -1,5 +1,7 @@
 use crate::commitment::TagError;
 use crate::run_ticket::{public_key_from_pb, public_key_to_pb, signature_from_pb, signature_to_pb};
+#[cfg(test)]
+use crate::{Assurance, Operation, scheme_id};
 use crate::{
     CanonicalizationId, Digest, EventCommitment, InputCommitment, InputEventBody,
     InputEventBodyParts, InputEventEnvelope, OutputEventBody, OutputEventBodyParts,
@@ -186,7 +188,11 @@ mod tests {
     #[test]
     fn input_event_round_trips_through_proto() {
         let caller = key(1);
-        let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon(),
+        );
         builder
             .push("request.body", br#"{"model":"gpt-test"}"#.to_vec())
             .unwrap();
@@ -201,11 +207,19 @@ mod tests {
     fn output_event_round_trips_through_proto() {
         let caller = key(1);
         let producer = key(2);
-        let mut input_builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
+        let mut input_builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon(),
+        );
         input_builder.push("request.body", b"{}".to_vec()).unwrap();
         let (_, input) = input_builder.finish().unwrap();
-        let mut output_builder =
-            OutputTranscriptBuilder::new(SchemeId::Fetch, input, &producer, canon());
+        let mut output_builder = OutputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            input,
+            &producer,
+            canon(),
+        );
         output_builder
             .push("response.delta", br#"{"delta":"ok"}"#.to_vec())
             .unwrap();
@@ -219,7 +233,11 @@ mod tests {
     #[test]
     fn input_event_decode_rejects_bad_digest_length() {
         let caller = key(1);
-        let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon(),
+        );
         builder.push("request.body", b"{}".to_vec()).unwrap();
         let (events, _) = builder.finish().unwrap();
         let mut pb = input_event_to_pb(&events[0]);
@@ -238,7 +256,11 @@ mod tests {
     #[test]
     fn input_event_decode_preserves_signed_body_signer() {
         let caller = key(1);
-        let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon(),
+        );
         builder.push("request.body", b"{}".to_vec()).unwrap();
         let (events, _) = builder.finish().unwrap();
         let mut pb = input_event_to_pb(&events[0]);
@@ -253,20 +275,29 @@ mod tests {
     #[test]
     fn input_event_decode_does_not_recompute_previous_event() {
         let caller = key(1);
-        let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon());
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon(),
+        );
         builder.push("request.body", b"{}".to_vec()).unwrap();
         let (events, _) = builder.finish().unwrap();
         let mut pb = input_event_to_pb(&events[0]);
-        pb.body.as_mut().unwrap().previous_event =
-            input_genesis(SchemeId::Evaluate, &caller.public_key())
-                .as_bytes()
-                .to_vec();
+        pb.body.as_mut().unwrap().previous_event = input_genesis(
+            scheme_id(Operation::Evaluate, Assurance::ProducerSigned),
+            &caller.public_key(),
+        )
+        .as_bytes()
+        .to_vec();
 
         let decoded = input_event_from_pb(pb).unwrap();
 
         assert_eq!(
             decoded.event().body().previous_event(),
-            input_genesis(SchemeId::Evaluate, &caller.public_key())
+            input_genesis(
+                scheme_id(Operation::Evaluate, Assurance::ProducerSigned),
+                &caller.public_key(),
+            )
         );
     }
 }

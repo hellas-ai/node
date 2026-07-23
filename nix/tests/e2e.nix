@@ -241,8 +241,7 @@ in
             port = executorPort;
             openFirewall = true;
             executePolicy = "skip";
-            assuranceCodec = "apple.app-attest.v1";
-            assurancePolicy = "0000000000000000000000000000000000000000000000000000000000000000";
+            assurance = "apple-app-attest";
             queueSize = 2;
             fetchMaxInFlight = 2;
             fetchQueueSize = 3;

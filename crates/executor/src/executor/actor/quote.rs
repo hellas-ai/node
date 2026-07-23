@@ -37,12 +37,18 @@ impl Executor {
             execution_environment,
             body,
             caller_key,
+            assurance,
             ..
         } = verify_input_events(&input).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!(
                 "fetch input transcript verification failed: {err}"
             ))
         })?;
+        if assurance != self.provider.assurance {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "request assurance does not match provider assurance".into(),
+            ));
+        }
         let route = crate::fetch_policy::FetchRoute::new(service.clone(), method.clone());
         let entry = self
             .fetch_routes
@@ -68,7 +74,7 @@ impl Executor {
         let (terms, ticket) = quote_ticket(
             request_commitment,
             self.provider.genesis.as_slice(),
-            self.provider.assurance.clone(),
+            assurance,
         )?;
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             terms,

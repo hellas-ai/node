@@ -14,6 +14,7 @@ iroh = [
     "dep:futures",
     "dep:iroh",
     "dep:iroh-mdns-address-lookup",
+    "dep:hellas-attestation",
     "hellas-rpc/courtesy",
     "hellas-wire/iroh",
     "hellas-wire/discovery-dht",
@@ -25,7 +26,19 @@ evaluate = ["hellas-rpc/evaluate"]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
+hellas-attestation = { workspace = true, features = ["apple-app-attest"], optional = true }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
+rand.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ciborium.workspace = true
+hex.workspace = true
+p256.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

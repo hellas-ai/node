@@ -275,6 +275,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                         } else {
                             AuthLevel::None
                         },
+                        open_exporter: None,
                     },
                 };
                 let _ = self.inbound_tx.send(inbound);

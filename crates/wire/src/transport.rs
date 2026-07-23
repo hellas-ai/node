@@ -56,11 +56,25 @@ pub enum AuthLevel {
 }
 
 /// Transport-provided context for an inbound stream.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TransportContext {
     pub peer: Option<PeerIdentity>,
     pub rtt_ms: Option<f64>,
     pub auth_level: AuthLevel,
+    /// TLS exporter derived from the live connection for the confidential
+    /// open handshake. Transports without a TLS/QUIC exporter leave it absent.
+    pub open_exporter: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for TransportContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportContext")
+            .field("peer", &self.peer)
+            .field("rtt_ms", &self.rtt_ms)
+            .field("auth_level", &self.auth_level)
+            .field("open_exporter", &self.open_exporter.map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 pub struct Inbound<S> {
@@ -74,6 +88,12 @@ pub struct Inbound<S> {
 pub trait StreamTransport {
     type Stream: Stream;
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Connection-level context available to outbound callers. Inbound calls
+    /// receive the same values on [`Inbound::context`].
+    fn context(&self) -> TransportContext {
+        TransportContext::default()
+    }
 
     /// Open a new outbound stream for this method. Headers go on the
     /// `OpenFrame`; body follows via `SendHalf::send_body`.

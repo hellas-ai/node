@@ -5,6 +5,7 @@ package hellas.fetch.v1;
 import "hellas/v1/hellas.proto";
 
 service Fetch {
+  rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
   rpc CreateTicket(FetchRequest) returns (.hellas.v1.Ticket);
 }
 

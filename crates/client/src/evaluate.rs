@@ -3,8 +3,8 @@ use hellas_rpc::evaluate::{
     output_canonicalization, verify_terminal_continuation,
 };
 use hellas_rpc::{
-    Digest, EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey, SchemeId, StreamId,
-    output_genesis,
+    Assurance, Digest, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, PublicKey,
+    StreamId, output_genesis, scheme_id,
 };
 
 use crate::{ClientError, ClientResult};
@@ -16,11 +16,12 @@ pub struct EvaluateChunkVerifier {
     next_sequence: u64,
     next_position: u64,
     producer_key: Option<PublicKey>,
+    assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
 }
 
 impl EvaluateChunkVerifier {
-    pub fn new(input: InputCommitment) -> Self {
+    pub fn new(input: InputCommitment, assurance: Assurance) -> Self {
         let stream_id = StreamId::from_input_commitment(input);
         Self {
             input,
@@ -29,8 +30,13 @@ impl EvaluateChunkVerifier {
             next_sequence: 0,
             next_position: 0,
             producer_key: None,
+            assurance,
             events: Vec::new(),
         }
+    }
+
+    pub const fn assurance(&self) -> Assurance {
+        self.assurance
     }
 
     pub fn verify_chunk(
@@ -54,7 +60,7 @@ impl EvaluateChunkVerifier {
             )
         })?;
         let body = event.event().body();
-        if body.scheme() != SchemeId::Evaluate {
+        if body.scheme() != scheme_id(Operation::Evaluate, self.assurance) {
             return Err(ClientError::protocol(
                 "evaluate output chunk used the wrong scheme",
             ));
@@ -120,7 +126,7 @@ impl EvaluateChunkVerifier {
                 ));
             }
         }
-        verify_terminal_continuation(&self.events, output_events)
+        verify_terminal_continuation(self.assurance, &self.events, output_events)
             .map_err(|source| ClientError::EvaluateTranscript { source })
     }
 }
@@ -146,6 +152,8 @@ mod tests {
     };
     use hellas_rpc::{ContentId, EvaluateRequest, ProducerSigningKey};
 
+    const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
+
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
     }
@@ -159,9 +167,11 @@ mod tests {
             runner_public_key: runner.public_key(),
             execution_environment: ContentId::from_bytes([8; 32]),
             nonce: [7; 32],
+            assurance: TEST_ASSURANCE,
+            retain: true,
         };
         let input = input_commitment(&request);
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
         let output_events = builder
             .finish(EvaluateTerminal {
@@ -176,7 +186,7 @@ mod tests {
             })
             .unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input);
+        let mut verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE);
         let (position, delta) = verifier.verify_chunk(token_event).unwrap();
         assert_eq!(position, 2);
         assert_eq!(delta.token_ids, vec![10, 11]);

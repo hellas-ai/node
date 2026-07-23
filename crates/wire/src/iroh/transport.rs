@@ -14,6 +14,9 @@ use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, Transp
 
 use super::stream::IrohStream;
 
+pub const OPEN_EXPORTER_LABEL: &[u8] = b"hellas/attest/open/v1";
+pub const OPEN_EXPORTER_LEN: usize = 32;
+
 pub struct IrohTransport {
     connection: Arc<Connection>,
     accept_lock: Arc<Mutex<()>>,
@@ -29,6 +32,28 @@ impl IrohTransport {
 
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Derive the confidential-open exporter from this exact QUIC connection.
+    pub fn open_exporter(&self) -> Result<[u8; OPEN_EXPORTER_LEN], IrohTransportError> {
+        let mut exporter = [0; OPEN_EXPORTER_LEN];
+        self.connection
+            .export_keying_material(&mut exporter, OPEN_EXPORTER_LABEL, b"")
+            .map_err(|_| {
+                IrohTransportError::Connection(
+                    "failed to export confidential-open keying material".into(),
+                )
+            })?;
+        Ok(exporter)
+    }
+
+    fn transport_context(&self) -> Result<TransportContext, IrohTransportError> {
+        Ok(TransportContext {
+            peer: self.peer_identity(),
+            rtt_ms: None,
+            auth_level: AuthLevel::Vouched,
+            open_exporter: Some(self.open_exporter()?),
+        })
     }
 
     fn peer_identity(&self) -> Option<PeerIdentity> {
@@ -51,6 +76,16 @@ pub enum IrohTransportError {
 impl StreamTransport for IrohTransport {
     type Stream = IrohStream;
     type Error = IrohTransportError;
+
+    fn context(&self) -> TransportContext {
+        self.transport_context()
+            .unwrap_or_else(|_| TransportContext {
+                peer: self.peer_identity(),
+                rtt_ms: None,
+                auth_level: AuthLevel::Vouched,
+                open_exporter: None,
+            })
+    }
 
     async fn open(&self, method_id: u32, headers: Metadata) -> Result<Self::Stream, Self::Error> {
         let (send, recv) = self
@@ -106,11 +141,7 @@ impl StreamTransport for IrohTransport {
             method_id,
             headers,
             stream,
-            context: TransportContext {
-                peer: self.peer_identity(),
-                rtt_ms: None, // iroh's rtt() requires a PathId; surface later via a helper
-                auth_level: AuthLevel::Vouched,
-            },
+            context: self.transport_context()?,
         }))
     }
 }

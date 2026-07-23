@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::signature::verify_digest_signature;
+#[cfg(test)]
+use crate::{Assurance, Operation, scheme_id};
 use crate::{
     DagCborEncoder, Digest, ProducerId, ProducerSigningKey, PublicKey, SchemeId, Signature,
     SignatureError, hash_tuple, tags,
@@ -869,8 +871,11 @@ mod tests {
     }
 
     fn input_transcript(caller: &ProducerSigningKey) -> (Vec<InputEventEnvelope>, InputCommitment) {
-        let mut builder =
-            InputTranscriptBuilder::new(SchemeId::Fetch, caller, canon("openai.responses.v1"));
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            caller,
+            canon("openai.responses.v1"),
+        );
         builder
             .push("input", br#"{"model":"gpt-test"}"#.to_vec())
             .unwrap();
@@ -883,7 +888,7 @@ mod tests {
         input: InputCommitment,
     ) -> (Vec<OutputEventEnvelope>, EventCommitment) {
         let mut builder = OutputTranscriptBuilder::new(
-            SchemeId::Fetch,
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
             input,
             producer,
             canon("openai.responses.v1"),
@@ -906,7 +911,12 @@ mod tests {
         let (events, input) = input_transcript(&caller);
 
         assert_eq!(
-            verify_input_event_envelopes(SchemeId::Fetch, &caller.public_key(), &events).unwrap(),
+            verify_input_event_envelopes(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                &caller.public_key(),
+                &events,
+            )
+            .unwrap(),
             input
         );
     }
@@ -918,8 +928,13 @@ mod tests {
         let (_, input) = input_transcript(&caller);
         let (events, _) = output_transcript(&producer, input);
 
-        verify_output_event_envelopes(SchemeId::Fetch, input, &producer.public_key(), &events)
-            .unwrap();
+        verify_output_event_envelopes(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            input,
+            &producer.public_key(),
+            &events,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -929,8 +944,12 @@ mod tests {
         let (events, _) = input_transcript(&caller);
 
         assert_eq!(
-            verify_input_event_envelopes(SchemeId::Fetch, &other.public_key(), &events)
-                .unwrap_err(),
+            verify_input_event_envelopes(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                &other.public_key(),
+                &events,
+            )
+            .unwrap_err(),
             StreamVerifyError::UnexpectedSigner
         );
     }
@@ -944,8 +963,13 @@ mod tests {
         let (events, _) = output_transcript(&producer, input);
 
         assert_eq!(
-            verify_output_event_envelopes(SchemeId::Fetch, input, &other.public_key(), &events)
-                .unwrap_err(),
+            verify_output_event_envelopes(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                input,
+                &other.public_key(),
+                &events,
+            )
+            .unwrap_err(),
             StreamVerifyError::UnexpectedSigner
         );
     }
@@ -1020,7 +1044,10 @@ mod tests {
         envelope.verify(&caller.public_key()).unwrap();
 
         let mutations: Mutations<InputEventBodyParts> = vec![
-            ("scheme", Box::new(|p| p.scheme = SchemeId::Evaluate)),
+            (
+                "scheme",
+                Box::new(|p| p.scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned)),
+            ),
             ("sequence", Box::new(|p| p.sequence += 1)),
             (
                 "previous_event",
@@ -1053,7 +1080,10 @@ mod tests {
         envelope.verify(&producer.public_key()).unwrap();
 
         let mutations: Mutations<OutputEventBodyParts> = vec![
-            ("scheme", Box::new(|p| p.scheme = SchemeId::Evaluate)),
+            (
+                "scheme",
+                Box::new(|p| p.scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned)),
+            ),
             (
                 "input",
                 Box::new(|p| p.input = InputCommitment::from_digest(flipped(p.input.digest()))),
@@ -1149,7 +1179,7 @@ mod tests {
 
         assert_eq!(
             verify_output_event_envelopes(
-                SchemeId::Fetch,
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
                 other_input,
                 &producer.public_key(),
                 &events
@@ -1173,8 +1203,16 @@ mod tests {
     #[test]
     fn canonicalization_id_affects_event_commitment() {
         let caller = key(1);
-        let mut a = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon("a"));
-        let mut b = InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon("b"));
+        let mut a = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon("a"),
+        );
+        let mut b = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon("b"),
+        );
         let a = a.push("input", b"same".to_vec()).unwrap();
         let b = b.push("input", b"same".to_vec()).unwrap();
 
@@ -1187,8 +1225,12 @@ mod tests {
         let (events, _) = input_transcript(&caller);
 
         assert_eq!(
-            verify_input_event_envelopes(SchemeId::Fetch, &caller.public_key(), &events[1..])
-                .unwrap_err(),
+            verify_input_event_envelopes(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                &caller.public_key(),
+                &events[1..],
+            )
+            .unwrap_err(),
             StreamVerifyError::SequenceMismatch {
                 expected: 0,
                 actual: 1
@@ -1197,8 +1239,12 @@ mod tests {
 
         let reordered = vec![events[1].clone(), events[0].clone()];
         assert_eq!(
-            verify_input_event_envelopes(SchemeId::Fetch, &caller.public_key(), &reordered)
-                .unwrap_err(),
+            verify_input_event_envelopes(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                &caller.public_key(),
+                &reordered,
+            )
+            .unwrap_err(),
             StreamVerifyError::SequenceMismatch {
                 expected: 0,
                 actual: 1
@@ -1224,14 +1270,18 @@ mod tests {
         let (_, input) = input_transcript(&caller);
 
         assert_eq!(
-            InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon("openai.responses.v1"))
-                .finish()
-                .unwrap_err(),
+            InputTranscriptBuilder::new(
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+                &caller,
+                canon("openai.responses.v1"),
+            )
+            .finish()
+            .unwrap_err(),
             StreamVerifyError::EmptyTranscript
         );
         assert_eq!(
             OutputTranscriptBuilder::new(
-                SchemeId::Fetch,
+                scheme_id(Operation::Fetch, Assurance::ProducerSigned),
                 input,
                 &producer,
                 canon("openai.responses.v1")
@@ -1245,8 +1295,11 @@ mod tests {
     #[test]
     fn input_event_commitment_vector_pinned() {
         let caller = key(1);
-        let mut builder =
-            InputTranscriptBuilder::new(SchemeId::Fetch, &caller, canon("openai.responses.v1"));
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, Assurance::ProducerSigned),
+            &caller,
+            canon("openai.responses.v1"),
+        );
         builder
             .push("input", br#"{"model":"gpt-test"}"#.to_vec())
             .unwrap();

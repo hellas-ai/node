@@ -1,6 +1,8 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
-use crate::execution::{CliRuntime, ExecutionRequest, ExecutionStrategy, PreparedExecution};
+use crate::execution::{
+    CliRuntime, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy, PreparedExecution,
+};
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -11,11 +13,12 @@ use hellas_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
     Message as WireMessage,
 };
-use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
+use hellas_client::{ExecutionRoute, ProducerTrust, ProviderTrustAnchor, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
 use hellas_models::ModelAssets;
 use hellas_rpc::Dtype;
+use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -49,6 +52,8 @@ pub(super) struct GatewayState {
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     runner_key: Arc<hellas_rpc::ProducerSigningKey>,
+    assurance: hellas_rpc::Assurance,
+    provider_trust: ProviderTrustAnchor,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -86,8 +91,6 @@ impl GatewayState {
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {
-            let assurance =
-                assurance(options.assurance_codec.as_deref(), options.assurance_policy)?;
             CliRuntime::local(
                 Executor::spawn_with_producer_key(
                     ExecutePolicy::Eager,
@@ -95,7 +98,7 @@ impl GatewayState {
                     vec![options.dtype],
                     runner_key.as_ref().clone(),
                     options.provider_genesis.clone(),
-                    assurance,
+                    options.assurance,
                 )
                 .context("failed to initialize local execution backend")?,
             )
@@ -123,6 +126,7 @@ impl GatewayState {
                         options.node_id,
                         options.node_addrs.clone(),
                         options.retries,
+                        options.provider_trust.clone(),
                     ),
                     (
                         &options.responses_fetch_route_service,
@@ -136,6 +140,7 @@ impl GatewayState {
                             })?,
                     ),
                     runner_key.as_ref().clone(),
+                    options.assurance,
                     producer_trust,
                     options.responses_fetch_request_overrides.clone(),
                 )))
@@ -160,6 +165,8 @@ impl GatewayState {
             responses_proxy,
             responses_fetch,
             runner_key,
+            assurance: options.assurance,
+            provider_trust: options.provider_trust.clone(),
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -176,7 +183,12 @@ impl GatewayState {
         if self.local {
             return ExecutionRoute::Local;
         }
-        ExecutionRoute::remote(self.node_id, self.node_addrs.clone(), self.retries)
+        ExecutionRoute::remote(
+            self.node_id,
+            self.node_addrs.clone(),
+            self.retries,
+            self.provider_trust.clone(),
+        )
     }
 
     fn execution_strategy(&self) -> ExecutionStrategy {
@@ -193,7 +205,10 @@ impl GatewayState {
         if let Some(node_id) = self.verify_node_id {
             return ExecutionStrategy::Verify {
                 primary,
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(node_id)),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
+                    node_id,
+                    self.provider_trust.clone(),
+                )),
             };
         }
 
@@ -244,6 +259,7 @@ impl GatewayState {
         prepared_prompt: PreparedPrompt,
         max_tokens: u32,
         prepare_error: &str,
+        retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
         let prompt_tokens = prepared_prompt.input_ids.len() as u32;
         let stop_token_ids = prepared_prompt.stop_token_ids.clone();
@@ -251,7 +267,11 @@ impl GatewayState {
             self.runtime.clone(),
             assets.clone(),
             prepared_prompt,
-            max_tokens,
+            ExecutionRequestOptions {
+                max_seq: max_tokens,
+                assurance: self.assurance,
+                retention,
+            },
             self.execution_strategy(),
             self.runner_key.as_ref().clone(),
         )
@@ -278,6 +298,7 @@ impl GatewayState {
     pub(super) async fn prepare_wire_execution(
         &self,
         req: &WireExecutionRequest,
+        retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
         let max_tokens = req
             .canonical
@@ -335,21 +356,10 @@ impl GatewayState {
             prepared_prompt,
             max_tokens,
             "Failed to prepare Responses input",
+            retention,
         )
         .await
     }
-}
-
-#[cfg(feature = "evaluate")]
-fn assurance(
-    codec: Option<&str>,
-    policy: Option<hellas_rpc::ContentId>,
-) -> anyhow::Result<hellas_rpc::AssuranceRequirement> {
-    hellas_rpc::AssuranceRequirement::new(
-        codec.context("local provider requires --assurance-codec")?,
-        policy.context("local provider requires --assurance-policy")?,
-    )
-    .map_err(Into::into)
 }
 
 fn wire_tools_to_raw(req: &WireExecutionRequest) -> Vec<serde_json::Value> {
@@ -466,13 +476,11 @@ impl IntoResponse for HttpError {
         if self.status.is_server_error() {
             error!(
                 status = %self.status,
-                message = %self.message,
                 "gateway request failed"
             );
         } else {
             warn!(
                 status = %self.status,
-                message = %self.message,
                 "gateway request rejected"
             );
         }
@@ -500,6 +508,11 @@ mod tests {
     }
 
     fn state(local: bool, verify_local: bool, verify_node_id: Option<EndpointId>) -> GatewayState {
+        let provider_trust = ProviderTrustAnchor {
+            expected_genesis: hellas_rpc::ContentId::from_bytes([9; 32]),
+            required_assurance: hellas_rpc::Assurance::ProducerSigned,
+            apple_app_attest: None,
+        };
         GatewayState {
             node_id: Some(endpoint(1)),
             node_addrs: Vec::new(),
@@ -517,6 +530,8 @@ mod tests {
             runner_key: Arc::new(
                 hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32]).expect("valid test key"),
             ),
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            provider_trust,
             model_cache: Arc::default(),
             model_load_locks: Arc::default(),
         }
@@ -525,10 +540,13 @@ mod tests {
     #[test]
     fn execution_strategy_uses_local_shadow_for_verify_local() {
         let state = state(false, true, None);
+        let trust = state.provider_trust.clone();
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(1))),
+                primary: ExecutionRoute::RemoteDirect(
+                    RemoteNodeTarget::direct(endpoint(1), trust,)
+                ),
                 shadow: ExecutionRoute::Local,
             }
         );
@@ -538,11 +556,15 @@ mod tests {
     fn execution_strategy_uses_remote_shadow_for_verify_node() {
         let verify_node = endpoint(2);
         let state = state(false, false, Some(verify_node));
+        let trust = state.provider_trust.clone();
         assert_eq!(
             state.execution_strategy(),
             ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(1))),
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::from(endpoint(2))),
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
+                    endpoint(1),
+                    trust.clone(),
+                )),
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(endpoint(2), trust)),
             }
         );
     }
