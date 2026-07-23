@@ -5,10 +5,10 @@ use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
     Provenance,
 };
-use hellas_rpc::fetch::{build_input_events, verify_input_events};
+use hellas_rpc::fetch::{build_input_events_with_retention, verify_input_events};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
-use hellas_rpc::{ContentId, ProducerSigningKey};
+use hellas_rpc::{Assurance, ContentId, ProducerSigningKey, Retention};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ pub(super) struct ResponsesFetchBackend {
     method: String,
     execution_environment: ContentId,
     caller_key: Arc<ProducerSigningKey>,
+    assurance: Assurance,
     producer_trust: ProducerTrust,
     request_overrides: JsonMap<String, JsonValue>,
 }
@@ -34,6 +35,7 @@ impl ResponsesFetchBackend {
         route: ExecutionRoute,
         target: (&str, &str, ContentId),
         caller_key: ProducerSigningKey,
+        assurance: Assurance,
         producer_trust: ProducerTrust,
         request_overrides: JsonMap<String, JsonValue>,
     ) -> Self {
@@ -45,6 +47,7 @@ impl ResponsesFetchBackend {
             method: method.to_string(),
             execution_environment,
             caller_key: Arc::new(caller_key),
+            assurance,
             producer_trust,
             request_overrides,
         }
@@ -54,13 +57,16 @@ impl ResponsesFetchBackend {
 impl ExecutionBackend for ResponsesFetchBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
-            let payload = provider_request_body(&request, &self.request_overrides)?;
+            let ProviderRequestBody { payload, retention } =
+                provider_request_body(&request, &self.request_overrides)?;
             let (input, input_commitment) = signed_input_events_with_commitment(
                 &self.service,
                 &self.method,
                 &payload,
                 self.execution_environment,
+                self.assurance,
                 self.caller_key.as_ref(),
+                retention,
             )
             .map_err(|source| {
                 BackendError::failed(format!("failed to sign fetch request: {source}"))
@@ -88,9 +94,19 @@ fn signed_input_events_with_commitment(
     method: &str,
     payload: &[u8],
     execution_environment: ContentId,
+    assurance: Assurance,
     key: &ProducerSigningKey,
+    retention: Retention,
 ) -> anyhow::Result<(Vec<hellas_rpc::pb::execute::InputEventEnvelope>, String)> {
-    let events = build_input_events(service, method, payload, execution_environment, key)?;
+    let events = build_input_events_with_retention(
+        service,
+        method,
+        payload,
+        execution_environment,
+        assurance,
+        key,
+        retention,
+    )?;
     let input_commitment = verify_input_events(&events)?.input_commitment;
     Ok((
         events.iter().map(input_event_to_pb).collect(),
@@ -131,10 +147,16 @@ fn fetch_events(
     }
 }
 
+#[derive(Debug)]
+struct ProviderRequestBody {
+    payload: Bytes,
+    retention: Retention,
+}
+
 fn provider_request_body(
     request: &BackendRequest,
     request_overrides: &JsonMap<String, JsonValue>,
-) -> Result<Bytes, BackendError> {
+) -> Result<ProviderRequestBody, BackendError> {
     let JsonValue::Object(mut object) = request.raw.value().clone() else {
         return Err(BackendError::rejected(
             "Responses fetch request body must be a JSON object",
@@ -148,13 +170,32 @@ fn provider_request_body(
         JsonValue::String(request.execution.canonical.model.name.clone()),
     );
     object.insert("stream".to_string(), JsonValue::Bool(true));
-    serde_json::to_vec(&JsonValue::Object(object))
+    let retention = retention_from_json_object(&object)?;
+    let payload = serde_json::to_vec(&JsonValue::Object(object))
         .map(Bytes::from)
         .map_err(|source| {
             BackendError::failed(format!(
                 "failed to encode Responses fetch request: {source}"
             ))
-        })
+        })?;
+    Ok(ProviderRequestBody { payload, retention })
+}
+
+pub(super) fn retention_from_json(value: &JsonValue) -> Result<Retention, BackendError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| BackendError::rejected("request body must be a JSON object"))?;
+    retention_from_json_object(object)
+}
+
+fn retention_from_json_object(
+    object: &JsonMap<String, JsonValue>,
+) -> Result<Retention, BackendError> {
+    match object.get("store") {
+        None => Ok(Retention::Retain),
+        Some(JsonValue::Bool(store)) => Ok(Retention::from_retain(*store)),
+        Some(_) => Err(BackendError::rejected("`store` must be a boolean")),
+    }
 }
 
 #[cfg(test)]
@@ -181,12 +222,13 @@ mod tests {
         let overrides = JsonMap::from_iter([("store".to_string(), JsonValue::Bool(false))]);
 
         let body = provider_request_body(&request, &overrides).unwrap();
-        let value: JsonValue = serde_json::from_slice(&body).unwrap();
+        let value: JsonValue = serde_json::from_slice(&body.payload).unwrap();
 
         assert_eq!(value["model"], "gpt-5.5");
         assert_eq!(value["input"], "hello");
         assert_eq!(value["stream"], true);
         assert_eq!(value["store"], false);
+        assert_eq!(body.retention, Retention::Ephemeral);
     }
 
     #[test]
@@ -195,10 +237,18 @@ mod tests {
         let overrides = JsonMap::new();
 
         let body = provider_request_body(&request, &overrides).unwrap();
-        let value: JsonValue = serde_json::from_slice(&body).unwrap();
+        let value: JsonValue = serde_json::from_slice(&body.payload).unwrap();
 
         assert_eq!(value["stream"], true);
         assert!(value.get("store").is_none());
+        assert_eq!(body.retention, Retention::Retain);
+    }
+
+    #[test]
+    fn provider_body_rejects_non_boolean_store_after_overrides() {
+        let request = backend_request(br#"{"model":"m","input":"hello","store":"no"}"#, "m");
+        let err = provider_request_body(&request, &JsonMap::new()).unwrap_err();
+        assert!(err.to_string().contains("`store` must be a boolean"));
     }
 
     #[test]
@@ -209,11 +259,13 @@ mod tests {
             "responses",
             br#"{"input":"hi"}"#,
             ContentId::from_bytes([9; 32]),
+            Assurance::ProducerSigned,
             &key,
+            Retention::Retain,
         )
         .unwrap();
 
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 8);
         assert_eq!(commitment.len(), 64);
     }
 }

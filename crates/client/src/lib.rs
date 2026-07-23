@@ -16,16 +16,8 @@ pub use fetch::{
     validate_fetch_ticket, verified_fetch_input, verify_fetch_work_event,
 };
 #[cfg(feature = "iroh")]
-pub use iroh::{ExecutionRoute, RemoteNodeTarget};
+pub use iroh::{AppleAppAttestTrust, ExecutionRoute, ProviderTrustAnchor, RemoteNodeTarget};
 pub use run_ticket::{runner_public_key, signed_run_ticket_request};
-
-/// A dispatch route whose target type is supplied by the transport layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Route<T> {
-    Local,
-    RemoteDirect(T),
-    RemoteDiscovery { retries: usize },
-}
 
 /// Client capabilities shared by local and transport-specific orchestration.
 #[derive(Clone)]

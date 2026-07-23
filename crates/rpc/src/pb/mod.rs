@@ -116,8 +116,40 @@ mod id_pins {
     #[test]
     fn execute_ids_are_stable() {
         use super::services::execute::{Execute, RunTicket};
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xf5bbaa4d);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xed73b80c);
+        assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
+        assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xb5ed3e1c);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x0de6393b);
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn evaluate_ids_are_stable() {
+        use super::services::evaluate::{CreateTicket, Evaluate};
+        assert_eq!(<Evaluate as ServiceMarker>::SERVICE_ID, 0xbe10d224);
+        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xee83d084);
+    }
+
+    #[cfg(feature = "fetch")]
+    #[test]
+    fn fetch_ids_are_stable() {
+        use super::services::fetch::{CreateTicket, Fetch, Open};
+        assert_eq!(<Fetch as ServiceMarker>::SERVICE_ID, 0x8472b96a);
+        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x4c386ff8);
+        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xb232c2a7);
+    }
+
+    #[cfg(feature = "courtesy")]
+    #[test]
+    fn courtesy_ids_are_stable() {
+        use super::services::courtesy::{
+            Courtesy, Open, QuoteChatPrompt, QuotePreparedText, QuotePrompt,
+        };
+        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0x360d5775);
+        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xea3c6fa1);
+        assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x991a7eb2);
+        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0xad5deb50);
+        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0x6d37221c);
     }
 
     #[cfg(feature = "chain")]

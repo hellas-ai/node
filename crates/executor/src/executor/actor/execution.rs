@@ -41,7 +41,7 @@ impl Executor {
         validate_job_terms(
             &verified_run.terms,
             self.provider.genesis.as_slice(),
-            &self.provider.assurance,
+            self.provider.assurance,
         )?;
         let request_commitment_id = *verified_run.terms.request.as_bytes();
         let request_commitment = request_commitment_id.to_vec();
@@ -56,7 +56,11 @@ impl Executor {
         #[cfg(feature = "evaluate")]
         if let Some(engine) = self.evaluate.as_ref()
             && let Some(outcome) = engine
-                .replay_completed(request_commitment_id, &verified_run.public_key)
+                .replay_completed(
+                    request_commitment_id,
+                    &verified_run.public_key,
+                    verified_run.terms.assurance,
+                )
                 .await?
         {
             info!(
@@ -85,6 +89,34 @@ impl Executor {
             return Err(ExecutorError::InvalidQuoteRequest(
                 "run ticket terms do not match quote".into(),
             ));
+        }
+        match &quote.kind {
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Scheme(job) => {
+                let evaluate = job
+                    .clone_box()
+                    .into_any()
+                    .downcast::<crate::evaluate::EvaluateJob>()
+                    .map_err(|_| {
+                        ExecutorError::InvalidQuoteRequest("scheme job type mismatch".into())
+                    })?;
+                if evaluate.evaluate_request.assurance != verified_run.terms.assurance {
+                    return Err(ExecutorError::InvalidQuoteRequest(
+                        "evaluate request assurance does not match ticket terms".into(),
+                    ));
+                }
+            }
+            QuoteKind::Fetch { .. } => {
+                let fetch_quote = self
+                    .fetch_state
+                    .quoted(input_commitment)
+                    .map_err(fetch_execute_error)?;
+                if fetch_quote.assurance != verified_run.terms.assurance {
+                    return Err(ExecutorError::InvalidQuoteRequest(
+                        "fetch request assurance does not match ticket terms".into(),
+                    ));
+                }
+            }
         }
         ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
         match quote.kind {
@@ -151,6 +183,7 @@ impl Executor {
                     request,
                     provider: entry.provider,
                     input_commitment,
+                    assurance: fetch_quote.assurance,
                     request_commitment_id,
                     quota_reservation: admission.reservation,
                     execution_id: execution_id.clone(),
@@ -260,6 +293,11 @@ impl Executor {
         let verified_input = transcript.verify(&producer_key).map_err(|err| {
             ExecutorError::InvalidQuoteRequest(format!("fetch transcript rejected: {err}"))
         })?;
+        if verified_input.assurance != verified_run.terms.assurance {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "fetch request assurance does not match ticket terms".into(),
+            ));
+        }
         ensure_authorized_runner(&verified_input.caller_key, &verified_run.public_key)?;
         let outcome = fetch_transcript_outcome(request_commitment_id, &transcript).await?;
         info!(
@@ -446,6 +484,7 @@ fn spawn_fetch_provider(
             projector,
             quota_reservation,
             input_commitment,
+            assurance,
             request_commitment_id,
             execution_id,
             model_id,
@@ -456,6 +495,7 @@ fn spawn_fetch_provider(
             request,
             projector,
             input_commitment,
+            assurance,
             &producer_key,
             sender.clone(),
         )
@@ -477,10 +517,11 @@ async fn run_fetch_provider(
     request: FetchProviderRequest,
     mut projector: Box<dyn FetchProjector>,
     input_commitment: InputCommitment,
+    assurance: hellas_rpc::Assurance,
     producer_key: &ProducerSigningKey,
     sender: mpsc::Sender<Result<WorkEvent, hellas_wire::WireStatus>>,
 ) -> Result<FetchProviderRun, FetchProviderFailure> {
-    let mut builder = FetchOutputTranscriptBuilder::new(input_commitment, producer_key);
+    let mut builder = FetchOutputTranscriptBuilder::new(input_commitment, assurance, producer_key);
     let mut position = 0_u64;
     let mut terminal = None;
     let mut stream = provider
@@ -845,12 +886,8 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
     }
 
-    fn test_assurance() -> hellas_rpc::AssuranceRequirement {
-        hellas_rpc::AssuranceRequirement::new(
-            hellas_rpc::APPLE_APP_ATTEST,
-            hellas_rpc::ContentId::from_bytes([8; 32]),
-        )
-        .unwrap()
+    fn test_assurance() -> hellas_rpc::Assurance {
+        hellas_rpc::Assurance::ProducerSigned
     }
 
     fn test_genesis() -> Vec<u8> {
@@ -867,7 +904,15 @@ mod tests {
         method: &str,
         body: &[u8],
     ) -> FetchRequest {
-        let events = build_input_events(service, method, body, test_environment(), key).unwrap();
+        let events = build_input_events(
+            service,
+            method,
+            body,
+            test_environment(),
+            test_assurance(),
+            key,
+        )
+        .unwrap();
         FetchRequest {
             input: events.iter().map(input_event_to_pb).collect(),
         }
@@ -1086,6 +1131,7 @@ mod tests {
             "run",
             br#"{"hello":"crash"}"#,
             test_environment(),
+            test_assurance(),
             &signing_key,
         )
         .unwrap();

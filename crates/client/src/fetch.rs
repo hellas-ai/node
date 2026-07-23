@@ -9,8 +9,8 @@ use hellas_rpc::pb::execute::{self as pb, Ticket, WorkEvent, WorkFinished, work_
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
 use hellas_rpc::{
-    EventCommitment, InputCommitment, OutputEventEnvelope, PublicKey, SchemeId, StreamId,
-    output_genesis,
+    Assurance, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, PublicKey,
+    StreamId, output_genesis, scheme_id,
 };
 
 use crate::{ClientError, ClientResult};
@@ -76,11 +76,12 @@ pub struct FetchChunkVerifier {
     next_position: u64,
     trust: ProducerTrust,
     producer_key: Option<PublicKey>,
+    assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
 }
 
 impl FetchChunkVerifier {
-    pub fn new(input: InputCommitment, trust: ProducerTrust) -> Self {
+    pub fn new(input: InputCommitment, assurance: Assurance, trust: ProducerTrust) -> Self {
         let stream_id = StreamId::from_input_commitment(input);
         Self {
             input,
@@ -90,6 +91,7 @@ impl FetchChunkVerifier {
             next_position: 0,
             trust,
             producer_key: None,
+            assurance,
             events: Vec::new(),
         }
     }
@@ -119,7 +121,7 @@ impl FetchChunkVerifier {
             ClientError::source("fetch output chunk signature verification failed", source)
         })?;
         let body = event.event().body();
-        if body.scheme() != SchemeId::Fetch {
+        if body.scheme() != scheme_id(Operation::Fetch, self.assurance) {
             return Err(ClientError::protocol(
                 "fetch output chunk used the wrong scheme",
             ));
@@ -190,7 +192,7 @@ impl FetchChunkVerifier {
                 }
             }
         }
-        hellas_rpc::fetch::verify_terminal_continuation(&self.events, output_events)
+        hellas_rpc::fetch::verify_terminal_continuation(self.assurance, &self.events, output_events)
             .map_err(|source| ClientError::FetchTranscript { source })
     }
 }
@@ -200,7 +202,7 @@ pub fn verify_fetch_work_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
 ) -> ClientResult<FetchExecutionEvent> {
-    match convert_fetch_wire_event(event, input_commitment)? {
+    match convert_fetch_wire_event(event, input_commitment, verifier.assurance)? {
         DecodedFetchWireEvent::Chunk {
             output_event,
             event,
@@ -224,6 +226,7 @@ pub fn verify_fetch_work_event(
 fn convert_fetch_wire_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
+    assurance: Assurance,
 ) -> ClientResult<DecodedFetchWireEvent> {
     let Some(event) = event.kind else {
         return Err(ClientError::protocol("wire event with no body"));
@@ -244,7 +247,7 @@ fn convert_fetch_wire_event(
             })
         }
         work_event::Kind::Finished(finished) => Ok(DecodedFetchWireEvent::Done(
-            parse_fetch_finished(finished, input_commitment)?,
+            parse_fetch_finished(finished, input_commitment, assurance)?,
         )),
         work_event::Kind::Failed(failed) => Ok(DecodedFetchWireEvent::Done(FetchOutcome::Failed {
             position: failed.position,
@@ -256,6 +259,7 @@ fn convert_fetch_wire_event(
 pub fn parse_fetch_finished(
     finished: WorkFinished,
     input_commitment: InputCommitment,
+    assurance: Assurance,
 ) -> ClientResult<FetchOutcome> {
     let output_events = finished
         .output_events
@@ -263,7 +267,7 @@ pub fn parse_fetch_finished(
         .map(output_event_from_pb)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| ClientError::FetchStreamEnvelope { source })?;
-    let output = verify_output_events(input_commitment, &output_events)
+    let output = verify_output_events(input_commitment, assurance, &output_events)
         .map_err(|source| ClientError::FetchTranscript { source })?;
     let (_, terminal_payload) = output.output_event_payloads();
     let terminal = decode_fetch_terminal_payload(terminal_payload)
@@ -288,6 +292,7 @@ pub fn verified_fetch_input(request: &FetchRequest) -> ClientResult<FetchInput> 
 pub fn validate_fetch_ticket(
     ticket: pb::Ticket,
     input_commitment: InputCommitment,
+    assurance: Assurance,
 ) -> ClientResult<Ticket> {
     let request_commitment: [u8; 32] =
         ticket
@@ -305,6 +310,13 @@ pub fn validate_fetch_ticket(
             "fetch ticket request_commitment does not match signed input transcript",
         ));
     }
+    let terms = hellas_rpc::run_ticket::job_terms_from_pb(&ticket)
+        .map_err(|source| ClientError::source("invalid fetch ticket terms", source))?;
+    if terms.assurance != assurance {
+        return Err(ClientError::protocol(
+            "fetch ticket assurance does not match signed input transcript",
+        ));
+    }
     Ok(ticket)
 }
 
@@ -319,6 +331,8 @@ mod tests {
     use hellas_rpc::output::{OutputEvent, StopReason};
     use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
     use hellas_rpc::{ContentId, ProducerSigningKey as SigningKey};
+
+    const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
@@ -335,6 +349,7 @@ mod tests {
             method,
             payload,
             ContentId::from_bytes([9; 32]),
+            TEST_ASSURANCE,
             caller,
         )
         .unwrap();
@@ -357,7 +372,8 @@ mod tests {
         terminal_payload: &[u8],
     ) -> WorkFinished {
         let input = verified_fetch_input(request).unwrap().input_commitment;
-        let events = build_output_events(input, terminal_payload, producer).unwrap();
+        let events =
+            build_output_events(input, TEST_ASSURANCE, terminal_payload, producer).unwrap();
         WorkFinished {
             output_events: events.iter().map(output_event_to_pb).collect(),
             assurance_evidence: Vec::new(),
@@ -381,7 +397,7 @@ mod tests {
         let finished = fetch_finished(&request, &producer, &terminal_payload);
 
         let input = input_commitment_for(&request);
-        let outcome = parse_fetch_finished(finished, input).unwrap();
+        let outcome = parse_fetch_finished(finished, input, TEST_ASSURANCE).unwrap();
         let FetchOutcome::Completed {
             terminal,
             output_events,
@@ -407,10 +423,11 @@ mod tests {
         let trusted_producer = key(3);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let input = input_commitment_for(&request);
-        let mut builder = FetchOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let chunk = builder.push_event(br#"{"delta":"a"}"#.to_vec()).unwrap();
 
-        let mut verifier = FetchChunkVerifier::new(input, trust_in(&[&trusted_producer]));
+        let mut verifier =
+            FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&trusted_producer]));
         let err = verifier.verify_chunk(chunk).unwrap_err();
         assert!(err.to_string().contains("untrusted producer key"));
     }
@@ -421,10 +438,10 @@ mod tests {
         let producer = key(2);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let input = input_commitment_for(&request);
-        let mut builder = FetchOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let chunk = builder.push_event(br#"{"delta":"a"}"#.to_vec()).unwrap();
 
-        let mut verifier = FetchChunkVerifier::new(input, trust_in(&[&producer]));
+        let mut verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
         verifier.verify_chunk(chunk).unwrap();
     }
 
@@ -435,10 +452,16 @@ mod tests {
         let trusted_producer = key(3);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let input = input_commitment_for(&request);
-        let output_events =
-            build_output_events(input, &finished_terminal_payload(), &producer).unwrap();
+        let output_events = build_output_events(
+            input,
+            TEST_ASSURANCE,
+            &finished_terminal_payload(),
+            &producer,
+        )
+        .unwrap();
 
-        let verifier = FetchChunkVerifier::new(input, trust_in(&[&trusted_producer]));
+        let verifier =
+            FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&trusted_producer]));
         let err = verifier.verify_terminal(&output_events).unwrap_err();
         assert!(err.to_string().contains("untrusted producer key"));
     }
@@ -449,10 +472,15 @@ mod tests {
         let producer = key(2);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let input = input_commitment_for(&request);
-        let output_events =
-            build_output_events(input, &finished_terminal_payload(), &producer).unwrap();
+        let output_events = build_output_events(
+            input,
+            TEST_ASSURANCE,
+            &finished_terminal_payload(),
+            &producer,
+        )
+        .unwrap();
 
-        let verifier = FetchChunkVerifier::new(input, trust_in(&[&producer]));
+        let verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
         verifier.verify_terminal(&output_events).unwrap();
     }
 
@@ -462,7 +490,13 @@ mod tests {
         let producer = key(2);
         let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
         let input = input_commitment_for(&request);
-        let events = build_output_events(input, &finished_terminal_payload(), &producer).unwrap();
+        let events = build_output_events(
+            input,
+            TEST_ASSURANCE,
+            &finished_terminal_payload(),
+            &producer,
+        )
+        .unwrap();
         let mut finished = WorkFinished {
             output_events: events.iter().map(output_event_to_pb).collect(),
             assurance_evidence: Vec::new(),
@@ -470,7 +504,7 @@ mod tests {
         finished.output_events[0].payload = br#"{"x":2}"#.to_vec();
 
         assert!(matches!(
-            parse_fetch_finished(finished, input).unwrap_err(),
+            parse_fetch_finished(finished, input, TEST_ASSURANCE).unwrap_err(),
             ClientError::FetchStreamEnvelope { .. } | ClientError::FetchTranscript { .. }
         ));
     }

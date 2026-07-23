@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalizationId, Digest, Evaluate, EvaluateRequest, InputCommitment, OutputEventEnvelope,
-    OutputTranscriptBuilder, ProducerSigningKey, PublicKey, SchemeId, StreamVerifyError,
-    decode_dag_cbor, encode_token_ids, verify_output_event_envelopes,
+    Assurance, CanonicalizationId, Digest, Evaluate, EvaluateRequest, InputCommitment, Operation,
+    OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, StreamVerifyError,
+    decode_dag_cbor, encode_token_ids, scheme_id, verify_output_event_envelopes,
 };
 use crate::{DagCborDecodeError, DagCborEncodeError, canonical_dag_cbor};
 
@@ -151,10 +151,10 @@ pub struct EvaluateOutputTranscriptBuilder<'a> {
 }
 
 impl<'a> EvaluateOutputTranscriptBuilder<'a> {
-    pub fn new(input: InputCommitment, key: &'a ProducerSigningKey) -> Self {
+    pub fn new(input: InputCommitment, assurance: Assurance, key: &'a ProducerSigningKey) -> Self {
         Self {
             inner: OutputTranscriptBuilder::new(
-                SchemeId::Evaluate,
+                scheme_id(Operation::Evaluate, assurance),
                 input,
                 key,
                 output_canonicalization(),
@@ -165,21 +165,23 @@ impl<'a> EvaluateOutputTranscriptBuilder<'a> {
 
     pub fn resume_verified(
         input: InputCommitment,
+        assurance: Assurance,
         key: &'a ProducerSigningKey,
         events: Vec<OutputEventEnvelope>,
     ) -> Result<Self, EvaluateProtocolError> {
         let public_key = key.public_key();
         if events.is_empty() {
-            return Ok(Self::new(input, key));
+            return Ok(Self::new(input, assurance, key));
         }
-        verify_output_event_envelopes(SchemeId::Evaluate, input, &public_key, &events)?;
+        let scheme = scheme_id(Operation::Evaluate, assurance);
+        verify_output_event_envelopes(scheme, input, &public_key, &events)?;
         let next_position = verify_token_prefix(&events)?;
         if *events[0].event().public_key() != public_key {
             return Err(EvaluateProtocolError::ProducerKeyMismatch);
         }
         Ok(Self {
             inner: OutputTranscriptBuilder::resume_verified(
-                SchemeId::Evaluate,
+                scheme,
                 input,
                 key,
                 output_canonicalization(),
@@ -226,6 +228,7 @@ impl<'a> EvaluateOutputTranscriptBuilder<'a> {
 
 pub fn verify_output_events(
     input: InputCommitment,
+    assurance: Assurance,
     events: &[OutputEventEnvelope],
 ) -> Result<EvaluateOutput, EvaluateProtocolError> {
     let producer_key = *events
@@ -233,7 +236,12 @@ pub fn verify_output_events(
         .ok_or(EvaluateProtocolError::EmptyOutputTranscript)?
         .event()
         .public_key();
-    verify_output_event_envelopes(SchemeId::Evaluate, input, &producer_key, events)?;
+    verify_output_event_envelopes(
+        scheme_id(Operation::Evaluate, assurance),
+        input,
+        &producer_key,
+        events,
+    )?;
     let (token_deltas, terminal) = output_payloads(events)?;
     Ok(EvaluateOutput {
         producer_key,
@@ -243,6 +251,7 @@ pub fn verify_output_events(
 }
 
 pub fn verify_terminal_continuation(
+    assurance: Assurance,
     streamed_prefix: &[OutputEventEnvelope],
     finished: &[OutputEventEnvelope],
 ) -> Result<(), EvaluateProtocolError> {
@@ -255,7 +264,7 @@ pub fn verify_terminal_continuation(
         .first()
         .ok_or(EvaluateProtocolError::EmptyOutputTranscript)?;
     let input = first.event().body().input();
-    verify_output_events(input, finished)?;
+    verify_output_events(input, assurance, finished)?;
     for (index, streamed) in streamed_prefix.iter().enumerate() {
         expect_output_event(streamed, index, TOKEN_DELTA_EVENT_KIND)?;
         let Some(finished_event) = finished.get(index) else {
@@ -378,6 +387,8 @@ pub enum EvaluateProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
     use crate::ProducerSigningKey;
 
     fn key(byte: u8) -> ProducerSigningKey {
@@ -388,7 +399,7 @@ mod tests {
     fn output_events_round_trip_through_shape_verifier() {
         let producer = key(2);
         let input = InputCommitment::from_digest(Digest::from_bytes([3; 32]));
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let first = builder.push_token_delta(vec![10, 11]).unwrap();
         let terminal = EvaluateTerminal {
             final_position: 2,
@@ -403,7 +414,7 @@ mod tests {
         let events = builder.finish(terminal.clone()).unwrap();
 
         assert_eq!(events[0], first);
-        let output = verify_output_events(input, &events).unwrap();
+        let output = verify_output_events(input, TEST_ASSURANCE, &events).unwrap();
         assert_eq!(output.token_deltas.len(), 1);
         assert_eq!(output.token_deltas[0].token_ids, vec![10, 11]);
         assert_eq!(output.terminal, terminal);
@@ -413,11 +424,15 @@ mod tests {
     fn resume_appends_terminal_without_resigning_prefix() {
         let producer = key(2);
         let input = InputCommitment::from_digest(Digest::from_bytes([3; 32]));
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let prefix = vec![builder.push_token_delta(vec![10]).unwrap()];
-        let resumed =
-            EvaluateOutputTranscriptBuilder::resume_verified(input, &producer, prefix.clone())
-                .unwrap();
+        let resumed = EvaluateOutputTranscriptBuilder::resume_verified(
+            input,
+            TEST_ASSURANCE,
+            &producer,
+            prefix.clone(),
+        )
+        .unwrap();
         let events = resumed
             .finish(EvaluateTerminal {
                 final_position: 1,
@@ -432,14 +447,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(events[0], prefix[0]);
-        verify_terminal_continuation(&prefix, &events).unwrap();
+        verify_terminal_continuation(TEST_ASSURANCE, &prefix, &events).unwrap();
     }
 
     #[test]
     fn terminal_position_must_match_token_deltas() {
         let producer = key(2);
         let input = InputCommitment::from_digest(Digest::from_bytes([3; 32]));
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         builder.push_token_delta(vec![10]).unwrap();
 
         assert!(matches!(

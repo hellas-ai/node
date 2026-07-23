@@ -17,6 +17,7 @@ use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+use zeroize::Zeroize;
 
 pub(crate) struct ExecuteWorker {
     tx: SyncSender<ExecuteJob>,
@@ -44,6 +45,24 @@ pub(crate) struct ExecuteJob {
 struct DecodeOutcome {
     stop_reason: StopReason,
     output_tokens: Vec<u32>,
+}
+
+struct SensitivePreparedPrompt(PreparedPrompt);
+
+impl SensitivePreparedPrompt {
+    fn new(input_ids: Vec<i32>, stop_token_ids: Vec<i32>) -> Self {
+        Self(PreparedPrompt::new(input_ids, stop_token_ids))
+    }
+
+    fn prompt(&self) -> &PreparedPrompt {
+        &self.0
+    }
+}
+
+impl Drop for SensitivePreparedPrompt {
+    fn drop(&mut self) {
+        self.0.input_ids.zeroize();
+    }
 }
 
 pub(crate) struct WorkerCompletion {
@@ -114,6 +133,7 @@ fn worker_loop(
         let position = Arc::new(AtomicU64::new(0));
         let mut output_builder = EvaluateOutputTranscriptBuilder::new(
             input_commitment(&evaluate_request),
+            evaluate_request.assurance,
             &producer_key,
         );
         let mut output_events = Vec::new();
@@ -136,15 +156,15 @@ fn worker_loop(
             },
             Ok(Err(err)) => {
                 let msg = format!("{err:#}");
-                warn!("execute worker job {execution_id} failed: {msg}");
+                warn!(%execution_id, "execute worker job failed");
                 WorkerCompletionResult::Failed {
                     position: position.load(Ordering::Relaxed),
                     error: msg,
                 }
             }
-            Err(panic) => {
-                let msg = format!("worker panicked: {}", crate::backend::panic_message(&panic));
-                warn!("execute worker job {execution_id} {msg}");
+            Err(_) => {
+                let msg = "worker panicked; sensitive details suppressed".to_string();
+                warn!(%execution_id, "execute worker stopped without content logging");
                 WorkerCompletionResult::Failed {
                     position: position.load(Ordering::Relaxed),
                     error: msg,
@@ -205,7 +225,7 @@ fn run_job(
             engine
         }
     };
-    let prepared = PreparedPrompt::new(
+    let prepared = SensitivePreparedPrompt::new(
         input_ids_to_i32(&invocation.input_ids)?,
         invocation.stop_token_ids,
     );
@@ -218,7 +238,7 @@ fn run_job(
     let mut progress_error = None;
 
     let generated_output = engine
-        .generate_tokens_from_prepared(&prepared, invocation.max_new_tokens, |token| {
+        .generate_tokens_from_prepared(prepared.prompt(), invocation.max_new_tokens, |token| {
             generated = generated.saturating_add(1);
             output_tokens.push(token.token_id);
             pending.push(token.token_id);

@@ -10,6 +10,7 @@ import "hellas/v1/hellas.proto";
 // templates, model listing, and metrics, or decline to serve them.
 
 service Courtesy {
+  rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
   rpc QuotePreparedText(QuotePreparedTextRequest) returns (QuotePreparedTextResponse);
   rpc QuotePrompt(QuotePromptRequest) returns (QuotePromptResponse);
   rpc QuoteChatPrompt(QuoteChatPromptRequest) returns (QuoteChatPromptResponse);
@@ -49,6 +50,9 @@ message QuotePreparedTextRequest {
   // QuotePreparedTextResponse.dtype.
   repeated string accept_dtypes = 7;
   .hellas.v1.PublicKey runner_public_key = 8;
+  .hellas.v1.Assurance assurance = 9;
+  // Absence preserves the historical default: retain.
+  optional bool retain = 10;
 }
 
 message QuotePreparedTextResponse {
@@ -74,6 +78,9 @@ message QuotePromptRequest {
   // QuotePromptResponse.dtype.
   repeated string accept_dtypes = 5;
   .hellas.v1.PublicKey runner_public_key = 6;
+  .hellas.v1.Assurance assurance = 7;
+  // Absence preserves the historical default: retain.
+  optional bool retain = 8;
 }
 
 message QuotePromptResponse {
@@ -105,6 +112,9 @@ message QuoteChatPromptRequest {
   // QuoteChatPromptResponse.dtype.
   repeated string accept_dtypes = 6;
   .hellas.v1.PublicKey runner_public_key = 7;
+  .hellas.v1.Assurance assurance = 8;
+  // Absence preserves the historical default: retain.
+  optional bool retain = 9;
 }
 
 message QuoteChatPromptResponse {

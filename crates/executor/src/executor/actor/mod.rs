@@ -16,7 +16,7 @@ use crate::scheme::SchemeEngine;
 use crate::state::{ArtifactStoreConfig, ExecutorState};
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::{AssuranceRequirement, Dtype, ProducerSigningKey};
+use hellas_rpc::{Assurance, Dtype, ProducerSigningKey};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -46,7 +46,7 @@ pub struct ExecutorSpawnConfig {
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
     pub provider_genesis: Arc<Vec<u8>>,
-    pub assurance: AssuranceRequirement,
+    pub assurance: Assurance,
     pub fetch_access_policy: FetchAccessPolicy,
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -79,7 +79,7 @@ impl Executor {
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
         provider_genesis: Vec<u8>,
-        assurance: AssuranceRequirement,
+        assurance: Assurance,
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);
         Self::spawn_runtime(ExecutorRuntimeConfig {
@@ -108,7 +108,7 @@ impl Executor {
         supported_dtypes: Vec<Dtype>,
         producer_key: ProducerSigningKey,
         provider_genesis: Vec<u8>,
-        assurance: AssuranceRequirement,
+        assurance: Assurance,
         fetch_routes: FetchRouteRegistry,
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);

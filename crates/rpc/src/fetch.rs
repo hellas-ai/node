@@ -1,13 +1,14 @@
 use std::str;
 
 use crate::{
-    CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope, InputTranscriptBuilder,
-    JsonBytes, OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey,
-    SchemeId, StreamVerifyError, verify_input_event_envelopes, verify_output_event_envelopes,
+    Assurance, CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope,
+    InputTranscriptBuilder, JsonBytes, Operation, OutputEventEnvelope, OutputTranscriptBuilder,
+    ProducerSigningKey, PublicKey, Retention, StreamVerifyError, scheme_id,
+    verify_input_event_envelopes, verify_output_event_envelopes,
 };
 use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 
-const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v2";
+const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
 const OUTPUT_EVENT_KIND: &str = "response.event";
 const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
@@ -15,11 +16,13 @@ const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchInput {
     pub input_commitment: InputCommitment,
+    pub assurance: Assurance,
     pub caller_key: PublicKey,
     pub execution_environment: ContentId,
     pub service: String,
     pub method: String,
     pub body: JsonBytes,
+    pub retention: Retention,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,13 +51,39 @@ pub fn build_input_events(
     method: &str,
     payload: &[u8],
     execution_environment: ContentId,
+    assurance: Assurance,
     key: &ProducerSigningKey,
+) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
+    build_input_events_with_retention(
+        service,
+        method,
+        payload,
+        execution_environment,
+        assurance,
+        key,
+        Retention::Retain,
+    )
+}
+
+pub fn build_input_events_with_retention(
+    service: &str,
+    method: &str,
+    payload: &[u8],
+    execution_environment: ContentId,
+    assurance: Assurance,
+    key: &ProducerSigningKey,
+    retention: Retention,
 ) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
     validate_non_empty_service_method(service, method)?;
     validate_json("request.body", payload)?;
-    let mut builder = InputTranscriptBuilder::new(SchemeId::Fetch, key, input_canonicalization());
+    let mut builder = InputTranscriptBuilder::new(
+        scheme_id(Operation::Fetch, assurance),
+        key,
+        input_canonicalization(),
+    );
     let mut nonce = [0; 32];
     OsRng.fill_bytes(&mut nonce);
+    builder.push("assurance", vec![assurance.to_byte()])?;
     builder.push(
         "execution.environment",
         execution_environment.as_bytes().to_vec(),
@@ -62,6 +91,7 @@ pub fn build_input_events(
     builder.push("request.nonce", nonce.to_vec())?;
     builder.push("service", service.as_bytes().to_vec())?;
     builder.push("method", method.as_bytes().to_vec())?;
+    builder.push("request.retain", vec![u8::from(retention.should_retain())])?;
     builder.push("request.body", payload.to_vec())?;
     builder.push("input.end", Vec::new())?;
     let (events, _) = builder.finish()?;
@@ -70,11 +100,16 @@ pub fn build_input_events(
 
 pub fn build_output_events(
     input: InputCommitment,
+    assurance: Assurance,
     payload: &[u8],
     key: &ProducerSigningKey,
 ) -> Result<Vec<OutputEventEnvelope>, FetchProtocolError> {
-    let mut builder =
-        OutputTranscriptBuilder::new(SchemeId::Fetch, input, key, output_canonicalization());
+    let mut builder = OutputTranscriptBuilder::new(
+        scheme_id(Operation::Fetch, assurance),
+        input,
+        key,
+        output_canonicalization(),
+    );
     builder.push(OUTPUT_TERMINAL_KIND, payload.to_vec())?;
     let (events, _) = builder.finish()?;
     Ok(events)
@@ -85,10 +120,10 @@ pub struct FetchOutputTranscriptBuilder<'a> {
 }
 
 impl<'a> FetchOutputTranscriptBuilder<'a> {
-    pub fn new(input: InputCommitment, key: &'a ProducerSigningKey) -> Self {
+    pub fn new(input: InputCommitment, assurance: Assurance, key: &'a ProducerSigningKey) -> Self {
         Self {
             inner: OutputTranscriptBuilder::new(
-                SchemeId::Fetch,
+                scheme_id(Operation::Fetch, assurance),
                 input,
                 key,
                 output_canonicalization(),
@@ -121,22 +156,27 @@ pub fn verify_input_events(
         .ok_or(FetchProtocolError::EmptyInputTranscript)?
         .event()
         .public_key();
-    let input_commitment = verify_input_event_envelopes(SchemeId::Fetch, &caller_key, events)?;
-    let (execution_environment, service, method, body) = input_parts(events)?;
+    let assurance = input_assurance(events)?;
+    let input_commitment =
+        verify_input_event_envelopes(scheme_id(Operation::Fetch, assurance), &caller_key, events)?;
+    let (execution_environment, service, method, body, retention) = input_parts(events)?;
     validate_non_empty_service_method(&service, &method)?;
     validate_json("request.body", body.as_bytes())?;
     Ok(FetchInput {
         input_commitment,
+        assurance,
         caller_key,
         execution_environment,
         service,
         method,
         body,
+        retention,
     })
 }
 
 pub fn verify_output_events(
     input: InputCommitment,
+    assurance: Assurance,
     events: &[OutputEventEnvelope],
 ) -> Result<FetchOutput, FetchProtocolError> {
     let producer_key = *events
@@ -144,7 +184,12 @@ pub fn verify_output_events(
         .ok_or(FetchProtocolError::EmptyOutputTranscript)?
         .event()
         .public_key();
-    verify_output_event_envelopes(SchemeId::Fetch, input, &producer_key, events)?;
+    verify_output_event_envelopes(
+        scheme_id(Operation::Fetch, assurance),
+        input,
+        &producer_key,
+        events,
+    )?;
     let (event_payloads, terminal_payload) = output_payloads(events)?;
     Ok(FetchOutput {
         producer_key,
@@ -154,6 +199,7 @@ pub fn verify_output_events(
 }
 
 pub fn verify_terminal_continuation(
+    assurance: Assurance,
     streamed_prefix: &[OutputEventEnvelope],
     finished: &[OutputEventEnvelope],
 ) -> Result<(), FetchProtocolError> {
@@ -170,7 +216,12 @@ pub fn verify_terminal_continuation(
         .ok_or(FetchProtocolError::EmptyOutputTranscript)?;
     let input = first.event().body().input();
     let producer_key = *first.event().public_key();
-    verify_output_event_envelopes(SchemeId::Fetch, input, &producer_key, finished)?;
+    verify_output_event_envelopes(
+        scheme_id(Operation::Fetch, assurance),
+        input,
+        &producer_key,
+        finished,
+    )?;
     output_payloads(finished)?;
     for (index, streamed) in streamed_prefix.iter().enumerate() {
         expect_output_event(streamed, index, OUTPUT_EVENT_KIND)?;
@@ -208,49 +259,74 @@ fn output_payloads(
 
 fn input_parts(
     events: &[InputEventEnvelope],
-) -> Result<(ContentId, String, String, JsonBytes), FetchProtocolError> {
-    if events.len() != 6 {
+) -> Result<(ContentId, String, String, JsonBytes, Retention), FetchProtocolError> {
+    if events.len() != 8 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
         });
     }
-    expect_input_event(&events[0], 0, "execution.environment")?;
-    expect_input_event(&events[1], 1, "request.nonce")?;
-    expect_input_event(&events[2], 2, "service")?;
-    expect_input_event(&events[3], 3, "method")?;
-    expect_input_event(&events[4], 4, "request.body")?;
-    expect_input_event(&events[5], 5, "input.end")?;
-    if !events[5].payload().is_empty() {
+    expect_input_event(&events[0], 0, "assurance")?;
+    expect_input_event(&events[1], 1, "execution.environment")?;
+    expect_input_event(&events[2], 2, "request.nonce")?;
+    expect_input_event(&events[3], 3, "service")?;
+    expect_input_event(&events[4], 4, "method")?;
+    expect_input_event(&events[5], 5, "request.retain")?;
+    expect_input_event(&events[6], 6, "request.body")?;
+    expect_input_event(&events[7], 7, "input.end")?;
+    if !events[7].payload().is_empty() {
         return Err(FetchProtocolError::NonEmptyInputEnd);
     }
-    let execution_environment = ContentId::from_slice(events[0].payload()).map_err(|_| {
+    let execution_environment = ContentId::from_slice(events[1].payload()).map_err(|_| {
         FetchProtocolError::WrongInputLength {
             field: "execution.environment",
-            actual: events[0].payload().len(),
+            actual: events[1].payload().len(),
         }
     })?;
-    if events[1].payload().len() != 32 {
+    if events[2].payload().len() != 32 {
         return Err(FetchProtocolError::WrongInputLength {
             field: "request.nonce",
-            actual: events[1].payload().len(),
+            actual: events[2].payload().len(),
         });
     }
     let service =
-        str::from_utf8(events[2].payload()).map_err(|source| FetchProtocolError::Utf8 {
+        str::from_utf8(events[3].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "service",
             source,
         })?;
     let method =
-        str::from_utf8(events[3].payload()).map_err(|source| FetchProtocolError::Utf8 {
+        str::from_utf8(events[4].payload()).map_err(|source| FetchProtocolError::Utf8 {
             field: "method",
             source,
         })?;
+    let retention = match events[5].payload() {
+        [0] => Retention::Ephemeral,
+        [1] => Retention::Retain,
+        payload => {
+            return Err(FetchProtocolError::InvalidRetention {
+                actual: payload.to_vec(),
+            });
+        }
+    };
     Ok((
         execution_environment,
         service.to_string(),
         method.to_string(),
-        JsonBytes::new(events[4].payload().to_vec()),
+        JsonBytes::new(events[6].payload().to_vec()),
+        retention,
     ))
+}
+
+fn input_assurance(events: &[InputEventEnvelope]) -> Result<Assurance, FetchProtocolError> {
+    let event = events
+        .first()
+        .ok_or(FetchProtocolError::EmptyInputTranscript)?;
+    expect_input_event(event, 0, "assurance")?;
+    let [tag] = event.payload() else {
+        return Err(FetchProtocolError::WrongAssuranceLength {
+            actual: event.payload().len(),
+        });
+    };
+    Assurance::from_byte(*tag).map_err(|_| FetchProtocolError::UnknownAssurance(*tag))
 }
 
 fn validate_non_empty_service_method(
@@ -322,8 +398,14 @@ pub enum FetchProtocolError {
     EmptyInputTranscript,
     #[error("fetch output transcript is empty")]
     EmptyOutputTranscript,
-    #[error("fetch input transcript must contain exactly 6 events, got {actual}")]
+    #[error("fetch input transcript must contain exactly 8 events, got {actual}")]
     WrongInputEventCount { actual: usize },
+    #[error("fetch assurance must be exactly one byte, got {actual}")]
+    WrongAssuranceLength { actual: usize },
+    #[error("unknown fetch assurance tag 0x{0:02x}")]
+    UnknownAssurance(u8),
+    #[error("fetch retention signal must be exactly one byte, 0 or 1; got {actual:?}")]
+    InvalidRetention { actual: Vec<u8> },
     #[error("fetch {field} must be 32 bytes, got {actual}")]
     WrongInputLength { field: &'static str, actual: usize },
     #[error("fetch output transcript must contain exactly one terminal event, got {actual} events")]
@@ -368,6 +450,8 @@ pub enum FetchProtocolError {
 mod tests {
     use super::*;
 
+    const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
+
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
     }
@@ -384,25 +468,92 @@ mod tests {
             "responses",
             br#"{"model":"gpt"}"#,
             environment(),
+            TEST_ASSURANCE,
             &caller,
         )
         .unwrap();
 
         let input = verify_input_events(&events).unwrap();
 
+        assert_eq!(input.assurance, TEST_ASSURANCE);
         assert_eq!(input.caller_key, caller.public_key());
         assert_eq!(input.service, "openai");
         assert_eq!(input.method, "responses");
         assert_eq!(input.body.as_bytes(), br#"{"model":"gpt"}"#);
+        assert_eq!(input.retention, Retention::Retain);
+    }
+
+    #[test]
+    fn ephemeral_retention_round_trips_in_signed_input() {
+        let caller = key(1);
+        let events = build_input_events_with_retention(
+            "openai",
+            "responses",
+            br#"{"store":false}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &caller,
+            Retention::Ephemeral,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_input_events(&events).unwrap().retention,
+            Retention::Ephemeral
+        );
+    }
+
+    #[test]
+    fn input_retention_commitment_vector_is_pinned() {
+        let caller = key(1);
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
+            &caller,
+            input_canonicalization(),
+        );
+        builder
+            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
+            .unwrap();
+        builder
+            .push("execution.environment", environment().as_bytes().to_vec())
+            .unwrap();
+        builder.push("request.nonce", vec![7; 32]).unwrap();
+        builder.push("service", b"openai".to_vec()).unwrap();
+        builder.push("method", b"responses".to_vec()).unwrap();
+        builder.push("request.retain", vec![0]).unwrap();
+        builder
+            .push("request.body", br#"{"input":"private"}"#.to_vec())
+            .unwrap();
+        builder.push("input.end", Vec::new()).unwrap();
+        let (_events, commitment) = builder.finish().unwrap();
+
+        assert_eq!(
+            commitment.digest().to_string(),
+            "707775ab9509186b6cfd49cd281515e86eb0a5719da9d052db9d47df0d6e7177"
+        );
     }
 
     #[test]
     fn identical_requests_get_fresh_commitments() {
         let caller = key(1);
-        let first =
-            build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap();
-        let second =
-            build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap();
+        let first = build_input_events(
+            "openai",
+            "responses",
+            br#"{}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &caller,
+        )
+        .unwrap();
+        let second = build_input_events(
+            "openai",
+            "responses",
+            br#"{}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &caller,
+        )
+        .unwrap();
         assert_ne!(
             verify_input_events(&first).unwrap().input_commitment,
             verify_input_events(&second).unwrap().input_commitment
@@ -419,20 +570,47 @@ mod tests {
                 "responses",
                 br#"{"model":"gpt"}"#,
                 environment(),
+                TEST_ASSURANCE,
                 &caller,
             )
             .unwrap(),
         )
         .unwrap()
         .input_commitment;
-        let events = build_output_events(input, br#"{"id":"resp"}"#, &producer).unwrap();
+        let events =
+            build_output_events(input, TEST_ASSURANCE, br#"{"id":"resp"}"#, &producer).unwrap();
 
-        let output = verify_output_events(input, &events).unwrap();
+        let output = verify_output_events(input, TEST_ASSURANCE, &events).unwrap();
         let (payloads, terminal) = output.output_event_payloads();
 
         assert_eq!(output.producer_key, producer.public_key());
         assert!(payloads.is_empty());
         assert_eq!(terminal, br#"{"id":"resp"}"#);
+    }
+
+    #[test]
+    fn output_events_reject_a_different_assurance() {
+        let caller = key(1);
+        let producer = key(2);
+        let input = verify_input_events(
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{}"#,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .input_commitment;
+        let events = build_output_events(input, TEST_ASSURANCE, br#"{}"#, &producer).unwrap();
+
+        assert!(matches!(
+            verify_output_events(input, Assurance::AppleAppAttest, &events).unwrap_err(),
+            FetchProtocolError::Stream(StreamVerifyError::SchemeMismatch)
+        ));
     }
 
     #[test]
@@ -445,13 +623,14 @@ mod tests {
                 "responses",
                 br#"{"model":"gpt"}"#,
                 environment(),
+                TEST_ASSURANCE,
                 &caller,
             )
             .unwrap(),
         )
         .unwrap()
         .input_commitment;
-        let mut builder = FetchOutputTranscriptBuilder::new(input, &producer);
+        let mut builder = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let first = builder
             .push_event(b"semantic-output-event-1".to_vec())
             .unwrap();
@@ -462,7 +641,7 @@ mod tests {
 
         assert_eq!(events[0], first);
         assert_eq!(events[1], second);
-        let output = verify_output_events(input, &events).unwrap();
+        let output = verify_output_events(input, TEST_ASSURANCE, &events).unwrap();
         let (payloads, terminal) = output.output_event_payloads();
 
         assert_eq!(output.producer_key, producer.public_key());
@@ -474,7 +653,7 @@ mod tests {
             ]
         );
         assert_eq!(terminal, b"semantic-terminal");
-        verify_terminal_continuation(&events[..2], &events).unwrap();
+        verify_terminal_continuation(TEST_ASSURANCE, &events[..2], &events).unwrap();
     }
 
     #[test]
@@ -487,6 +666,7 @@ mod tests {
                 "responses",
                 br#"{"model":"gpt"}"#,
                 environment(),
+                TEST_ASSURANCE,
                 &caller,
             )
             .unwrap(),
@@ -494,18 +674,19 @@ mod tests {
         .unwrap()
         .input_commitment;
 
-        let mut streamed = FetchOutputTranscriptBuilder::new(input, &producer);
+        let mut streamed = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         let first_streamed = streamed.push_event(b"live-event".to_vec()).unwrap();
         let _streamed_finished = streamed.finish(b"terminal".to_vec()).unwrap();
 
-        let mut divergent = FetchOutputTranscriptBuilder::new(input, &producer);
+        let mut divergent = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
         divergent
             .push_event(b"different-live-event".to_vec())
             .unwrap();
         let divergent_finished = divergent.finish(b"terminal".to_vec()).unwrap();
 
         assert!(matches!(
-            verify_terminal_continuation(&[first_streamed], &divergent_finished).unwrap_err(),
+            verify_terminal_continuation(TEST_ASSURANCE, &[first_streamed], &divergent_finished,)
+                .unwrap_err(),
             FetchProtocolError::OutputPrefixMismatch { index: 0 }
         ));
     }
@@ -513,14 +694,21 @@ mod tests {
     #[test]
     fn input_rejects_empty_service() {
         let caller = key(1);
-        let mut builder =
-            InputTranscriptBuilder::new(SchemeId::Fetch, &caller, input_canonicalization());
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
+            &caller,
+            input_canonicalization(),
+        );
+        builder
+            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
+            .unwrap();
         builder
             .push("execution.environment", environment().as_bytes().to_vec())
             .unwrap();
         builder.push("request.nonce", vec![0; 32]).unwrap();
         builder.push("service", Vec::new()).unwrap();
         builder.push("method", b"responses".to_vec()).unwrap();
+        builder.push("request.retain", vec![1]).unwrap();
         builder.push("request.body", br#"{}"#.to_vec()).unwrap();
         builder.push("input.end", Vec::new()).unwrap();
         let (events, _) = builder.finish().unwrap();
@@ -535,16 +723,20 @@ mod tests {
     fn input_rejects_wrong_canonicalization() {
         let caller = key(1);
         let mut builder = InputTranscriptBuilder::new(
-            SchemeId::Fetch,
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
             &caller,
             CanonicalizationId::from_bytes(b"wrong.input.v2"),
         );
+        builder
+            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
+            .unwrap();
         builder
             .push("execution.environment", environment().as_bytes().to_vec())
             .unwrap();
         builder.push("request.nonce", vec![0; 32]).unwrap();
         builder.push("service", b"openai".to_vec()).unwrap();
         builder.push("method", b"responses".to_vec()).unwrap();
+        builder.push("request.retain", vec![1]).unwrap();
         builder.push("request.body", br#"{}"#.to_vec()).unwrap();
         builder.push("input.end", Vec::new()).unwrap();
         let (events, _) = builder.finish().unwrap();
@@ -560,11 +752,20 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap(),
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{}"#,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            )
+            .unwrap(),
         )
         .unwrap()
         .input_commitment;
-        let events = build_output_events(input, br#"{"ok":true}"#, &producer).unwrap();
+        let events =
+            build_output_events(input, TEST_ASSURANCE, br#"{"ok":true}"#, &producer).unwrap();
 
         assert!(matches!(
             OutputEventEnvelope::new(events[0].event().clone(), br#"{"ok":false}"#.to_vec(),)
@@ -578,12 +779,20 @@ mod tests {
         let caller = key(1);
         let producer = key(2);
         let input = verify_input_events(
-            &build_input_events("openai", "responses", br#"{}"#, environment(), &caller).unwrap(),
+            &build_input_events(
+                "openai",
+                "responses",
+                br#"{}"#,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            )
+            .unwrap(),
         )
         .unwrap()
         .input_commitment;
         let mut builder = OutputTranscriptBuilder::new(
-            SchemeId::Fetch,
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
             input,
             &producer,
             CanonicalizationId::from_bytes(b"wrong.output.v2"),
@@ -594,7 +803,7 @@ mod tests {
         let (events, _) = builder.finish().unwrap();
 
         assert!(matches!(
-            verify_output_events(input, &events).unwrap_err(),
+            verify_output_events(input, TEST_ASSURANCE, &events).unwrap_err(),
             FetchProtocolError::OutputCanonicalizationMismatch { index: 0 }
         ));
     }

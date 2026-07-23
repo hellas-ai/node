@@ -14,7 +14,7 @@ use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::{AssuranceRequirement, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
+use hellas_rpc::{Assurance, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
 use hellas_wire::WireStatus;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -28,7 +28,7 @@ pub use actor::{Executor, ExecutorSpawnConfig};
 pub(crate) struct ProviderContext {
     pub producer_key: Arc<ProducerSigningKey>,
     pub genesis: Arc<Vec<u8>>,
-    pub assurance: AssuranceRequirement,
+    pub assurance: Assurance,
 }
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
@@ -138,6 +138,7 @@ pub(crate) struct PendingFetch {
     pub projector: Box<dyn FetchProjector>,
     pub quota_reservation: Option<FetchQuotaReservation>,
     pub input_commitment: InputCommitment,
+    pub assurance: Assurance,
     pub request_commitment_id: [u8; 32],
     pub execution_id: String,
     pub model_id: String,

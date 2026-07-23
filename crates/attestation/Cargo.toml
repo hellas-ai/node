@@ -10,6 +10,7 @@ documentation.workspace = true
 [features]
 default = []
 apple-app-attest = [
+    "dep:base64",
     "dep:cc",
     "dep:ciborium",
     "dep:p256",
@@ -22,6 +23,7 @@ apple-app-attest = [
 ]
 
 [dependencies]
+base64 = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute"] }
 p256 = { workspace = true, optional = true }
@@ -34,7 +36,7 @@ thiserror.workspace = true
 x509-cert = { workspace = true, optional = true }
 
 [dev-dependencies]
-base64.workspace = true
+hex.workspace = true
 tokio.workspace = true
 
 [build-dependencies]

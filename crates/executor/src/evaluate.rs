@@ -23,12 +23,14 @@ use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 use hellas_rpc::spec::ModelSpec;
-use hellas_rpc::{Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey};
+use hellas_rpc::{
+    Assurance, Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::artifacts::EvaluateArtifactStore;
+use crate::artifacts::{EvaluateArtifactStore, EvaluateArtifactStores};
 use crate::executor::{ExecuteOutcome, ExecutorMessage, ProviderContext, TicketOutcome};
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
@@ -74,7 +76,7 @@ enum StartExecutionError {
 }
 
 pub struct EvaluateEngine {
-    artifacts: EvaluateArtifactStore,
+    artifacts: EvaluateArtifactStores,
     supported_dtypes: Vec<Dtype>,
     models: HashMap<ModelLocator, LocalModelStatus>,
     completed: HashMap<[u8; 32], CompletedEvaluate>,
@@ -89,6 +91,7 @@ pub struct EvaluateEngine {
 #[derive(Clone)]
 struct CompletedEvaluate {
     runner_public_key: PublicKey,
+    assurance: Assurance,
     termination: Termination,
 }
 
@@ -103,7 +106,7 @@ impl EvaluateEngine {
         tx: mpsc::UnboundedSender<ExecutorMessage>,
     ) -> Self {
         Self {
-            artifacts,
+            artifacts: EvaluateArtifactStores::new(artifacts),
             supported_dtypes,
             models: HashMap::new(),
             completed: HashMap::new(),
@@ -132,6 +135,7 @@ impl EvaluateEngine {
         &self,
         request_commitment: [u8; 32],
         runner_public_key: &PublicKey,
+        assurance: Assurance,
     ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
         let Some(completed) = self.completed.get(&request_commitment) else {
             return Ok(None);
@@ -139,6 +143,11 @@ impl EvaluateEngine {
         if completed.runner_public_key != *runner_public_key {
             return Err(ExecutorError::PolicyDenied(
                 "run ticket signer is not authorized for this ticket".to_string(),
+            ));
+        }
+        if completed.assurance != assurance {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "evaluate request assurance does not match ticket terms".to_string(),
             ));
         }
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
@@ -186,6 +195,7 @@ impl EvaluateEngine {
     ) -> Result<(Termination, u64), ExecutorError> {
         let text_artifact = self
             .artifacts
+            .for_retention(evaluate_request.retention())
             .record_completed_text(evaluate_request, invocation, &output_tokens)
             .await?;
         let input_units = invocation.input_ids.len() as u64;
@@ -206,6 +216,7 @@ impl EvaluateEngine {
         };
         let output_events = EvaluateOutputTranscriptBuilder::resume_verified(
             input_commitment(evaluate_request),
+            evaluate_request.assurance,
             &self.provider.producer_key,
             output_events,
         )
@@ -237,8 +248,10 @@ impl SchemeEngine for EvaluateEngine {
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
         store.prune_expired_quotes(Instant::now());
         let evaluate_request = crate::state::evaluate_request_from_pb(request)?;
+        ensure_supported_assurance(evaluate_request.assurance, self.provider.assurance)?;
         let resolved = self
             .artifacts
+            .for_retention(evaluate_request.retention())
             .resolve_evaluate_request(evaluate_request.clone())
             .await?;
         if !self.supported_dtypes.contains(&resolved.locator.dtype) {
@@ -260,7 +273,7 @@ impl SchemeEngine for EvaluateEngine {
         let (terms, ticket) = quote_ticket(
             request_commitment,
             self.provider.genesis.as_slice(),
-            self.provider.assurance.clone(),
+            evaluate_request.assurance,
         )?;
         let model_id = resolved.locator.spec();
         let request_commitment_bytes = store.create_quote(QuoteRecord {
@@ -292,6 +305,7 @@ impl SchemeEngine for EvaluateEngine {
         let total_start = Instant::now();
         store.prune_expired_quotes(Instant::now());
         let plan = QuotePlan::from_prepared_text_request(request, &self.supported_dtypes)?;
+        ensure_supported_assurance(plan.assurance, self.provider.assurance)?;
 
         if !self
             .execute_policy
@@ -303,14 +317,18 @@ impl SchemeEngine for EvaluateEngine {
             )));
         }
 
-        let resolved = self.artifacts.record_prepared_text(&plan).await?;
+        let resolved = self
+            .artifacts
+            .for_retention(plan.retention)
+            .record_prepared_text(&plan)
+            .await?;
         let evaluate_request = resolved.evaluate_request.clone();
         let evaluate_request_pb = evaluate_request_to_pb(&evaluate_request);
         let request_commitment = Evaluate::commit_request(&evaluate_request);
         let (terms, ticket) = quote_ticket(
             request_commitment,
             self.provider.genesis.as_slice(),
-            self.provider.assurance.clone(),
+            evaluate_request.assurance,
         )?;
         let commitment_id = request_commitment.digest();
         let model_id = plan.locator.spec();
@@ -365,12 +383,15 @@ impl SchemeEngine for EvaluateEngine {
         let prepared = assets.prepare_plain(&request.prompt)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
+        let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
         let quote = assets.prepare_quote(&prepared)?;
         let prepared_request = quote_prepared_text_request(
             quote,
             request.max_new_tokens,
             dtype.as_wire().to_string(),
             &runner_public_key,
+            request.assurance,
+            retention,
         );
         let inner = self.quote_prepared_text(store, prepared_request).await?;
 
@@ -413,12 +434,15 @@ impl SchemeEngine for EvaluateEngine {
         let prepared = assets.prepare_chat(&messages)?;
         let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
+        let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
         let quote = assets.prepare_quote(&prepared)?;
         let prepared_request = quote_prepared_text_request(
             quote,
             request.max_new_tokens,
             dtype.as_wire().to_string(),
             &runner_public_key,
+            request.assurance,
+            retention,
         );
         let inner = self.quote_prepared_text(store, prepared_request).await?;
 
@@ -466,6 +490,7 @@ impl SchemeEngine for EvaluateEngine {
     ) -> Result<PutArtifactResponse, ExecutorError> {
         let digest = self
             .artifacts
+            .retained()
             .publish_canonical_bytes(request.canonical_artifact)
             .await?;
         Ok(PutArtifactResponse {
@@ -477,8 +502,12 @@ impl SchemeEngine for EvaluateEngine {
         &mut self,
         request: GetArtifactRequest,
     ) -> Result<GetArtifactResponse, ExecutorError> {
+        // Courtesy only exposes the retained store. Ephemeral prompt and
+        // token artifacts live in the separate memory store and are never
+        // reachable through this API.
         let canonical_artifact = self
             .artifacts
+            .retained()
             .get_canonical_bytes(digest_from_slice(&request.digest, "digest")?)
             .await?;
         Ok(GetArtifactResponse { canonical_artifact })
@@ -577,8 +606,10 @@ impl SchemeEngine for EvaluateEngine {
         &self,
         request_commitment: [u8; 32],
         runner_public_key: &PublicKey,
+        assurance: Assurance,
     ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
-        EvaluateEngine::replay_completed(self, request_commitment, runner_public_key).await
+        EvaluateEngine::replay_completed(self, request_commitment, runner_public_key, assurance)
+            .await
     }
 
     async fn on_completion(&mut self, completion: Box<dyn crate::scheme::SchemeCompletion>) {
@@ -629,7 +660,8 @@ impl SchemeEngine for EvaluateEngine {
                         Err(err) => {
                             let msg = format!("{err:#}");
                             warn!(
-                                "execute worker job {execution_id} failed while recording/signing output transcript: {msg}"
+                                %execution_id,
+                                "execute worker failed while recording/signing output transcript"
                             );
                             (
                                 Termination::Failed {
@@ -654,6 +686,7 @@ impl SchemeEngine for EvaluateEngine {
                 request_commitment,
                 CompletedEvaluate {
                     runner_public_key: evaluate_request.runner_public_key,
+                    assurance: evaluate_request.assurance,
                     termination: termination.clone(),
                 },
             );
@@ -674,6 +707,8 @@ fn quote_prepared_text_request(
     max_new_tokens: u32,
     accept_dtype: String,
     runner_public_key: &hellas_rpc::PublicKey,
+    assurance: i32,
+    retention: hellas_rpc::Retention,
 ) -> QuotePreparedTextRequest {
     QuotePreparedTextRequest {
         huggingface_model_id: quote.huggingface_model_id,
@@ -686,6 +721,21 @@ fn quote_prepared_text_request(
         }),
         accept_dtypes: vec![accept_dtype],
         runner_public_key: Some(public_key_to_pb(runner_public_key)),
+        assurance,
+        retain: Some(retention.should_retain()),
+    }
+}
+
+fn ensure_supported_assurance(
+    request: Assurance,
+    provider: Assurance,
+) -> Result<(), ExecutorError> {
+    if request == provider {
+        Ok(())
+    } else {
+        Err(ExecutorError::InvalidQuoteRequest(
+            "request assurance does not match provider assurance".to_string(),
+        ))
     }
 }
 
@@ -736,11 +786,7 @@ mod tests {
             ProviderContext {
                 producer_key,
                 genesis: Arc::new(b"genesis".to_vec()),
-                assurance: hellas_rpc::AssuranceRequirement::new(
-                    hellas_rpc::APPLE_APP_ATTEST,
-                    hellas_rpc::ContentId::from_bytes([8; 32]),
-                )
-                .unwrap(),
+                assurance: Assurance::ProducerSigned,
             },
             tx,
         )
@@ -754,7 +800,8 @@ mod tests {
         let request_commitment = [7; 32];
         let input =
             hellas_rpc::InputCommitment::from_digest(Digest::from_bytes(request_commitment));
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, &producer);
+        let mut builder =
+            EvaluateOutputTranscriptBuilder::new(input, Assurance::ProducerSigned, &producer);
         builder.push_token_delta(vec![10]).unwrap();
         let output_events = builder
             .finish(EvaluateTerminal {
@@ -774,12 +821,13 @@ mod tests {
             request_commitment,
             CompletedEvaluate {
                 runner_public_key: runner,
+                assurance: Assurance::ProducerSigned,
                 termination,
             },
         );
 
         let mut outcome = engine
-            .replay_completed(request_commitment, &runner)
+            .replay_completed(request_commitment, &runner, Assurance::ProducerSigned)
             .await
             .unwrap()
             .expect("stored completion should replay");
@@ -804,6 +852,7 @@ mod tests {
             request_commitment,
             CompletedEvaluate {
                 runner_public_key: runner,
+                assurance: Assurance::ProducerSigned,
                 termination: Termination::Failed {
                     position: 0,
                     error: "not replayed".to_string(),
@@ -812,9 +861,34 @@ mod tests {
         );
 
         let err = engine
-            .replay_completed(request_commitment, &wrong_runner)
+            .replay_completed(request_commitment, &wrong_runner, Assurance::ProducerSigned)
             .await
             .unwrap_err();
         assert!(matches!(err, ExecutorError::PolicyDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn replay_completed_rejects_wrong_assurance() {
+        let producer = Arc::new(key(2));
+        let runner = key(3).public_key();
+        let mut engine = test_engine(producer);
+        let request_commitment = [7; 32];
+        engine.completed.insert(
+            request_commitment,
+            CompletedEvaluate {
+                runner_public_key: runner,
+                assurance: Assurance::ProducerSigned,
+                termination: Termination::Failed {
+                    position: 0,
+                    error: "not replayed".to_string(),
+                },
+            },
+        );
+
+        let err = engine
+            .replay_completed(request_commitment, &runner, Assurance::AppleAppAttest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::InvalidQuoteRequest(_)));
     }
 }

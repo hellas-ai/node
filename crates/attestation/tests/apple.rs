@@ -1,60 +1,287 @@
 #![cfg(feature = "apple-app-attest")]
 
+use std::collections::BTreeMap;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use hellas_attestation::{
-    AnchorTime, AppleCredential, ApplePolicy, AppleVerdict, RegisteredAppleCredential,
-    appraise_apple, register_apple, verify_apple_assertion,
+    AnchorTime, AppleCredential, ApplePolicy, AppleVerdict, AttestationError,
+    RegisteredAppleCredential, apple_app_attest_root_ca, apple_app_id_hash,
+    apple_credential_identity, appraise_apple, register_apple, verify_apple_assertion,
 };
+use hellas_rpc::ContentId;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use serde::Serialize;
+use serde_bytes::ByteBuf;
+use sha2::{Digest as _, Sha256};
 
-const ATTESTATION: &str = "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";
-const ASSERTION: &str = "omlzaWduYXR1cmVYSDBGAiEArgYZlV4ENGjcEL2VxZ+VV+AKIR4t0+CHtnQYsQGJaCQCIQDKtWNuxQ/aPsF2b9ofegvPA7BHZB3TQIWOKTEgefmXGHFhdXRoZW50aWNhdG9yRGF0YViZl3UZ9S7UG1oAfJ1f4CeSJqkc2TZAHMPIDLB1ASegE0tAAAAAAaN1YXBwbGVfY2RfaGFzaF9oYXNoXzAxWCDLkqiQkVRXsib+qb53j8aimZSixg36pgNx6eJk2FQTBnVhcHBsZV9jZF9oYXNoX3R5cGVfMDFBAngcYXBwbGVfdmFsaWRhdGlvbl9jYXRlZ29yeV8wMUQGAAAA";
-const ROOT: &str = "MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYwJAYDVQQDDB1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNaFw00NTAzMTUwMDAwMDBaMFIxJjAkBgNVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlvbiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdhNbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9auYen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwMDaAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn53O5+FRXgeLhpJ06ysC5PrOyAjEAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijVoyFraWVIyd/dganmrduC1bmTBGwD";
+const APP_ID: &str = "2F53L9ZR3N.ai.hellas.app-attest-spike";
+const FIXTURE_VALIDATION_TIME: u64 = 1_784_384_387;
+const REAL_CD_HASH: [u8; 32] = [
+    0xcb, 0x92, 0xa8, 0x90, 0x91, 0x54, 0x57, 0xb2, 0x26, 0xfe, 0xa9, 0xbe, 0x77, 0x8f, 0xc6, 0xa2,
+    0x99, 0x94, 0xa2, 0xc6, 0x0d, 0xfa, 0xa6, 0x03, 0x71, 0xe9, 0xe2, 0x64, 0xd8, 0x54, 0x13, 0x06,
+];
 
-fn bytes(value: &str) -> Vec<u8> {
+struct Fixture {
+    attestation_object_base64: &'static str,
+    attestation_client_data_hash_hex: &'static str,
+    assertion_object_base64: &'static str,
+    assertion_client_data_hash_hex: &'static str,
+}
+
+fn fixture() -> Fixture {
+    fn field(name: &str) -> &'static str {
+        include_str!("fixtures/real-app-attest.json")
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.trim().split_once(" : ")?;
+                (key.trim_matches('"') == name)
+                    .then(|| value.trim_end_matches(',').trim_matches('"'))
+            })
+            .unwrap()
+    }
+    Fixture {
+        attestation_object_base64: field("attestationObjectBase64"),
+        attestation_client_data_hash_hex: field("attestationClientDataHashHex"),
+        assertion_object_base64: field("assertionObjectBase64"),
+        assertion_client_data_hash_hex: field("assertionClientDataHashHex"),
+    }
+}
+
+fn decode_base64(value: &str) -> Vec<u8> {
     STANDARD.decode(value).unwrap()
 }
 
-fn credential() -> RegisteredAppleCredential {
-    let credential = AppleCredential {
-        attestation: bytes(ATTESTATION),
-        client_data_hash: bytes("JsCMkdwVLNrsuBo6U4TbyH5FAsmW0fpK7mN1JdtJlzQ=")
-            .try_into()
-            .unwrap(),
-    };
+fn decode_hex_32(value: &str) -> [u8; 32] {
+    hex::decode(value).unwrap().try_into().unwrap()
+}
+
+fn fixture_credential(fixture: &Fixture) -> AppleCredential {
+    AppleCredential {
+        attestation: decode_base64(fixture.attestation_object_base64),
+        client_data_hash: decode_hex_32(fixture.attestation_client_data_hash_hex),
+    }
+}
+
+fn registered_fixture(fixture: &Fixture) -> RegisteredAppleCredential {
     register_apple(
-        &credential,
-        bytes("l3UZ9S7UG1oAfJ1f4CeSJqkc2TZAHMPIDLB1ASegE0s=")
-            .try_into()
-            .unwrap(),
-        &bytes(ROOT),
-        AnchorTime(1_784_384_387),
+        &fixture_credential(fixture),
+        apple_app_id_hash(APP_ID),
+        apple_app_attest_root_ca(),
+        AnchorTime(FIXTURE_VALIDATION_TIME),
     )
     .unwrap()
 }
 
-#[test]
-fn verifies_sanitized_mac_fixture() {
-    let registered = credential();
-    let hash: [u8; 32] = bytes("30u+eepBuE/GrsOTXpSfQGmNXHFGZ6oae+RG3pWVQco=")
-        .try_into()
-        .unwrap();
-    let claims = verify_apple_assertion(&bytes(ASSERTION), &hash, &registered).unwrap();
+fn signing_key() -> SigningKey {
+    SigningKey::from_bytes((&[7; 32]).into()).unwrap()
+}
 
-    assert_eq!(claims.counter, 1);
+fn registered(signing_key: &SigningKey) -> RegisteredAppleCredential {
+    RegisteredAppleCredential {
+        id: ContentId::from_bytes([9; 32]),
+        public_key: signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap(),
+    }
+}
+
+fn assertion(
+    signing_key: &SigningKey,
+    rp_id_hash: [u8; 32],
+    asserted_cd_hash: [u8; 32],
+    counter: u32,
+    client_data_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut extensions = BTreeMap::new();
+    extensions.insert(
+        "apple_cd_hash_hash_01".to_owned(),
+        ByteBuf::from(asserted_cd_hash.to_vec()),
+    );
+    extensions.insert("apple_cd_hash_type_01".to_owned(), ByteBuf::from(vec![2]));
+    extensions.insert(
+        "apple_validation_category_01".to_owned(),
+        ByteBuf::from(vec![6, 0, 0, 0]),
+    );
+    let mut extension_bytes = Vec::new();
+    ciborium::into_writer(&extensions, &mut extension_bytes).unwrap();
+
+    let mut authenticator_data = Vec::new();
+    authenticator_data.extend_from_slice(&rp_id_hash);
+    authenticator_data.push(0x40);
+    authenticator_data.extend_from_slice(&counter.to_be_bytes());
+    authenticator_data.extend_from_slice(&extension_bytes);
+    let digest = Sha256::digest([authenticator_data.as_slice(), client_data_hash].concat());
+    let signature: Signature = signing_key.sign(&digest);
+
+    #[derive(Serialize)]
+    struct Assertion {
+        #[serde(rename = "authenticatorData")]
+        authenticator_data: ByteBuf,
+        signature: ByteBuf,
+    }
+
+    let mut encoded = Vec::new();
+    ciborium::into_writer(
+        &Assertion {
+            authenticator_data: ByteBuf::from(authenticator_data),
+            signature: ByteBuf::from(signature.to_der().as_bytes().to_vec()),
+        },
+        &mut encoded,
+    )
+    .unwrap();
+    encoded
+}
+
+#[test]
+fn real_attestation_registers_against_apple_chain() {
+    let fixture = fixture();
+    let credential = fixture_credential(&fixture);
+    let registered = registered_fixture(&fixture);
+
+    assert_eq!(registered.id, credential.content_id());
     assert_eq!(
-        appraise_apple(
-            &claims,
-            &ApplePolicy {
-                allowed_cd_hashes: vec![claims.cd_hash]
-            }
+        register_apple(
+            &credential,
+            apple_app_id_hash("WRONGTEAM.ai.hellas.app-attest-spike"),
+            apple_app_attest_root_ca(),
+            AnchorTime(FIXTURE_VALIDATION_TIME),
         ),
-        AppleVerdict::Accepted
+        Err(AttestationError::Credential)
     );
 }
 
 #[test]
-fn rejects_other_statement() {
-    let registered = credential();
-    assert!(verify_apple_assertion(&bytes(ASSERTION), &[0; 32], &registered).is_err());
+fn real_assertion_verifies_with_app_rp_id_and_direct_cd_hash_allowlist() {
+    let fixture = fixture();
+    let registered = registered_fixture(&fixture);
+    let client_data_hash = decode_hex_32(fixture.assertion_client_data_hash_hex);
+    let assertion = decode_base64(fixture.assertion_object_base64);
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![REAL_CD_HASH],
+    };
+
+    let claims =
+        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy).unwrap();
+    assert_eq!(claims.counter, 1);
+    assert_eq!(claims.cd_hash, REAL_CD_HASH);
+    assert_eq!(appraise_apple(&claims, &policy), AppleVerdict::Accepted);
+
+    let legacy_hashed_cd_policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![Sha256::digest(REAL_CD_HASH).into()],
+    };
+    assert_eq!(
+        verify_apple_assertion(
+            &assertion,
+            &client_data_hash,
+            &registered,
+            &legacy_hashed_cd_policy,
+        ),
+        Err(AttestationError::Credential)
+    );
+}
+
+#[test]
+fn credential_identity_extracts_real_build_identity_without_rp_id_relation() {
+    let fixture = fixture();
+    let credential = fixture_credential(&fixture);
+    let identity = apple_credential_identity(&credential.attestation).unwrap();
+
+    assert_eq!(identity.public_key, registered_fixture(&fixture).public_key);
+    assert_eq!(identity.rp_id_hash, apple_app_id_hash(APP_ID));
+    assert_eq!(identity.cd_hash, REAL_CD_HASH);
+    let legacy_rp_id_hash: [u8; 32] = Sha256::digest(identity.cd_hash).into();
+    assert_ne!(apple_app_id_hash(APP_ID), legacy_rp_id_hash);
+}
+
+#[test]
+fn verifies_assertion_from_an_updated_allowlisted_cd_hash() {
+    let signing_key = signing_key();
+    let registered = registered(&signing_key);
+    let rp_id_hash = apple_app_id_hash(APP_ID);
+    let old_cd_hash = [1; 32];
+    let updated_cd_hash = [2; 32];
+    let policy = ApplePolicy {
+        expected_rp_id_hash: rp_id_hash,
+        allowed_cd_hashes: vec![old_cd_hash, updated_cd_hash],
+    };
+    let client_data_hash = [3; 32];
+    let assertion = assertion(
+        &signing_key,
+        rp_id_hash,
+        updated_cd_hash,
+        1,
+        &client_data_hash,
+    );
+    let claims =
+        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy).unwrap();
+
+    assert_eq!(claims.counter, 1);
+    assert_eq!(claims.cd_hash, updated_cd_hash);
+}
+
+#[test]
+fn rejects_wrong_app_rp_id_and_cd_hash_outside_allowlist() {
+    let signing_key = signing_key();
+    let registered = registered(&signing_key);
+    let rp_id_hash = apple_app_id_hash(APP_ID);
+    let allowed_cd_hash = [1; 32];
+    let denied_cd_hash = [2; 32];
+    let client_data_hash = [3; 32];
+    let policy = ApplePolicy {
+        expected_rp_id_hash: rp_id_hash,
+        allowed_cd_hashes: vec![allowed_cd_hash],
+    };
+
+    let wrong_app = assertion(
+        &signing_key,
+        apple_app_id_hash("OTHERTEAM.example.app"),
+        allowed_cd_hash,
+        1,
+        &client_data_hash,
+    );
+    assert_eq!(
+        verify_apple_assertion(&wrong_app, &client_data_hash, &registered, &policy),
+        Err(AttestationError::Binding)
+    );
+
+    let denied_build = assertion(
+        &signing_key,
+        rp_id_hash,
+        denied_cd_hash,
+        1,
+        &client_data_hash,
+    );
+    assert_eq!(
+        verify_apple_assertion(&denied_build, &client_data_hash, &registered, &policy),
+        Err(AttestationError::Credential)
+    );
+}
+
+#[test]
+fn repeated_verification_does_not_advance_counter_state() {
+    let signing_key = signing_key();
+    let registered = registered(&signing_key);
+    let rp_id_hash = apple_app_id_hash(APP_ID);
+    let cd_hash = [1; 32];
+    let client_data_hash = [3; 32];
+    let policy = ApplePolicy {
+        expected_rp_id_hash: rp_id_hash,
+        allowed_cd_hashes: vec![cd_hash],
+    };
+    let assertion = assertion(&signing_key, rp_id_hash, cd_hash, 2, &client_data_hash);
+
+    let first =
+        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy).unwrap();
+    let second =
+        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(second.counter, 2);
 }

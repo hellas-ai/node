@@ -151,6 +151,43 @@ pub(crate) struct EvaluateArtifactStore {
     outputs_by_execution: HashMap<TextExecutionId, TextArtifactId>,
 }
 
+/// Retained and ephemeral evaluate artifacts share one routing point.
+/// Courtesy APIs intentionally receive only [`Self::retained`].
+pub(crate) struct EvaluateArtifactStores {
+    retained: EvaluateArtifactStore,
+    ephemeral: EvaluateArtifactStore,
+}
+
+impl EvaluateArtifactStores {
+    pub(crate) fn new(retained: EvaluateArtifactStore) -> Self {
+        Self {
+            retained,
+            ephemeral: EvaluateArtifactStore::memory(),
+        }
+    }
+
+    pub(crate) fn for_retention(
+        &mut self,
+        retention: hellas_rpc::Retention,
+    ) -> &mut EvaluateArtifactStore {
+        if retention.should_retain() {
+            &mut self.retained
+        } else {
+            &mut self.ephemeral
+        }
+    }
+
+    pub(crate) fn retained(&mut self) -> &mut EvaluateArtifactStore {
+        &mut self.retained
+    }
+
+    #[cfg(test)]
+    async fn shutdown(&self) -> Result<(), ExecutorError> {
+        self.ephemeral.shutdown().await?;
+        self.retained.shutdown().await
+    }
+}
+
 struct MaterializedTextSource {
     locator: ModelLocator,
     execution_environment: hellas_rpc::ContentId,
@@ -242,6 +279,8 @@ impl EvaluateArtifactStore {
             runner_public_key: plan.runner_public_key,
             execution_environment,
             nonce: rand::random(),
+            assurance: plan.assurance,
+            retain: plan.retention.should_retain(),
         };
 
         Ok(ResolvedEvaluateExecution {
@@ -848,6 +887,8 @@ mod tests {
             runner_public_key: runner_public_key(),
             execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
             nonce: [7; 32],
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            retain: true,
         }
     }
 
@@ -866,6 +907,8 @@ mod tests {
             },
             initial_artifact_id: None,
             runner_public_key: runner_public_key(),
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            retention: hellas_rpc::Retention::Retain,
         }
     }
 
@@ -986,6 +1029,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_routes_prompt_artifacts_away_from_filesystem_and_courtesy_store() {
+        let path = temp_artifact_store_path("retention");
+        fs::create_dir_all(&path).unwrap();
+        let retained = EvaluateArtifactStore::open(ArtifactStoreConfig::fs(&path))
+            .await
+            .unwrap();
+        let mut stores = EvaluateArtifactStores::new(retained);
+        let before = filesystem_snapshot(&path);
+
+        let mut ephemeral_plan = plan();
+        ephemeral_plan.retention = hellas_rpc::Retention::Ephemeral;
+        let ephemeral = stores
+            .for_retention(ephemeral_plan.retention)
+            .record_prepared_text(&ephemeral_plan)
+            .await
+            .unwrap();
+        stores
+            .for_retention(ephemeral_plan.retention)
+            .record_completed_text(
+                &ephemeral.evaluate_request,
+                &ephemeral.invocation,
+                &[10, 11],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(filesystem_snapshot(&path), before);
+        assert!(
+            stores
+                .retained()
+                .get_canonical_bytes(ephemeral.evaluate_request.text_execution)
+                .await
+                .is_err(),
+            "ephemeral token graph must not be exposed by Courtesy GetArtifact"
+        );
+
+        let retained_plan = plan();
+        let retained = stores
+            .for_retention(retained_plan.retention)
+            .record_prepared_text(&retained_plan)
+            .await
+            .unwrap();
+        stores
+            .for_retention(retained_plan.retention)
+            .record_completed_text(&retained.evaluate_request, &retained.invocation, &[10, 11])
+            .await
+            .unwrap();
+
+        assert_ne!(filesystem_snapshot(&path), before);
+        assert!(path.join(EVALUATE_INDEX_FILE).is_file());
+        assert!(
+            stores
+                .retained()
+                .get_canonical_bytes(retained.evaluate_request.text_execution)
+                .await
+                .is_ok(),
+            "retained artifacts remain available through Courtesy GetArtifact"
+        );
+
+        stores.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn fs_store_reopens_typed_artifacts_from_canonical_blobs() {
         let path = temp_artifact_store_path("reopen");
         let _ = std::fs::remove_dir_all(&path);
@@ -1078,5 +1185,30 @@ mod tests {
             "hellas-executor-artifacts-{test}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn filesystem_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files
     }
 }

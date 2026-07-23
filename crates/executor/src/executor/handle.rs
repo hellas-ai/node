@@ -25,7 +25,7 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
+use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
@@ -107,6 +107,9 @@ impl ExecutorHandle {
             .await
     }
 
+    /// Read from the retained Courtesy artifact namespace. Ephemeral job
+    /// artifacts are held by a separate memory store in the evaluate engine
+    /// and are intentionally unreachable through this handle.
     pub async fn get_artifact_handle(
         &self,
         request: GetArtifactRequest,
@@ -188,6 +191,13 @@ impl EvaluateHandler for ExecutorHandle {
 
 #[allow(refining_impl_trait)]
 impl FetchHandler for ExecutorHandle {
+    async fn open(&self, _request: OpenRequest) -> Result<OpenResponse, WireStatus> {
+        Err(WireStatus::new(
+            WireCode::FailedPrecondition,
+            "confidential open dispatcher is unavailable",
+        ))
+    }
+
     async fn create_ticket(
         &self,
         request: PbFetchRequest,
@@ -202,6 +212,13 @@ impl FetchHandler for ExecutorHandle {
 
 #[allow(refining_impl_trait)]
 impl CourtesyHandler for ExecutorHandle {
+    async fn open(&self, _request: OpenRequest) -> Result<OpenResponse, WireStatus> {
+        Err(WireStatus::new(
+            WireCode::FailedPrecondition,
+            "confidential open dispatcher is unavailable",
+        ))
+    }
+
     async fn quote_prompt(
         &self,
         request: QuotePromptRequest,

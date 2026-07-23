@@ -17,15 +17,16 @@ use hellas_executor::{
     ExecutorSpawnConfig, FetchAccessPolicy, FetchRouteRegistry, FetchServer,
 };
 use hellas_rpc::Dtype;
+use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::serve::AccountingDispatcher;
-use hellas_rpc::services::courtesy::Courtesy;
+use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen};
 use hellas_rpc::services::evaluate::Evaluate;
 use hellas_rpc::services::execute::Execute;
-use hellas_rpc::services::fetch::Fetch;
+use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
 use hellas_rpc::services::node::{Node, NodeServer};
-use hellas_rpc::{AssuranceRequirement, ProducerSigningKey};
+use hellas_rpc::{Assurance, ProducerSigningKey};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
@@ -33,6 +34,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
+use crate::identity::ProviderOpenIdentity;
 
 use super::node_handler::NodeHandlerImpl;
 
@@ -82,7 +84,8 @@ pub(super) struct NodeConfig {
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
     pub(super) provider_genesis: Vec<u8>,
-    pub(super) assurance: AssuranceRequirement,
+    pub(super) open_identity: Arc<ProviderOpenIdentity>,
+    pub(super) assurance: Assurance,
     pub(super) metrics: Arc<ExecutorMetrics>,
 }
 
@@ -154,6 +157,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
     let accept_handle = handle.clone();
+    let accept_open_identity = config.open_identity;
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         loop {
@@ -169,6 +173,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                 }
             };
             let handle_for_conn = accept_handle.clone();
+            let open_identity_for_conn = accept_open_identity.clone();
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
             tokio::spawn(async move {
@@ -184,6 +189,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                     alpn,
                     conn,
                     handle_for_conn,
+                    open_identity_for_conn,
                     node_handler_for_conn,
                     manager_for_conn,
                 )
@@ -210,6 +216,7 @@ async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
     handle: hellas_executor::ExecutorHandle,
+    open_identity: Arc<ProviderOpenIdentity>,
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
 ) -> anyhow::Result<()> {
@@ -228,10 +235,19 @@ async fn serve_connection(
         let server = AccountingDispatcher::new(EvaluateServer(handle), manager);
         serve_loop(&transport, &server).await
     } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(FetchServer(handle), manager);
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, FetchOpen>::new(FetchServer(handle), open_identity),
+            manager,
+        );
         serve_loop(&transport, &server).await
     } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(CourtesyServer(handle), manager);
+        // Courtesy artifact reads are retained-only. The executor handle does
+        // not expose the separate in-memory namespace used by no-retention
+        // evaluate jobs.
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, CourtesyOpen>::new(CourtesyServer(handle), open_identity),
+            manager,
+        );
         serve_loop(&transport, &server).await
     } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
@@ -248,8 +264,10 @@ where
     S::Error: Send + Sync + 'static,
 {
     while let Ok(Some(inbound)) = transport.accept().await {
-        if let Err(e) = server.dispatch(inbound).await {
-            warn!("dispatch error: {e}");
+        if server.dispatch(inbound).await.is_err() {
+            // RPC errors can be derived from request content. Keep the trace
+            // useful without copying prompt or token material into logs.
+            warn!("dispatch error; request details suppressed");
         }
     }
     Ok(())

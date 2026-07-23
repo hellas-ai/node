@@ -1,5 +1,10 @@
-use std::{collections::BTreeMap, io::Cursor, time::Duration};
+use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::sync::OnceLock;
+use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use hellas_rpc::pb::execute::AssuranceEvidence;
 use hellas_rpc::{APPLE_APP_ATTEST, ContentId, DagCborEncoder};
 use p256::ecdsa::signature::Verifier;
@@ -29,6 +34,22 @@ const ACL: &[u8] = &[
     0x63, 0x30, 0x05, 0xa6, 0x03, 0x02, 0x01, 0x01,
 ];
 const PRODUCTION_AAGUID: &[u8; 16] = b"appattest\0\0\0\0\0\0\0";
+const APP_ATTEST_ROOT_CA_BASE64: &str = "MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYwJAYDVQQDDB1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNaFw00NTAzMTUwMDAwMDBaMFIxJjAkBgNVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlvbiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdhNbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9auYen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwMDaAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn53O5+FRXgeLhpJ06ysC5PrOyAjEAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijVoyFraWVIyd/dganmrduC1bmTBGwD";
+
+/// Apple's pinned App Attestation Root CA in DER form.
+pub fn apple_app_attest_root_ca() -> &'static [u8] {
+    static ROOT: OnceLock<Vec<u8>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        STANDARD
+            .decode(APP_ATTEST_ROOT_CA_BASE64)
+            .expect("embedded Apple App Attestation Root CA is valid base64")
+    })
+}
+
+/// Compute the WebAuthn RP-ID hash for the pinned Apple application identity.
+pub fn apple_app_id_hash(team_id_and_bundle_id: &str) -> [u8; 32] {
+    Sha256::digest(team_id_and_bundle_id.as_bytes()).into()
+}
 
 pub struct AppleCredential {
     pub attestation: Vec<u8>,
@@ -46,20 +67,35 @@ impl AppleCredential {
     }
 }
 
+/// The persistable output of one successful Apple credential registration.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredAppleCredential {
     pub id: ContentId,
     pub public_key: [u8; 33],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppleCredentialIdentity {
+    pub public_key: [u8; 33],
     pub rp_id_hash: [u8; 32],
+    pub cd_hash: [u8; 32],
+}
+
+/// Persistent high-water-mark port for live Apple assertion counters.
+pub trait AssertionCounterStore {
+    fn advance(&self, public_key: &[u8; 33], counter: u32) -> Result<(), AttestationError>;
 }
 
 /// A provisioned app instance on a Full-Security/SIP Mac endorsed the statement.
 /// This does not prove that the computation was performed or performed correctly.
+#[derive(Debug, PartialEq, Eq)]
 pub struct AppleClaims {
     pub cd_hash: [u8; 32],
     pub counter: u32,
 }
 
 pub struct ApplePolicy {
+    pub expected_rp_id_hash: [u8; 32],
     pub allowed_cd_hashes: Vec<[u8; 32]>,
 }
 
@@ -87,10 +123,8 @@ pub fn register_apple(
     if object.fmt != "apple-appattest" || object.statement.certificates.len() != 2 {
         return Err(AttestationError::Credential);
     }
-    verify_chain(&object.statement.certificates, root, anchor)?;
+    let leaf = verify_chain(&object.statement.certificates, root, anchor)?;
     let auth = attestation_auth_data(&object.auth_data, expected_rp_id_hash)?;
-    let leaf = Certificate::from_der(&object.statement.certificates[0])
-        .map_err(|_| AttestationError::Credential)?;
     let extensions = leaf
         .tbs_certificate
         .extensions
@@ -119,13 +153,12 @@ pub fn register_apple(
     Ok(RegisteredAppleCredential {
         id: credential.content_id(),
         public_key: compressed,
-        rp_id_hash: expected_rp_id_hash,
     })
 }
 
 pub fn apple_credential_identity(
     attestation: &[u8],
-) -> Result<([u8; 33], [u8; 32]), AttestationError> {
+) -> Result<AppleCredentialIdentity, AttestationError> {
     let object: AttestationObject = cbor(attestation, "Apple attestation")?;
     let rp_id_hash = object
         .auth_data
@@ -139,7 +172,22 @@ pub fn apple_credential_identity(
         .first()
         .ok_or(AttestationError::Credential)?;
     let leaf = Certificate::from_der(leaf).map_err(|_| AttestationError::Credential)?;
-    Ok((public_key(&leaf, auth.credential_id)?, rp_id_hash))
+    let cd_hash = attestation_cd_hash(auth.credential_data)?;
+    Ok(AppleCredentialIdentity {
+        public_key: public_key(&leaf, auth.credential_id)?,
+        rp_id_hash,
+        cd_hash,
+    })
+}
+
+fn attestation_cd_hash(credential_data: &[u8]) -> Result<[u8; 32], AttestationError> {
+    let mut cursor = Cursor::new(credential_data);
+    let _: ciborium::Value = ciborium::from_reader(&mut cursor)
+        .map_err(|_| AttestationError::Malformed("Apple credential public key"))?;
+    let extensions = credential_data
+        .get(cursor.position() as usize..)
+        .ok_or(AttestationError::Credential)?;
+    apple_cd_hash(extensions, "Apple attestation extensions")
 }
 
 fn public_key(
@@ -167,6 +215,8 @@ pub fn verify_apple(
     evidence: &AssuranceEvidence,
     expected: Binding,
     credential: &RegisteredAppleCredential,
+    policy: &ApplePolicy,
+    counters: &dyn AssertionCounterStore,
 ) -> Result<AppleClaims, AttestationError> {
     if evidence.codec != APPLE_APP_ATTEST {
         return Err(AttestationError::Codec);
@@ -174,16 +224,25 @@ pub fn verify_apple(
     if evidence.credential != credential.id.as_bytes() {
         return Err(AttestationError::Credential);
     }
-    verify_apple_assertion(&evidence.proof, expected.as_bytes(), credential)
+    let claims = verify_apple_assertion(&evidence.proof, expected.as_bytes(), credential, policy)?;
+    counters.advance(&credential.public_key, claims.counter)?;
+    Ok(claims)
 }
 
 pub fn verify_apple_assertion(
     assertion: &[u8],
     client_data_hash: &[u8; 32],
     credential: &RegisteredAppleCredential,
+    policy: &ApplePolicy,
 ) -> Result<AppleClaims, AttestationError> {
     let assertion: Assertion = cbor(assertion, "Apple assertion")?;
-    let auth = assertion_auth_data(&assertion.authenticator_data, credential.rp_id_hash)?;
+    let rp_id_hash = assertion
+        .authenticator_data
+        .get(..32)
+        .ok_or(AttestationError::Binding)?;
+    if rp_id_hash != policy.expected_rp_id_hash {
+        return Err(AttestationError::Binding);
+    }
     let signature =
         Signature::from_der(&assertion.signature).map_err(|_| AttestationError::Signature)?;
     let key = VerifyingKey::from_sec1_bytes(&credential.public_key)
@@ -192,14 +251,18 @@ pub fn verify_apple_assertion(
         Sha256::digest([assertion.authenticator_data.as_slice(), client_data_hash].concat());
     key.verify(&digest, &signature)
         .map_err(|_| AttestationError::Signature)?;
-    Ok(auth)
+    let claims = assertion_auth_data(&assertion.authenticator_data)?;
+    if !policy.allowed_cd_hashes.contains(&claims.cd_hash) {
+        return Err(AttestationError::Credential);
+    }
+    Ok(claims)
 }
 
 fn verify_chain(
     certificates: &[ByteBuf],
     root: &[u8],
     anchor: AnchorTime,
-) -> Result<(), AttestationError> {
+) -> Result<Certificate, AttestationError> {
     let leaf = CertificateDer::from(certificates[0].as_ref());
     let intermediate = CertificateDer::from(certificates[1].as_ref());
     let root = CertificateDer::from(root);
@@ -236,11 +299,12 @@ fn verify_chain(
     if eku.extn_value.as_bytes() != APP_ATTEST_EKU_DER {
         return Err(AttestationError::Credential);
     }
-    Ok(())
+    Ok(leaf)
 }
 
 struct AttestationAuth<'a> {
     credential_id: &'a [u8],
+    credential_data: &'a [u8],
 }
 
 fn attestation_auth_data(
@@ -263,15 +327,25 @@ fn attestation_auth_data(
     if credential_id.len() != 32 {
         return Err(AttestationError::Credential);
     }
-    Ok(AttestationAuth { credential_id })
+    Ok(AttestationAuth {
+        credential_id,
+        credential_data: &data[credential_end..],
+    })
 }
 
-fn assertion_auth_data(data: &[u8], rp_id_hash: [u8; 32]) -> Result<AppleClaims, AttestationError> {
-    if data.len() <= 37 || data[..32] != rp_id_hash || data[32] != 0x40 {
+fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
+    if data.len() <= 37 || data[32] != 0x40 {
         return Err(AttestationError::Binding);
     }
-    let extensions: BTreeMap<String, ByteBuf> =
-        cbor(&data[37..], "Apple authenticator extensions")?;
+    let cd_hash = apple_cd_hash(&data[37..], "Apple authenticator extensions")?;
+    Ok(AppleClaims {
+        cd_hash,
+        counter: u32::from_be_bytes(data[33..37].try_into().unwrap()),
+    })
+}
+
+fn apple_cd_hash(bytes: &[u8], name: &'static str) -> Result<[u8; 32], AttestationError> {
+    let extensions: BTreeMap<String, ByteBuf> = cbor(bytes, name)?;
     let cd_hash: [u8; 32] = extensions
         .get("apple_cd_hash_hash_01")
         .and_then(|value| value.as_ref().try_into().ok())
@@ -284,10 +358,7 @@ fn assertion_auth_data(data: &[u8], rp_id_hash: [u8; 32]) -> Result<AppleClaims,
     {
         return Err(AttestationError::Credential);
     }
-    Ok(AppleClaims {
-        cd_hash,
-        counter: u32::from_be_bytes(data[33..37].try_into().unwrap()),
-    })
+    Ok(cd_hash)
 }
 
 fn cbor<T: for<'de> Deserialize<'de>>(

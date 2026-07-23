@@ -7,8 +7,7 @@ use hellas_executor::{
 };
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::{
-    AssuranceRequirement, ContentId, Dtype, FetchProgramManifest, ProducerSigningKey,
-    ProgramManifest,
+    Assurance, ContentId, Dtype, FetchProgramManifest, ProducerSigningKey, ProgramManifest,
 };
 use iroh::SecretKey;
 use serde::Deserialize;
@@ -17,6 +16,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::identity::ProviderOpenIdentity;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -44,7 +45,8 @@ pub struct ServeOptions {
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
     pub provider_genesis: Vec<u8>,
-    pub assurance: AssuranceRequirement,
+    pub open_identity: Arc<ProviderOpenIdentity>,
+    pub assurance: Assurance,
 }
 
 pub async fn run(options: ServeOptions) -> CliResult<()> {
@@ -88,6 +90,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         provider_genesis: options.provider_genesis,
+        open_identity: options.open_identity,
         assurance: options.assurance,
         metrics: metrics.clone(),
     })

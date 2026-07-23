@@ -14,19 +14,20 @@ service Execute {
 message Ticket {
   bytes request_commitment = 1; // exactly 32 bytes
   JobTerms terms = 2;
-  bytes provider_genesis = 3; // canonical SignedProviderGenesis
+  bytes provider_genesis = 3; // canonical ProviderEnrollmentBundle
 }
 
 message JobTerms {
   bytes provider_genesis = 1; // ContentId
-  AssuranceRequirement assurance = 2;
+  Assurance assurance = 2;
   uint64 amount = 3;
   uint64 ttl_ms = 4;
 }
 
-message AssuranceRequirement {
-  string codec = 1;
-  bytes policy = 2; // ContentId
+// Numeric values are canonical protocol tags and must not be renumbered.
+enum Assurance {
+  ASSURANCE_PRODUCER_SIGNED = 0;
+  ASSURANCE_APPLE_APP_ATTEST = 1;
 }
 
 message RunTicketRequest {
@@ -48,6 +49,20 @@ message Signature {
     bytes secp256k1 = 1;
     bytes ed25519 = 2;
     bytes p256 = 3;
+  }
+}
+
+// Confidential-open messages are shared by prompt-bearing services so the
+// proof is exchanged on the same QUIC connection as the eventual request.
+message OpenRequest {
+  bytes nonce = 1; // fresh requester nonce; exactly 32 bytes
+}
+
+message OpenResponse {
+  bytes provider_genesis = 1; // canonical ProviderEnrollmentBundle
+  oneof proof {
+    Signature producer_signature = 2;
+    bytes apple_app_attest_assertion = 3;
   }
 }
 

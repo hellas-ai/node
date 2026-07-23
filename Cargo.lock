@@ -3366,6 +3366,7 @@ dependencies = [
  "cc",
  "ciborium",
  "hellas-rpc",
+ "hex",
  "p256",
  "rustls-pki-types",
  "rustls-webpki",
@@ -3437,6 +3438,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chatgrad",
+ "ciborium",
  "clap",
  "futures",
  "hellas-adaptors",
@@ -3457,12 +3459,15 @@ dependencies = [
  "opentelemetry 0.31.0",
  "opentelemetry-otlp 0.31.1",
  "opentelemetry_sdk 0.31.0",
+ "p256",
  "prometheus-client",
  "qrcode",
  "rand 0.8.6",
  "reqwest 0.13.1",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3477,11 +3482,21 @@ name = "hellas-client"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "base64 0.22.1",
+ "ciborium",
  "futures",
+ "hellas-attestation",
  "hellas-rpc",
  "hellas-wire",
+ "hex",
  "iroh",
  "iroh-mdns-address-lookup",
+ "p256",
+ "rand 0.8.6",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
 ]
 
@@ -3510,6 +3525,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
