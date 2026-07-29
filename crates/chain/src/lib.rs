@@ -32,6 +32,8 @@ pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "validator")]
+pub mod staked;
+#[cfg(feature = "validator")]
 pub mod validator;
 
 #[cfg(any(
@@ -53,6 +55,8 @@ pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mem
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use execution::store::{UtxoDb, utxo_db_config};
+#[cfg(feature = "validator")]
+pub use execution::{ChainVerifier, ExecutionError};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use indexer::{
     BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,

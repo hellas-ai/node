@@ -9,6 +9,6 @@ mod verifier;
 mod working_set;
 
 #[cfg(feature = "validator")]
-pub use kernel::{execute_all, execute_proposal};
+pub use kernel::{ExecutionError, execute_all, execute_proposal};
 #[cfg(feature = "validator")]
 pub use verifier::ChainVerifier;

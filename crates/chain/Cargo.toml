@@ -82,6 +82,10 @@ server = [
     "tokio/time",
     "tokio-stream/sync",
 ]
+# Dev-chain seal verification: staked opens are admitted and violation
+# seals verify against a preverified fraud-artifact cache. Never enable
+# on a production chain — the artifact cache is trusted input.
+preverified-seals = ["validator"]
 validator = [
     "indexer",
     "server",
@@ -94,6 +98,7 @@ validator = [
     "dep:toml",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
+    "dep:blake3",
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
@@ -102,6 +107,7 @@ wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 [dependencies]
 axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
+blake3 = { workspace = true, optional = true }
 bs58 = { version = "0.5", optional = true }
 bytes = { workspace = true, optional = true }
 commonware-actor = { workspace = true, optional = true }

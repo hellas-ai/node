@@ -158,8 +158,7 @@ fn production_secp256k1_verifier_rejects_dispute_seals() {
     let seal = Seal::placeholder(terms.protocol(), CloseKind::Violation, hash);
     let public = SealPublicInputs {
         edge_id: edge,
-        protocol: terms.protocol(),
-        terms_hash: terms.hash(),
+        terms: &terms,
         payouts: &outputs,
     };
 
