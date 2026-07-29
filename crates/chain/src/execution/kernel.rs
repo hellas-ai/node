@@ -9,7 +9,7 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::{Clock, Metrics, Storage};
 use hellas_kernel::{
     ApplyError, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event, EventKind,
-    InvalidProofReason, Secp256k1Verifier, State, Tx as KernelTx,
+    InvalidProofReason, SealVerifier, SigVerifier, State, Tx as KernelTx,
 };
 use thiserror::Error;
 
@@ -101,19 +101,20 @@ where
         .map_err(storage_err)
 }
 
-pub async fn execute_all<E>(
+pub async fn execute_all<E, V>(
     context: KernelContext,
+    verifier: &V,
     txs: &[Transaction],
     genesis_allocations: &[(SettlementKey, u64)],
     batches: Batch<E>,
 ) -> Result<Batch<E>, ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
+    V: SigVerifier + SealVerifier,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
-    let verifier = Secp256k1Verifier::new();
     for tx in txs {
-        let next = apply_transaction(batches, context, &verifier, tx)
+        let next = apply_transaction(batches, context, verifier, tx)
             .await
             .map_err(|(_, err)| err)?;
         batches = next;
@@ -121,8 +122,9 @@ where
     Ok(batches)
 }
 
-pub async fn execute_proposal<E>(
+pub async fn execute_proposal<E, V>(
     context: KernelContext,
+    verifier: &V,
     candidates: Vec<Transaction>,
     genesis_allocations: &[(SettlementKey, u64)],
     max_txs: usize,
@@ -131,13 +133,13 @@ pub async fn execute_proposal<E>(
 ) -> Result<(Batch<E>, Vec<Transaction>, Vec<Transaction>), ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
+    V: SigVerifier + SealVerifier,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     let mut included = Vec::new();
     let mut retained = Vec::new();
     let mut included_bytes = 0_usize;
     let mut candidates = candidates.into_iter();
-    let verifier = Secp256k1Verifier::new();
 
     while let Some(tx) = candidates.next() {
         let next_bytes = included_bytes.saturating_add(tx.encode_size());
@@ -147,7 +149,7 @@ where
             break;
         }
 
-        match apply_transaction(batches, context, &verifier, &tx).await {
+        match apply_transaction(batches, context, verifier, &tx).await {
             Ok(next) => {
                 batches = next;
                 included_bytes = next_bytes;
@@ -200,14 +202,15 @@ where
     batches
 }
 
-async fn apply_transaction<E>(
+async fn apply_transaction<E, V>(
     mut batches: Batch<E>,
     context: KernelContext,
-    verifier: &Secp256k1Verifier,
+    verifier: &V,
     tx: &Transaction,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
+    V: SigVerifier + SealVerifier,
 {
     match tx {
         Transaction::Transfer {
@@ -535,14 +538,15 @@ where
     (batches, None)
 }
 
-async fn apply_kernel_transaction<E>(
+async fn apply_kernel_transaction<E, V>(
     batches: Batch<E>,
     context: KernelContext,
-    verifier: &Secp256k1Verifier,
+    verifier: &V,
     tx: &KernelTx,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
+    V: SigVerifier + SealVerifier,
 {
     let working = match load_kernel_slots(&batches, tx).await {
         Ok(working) => working,
@@ -569,6 +573,7 @@ mod tests {
     use super::*;
     use crate::domain::{KERNEL_FEES, MAX_TXS_PER_BLOCK};
     use crate::execution::{
+        ChainVerifier,
         store::{UtxoDatabase, utxo_db_config},
         test_support::{
             index_block, index_genesis, kernel_fixture, kernel_fixture_at, legacy_address,
@@ -601,9 +606,15 @@ mod tests {
         genesis_allocations: &[(SettlementKey, u64)],
     ) -> commonware_cryptography::sha256::Digest {
         let batches = database.new_batches().await;
-        let batches = execute_all(context, txs, genesis_allocations, batches)
-            .await
-            .expect("block executes");
+        let batches = execute_all(
+            context,
+            &ChainVerifier::new(),
+            txs,
+            genesis_allocations,
+            batches,
+        )
+        .await
+        .expect("block executes");
         let merkleized = batches.merkleize().await.expect("block merkleizes");
         let root = merkleized.root();
         database.finalize(merkleized).await;
@@ -927,6 +938,7 @@ mod tests {
             let missing_batches = missing_database.new_batches().await;
             let (_, included, retained) = execute_proposal(
                 context(1),
+                &ChainVerifier::new(),
                 vec![Transaction::Kernel(fixture.open.clone())],
                 &[],
                 MAX_TXS_PER_BLOCK,
@@ -942,6 +954,7 @@ mod tests {
             let bad_auth_batches = bad_auth_database.new_batches().await;
             let (_, included, retained) = execute_proposal(
                 context(1),
+                &ChainVerifier::new(),
                 vec![Transaction::Kernel(
                     fixture.bad_auth_open().expect("bad-auth fixture"),
                 )],
@@ -957,10 +970,15 @@ mod tests {
 
             let contract_database = database(runtime.child("contract"), "contract_taxonomy").await;
             let contract_batches = contract_database.new_batches().await;
-            let contract_batches =
-                execute_all(context(1), &[], &fixture.allocations, contract_batches)
-                    .await
-                    .expect("genesis seed");
+            let contract_batches = execute_all(
+                context(1),
+                &ChainVerifier::new(),
+                &[],
+                &fixture.allocations,
+                contract_batches,
+            )
+            .await
+            .expect("genesis seed");
             let working = load_kernel_slots(&contract_batches, &fixture.open)
                 .await
                 .expect("preload funded slots");
@@ -1038,16 +1056,22 @@ mod tests {
             let database = database(runtime, "open_coin_collision").await;
             let fixture = kernel_fixture(10).expect("kernel fixture");
             let batches = database.new_batches().await;
-            let batches = execute_all(context(1), &[], &fixture.allocations, batches)
-                .await
-                .expect("genesis seed");
+            let batches = execute_all(
+                context(1),
+                &ChainVerifier::new(),
+                &[],
+                &fixture.allocations,
+                batches,
+            )
+            .await
+            .expect("genesis seed");
             let collision_id = edge_object_id(fixture.edge);
             let collision = Object::Coin(Coin {
                 owner: fixture.maker,
                 value: 7,
             });
             let batches = batches.write(collision_id, Some(collision));
-            let verifier = Secp256k1Verifier::new();
+            let verifier = ChainVerifier::new();
             let (batches, error) = apply_transaction(
                 batches,
                 context(1),
@@ -1069,6 +1093,7 @@ mod tests {
 
             let (batches, included, retained) = execute_proposal(
                 context(1),
+                &ChainVerifier::new(),
                 vec![Transaction::Kernel(fixture.open.clone())],
                 &[],
                 MAX_TXS_PER_BLOCK,
@@ -1079,7 +1104,7 @@ mod tests {
             .expect("wrong-kind candidate is a non-fatal proposal drop");
             assert!(included.is_empty());
             assert!(retained.is_empty());
-            let batches = execute_all(context(1), &included, &[], batches)
+            let batches = execute_all(context(1), &ChainVerifier::new(), &included, &[], batches)
                 .await
                 .expect("block without dropped open replays");
             assert_eq!(
@@ -1105,13 +1130,19 @@ mod tests {
             let database = database(runtime, "open_edge_collision").await;
             let fixture = kernel_fixture(10).expect("kernel fixture");
             let batches = database.new_batches().await;
-            let batches = execute_all(context(1), &[], &fixture.allocations, batches)
-                .await
-                .expect("genesis seed");
+            let batches = execute_all(
+                context(1),
+                &ChainVerifier::new(),
+                &[],
+                &fixture.allocations,
+                batches,
+            )
+            .await
+            .expect("genesis seed");
             let collision_id = edge_object_id(fixture.edge);
             let collision = Object::Edge(crate::domain::test_edge());
             let batches = batches.write(collision_id, Some(collision));
-            let verifier = Secp256k1Verifier::new();
+            let verifier = ChainVerifier::new();
             let (batches, error) = apply_transaction(
                 batches,
                 context(1),
@@ -1131,6 +1162,7 @@ mod tests {
 
             let (batches, included, retained) = execute_proposal(
                 context(1),
+                &ChainVerifier::new(),
                 vec![Transaction::Kernel(fixture.open.clone())],
                 &[],
                 MAX_TXS_PER_BLOCK,
@@ -1141,7 +1173,7 @@ mod tests {
             .expect("edge-exists candidate is a non-fatal proposal drop");
             assert!(included.is_empty());
             assert!(retained.is_empty());
-            let batches = execute_all(context(1), &included, &[], batches)
+            let batches = execute_all(context(1), &ChainVerifier::new(), &included, &[], batches)
                 .await
                 .expect("block without dropped open replays");
             assert_eq!(
@@ -1172,6 +1204,7 @@ mod tests {
             let batches = database.new_batches().await;
             let (batches, included, retained) = execute_proposal(
                 context(1),
+                &ChainVerifier::new(),
                 vec![open, close.clone(), close],
                 &fixture.allocations,
                 MAX_TXS_PER_BLOCK,

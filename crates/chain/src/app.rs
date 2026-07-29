@@ -7,7 +7,7 @@ use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
 use crate::execution::store::{UtxoDatabase, UtxoSyncTarget, empty_state};
 #[cfg(feature = "validator")]
-use crate::execution::{execute_all, execute_proposal};
+use crate::execution::{ChainVerifier, execute_all, execute_proposal};
 use crate::light_client::{ConsensusActivity, ProposalInfo};
 use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
@@ -81,6 +81,8 @@ pub struct Application {
     genesis_allocations: Arc<Vec<(SettlementKey, u64)>>,
     finalized_height: Registered<Gauge>,
     owner_index: OwnerIndex,
+    #[cfg(feature = "validator")]
+    verifier: Arc<ChainVerifier>,
 }
 
 impl Application {
@@ -121,6 +123,8 @@ impl Application {
             genesis_allocations: Arc::new(genesis_allocations),
             finalized_height,
             owner_index,
+            #[cfg(feature = "validator")]
+            verifier: Arc::new(ChainVerifier::new()),
         }
     }
 }
@@ -182,6 +186,7 @@ where
         let block_parent = parent.digest();
         let (batches, txs, retained) = match execute_proposal(
             kernel_context(block_height, block_parent),
+            self.verifier.as_ref(),
             candidates,
             &self.genesis_allocations,
             MAX_TXS_PER_BLOCK,
@@ -238,6 +243,7 @@ where
             // from the block field so verify and certified replay cannot
             // diverge when the kernel begins consuming it.
             kernel_context(block.height(), block.parent()),
+            self.verifier.as_ref(),
             block.txs(),
             &self.genesis_allocations,
             batches,
@@ -272,6 +278,7 @@ where
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         let batches = execute_all(
             kernel_context(block.height(), block.parent()),
+            self.verifier.as_ref(),
             block.txs(),
             &self.genesis_allocations,
             batches,

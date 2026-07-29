@@ -254,7 +254,7 @@ mod tests {
         config::Config,
         domain::{KERNEL_FEES, ObjectKind, Transaction, edge_object_id, genesis_object_id},
         execution::{
-            execute_all,
+            ChainVerifier, execute_all,
             store::utxo_db_config,
             test_support::{
                 consensus_fixture, finalization, index_block, index_genesis, kernel_fixture,
@@ -334,6 +334,7 @@ mod tests {
                     BlockHash::from_bytes([0; BlockHash::LENGTH]),
                     KERNEL_FEES,
                 ),
+                &ChainVerifier::new(),
                 &[],
                 &allocations,
                 batches,
@@ -376,6 +377,7 @@ mod tests {
                     BlockHash::from_bytes([0; BlockHash::LENGTH]),
                     KERNEL_FEES,
                 ),
+                &ChainVerifier::new(),
                 &transactions,
                 &allocations,
                 batches,
