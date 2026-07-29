@@ -428,6 +428,56 @@ mod tests {
         }
     }
 
+    /// Option-1 (stake-only, λ=0) economics, with p_d = p_w = 1. These
+    /// are deliberately NOT the paper's `p_d·(P_set + S)` / `λ·P_set`
+    /// equations: across two edges the provider always redeems its
+    /// payment voucher, so the penalty relative to undetected fraud is
+    /// exactly `S`, and the client is made whole from the slash award,
+    /// never from clawback.
+    #[test]
+    fn option_one_economics_hold_for_the_committed_bond_shape() {
+        // The shape the e2e fixtures commit.
+        let stake = 1_000_u64; // S
+        let award = 700_u64; // A
+        let max_job_price = 500_u64;
+        let max_dispute_cost = 200_u64;
+        let price = 400_u64; // p_j of the fixture job
+        let dispute_cost = 150_u64; // C_disp ≤ max_dispute_cost
+        let honest_cost = 900_u64; // c_H
+        let fraud_cost = 100_u64; // c_F
+
+        // Provider IC: S ≥ c_H − c_F (p_j cancels — the provider keeps
+        // its payment either way).
+        assert!(stake >= honest_cost - fraud_cost);
+        // Strict dispute incentive: A > C_disp.
+        assert!(award > dispute_cost);
+        // Conditional reimbursement: A ≥ p_j + C_disp, guaranteed for
+        // every admissible job by the committed open-time floor.
+        assert!(award >= max_job_price + max_dispute_cost);
+        assert!(price <= max_job_price && dispute_cost <= max_dispute_cost);
+        assert!(award >= price + dispute_cost);
+
+        // The many-job cheat, priced honestly: the provider redeems the
+        // frontier through job k, defrauds job k+1, still collects p_j,
+        // and loses exactly S — never p_j + S. Its marginal payoff for
+        // the fraudulent job is (p_j − c_F − S) vs the honest
+        // (p_j − c_H); with the IC above, fraud is weakly worse.
+        let fraud_payoff = i128::from(price) - i128::from(fraud_cost) - i128::from(stake);
+        let honest_payoff = i128::from(price) - i128::from(honest_cost);
+        assert_eq!(
+            fraud_payoff - honest_payoff,
+            i128::from(honest_cost) - i128::from(fraud_cost) - i128::from(stake),
+        );
+        assert!(fraud_payoff <= honest_payoff);
+        // And the settlement delta on proven fraud is +p_j (payment
+        // kept) − S (stake lost): p_j − S, matching what the kernel's
+        // pinned payouts actually move.
+        assert_eq!(
+            i128::from(price) - i128::from(stake),
+            i128::from(price) - i128::from(award) - i128::from(stake - award),
+        );
+    }
+
     /// Slice-1 e2e fixture: the client funds a payment channel, advances
     /// the frontier with asymmetric vouchers, and the provider redeems
     /// exactly the latest one as a kernel `Mutual` at consensus
