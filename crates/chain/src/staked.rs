@@ -16,11 +16,156 @@
 //! counter.
 
 use hellas_kernel::{
-    BlockHeight, EdgeId, Encode, Key, PayloadHash, Seal, SealPublicInputs, Secp256k1Verifier, Sig,
-    SigVerifier as _, TermsHash, Writer as _,
+    Auth, BlockHeight, CloseKind, EdgeId, Encode, Key, List, MAX_EDGE_OUTPUTS, Parties,
+    PayloadHash, Payout, Proof, ProtocolCode, Seal, SealPublicInputs, Secp256k1Signer,
+    Secp256k1Verifier, Sig, SigVerifier as _, Terms, TermsHash, Tx as KernelTx, Writer as _,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Protocol code for the optimistic payment channel (plain `Basic`
+/// terms shape; client = maker funds capacity `B`, timeout refunds the
+/// client).
+pub const PAYMENT_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
+/// Protocol code for the provider stake bond.
+pub const STAKE_BOND_PROTOCOL: ProtocolCode = ProtocolCode::new(3);
+
+/// Builds the payment-channel terms: a `Basic` edge whose maker is the
+/// client, whose taker is the provider, and whose timeout refunds the
+/// entire close value to the client (the unilateral fallback when the
+/// provider disappears — the client never signs a `Mutual` close, so
+/// its own exit is `Timeout`).
+///
+/// `refund` must equal the edge's close value (locked capacity plus
+/// timeout reserve surplus); the kernel rejects the open otherwise.
+#[must_use]
+pub fn payment_channel_terms(
+    client: Key,
+    provider: Key,
+    timeout: BlockHeight,
+    refund: u64,
+) -> Terms {
+    let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+    outputs[0] = Payout::new(client, refund);
+    Terms::basic(
+        PAYMENT_PROTOCOL,
+        Parties::new(client, provider),
+        timeout,
+        List::take(outputs, 1),
+    )
+}
+
+/// A client-signed payment frontier: the maker's kernel `Mutual`
+/// authorization over one exact two-output close of the payment edge,
+/// at cumulative provider earnings `E`.
+///
+/// Asymmetric by construction — a voucher carries *only* the maker
+/// authorization. The provider turns the latest voucher into an
+/// executable close by adding its own signature at redemption time;
+/// provider authorization never crosses the API boundary in the other
+/// direction, so the client's only unilateral exit stays `Timeout` and
+/// a stale-frontier race needs a signature the client never saw.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct MakerVoucher {
+    /// The payment edge this voucher closes.
+    pub payment_edge: EdgeId,
+    /// Commitment to the payment edge's open terms.
+    pub terms_hash: TermsHash,
+    /// Cumulative provider earnings `E` this frontier settles at. The
+    /// monotonicity index — strictly increasing per voucher.
+    pub cumulative: u64,
+    /// The exact close payouts: `[(client, total − E), (provider, E)]`.
+    pub outputs: List<Payout, MAX_EDGE_OUTPUTS>,
+    /// Maker authorization over the canonical kernel `Mutual` payload
+    /// hash of exactly these outputs.
+    pub client_auth: Auth,
+}
+
+impl MakerVoucher {
+    /// Client-side issuance: signs the canonical kernel `Mutual` payload
+    /// for the frontier at cumulative earnings `cumulative`, where
+    /// `total` is the edge's exact close value (capacity plus reserve
+    /// surplus). Returns `None` when `cumulative > total`.
+    #[must_use]
+    pub fn issue(
+        client: &Secp256k1Signer,
+        provider: Key,
+        payment_edge: EdgeId,
+        terms_hash: TermsHash,
+        total: u64,
+        cumulative: u64,
+    ) -> Option<Self> {
+        let refund = total.checked_sub(cumulative)?;
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(client.party_key(), refund);
+        slots[1] = Payout::new(provider, cumulative);
+        let outputs = List::take(slots, 2);
+        let hash = KernelTx::payload_hash(payment_edge, CloseKind::Mutual, terms_hash, &outputs);
+        Some(Self {
+            payment_edge,
+            terms_hash,
+            cumulative,
+            outputs,
+            client_auth: Auth::native(client.sign(hash)),
+        })
+    }
+
+    /// Provider-side redemption: adds the taker authorization and
+    /// produces the executable kernel `Mutual` close. This is the only
+    /// place provider authorization is created, and it never leaves the
+    /// resulting transaction.
+    #[must_use]
+    pub fn redeem(&self, provider: &Secp256k1Signer) -> KernelTx {
+        let hash = KernelTx::payload_hash(
+            self.payment_edge,
+            CloseKind::Mutual,
+            self.terms_hash,
+            &self.outputs,
+        );
+        KernelTx::close(
+            self.payment_edge,
+            Proof::mutual(self.client_auth.clone(), Auth::native(provider.sign(hash))),
+            self.outputs.clone(),
+        )
+    }
+}
+
+/// Provider-side frontier bookkeeping: keeps only the latest voucher
+/// and refuses regressions, cross-edge substitutions, and mismatched
+/// terms.
+#[derive(Debug, Clone, Default)]
+pub struct VoucherBook {
+    latest: Option<MakerVoucher>,
+}
+
+impl VoucherBook {
+    /// Creates an empty book.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accepts `voucher` iff it strictly advances the frontier on the
+    /// same edge and terms. Returns false (book unchanged) otherwise.
+    pub fn accept(&mut self, voucher: MakerVoucher) -> bool {
+        if let Some(latest) = &self.latest {
+            let advances = voucher.payment_edge == latest.payment_edge
+                && voucher.terms_hash == latest.terms_hash
+                && voucher.cumulative > latest.cumulative;
+            if !advances {
+                return false;
+            }
+        }
+        self.latest = Some(voucher);
+        true
+    }
+
+    /// The highest-`E` voucher accepted so far.
+    #[must_use]
+    pub const fn latest(&self) -> Option<&MakerVoucher> {
+        self.latest.as_ref()
+    }
+}
 
 /// Domain separator for [`JobAcceptanceContext::digest`].
 const JOB_ACCEPTANCE_DOMAIN: &[u8] = b"hellas.staked.job_acceptance.v1";
@@ -281,6 +426,120 @@ mod tests {
             result,
             provider_result_sig: provider.sign(result.digest()),
         }
+    }
+
+    /// Slice-1 e2e fixture: the client funds a payment channel, advances
+    /// the frontier with asymmetric vouchers, and the provider redeems
+    /// exactly the latest one as a kernel `Mutual` at consensus
+    /// execution. Stale and cross-frontier vouchers die in the book;
+    /// overdrafts cannot even be issued.
+    #[test]
+    fn provider_redeems_only_the_latest_frontier_at_consensus_execution() {
+        const CAPACITY: u64 = 2_000;
+        run_qmdb(|runtime| async move {
+            let client = signer(11);
+            let provider = signer(12);
+            let terms = payment_channel_terms(
+                client.party_key(),
+                provider.party_key(),
+                BlockHeight::new(100),
+                CAPACITY,
+            );
+            let client_coin = CoinId::from_bytes(genesis_object_id(0).0);
+            let funding = Funding::new(
+                List::take([client_coin; MAX_PARTY_INPUTS], 1),
+                List::take([client_coin; MAX_PARTY_INPUTS], 0),
+            );
+            let open_hash = KernelTx::open_hash(&funding, &terms);
+            let open = KernelTx::open(
+                funding.clone(),
+                terms.clone(),
+                Auth::native(client.sign(open_hash)),
+                Auth::native(provider.sign(open_hash)),
+            );
+            let payment_edge = KernelTx::edge_id_of(&funding, &terms);
+            let allocations = vec![(SettlementKey::from(client.party_key()), CAPACITY)];
+
+            let verifier = ChainVerifier::new();
+            let config = utxo_db_config(&runtime, "voucher_e2e", 1024, 8);
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+            let batches = database.new_batches().await;
+            let batches = execute_all(
+                context(1),
+                &verifier,
+                &[Transaction::Kernel(open)],
+                &allocations,
+                batches,
+            )
+            .await
+            .expect("payment channel opens");
+            let merkleized = batches.merkleize().await.expect("open merkleizes");
+            database.finalize(merkleized).await;
+
+            // Two jobs' worth of frontier: E = 800, then E = 1550. The
+            // client only ever signs; the provider only ever accumulates.
+            let issue = |cumulative| {
+                MakerVoucher::issue(
+                    &client,
+                    provider.party_key(),
+                    payment_edge,
+                    terms.hash(),
+                    CAPACITY,
+                    cumulative,
+                )
+            };
+            let first = issue(800).expect("first frontier");
+            let second = issue(1_550).expect("second frontier");
+            assert!(issue(CAPACITY + 1).is_none(), "overdraft is unissuable");
+
+            let mut book = VoucherBook::new();
+            assert!(book.accept(first.clone()));
+            assert!(book.accept(second));
+            assert!(!book.accept(first), "stale frontier regression refused");
+            let latest = book.latest().expect("latest frontier");
+            assert_eq!(latest.cumulative, 1_550);
+
+            let close = latest.redeem(&provider);
+            let batches = execute_all(
+                context(2),
+                &verifier,
+                &[Transaction::Kernel(close)],
+                &allocations,
+                database.new_batches().await,
+            )
+            .await
+            .expect("latest frontier redeems as a kernel Mutual");
+
+            assert_eq!(
+                batches
+                    .get(&edge_object_id(payment_edge))
+                    .await
+                    .expect("edge read"),
+                None,
+            );
+            let ids = KernelTx::close_output_ids(payment_edge, &latest.outputs);
+            let slots: Vec<_> = ids.as_slice().to_vec();
+            assert_eq!(
+                batches
+                    .get(&coin_object_id(slots[0]))
+                    .await
+                    .expect("client refund read"),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from(client.party_key()),
+                    value: CAPACITY - 1_550,
+                })),
+            );
+            assert_eq!(
+                batches
+                    .get(&coin_object_id(slots[1]))
+                    .await
+                    .expect("provider earnings read"),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from(provider.party_key()),
+                    value: 1_550,
+                })),
+            );
+        });
     }
 
     /// Slice-1 e2e fixture: a provider-funded bond opens under real
