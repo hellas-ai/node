@@ -1,7 +1,7 @@
-use super::{store::UtxoDatabase, working_set::BlockWorkingSet};
+use super::{store::UtxoDatabase, verifier::StakedOpenPolicy, working_set::BlockWorkingSet};
 use crate::domain::{
-    Address, Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id,
-    edge_object_id, genesis_object_id, output_object_id,
+    Address, Coin, MAX_STAKED_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey,
+    Transaction, coin_object_id, edge_object_id, genesis_object_id, output_object_id,
 };
 use commonware_codec::{Encode, EncodeSize};
 use commonware_cryptography::{Hasher, Sha256};
@@ -49,6 +49,10 @@ pub enum ExecutionError {
     KernelHostContract { error: ApplyError },
     #[error("kernel transaction rejected: {error:?}")]
     KernelApply { error: ApplyError },
+    #[error("staked open rejected: the wired verifier cannot verify any dispute seal")]
+    StakedOpenUnsupported,
+    #[error("staked open lifetime {blocks} blocks exceeds the consensus cap {max}")]
+    StakedLifetimeExceeded { blocks: u64, max: u64 },
 }
 
 impl ExecutionError {
@@ -110,7 +114,7 @@ pub async fn execute_all<E, V>(
 ) -> Result<Batch<E>, ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier,
+    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     for tx in txs {
@@ -133,7 +137,7 @@ pub async fn execute_proposal<E, V>(
 ) -> Result<(Batch<E>, Vec<Transaction>, Vec<Transaction>), ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier,
+    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     let mut included = Vec::new();
@@ -210,7 +214,7 @@ async fn apply_transaction<E, V>(
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier,
+    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     match tx {
         Transaction::Transfer {
@@ -538,6 +542,39 @@ where
     (batches, None)
 }
 
+/// Consensus admission for staked (fraud-game) opens, checked before the
+/// kernel ever sees the transaction. A bond whose `Violation` path can
+/// never verify is just locked funds with a dead dispute game, so staked
+/// opens are refused unless the wired verifier admits them; admitted
+/// bonds must still commit a bounded lifetime, because lifetime fees are
+/// zero and a distant timeout would be operationally permanent.
+fn check_staked_open<V: StakedOpenPolicy>(
+    context: KernelContext,
+    verifier: &V,
+    tx: &KernelTx,
+) -> Result<(), ExecutionError> {
+    let KernelTx::Open { terms, .. } = tx else {
+        return Ok(());
+    };
+    if terms.as_stake_bond().is_none() {
+        return Ok(());
+    }
+    if !verifier.admits_staked_opens() {
+        return Err(ExecutionError::StakedOpenUnsupported);
+    }
+    let blocks = terms
+        .timeout()
+        .get()
+        .saturating_sub(context.block_height().get());
+    if blocks > MAX_STAKED_LIFETIME_BLOCKS {
+        return Err(ExecutionError::StakedLifetimeExceeded {
+            blocks,
+            max: MAX_STAKED_LIFETIME_BLOCKS,
+        });
+    }
+    Ok(())
+}
+
 async fn apply_kernel_transaction<E, V>(
     batches: Batch<E>,
     context: KernelContext,
@@ -546,8 +583,11 @@ async fn apply_kernel_transaction<E, V>(
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier,
+    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
+    if let Err(err) = check_staked_open(context, verifier, tx) {
+        return Err((batches, err));
+    }
     let working = match load_kernel_slots(&batches, tx).await {
         Ok(working) => working,
         Err(err) => return Err((batches, err)),
@@ -1006,6 +1046,127 @@ mod tests {
                 }
                 .is_fatal_storage()
             );
+        });
+    }
+
+    #[test]
+    fn staked_opens_are_gated_at_consensus_execution() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
+            MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
+            Payout as KernelPayout, ProtocolCode, SealPublicInputs, Sig, StakeBondTerms,
+            Terms as KernelTerms,
+        };
+
+        /// Delegates all verification to [`ChainVerifier`] but admits
+        /// staked opens, standing in for the future seal-capable dev
+        /// verifier.
+        struct AdmittingVerifier(ChainVerifier);
+        impl SigVerifier for AdmittingVerifier {
+            fn verify_sig(
+                &self,
+                sig: Sig,
+                party_key: KernelKey,
+                hash: hellas_kernel::PayloadHash,
+            ) -> bool {
+                self.0.verify_sig(sig, party_key, hash)
+            }
+        }
+        impl SealVerifier for AdmittingVerifier {
+            fn verify_seal(
+                &self,
+                seal: hellas_kernel::Seal,
+                public: &SealPublicInputs<'_>,
+            ) -> bool {
+                self.0.verify_seal(seal, public)
+            }
+        }
+        impl StakedOpenPolicy for AdmittingVerifier {
+            fn admits_staked_opens(&self) -> bool {
+                true
+            }
+        }
+
+        let staked_open = |timeout: u64| {
+            let terms = KernelTerms::stake_bond(StakeBondTerms {
+                protocol: ProtocolCode::new(1),
+                parties: Parties::new(
+                    KernelKey::from_bytes([2; KernelKey::LENGTH]),
+                    KernelKey::from_bytes([3; KernelKey::LENGTH]),
+                ),
+                timeout: KernelHeight::new(timeout),
+                timeout_outputs: List::take([KernelPayout::default(); OUTPUTS], 0),
+                treasury: KernelKey::from_bytes([4; KernelKey::LENGTH]),
+                award: 1,
+                stake: 1,
+                max_job_price: 1,
+                max_dispute_cost: 0,
+            });
+            let zero = CoinId::from_bytes([0; CoinId::LENGTH]);
+            let empty = List::take([zero; INPUTS], 0);
+            let garbage = Auth::native(Sig::from_bytes([0; 64]));
+            Transaction::Kernel(KernelTx::open(
+                Funding::new(empty.clone(), empty),
+                terms,
+                garbage.clone(),
+                garbage,
+            ))
+        };
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "staked_gate").await;
+
+            // Production verifier: refused before the kernel sees it, and
+            // dropped (not retained) from proposals.
+            let batches = database.new_batches().await;
+            let (batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &staked_open(50))
+                    .await
+                    .err()
+                    .expect("staked open refused in production");
+            assert_eq!(error, ExecutionError::StakedOpenUnsupported);
+            assert!(!error.is_transient_for_mempool());
+            assert!(!error.is_fatal_storage());
+            let (batches, included, retained) = execute_proposal(
+                context(1),
+                &ChainVerifier::new(),
+                vec![staked_open(50)],
+                &[],
+                MAX_TXS_PER_BLOCK,
+                usize::MAX,
+                batches,
+            )
+            .await
+            .expect("gated staked open is a non-fatal drop");
+            assert!(included.is_empty());
+            assert!(retained.is_empty());
+
+            // Admitting verifier: the lifetime cap holds...
+            let admitting = AdmittingVerifier(ChainVerifier::new());
+            let over_cap = 1 + crate::domain::MAX_STAKED_LIFETIME_BLOCKS + 1;
+            let (batches, error) =
+                apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
+                    .await
+                    .err()
+                    .expect("over-cap staked open refused");
+            assert_eq!(
+                error,
+                ExecutionError::StakedLifetimeExceeded {
+                    blocks: crate::domain::MAX_STAKED_LIFETIME_BLOCKS + 1,
+                    max: crate::domain::MAX_STAKED_LIFETIME_BLOCKS,
+                }
+            );
+
+            // ...and an in-cap staked open falls through to ordinary
+            // kernel validation (here: rejected by the kernel because the
+            // committed stake exceeds the zero funding — proof the gate
+            // itself no longer blocks it).
+            let (_batches, error) =
+                apply_transaction(batches, context(1), &admitting, &staked_open(50))
+                    .await
+                    .err()
+                    .expect("kernel still validates admitted staked opens");
+            assert!(matches!(error, ExecutionError::KernelApply { .. }));
         });
     }
 

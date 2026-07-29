@@ -13,6 +13,22 @@ use hellas_kernel::{
     SigVerifier,
 };
 
+/// Whether the wired verifier can actually verify some protocol's
+/// dispute seals.
+///
+/// Consensus execution rejects every staked-terms `Open` unless the
+/// verifier admits them: a bond whose `Violation` path can never verify
+/// is not a bond, just locked funds with a dead dispute game. The gate
+/// lifts exactly when a seal-capable verifier is wired — it cannot
+/// desync from the verification capability, because it *is* the
+/// verification capability.
+pub trait StakedOpenPolicy {
+    /// Returns true when staked-terms opens are admissible under this
+    /// verifier.
+    #[must_use]
+    fn admits_staked_opens(&self) -> bool;
+}
+
 /// The verifier every consensus execution path runs with.
 #[derive(Debug, Default)]
 pub struct ChainVerifier {
@@ -42,5 +58,13 @@ impl SigVerifier for ChainVerifier {
 impl SealVerifier for ChainVerifier {
     fn verify_seal(&self, seal: Seal, public: &SealPublicInputs<'_>) -> bool {
         self.inner.verify_seal(seal, public)
+    }
+}
+
+impl StakedOpenPolicy for ChainVerifier {
+    /// Every seal is rejected (`Secp256k1Verifier`'s hard-reject), so
+    /// staked opens are meaningless and refused.
+    fn admits_staked_opens(&self) -> bool {
+        false
     }
 }
