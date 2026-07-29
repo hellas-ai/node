@@ -1101,6 +1101,7 @@ mod tests {
                 stake: 1,
                 max_job_price: 1,
                 max_dispute_cost: 0,
+                challenge_margin: 1,
             });
             let zero = CoinId::from_bytes([0; CoinId::LENGTH]);
             let empty = List::take([zero; INPUTS], 0);

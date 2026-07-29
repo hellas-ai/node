@@ -501,6 +501,7 @@ fn maximum_bounded_lists_reach_their_declared_codec_bounds() {
         stake: 10,
         max_job_price: 6,
         max_dispute_cost: 4,
+        challenge_margin: 8,
     });
     assert_eq!(max_terms.encoded_size(), Terms::MAX_ENCODED_SIZE);
 

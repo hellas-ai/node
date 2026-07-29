@@ -187,6 +187,12 @@ pub enum InvalidOpenReason {
     /// `max_job_price + max_dispute_cost` overflowed while checking the
     /// award floor.
     AwardFloorOverflow,
+    /// Stake-bond terms name a party key as the treasury, which would
+    /// collapse the slash penalty from the stake to the award.
+    TreasuryIsParty,
+    /// Stake-bond terms commit a zero `max_job_price`: the bond covers
+    /// no job and the strict dispute incentive degenerates.
+    JobPriceCapZero,
 }
 
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.

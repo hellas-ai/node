@@ -84,7 +84,10 @@ server = [
 ]
 # Dev-chain seal verification: staked opens are admitted and violation
 # seals verify against a preverified fraud-artifact cache. Never enable
-# on a production chain — the artifact cache is trusted input.
+# on a production chain, and never on a multi-validator network: the
+# cache is process-local trusted input, not consensus state — two
+# validators with different cache contents would fork on a violation
+# close. Single-node dev chains only.
 preverified-seals = ["validator"]
 validator = [
     "indexer",

@@ -86,9 +86,16 @@ pub struct StakeBondTerms {
     pub stake: u64,
     /// Largest job price this bond may cover; with `max_dispute_cost`
     /// it floors the award so a slash always makes the client whole.
+    /// At least 1 — a bond that can cover no job is not a bond.
     pub max_job_price: u64,
     /// Largest dispute cost this bond may cover.
     pub max_dispute_cost: u64,
+    /// Challenge margin in blocks: the challenge window plus inclusion
+    /// and finality margins. A job is only covered when its terminal
+    /// deadline leaves at least this margin before `timeout`, otherwise
+    /// a stalling provider could push the challenge past the bond's
+    /// expiry and escape into a stake refund.
+    pub challenge_margin: u64,
 }
 
 impl Terms {
@@ -229,7 +236,7 @@ const BASIC_BODY_SIZE: usize = ProtocolCode::MAX_ENCODED_SIZE
 
 impl Encode for StakeBondTerms {
     const MAX_ENCODED_SIZE: usize =
-        BASIC_BODY_SIZE + Key::MAX_ENCODED_SIZE + 4 * u64::MAX_ENCODED_SIZE;
+        BASIC_BODY_SIZE + Key::MAX_ENCODED_SIZE + 5 * u64::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
         ProtocolCode::MAX_ENCODED_SIZE
@@ -237,7 +244,7 @@ impl Encode for StakeBondTerms {
             + BlockHeight::MAX_ENCODED_SIZE
             + self.timeout_outputs.encoded_size()
             + Key::MAX_ENCODED_SIZE
-            + 4 * u64::MAX_ENCODED_SIZE
+            + 5 * u64::MAX_ENCODED_SIZE
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
@@ -250,6 +257,7 @@ impl Encode for StakeBondTerms {
         self.stake.encode_to(writer);
         self.max_job_price.encode_to(writer);
         self.max_dispute_cost.encode_to(writer);
+        self.challenge_margin.encode_to(writer);
     }
 }
 
@@ -265,6 +273,7 @@ impl Decode for StakeBondTerms {
         let stake = decode_field(buf, &mut consumed)?;
         let max_job_price = decode_field(buf, &mut consumed)?;
         let max_dispute_cost = decode_field(buf, &mut consumed)?;
+        let challenge_margin = decode_field(buf, &mut consumed)?;
         Ok((
             Self {
                 protocol,
@@ -276,6 +285,7 @@ impl Decode for StakeBondTerms {
                 stake,
                 max_job_price,
                 max_dispute_cost,
+                challenge_margin,
             },
             consumed,
         ))
@@ -391,6 +401,7 @@ mod tests {
             stake: 12,
             max_job_price: 4,
             max_dispute_cost: 3,
+            challenge_margin: 5,
         }
     }
 
@@ -482,7 +493,7 @@ mod tests {
                 + <usize as Encode>::MAX_ENCODED_SIZE
                 + MAX_EDGE_OUTPUTS * Payout::MAX_ENCODED_SIZE
                 + Key::MAX_ENCODED_SIZE
-                + 4 * u64::MAX_ENCODED_SIZE,
+                + 5 * u64::MAX_ENCODED_SIZE,
         );
         assert_eq!(body.encoded_size(), writer.position());
         assert!(body.encoded_size() <= TermsBody::MAX_ENCODED_SIZE);
