@@ -176,6 +176,17 @@ pub enum InvalidOpenReason {
     /// `SigVerifier`. Both maker and taker must sign the canonical open
     /// hash for the produced edge.
     BadSignature,
+    /// Stake-bond terms commit a stake that does not equal the net value
+    /// the open actually locks.
+    StakeMismatch,
+    /// Stake-bond terms commit an award of zero or above the stake.
+    AwardOutOfRange,
+    /// Stake-bond terms commit an award below `max_job_price +
+    /// max_dispute_cost`, so a slash could not make the client whole.
+    AwardBelowFloor,
+    /// `max_job_price + max_dispute_cost` overflowed while checking the
+    /// award floor.
+    AwardFloorOverflow,
 }
 
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.
@@ -191,6 +202,10 @@ pub enum InvalidCloseReason {
     /// Sum of payout values does not equal principal plus reserve surplus for
     /// the selected close path.
     ValueMismatch,
+    /// The close kind is not in the edge's committed [`crate::CloseKindSet`].
+    /// Raised before any witness check — e.g. a `Mutual` close of a stake
+    /// bond is rejected even with both parties' valid signatures.
+    KindForbidden,
 }
 
 /// Specific reason an [`ApplyError::InvalidProof`] was raised.

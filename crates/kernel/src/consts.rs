@@ -101,6 +101,11 @@ pub(crate) const CLOSE: &[u8] = b"hellas.edge.close.v1";
 /// parties, timeout height, timeout payouts.
 pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v1";
 
+/// Prefix for the stake-bond terms commitment. Inputs: protocol code,
+/// parties, timeout height, timeout payouts, treasury key, award, stake,
+/// max job price, max dispute cost.
+pub(crate) const TERMS_STAKE_BOND: &[u8] = b"hellas.terms.stake_bond.v1";
+
 /// Prefix for the deterministic seal placeholder used by tests and
 /// modelling. Inputs: protocol code, close kind tag, close hash.
 #[cfg(any(test, feature = "placeholders"))]

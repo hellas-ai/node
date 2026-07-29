@@ -7,8 +7,8 @@
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode, DecodeError, EdgeId, Encode, Fees, Funding,
     Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash,
-    Payout, Proof, ProtocolCode, Seal, Sig, Terms, TermsHash, Tx, WebAuthnAssertion, WebAuthnData,
-    Writer,
+    Payout, Proof, ProtocolCode, Seal, Sig, StakeBondTerms, Terms, TermsHash, Tx,
+    WebAuthnAssertion, WebAuthnData, Writer,
 };
 
 const fn key(byte: u8) -> Key {
@@ -490,12 +490,18 @@ fn maximum_bounded_lists_reach_their_declared_codec_bounds() {
     let auth = Auth::webauthn(assertion);
     assert_eq!(auth.encoded_size(), Auth::MAX_ENCODED_SIZE);
 
-    let max_terms = Terms::basic(
-        ProtocolCode::new(8),
-        Parties::new(key(8), key(9)),
-        BlockHeight::new(200),
-        List::all([Payout::new(key(8), 10); MAX_EDGE_OUTPUTS]),
-    );
+    // StakeBond is the widest terms shape, so it defines the codec bound.
+    let max_terms = Terms::stake_bond(StakeBondTerms {
+        protocol: ProtocolCode::new(8),
+        parties: Parties::new(key(8), key(9)),
+        timeout: BlockHeight::new(200),
+        timeout_outputs: List::all([Payout::new(key(8), 10); MAX_EDGE_OUTPUTS]),
+        treasury: key(10),
+        award: 10,
+        stake: 10,
+        max_job_price: 6,
+        max_dispute_cost: 4,
+    });
     assert_eq!(max_terms.encoded_size(), Terms::MAX_ENCODED_SIZE);
 
     let tx = Tx::open(funding, max_terms, auth.clone(), auth);

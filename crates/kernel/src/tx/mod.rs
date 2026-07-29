@@ -15,7 +15,7 @@ pub use self::{
     auth::{Auth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
     payout::Payout,
-    proof::{CloseKind, Proof, Seal},
+    proof::{CloseKind, CloseKindSet, Proof, Seal},
 };
 
 use crate::{
@@ -345,13 +345,40 @@ where
         terms.hash(),
         (open_fee, lifetime_fee, reserve, context.fees()),
         terms.timeout(),
+        terms.allowed_closes(),
     )
     .map_err(|reason| invalid_open(output, reason))?;
     check_open_terms(output, &edge, terms)?;
+    check_stake_bond_open(output, &edge, terms)?;
     check_open_auth(
         output, funding, terms, parties, maker_auth, taker_auth, verifier,
     )?;
     Ok(Change::open(&coins, (output, edge)))
+}
+
+/// Stake-bond opens additionally commit the slash arithmetic. The stake
+/// must be the value this open actually locks, and the award must be
+/// positive, within the stake, and at least `max_job_price +
+/// max_dispute_cost` — otherwise a later slash could not reimburse the
+/// client for the worst job this bond admits.
+fn check_stake_bond_open(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelResult<()> {
+    let Some(bond) = terms.as_stake_bond() else {
+        return Ok(());
+    };
+    if bond.stake != edge.value() {
+        return Err(invalid_open(output, InvalidOpenReason::StakeMismatch));
+    }
+    if bond.award == 0 || bond.award > bond.stake {
+        return Err(invalid_open(output, InvalidOpenReason::AwardOutOfRange));
+    }
+    let floor = bond
+        .max_job_price
+        .checked_add(bond.max_dispute_cost)
+        .ok_or_else(|| invalid_open(output, InvalidOpenReason::AwardFloorOverflow))?;
+    if bond.award < floor {
+        return Err(invalid_open(output, InvalidOpenReason::AwardBelowFloor));
+    }
+    Ok(())
 }
 
 /// Every coin in `funding.maker` must be owned by `parties.maker()`;
@@ -448,6 +475,9 @@ where
     let edge = batch
         .edge(input)
         .ok_or(ApplyError::MissingEdge { id: input })?;
+    if !edge.allows(proof.kind()) {
+        return Err(invalid_close(input, InvalidCloseReason::KindForbidden));
+    }
     // Cheap structural checks first: output freshness and value conservation.
     // Close has no marginal monetary fee: the reserve was committed when the
     // edge opened, while `Tx::cost()` still counts close resources for block
@@ -514,6 +544,7 @@ where
             if context.block_height() >= edge.timeout() {
                 return Err(InvalidProofReason::ProofExpired);
             }
+            check_violation_payouts(terms, outputs)?;
             let public = SealPublicInputs {
                 edge_id: input,
                 protocol: terms.protocol(),
@@ -527,6 +558,34 @@ where
             }
         }
     }
+}
+
+/// A stake-bond violation pays out exactly `[(client, award + surplus),
+/// (treasury, stake − award)]`, where client = the bond's taker. The
+/// routing is enforced here, structurally, from the terms revealed by
+/// the proof — the seal verifier only decides whether the fraud
+/// artifact is genuine, and can never redirect the payout. Output 0's
+/// value follows from conservation (`Edge::closes` pins the total to
+/// `stake + surplus`), so checking output 1's exact value pins both.
+fn check_violation_payouts(terms: &Terms, outputs: &Payouts) -> Result<(), InvalidProofReason> {
+    let Some(bond) = terms.as_stake_bond() else {
+        return Ok(());
+    };
+    let [client, treasury] = outputs.as_slice() else {
+        return Err(InvalidProofReason::PayoutMismatch);
+    };
+    // Open-time checks guarantee award ≤ stake; a violated subtraction
+    // here means the terms did not pass this kernel's open path.
+    let Some(remainder) = bond.stake.checked_sub(bond.award) else {
+        return Err(InvalidProofReason::PayoutMismatch);
+    };
+    if client.owner() != bond.parties.taker()
+        || treasury.owner() != bond.treasury
+        || treasury.value() != remainder
+    {
+        return Err(InvalidProofReason::PayoutMismatch);
+    }
+    Ok(())
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {

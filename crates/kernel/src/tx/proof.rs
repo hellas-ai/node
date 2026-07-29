@@ -58,6 +58,73 @@ impl CloseKind {
             Self::Mutual => 2,
         }
     }
+
+    const fn bit(self) -> u8 {
+        1 << self.tag()
+    }
+}
+
+/// Committed set of close kinds an edge admits.
+///
+/// Derived from the open terms (each [`crate::Terms`] shape fixes its
+/// set structurally) and persisted on the [`crate::Edge`], so every
+/// close — including `Mutual`, which reveals no terms body — is checked
+/// against the committed policy. `Timeout` is a member of every set the
+/// kernel constructs: an edge must always have a unilateral,
+/// non-cryptographic exit, or funds could be locked forever.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct CloseKindSet(u8);
+
+impl CloseKindSet {
+    const ALL_BITS: u8 =
+        CloseKind::Mutual.bit() | CloseKind::Timeout.bit() | CloseKind::Violation.bit();
+
+    /// The empty set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Every close kind.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self(Self::ALL_BITS)
+    }
+
+    /// Returns this set with `kind` added.
+    #[must_use]
+    pub const fn with(self, kind: CloseKind) -> Self {
+        Self(self.0 | kind.bit())
+    }
+
+    /// Returns true when `kind` is a member of this set.
+    #[must_use]
+    pub const fn contains(self, kind: CloseKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+}
+
+impl Encode for CloseKindSet {
+    const MAX_ENCODED_SIZE: usize = u8::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        self.0.encode_to(writer);
+    }
+}
+
+impl Decode for CloseKindSet {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = 0;
+        let bits = decode_field::<u8>(buf, &mut consumed)?;
+        if bits & !Self::ALL_BITS != 0 {
+            return Err(DecodeError::InvalidTag { tag: bits });
+        }
+        Ok((Self(bits), consumed))
+    }
 }
 
 /// Compact mode-specific proof result for a violation outcome.

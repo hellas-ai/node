@@ -734,6 +734,8 @@ pub(crate) fn test_edge() -> KernelEdge {
     bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[4; 32]);
+    // CloseKindSet: all close kinds allowed.
+    bytes.push(0b111);
     assert_eq!(bytes.len(), KernelEdge::MAX_ENCODED_SIZE);
     KernelEdge::decode_exact(&bytes).expect("test edge must use the kernel canonical layout")
 }

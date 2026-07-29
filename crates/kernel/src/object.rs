@@ -16,6 +16,7 @@ use crate::{
     list::List,
     primitive::{CoinId, Key, TermsHash},
     store::Batch,
+    tx::{CloseKind, CloseKindSet},
 };
 
 /// Owner-only UTXO object.
@@ -136,6 +137,7 @@ pub struct Edge {
     timeout: BlockHeight,
     parties: Parties,
     terms: TermsHash,
+    allowed: CloseKindSet,
 }
 
 impl Edge {
@@ -146,6 +148,7 @@ impl Edge {
         timeout: BlockHeight,
         parties: Parties,
         terms: TermsHash,
+        allowed: CloseKindSet,
     ) -> Self {
         Self {
             value,
@@ -154,6 +157,7 @@ impl Edge {
             timeout,
             parties,
             terms,
+            allowed,
         }
     }
 
@@ -163,6 +167,7 @@ impl Edge {
         terms: TermsHash,
         debits: (u64, u64, u64, Fees),
         timeout: BlockHeight,
+        allowed: CloseKindSet,
     ) -> Result<Self, InvalidOpenReason> {
         let (open_fee, lifetime_fee, reserve, close_fees) = debits;
         let total = Self::total(coins).ok_or(InvalidOpenReason::FundingOverflow)?;
@@ -172,7 +177,7 @@ impl Edge {
             .and_then(|after_fee| after_fee.checked_sub(reserve))
             .ok_or(InvalidOpenReason::FundingInsufficient)?;
         Ok(Self::new(
-            value, reserve, close_fees, timeout, parties, terms,
+            value, reserve, close_fees, timeout, parties, terms, allowed,
         ))
     }
 
@@ -242,6 +247,18 @@ impl Edge {
     pub const fn terms(self) -> TermsHash {
         self.terms
     }
+
+    /// Returns the close kinds committed by the opening terms.
+    #[must_use]
+    pub const fn allowed_closes(self) -> CloseKindSet {
+        self.allowed
+    }
+
+    /// Returns true when the opening terms admit this close kind.
+    #[must_use]
+    pub const fn allows(self, kind: CloseKind) -> bool {
+        self.allowed.contains(kind)
+    }
 }
 
 impl Encode for Edge {
@@ -250,7 +267,8 @@ impl Encode for Edge {
         + Fees::MAX_ENCODED_SIZE
         + BlockHeight::MAX_ENCODED_SIZE
         + Parties::MAX_ENCODED_SIZE
-        + TermsHash::MAX_ENCODED_SIZE;
+        + TermsHash::MAX_ENCODED_SIZE
+        + CloseKindSet::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
         Self::MAX_ENCODED_SIZE
@@ -264,6 +282,7 @@ impl Encode for Edge {
         self.timeout.encode_to(writer);
         self.parties.encode_to(writer);
         self.terms.encode_to(writer);
+        self.allowed.encode_to(writer);
     }
 }
 
@@ -276,8 +295,9 @@ impl Decode for Edge {
         let timeout = decode_field(buf, &mut consumed)?;
         let parties = decode_field(buf, &mut consumed)?;
         let terms = decode_field(buf, &mut consumed)?;
+        let allowed = decode_field(buf, &mut consumed)?;
         Ok((
-            Self::new(value, reserve, close_fees, timeout, parties, terms),
+            Self::new(value, reserve, close_fees, timeout, parties, terms, allowed),
             consumed,
         ))
     }
@@ -360,6 +380,7 @@ mod tests {
                 Key::from_bytes([3; Key::LENGTH]),
             ),
             TermsHash::from_bytes([4; TermsHash::LENGTH]),
+            CloseKindSet::all(),
         );
         let mut edge_buf = [0; Edge::MAX_ENCODED_SIZE + 1];
         assert_canonical_round_trip(edge, &mut edge_buf);
