@@ -435,6 +435,10 @@ pub const MAX_TXS_PER_BLOCK: usize = 256;
 pub const MAX_BLOCK_TX_BYTES: usize = 768 * 1024;
 /// Consensus-critical kernel fee schedule compiled into the chain.
 pub const KERNEL_FEES: Fees = Fees::ZERO;
+/// Longest lifetime, in blocks, a staked (fraud-game) edge may commit at
+/// open. Lifetime fees are currently zero, so without this consensus cap
+/// a `u64::MAX` timeout would make a bond operationally permanent.
+pub const MAX_STAKED_LIFETIME_BLOCKS: u64 = 1_000_000;
 /// Default genesis allocation balance.
 pub const GENESIS_BALANCE: u64 = 100_000_000;
 /// Minimum `WebAuthn` authenticator data length.
