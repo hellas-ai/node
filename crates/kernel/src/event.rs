@@ -284,6 +284,7 @@ mod tests {
             TermsHash::from_bytes([0x44; TermsHash::LENGTH]),
             (0, 0, 0, Fees::ZERO),
             BlockHeight::new(10),
+            crate::tx::CloseKindSet::all(),
         )
         .expect("coherence edge");
         Change::open(&coins, (EdgeId::from_bytes([0x51; EdgeId::LENGTH]), edge))

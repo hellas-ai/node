@@ -93,8 +93,11 @@ pub use primitive::{CoinId, EdgeId, Key, Party, PayloadHash, ProtocolCode, Sig, 
 pub use secp256k1::{Secp256k1Signer, Secp256k1SignerError, Secp256k1Verifier};
 pub use state::State;
 pub use store::{Batch, Store};
-pub use terms::Terms;
-pub use tx::{Auth, CloseKind, Funding, Payout, Proof, Seal, Tx, WebAuthnAssertion, WebAuthnData};
+pub use terms::{StakeBondTerms, Terms};
+pub use tx::{
+    Auth, CloseKind, CloseKindSet, Funding, Payout, Proof, Seal, Tx, WebAuthnAssertion,
+    WebAuthnData,
+};
 pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
 pub use view::{Snapshot, View};
 #[cfg(feature = "test-support")]

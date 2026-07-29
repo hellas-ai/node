@@ -14,6 +14,8 @@ mod support;
 
 #[path = "channel/batch.rs"]
 mod batch;
+#[path = "channel/bond.rs"]
+mod bond;
 #[path = "channel/close.rs"]
 mod close;
 #[path = "channel/op.rs"]
