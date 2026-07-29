@@ -547,8 +547,7 @@ where
             check_violation_payouts(terms, outputs)?;
             let public = SealPublicInputs {
                 edge_id: input,
-                protocol: terms.protocol(),
-                terms_hash,
+                terms,
                 payouts: outputs,
             };
             if verifier.verify_seal(*seal, &public) {

@@ -1115,31 +1115,36 @@ mod tests {
 
         run_qmdb(|runtime| async move {
             let database = database(runtime, "staked_gate").await;
-
-            // Production verifier: refused before the kernel sees it, and
-            // dropped (not retained) from proposals.
             let batches = database.new_batches().await;
-            let (batches, error) =
-                apply_transaction(batches, context(1), &ChainVerifier::new(), &staked_open(50))
-                    .await
-                    .err()
-                    .expect("staked open refused in production");
-            assert_eq!(error, ExecutionError::StakedOpenUnsupported);
-            assert!(!error.is_transient_for_mempool());
-            assert!(!error.is_fatal_storage());
-            let (batches, included, retained) = execute_proposal(
-                context(1),
-                &ChainVerifier::new(),
-                vec![staked_open(50)],
-                &[],
-                MAX_TXS_PER_BLOCK,
-                usize::MAX,
-                batches,
-            )
-            .await
-            .expect("gated staked open is a non-fatal drop");
-            assert!(included.is_empty());
-            assert!(retained.is_empty());
+
+            // Production verifier (no preverified-seals feature): refused
+            // before the kernel sees it, and dropped (not retained) from
+            // proposals.
+            #[cfg(not(feature = "preverified-seals"))]
+            let batches = {
+                let (batches, error) =
+                    apply_transaction(batches, context(1), &ChainVerifier::new(), &staked_open(50))
+                        .await
+                        .err()
+                        .expect("staked open refused in production");
+                assert_eq!(error, ExecutionError::StakedOpenUnsupported);
+                assert!(!error.is_transient_for_mempool());
+                assert!(!error.is_fatal_storage());
+                let (batches, included, retained) = execute_proposal(
+                    context(1),
+                    &ChainVerifier::new(),
+                    vec![staked_open(50)],
+                    &[],
+                    MAX_TXS_PER_BLOCK,
+                    usize::MAX,
+                    batches,
+                )
+                .await
+                .expect("gated staked open is a non-fatal drop");
+                assert!(included.is_empty());
+                assert!(retained.is_empty());
+                batches
+            };
 
             // Admitting verifier: the lifetime cap holds...
             let admitting = AdmittingVerifier(ChainVerifier::new());

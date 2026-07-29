@@ -3384,6 +3384,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64ct",
+ "blake3",
  "bs58",
  "bytes",
  "commonware-actor",

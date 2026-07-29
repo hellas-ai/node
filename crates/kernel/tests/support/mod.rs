@@ -39,10 +39,10 @@ impl SealVerifier for FakeVerifier {
         let hash = Tx::payload_hash(
             public.edge_id,
             CloseKind::Violation,
-            public.terms_hash,
+            public.terms_hash(),
             public.payouts,
         );
-        seal == Seal::placeholder(public.protocol, CloseKind::Violation, hash)
+        seal == Seal::placeholder(public.protocol(), CloseKind::Violation, hash)
     }
 }
 

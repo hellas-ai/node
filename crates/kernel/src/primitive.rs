@@ -258,10 +258,16 @@ impl PayloadHash {
     /// Encoded length of a payload commitment.
     pub const LENGTH: usize = HASH_LENGTH;
 
-    /// Reconstructs a payload commitment from canonical bytes.
+    /// Builds a payload commitment from raw digest bytes.
     ///
-    /// `pub(crate)` by design: see [`CoinId::from_bytes`].
-    pub(crate) const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
+    /// Public, unlike the state-object id constructors: a payload hash
+    /// is a *message* commitment, not a store-integrity identifier.
+    /// Protocol layers define their own domain-separated payloads
+    /// (e.g. job acceptance/result contexts) and sign them with the
+    /// same kernel signer machinery. Forging one buys nothing — a
+    /// signature only ever attests to the hash that was signed.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
     }
 

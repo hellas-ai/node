@@ -33,6 +33,7 @@
 use crate::consts::MAX_EDGE_OUTPUTS;
 use crate::list::List;
 use crate::primitive::{EdgeId, Key, PayloadHash, ProtocolCode, Sig, TermsHash};
+use crate::terms::Terms;
 use crate::tx::{Auth, Payout, Seal};
 
 /// Decides whether one party-key authorization is admissible over a
@@ -69,22 +70,39 @@ pub trait SigVerifier {
 /// Bundled and passed by value-reference into [`SealVerifier::verify_seal`]
 /// so concrete protocol-specific verifiers see a stable input shape
 /// regardless of the underlying ZK system. The kernel populates every
-/// field from the close transaction and the live edge state.
+/// field from the close transaction and the live edge state; a
+/// `Violation` proof reveals the full terms body (already checked
+/// against the edge's committed hash), so verifiers read committed
+/// policy — protocol code, stake-bond parameters, parties — directly
+/// from `terms` instead of resolving it from a bare hash.
 #[derive(Debug, Clone, Copy)]
 pub struct SealPublicInputs<'a> {
     /// Id of the edge being closed.
     pub edge_id: EdgeId,
-    /// Protocol code committed by the closed edge's terms. Verifiers use
-    /// this to dispatch to the right protocol-specific seal circuit /
-    /// verifying key.
-    pub protocol: ProtocolCode,
-    /// Commitment to the closed edge's terms. The seal's circuit binds
-    /// to this to prevent cross-edge replay.
-    pub terms_hash: TermsHash,
+    /// The closed edge's revealed terms. Hash-checked by the kernel
+    /// against the edge before the verifier runs.
+    pub terms: &'a Terms,
     /// Payouts the close materialises. The seal commits to this exact
     /// payout shape, so a verifying circuit can attest "this outcome
     /// justifies these payouts".
     pub payouts: &'a List<Payout, MAX_EDGE_OUTPUTS>,
+}
+
+impl SealPublicInputs<'_> {
+    /// Protocol code committed by the closed edge's terms. Verifiers use
+    /// this to dispatch to the right protocol-specific seal circuit /
+    /// verifying key.
+    #[must_use]
+    pub const fn protocol(&self) -> ProtocolCode {
+        self.terms.protocol()
+    }
+
+    /// Commitment to the closed edge's terms. The seal's circuit binds
+    /// to this to prevent cross-edge replay.
+    #[must_use]
+    pub const fn terms_hash(&self) -> TermsHash {
+        self.terms.hash()
+    }
 }
 
 /// Decides whether a protocol-specific dispute seal is admissible.
