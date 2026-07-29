@@ -25,6 +25,7 @@ fn bond_terms_shaped(award: u64, stake: u64, price: u64, dispute: u64) -> Terms 
         stake,
         max_job_price: price,
         max_dispute_cost: dispute,
+        challenge_margin: 1,
     })
 }
 
@@ -222,6 +223,27 @@ fn bond_open_rejects_bad_slash_arithmetic_without_mutation() {
         (
             bond_terms_shaped(AWARD, STAKE, u64::MAX, 1),
             InvalidOpenReason::AwardFloorOverflow,
+        ),
+        // A party-controlled treasury would collapse the penalty to A.
+        (
+            Terms::stake_bond(StakeBondTerms {
+                protocol: PROTOCOL,
+                parties: PARTIES,
+                timeout: TIMEOUT,
+                timeout_outputs: payouts1(Payout::new(MAKER, STAKE)),
+                treasury: MAKER,
+                award: AWARD,
+                stake: STAKE,
+                max_job_price: 4,
+                max_dispute_cost: 3,
+                challenge_margin: 1,
+            }),
+            InvalidOpenReason::TreasuryIsParty,
+        ),
+        // A zero job-price cap covers no job.
+        (
+            bond_terms_shaped(AWARD, STAKE, 0, 0),
+            InvalidOpenReason::JobPriceCapZero,
         ),
     ];
     for (terms, reason) in cases {

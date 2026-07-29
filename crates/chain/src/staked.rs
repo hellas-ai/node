@@ -201,6 +201,25 @@ pub struct JobAcceptanceContext {
 }
 
 impl JobAcceptanceContext {
+    /// The job admission rule: the client MUST refuse jobs that fail
+    /// this before accepting, and the verifier re-checks it before a
+    /// slash. The price must sit within the bond's committed cap (and
+    /// be at least 1, so a challenge is never value-indifferent), and
+    /// the terminal deadline must leave the bond's committed challenge
+    /// margin before its timeout — otherwise a stalling provider could
+    /// push the challenge window past the bond's expiry and escape into
+    /// a stake refund.
+    #[must_use]
+    pub fn covered_by(&self, bond: &hellas_kernel::StakeBondTerms) -> bool {
+        self.price >= 1
+            && self.price <= bond.max_job_price
+            && self
+                .terminal_deadline
+                .get()
+                .checked_add(bond.challenge_margin)
+                .is_some_and(|challenge_end| challenge_end <= bond.timeout.get())
+    }
+
     /// Canonical digest both parties sign at acceptance.
     #[must_use]
     pub fn digest(&self) -> PayloadHash {
@@ -292,8 +311,7 @@ impl FraudArtifact {
         let sigs = Secp256k1Verifier::new();
         self.acceptance.bond_edge == public.edge_id
             && self.acceptance.bond_terms == public.terms_hash()
-            && self.acceptance.price >= 1
-            && self.acceptance.price <= bond.max_job_price
+            && self.acceptance.covered_by(bond)
             && self.result.acceptance == acceptance_digest
             && sigs.verify_sig(self.client_acceptance_sig, client, acceptance_digest)
             && sigs.verify_sig(self.provider_acceptance_sig, provider, acceptance_digest)
@@ -370,7 +388,7 @@ mod tests {
     use hellas_kernel::{
         ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context as KernelContext, Funding,
         InvalidProofReason, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
-        ProtocolCode, Secp256k1Signer, StakeBondTerms, Terms, Tx as KernelTx,
+        Secp256k1Signer, StakeBondTerms, Terms, Tx as KernelTx,
     };
 
     const STAKE: u64 = 1_000;
@@ -425,6 +443,61 @@ mod tests {
             provider_acceptance_sig: provider.sign(acceptance_digest),
             result,
             provider_result_sig: provider.sign(result.digest()),
+        }
+    }
+
+    /// The committed admission rule: price caps and the challenge
+    /// margin against the bond timeout, exactly the inequalities the
+    /// plan makes load-bearing against the stall-past-timeout escape.
+    #[test]
+    fn job_coverage_enforces_price_caps_and_challenge_margin() {
+        let provider = signer(5);
+        let client = signer(6);
+        let bond = StakeBondTerms {
+            protocol: STAKE_BOND_PROTOCOL,
+            parties: Parties::new(provider.party_key(), client.party_key()),
+            timeout: BlockHeight::new(100),
+            timeout_outputs: List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
+            treasury: signer(7).party_key(),
+            award: 700,
+            stake: 1_000,
+            max_job_price: 500,
+            max_dispute_cost: 200,
+            challenge_margin: 20,
+        };
+        let base = JobAcceptanceContext {
+            bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
+            bond_terms: Terms::stake_bond(bond.clone()).hash(),
+            payment_edge: hellas_kernel::EdgeId::from_bytes([2; 32]),
+            sequence: 1,
+            request: [7; 32],
+            environment: [8; 32],
+            price: 400,
+            terminal_deadline: BlockHeight::new(60),
+        };
+
+        assert!(base.covered_by(&bond));
+        assert!(
+            JobAcceptanceContext {
+                terminal_deadline: BlockHeight::new(80),
+                ..base
+            }
+            .covered_by(&bond),
+            "deadline exactly at the margin edge is covered",
+        );
+        for uncovered in [
+            JobAcceptanceContext { price: 0, ..base },
+            JobAcceptanceContext { price: 501, ..base },
+            JobAcceptanceContext {
+                terminal_deadline: BlockHeight::new(81),
+                ..base
+            },
+            JobAcceptanceContext {
+                terminal_deadline: BlockHeight::new(u64::MAX),
+                ..base
+            },
+        ] {
+            assert!(!uncovered.covered_by(&bond));
         }
     }
 
@@ -604,7 +677,7 @@ mod tests {
             let treasury = signer(7).party_key();
             let parties = Parties::new(provider.party_key(), client.party_key());
             let terms = Terms::stake_bond(StakeBondTerms {
-                protocol: ProtocolCode::new(2),
+                protocol: STAKE_BOND_PROTOCOL,
                 parties,
                 timeout: BlockHeight::new(100),
                 timeout_outputs: List::take(
@@ -616,6 +689,7 @@ mod tests {
                 stake: STAKE,
                 max_job_price: 500,
                 max_dispute_cost: 200,
+                challenge_margin: 20,
             });
 
             let provider_coin = CoinId::from_bytes(genesis_object_id(0).0);

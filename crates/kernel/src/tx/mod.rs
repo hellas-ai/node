@@ -371,6 +371,17 @@ fn check_stake_bond_open(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelRe
     if bond.award == 0 || bond.award > bond.stake {
         return Err(invalid_open(output, InvalidOpenReason::AwardOutOfRange));
     }
+    // A party-controlled treasury would collapse the slash penalty from
+    // S to A: the provider would recover S − A through its own key.
+    if bond.treasury == bond.parties.maker() || bond.treasury == bond.parties.taker() {
+        return Err(invalid_open(output, InvalidOpenReason::TreasuryIsParty));
+    }
+    // A zero job-price cap covers no job (p_j ≥ 1) and would let the
+    // award floor degenerate to A = max_dispute_cost, breaking the
+    // strict dispute incentive A > C_disp.
+    if bond.max_job_price == 0 {
+        return Err(invalid_open(output, InvalidOpenReason::JobPriceCapZero));
+    }
     let floor = bond
         .max_job_price
         .checked_add(bond.max_dispute_cost)

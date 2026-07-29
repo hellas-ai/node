@@ -120,7 +120,10 @@ impl Decode for CloseKindSet {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut consumed = 0;
         let bits = decode_field::<u8>(buf, &mut consumed)?;
-        if bits & !Self::ALL_BITS != 0 {
+        // Reject unknown bits, and reject any set without Timeout: the
+        // kernel never constructs one (an edge must keep a unilateral
+        // exit), so a persisted no-exit set is corrupt state, not data.
+        if bits & !Self::ALL_BITS != 0 || bits & CloseKind::Timeout.bit() == 0 {
             return Err(DecodeError::InvalidTag { tag: bits });
         }
         Ok((Self(bits), consumed))
