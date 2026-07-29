@@ -4,7 +4,11 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(feature = "validator")]
+mod verifier;
+#[cfg(feature = "validator")]
 mod working_set;
 
 #[cfg(feature = "validator")]
 pub use kernel::{execute_all, execute_proposal};
+#[cfg(feature = "validator")]
+pub use verifier::ChainVerifier;
