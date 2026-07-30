@@ -46,12 +46,7 @@ pub const STAKE_BOND_PROTOCOL: ProtocolCode = ProtocolCode::new(3);
 /// `refund` must equal the edge's close value (locked capacity plus
 /// timeout reserve surplus); the kernel rejects the open otherwise.
 #[must_use]
-pub fn payment_terms(
-    client: Key,
-    provider: Key,
-    timeout: BlockHeight,
-    refund: u64,
-) -> Terms {
+pub fn payment_terms(client: Key, provider: Key, timeout: BlockHeight, refund: u64) -> Terms {
     let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
     outputs[0] = Payout::new(client, refund);
     Terms::basic(
@@ -234,8 +229,7 @@ impl Channel {
         }
         let provider = provider_key(&policy.parties);
         let client = client_key(&policy.parties);
-        let mirrored =
-            provider == payment.parties().taker() && client == payment.parties().maker();
+        let mirrored = provider == payment.parties().taker() && client == payment.parties().maker();
         if !mirrored {
             return None;
         }
@@ -301,7 +295,9 @@ impl Channel {
     /// Cumulative provider earnings `E` at the latest frontier.
     #[must_use]
     pub fn cumulative(&self) -> u64 {
-        self.frontier.as_ref().map_or(0, |voucher| voucher.cumulative)
+        self.frontier
+            .as_ref()
+            .map_or(0, |voucher| voucher.cumulative)
     }
 
     /// Sequence of the most recently admitted job.
@@ -355,11 +351,7 @@ impl Channel {
     ///
     /// On success the job becomes the channel's single in-flight job
     /// and consumes its sequence number.
-    pub fn admit(
-        &mut self,
-        now: BlockHeight,
-        job: JobAcceptanceContext,
-    ) -> Result<(), AdmitError> {
+    pub fn admit(&mut self, now: BlockHeight, job: JobAcceptanceContext) -> Result<(), AdmitError> {
         if self.active.is_some() {
             return Err(AdmitError::Busy);
         }
@@ -496,7 +488,9 @@ impl Channel {
         if provider.party_key() != self.provider() {
             return None;
         }
-        self.frontier.as_ref().map(|voucher| voucher.redeem(provider))
+        self.frontier
+            .as_ref()
+            .map(|voucher| voucher.redeem(provider))
     }
 
     /// The client's unilateral exit: a `Timeout` close of the payment
@@ -1007,7 +1001,11 @@ mod channel_tests {
         let bond = bond_terms();
         assert_eq!(
             mine.slash_close(seal),
-            KernelTx::close(bond_edge(), Proof::violation(bond.clone(), seal), outputs.clone()),
+            KernelTx::close(
+                bond_edge(),
+                Proof::violation(bond.clone(), seal),
+                outputs.clone()
+            ),
         );
         assert!(artifact.binds(&SealPublicInputs {
             edge_id: bond_edge(),
@@ -1064,7 +1062,10 @@ mod channel_tests {
         let Some(foreign) = issue_at(EdgeId::from_bytes([9; 32]), 400) else {
             panic!("foreign voucher issues");
         };
-        assert_eq!(theirs.settle(now(), foreign), Err(SettleError::ForeignVoucher));
+        assert_eq!(
+            theirs.settle(now(), foreign),
+            Err(SettleError::ForeignVoucher)
+        );
 
         let Some(short) = issue_at(payment_edge(), 399) else {
             panic!("short voucher issues");
@@ -1078,7 +1079,10 @@ mod channel_tests {
             client_auth: Auth::native(provider().sign(accepted.digest())),
             ..genuine.clone()
         };
-        assert_eq!(theirs.settle(now(), forged), Err(SettleError::BadAuthorization));
+        assert_eq!(
+            theirs.settle(now(), forged),
+            Err(SettleError::BadAuthorization)
+        );
 
         assert_eq!(theirs.settle(now(), genuine.clone()), Ok(()));
         assert_eq!(theirs.settle(now(), genuine), Err(SettleError::NoActiveJob));
@@ -1462,16 +1466,25 @@ mod tests {
             let now = BlockHeight::new(1);
             let first = mine.job([7; 32], [8; 32], 800, BlockHeight::new(60));
             mine.admit(now, first).expect("client admits the first job");
-            theirs.admit(now, first).expect("provider admits the first job");
+            theirs
+                .admit(now, first)
+                .expect("provider admits the first job");
             let voucher = mine.issue(&client).expect("first frontier issues");
             let stale = voucher.clone();
-            theirs.settle(now, voucher).expect("provider settles the first job");
+            theirs
+                .settle(now, voucher)
+                .expect("provider settles the first job");
 
             let second = mine.job([7; 32], [8; 32], 750, BlockHeight::new(70));
-            mine.admit(now, second).expect("client admits the second job");
-            theirs.admit(now, second).expect("provider admits the second job");
+            mine.admit(now, second)
+                .expect("client admits the second job");
+            theirs
+                .admit(now, second)
+                .expect("provider admits the second job");
             let voucher = mine.issue(&client).expect("second frontier issues");
-            theirs.settle(now, voucher).expect("provider settles the second job");
+            theirs
+                .settle(now, voucher)
+                .expect("provider settles the second job");
             assert_eq!(theirs.cumulative(), 1_550);
             assert_eq!(
                 theirs.settle(now, stale),

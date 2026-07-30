@@ -19,6 +19,8 @@ mod consensus;
 pub mod domain;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
+#[cfg(feature = "validator")]
+pub mod faucet;
 #[cfg(feature = "indexer")]
 pub mod follower;
 #[cfg(any(feature = "indexer", feature = "validator"))]
