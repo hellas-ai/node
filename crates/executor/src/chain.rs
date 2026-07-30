@@ -10,11 +10,16 @@
 //! tests with scripted heights and a recording submission sink.
 
 use hellas_chain::domain::{ObjectId, Transaction};
-use hellas_chain::staked::{Channel, JobAcceptanceContext};
+use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
-use hellas_kernel::{BlockHeight, EdgeId, Secp256k1Signer, Sig, TermsHash};
+use hellas_kernel::{
+    Auth, BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, PayloadHash, Payout, Secp256k1Signer, Sig,
+    TermsHash,
+};
 use hellas_rpc::ProducerSigningKey;
-use hellas_rpc::pb::execute::{JobAcceptance, signature};
+use hellas_rpc::pb::execute::{
+    JobAcceptance, ReceiptResponse, SettleRequest, Signature as PbSignature, signature,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -28,17 +33,76 @@ pub struct StakedProvider {
     pub chain: Arc<dyn ChainView>,
 }
 
+/// Encodes a kernel signature as its wire form.
+pub(crate) fn sig_to_pb(sig: Sig) -> PbSignature {
+    PbSignature {
+        kind: Some(signature::Kind::Secp256k1(sig.as_bytes().to_vec())),
+    }
+}
+
+/// Decodes a wire signature that must be a 64-byte secp256k1 witness.
+pub(crate) fn sig_from_pb(
+    field: &'static str,
+    pb: Option<&PbSignature>,
+) -> Result<Sig, String> {
+    let kind = pb
+        .and_then(|sig| sig.kind.as_ref())
+        .ok_or_else(|| format!("{field} is missing"))?;
+    let signature::Kind::Secp256k1(bytes) = kind else {
+        return Err(format!("{field} must be secp256k1"));
+    };
+    Ok(Sig::from_bytes(fixed64(field, bytes)?))
+}
+
+/// The provider's staked receipt: signatures over the acceptance digest
+/// and over the result context binding it to the provider's own
+/// recorded terminal transcript.
+pub(crate) fn receipt_response(
+    signer: &Secp256k1Signer,
+    acceptance: PayloadHash,
+    transcript: [u8; 32],
+) -> ReceiptResponse {
+    let result = JobResultContext {
+        acceptance,
+        transcript,
+    };
+    ReceiptResponse {
+        provider_acceptance_signature: Some(sig_to_pb(signer.sign(acceptance))),
+        transcript: transcript.to_vec(),
+        provider_result_signature: Some(sig_to_pb(signer.sign(result.digest()))),
+    }
+}
+
+/// Rebuilds the maker voucher a settle request stands for, on the
+/// channel's canonical two-output close shape. [`Channel::settle`]
+/// still re-validates everything, including the authorization.
+pub(crate) fn voucher_from_pb(
+    request: &SettleRequest,
+    channel: &Channel,
+) -> Result<MakerVoucher, String> {
+    let payment_edge = EdgeId::from_bytes(fixed32("payment_edge", &request.payment_edge)?);
+    let terms_hash = TermsHash::from_bytes(fixed32("payment_terms", &request.payment_terms)?);
+    let authorization = sig_from_pb("client_authorization", request.client_authorization.as_ref())?;
+    let refund = channel
+        .capacity()
+        .checked_sub(request.cumulative)
+        .ok_or("frontier exceeds the payment capacity")?;
+    let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+    slots[0] = Payout::new(channel.client(), refund);
+    slots[1] = Payout::new(channel.provider(), request.cumulative);
+    Ok(MakerVoucher {
+        payment_edge,
+        terms_hash,
+        cumulative: request.cumulative,
+        outputs: List::take(slots, 2),
+        client_auth: Auth::native(authorization),
+    })
+}
+
 /// Decodes a wire [`JobAcceptance`] into the canonical context plus the
 /// client's signature over its digest.
 pub fn acceptance_from_pb(pb: &JobAcceptance) -> Result<(JobAcceptanceContext, Sig), String> {
-    let signature = pb
-        .client_signature
-        .as_ref()
-        .and_then(|sig| sig.kind.as_ref())
-        .ok_or("acceptance is missing the client signature")?;
-    let signature::Kind::Secp256k1(bytes) = signature else {
-        return Err("acceptance client signature must be secp256k1".into());
-    };
+    let signature = sig_from_pb("client signature", pb.client_signature.as_ref())?;
     let context = JobAcceptanceContext {
         bond_edge: EdgeId::from_bytes(fixed32("bond_edge", &pb.bond_edge)?),
         bond_terms: TermsHash::from_bytes(fixed32("bond_terms", &pb.bond_terms)?),
@@ -49,7 +113,7 @@ pub fn acceptance_from_pb(pb: &JobAcceptance) -> Result<(JobAcceptanceContext, S
         price: pb.price,
         terminal_deadline: BlockHeight::new(pb.terminal_deadline),
     };
-    Ok((context, Sig::from_bytes(fixed64("client_signature", bytes)?)))
+    Ok((context, signature))
 }
 
 /// Encodes the canonical context and the client's digest signature as a
@@ -65,11 +129,7 @@ pub fn acceptance_to_pb(context: &JobAcceptanceContext, client_signature: Sig) -
         environment: context.environment.to_vec(),
         price: context.price,
         terminal_deadline: context.terminal_deadline.get(),
-        client_signature: Some(hellas_rpc::pb::execute::Signature {
-            kind: Some(signature::Kind::Secp256k1(
-                client_signature.as_bytes().to_vec(),
-            )),
-        }),
+        client_signature: Some(sig_to_pb(client_signature)),
     }
 }
 

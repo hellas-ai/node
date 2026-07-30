@@ -289,6 +289,12 @@ impl Executor {
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
+                ExecutorMessage::Receipt { request, reply } => {
+                    let _ = reply.send(self.handle_receipt(&request).await);
+                }
+                ExecutorMessage::Settle { request, reply } => {
+                    let _ = reply.send(self.handle_settle(&request));
+                }
                 #[cfg(feature = "evaluate")]
                 ExecutorMessage::SchemeFinished(completion) => {
                     if let Some(engine) = self.evaluate.as_mut() {

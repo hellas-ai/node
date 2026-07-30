@@ -115,11 +115,13 @@ mod id_pins {
     #[cfg(feature = "execute")]
     #[test]
     fn execute_ids_are_stable() {
-        use super::services::execute::{Execute, RunTicket};
+        use super::services::execute::{Execute, Receipt, RunTicket, Settle};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x23b97d0b);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x97f213af);
         assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xd2d6478a);
+        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0x51b8f220);
+        assert_eq!(<Settle as MethodMarker>::METHOD_ID, 0xc678dd9f);
     }
 
     #[cfg(feature = "evaluate")]

@@ -9,7 +9,36 @@ package hellas.v1;
 
 service Execute {
   rpc RunTicket(RunTicketRequest) returns (stream WorkEvent);
+  rpc Receipt(ReceiptRequest) returns (ReceiptResponse);
+  rpc Settle(SettleRequest) returns (SettleResponse);
 }
+
+// Staked-flow receipt: after a job's terminal output, the client asks
+// for the provider signatures that complete a fraud artifact. The
+// provider signs only its own recorded transcript — a client-supplied
+// transcript is never signed.
+message ReceiptRequest {
+  bytes acceptance_digest = 1; // exactly 32 bytes
+}
+
+message ReceiptResponse {
+  Signature provider_acceptance_signature = 1; // secp256k1 over the acceptance digest
+  bytes transcript = 2;                        // exactly 32 bytes: terminal event commitment
+  Signature provider_result_signature = 3;     // secp256k1 over the result digest
+}
+
+// Staked-flow settlement: the client's frontier voucher paying the
+// in-flight job's price. The provider reconstructs the canonical
+// two-output close shape itself; only the frontier value and the maker
+// authorization cross the wire.
+message SettleRequest {
+  bytes payment_edge = 1;             // exactly 32 bytes (kernel EdgeId)
+  bytes payment_terms = 2;            // exactly 32 bytes (kernel TermsHash)
+  uint64 cumulative = 3;              // frontier E after this job
+  Signature client_authorization = 4; // secp256k1 over the kernel Mutual payload
+}
+
+message SettleResponse {}
 
 message Ticket {
   bytes request_commitment = 1; // exactly 32 bytes
