@@ -1271,15 +1271,21 @@ mod tests {
         );
     }
 
-    /// Slice-2 e2e fixture: both parties drive [`Channel`] through two
-    /// honest jobs — admit, issue, settle — and the provider redeems
-    /// the final frontier as a kernel `Mutual` at consensus execution.
+    /// The full game at consensus execution: both edges open for real
+    /// (so every id the contexts bind is a true `edge_id_of`), both
+    /// parties drive [`Channel`] through two honest jobs and a frontier
+    /// redemption, and then a third, fraudulent job slashes the real
+    /// bond into the kernel-pinned payouts — every close built by
+    /// `Channel` itself.
     #[test]
-    fn channel_jobs_settle_and_the_frontier_redeems_at_consensus_execution() {
+    fn the_full_game_plays_out_at_consensus_execution() {
         const CAPACITY: u64 = 2_000;
+        const STAKE_TOTAL: u64 = 2_000;
+        const SLASH_AWARD: u64 = 1_200;
         run_qmdb(|runtime| async move {
             let client = signer(11);
             let provider = signer(12);
+            let treasury = signer(13).party_key();
             let terms = payment_terms(
                 client.party_key(),
                 provider.party_key(),
@@ -1292,51 +1298,69 @@ mod tests {
                 List::take([client_coin; MAX_PARTY_INPUTS], 0),
             );
             let open_hash = KernelTx::open_hash(&funding, &terms);
-            let open = KernelTx::open(
+            let payment_open = KernelTx::open(
                 funding.clone(),
                 terms.clone(),
                 Auth::native(client.sign(open_hash)),
                 Auth::native(provider.sign(open_hash)),
             );
             let payment_edge = KernelTx::edge_id_of(&funding, &terms);
-            let allocations = vec![(SettlementKey::from(client.party_key()), CAPACITY)];
 
-            let verifier = ChainVerifier::new();
-            let config = utxo_db_config(&runtime, "voucher_e2e", 1024, 8);
-            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
-            let batches = database.new_batches().await;
-            let batches = execute_all(
-                context(1),
-                &verifier,
-                &[Transaction::Kernel(open)],
-                &allocations,
-                batches,
-            )
-            .await
-            .expect("payment channel opens");
-            let merkleized = batches.merkleize().await.expect("open merkleizes");
-            database.finalize(merkleized).await;
-
-            // The bond side of the pairing (terms only here; the slash
-            // e2e below exercises an on-chain bond). Coverage margins:
-            // deadline + challenge margin (20) < 100 and deadline +
-            // close margin (5) < 100.
+            // The provider-funded bond, opened on-chain in the same
+            // block. Coverage margins: deadline + challenge margin (20)
+            // < 100 and deadline + close margin (5) < 100.
             let bond = Terms::stake_bond(StakeBondTerms {
                 protocol: STAKE_BOND_PROTOCOL,
                 parties: Parties::new(provider.party_key(), client.party_key()),
                 timeout: BlockHeight::new(100),
                 timeout_outputs: List::take(
-                    [Payout::new(provider.party_key(), 2_000); MAX_EDGE_OUTPUTS],
+                    [Payout::new(provider.party_key(), STAKE_TOTAL); MAX_EDGE_OUTPUTS],
                     1,
                 ),
-                treasury: signer(13).party_key(),
-                award: 1_200,
-                stake: 2_000,
+                treasury,
+                award: SLASH_AWARD,
+                stake: STAKE_TOTAL,
                 max_job_price: 1_000,
                 max_dispute_cost: 200,
                 challenge_margin: 20,
             });
-            let bond_edge = hellas_kernel::EdgeId::from_bytes([0x44; 32]);
+            let provider_coin = CoinId::from_bytes(genesis_object_id(1).0);
+            let bond_funding = Funding::new(
+                List::take([provider_coin; MAX_PARTY_INPUTS], 1),
+                List::take([provider_coin; MAX_PARTY_INPUTS], 0),
+            );
+            let bond_open_hash = KernelTx::open_hash(&bond_funding, &bond);
+            let bond_open = KernelTx::open(
+                bond_funding.clone(),
+                bond.clone(),
+                Auth::native(provider.sign(bond_open_hash)),
+                Auth::native(client.sign(bond_open_hash)),
+            );
+            let bond_edge = KernelTx::edge_id_of(&bond_funding, &bond);
+            let allocations = vec![
+                (SettlementKey::from(client.party_key()), CAPACITY),
+                (SettlementKey::from(provider.party_key()), STAKE_TOTAL),
+            ];
+
+            let verifier = ChainVerifier::new();
+            let config = utxo_db_config(&runtime, "full_game_e2e", 1024, 8);
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+            let batches = database.new_batches().await;
+            let batches = execute_all(
+                context(1),
+                &verifier,
+                &[
+                    Transaction::Kernel(payment_open),
+                    Transaction::Kernel(bond_open),
+                ],
+                &allocations,
+                batches,
+            )
+            .await
+            .expect("both edges of the pairing open");
+            let merkleized = batches.merkleize().await.expect("opens merkleize");
+            database.finalize(merkleized).await;
+
             let mut mine = Channel::new(bond_edge, bond.clone(), payment_edge, terms.clone(), 5)
                 .expect("mirrored pairing constructs the client channel");
             let mut theirs = Channel::new(bond_edge, bond, payment_edge, terms.clone(), 5)
@@ -1406,6 +1430,76 @@ mod tests {
                 Some(Object::Coin(Coin {
                     owner: SettlementKey::from(provider.party_key()),
                     value: 1_550,
+                })),
+            );
+            let merkleized = batches.merkleize().await.expect("redemption merkleizes");
+            database.finalize(merkleized).await;
+
+            // The third job is defrauded: the provider signs a bad
+            // terminal result (the receipt path, stood in for by its
+            // signer here) and never gets a voucher. The client's fraud
+            // exit slashes the real bond into the kernel-pinned shape,
+            // with every byte of the close built by its own channel.
+            let fraud = mine.job([7; 32], [8; 32], 450, BlockHeight::new(75));
+            mine.admit(BlockHeight::new(2), fraud)
+                .expect("client admits the third job");
+            theirs
+                .admit(BlockHeight::new(2), fraud)
+                .expect("provider admits the third job");
+            let digest = fraud.digest();
+            let result = JobResultContext {
+                acceptance: digest,
+                transcript: [9; 32],
+            };
+            let artifact = FraudArtifact {
+                acceptance: fraud,
+                client_acceptance_sig: client.sign(digest),
+                provider_acceptance_sig: provider.sign(digest),
+                result,
+                provider_result_sig: provider.sign(result.digest()),
+            };
+            let seal = verifier.preverified_seals().insert(artifact);
+            let slash = mine.slash_close(seal);
+            let batches = execute_all(
+                context(3),
+                &verifier,
+                &[Transaction::Kernel(slash.clone())],
+                &allocations,
+                database.new_batches().await,
+            )
+            .await
+            .expect("the channel-built violation close slashes the bond");
+
+            assert_eq!(
+                batches
+                    .get(&edge_object_id(bond_edge))
+                    .await
+                    .expect("bond edge read"),
+                None,
+            );
+            let KernelTx::Close { outputs, .. } = &slash else {
+                panic!("slash close is a close");
+            };
+            let ids = KernelTx::close_output_ids(bond_edge, outputs);
+            let slots: Vec<_> = ids.as_slice().to_vec();
+            assert_eq!(
+                batches
+                    .get(&coin_object_id(slots[0]))
+                    .await
+                    .expect("client award read"),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from(client.party_key()),
+                    value: SLASH_AWARD,
+                })),
+            );
+            assert_eq!(
+                batches
+                    .get(&coin_object_id(slots[1]))
+                    .await
+                    .expect("treasury remainder read"),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from(treasury),
+                    value: STAKE_TOTAL - SLASH_AWARD,
                 })),
             );
         });
