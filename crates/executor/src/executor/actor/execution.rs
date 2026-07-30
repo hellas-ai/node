@@ -114,7 +114,12 @@ impl Executor {
 
     /// Staked-flow settlement: accepts the client's frontier voucher
     /// for the in-flight job, releasing the serialization lock.
-    /// `Channel::settle` re-validates the frontier advance, the
+    ///
+    /// The provider accepts payment only for work it has *terminally
+    /// recorded*: settling before completion would clear the lock while
+    /// the job still runs (breaking serialize-through-resolution) and
+    /// leave the client paid but unable to obtain a receipt. Beyond
+    /// that, `Channel::settle` re-validates the frontier advance, the
     /// canonical outputs, the maker authorization, and — against the
     /// finalized height — that the frontier can still be redeemed before
     /// the payment timeout.
@@ -128,6 +133,13 @@ impl Executor {
         };
         let voucher =
             voucher_from_pb(request, &staked.channel).map_err(ExecutorError::InvalidQuoteRequest)?;
+        let Some(active_request) = staked.channel.active().map(|job| job.request) else {
+            return Err(refuse("no job awaiting settlement".into()));
+        };
+        // Gate on the same completed-transcript check a receipt requires,
+        // so `settled ⇒ the client could have obtained its receipt`.
+        self.terminal_commitment(active_request).await?;
+        let staked = self.staked.as_ref().expect("staked provider still present");
         let now = staked
             .chain
             .finalized_height()
@@ -1226,10 +1238,21 @@ mod tests {
         assert_eq!(chunks.len(), 1);
 
         // v1 serializes jobs through resolution: with the first job
-        // unsettled, the next job is refused as Busy.
+        // unsettled, the next job is refused as Busy — even when it
+        // carries the correct next sequence (2), so the refusal is the
+        // lock and not a sequence mismatch. The client cannot build a
+        // seq-2 acceptance on its own locked channel, so bump a spare
+        // channel to sequence 1 (admit + rescind keeps it consumed).
         let request = fetch_request(&client_key(), "echo", "run", second_input);
         let second_ticket = handle.create_fetch_ticket(request).await.unwrap().response;
-        let (blocked, _) = acceptance_for(&mut staked_channel_fixture(), second_ticket.clone(), 61);
+        let mut bumped = staked_channel_fixture();
+        let throwaway = bumped.job([0; 32], [0; 32], 400, hellas_kernel::BlockHeight::new(50));
+        bumped
+            .admit(hellas_kernel::BlockHeight::new(10), throwaway)
+            .unwrap();
+        bumped.rescind();
+        let (blocked, blocked_job) = acceptance_for(&mut bumped, second_ticket.clone(), 61);
+        assert_eq!(blocked_job.sequence, 2, "the blocked job is the next sequence");
         let busy = handle.run_ticket_handle(blocked).await;
         assert!(matches!(
             busy,
