@@ -31,7 +31,7 @@ pub mod owner_index;
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
-#[cfg(feature = "validator")]
+#[cfg(feature = "staked")]
 pub mod staked;
 #[cfg(feature = "validator")]
 pub mod validator;

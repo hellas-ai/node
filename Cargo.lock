@@ -3512,6 +3512,8 @@ dependencies = [
  "chatgrad",
  "futures-core",
  "futures-util",
+ "hellas-chain",
+ "hellas-kernel",
  "hellas-models",
  "hellas-rpc",
  "hellas-wire",
