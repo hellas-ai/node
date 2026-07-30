@@ -6,6 +6,7 @@ use crate::ExecutorError;
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
+use crate::chain::ChainView;
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
@@ -37,6 +38,10 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
+    // Consumed by the staked job-admission gate (its wiring lands with
+    // the schema change); `None` = no chain connection, today's behavior.
+    #[allow(dead_code)]
+    pub(super) chain_view: Option<Arc<dyn ChainView>>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -52,6 +57,9 @@ pub struct ExecutorSpawnConfig {
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
     pub artifact_store: ArtifactStoreConfig,
+    /// Chain connection for the staked job flow. `None` runs the
+    /// executor without a chain view, exactly as before.
+    pub chain_view: Option<Arc<dyn ChainView>>,
 }
 
 struct ExecutorRuntimeConfig {
@@ -70,6 +78,7 @@ struct ExecutorRuntimeConfig {
     #[cfg(feature = "evaluate")]
     artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
+    chain_view: Option<Arc<dyn ChainView>>,
 }
 
 impl Executor {
@@ -99,6 +108,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
+            chain_view: None,
         })
     }
 
@@ -129,6 +139,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
+            chain_view: None,
         })
     }
 
@@ -156,6 +167,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts,
             fetch_store,
+            chain_view: config.chain_view,
         })
     }
 
@@ -210,6 +222,7 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
+            chain_view: config.chain_view,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {

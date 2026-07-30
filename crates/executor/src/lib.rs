@@ -6,6 +6,8 @@ mod error;
 pub use error::{BackendInitError, ExecutorError, StateError};
 
 mod artifacts;
+
+mod chain;
 #[cfg(feature = "evaluate")]
 mod backend;
 #[cfg(feature = "evaluate")]
@@ -22,6 +24,7 @@ mod state;
 #[cfg(feature = "evaluate")]
 mod worker;
 
+pub use chain::{ChainView, FakeChainView};
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch_policy::{
     CallerAccess, FetchAccessError, FetchAccessPolicy, FetchAdmission, FetchQuotaReservation,
