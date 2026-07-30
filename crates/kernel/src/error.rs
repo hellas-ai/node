@@ -193,6 +193,10 @@ pub enum InvalidOpenReason {
     /// Stake-bond terms commit a zero `max_job_price`: the bond covers
     /// no job and the strict dispute incentive degenerates.
     JobPriceCapZero,
+    /// Stake-bond terms commit a zero `challenge_margin`: no block is
+    /// left between a job's terminal deadline and the bond timeout for a
+    /// challenge to land, so the bond could never cover a job.
+    ChallengeMarginZero,
 }
 
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.
