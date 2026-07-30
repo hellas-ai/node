@@ -10,13 +10,23 @@
 //! tests with scripted heights and a recording submission sink.
 
 use hellas_chain::domain::{ObjectId, Transaction};
-use hellas_chain::staked::JobAcceptanceContext;
+use hellas_chain::staked::{Channel, JobAcceptanceContext};
 use hellas_chain::{EdgeState, LightClient, QueryError};
 use hellas_kernel::{BlockHeight, EdgeId, Secp256k1Signer, Sig, TermsHash};
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::pb::execute::{JobAcceptance, signature};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Everything a staked provider needs: its side of the pairing and the
+/// chain it observes. One value at the spawn boundary — a staked
+/// executor without a chain view is unrepresentable.
+pub struct StakedProvider {
+    /// The provider's side of the two-edge pairing.
+    pub channel: Channel,
+    /// The chain the deadline heights are read from.
+    pub chain: Arc<dyn ChainView>,
+}
 
 /// Decodes a wire [`JobAcceptance`] into the canonical context plus the
 /// client's signature over its digest.
