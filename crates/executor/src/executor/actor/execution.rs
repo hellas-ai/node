@@ -1,5 +1,6 @@
 use crate::ExecutorError;
 use crate::StateError;
+use crate::chain::{acceptance_from_pb, receipt_response, voucher_from_pb};
 use crate::executor::{
     ExecuteOutcome, ExecutorMessage, FetchCompletion, FetchProviderFailure, FetchProviderRun,
     PendingFetch,
@@ -8,12 +9,11 @@ use crate::fetch::{FetchStateError, FetchTranscript};
 use crate::fetch_policy::{FetchAccessError, FetchRoute};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
-use crate::chain::{acceptance_from_pb, receipt_response, voucher_from_pb};
 use crate::state::{QuoteKind, new_execution_id, validate_job_terms};
-use hellas_kernel::SigVerifier as _;
-use hellas_rpc::pb::execute::{ReceiptRequest, ReceiptResponse, SettleRequest, SettleResponse};
 use futures_util::StreamExt;
+use hellas_kernel::SigVerifier as _;
 use hellas_rpc::fetch::{FetchOutputTranscriptBuilder, decode_fetch_terminal_payload};
+use hellas_rpc::pb::execute::{ReceiptRequest, ReceiptResponse, SettleRequest, SettleResponse};
 use hellas_rpc::pb::execute::{
     RunTicketRequest, WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event,
 };
@@ -83,12 +83,9 @@ impl Executor {
         let Some(now) = height else {
             return refuse("no finalized block observed yet".into());
         };
-        staked
-            .channel
-            .admit(now, context)
-            .map_err(|reason| ExecutorError::InvalidQuoteRequest(format!(
-                "job not admitted: {reason:?}"
-            )))
+        staked.channel.admit(now, context).map_err(|reason| {
+            ExecutorError::InvalidQuoteRequest(format!("job not admitted: {reason:?}"))
+        })
     }
 
     /// Staked-flow receipt: signs the in-flight job's acceptance digest
@@ -264,159 +261,189 @@ impl Executor {
         }
         ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
         self.admit_staked_job(&request, &verified_run).await?;
-        match quote.kind {
-            #[cfg(feature = "evaluate")]
-            QuoteKind::Scheme(job) => {
-                let execution_id = new_execution_id();
-                let engine = self
-                    .evaluate
-                    .as_mut()
-                    .ok_or_else(super::evaluate_disabled)?;
-                let outcome = engine.start(
-                    job,
-                    crate::scheme::SchemeRunContext {
-                        execution_id,
-                        request_commitment: request_commitment_id,
-                    },
-                )?;
-                let _ = self.store.remove_quote(&request_commitment);
-                Ok(outcome)
-            }
-            QuoteKind::Fetch { request } => {
-                let provenance = ExecutionProvenance {
-                    commitment_id: request_commitment_id,
-                };
-                if self.active_fetches >= self.fetch_max_in_flight
-                    && self.pending_fetches.len() >= self.fetch_queue_capacity
-                {
-                    return Err(ExecutorError::QueueFull {
-                        capacity: self.fetch_queue_capacity,
-                    });
+        // Admission consumed the serialization lock. Every dispatch path
+        // that does NOT leave a job genuinely in flight must release it,
+        // or one failed attempt wedges the pairing in `Busy` until
+        // restart. The lock stays held only when this returns `Ok` with a
+        // started/queued job; any error releases it below (the sequence
+        // stays consumed, so a half-signed acceptance can never be
+        // reused). Runtime failures after a successful start release it in
+        // `handle_fetch_finished`.
+        let dispatched: Result<ExecuteOutcome, ExecutorError> = async {
+            match quote.kind {
+                #[cfg(feature = "evaluate")]
+                QuoteKind::Scheme(job) => {
+                    let execution_id = new_execution_id();
+                    let engine = self
+                        .evaluate
+                        .as_mut()
+                        .ok_or_else(super::evaluate_disabled)?;
+                    let outcome = engine.start(
+                        job,
+                        crate::scheme::SchemeRunContext {
+                            execution_id,
+                            request_commitment: request_commitment_id,
+                        },
+                    )?;
+                    let _ = self.store.remove_quote(&request_commitment);
+                    Ok(outcome)
                 }
-                let route = FetchRoute::new(request.service.clone(), request.method.clone());
-                let entry = self
-                    .fetch_routes
-                    .entry(&route)
-                    .cloned()
-                    .ok_or_else(|| no_fetch_route_error(&route))?;
-                let projection = entry
-                    .projector_factory
-                    .create(&request)
-                    .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
-                let fetch_quote = self
-                    .fetch_state
-                    .quoted(input_commitment)
-                    .map_err(fetch_execute_error)?;
-                let execution_id = new_execution_id();
-                let admission = self
-                    .fetch_access_policy
-                    .authorize_admission(
-                        &fetch_quote.caller_key,
-                        &projection.request_view,
-                        now_ms(),
-                        execution_id.clone(),
-                        &entry.capabilities,
-                    )
-                    .map_err(fetch_access_error)?;
-                let model_id = projection
-                    .request_view
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| quote.model_id.clone());
-                let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
-                let pending = PendingFetch {
-                    request,
-                    provider: entry.provider,
-                    input_commitment,
-                    assurance: fetch_quote.assurance,
-                    request_commitment_id,
-                    quota_reservation: admission.reservation,
-                    execution_id: execution_id.clone(),
-                    model_id: model_id.clone(),
-                    sender,
-                    projector: projection.projector,
-                };
-
-                let queued = if self.active_fetches < self.fetch_max_in_flight {
-                    match self.fetch_state.start(input_commitment) {
-                        Ok(_) => {
-                            self.start_fetch_execution(pending);
-                            false
-                        }
-                        Err(FetchStateError::AlreadyCompleted) => {
-                            let _ = self
-                                .fetch_access_policy
-                                .cancel_reservation(pending.quota_reservation.as_ref());
-                            if let Some(outcome) = self
-                                .replay_fetch_execution(
-                                    input_commitment,
-                                    request_commitment_id,
-                                    &verified_run,
-                                )
-                                .await?
-                            {
-                                return Ok(outcome);
-                            }
-                            return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
-                        }
-                        Err(err) => {
-                            let _ = self
-                                .fetch_access_policy
-                                .cancel_reservation(pending.quota_reservation.as_ref());
-                            return Err(fetch_execute_error(err));
-                        }
+                QuoteKind::Fetch { request } => {
+                    let provenance = ExecutionProvenance {
+                        commitment_id: request_commitment_id,
+                    };
+                    if self.active_fetches >= self.fetch_max_in_flight
+                        && self.pending_fetches.len() >= self.fetch_queue_capacity
+                    {
+                        return Err(ExecutorError::QueueFull {
+                            capacity: self.fetch_queue_capacity,
+                        });
                     }
-                } else {
-                    match self.fetch_state.queue(input_commitment) {
-                        Ok(_) => {
-                            self.pending_fetches.push_back(pending);
-                            true
-                        }
-                        Err(FetchStateError::AlreadyCompleted) => {
-                            let _ = self
-                                .fetch_access_policy
-                                .cancel_reservation(pending.quota_reservation.as_ref());
-                            if let Some(outcome) = self
-                                .replay_fetch_execution(
-                                    input_commitment,
-                                    request_commitment_id,
-                                    &verified_run,
-                                )
-                                .await?
-                            {
-                                return Ok(outcome);
+                    let route = FetchRoute::new(request.service.clone(), request.method.clone());
+                    let entry = self
+                        .fetch_routes
+                        .entry(&route)
+                        .cloned()
+                        .ok_or_else(|| no_fetch_route_error(&route))?;
+                    let projection = entry
+                        .projector_factory
+                        .create(&request)
+                        .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
+                    let fetch_quote = self
+                        .fetch_state
+                        .quoted(input_commitment)
+                        .map_err(fetch_execute_error)?;
+                    let execution_id = new_execution_id();
+                    let admission = self
+                        .fetch_access_policy
+                        .authorize_admission(
+                            &fetch_quote.caller_key,
+                            &projection.request_view,
+                            now_ms(),
+                            execution_id.clone(),
+                            &entry.capabilities,
+                        )
+                        .map_err(fetch_access_error)?;
+                    let model_id = projection
+                        .request_view
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| quote.model_id.clone());
+                    let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+                    let pending = PendingFetch {
+                        request,
+                        provider: entry.provider,
+                        input_commitment,
+                        assurance: fetch_quote.assurance,
+                        request_commitment_id,
+                        quota_reservation: admission.reservation,
+                        execution_id: execution_id.clone(),
+                        model_id: model_id.clone(),
+                        sender,
+                        projector: projection.projector,
+                    };
+
+                    let queued = if self.active_fetches < self.fetch_max_in_flight {
+                        match self.fetch_state.start(input_commitment) {
+                            Ok(_) => {
+                                self.start_fetch_execution(pending);
+                                false
                             }
-                            return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                            Err(FetchStateError::AlreadyCompleted) => {
+                                let _ = self
+                                    .fetch_access_policy
+                                    .cancel_reservation(pending.quota_reservation.as_ref());
+                                if let Some(outcome) = self
+                                    .replay_fetch_execution(
+                                        input_commitment,
+                                        request_commitment_id,
+                                        &verified_run,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(outcome);
+                                }
+                                return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                            }
+                            Err(err) => {
+                                let _ = self
+                                    .fetch_access_policy
+                                    .cancel_reservation(pending.quota_reservation.as_ref());
+                                return Err(fetch_execute_error(err));
+                            }
                         }
-                        Err(err) => {
-                            let _ = self
-                                .fetch_access_policy
-                                .cancel_reservation(pending.quota_reservation.as_ref());
-                            return Err(fetch_execute_error(err));
+                    } else {
+                        match self.fetch_state.queue(input_commitment) {
+                            Ok(_) => {
+                                self.pending_fetches.push_back(pending);
+                                true
+                            }
+                            Err(FetchStateError::AlreadyCompleted) => {
+                                let _ = self
+                                    .fetch_access_policy
+                                    .cancel_reservation(pending.quota_reservation.as_ref());
+                                if let Some(outcome) = self
+                                    .replay_fetch_execution(
+                                        input_commitment,
+                                        request_commitment_id,
+                                        &verified_run,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(outcome);
+                                }
+                                return Err(fetch_execute_error(FetchStateError::AlreadyCompleted));
+                            }
+                            Err(err) => {
+                                let _ = self
+                                    .fetch_access_policy
+                                    .cancel_reservation(pending.quota_reservation.as_ref());
+                                return Err(fetch_execute_error(err));
+                            }
                         }
-                    }
-                };
+                    };
 
-                self.metrics.record_execution_started(
-                    &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
-                    /* cached_output= */ 0, /* prefill= */ 0,
-                );
-                let _ = self.store.remove_quote(&request_commitment);
+                    self.metrics.record_execution_started(
+                        &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
+                        /* cached_output= */ 0, /* prefill= */ 0,
+                    );
+                    let _ = self.store.remove_quote(&request_commitment);
 
-                info!(
-                    %execution_id,
-                    request_commitment = %format_request_commitment(&request_commitment),
-                    queued,
-                    active_fetches = self.active_fetches,
-                    fetch_queue_len = self.pending_fetches.len(),
-                    "accepted fetch execution"
-                );
+                    info!(
+                        %execution_id,
+                        request_commitment = %format_request_commitment(&request_commitment),
+                        queued,
+                        active_fetches = self.active_fetches,
+                        fetch_queue_len = self.pending_fetches.len(),
+                        "accepted fetch execution"
+                    );
 
-                Ok(ExecuteOutcome {
-                    provenance,
-                    events: receiver,
-                })
+                    Ok(ExecuteOutcome {
+                        provenance,
+                        events: receiver,
+                    })
+                }
             }
+        }
+        .await;
+        if dispatched.is_err() {
+            self.resolve_staked_failure(request_commitment_id);
+        }
+        dispatched
+    }
+
+    /// Releases the staked serialization lock for a job that never
+    /// reached (or fell out of) an in-flight state, keeping its sequence
+    /// consumed. A no-op for unstaked providers or when a different job
+    /// is active, so it is safe to call from any failure path.
+    fn resolve_staked_failure(&mut self, request: [u8; 32]) {
+        if let Some(staked) = self.staked.as_mut()
+            && staked
+                .channel
+                .active()
+                .is_some_and(|job| job.request == request)
+        {
+            staked.channel.rescind();
         }
     }
 
@@ -495,6 +522,7 @@ impl Executor {
                 self.metrics.record_execution_failed(&model_id, 0);
                 send_fetch_failed(sender, failure.position, error).await;
                 self.finish_fetch_slot();
+                self.resolve_staked_failure(request_commitment_id);
                 return;
             }
         };
@@ -510,6 +538,7 @@ impl Executor {
                 self.metrics.record_execution_failed(&model_id, 0);
                 send_fetch_failed(sender, 0, error).await;
                 self.finish_fetch_slot();
+                self.resolve_staked_failure(request_commitment_id);
                 return;
             }
         };
@@ -523,6 +552,7 @@ impl Executor {
             self.metrics.record_execution_failed(&model_id, 0);
             send_fetch_failed(sender, 0, error).await;
             self.finish_fetch_slot();
+            self.resolve_staked_failure(request_commitment_id);
             return;
         }
         if let Err(err) = self
@@ -1068,12 +1098,8 @@ mod tests {
         use hellas_kernel::{BlockHeight, EdgeId};
         let provider = crate::kernel_signer(&key()).party_key();
         let client = crate::kernel_signer(&client_key()).party_key();
-        let payment = hellas_chain::staked::payment_terms(
-            client,
-            provider,
-            BlockHeight::new(150),
-            5_000,
-        );
+        let payment =
+            hellas_chain::staked::payment_terms(client, provider, BlockHeight::new(150), 5_000);
         hellas_chain::staked::Channel::new(
             EdgeId::from_bytes([1; 32]),
             fixture_bond_terms(),
@@ -1232,7 +1258,8 @@ mod tests {
         };
         let bond = fixture_bond_terms();
         let mut slots = [hellas_kernel::Payout::default(); hellas_kernel::MAX_EDGE_OUTPUTS];
-        slots[0] = hellas_kernel::Payout::new(crate::kernel_signer(&client_key()).party_key(), 1_500);
+        slots[0] =
+            hellas_kernel::Payout::new(crate::kernel_signer(&client_key()).party_key(), 1_500);
         slots[1] = hellas_kernel::Payout::new(fixture_treasury(), 500);
         let payouts = hellas_kernel::List::take(slots, 2);
         assert!(artifact.binds(&hellas_kernel::SealPublicInputs {
@@ -1261,6 +1288,60 @@ mod tests {
 
         // ...and the next job admits and runs.
         let (next, _) = acceptance_for(&mut client_channel, second_ticket, 61);
+        let outcome = handle.run_ticket_handle(next).await.unwrap();
+        let (chunks, _finished) = drain_outcome(outcome.events).await;
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_failure_does_not_wedge_the_pairing() {
+        // The provider serves "run" but has no programmed response for
+        // the first input, so that job admits and starts, then fails at
+        // runtime — exercising the release on the async completion path.
+        let bad = br#"{"hello":"unprogrammed"}"#;
+        let good = br#"{"hello":"good"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            good,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let mut client_channel = staked_channel_fixture();
+
+        let bad_ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", bad))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, _) = acceptance_for(&mut client_channel, bad_ticket, 60);
+        let outcome = handle
+            .run_ticket_handle(admitted)
+            .await
+            .expect("the job admits and starts");
+        let mut events = outcome.events;
+        let mut failed = false;
+        while let Some(event) = events.recv().await {
+            if let work_event::Kind::Failed(_) = event.unwrap().kind.unwrap() {
+                failed = true;
+            }
+        }
+        assert!(failed, "the unprogrammed provider run fails at runtime");
+        // The client observes the failure and releases its own side too,
+        // keeping both channels' sequences aligned (both consumed 1).
+        client_channel.rescind();
+
+        // The runtime failure released the provider's lock: the next
+        // well-formed job admits and runs instead of hitting Busy
+        // forever, at the next sequence (rescind kept 1 consumed).
+        let good_ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", good))
+            .await
+            .unwrap()
+            .response;
+        let (next, next_job) = acceptance_for(&mut client_channel, good_ticket, 61);
+        assert_eq!(next_job.sequence, 2, "the failed job consumed sequence 1");
         let outcome = handle.run_ticket_handle(next).await.unwrap();
         let (chunks, _finished) = drain_outcome(outcome.events).await;
         assert_eq!(chunks.len(), 1);

@@ -7,9 +7,9 @@ pub use error::{BackendInitError, ExecutorError, StateError};
 
 mod artifacts;
 
-mod chain;
 #[cfg(feature = "evaluate")]
 mod backend;
+mod chain;
 #[cfg(feature = "evaluate")]
 mod evaluate;
 mod executor;
