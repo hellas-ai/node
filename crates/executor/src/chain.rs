@@ -41,10 +41,7 @@ pub(crate) fn sig_to_pb(sig: Sig) -> PbSignature {
 }
 
 /// Decodes a wire signature that must be a 64-byte secp256k1 witness.
-pub(crate) fn sig_from_pb(
-    field: &'static str,
-    pb: Option<&PbSignature>,
-) -> Result<Sig, String> {
+pub(crate) fn sig_from_pb(field: &'static str, pb: Option<&PbSignature>) -> Result<Sig, String> {
     let kind = pb
         .and_then(|sig| sig.kind.as_ref())
         .ok_or_else(|| format!("{field} is missing"))?;
@@ -82,7 +79,10 @@ pub(crate) fn voucher_from_pb(
 ) -> Result<MakerVoucher, String> {
     let payment_edge = EdgeId::from_bytes(fixed32("payment_edge", &request.payment_edge)?);
     let terms_hash = TermsHash::from_bytes(fixed32("payment_terms", &request.payment_terms)?);
-    let authorization = sig_from_pb("client_authorization", request.client_authorization.as_ref())?;
+    let authorization = sig_from_pb(
+        "client_authorization",
+        request.client_authorization.as_ref(),
+    )?;
     let refund = channel
         .capacity()
         .checked_sub(request.cumulative)
@@ -136,13 +136,13 @@ pub fn acceptance_to_pb(context: &JobAcceptanceContext, client_signature: Sig) -
 fn fixed32(field: &'static str, bytes: &[u8]) -> Result<[u8; 32], String> {
     bytes
         .try_into()
-        .map_err(|_| format!("acceptance {field} must be 32 bytes, got {}", bytes.len()))
+        .map_err(|_| format!("{field} must be 32 bytes, got {}", bytes.len()))
 }
 
 fn fixed64(field: &'static str, bytes: &[u8]) -> Result<[u8; 64], String> {
     bytes
         .try_into()
-        .map_err(|_| format!("acceptance {field} must be 64 bytes, got {}", bytes.len()))
+        .map_err(|_| format!("{field} must be 64 bytes, got {}", bytes.len()))
 }
 
 /// Kernel signer sharing the producer identity's secp256k1 scalar: the
