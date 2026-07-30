@@ -293,7 +293,7 @@ impl Executor {
                     let _ = reply.send(self.handle_receipt(&request).await);
                 }
                 ExecutorMessage::Settle { request, reply } => {
-                    let _ = reply.send(self.handle_settle(&request));
+                    let _ = reply.send(self.handle_settle(&request).await);
                 }
                 #[cfg(feature = "evaluate")]
                 ExecutorMessage::SchemeFinished(completion) => {

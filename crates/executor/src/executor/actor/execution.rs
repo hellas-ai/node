@@ -115,19 +115,27 @@ impl Executor {
     /// Staked-flow settlement: accepts the client's frontier voucher
     /// for the in-flight job, releasing the serialization lock.
     /// `Channel::settle` re-validates the frontier advance, the
-    /// canonical outputs, and the maker authorization.
-    pub(super) fn handle_settle(
+    /// canonical outputs, the maker authorization, and — against the
+    /// finalized height — that the frontier can still be redeemed before
+    /// the payment timeout.
+    pub(super) async fn handle_settle(
         &mut self,
         request: &SettleRequest,
     ) -> Result<SettleResponse, ExecutorError> {
-        let Some(staked) = self.staked.as_mut() else {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "provider does not run the staked flow".into(),
-            ));
+        let refuse = |message: String| ExecutorError::InvalidQuoteRequest(message);
+        let Some(staked) = self.staked.as_ref() else {
+            return Err(refuse("provider does not run the staked flow".into()));
         };
-        let voucher = voucher_from_pb(request, &staked.channel)
-            .map_err(ExecutorError::InvalidQuoteRequest)?;
-        staked.channel.settle(voucher).map_err(|reason| {
+        let voucher =
+            voucher_from_pb(request, &staked.channel).map_err(ExecutorError::InvalidQuoteRequest)?;
+        let now = staked
+            .chain
+            .finalized_height()
+            .await
+            .map_err(|err| refuse(format!("chain view: {err}")))?
+            .ok_or_else(|| refuse("no finalized block observed yet".into()))?;
+        let staked = self.staked.as_mut().expect("staked provider still present");
+        staked.channel.settle(now, voucher).map_err(|reason| {
             ExecutorError::InvalidQuoteRequest(format!("settlement refused: {reason:?}"))
         })?;
         Ok(SettleResponse {})

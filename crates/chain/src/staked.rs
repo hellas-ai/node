@@ -165,6 +165,11 @@ pub enum AdmitError {
 pub enum SettleError {
     /// No job is awaiting settlement.
     NoActiveJob,
+    /// The observed height leaves less than the redemption margin before
+    /// the payment timeout, so an accepted frontier could not be
+    /// redeemed before the client's unilateral refund — the provider
+    /// refuses to treat it as payment.
+    TooLateToRedeem,
     /// The voucher names a different payment edge or terms.
     ForeignVoucher,
     /// The voucher does not advance the frontier by exactly the active
@@ -416,18 +421,32 @@ impl Channel {
     }
 
     /// Provider-side settlement: accepts the frontier voucher paying
-    /// the in-flight job's price and resolves the job.
+    /// the in-flight job's price and resolves the job, given the highest
+    /// finalized height `now` the provider has observed.
     ///
     /// The voucher must name this payment edge and terms, advance the
     /// frontier by exactly the job's price into the canonical
     /// `[(client, total − E), (provider, E)]` shape, and carry a maker
     /// authorization that verifies over the canonical mutual-close
-    /// payload — the provider never treats an unredeemable frontier as
-    /// payment.
-    pub fn settle(&mut self, voucher: MakerVoucher) -> Result<(), SettleError> {
+    /// payload. It is also refused when `now` leaves less than the
+    /// redemption margin before the payment timeout: the kernel rejects
+    /// a `Mutual` close at `height >= payment_timeout`, so a frontier
+    /// accepted too late could be stranded behind the client's timeout
+    /// refund. The redemption guarantee binds at *settle* time, not just
+    /// at admission — an honest client settles promptly (well inside the
+    /// margin), and a client that stalls past it forfeits that job's
+    /// payment rather than trapping the provider.
+    pub fn settle(&mut self, now: BlockHeight, voucher: MakerVoucher) -> Result<(), SettleError> {
         let Some(job) = self.active.as_ref() else {
             return Err(SettleError::NoActiveJob);
         };
+        let redeemable = now
+            .get()
+            .checked_add(self.close_margin)
+            .is_some_and(|end| end < self.payment.timeout().get());
+        if !redeemable {
+            return Err(SettleError::TooLateToRedeem);
+        }
         if voucher.payment_edge != self.payment_edge || voucher.terms_hash != self.payment.hash() {
             return Err(SettleError::ForeignVoucher);
         }
@@ -822,7 +841,7 @@ mod channel_tests {
             panic!("client issues the frontier");
         };
         assert_eq!(voucher.cumulative, 400);
-        assert_eq!(theirs.settle(voucher), Ok(()));
+        assert_eq!(theirs.settle(now(), voucher), Ok(()));
         for side in [&mine, &theirs] {
             assert_eq!(side.cumulative(), 400);
             assert_eq!(side.sequence(), 1);
@@ -836,7 +855,7 @@ mod channel_tests {
         let Some(voucher) = mine.issue(&client()) else {
             panic!("second frontier issues");
         };
-        assert_eq!(theirs.settle(voucher), Ok(()));
+        assert_eq!(theirs.settle(now(), voucher), Ok(()));
         assert_eq!(theirs.cumulative(), 900);
     }
 
@@ -927,7 +946,7 @@ mod channel_tests {
             let Some(voucher) = mine.issue(&client()) else {
                 panic!("frontier issues");
             };
-            assert_eq!(theirs.settle(voucher), Ok(()));
+            assert_eq!(theirs.settle(now(), voucher), Ok(()));
         }
         assert_eq!(mine.cumulative(), CAPACITY);
         let unfunded = job(&mine, 1, 70);
@@ -1022,12 +1041,12 @@ mod channel_tests {
         let Some(foreign) = issue_at(EdgeId::from_bytes([9; 32]), 400) else {
             panic!("foreign voucher issues");
         };
-        assert_eq!(theirs.settle(foreign), Err(SettleError::ForeignVoucher));
+        assert_eq!(theirs.settle(now(), foreign), Err(SettleError::ForeignVoucher));
 
         let Some(short) = issue_at(payment_edge(), 399) else {
             panic!("short voucher issues");
         };
-        assert_eq!(theirs.settle(short), Err(SettleError::WrongFrontier));
+        assert_eq!(theirs.settle(now(), short), Err(SettleError::WrongFrontier));
 
         let Some(genuine) = issue_at(payment_edge(), 400) else {
             panic!("genuine voucher issues");
@@ -1036,10 +1055,37 @@ mod channel_tests {
             client_auth: Auth::native(provider().sign(accepted.digest())),
             ..genuine.clone()
         };
-        assert_eq!(theirs.settle(forged), Err(SettleError::BadAuthorization));
+        assert_eq!(theirs.settle(now(), forged), Err(SettleError::BadAuthorization));
 
-        assert_eq!(theirs.settle(genuine.clone()), Ok(()));
-        assert_eq!(theirs.settle(genuine), Err(SettleError::NoActiveJob));
+        assert_eq!(theirs.settle(now(), genuine.clone()), Ok(()));
+        assert_eq!(theirs.settle(now(), genuine), Err(SettleError::NoActiveJob));
+    }
+
+    // The redemption guarantee binds at settle time: a voucher offered
+    // too close to the payment timeout to redeem is refused, so the
+    // provider is never lured into accepting payment it cannot bank.
+    #[test]
+    fn settlement_is_refused_once_redemption_no_longer_fits() {
+        let mut theirs = channel();
+        let accepted = job(&theirs, 400, 60);
+        assert_eq!(theirs.admit(now(), accepted), Ok(()));
+        let Some(voucher) = MakerVoucher::issue(
+            &client(),
+            provider().party_key(),
+            payment_edge(),
+            payment().hash(),
+            CAPACITY,
+            400,
+        ) else {
+            panic!("voucher issues");
+        };
+        // 145 + 5 = 150 == payment timeout: no block left to redeem.
+        assert_eq!(
+            theirs.settle(BlockHeight::new(145), voucher.clone()),
+            Err(SettleError::TooLateToRedeem),
+        );
+        // 144 + 5 = 149 < 150: the last height a settlement still fits.
+        assert_eq!(theirs.settle(BlockHeight::new(144), voucher), Ok(()));
     }
 
     #[test]
@@ -1375,16 +1421,16 @@ mod tests {
             theirs.admit(now, first).expect("provider admits the first job");
             let voucher = mine.issue(&client).expect("first frontier issues");
             let stale = voucher.clone();
-            theirs.settle(voucher).expect("provider settles the first job");
+            theirs.settle(now, voucher).expect("provider settles the first job");
 
             let second = mine.job([7; 32], [8; 32], 750, BlockHeight::new(70));
             mine.admit(now, second).expect("client admits the second job");
             theirs.admit(now, second).expect("provider admits the second job");
             let voucher = mine.issue(&client).expect("second frontier issues");
-            theirs.settle(voucher).expect("provider settles the second job");
+            theirs.settle(now, voucher).expect("provider settles the second job");
             assert_eq!(theirs.cumulative(), 1_550);
             assert_eq!(
-                theirs.settle(stale),
+                theirs.settle(now, stale),
                 Err(SettleError::NoActiveJob),
                 "a settled frontier has nothing further to settle",
             );
