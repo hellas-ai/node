@@ -776,8 +776,16 @@ impl ItfRunner for L1StakeRunner {
                 Ok(Some(event.kind().clone()))
             }
             // The model refused these; the kernel must too, leaving the
-            // store untouched. This is where "the kernel rejects what
-            // the model rejects" is actually exercised.
+            // store untouched.
+            //
+            // Reason-blind by construction: the fixture format records
+            // no rejection reason, so ANY `ApplyError` satisfies this.
+            // A regression that rejected every bond open for one wrong
+            // reason would keep all seven malformed-open fixtures green.
+            // The exact `InvalidOpenReason` per malformed variant is
+            // pinned by `tests/channel/bond.rs` instead; this replay
+            // pins only that acceptance/rejection agrees with the model
+            // and that a refusal is atomic.
             stake_itf::Input::RejectedOpenInput(variant) => {
                 let before = *actual.store();
                 let op = stake_model::open(variant.to_model());

@@ -31,11 +31,23 @@ let
     clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
       cargoEnv rustToolchain
     );
-    executor-artifacts = mk "check-executor-artifacts" "cargo test -p hellas-executor artifacts::" (
-      cargoEnv rustToolchain
-    );
+    # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
+    # replay that the entire abstract-correspondence story rests on — and
+    # the exact-error pins in `tests/channel/`. `--all-features` is load
+    # bearing: `secp256k1`, `webauthn`, and `test-support` gate whole test
+    # files, and a bare `cargo test -p hellas-kernel` compiles them away
+    # to empty binaries.
+    kernel = mk "check-kernel" "cargo test -p hellas-kernel --all-features" (cargoEnv rustToolchain);
+    executor = mk "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
+        (cargoEnv rustToolchain);
+    # The staked fraud-game end-to-end tests (consensus-level slash and
+    # the full two-edge game) live behind `preverified-seals`. It implies
+    # `validator`, not the other way round, so the check above never
+    # reaches them.
+    staked =
+      mk "check-staked" "cargo test -p hellas-chain --no-default-features --features preverified-seals"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
