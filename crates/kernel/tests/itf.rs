@@ -35,7 +35,7 @@ use support::{
     FAKE_VERIFIER, coin_view,
     itf::PartyTag,
     itf::{
-        CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for,
+        CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for, party_key,
         rejected_op_for,
     },
     itf_l1_fees as fee_itf, itf_l1_stake as stake_itf,
@@ -188,13 +188,21 @@ impl ItfRunner for L1Runner {
             check_edge(expected, &view, tag, edge_id(edge_key))?;
         }
 
-        check_open_auth(expected)?;
+        check_open_auth(&view, expected)?;
 
         Ok(true)
     }
 }
 
-struct L1FeesRunner;
+/// Carries the genesis total this trace was seeded with and the close
+/// kind the replay actually applied, so `state_invariant` can assert the
+/// model's `paid` accumulator and `close_outcome` against reality rather
+/// than against themselves.
+#[derive(Default)]
+struct L1FeesRunner {
+    genesis_total: u64,
+    applied_close: Option<fee_model::ProofKey>,
+}
 
 impl ItfRunner for L1FeesRunner {
     type ActualState = fee_model::TraceState;
@@ -208,8 +216,10 @@ impl ItfRunner for L1FeesRunner {
             expected.coins.get(&fee_itf::CoinTag::MakerCoin).copied(),
         )? == 20
         {
+            self.genesis_total = 20 + fee_model::TAKER_VALUE;
             Ok(fee_model::initial_state_underfunded())
         } else {
+            self.genesis_total = fee_model::MAKER_VALUE + fee_model::TAKER_VALUE;
             Ok(fee_model::initial_state())
         }
     }
@@ -244,6 +254,7 @@ impl ItfRunner for L1FeesRunner {
                 let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected l1_fees close {proof:?} for {shape:?}: {err:?}")
                 })?;
+                self.applied_close = Some(proof);
                 Ok(Some(event.kind().clone()))
             }
             // The model refused this open (e.g. underfunded); the kernel
@@ -357,9 +368,74 @@ impl ItfRunner for L1FeesRunner {
         }
         check_fee_edge(expected, &view, shape)?;
         check_fee_open_parties(expected, shape)?;
+        check_fee_paid(expected, &view, shape, self.genesis_total)?;
+        check_fee_close_outcome(expected, self.applied_close)?;
 
         Ok(true)
     }
+}
+
+/// Cross-checks the model's `paid` fee accumulator against the kernel's
+/// real value accounting: everything the kernel still holds (live coins,
+/// edge principal, reserve) plus what the model says was paid away in
+/// fees must equal what genesis seeded.
+///
+/// Without this, `paid` was deserialized and never read — so the entire
+/// fee schedule was asserted only inside Quint and never against the
+/// kernel that implements it.
+fn check_fee_paid(
+    expected: &fee_itf::State,
+    view: &fee_model::TraceView,
+    shape: fee_model::FundingShape,
+    genesis_total: u64,
+) -> Result<bool, String> {
+    let mut held = 0_u64;
+    for id in [
+        fee_model::MAKER_ID,
+        fee_model::TAKER_ID,
+        fee_model::maker_out(shape),
+        fee_model::taker_out(shape),
+    ] {
+        if let Some(coin) = view.coin(id) {
+            held = held.saturating_add(coin.value());
+        }
+    }
+    if let Some(edge) = view.edge(fee_model::edge_id(shape)) {
+        held = held
+            .saturating_add(edge.value())
+            .saturating_add(edge.reserve());
+    }
+    let paid = u64::try_from(expected.paid).map_err(|_| "negative paid".to_string())?;
+    let total = held.saturating_add(paid);
+    if total != genesis_total {
+        return Err(format!(
+            "l1_fees value accounting: kernel holds {held} + model paid {paid} = {total}, genesis seeded {genesis_total}",
+        ));
+    }
+    Ok(true)
+}
+
+/// The model's `close_outcome` must name the close kind the replay
+/// actually applied to the kernel. Previously deserialized and never
+/// read, which left every close kind indistinguishable at the invariant
+/// level.
+fn check_fee_close_outcome(
+    expected: &fee_itf::State,
+    applied: Option<fee_model::ProofKey>,
+) -> Result<bool, String> {
+    let want = match expected.close_outcome {
+        fee_itf::CloseOutcomeTag::NoClose => None,
+        fee_itf::CloseOutcomeTag::ClosedMutual => Some(fee_model::ProofKey::Mutual),
+        fee_itf::CloseOutcomeTag::ClosedTimeout => Some(fee_model::ProofKey::Timeout),
+        fee_itf::CloseOutcomeTag::ClosedViolation => Some(fee_model::ProofKey::Violation),
+    };
+    if applied != want {
+        return Err(format!(
+            "l1_fees close outcome: model says {:?}, replay applied {applied:?}",
+            expected.close_outcome,
+        ));
+    }
+    Ok(true)
 }
 
 fn check_coin(
@@ -428,7 +504,17 @@ fn check_edge(
     }
 }
 
-fn check_open_auth(expected: &State) -> Result<bool, String> {
+/// The open-authorization correspondence: for every edge the model
+/// says is live, the KERNEL's edge must carry exactly the party keys
+/// the model recorded as having authorized the open.
+///
+/// This must read `view`. An earlier version took only `expected` and
+/// compared the model against itself — which restated the Quint
+/// invariant `fundingAuthorized` and could never fail, so the kernel's
+/// party binding went unchecked. Worse, in the fixture named for the
+/// property (`l1_unauthorizedOpenRejectedTest`) `liveEdges` is empty in
+/// every state, so the loop body never even executed.
+fn check_open_auth(view: &TraceView, expected: &State) -> Result<bool, String> {
     for tag in &expected.live_edges {
         let auth = expected
             .open_auth
@@ -436,6 +522,17 @@ fn check_open_auth(expected: &State) -> Result<bool, String> {
             .ok_or_else(|| format!("{tag:?}: missing open auth"))?;
         if (auth.maker, auth.taker) != canonical_auth(*tag) {
             return Err(format!("{tag:?}: unauthorized open auth {auth:?}"));
+        }
+        let id = edge_id(edge_key(*tag));
+        let edge = view
+            .edge(id)
+            .ok_or_else(|| format!("{tag:?}: model says live, kernel has no edge"))?;
+        let want = hellas_kernel::Parties::new(party_key(auth.maker), party_key(auth.taker));
+        if edge.parties() != want {
+            return Err(format!(
+                "{tag:?}: kernel parties {:?} do not match authorized open {want:?}",
+                edge.parties(),
+            ));
         }
     }
     Ok(true)
@@ -803,9 +900,7 @@ impl ItfRunner for L1StakeRunner {
             }
         }
 
-        // closeOutcome and bondTerms are structural: a closed bond has
-        // no live edge, and the committed terms must be the ones the
-        // kernel actually opened.
+        // A closed bond must be gone from the kernel too.
         let closed = matches!(
             expected.close_outcome,
             stake_itf::CloseOutcomeTag::ClosedViolation | stake_itf::CloseOutcomeTag::ClosedTimeout
@@ -813,11 +908,24 @@ impl ItfRunner for L1StakeRunner {
         if closed && view.edge(edge).is_some() {
             return Err("l1_stake closed bond is still live in the kernel".to_string());
         }
-        if expected.bond_live && expected.bond_terms != stake_itf::VariantTag::Valid {
-            return Err(format!(
-                "l1_stake live bond committed non-admissible terms {:?}",
-                expected.bond_terms,
-            ));
+        // The committed terms correspondence. This must compare against
+        // the KERNEL's terms hash: an earlier version asserted only
+        // `expected.bond_terms != Valid`, which restated the Quint
+        // invariant `liveBondIsWellFormed` against itself and could
+        // never fail — the exact false correspondence this suite exists
+        // to prevent.
+        if expected.bond_live {
+            let want = stake_model::terms_for(expected.bond_terms.to_model()).hash();
+            let live = view
+                .edge(edge)
+                .ok_or_else(|| "l1_stake model says bond live, kernel has none".to_string())?;
+            if live.terms() != want {
+                return Err(format!(
+                    "l1_stake kernel terms {:?} do not match committed {:?}",
+                    live.terms(),
+                    expected.bond_terms,
+                ));
+            }
         }
 
         Ok(true)
@@ -890,7 +998,7 @@ fn replays_all_itf_fixtures() {
                 let trace: itf::Trace<fee_itf::State> = itf::trace_from_str(&json)
                     .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));
                 trace
-                    .run_on(L1FeesRunner)
+                    .run_on(L1FeesRunner::default())
                     .unwrap_or_else(|err| panic!("fixture {name} replay failed: {err:?}"));
             }
             FixtureKind::L1Stake => {

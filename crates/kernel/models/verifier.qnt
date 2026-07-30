@@ -8,10 +8,13 @@
 // WebAuthn changes only the witness encoding. The invariant cares that the
 // same party key used for funds/terms authorized the open, with no separate
 // open-auth key namespace.
-// Two narrow verifier interfaces draw the kernel/crypto seam:
-//
-//   sigOk(...)  ↔ SigVerifier::verify_sig
-//   sealOk(...) ↔ SealVerifier::verify_seal
+// The kernel/crypto seam (`SigVerifier::verify_sig`,
+// `SealVerifier::verify_seal`) is ABSTRACTED AWAY here, not modelled:
+// this module has no `sigOk`/`sealOk` predicate, and `proofOk` below is
+// a height guard only. The model therefore cannot distinguish a valid
+// signature from a forged one — witness validity is an assumption
+// (`deps/assumptions.qnt`), and real signature behaviour is pinned by
+// the Rust tests (`tests/secp256k1.rs`, `tests/webauthn.rs`) instead.
 //
 // Timeout closes need neither — their admissibility is purely
 // structural (terms-hash binding, height guard, payout shape) and lives

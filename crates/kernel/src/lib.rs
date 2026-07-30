@@ -4,9 +4,11 @@
 //!
 //! # Abstract model
 //!
-//! Every kernel module has a counterpart under `models/`. Reading the abstract
-//! Quint module first is often the fastest way to understand a Rust module's
-//! shape.
+//! Many kernel modules have a counterpart under `models/`; the table below
+//! is the authoritative mapping. Modules absent from it (e.g. `terms`,
+//! `canonical`, `list`, `secp256k1`, `webauthn`) have no abstract
+//! counterpart by design. Reading the abstract Quint module first is often
+//! the fastest way to understand a Rust module's shape.
 //!
 //! | Concern              | Rust                       | Quint                                |
 //! |----------------------|----------------------------|--------------------------------------|
@@ -18,6 +20,8 @@
 //! | Block context        | [`Context`]                     | `models/l1.qnt` (`height` var)       |
 //! | Established rules    | [`Diff`], [`View`]              | `models/rules/invariants.qnt`        |
 //! | Assumed dependencies | [`Store`], verifier traits      | `models/deps/assumptions.qnt`        |
+//! | Fees / reserve        | [`Fees`], [`Cost`]             | `models/l1_fees.qnt`                 |
+//! | Stake bond edge       | [`StakeBondTerms`]             | `models/l1_stake.qnt`                |
 //!
 //! # Verifier boundary
 //!

@@ -14,8 +14,8 @@
 //! kernel handles it inline.
 //!
 //! Production callers wire real implementations of both — typically a
-//! preverified-cache lookup populated off the apply critical path
-//! (PERF.md §4) — so the kernel stays a pure transition function and
+//! preverified-cache lookup populated off the apply critical path — so
+//! the kernel stays a pure transition function and
 //! parallel signature verification does not have to retrofit the apply
 //! path. Tests provide forgeable verifiers that accept the deterministic
 //! shapes built by `Sig::placeholder` and `Seal::placeholder` (gated
