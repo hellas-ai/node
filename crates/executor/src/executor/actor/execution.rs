@@ -8,9 +8,10 @@ use crate::fetch::{FetchStateError, FetchTranscript};
 use crate::fetch_policy::{FetchAccessError, FetchRoute};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
-use crate::chain::acceptance_from_pb;
+use crate::chain::{acceptance_from_pb, receipt_response, voucher_from_pb};
 use crate::state::{QuoteKind, new_execution_id, validate_job_terms};
 use hellas_kernel::SigVerifier as _;
+use hellas_rpc::pb::execute::{ReceiptRequest, ReceiptResponse, SettleRequest, SettleResponse};
 use futures_util::StreamExt;
 use hellas_rpc::fetch::{FetchOutputTranscriptBuilder, decode_fetch_terminal_payload};
 use hellas_rpc::pb::execute::{
@@ -88,6 +89,90 @@ impl Executor {
             .map_err(|reason| ExecutorError::InvalidQuoteRequest(format!(
                 "job not admitted: {reason:?}"
             )))
+    }
+
+    /// Staked-flow receipt: signs the in-flight job's acceptance digest
+    /// and a result context binding it to the provider's own recorded
+    /// terminal transcript. Idempotent — the job stays in flight until
+    /// settlement, so a lost response is simply re-requested.
+    pub(super) async fn handle_receipt(
+        &mut self,
+        request: &ReceiptRequest,
+    ) -> Result<ReceiptResponse, ExecutorError> {
+        let refuse = |message: &str| ExecutorError::InvalidQuoteRequest(message.to_string());
+        let Some(staked) = self.staked.as_ref() else {
+            return Err(refuse("provider does not run the staked flow"));
+        };
+        let Some(active) = staked.channel.active().copied() else {
+            return Err(refuse("no job awaiting a receipt"));
+        };
+        let digest = active.digest();
+        if request.acceptance_digest.as_slice() != digest.as_bytes().as_slice() {
+            return Err(refuse("receipt names a job other than the in-flight one"));
+        }
+        let transcript = self.terminal_commitment(active.request).await?;
+        let signer = crate::kernel_signer(&self.provider.producer_key);
+        Ok(receipt_response(&signer, digest, transcript))
+    }
+
+    /// Staked-flow settlement: accepts the client's frontier voucher
+    /// for the in-flight job, releasing the serialization lock.
+    /// `Channel::settle` re-validates the frontier advance, the
+    /// canonical outputs, and the maker authorization.
+    pub(super) fn handle_settle(
+        &mut self,
+        request: &SettleRequest,
+    ) -> Result<SettleResponse, ExecutorError> {
+        let Some(staked) = self.staked.as_mut() else {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "provider does not run the staked flow".into(),
+            ));
+        };
+        let voucher = voucher_from_pb(request, &staked.channel)
+            .map_err(ExecutorError::InvalidQuoteRequest)?;
+        staked.channel.settle(voucher).map_err(|reason| {
+            ExecutorError::InvalidQuoteRequest(format!("settlement refused: {reason:?}"))
+        })?;
+        Ok(SettleResponse {})
+    }
+
+    /// The terminal event commitment of the provider's own completed
+    /// transcript for `request`, from whichever engine ran it.
+    async fn terminal_commitment(&self, request: [u8; 32]) -> Result<[u8; 32], ExecutorError> {
+        let refuse = |message: &str| ExecutorError::InvalidQuoteRequest(message.to_string());
+        let input = InputCommitment::from_digest(Digest::from_bytes(request));
+        let producer = self.provider.producer_key.public_key();
+        match self.fetch_state.replay_completed(input, &producer) {
+            Ok(transcript) => {
+                let Some(terminal) = transcript.output_events().last() else {
+                    return Err(refuse("empty fetch transcript"));
+                };
+                return Ok(*terminal.event_commitment().as_bytes());
+            }
+            Err(FetchStateError::NotFound | FetchStateError::NotCompleted) => {}
+            Err(err) => return Err(fetch_execute_error(err)),
+        }
+        #[cfg(feature = "evaluate")]
+        if let Some(engine) = self.evaluate.as_ref()
+            && let Some(outcome) = engine
+                .replay_completed(request, &producer, self.provider.assurance)
+                .await?
+        {
+            let mut events = outcome.events;
+            while let Some(event) = events.recv().await {
+                let event =
+                    event.map_err(|status| refuse(&format!("replayed transcript: {status}")))?;
+                if let Some(work_event::Kind::Finished(finished)) = event.kind {
+                    let Some(terminal) = finished.output_events.last() else {
+                        break;
+                    };
+                    let envelope = hellas_rpc::stream::output_event_from_pb(terminal.clone())
+                        .map_err(|err| refuse(&format!("replayed terminal event: {err}")))?;
+                    return Ok(*envelope.event_commitment().as_bytes());
+                }
+            }
+        }
+        Err(refuse("no completed transcript for the in-flight job"))
     }
 
     pub(super) async fn handle_execute(
@@ -950,30 +1035,39 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([8; 32]).expect("valid test key")
     }
 
-    fn staked_channel_fixture() -> hellas_chain::staked::Channel {
+    fn fixture_treasury() -> hellas_kernel::Key {
+        crate::kernel_signer(
+            &ProducerSigningKey::from_secret_bytes([9; 32]).expect("valid test key"),
+        )
+        .party_key()
+    }
+
+    fn fixture_bond_terms() -> hellas_kernel::Terms {
         use hellas_kernel::{
-            BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout, StakeBondTerms, Terms,
+            BlockHeight, List, MAX_EDGE_OUTPUTS, Parties, Payout, StakeBondTerms, Terms,
         };
         let provider = crate::kernel_signer(&key()).party_key();
         let client = crate::kernel_signer(&client_key()).party_key();
-        let treasury = crate::kernel_signer(
-            &ProducerSigningKey::from_secret_bytes([9; 32]).expect("valid test key"),
-        )
-        .party_key();
         let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
         outputs[0] = Payout::new(provider, 2_000);
-        let bond = Terms::stake_bond(StakeBondTerms {
+        Terms::stake_bond(StakeBondTerms {
             protocol: hellas_chain::staked::STAKE_BOND_PROTOCOL,
             parties: Parties::new(provider, client),
             timeout: BlockHeight::new(200),
             timeout_outputs: List::take(outputs, 1),
-            treasury,
+            treasury: fixture_treasury(),
             award: 1_500,
             stake: 2_000,
             max_job_price: 1_000,
             max_dispute_cost: 500,
             challenge_margin: 20,
-        });
+        })
+    }
+
+    fn staked_channel_fixture() -> hellas_chain::staked::Channel {
+        use hellas_kernel::{BlockHeight, EdgeId};
+        let provider = crate::kernel_signer(&key()).party_key();
+        let client = crate::kernel_signer(&client_key()).party_key();
         let payment = hellas_chain::staked::payment_terms(
             client,
             provider,
@@ -982,7 +1076,7 @@ mod tests {
         );
         hellas_chain::staked::Channel::new(
             EdgeId::from_bytes([1; 32]),
-            bond,
+            fixture_bond_terms(),
             EdgeId::from_bytes([2; 32]),
             payment,
             5,
@@ -1016,12 +1110,13 @@ mod tests {
     }
 
     /// The client side of the staked handshake: run the same admission
-    /// the provider will run, sign the acceptance digest, and attach it.
-    fn accepted_request(
+    /// the provider will run on the caller's channel, sign the
+    /// acceptance digest, and attach it.
+    fn acceptance_for(
+        channel: &mut hellas_chain::staked::Channel,
         ticket: hellas_rpc::pb::execute::Ticket,
         deadline: u64,
-    ) -> RunTicketRequest {
-        let mut channel = staked_channel_fixture();
+    ) -> (RunTicketRequest, hellas_chain::staked::JobAcceptanceContext) {
         let terms = ticket.terms.clone().expect("ticket terms");
         let request_commitment: [u8; 32] = ticket
             .request_commitment
@@ -1045,20 +1140,26 @@ mod tests {
         let signature = crate::kernel_signer(&client_key()).sign(context.digest());
         let mut request = run_ticket_request(ticket, &client_key());
         request.acceptance = Some(crate::acceptance_to_pb(&context, signature));
-        request
+        (request, context)
     }
 
     #[tokio::test]
-    async fn staked_executor_gates_execution_on_an_admissible_acceptance() {
+    async fn staked_executor_gates_receipts_and_settles_the_full_job_loop() {
+        use hellas_chain::staked::{FraudArtifact, JobResultContext};
+
         let input = br#"{"hello":"staked"}"#;
+        let second_input = br#"{"hello":"again"}"#;
         let provider = MockFetchProvider::new();
-        provider.insert(
-            "echo",
-            "run",
-            input,
-            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
-        );
+        for body in [input.as_slice(), second_input.as_slice()] {
+            provider.insert(
+                "echo",
+                "run",
+                body,
+                [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+            );
+        }
         let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let mut client_channel = staked_channel_fixture();
         let request = fetch_request(&client_key(), "echo", "run", input);
         let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
 
@@ -1074,7 +1175,8 @@ mod tests {
 
         // A price that does not match the ticket terms: refused before
         // any state changes.
-        let mut wrong_price = accepted_request(ticket.clone(), 60);
+        let (mut wrong_price, _) =
+            acceptance_for(&mut staked_channel_fixture(), ticket.clone(), 60);
         wrong_price.acceptance.as_mut().unwrap().price -= 1;
         let refused = handle.run_ticket_handle(wrong_price).await;
         assert!(matches!(
@@ -1084,25 +1186,84 @@ mod tests {
         ));
 
         // An admissible client-signed acceptance runs to completion.
-        let outcome = handle
-            .run_ticket_handle(accepted_request(ticket.clone(), 60))
-            .await
-            .unwrap();
+        let (admitted, first_job) = acceptance_for(&mut client_channel, ticket.clone(), 60);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
         let (chunks, _finished) = drain_outcome(outcome.events).await;
         assert_eq!(chunks.len(), 1);
 
         // v1 serializes jobs through resolution: with the first job
         // unsettled, the next job is refused as Busy.
-        let second_input = br#"{"hello":"again"}"#;
         let request = fetch_request(&client_key(), "echo", "run", second_input);
         let second_ticket = handle.create_fetch_ticket(request).await.unwrap().response;
-        let busy = handle
-            .run_ticket_handle(accepted_request(second_ticket, 61))
-            .await;
+        let (blocked, _) = acceptance_for(&mut staked_channel_fixture(), second_ticket.clone(), 61);
+        let busy = handle.run_ticket_handle(blocked).await;
         assert!(matches!(
             busy,
             Err(ExecutorError::InvalidQuoteRequest(ref msg)) if msg.contains("Busy")
         ));
+
+        // The receipt completes a fraud artifact that binds to the
+        // fixture bond under the kernel's pinned slash payouts.
+        let digest = first_job.digest();
+        let receipt = handle
+            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
+                acceptance_digest: digest.as_bytes().to_vec(),
+            })
+            .await
+            .unwrap();
+        let transcript: [u8; 32] = receipt.transcript.clone().try_into().unwrap();
+        let artifact = FraudArtifact {
+            acceptance: first_job,
+            client_acceptance_sig: crate::kernel_signer(&client_key()).sign(digest),
+            provider_acceptance_sig: crate::chain::sig_from_pb(
+                "receipt acceptance sig",
+                receipt.provider_acceptance_signature.as_ref(),
+            )
+            .unwrap(),
+            result: JobResultContext {
+                acceptance: digest,
+                transcript,
+            },
+            provider_result_sig: crate::chain::sig_from_pb(
+                "receipt result sig",
+                receipt.provider_result_signature.as_ref(),
+            )
+            .unwrap(),
+        };
+        let bond = fixture_bond_terms();
+        let mut slots = [hellas_kernel::Payout::default(); hellas_kernel::MAX_EDGE_OUTPUTS];
+        slots[0] = hellas_kernel::Payout::new(crate::kernel_signer(&client_key()).party_key(), 1_500);
+        slots[1] = hellas_kernel::Payout::new(fixture_treasury(), 500);
+        let payouts = hellas_kernel::List::take(slots, 2);
+        assert!(artifact.binds(&hellas_kernel::SealPublicInputs {
+            edge_id: hellas_kernel::EdgeId::from_bytes([1; 32]),
+            terms: &bond,
+            payouts: &payouts,
+        }));
+
+        // Settlement with the client's frontier voucher releases the
+        // serialization lock...
+        let voucher = client_channel
+            .issue(&crate::kernel_signer(&client_key()))
+            .unwrap();
+        let hellas_kernel::Auth::Native(authorization) = voucher.client_auth else {
+            panic!("issued vouchers carry native maker authorization");
+        };
+        handle
+            .settle_handle(hellas_rpc::pb::execute::SettleRequest {
+                payment_edge: voucher.payment_edge.as_bytes().to_vec(),
+                payment_terms: voucher.terms_hash.as_bytes().to_vec(),
+                cumulative: voucher.cumulative,
+                client_authorization: Some(crate::chain::sig_to_pb(authorization)),
+            })
+            .await
+            .unwrap();
+
+        // ...and the next job admits and runs.
+        let (next, _) = acceptance_for(&mut client_channel, second_ticket, 61);
+        let outcome = handle.run_ticket_handle(next).await.unwrap();
+        let (chunks, _finished) = drain_outcome(outcome.events).await;
+        assert_eq!(chunks.len(), 1);
     }
 
     #[tokio::test]

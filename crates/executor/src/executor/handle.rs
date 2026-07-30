@@ -25,7 +25,10 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, RunTicketRequest, Ticket, WorkEvent};
+use hellas_rpc::pb::execute::{
+    OpenRequest, OpenResponse, ReceiptRequest, ReceiptResponse, RunTicketRequest, SettleRequest,
+    SettleResponse, Ticket, WorkEvent,
+};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
@@ -136,6 +139,22 @@ impl ExecutorHandle {
             .await
     }
 
+    pub async fn receipt_handle(
+        &self,
+        request: ReceiptRequest,
+    ) -> Result<ReceiptResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::Receipt { request, reply })
+            .await
+    }
+
+    pub async fn settle_handle(
+        &self,
+        request: SettleRequest,
+    ) -> Result<SettleResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::Settle { request, reply })
+            .await
+    }
+
     pub async fn get_stats_handle(&self) -> Result<GetStatsResponse, ExecutorError> {
         self.send(|reply| ExecutorMessage::GetStats { reply }).await
     }
@@ -169,6 +188,16 @@ impl ExecuteHandler for ExecutorHandle {
         } = outcome;
         let stream: ExecuteStream = Box::pin(ReceiverStream::new(events));
         Ok(stream)
+    }
+
+    #[allow(refining_impl_trait)]
+    async fn receipt(&self, request: ReceiptRequest) -> Result<ReceiptResponse, WireStatus> {
+        Ok(self.receipt_handle(request).await?)
+    }
+
+    #[allow(refining_impl_trait)]
+    async fn settle(&self, request: SettleRequest) -> Result<SettleResponse, WireStatus> {
+        Ok(self.settle_handle(request).await?)
     }
 }
 
