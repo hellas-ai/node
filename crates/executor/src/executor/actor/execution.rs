@@ -49,7 +49,7 @@ impl Executor {
         verified_run: &VerifiedRunTicket,
     ) -> Result<(), ExecutorError> {
         let refuse = |message: String| Err(ExecutorError::InvalidQuoteRequest(message));
-        let Some(channel) = self.staked.as_mut() else {
+        let Some(staked) = self.staked.as_mut() else {
             if request.acceptance.is_some() {
                 return refuse("provider does not run the staked flow".into());
             }
@@ -71,20 +71,19 @@ impl Executor {
         }
         let digest = context.digest();
         let verifier = hellas_kernel::Secp256k1Verifier::new();
-        if !verifier.verify_sig(client_signature, channel.client(), digest) {
+        if !verifier.verify_sig(client_signature, staked.channel.client(), digest) {
             return refuse("acceptance client signature does not verify".into());
         }
-        let Some(view) = self.chain_view.as_ref() else {
-            return refuse("staked provider has no chain view".into());
-        };
-        let height = view
+        let height = staked
+            .chain
             .finalized_height()
             .await
             .map_err(|err| ExecutorError::InvalidQuoteRequest(format!("chain view: {err}")))?;
         let Some(now) = height else {
             return refuse("no finalized block observed yet".into());
         };
-        channel
+        staked
+            .channel
             .admit(now, context)
             .map_err(|reason| ExecutorError::InvalidQuoteRequest(format!(
                 "job not admitted: {reason:?}"
@@ -1007,8 +1006,10 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Memory,
-            chain_view: Some(Arc::new(chain)),
-            staked_channel: Some(staked_channel_fixture()),
+            staked: Some(crate::StakedProvider {
+                channel: staked_channel_fixture(),
+                chain: Arc::new(chain),
+            }),
         })
         .await
         .unwrap()
@@ -1241,8 +1242,7 @@ mod tests {
             fetch_max_in_flight,
             fetch_queue_capacity,
             artifact_store: ArtifactStoreConfig::Memory,
-            chain_view: None,
-            staked_channel: None,
+            staked: None,
         })
         .await
         .unwrap()
@@ -1423,8 +1423,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Fs(dir.clone()),
-            chain_view: None,
-            staked_channel: None,
+            staked: None,
         })
         .await
         .unwrap();
@@ -1489,8 +1488,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Memory,
-            chain_view: None,
-            staked_channel: None,
+            staked: None,
         })
         .await
         .unwrap();

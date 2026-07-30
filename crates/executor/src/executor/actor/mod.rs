@@ -6,8 +6,7 @@ use crate::ExecutorError;
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
-use crate::chain::ChainView;
-use hellas_chain::staked::Channel;
+use crate::chain::StakedProvider;
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
@@ -39,9 +38,8 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
-    pub(super) chain_view: Option<Arc<dyn ChainView>>,
-    /// The provider's side of the staked pairing, when configured.
-    pub(super) staked: Option<Channel>,
+    /// The staked pairing plus its chain view, when configured.
+    pub(super) staked: Option<StakedProvider>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -57,13 +55,10 @@ pub struct ExecutorSpawnConfig {
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
     pub artifact_store: ArtifactStoreConfig,
-    /// Chain connection for the staked job flow. `None` runs the
-    /// executor without a chain view, exactly as before.
-    pub chain_view: Option<Arc<dyn ChainView>>,
-    /// The provider's side of the staked pairing. `Some` makes every
-    /// execution require an admissible client-signed job acceptance
-    /// (and a chain view for the deadline height).
-    pub staked_channel: Option<Channel>,
+    /// The staked pairing plus its chain view. `Some` makes every
+    /// execution require an admissible client-signed job acceptance,
+    /// with deadlines checked against the chain's finalized height.
+    pub staked: Option<StakedProvider>,
 }
 
 struct ExecutorRuntimeConfig {
@@ -82,8 +77,7 @@ struct ExecutorRuntimeConfig {
     #[cfg(feature = "evaluate")]
     artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
-    chain_view: Option<Arc<dyn ChainView>>,
-    staked_channel: Option<Channel>,
+    staked: Option<StakedProvider>,
 }
 
 impl Executor {
@@ -113,8 +107,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
-            chain_view: None,
-            staked_channel: None,
+            staked: None,
         })
     }
 
@@ -145,8 +138,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
-            chain_view: None,
-            staked_channel: None,
+            staked: None,
         })
     }
 
@@ -174,8 +166,7 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts,
             fetch_store,
-            chain_view: config.chain_view,
-            staked_channel: config.staked_channel,
+            staked: config.staked,
         })
     }
 
@@ -230,8 +221,7 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
-            chain_view: config.chain_view,
-            staked: config.staked_channel,
+            staked: config.staked,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {
