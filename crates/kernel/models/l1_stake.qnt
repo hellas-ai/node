@@ -12,7 +12,8 @@
 // Scope is deliberately one bond edge. The payment channel is an
 // ordinary `Basic` edge already covered by `l1.qnt`, and the off-chain
 // pairing (job admission, vouchers, margins) is *not* kernel policy —
-// it lives in `chain::staked::Channel` and is modelled separately. The
+// it lives in `chain::staked::Channel`, which has NO Quint model yet
+// (its rules are covered by `chain::staked`'s Rust tests). The
 // only rules asserted here are ones this kernel actually enforces:
 // open arithmetic, the close-kind set, pinned slash routing, and the
 // timeout return. Fees are zero (dev schedule), so the reserve surplus

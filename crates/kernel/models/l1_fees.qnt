@@ -4,8 +4,11 @@ module l1_fees {
   import bounds.* from "./bounds"
 
   // Unified accepted-transition model for one L1 edge. This composes the
-  // object lifecycle shape from `l1.qnt` with the fee, reserve, lifetime, and
-  // stake buckets that were previously exercised in focused models.
+  // object lifecycle shape from `l1.qnt` with the fee, reserve, and
+  // lifetime buckets that were previously exercised in focused models.
+  // Stake is NOT modelled here — it lives on a StakeBond edge in
+  // `l1_stake.qnt`. A stake side-bucket on a Basic edge was removed
+  // because the kernel has no such concept.
   //
   // This model intentionally does not try to cover invalid-transaction network
   // spam. It models accepted L1 state transitions plus disabled invalid kernel
