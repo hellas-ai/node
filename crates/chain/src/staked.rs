@@ -1,24 +1,31 @@
 //! Staked fraud-game protocol vocabulary (v1: one finite epoch, one
 //! challenge-live job at a time).
 //!
-//! Two long-lived edges per relationship: a payment channel (plain
+//! Two long-lived edges per pairing: a payment edge (plain
 //! `Terms::basic`, client = maker) advancing an off-chain signed
 //! frontier, and a provider-funded stake bond (`Terms::StakeBond`) whose
 //! `Violation` close slashes the stake into the committed
 //! `[(client, award + surplus), (treasury, stake − award)]` shape — the
 //! kernel pins that routing structurally.
 //!
-//! This module defines the job-binding contexts a violation seal must
-//! prove itself against, and the dev-only preverified artifact cache the
-//! `preverified-seals` verifier consults. The bond `EdgeId` is the epoch
-//! identity: it is unforgeable and unique per (funding, terms), so
-//! contexts bind it directly instead of carrying a separate epoch
-//! counter.
+//! [`Channel`] is the one off-chain structure for such a pairing, held
+//! symmetrically by both parties: the client admits jobs and issues
+//! frontier vouchers; the provider admits the same jobs and settles the
+//! same vouchers. Every off-chain invariant — admission, serialization
+//! through resolution, frontier monotonicity — lives in its methods.
+//!
+//! This module also defines the job-binding contexts a violation seal
+//! must prove itself against, and the dev-only preverified artifact
+//! cache the `preverified-seals` verifier consults. The bond `EdgeId`
+//! is the epoch identity: it is unforgeable and unique per (funding,
+//! terms), so contexts bind it directly instead of carrying a separate
+//! epoch counter.
 
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, EdgeId, Encode, Key, List, MAX_EDGE_OUTPUTS, Parties,
     PayloadHash, Payout, Proof, ProtocolCode, Seal, SealPublicInputs, Secp256k1Signer,
-    Secp256k1Verifier, Sig, SigVerifier as _, Terms, TermsHash, Tx as KernelTx, Writer as _,
+    Secp256k1Verifier, Sig, SigVerifier as _, StakeBondTerms, Terms, TermsHash, Tx as KernelTx,
+    Writer as _,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,7 +37,7 @@ pub const PAYMENT_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
 /// Protocol code for the provider stake bond.
 pub const STAKE_BOND_PROTOCOL: ProtocolCode = ProtocolCode::new(3);
 
-/// Builds the payment-channel terms: a `Basic` edge whose maker is the
+/// Builds the payment-edge terms: a `Basic` edge whose maker is the
 /// client, whose taker is the provider, and whose timeout refunds the
 /// entire close value to the client (the unilateral fallback when the
 /// provider disappears — the client never signs a `Mutual` close, so
@@ -39,7 +46,7 @@ pub const STAKE_BOND_PROTOCOL: ProtocolCode = ProtocolCode::new(3);
 /// `refund` must equal the edge's close value (locked capacity plus
 /// timeout reserve surplus); the kernel rejects the open otherwise.
 #[must_use]
-pub fn payment_channel_terms(
+pub fn payment_terms(
     client: Key,
     provider: Key,
     timeout: BlockHeight,
@@ -130,40 +137,374 @@ impl MakerVoucher {
     }
 }
 
-/// Provider-side frontier bookkeeping: keeps only the latest voucher
-/// and refuses regressions, cross-edge substitutions, and mismatched
-/// terms.
-#[derive(Debug, Clone, Default)]
-pub struct VoucherBook {
-    latest: Option<MakerVoucher>,
+/// Reason a [`Channel::admit`] refused a job.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum AdmitError {
+    /// v1 serializes jobs through resolution: the in-flight job has not
+    /// settled.
+    Busy,
+    /// The context names a different bond, payment edge, or terms.
+    ForeignJob,
+    /// The context's sequence is not the next one in this channel.
+    OutOfSequence,
+    /// The terminal deadline is not strictly after the observed height.
+    DeadlinePassed,
+    /// The job fails the bond's committed admission rule (price caps or
+    /// the challenge margin against the bond timeout).
+    Uncovered,
+    /// The provider's redemption margin does not fit before the payment
+    /// edge's timeout: an accepted job could strand the frontier behind
+    /// the client's unilateral refund.
+    RedemptionMarginExceeded,
+    /// The frontier plus this job's price exceeds the payment capacity.
+    InsufficientCapacity,
 }
 
-impl VoucherBook {
-    /// Creates an empty book.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Reason a [`Channel::settle`] refused a voucher.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum SettleError {
+    /// No job is awaiting settlement.
+    NoActiveJob,
+    /// The voucher names a different payment edge or terms.
+    ForeignVoucher,
+    /// The voucher does not advance the frontier by exactly the active
+    /// job's price into the canonical two-output close shape.
+    WrongFrontier,
+    /// The maker authorization does not verify over the canonical
+    /// mutual-close payload.
+    BadAuthorization,
+}
 
-    /// Accepts `voucher` iff it strictly advances the frontier on the
-    /// same edge and terms. Returns false (book unchanged) otherwise.
-    pub fn accept(&mut self, voucher: MakerVoucher) -> bool {
-        if let Some(latest) = &self.latest {
-            let advances = voucher.payment_edge == latest.payment_edge
-                && voucher.terms_hash == latest.terms_hash
-                && voucher.cumulative > latest.cumulative;
-            if !advances {
-                return false;
-            }
+/// The one off-chain structure for a two-edge pairing, held
+/// symmetrically by both parties.
+///
+/// A channel pairs the provider-funded stake bond with the
+/// client-funded payment edge and carries everything off-chain the
+/// pairing needs: the latest client-authorized frontier, the single
+/// in-flight job (v1 serializes jobs through resolution), and the
+/// strictly-increasing job sequence. The client uses it to refuse
+/// uncovered jobs and issue vouchers; the provider uses it to gate
+/// admission and settle the same vouchers — one validation path, so
+/// the two sides cannot diverge on what is admissible.
+///
+/// Terms are stored whole; hashes, capacity, and timeouts are derived
+/// (`Terms` caches its own hash, so nothing here duplicates a
+/// commitment).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Channel {
+    bond_edge: EdgeId,
+    bond: Terms,
+    payment_edge: EdgeId,
+    payment: Terms,
+    close_margin: u64,
+    frontier: Option<MakerVoucher>,
+    active: Option<JobAcceptanceContext>,
+    sequence: u64,
+}
+
+impl Channel {
+    /// Pairs a stake bond with a payment edge.
+    ///
+    /// Returns `None` unless the bond terms are stake-bond shaped, the
+    /// payment terms are basic shaped, the parties mirror (bond maker =
+    /// payment taker = provider; bond taker = payment maker = client),
+    /// and `close_margin` leaves the provider at least one block to
+    /// redeem.
+    #[must_use]
+    pub fn new(
+        bond_edge: EdgeId,
+        bond: Terms,
+        payment_edge: EdgeId,
+        payment: Terms,
+        close_margin: u64,
+    ) -> Option<Self> {
+        let policy = bond.as_stake_bond()?;
+        if payment.as_stake_bond().is_some() || close_margin == 0 {
+            return None;
         }
-        self.latest = Some(voucher);
-        true
+        let mirrored = provider_key(&policy.parties) == payment.parties().taker()
+            && client_key(&policy.parties) == payment.parties().maker();
+        if !mirrored {
+            return None;
+        }
+        Some(Self {
+            bond_edge,
+            bond,
+            payment_edge,
+            payment,
+            close_margin,
+            frontier: None,
+            active: None,
+            sequence: 0,
+        })
     }
 
-    /// The highest-`E` voucher accepted so far.
+    /// The bond edge backing this pairing (the epoch identity).
     #[must_use]
-    pub const fn latest(&self) -> Option<&MakerVoucher> {
-        self.latest.as_ref()
+    pub const fn bond_edge(&self) -> EdgeId {
+        self.bond_edge
+    }
+
+    /// The payment edge the frontier settles on.
+    #[must_use]
+    pub const fn payment_edge(&self) -> EdgeId {
+        self.payment_edge
+    }
+
+    /// The bond's committed policy. The constructor guarantees the shape.
+    #[must_use]
+    pub fn bond_policy(&self) -> &StakeBondTerms {
+        self.bond
+            .as_stake_bond()
+            .expect("Channel bond terms are stake-bond shaped by construction")
+    }
+
+    /// The client key (payment maker, bond taker, slash beneficiary).
+    #[must_use]
+    pub fn client(&self) -> Key {
+        self.payment.parties().maker()
+    }
+
+    /// The provider key (payment taker, bond maker, stake funder).
+    #[must_use]
+    pub fn provider(&self) -> Key {
+        self.payment.parties().taker()
+    }
+
+    /// The payment edge's exact close value, committed by its terms.
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.payment
+            .timeout_outputs()
+            .as_slice()
+            .iter()
+            .fold(0_u64, |sum, payout| sum.saturating_add(payout.value()))
+    }
+
+    /// Cumulative provider earnings `E` at the latest frontier.
+    #[must_use]
+    pub fn cumulative(&self) -> u64 {
+        self.frontier.as_ref().map_or(0, |voucher| voucher.cumulative)
+    }
+
+    /// Sequence of the most recently admitted job.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// The in-flight job, if any.
+    #[must_use]
+    pub const fn active(&self) -> Option<&JobAcceptanceContext> {
+        self.active.as_ref()
+    }
+
+    /// The latest client-authorized frontier, if any.
+    #[must_use]
+    pub const fn frontier(&self) -> Option<&MakerVoucher> {
+        self.frontier.as_ref()
+    }
+
+    /// Builds the acceptance context for the next job in this channel.
+    ///
+    /// Filling the binding fields from channel state means both parties
+    /// derive the identical context from the same request — the wire
+    /// carries it only so each side can [`Self::admit`] and sign the
+    /// exact same digest.
+    #[must_use]
+    pub fn job(
+        &self,
+        request: [u8; 32],
+        environment: [u8; 32],
+        price: u64,
+        terminal_deadline: BlockHeight,
+    ) -> JobAcceptanceContext {
+        JobAcceptanceContext {
+            bond_edge: self.bond_edge,
+            bond_terms: self.bond.hash(),
+            payment_edge: self.payment_edge,
+            sequence: self.sequence.saturating_add(1),
+            request,
+            environment,
+            price,
+            terminal_deadline,
+        }
+    }
+
+    /// The job admission gate, identical on both sides: the client MUST
+    /// refuse before signing, the provider MUST refuse before
+    /// co-signing. `now` is the highest finalized height the caller has
+    /// observed.
+    ///
+    /// On success the job becomes the channel's single in-flight job
+    /// and consumes its sequence number.
+    pub fn admit(
+        &mut self,
+        now: BlockHeight,
+        job: JobAcceptanceContext,
+    ) -> Result<(), AdmitError> {
+        if self.active.is_some() {
+            return Err(AdmitError::Busy);
+        }
+        let named = job.bond_edge == self.bond_edge
+            && job.bond_terms == self.bond.hash()
+            && job.payment_edge == self.payment_edge;
+        if !named {
+            return Err(AdmitError::ForeignJob);
+        }
+        if self.sequence.checked_add(1) != Some(job.sequence) {
+            return Err(AdmitError::OutOfSequence);
+        }
+        if job.terminal_deadline.get() <= now.get() {
+            return Err(AdmitError::DeadlinePassed);
+        }
+        if !job.covered_by(self.bond_policy()) {
+            return Err(AdmitError::Uncovered);
+        }
+        let redeemable = job
+            .terminal_deadline
+            .get()
+            .checked_add(self.close_margin)
+            .is_some_and(|end| end < self.payment.timeout().get());
+        if !redeemable {
+            return Err(AdmitError::RedemptionMarginExceeded);
+        }
+        let funded = self
+            .cumulative()
+            .checked_add(job.price)
+            .is_some_and(|next| next <= self.capacity());
+        if !funded {
+            return Err(AdmitError::InsufficientCapacity);
+        }
+        self.sequence = job.sequence;
+        self.active = Some(job);
+        Ok(())
+    }
+
+    /// Releases an admitted job that was never fully accepted (the
+    /// counterparty refused to co-sign, so no acceptance can bind
+    /// either party). MUST NOT be used once both acceptance signatures
+    /// exist — a co-signed job resolves only through
+    /// [`Self::issue`]/[`Self::settle`] or the fraud path.
+    ///
+    /// The rescinded sequence number stays consumed: a half-signed
+    /// acceptance digest over it may exist, so it is never reused.
+    pub fn rescind(&mut self) -> Option<JobAcceptanceContext> {
+        self.active.take()
+    }
+
+    /// Client-side settlement: issues the frontier voucher paying the
+    /// in-flight job's price and resolves the job. Returns `None` when
+    /// there is no in-flight job or `client` is not the payment maker.
+    pub fn issue(&mut self, client: &Secp256k1Signer) -> Option<MakerVoucher> {
+        let job = self.active.as_ref()?;
+        if client.party_key() != self.client() {
+            return None;
+        }
+        let cumulative = self.cumulative().checked_add(job.price)?;
+        let voucher = MakerVoucher::issue(
+            client,
+            self.provider(),
+            self.payment_edge,
+            self.payment.hash(),
+            self.capacity(),
+            cumulative,
+        )?;
+        self.frontier = Some(voucher.clone());
+        self.active = None;
+        Some(voucher)
+    }
+
+    /// Provider-side settlement: accepts the frontier voucher paying
+    /// the in-flight job's price and resolves the job.
+    ///
+    /// The voucher must name this payment edge and terms, advance the
+    /// frontier by exactly the job's price into the canonical
+    /// `[(client, total − E), (provider, E)]` shape, and carry a maker
+    /// authorization that verifies over the canonical mutual-close
+    /// payload — the provider never treats an unredeemable frontier as
+    /// payment.
+    pub fn settle(&mut self, voucher: MakerVoucher) -> Result<(), SettleError> {
+        let Some(job) = self.active.as_ref() else {
+            return Err(SettleError::NoActiveJob);
+        };
+        if voucher.payment_edge != self.payment_edge || voucher.terms_hash != self.payment.hash() {
+            return Err(SettleError::ForeignVoucher);
+        }
+        if self.cumulative().checked_add(job.price) != Some(voucher.cumulative) {
+            return Err(SettleError::WrongFrontier);
+        }
+        let Some(refund) = self.capacity().checked_sub(voucher.cumulative) else {
+            return Err(SettleError::WrongFrontier);
+        };
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(self.client(), refund);
+        slots[1] = Payout::new(self.provider(), voucher.cumulative);
+        if voucher.outputs != List::take(slots, 2) {
+            return Err(SettleError::WrongFrontier);
+        }
+        let hash = KernelTx::payload_hash(
+            self.payment_edge,
+            CloseKind::Mutual,
+            self.payment.hash(),
+            &voucher.outputs,
+        );
+        if !Secp256k1Verifier::new().verify_auth(&voucher.client_auth, self.client(), hash) {
+            return Err(SettleError::BadAuthorization);
+        }
+        self.frontier = Some(voucher);
+        self.active = None;
+        Ok(())
+    }
+
+    /// Provider-side redemption of the latest frontier as an executable
+    /// kernel `Mutual` close. Returns `None` when no frontier exists or
+    /// `provider` is not the payment taker.
+    #[must_use]
+    pub fn redeem(&self, provider: &Secp256k1Signer) -> Option<KernelTx> {
+        if provider.party_key() != self.provider() {
+            return None;
+        }
+        self.frontier.as_ref().map(|voucher| voucher.redeem(provider))
+    }
+
+    /// The client's unilateral exit: a `Timeout` close of the payment
+    /// edge into its committed full-refund outputs.
+    #[must_use]
+    pub fn payment_timeout_close(&self) -> KernelTx {
+        KernelTx::close(
+            self.payment_edge,
+            Proof::timeout(self.payment.clone()),
+            self.payment.timeout_outputs().clone(),
+        )
+    }
+
+    /// The provider's clean epoch end: a `Timeout` close of the bond
+    /// into its committed stake-return outputs.
+    #[must_use]
+    pub fn bond_timeout_close(&self) -> KernelTx {
+        KernelTx::close(
+            self.bond_edge,
+            Proof::timeout(self.bond.clone()),
+            self.bond.timeout_outputs().clone(),
+        )
+    }
+
+    /// The client's fraud exit: a `Violation` close of the bond under
+    /// `seal` into the kernel-pinned `[(client, award), (treasury,
+    /// stake − award)]` slash shape (the zero-fee shape: reserve
+    /// surplus is zero, so the award carries no extra `Q`).
+    #[must_use]
+    pub fn slash_close(&self, seal: Seal) -> KernelTx {
+        let policy = self.bond_policy();
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(self.client(), policy.award);
+        slots[1] = Payout::new(policy.treasury, policy.stake.saturating_sub(policy.award));
+        KernelTx::close(
+            self.bond_edge,
+            Proof::violation(self.bond.clone(), seal),
+            List::take(slots, 2),
+        )
     }
 }
 
@@ -217,7 +558,7 @@ impl JobAcceptanceContext {
     /// timeout`, matching the plan's `terminal_deadline + margins <
     /// bond_timeout`.
     #[must_use]
-    pub fn covered_by(&self, bond: &hellas_kernel::StakeBondTerms) -> bool {
+    pub fn covered_by(&self, bond: &StakeBondTerms) -> bool {
         self.price >= 1
             && self.price <= bond.max_job_price
             && self
@@ -328,14 +669,14 @@ impl FraudArtifact {
 
 /// The stake-bond party convention: the maker funds the stake.
 #[must_use]
-pub fn provider_key(parties: &hellas_kernel::Parties) -> Key {
+pub fn provider_key(parties: &Parties) -> Key {
     parties.maker()
 }
 
 /// The stake-bond party convention: the taker is the client and the
 /// committed violation beneficiary.
 #[must_use]
-pub fn client_key(parties: &hellas_kernel::Parties) -> Key {
+pub fn client_key(parties: &Parties) -> Key {
     parties.taker()
 }
 
@@ -378,6 +719,369 @@ impl PreverifiedSeals {
             .get(&seal)
             .copied();
         artifact.is_some_and(|artifact| artifact.seal() == seal && artifact.binds(public))
+    }
+}
+
+/// The seven symmetric scenarios of the two-edge game, driven purely —
+/// heights injected, no chain: honest settle, the two admission
+/// refusals (price, deadline), serialization, the fraud exit, and the
+/// two timeout exits. Plus the admission/settlement negatives that keep
+/// the two sides honest.
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    const CAPACITY: u64 = 2_000;
+    const STAKE: u64 = 1_000;
+    const AWARD: u64 = 700;
+    const BOND_TIMEOUT: u64 = 200;
+    const PAYMENT_TIMEOUT: u64 = 150;
+    const CLOSE_MARGIN: u64 = 5;
+    const CHALLENGE_MARGIN: u64 = 20;
+
+    fn signer(seed: u8) -> Secp256k1Signer {
+        let Ok(signer) = Secp256k1Signer::from_secret_scalar([seed; 32]) else {
+            panic!("non-zero secret scalar");
+        };
+        signer
+    }
+
+    fn provider() -> Secp256k1Signer {
+        signer(1)
+    }
+
+    fn client() -> Secp256k1Signer {
+        signer(2)
+    }
+
+    fn now() -> BlockHeight {
+        BlockHeight::new(10)
+    }
+
+    fn bond_edge() -> EdgeId {
+        EdgeId::from_bytes([1; 32])
+    }
+
+    fn payment_edge() -> EdgeId {
+        EdgeId::from_bytes([2; 32])
+    }
+
+    fn bond_terms() -> Terms {
+        let provider = provider().party_key();
+        let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+        outputs[0] = Payout::new(provider, STAKE);
+        Terms::stake_bond(StakeBondTerms {
+            protocol: STAKE_BOND_PROTOCOL,
+            parties: Parties::new(provider, client().party_key()),
+            timeout: BlockHeight::new(BOND_TIMEOUT),
+            timeout_outputs: List::take(outputs, 1),
+            treasury: signer(3).party_key(),
+            award: AWARD,
+            stake: STAKE,
+            max_job_price: 500,
+            max_dispute_cost: 200,
+            challenge_margin: CHALLENGE_MARGIN,
+        })
+    }
+
+    fn payment() -> Terms {
+        payment_terms(
+            client().party_key(),
+            provider().party_key(),
+            BlockHeight::new(PAYMENT_TIMEOUT),
+            CAPACITY,
+        )
+    }
+
+    fn channel() -> Channel {
+        let Some(channel) = Channel::new(
+            bond_edge(),
+            bond_terms(),
+            payment_edge(),
+            payment(),
+            CLOSE_MARGIN,
+        ) else {
+            panic!("mirrored pairing constructs");
+        };
+        channel
+    }
+
+    fn job(channel: &Channel, price: u64, deadline: u64) -> JobAcceptanceContext {
+        channel.job([7; 32], [8; 32], price, BlockHeight::new(deadline))
+    }
+
+    // Scenario 1: the honest job, settled symmetrically on both sides.
+    #[test]
+    fn honest_job_settles_the_frontier_on_both_sides() {
+        let mut mine = channel();
+        let mut theirs = channel();
+        let first = job(&mine, 400, 60);
+        assert_eq!(mine.admit(now(), first), Ok(()));
+        assert_eq!(theirs.admit(now(), first), Ok(()));
+        let Some(voucher) = mine.issue(&client()) else {
+            panic!("client issues the frontier");
+        };
+        assert_eq!(voucher.cumulative, 400);
+        assert_eq!(theirs.settle(voucher), Ok(()));
+        for side in [&mine, &theirs] {
+            assert_eq!(side.cumulative(), 400);
+            assert_eq!(side.sequence(), 1);
+            assert!(side.active().is_none());
+        }
+
+        // The lock is released: the next job runs the same way.
+        let second = job(&mine, 500, 70);
+        assert_eq!(mine.admit(now(), second), Ok(()));
+        assert_eq!(theirs.admit(now(), second), Ok(()));
+        let Some(voucher) = mine.issue(&client()) else {
+            panic!("second frontier issues");
+        };
+        assert_eq!(theirs.settle(voucher), Ok(()));
+        assert_eq!(theirs.cumulative(), 900);
+    }
+
+    // Scenario 2: prices outside the bond's committed cap are refused.
+    #[test]
+    fn admission_refuses_uncovered_prices() {
+        let mut channel = channel();
+        for price in [0, 501] {
+            let uncovered = job(&channel, price, 60);
+            assert_eq!(channel.admit(now(), uncovered), Err(AdmitError::Uncovered));
+        }
+    }
+
+    // Scenario 3: deadlines that leave no room for the challenge (bond
+    // side) or the redemption (payment side) are refused.
+    #[test]
+    fn admission_refuses_deadlines_outside_the_committed_margins() {
+        let mut channel = channel();
+        // 180 + 20 = 200 == bond timeout: the challenge cannot land.
+        let stalled = job(&channel, 400, 180);
+        assert_eq!(channel.admit(now(), stalled), Err(AdmitError::Uncovered));
+        // 145 + 5 = 150 == payment timeout: the frontier could be
+        // stranded behind the client's unilateral refund.
+        let stranded = job(&channel, 400, 145);
+        assert_eq!(
+            channel.admit(now(), stranded),
+            Err(AdmitError::RedemptionMarginExceeded),
+        );
+        // 144 + 5 = 149 < 150 and 144 + 20 = 164 < 200: the last
+        // admissible deadline under both margins.
+        let last = job(&channel, 400, 144);
+        assert_eq!(channel.admit(now(), last), Ok(()));
+    }
+
+    #[test]
+    fn admission_refuses_deadlines_at_or_before_the_observed_height() {
+        let mut channel = channel();
+        let expired = job(&channel, 400, 60);
+        assert_eq!(
+            channel.admit(BlockHeight::new(60), expired),
+            Err(AdmitError::DeadlinePassed),
+        );
+    }
+
+    // Scenario 4: v1 serializes jobs through resolution.
+    #[test]
+    fn admission_serializes_jobs_through_resolution() {
+        let mut mine = channel();
+        let first = job(&mine, 400, 60);
+        assert_eq!(mine.admit(now(), first), Ok(()));
+        let blocked = job(&mine, 100, 70);
+        assert_eq!(mine.admit(now(), blocked), Err(AdmitError::Busy));
+
+        // A never-co-signed offer is rescinded; its sequence stays
+        // consumed so a half-signed digest can never collide.
+        assert_eq!(mine.rescind(), Some(first));
+        let next = job(&mine, 100, 70);
+        assert_eq!(next.sequence, 2);
+        assert_eq!(mine.admit(now(), next), Ok(()));
+    }
+
+    #[test]
+    fn admission_refuses_foreign_and_out_of_sequence_contexts() {
+        let mut channel = channel();
+        let foreign = JobAcceptanceContext {
+            bond_edge: EdgeId::from_bytes([9; 32]),
+            ..job(&channel, 400, 60)
+        };
+        assert_eq!(channel.admit(now(), foreign), Err(AdmitError::ForeignJob));
+        let skipped = JobAcceptanceContext {
+            sequence: 5,
+            ..job(&channel, 400, 60)
+        };
+        assert_eq!(
+            channel.admit(now(), skipped),
+            Err(AdmitError::OutOfSequence),
+        );
+    }
+
+    #[test]
+    fn admission_refuses_jobs_the_capacity_cannot_fund() {
+        let mut mine = channel();
+        let mut theirs = channel();
+        for deadline in [60, 61, 62, 63] {
+            let next = job(&mine, 500, deadline);
+            assert_eq!(mine.admit(now(), next), Ok(()));
+            assert_eq!(theirs.admit(now(), next), Ok(()));
+            let Some(voucher) = mine.issue(&client()) else {
+                panic!("frontier issues");
+            };
+            assert_eq!(theirs.settle(voucher), Ok(()));
+        }
+        assert_eq!(mine.cumulative(), CAPACITY);
+        let unfunded = job(&mine, 1, 70);
+        assert_eq!(
+            mine.admit(now(), unfunded),
+            Err(AdmitError::InsufficientCapacity),
+        );
+    }
+
+    // Scenario 5: the fraud exit — the artifact binds to this bond and
+    // the slash close carries exactly the kernel-pinned payouts.
+    #[test]
+    fn fraud_artifact_binds_and_the_slash_close_matches_the_pinned_payouts() {
+        let mut mine = channel();
+        let accepted = job(&mine, 400, 60);
+        assert_eq!(mine.admit(now(), accepted), Ok(()));
+        let digest = accepted.digest();
+        let result = JobResultContext {
+            acceptance: digest,
+            transcript: [9; 32],
+        };
+        let artifact = FraudArtifact {
+            acceptance: accepted,
+            client_acceptance_sig: client().sign(digest),
+            provider_acceptance_sig: provider().sign(digest),
+            result,
+            provider_result_sig: provider().sign(result.digest()),
+        };
+        let seal = artifact.seal();
+
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(client().party_key(), AWARD);
+        slots[1] = Payout::new(signer(3).party_key(), STAKE - AWARD);
+        let outputs = List::take(slots, 2);
+        let bond = bond_terms();
+        assert_eq!(
+            mine.slash_close(seal),
+            KernelTx::close(bond_edge(), Proof::violation(bond.clone(), seal), outputs.clone()),
+        );
+        assert!(artifact.binds(&SealPublicInputs {
+            edge_id: bond_edge(),
+            terms: &bond,
+            payouts: &outputs,
+        }));
+    }
+
+    // Scenario 6: the provider vanishes; the client's refund needs no
+    // counterparty.
+    #[test]
+    fn a_vanished_provider_cannot_stop_the_clients_timeout_refund() {
+        let channel = channel();
+        assert_eq!(
+            channel.payment_timeout_close(),
+            KernelTx::close(
+                payment_edge(),
+                Proof::timeout(payment()),
+                payment().timeout_outputs().clone(),
+            ),
+        );
+    }
+
+    // Scenario 7: the clean epoch end returns the stake.
+    #[test]
+    fn a_clean_epoch_end_returns_the_stake_to_the_provider() {
+        let channel = channel();
+        assert_eq!(
+            channel.bond_timeout_close(),
+            KernelTx::close(
+                bond_edge(),
+                Proof::timeout(bond_terms()),
+                bond_terms().timeout_outputs().clone(),
+            ),
+        );
+    }
+
+    #[test]
+    fn settlement_refuses_foreign_stale_and_unauthorized_frontiers() {
+        let mut theirs = channel();
+        let accepted = job(&theirs, 400, 60);
+        assert_eq!(theirs.admit(now(), accepted), Ok(()));
+
+        let issue_at = |edge, cumulative| {
+            MakerVoucher::issue(
+                &client(),
+                provider().party_key(),
+                edge,
+                payment().hash(),
+                CAPACITY,
+                cumulative,
+            )
+        };
+        let Some(foreign) = issue_at(EdgeId::from_bytes([9; 32]), 400) else {
+            panic!("foreign voucher issues");
+        };
+        assert_eq!(theirs.settle(foreign), Err(SettleError::ForeignVoucher));
+
+        let Some(short) = issue_at(payment_edge(), 399) else {
+            panic!("short voucher issues");
+        };
+        assert_eq!(theirs.settle(short), Err(SettleError::WrongFrontier));
+
+        let Some(genuine) = issue_at(payment_edge(), 400) else {
+            panic!("genuine voucher issues");
+        };
+        let forged = MakerVoucher {
+            client_auth: Auth::native(provider().sign(accepted.digest())),
+            ..genuine.clone()
+        };
+        assert_eq!(theirs.settle(forged), Err(SettleError::BadAuthorization));
+
+        assert_eq!(theirs.settle(genuine.clone()), Ok(()));
+        assert_eq!(theirs.settle(genuine), Err(SettleError::NoActiveJob));
+    }
+
+    #[test]
+    fn only_the_client_issues_and_only_the_provider_redeems() {
+        let mut mine = channel();
+        let accepted = job(&mine, 400, 60);
+        assert_eq!(mine.admit(now(), accepted), Ok(()));
+        assert!(
+            mine.issue(&provider()).is_none(),
+            "the provider cannot sign the maker frontier",
+        );
+        let Some(_voucher) = mine.issue(&client()) else {
+            panic!("client issues");
+        };
+        assert!(
+            mine.redeem(&client()).is_none(),
+            "the client cannot redeem the taker close",
+        );
+        assert!(mine.redeem(&provider()).is_some());
+    }
+
+    #[test]
+    fn channel_construction_refuses_unmirrored_or_shapeless_pairings() {
+        let unmirrored = payment_terms(
+            provider().party_key(),
+            client().party_key(),
+            BlockHeight::new(PAYMENT_TIMEOUT),
+            CAPACITY,
+        );
+        let cases = [
+            // Parties do not mirror across the two edges.
+            (bond_terms(), unmirrored, CLOSE_MARGIN),
+            // A bond that is not a bond.
+            (payment(), payment(), CLOSE_MARGIN),
+            // A payment edge that is a bond.
+            (bond_terms(), bond_terms(), CLOSE_MARGIN),
+            // A zero close margin could never redeem.
+            (bond_terms(), payment(), 0),
+        ];
+        for (bond, payment, margin) in cases {
+            assert!(Channel::new(bond_edge(), bond, payment_edge(), payment, margin).is_none());
+        }
     }
 }
 
@@ -567,18 +1271,16 @@ mod tests {
         );
     }
 
-    /// Slice-1 e2e fixture: the client funds a payment channel, advances
-    /// the frontier with asymmetric vouchers, and the provider redeems
-    /// exactly the latest one as a kernel `Mutual` at consensus
-    /// execution. Stale and cross-frontier vouchers die in the book;
-    /// overdrafts cannot even be issued.
+    /// Slice-2 e2e fixture: both parties drive [`Channel`] through two
+    /// honest jobs — admit, issue, settle — and the provider redeems
+    /// the final frontier as a kernel `Mutual` at consensus execution.
     #[test]
-    fn provider_redeems_only_the_latest_frontier_at_consensus_execution() {
+    fn channel_jobs_settle_and_the_frontier_redeems_at_consensus_execution() {
         const CAPACITY: u64 = 2_000;
         run_qmdb(|runtime| async move {
             let client = signer(11);
             let provider = signer(12);
-            let terms = payment_channel_terms(
+            let terms = payment_terms(
                 client.party_key(),
                 provider.party_key(),
                 BlockHeight::new(100),
@@ -615,30 +1317,57 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("open merkleizes");
             database.finalize(merkleized).await;
 
-            // Two jobs' worth of frontier: E = 800, then E = 1550. The
-            // client only ever signs; the provider only ever accumulates.
-            let issue = |cumulative| {
-                MakerVoucher::issue(
-                    &client,
-                    provider.party_key(),
-                    payment_edge,
-                    terms.hash(),
-                    CAPACITY,
-                    cumulative,
-                )
-            };
-            let first = issue(800).expect("first frontier");
-            let second = issue(1_550).expect("second frontier");
-            assert!(issue(CAPACITY + 1).is_none(), "overdraft is unissuable");
+            // The bond side of the pairing (terms only here; the slash
+            // e2e below exercises an on-chain bond). Coverage margins:
+            // deadline + challenge margin (20) < 100 and deadline +
+            // close margin (5) < 100.
+            let bond = Terms::stake_bond(StakeBondTerms {
+                protocol: STAKE_BOND_PROTOCOL,
+                parties: Parties::new(provider.party_key(), client.party_key()),
+                timeout: BlockHeight::new(100),
+                timeout_outputs: List::take(
+                    [Payout::new(provider.party_key(), 2_000); MAX_EDGE_OUTPUTS],
+                    1,
+                ),
+                treasury: signer(13).party_key(),
+                award: 1_200,
+                stake: 2_000,
+                max_job_price: 1_000,
+                max_dispute_cost: 200,
+                challenge_margin: 20,
+            });
+            let bond_edge = hellas_kernel::EdgeId::from_bytes([0x44; 32]);
+            let mut mine = Channel::new(bond_edge, bond.clone(), payment_edge, terms.clone(), 5)
+                .expect("mirrored pairing constructs the client channel");
+            let mut theirs = Channel::new(bond_edge, bond, payment_edge, terms.clone(), 5)
+                .expect("mirrored pairing constructs the provider channel");
 
-            let mut book = VoucherBook::new();
-            assert!(book.accept(first.clone()));
-            assert!(book.accept(second));
-            assert!(!book.accept(first), "stale frontier regression refused");
-            let latest = book.latest().expect("latest frontier");
-            assert_eq!(latest.cumulative, 1_550);
+            // Two honest jobs: E = 800, then E = 1_550. Both sides run
+            // the same admission; the client issues, the provider
+            // settles.
+            let now = BlockHeight::new(1);
+            let first = mine.job([7; 32], [8; 32], 800, BlockHeight::new(60));
+            mine.admit(now, first).expect("client admits the first job");
+            theirs.admit(now, first).expect("provider admits the first job");
+            let voucher = mine.issue(&client).expect("first frontier issues");
+            let stale = voucher.clone();
+            theirs.settle(voucher).expect("provider settles the first job");
 
-            let close = latest.redeem(&provider);
+            let second = mine.job([7; 32], [8; 32], 750, BlockHeight::new(70));
+            mine.admit(now, second).expect("client admits the second job");
+            theirs.admit(now, second).expect("provider admits the second job");
+            let voucher = mine.issue(&client).expect("second frontier issues");
+            theirs.settle(voucher).expect("provider settles the second job");
+            assert_eq!(theirs.cumulative(), 1_550);
+            assert_eq!(
+                theirs.settle(stale),
+                Err(SettleError::NoActiveJob),
+                "a settled frontier has nothing further to settle",
+            );
+
+            let close = theirs
+                .redeem(&provider)
+                .expect("provider redeems the latest frontier");
             let batches = execute_all(
                 context(2),
                 &verifier,
@@ -656,6 +1385,7 @@ mod tests {
                     .expect("edge read"),
                 None,
             );
+            let latest = theirs.frontier().expect("latest frontier");
             let ids = KernelTx::close_output_ids(payment_edge, &latest.outputs);
             let slots: Vec<_> = ids.as_slice().to_vec();
             assert_eq!(
