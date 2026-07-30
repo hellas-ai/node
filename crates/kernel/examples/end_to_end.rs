@@ -80,15 +80,15 @@ fn main() {
         FEES.lifetime(),
     );
 
-    run_bilateral_mutual(&wallets, &verifier);
-    run_maker_funded_timeout(&wallets, &verifier);
+    run_bilateral_mutual(&wallets, verifier);
+    run_maker_funded_timeout(&wallets, verifier);
 
     println!();
     println!("The kernel saw public keys, signatures, terms, and object ids.");
     println!("Secrets stayed in the host, and dispute seals remain host-defined.");
 }
 
-fn run_bilateral_mutual(wallets: &Wallets, verifier: &Secp256k1Verifier) {
+fn run_bilateral_mutual(wallets: &Wallets, verifier: Secp256k1Verifier) {
     let maker_coin = coin_id(0xa1);
     let taker_coin = coin_id(0xb1);
     let open_context = context(1, 0x10, FEES);
@@ -117,7 +117,7 @@ fn run_bilateral_mutual(wallets: &Wallets, verifier: &Secp256k1Verifier) {
         state.store().edge_count(),
     );
 
-    let event = apply_one(&mut state, verifier, open_context, open);
+    let event = apply_one(&mut state, &verifier, open_context, open);
     let opened = state.store().edge(edge_id).expect("open inserted edge");
     println!(
         "open @{}: {}",
@@ -139,7 +139,7 @@ fn run_bilateral_mutual(wallets: &Wallets, verifier: &Secp256k1Verifier) {
 
     let close = signed_mutual_close(wallets, edge_id, terms_hash, mutual_outputs);
     let close_fee = schedule_fee(opened.close_fees(), close.cost());
-    let event = apply_one(&mut state, verifier, close_context, close);
+    let event = apply_one(&mut state, &verifier, close_context, close);
     println!(
         "close @{}: {}",
         close_context.block_height().get(),
@@ -149,7 +149,7 @@ fn run_bilateral_mutual(wallets: &Wallets, verifier: &Secp256k1Verifier) {
     print_live_coins(state.store());
 }
 
-fn run_maker_funded_timeout(wallets: &Wallets, verifier: &Secp256k1Verifier) {
+fn run_maker_funded_timeout(wallets: &Wallets, verifier: Secp256k1Verifier) {
     let maker_coin = coin_id(0xa2);
     let open_context = context(1, 0x20, FEES);
     let close_context = context(3, 0x21, FEES);
@@ -173,7 +173,7 @@ fn run_maker_funded_timeout(wallets: &Wallets, verifier: &Secp256k1Verifier) {
     println!("== 2. Maker-funded edge, timeout close ==");
     println!("genesis: maker coin=70, taker contributes no coin but signs the open");
 
-    let event = apply_one(&mut state, verifier, open_context, open);
+    let event = apply_one(&mut state, &verifier, open_context, open);
     let opened = state.store().edge(edge_id).expect("open inserted edge");
     println!(
         "open @{}: {}",
@@ -190,7 +190,7 @@ fn run_maker_funded_timeout(wallets: &Wallets, verifier: &Secp256k1Verifier) {
 
     let close = Tx::close(edge_id, Proof::timeout(terms), timeout_outputs);
     let close_fee = schedule_fee(opened.close_fees(), close.cost());
-    let event = apply_one(&mut state, verifier, close_context, close);
+    let event = apply_one(&mut state, &verifier, close_context, close);
     println!(
         "timeout close @{}: {}",
         close_context.block_height().get(),
