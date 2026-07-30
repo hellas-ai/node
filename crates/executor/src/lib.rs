@@ -24,7 +24,9 @@ mod state;
 #[cfg(feature = "evaluate")]
 mod worker;
 
-pub use chain::{ChainView, FakeChainView, kernel_signer};
+pub use chain::{
+    ChainView, FakeChainView, acceptance_from_pb, acceptance_to_pb, kernel_signer,
+};
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch_policy::{
     CallerAccess, FetchAccessError, FetchAccessPolicy, FetchAdmission, FetchQuotaReservation,

@@ -7,6 +7,7 @@ use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
 use crate::chain::ChainView;
+use hellas_chain::staked::Channel;
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
@@ -38,10 +39,9 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
-    // Consumed by the staked job-admission gate (its wiring lands with
-    // the schema change); `None` = no chain connection, today's behavior.
-    #[allow(dead_code)]
     pub(super) chain_view: Option<Arc<dyn ChainView>>,
+    /// The provider's side of the staked pairing, when configured.
+    pub(super) staked: Option<Channel>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -60,6 +60,10 @@ pub struct ExecutorSpawnConfig {
     /// Chain connection for the staked job flow. `None` runs the
     /// executor without a chain view, exactly as before.
     pub chain_view: Option<Arc<dyn ChainView>>,
+    /// The provider's side of the staked pairing. `Some` makes every
+    /// execution require an admissible client-signed job acceptance
+    /// (and a chain view for the deadline height).
+    pub staked_channel: Option<Channel>,
 }
 
 struct ExecutorRuntimeConfig {
@@ -79,6 +83,7 @@ struct ExecutorRuntimeConfig {
     artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
     chain_view: Option<Arc<dyn ChainView>>,
+    staked_channel: Option<Channel>,
 }
 
 impl Executor {
@@ -109,6 +114,7 @@ impl Executor {
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
             chain_view: None,
+            staked_channel: None,
         })
     }
 
@@ -140,6 +146,7 @@ impl Executor {
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
             chain_view: None,
+            staked_channel: None,
         })
     }
 
@@ -168,6 +175,7 @@ impl Executor {
             artifacts,
             fetch_store,
             chain_view: config.chain_view,
+            staked_channel: config.staked_channel,
         })
     }
 
@@ -223,6 +231,7 @@ impl Executor {
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
             chain_view: config.chain_view,
+            staked: config.staked_channel,
         };
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {

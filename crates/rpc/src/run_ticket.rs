@@ -69,6 +69,7 @@ pub fn sign_run_ticket(
         ticket: Some(ticket),
         signature: Some(signature_to_pb(&signature)),
         public_key: Some(public_key_to_pb(&key.public_key())),
+        acceptance: None,
     })
 }
 

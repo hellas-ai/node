@@ -104,6 +104,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         fetch_queue_capacity: config.fetch_queue_size,
         artifact_store: ArtifactStoreConfig::Fs(config.artifact_store_path),
         chain_view: None,
+        staked_channel: None,
     })
     .await
     .context("failed to spawn executor")?;

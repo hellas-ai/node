@@ -10,11 +10,70 @@
 //! tests with scripted heights and a recording submission sink.
 
 use hellas_chain::domain::{ObjectId, Transaction};
+use hellas_chain::staked::JobAcceptanceContext;
 use hellas_chain::{EdgeState, LightClient, QueryError};
-use hellas_kernel::{BlockHeight, Secp256k1Signer};
+use hellas_kernel::{BlockHeight, EdgeId, Secp256k1Signer, Sig, TermsHash};
 use hellas_rpc::ProducerSigningKey;
+use hellas_rpc::pb::execute::{JobAcceptance, signature};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Decodes a wire [`JobAcceptance`] into the canonical context plus the
+/// client's signature over its digest.
+pub fn acceptance_from_pb(pb: &JobAcceptance) -> Result<(JobAcceptanceContext, Sig), String> {
+    let signature = pb
+        .client_signature
+        .as_ref()
+        .and_then(|sig| sig.kind.as_ref())
+        .ok_or("acceptance is missing the client signature")?;
+    let signature::Kind::Secp256k1(bytes) = signature else {
+        return Err("acceptance client signature must be secp256k1".into());
+    };
+    let context = JobAcceptanceContext {
+        bond_edge: EdgeId::from_bytes(fixed32("bond_edge", &pb.bond_edge)?),
+        bond_terms: TermsHash::from_bytes(fixed32("bond_terms", &pb.bond_terms)?),
+        payment_edge: EdgeId::from_bytes(fixed32("payment_edge", &pb.payment_edge)?),
+        sequence: pb.sequence,
+        request: fixed32("request", &pb.request)?,
+        environment: fixed32("environment", &pb.environment)?,
+        price: pb.price,
+        terminal_deadline: BlockHeight::new(pb.terminal_deadline),
+    };
+    Ok((context, Sig::from_bytes(fixed64("client_signature", bytes)?)))
+}
+
+/// Encodes the canonical context and the client's digest signature as a
+/// wire [`JobAcceptance`].
+#[must_use]
+pub fn acceptance_to_pb(context: &JobAcceptanceContext, client_signature: Sig) -> JobAcceptance {
+    JobAcceptance {
+        bond_edge: context.bond_edge.as_bytes().to_vec(),
+        bond_terms: context.bond_terms.as_bytes().to_vec(),
+        payment_edge: context.payment_edge.as_bytes().to_vec(),
+        sequence: context.sequence,
+        request: context.request.to_vec(),
+        environment: context.environment.to_vec(),
+        price: context.price,
+        terminal_deadline: context.terminal_deadline.get(),
+        client_signature: Some(hellas_rpc::pb::execute::Signature {
+            kind: Some(signature::Kind::Secp256k1(
+                client_signature.as_bytes().to_vec(),
+            )),
+        }),
+    }
+}
+
+fn fixed32(field: &'static str, bytes: &[u8]) -> Result<[u8; 32], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("acceptance {field} must be 32 bytes, got {}", bytes.len()))
+}
+
+fn fixed64(field: &'static str, bytes: &[u8]) -> Result<[u8; 64], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("acceptance {field} must be 64 bytes, got {}", bytes.len()))
+}
 
 /// Kernel signer sharing the producer identity's secp256k1 scalar: the
 /// provider's on-chain party key IS its RPC identity.
