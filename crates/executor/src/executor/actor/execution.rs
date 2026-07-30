@@ -8,7 +8,9 @@ use crate::fetch::{FetchStateError, FetchTranscript};
 use crate::fetch_policy::{FetchAccessError, FetchRoute};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
+use crate::chain::acceptance_from_pb;
 use crate::state::{QuoteKind, new_execution_id, validate_job_terms};
+use hellas_kernel::SigVerifier as _;
 use futures_util::StreamExt;
 use hellas_rpc::fetch::{FetchOutputTranscriptBuilder, decode_fetch_terminal_payload};
 use hellas_rpc::pb::execute::{
@@ -31,6 +33,64 @@ use super::Executor;
 const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 
 impl Executor {
+    /// The staked job-admission gate.
+    ///
+    /// A staked provider requires every execution to carry a
+    /// client-signed [`hellas_chain::staked::JobAcceptanceContext`]
+    /// that names its bond, commits to exactly this ticket's request
+    /// and price, verifies under the channel's client key, and passes
+    /// [`hellas_chain::staked::Channel::admit`] at the latest finalized
+    /// height — which also serializes jobs through resolution. An
+    /// unstaked provider refuses acceptances outright rather than
+    /// silently dropping a commitment it will never honor.
+    async fn admit_staked_job(
+        &mut self,
+        request: &RunTicketRequest,
+        verified_run: &VerifiedRunTicket,
+    ) -> Result<(), ExecutorError> {
+        let refuse = |message: String| Err(ExecutorError::InvalidQuoteRequest(message));
+        let Some(channel) = self.staked.as_mut() else {
+            if request.acceptance.is_some() {
+                return refuse("provider does not run the staked flow".into());
+            }
+            return Ok(());
+        };
+        let Some(acceptance) = request.acceptance.as_ref() else {
+            return refuse("staked provider requires a job acceptance".into());
+        };
+        let (context, client_signature) =
+            acceptance_from_pb(acceptance).map_err(ExecutorError::InvalidQuoteRequest)?;
+        if context.request != *verified_run.terms.request.as_bytes() {
+            return refuse("acceptance does not commit to this request".into());
+        }
+        if context.environment != *verified_run.terms.provider_genesis.as_bytes() {
+            return refuse("acceptance does not commit to this environment".into());
+        }
+        if context.price != verified_run.terms.amount {
+            return refuse("acceptance price does not match the ticket terms".into());
+        }
+        let digest = context.digest();
+        let verifier = hellas_kernel::Secp256k1Verifier::new();
+        if !verifier.verify_sig(client_signature, channel.client(), digest) {
+            return refuse("acceptance client signature does not verify".into());
+        }
+        let Some(view) = self.chain_view.as_ref() else {
+            return refuse("staked provider has no chain view".into());
+        };
+        let height = view
+            .finalized_height()
+            .await
+            .map_err(|err| ExecutorError::InvalidQuoteRequest(format!("chain view: {err}")))?;
+        let Some(now) = height else {
+            return refuse("no finalized block observed yet".into());
+        };
+        channel
+            .admit(now, context)
+            .map_err(|reason| ExecutorError::InvalidQuoteRequest(format!(
+                "job not admitted: {reason:?}"
+            )))
+    }
+
     pub(super) async fn handle_execute(
         &mut self,
         request: RunTicketRequest,
@@ -119,6 +179,7 @@ impl Executor {
             }
         }
         ensure_authorized_runner(&quote.runner_public_key, &verified_run.public_key)?;
+        self.admit_staked_job(&request, &verified_run).await?;
         match quote.kind {
             #[cfg(feature = "evaluate")]
             QuoteKind::Scheme(job) => {
@@ -886,6 +947,192 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
     }
 
+    fn client_key() -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([8; 32]).expect("valid test key")
+    }
+
+    fn staked_channel_fixture() -> hellas_chain::staked::Channel {
+        use hellas_kernel::{
+            BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout, StakeBondTerms, Terms,
+        };
+        let provider = crate::kernel_signer(&key()).party_key();
+        let client = crate::kernel_signer(&client_key()).party_key();
+        let treasury = crate::kernel_signer(
+            &ProducerSigningKey::from_secret_bytes([9; 32]).expect("valid test key"),
+        )
+        .party_key();
+        let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+        outputs[0] = Payout::new(provider, 2_000);
+        let bond = Terms::stake_bond(StakeBondTerms {
+            protocol: hellas_chain::staked::STAKE_BOND_PROTOCOL,
+            parties: Parties::new(provider, client),
+            timeout: BlockHeight::new(200),
+            timeout_outputs: List::take(outputs, 1),
+            treasury,
+            award: 1_500,
+            stake: 2_000,
+            max_job_price: 1_000,
+            max_dispute_cost: 500,
+            challenge_margin: 20,
+        });
+        let payment = hellas_chain::staked::payment_terms(
+            client,
+            provider,
+            BlockHeight::new(150),
+            5_000,
+        );
+        hellas_chain::staked::Channel::new(
+            EdgeId::from_bytes([1; 32]),
+            bond,
+            EdgeId::from_bytes([2; 32]),
+            payment,
+            5,
+        )
+        .expect("mirrored staked pairing")
+    }
+
+    async fn spawn_staked_executor(provider: Arc<dyn FetchProvider>) -> crate::ExecutorHandle {
+        let chain = crate::FakeChainView::new();
+        chain.set_height(10);
+        Executor::spawn_configured(ExecutorSpawnConfig {
+            execute_policy: ExecutePolicy::Eager,
+            queue_capacity: 1,
+            supported_dtypes: vec![Dtype::F32],
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: Arc::new(key()),
+            provider_genesis: Arc::new(test_genesis()),
+            assurance: test_assurance(),
+            fetch_access_policy: FetchAccessPolicy::trusted_callers([client_key().public_key()]),
+            fetch_routes: test_routes("echo", "run", provider, Arc::new(TestFetchProjectorFactory)),
+            fetch_max_in_flight: 1,
+            fetch_queue_capacity: 1,
+            artifact_store: ArtifactStoreConfig::Memory,
+            chain_view: Some(Arc::new(chain)),
+            staked_channel: Some(staked_channel_fixture()),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The client side of the staked handshake: run the same admission
+    /// the provider will run, sign the acceptance digest, and attach it.
+    fn accepted_request(
+        ticket: hellas_rpc::pb::execute::Ticket,
+        deadline: u64,
+    ) -> RunTicketRequest {
+        let mut channel = staked_channel_fixture();
+        let terms = ticket.terms.clone().expect("ticket terms");
+        let request_commitment: [u8; 32] = ticket
+            .request_commitment
+            .clone()
+            .try_into()
+            .expect("32-byte request commitment");
+        let environment: [u8; 32] = terms
+            .provider_genesis
+            .clone()
+            .try_into()
+            .expect("32-byte environment");
+        let context = channel.job(
+            request_commitment,
+            environment,
+            terms.amount,
+            hellas_kernel::BlockHeight::new(deadline),
+        );
+        channel
+            .admit(hellas_kernel::BlockHeight::new(10), context)
+            .expect("client admits its own job");
+        let signature = crate::kernel_signer(&client_key()).sign(context.digest());
+        let mut request = run_ticket_request(ticket, &client_key());
+        request.acceptance = Some(crate::acceptance_to_pb(&context, signature));
+        request
+    }
+
+    #[tokio::test]
+    async fn staked_executor_gates_execution_on_an_admissible_acceptance() {
+        let input = br#"{"hello":"staked"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let request = fetch_request(&client_key(), "echo", "run", input);
+        let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+
+        // No acceptance: the staked provider refuses outright.
+        let bare = handle
+            .run_ticket_handle(run_ticket_request(ticket.clone(), &client_key()))
+            .await;
+        assert!(matches!(
+            bare,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("requires a job acceptance")
+        ));
+
+        // A price that does not match the ticket terms: refused before
+        // any state changes.
+        let mut wrong_price = accepted_request(ticket.clone(), 60);
+        wrong_price.acceptance.as_mut().unwrap().price -= 1;
+        let refused = handle.run_ticket_handle(wrong_price).await;
+        assert!(matches!(
+            refused,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("price does not match")
+        ));
+
+        // An admissible client-signed acceptance runs to completion.
+        let outcome = handle
+            .run_ticket_handle(accepted_request(ticket.clone(), 60))
+            .await
+            .unwrap();
+        let (chunks, _finished) = drain_outcome(outcome.events).await;
+        assert_eq!(chunks.len(), 1);
+
+        // v1 serializes jobs through resolution: with the first job
+        // unsettled, the next job is refused as Busy.
+        let second_input = br#"{"hello":"again"}"#;
+        let request = fetch_request(&client_key(), "echo", "run", second_input);
+        let second_ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+        let busy = handle
+            .run_ticket_handle(accepted_request(second_ticket, 61))
+            .await;
+        assert!(matches!(
+            busy,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg)) if msg.contains("Busy")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unstaked_executor_refuses_acceptances() {
+        let input = br#"{"hello":"unstaked"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_fetch_executor(Arc::new(provider), 1, 1).await;
+        let request = fetch_request(&key(), "echo", "run", input);
+        let ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+
+        let channel = staked_channel_fixture();
+        let context = channel.job([0; 32], [0; 32], 1, hellas_kernel::BlockHeight::new(60));
+        let mut request = run_ticket_request(ticket, &key());
+        request.acceptance = Some(crate::acceptance_to_pb(
+            &context,
+            crate::kernel_signer(&client_key()).sign(context.digest()),
+        ));
+        let refused = handle.run_ticket_handle(request).await;
+        assert!(matches!(
+            refused,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("does not run the staked flow")
+        ));
+    }
+
     fn test_assurance() -> hellas_rpc::Assurance {
         hellas_rpc::Assurance::ProducerSigned
     }
@@ -995,6 +1242,7 @@ mod tests {
             fetch_queue_capacity,
             artifact_store: ArtifactStoreConfig::Memory,
             chain_view: None,
+            staked_channel: None,
         })
         .await
         .unwrap()
@@ -1176,6 +1424,7 @@ mod tests {
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Fs(dir.clone()),
             chain_view: None,
+            staked_channel: None,
         })
         .await
         .unwrap();
@@ -1241,6 +1490,7 @@ mod tests {
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Memory,
             chain_view: None,
+            staked_channel: None,
         })
         .await
         .unwrap();

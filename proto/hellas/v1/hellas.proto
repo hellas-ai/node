@@ -34,6 +34,25 @@ message RunTicketRequest {
   Ticket ticket = 1;
   Signature signature = 2;
   PublicKey public_key = 3;
+  // Staked job admission: present when the pairing runs the staked
+  // fraud game. A staked provider refuses execution without it; an
+  // unstaked provider refuses execution with it.
+  JobAcceptance acceptance = 4;
+}
+
+// Client-signed job acceptance binding one job to its stake bond and
+// payment edge (the chain `staked` vocabulary). Field order mirrors the
+// canonical acceptance digest.
+message JobAcceptance {
+  bytes bond_edge = 1;            // exactly 32 bytes (kernel EdgeId)
+  bytes bond_terms = 2;           // exactly 32 bytes (kernel TermsHash)
+  bytes payment_edge = 3;         // exactly 32 bytes (kernel EdgeId)
+  uint64 sequence = 4;
+  bytes request = 5;              // exactly 32 bytes (request commitment)
+  bytes environment = 6;          // exactly 32 bytes (provider genesis ContentId)
+  uint64 price = 7;
+  uint64 terminal_deadline = 8;   // block height
+  Signature client_signature = 9; // secp256k1 over the acceptance digest
 }
 
 message PublicKey {

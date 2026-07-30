@@ -216,8 +216,14 @@ impl TermsHash {
 
     /// Reconstructs a terms commitment from canonical bytes.
     ///
-    /// `pub(crate)` by design: see [`CoinId::from_bytes`].
-    pub(crate) const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
+    /// Public because terms commitments legitimately cross protocol
+    /// boundaries (job acceptances name a bond's terms by hash) — the
+    /// kernel still only honors a commitment that matches a live
+    /// edge's committed hash, so a forged value cannot authorize
+    /// anything. Contrast [`CoinId::from_bytes`], which stays private
+    /// because ids are derived, never received.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
     }
 
