@@ -994,6 +994,7 @@ mod tests {
             fetch_max_in_flight,
             fetch_queue_capacity,
             artifact_store: ArtifactStoreConfig::Memory,
+            chain_view: None,
         })
         .await
         .unwrap()
@@ -1174,6 +1175,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Fs(dir.clone()),
+            chain_view: None,
         })
         .await
         .unwrap();
@@ -1238,6 +1240,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             artifact_store: ArtifactStoreConfig::Memory,
+            chain_view: None,
         })
         .await
         .unwrap();
