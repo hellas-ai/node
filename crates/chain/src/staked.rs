@@ -213,8 +213,13 @@ impl Channel {
     /// Returns `None` unless the bond terms are stake-bond shaped, the
     /// payment terms are basic shaped, the parties mirror (bond maker =
     /// payment taker = provider; bond taker = payment maker = client),
-    /// and `close_margin` leaves the provider at least one block to
-    /// redeem.
+    /// `close_margin` leaves the provider at least one block to redeem,
+    /// and — the routing the kernel does *not* pin at open — each edge's
+    /// timeout outputs pay the right party: the payment refund goes
+    /// wholly to the client, the bond's stake-return wholly to the
+    /// provider. Without this a malicious pairing could route the
+    /// client's unilateral refund to the provider, or let the client
+    /// drain the stake with a plain bond timeout.
     #[must_use]
     pub fn new(
         bond_edge: EdgeId,
@@ -227,9 +232,16 @@ impl Channel {
         if payment.as_stake_bond().is_some() || close_margin == 0 {
             return None;
         }
-        let mirrored = provider_key(&policy.parties) == payment.parties().taker()
-            && client_key(&policy.parties) == payment.parties().maker();
+        let provider = provider_key(&policy.parties);
+        let client = client_key(&policy.parties);
+        let mirrored =
+            provider == payment.parties().taker() && client == payment.parties().maker();
         if !mirrored {
+            return None;
+        }
+        let refunds_client = paid_solely_to(payment.timeout_outputs(), client);
+        let returns_stake = paid_solely_to(bond.timeout_outputs(), provider);
+        if !refunds_client || !returns_stake {
             return None;
         }
         Some(Self {
@@ -686,6 +698,13 @@ impl FraudArtifact {
     }
 }
 
+/// True when `outputs` is non-empty and every payout pays `key` — the
+/// timeout-routing invariant the kernel leaves unpinned (it enforces
+/// only the output *sum* at open).
+fn paid_solely_to(outputs: &List<Payout, MAX_EDGE_OUTPUTS>, key: Key) -> bool {
+    !outputs.as_slice().is_empty() && outputs.as_slice().iter().all(|p| p.owner() == key)
+}
+
 /// The stake-bond party convention: the maker funds the stake.
 #[must_use]
 pub fn provider_key(parties: &Parties) -> Key {
@@ -785,11 +804,11 @@ mod channel_tests {
         EdgeId::from_bytes([2; 32])
     }
 
-    fn bond_terms() -> Terms {
+    fn sample_stake_bond() -> StakeBondTerms {
         let provider = provider().party_key();
         let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
         outputs[0] = Payout::new(provider, STAKE);
-        Terms::stake_bond(StakeBondTerms {
+        StakeBondTerms {
             protocol: STAKE_BOND_PROTOCOL,
             parties: Parties::new(provider, client().party_key()),
             timeout: BlockHeight::new(BOND_TIMEOUT),
@@ -800,7 +819,11 @@ mod channel_tests {
             max_job_price: 500,
             max_dispute_cost: 200,
             challenge_margin: CHALLENGE_MARGIN,
-        })
+        }
+    }
+
+    fn bond_terms() -> Terms {
+        Terms::stake_bond(sample_stake_bond())
     }
 
     fn payment() -> Terms {
@@ -1115,6 +1138,24 @@ mod channel_tests {
             BlockHeight::new(PAYMENT_TIMEOUT),
             CAPACITY,
         );
+        // A payment edge whose timeout refunds the PROVIDER, not the
+        // client — the client's unilateral exit would hand capacity away.
+        let mut misrouted_payment_outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+        misrouted_payment_outputs[0] = Payout::new(provider().party_key(), CAPACITY);
+        let misrouted_payment = Terms::basic(
+            PAYMENT_PROTOCOL,
+            Parties::new(client().party_key(), provider().party_key()),
+            BlockHeight::new(PAYMENT_TIMEOUT),
+            List::take(misrouted_payment_outputs, 1),
+        );
+        // A bond whose timeout returns the stake to the CLIENT — a plain
+        // timeout would drain the stake with no fraud proof.
+        let mut drained_bond_outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+        drained_bond_outputs[0] = Payout::new(client().party_key(), STAKE);
+        let drained_bond = Terms::stake_bond(StakeBondTerms {
+            timeout_outputs: List::take(drained_bond_outputs, 1),
+            ..sample_stake_bond()
+        });
         let cases = [
             // Parties do not mirror across the two edges.
             (bond_terms(), unmirrored, CLOSE_MARGIN),
@@ -1124,6 +1165,9 @@ mod channel_tests {
             (bond_terms(), bond_terms(), CLOSE_MARGIN),
             // A zero close margin could never redeem.
             (bond_terms(), payment(), 0),
+            // Timeout outputs routed to the wrong party.
+            (bond_terms(), misrouted_payment, CLOSE_MARGIN),
+            (drained_bond, payment(), CLOSE_MARGIN),
         ];
         for (bond, payment, margin) in cases {
             assert!(Channel::new(bond_edge(), bond, payment_edge(), payment, margin).is_none());
