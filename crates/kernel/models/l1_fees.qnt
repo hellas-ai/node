@@ -75,8 +75,6 @@ module l1_fees {
   var paid: int
   var height: int
   var currentCloseFee: int
-  var postedStake: Party -> int
-  var stakeAwards: Party -> int
   var closeOutcome: CloseOutcome
   var lastInput: Input
   var lastEvent: Event
@@ -103,10 +101,8 @@ module l1_fees {
   pure val BaseCloseFee = 10
   pure val RaisedCloseFee = CloseReserve + 2
   pure val ReserveSurplus = CloseReserve - BaseCloseFee
-  pure val InitialStake = 12
-  pure val ViolationPenalty = 4
   pure val TotalPrincipal = MakerValue + TakerValue
-  pure val GenesisTotal = TotalPrincipal + InitialStake
+  pure val GenesisTotal = TotalPrincipal
 
   pure val EmptyParties: OpenParties = { maker: Adversary, taker: Adversary }
 
@@ -261,12 +257,6 @@ module l1_fees {
     shape != EmptyFunding
       and openPartiesFor(shape).maker != openPartiesFor(shape).taker
 
-  pure def violatorFor(shape: FundingShape): Party =
-    openPartiesFor(shape).taker
-
-  pure def violationBeneficiaryFor(shape: FundingShape): Party =
-    openPartiesFor(shape).maker
-
   def liveShape: FundingShape =
     edgeShape.get(Channel)
 
@@ -278,12 +268,6 @@ module l1_fees {
 
   def reserveTotal: int =
     liveEdges.fold(0, (sum, id) => sum + reserves.get(id))
-
-  def stakeTotal: int =
-    partyTotal(postedStake)
-
-  def stakeAwardTotal: int =
-    partyTotal(stakeAwards)
 
   def liveEdgeCount: int =
     liveEdges.size()
@@ -346,11 +330,7 @@ module l1_fees {
       and proofOk(p)
       and not(liveCoins.contains(MakerOut))
       and not(liveCoins.contains(TakerOut))
-      and (p != Violation
-        or all {
-          violationEnabled(liveShape),
-          postedStake.get(violatorFor(liveShape)) >= ViolationPenalty,
-        })
+      and (p != Violation or violationEnabled(liveShape))
 
   action init = all {
     coins' = AllCoins.mapBy(id =>
@@ -372,8 +352,6 @@ module l1_fees {
     paid' = 0,
     height' = 1,
     currentCloseFee' = BaseCloseFee,
-    postedStake' = makerTakerValues(0, InitialStake),
-    stakeAwards' = zeroPartyValues,
     closeOutcome' = NoClose,
     lastInput' = NoInput,
     lastEvent' = NoEvent,
@@ -399,8 +377,6 @@ module l1_fees {
     paid' = 0,
     height' = 1,
     currentCloseFee' = BaseCloseFee,
-    postedStake' = makerTakerValues(0, InitialStake),
-    stakeAwards' = zeroPartyValues,
     closeOutcome' = NoClose,
     lastInput' = NoInput,
     lastEvent' = NoEvent,
@@ -425,8 +401,6 @@ module l1_fees {
     paid' = paid + openFeeFor(s) + lifetimeFeeFor(s),
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = NoClose,
     lastInput' = OpenInput(s),
     lastEvent' = EdgeOpenedEvent,
@@ -447,8 +421,6 @@ module l1_fees {
     paid' = paid + committedCloseFeeFor(liveShape),
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = ClosedMutual,
     lastInput' = CloseInput(Mutual),
     lastEvent' = EdgeClosedEvent,
@@ -469,8 +441,6 @@ module l1_fees {
     paid' = paid + committedCloseFeeFor(liveShape),
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = ClosedTimeout,
     lastInput' = CloseInput(Timeout),
     lastEvent' = EdgeClosedEvent,
@@ -491,14 +461,6 @@ module l1_fees {
     paid' = paid + committedCloseFeeFor(liveShape),
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake.set(
-      violatorFor(liveShape),
-      postedStake.get(violatorFor(liveShape)) - ViolationPenalty
-    ),
-    stakeAwards' = stakeAwards.set(
-      violationBeneficiaryFor(liveShape),
-      stakeAwards.get(violationBeneficiaryFor(liveShape)) + ViolationPenalty
-    ),
     closeOutcome' = ClosedViolation,
     lastInput' = CloseInput(Violation),
     lastEvent' = EdgeClosedEvent,
@@ -518,8 +480,6 @@ module l1_fees {
     paid' = paid,
     height' = height,
     currentCloseFee' = RaisedCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = closeOutcome,
     lastInput' = RaiseFeeInput,
     lastEvent' = NoEvent,
@@ -543,8 +503,6 @@ module l1_fees {
     paid' = paid,
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = closeOutcome,
     lastInput' = RejectedOpenInput(s),
     lastEvent' = NoEvent,
@@ -566,8 +524,6 @@ module l1_fees {
     paid' = paid,
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = closeOutcome,
     lastInput' = RejectedCloseInput(p),
     lastEvent' = NoEvent,
@@ -586,8 +542,6 @@ module l1_fees {
     paid' = paid,
     height' = height + 1,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = closeOutcome,
     lastInput' = TickInput,
     lastEvent' = NoEvent,
@@ -605,8 +559,6 @@ module l1_fees {
     paid' = paid,
     height' = height,
     currentCloseFee' = currentCloseFee,
-    postedStake' = postedStake,
-    stakeAwards' = stakeAwards,
     closeOutcome' = closeOutcome,
     lastInput' = IdleInput,
     lastEvent' = NoEvent,
@@ -626,12 +578,10 @@ module l1_fees {
   }
 
   val valueAccounted =
-    coinTotal + edgeTotal + reserveTotal + paid + stakeTotal + stakeAwardTotal
-      == GenesisTotal
+    coinTotal + edgeTotal + reserveTotal + paid == GenesisTotal
 
   val partyValueAccounted =
-    partyTotal(partyLiquid) + edgeTotal + reserveTotal + paid + stakeTotal + stakeAwardTotal
-      == GenesisTotal
+    partyTotal(partyLiquid) + edgeTotal + reserveTotal + paid == GenesisTotal
 
   val constantsBalanced =
     PaidLifetimeBlocks == TimeoutHeight - 1
@@ -650,8 +600,6 @@ module l1_fees {
       and AllEdges.forall(id => reserves.get(id) >= 0)
       and AllEdges.forall(id => closeFees.get(id) >= 0)
       and paid >= 0
-      and partyNonNegative(postedStake)
-      and partyNonNegative(stakeAwards)
 
   val reserveAtLeastCommittedFee =
     liveEdges.forall(id => reserves.get(id) >= closeFees.get(id))
@@ -741,25 +689,11 @@ module l1_fees {
         not(canClose(Violation)),
       }
 
-  val stakeDomainConserved =
-    stakeTotal + stakeAwardTotal == InitialStake
 
-  val stakeAwardBackedOnlyByStakeDebits =
-    stakeAwardTotal == InitialStake - stakeTotal
 
-  val stakeAwardNeverExceedsPostedStake =
-    stakeAwardTotal <= InitialStake
 
-  val stakeAwardOnlyThroughViolation =
-    closeOutcome == ClosedViolation or stakeAwardTotal == 0
 
-  val timeoutDoesNotAwardStake =
-    closeOutcome != ClosedTimeout or stakeAwardTotal == 0
 
-  val selfEdgeCannotSlashWithoutOwnStake =
-    not(liveEdges.contains(Channel))
-      or liveShape != SelfFunding
-      or not(canClose(Violation))
 
   run fullFundingMutualTraceTest =
     init
@@ -768,7 +702,6 @@ module l1_fees {
       .expect(valueAccounted
         and partyValueAccounted
         and paid == openFeeFor(FullFunding) + lifetimeFeeFor(FullFunding) + committedCloseFeeFor(FullFunding)
-        and stakeAwardTotal == 0
         and termsCoherentForClose
         and deadSlotsAreZero)
 
@@ -814,8 +747,7 @@ module l1_fees {
         and partyValueAccounted
         and openPartiesFor(SelfFunding).maker == openPartiesFor(SelfFunding).taker
         and coins.get(TakerCoin) == TakerValue
-        and coins.get(MakerOut) == principalFor(SelfFunding) + reserveSurplusFor(SelfFunding)
-        and stakeAwardTotal == 0)
+        and coins.get(MakerOut) == principalFor(SelfFunding) + reserveSurplusFor(SelfFunding))
 
   run underfundedOneSidedOpenRejectedTest =
     initUnderfunded
@@ -844,8 +776,7 @@ module l1_fees {
         and currentCloseFee == RaisedCloseFee
         and closeOutcome == ClosedMutual
         and paid == openFeeFor(FullFunding) + lifetimeFeeFor(FullFunding) + committedCloseFeeFor(FullFunding)
-        and deadSlotsAreZero
-        and stakeAwardTotal == 0)
+        and deadSlotsAreZero)
 
   run timeoutCloseTraceTest =
     init
@@ -856,7 +787,6 @@ module l1_fees {
         and partyValueAccounted
         and paid == openFeeFor(FullFunding) + lifetimeFeeFor(FullFunding) + committedCloseFeeFor(FullFunding)
         and closeOutcome == ClosedTimeout
-        and stakeAwardTotal == 0
         and nonTimeoutProofsExpire)
 
   run expiredMutualAndViolationRejectedTest =
@@ -870,15 +800,14 @@ module l1_fees {
         and not(canClose(Mutual))
         and not(canClose(Violation)))
 
-  run violationAwardsStakeTraceTest =
+  // A Violation close of a Basic edge pays principal and charges the
+  // committed close fee like any other close kind. Stake lives on a
+  // StakeBond edge (models/l1_stake.qnt), never as a side bucket here.
+  run violationClosePaysPrincipalTraceTest =
     init
       .then(openBy(FullFunding))
       .then(closeViolation)
       .expect(valueAccounted
         and partyValueAccounted
-        and closeOutcome == ClosedViolation
-        and stakeAwards.get(Maker) == ViolationPenalty
-        and postedStake.get(Taker) == InitialStake - ViolationPenalty
-        and stakeAwardBackedOnlyByStakeDebits
-        and stakeAwardOnlyThroughViolation)
+        and closeOutcome == ClosedViolation)
 }

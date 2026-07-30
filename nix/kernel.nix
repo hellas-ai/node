@@ -62,12 +62,6 @@ let
         "fundingAuthorized"
         "expiredLiveHasTimeoutPath"
         "nonTimeoutProofsExpire"
-        "stakeDomainConserved"
-        "stakeAwardBackedOnlyByStakeDebits"
-        "stakeAwardNeverExceedsPostedStake"
-        "stakeAwardOnlyThroughViolation"
-        "timeoutDoesNotAwardStake"
-        "selfEdgeCannotSlashWithoutOwnStake"
       ];
     }
     {
@@ -168,12 +162,6 @@ let
         "fundingAuthorized"
         "expiredLiveHasTimeoutPath"
         "nonTimeoutProofsExpire"
-        "stakeDomainConserved"
-        "stakeAwardBackedOnlyByStakeDebits"
-        "stakeAwardNeverExceedsPostedStake"
-        "stakeAwardOnlyThroughViolation"
-        "timeoutDoesNotAwardStake"
-        "selfEdgeCannotSlashWithoutOwnStake"
       ];
     }
     {

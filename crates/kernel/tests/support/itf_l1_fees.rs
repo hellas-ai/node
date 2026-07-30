@@ -31,10 +31,6 @@ pub(crate) struct State {
     pub(crate) height: i64,
     #[serde(with = "As::<Integer>")]
     pub(crate) current_close_fee: i64,
-    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
-    pub(crate) posted_stake: BTreeMap<PartyTag, i64>,
-    #[serde(with = "As::<BTreeMap<Same, Integer>>")]
-    pub(crate) stake_awards: BTreeMap<PartyTag, i64>,
     pub(crate) close_outcome: CloseOutcomeTag,
     pub(crate) last_input: Input,
     pub(crate) last_event: Event,
