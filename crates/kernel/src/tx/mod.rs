@@ -382,6 +382,12 @@ fn check_stake_bond_open(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelRe
     if bond.max_job_price == 0 {
         return Err(invalid_open(output, InvalidOpenReason::JobPriceCapZero));
     }
+    // A zero challenge margin leaves no block between an honest job's
+    // terminal deadline and the bond timeout for a challenge to land,
+    // so no job could ever be covered (`covered_by` is unsatisfiable).
+    if bond.challenge_margin == 0 {
+        return Err(invalid_open(output, InvalidOpenReason::ChallengeMarginZero));
+    }
     let floor = bond
         .max_job_price
         .checked_add(bond.max_dispute_cost)

@@ -245,6 +245,22 @@ fn bond_open_rejects_bad_slash_arithmetic_without_mutation() {
             bond_terms_shaped(AWARD, STAKE, 0, 0),
             InvalidOpenReason::JobPriceCapZero,
         ),
+        // A zero challenge margin leaves no block to challenge in.
+        (
+            Terms::stake_bond(StakeBondTerms {
+                protocol: PROTOCOL,
+                parties: PARTIES,
+                timeout: TIMEOUT,
+                timeout_outputs: payouts1(Payout::new(MAKER, STAKE)),
+                treasury: TREASURY,
+                award: AWARD,
+                stake: STAKE,
+                max_job_price: 4,
+                max_dispute_cost: 3,
+                challenge_margin: 0,
+            }),
+            InvalidOpenReason::ChallengeMarginZero,
+        ),
     ];
     for (terms, reason) in cases {
         let funding = Funding::new(list(&[MAKER_COIN]), empty_party());

@@ -209,6 +209,13 @@ impl JobAcceptanceContext {
     /// margin before its timeout — otherwise a stalling provider could
     /// push the challenge window past the bond's expiry and escape into
     /// a stake refund.
+    ///
+    /// The margin comparison is strict: the kernel rejects a `Violation`
+    /// at `block_height >= timeout` (`ProofExpired`), so the last block a
+    /// challenge can actually land on is `timeout − 1`. A window ending
+    /// exactly at `timeout` is already too late, hence `challenge_end <
+    /// timeout`, matching the plan's `terminal_deadline + margins <
+    /// bond_timeout`.
     #[must_use]
     pub fn covered_by(&self, bond: &hellas_kernel::StakeBondTerms) -> bool {
         self.price >= 1
@@ -217,7 +224,7 @@ impl JobAcceptanceContext {
                 .terminal_deadline
                 .get()
                 .checked_add(bond.challenge_margin)
-                .is_some_and(|challenge_end| challenge_end <= bond.timeout.get())
+                .is_some_and(|challenge_end| challenge_end < bond.timeout.get())
     }
 
     /// Canonical digest both parties sign at acceptance.
@@ -479,15 +486,24 @@ mod tests {
         assert!(base.covered_by(&bond));
         assert!(
             JobAcceptanceContext {
-                terminal_deadline: BlockHeight::new(80),
+                // 79 + 20 = 99 < 100: the last covered deadline, leaving
+                // block 99 as the final slashable challenge block.
+                terminal_deadline: BlockHeight::new(79),
                 ..base
             }
             .covered_by(&bond),
-            "deadline exactly at the margin edge is covered",
+            "last strictly-under-timeout deadline is covered",
         );
         for uncovered in [
             JobAcceptanceContext { price: 0, ..base },
             JobAcceptanceContext { price: 501, ..base },
+            JobAcceptanceContext {
+                // 80 + 20 = 100 == timeout: the challenge would have to
+                // land at `timeout`, where the kernel already rejects
+                // Violation as ProofExpired. Not covered.
+                terminal_deadline: BlockHeight::new(80),
+                ..base
+            },
             JobAcceptanceContext {
                 terminal_deadline: BlockHeight::new(81),
                 ..base
