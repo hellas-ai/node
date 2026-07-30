@@ -7,8 +7,10 @@
 
 pub(crate) mod itf;
 pub(crate) mod itf_l1_fees;
+pub(crate) mod itf_l1_stake;
 pub(crate) mod l1;
 pub(crate) mod l1_fees;
+pub(crate) mod l1_stake;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
