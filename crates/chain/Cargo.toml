@@ -89,9 +89,14 @@ server = [
 # validators with different cache contents would fork on a violation
 # close. Single-node dev chains only.
 preverified-seals = ["validator"]
+# Staked fraud-game protocol vocabulary (`staked` module): Channel, the
+# job-binding contexts, vouchers. Pure kernel-level types — no consensus
+# stack, so executors/clients can depend on it without `validator`.
+staked = ["dep:blake3", "dep:hellas-kernel", "hellas-kernel/secp256k1"]
 validator = [
     "indexer",
     "server",
+    "staked",
     "dep:axum",
     "dep:commonware-broadcast",
     "dep:opentelemetry",
