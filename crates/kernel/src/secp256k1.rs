@@ -5,10 +5,17 @@
 //! crypto-agnostic — this module is gated behind the `secp256k1` feature, and
 //! the kernel never references it directly.
 //!
+//! Backed by pure-Rust [`k256`] (the `RustCrypto` sister of the [`p256`]
+//! this crate already uses for `WebAuthn`), so it builds on every target —
+//! including `wasm32` — without a C toolchain. Signatures are the
+//! identical secp256k1 ECDSA bytes libsecp256k1 produces.
+//!
 //! Compact-form ECDSA signatures are 64 bytes (`r ‖ s`), matching the
 //! kernel's [`Sig`] shape. Compressed public keys are 33 bytes, matching
 //! [`Key`]. The 32-byte [`PayloadHash`] is interpreted as the pre-hashed
-//! message — the verifier does not hash again.
+//! message — the verifier does not hash again. Signatures are produced
+//! and required in low-`S` normal form, so ECDSA malleability cannot
+//! flip an authorization into a second valid witness.
 //!
 //! # Scope
 //!
@@ -23,7 +30,9 @@
 
 use core::fmt;
 
-use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, VerifyOnly, ecdsa::Signature};
+use k256::FieldBytes;
+use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
 use crate::primitive::{Key, PayloadHash, Sig};
 use crate::tx::{Auth, Seal};
@@ -43,7 +52,7 @@ pub enum Secp256k1SignerError {
     reason = "secret-bearing signers must not be implicitly copied"
 )]
 pub struct Secp256k1Signer {
-    secret_key: SecretKey,
+    signing_key: SigningKey,
     party_key: Key,
 }
 
@@ -64,11 +73,17 @@ impl Secp256k1Signer {
     /// Returns [`Secp256k1SignerError::InvalidSecretScalar`] for zero or
     /// out-of-range scalars.
     pub fn from_secret_scalar(secret_scalar: [u8; 32]) -> Result<Self, Secp256k1SignerError> {
-        let secret_key = SecretKey::from_byte_array(secret_scalar)
+        let signing_key = SigningKey::from_bytes(&FieldBytes::from(secret_scalar))
             .map_err(|_| Secp256k1SignerError::InvalidSecretScalar)?;
-        let party_key = Key::from_bytes(secret_key.public_key(&Secp256k1::new()).serialize());
+        let encoded = signing_key.verifying_key().to_encoded_point(true);
+        let party_key = Key::from_bytes(
+            encoded
+                .as_bytes()
+                .try_into()
+                .map_err(|_| Secp256k1SignerError::InvalidSecretScalar)?,
+        );
         Ok(Self {
-            secret_key,
+            signing_key,
             party_key,
         })
     }
@@ -79,50 +94,61 @@ impl Secp256k1Signer {
         self.party_key
     }
 
-    /// Signs one canonical kernel payload hash into compact `r || s` form.
+    /// Signs one canonical kernel payload hash into compact low-`S`
+    /// `r || s` form.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: deterministic (RFC 6979) ECDSA over a fixed
+    /// 32-byte prehash with a validated key has no reachable failure —
+    /// the only error paths are a zero `r`/`s`, which RFC 6979 retries
+    /// past internally.
     #[must_use]
     pub fn sign(&self, hash: PayloadHash) -> Sig {
-        let signature = Secp256k1::new()
-            .sign_ecdsa(Message::from_digest(hash.to_bytes()), &self.secret_key)
-            .serialize_compact();
-        Sig::from_bytes(signature)
+        // Deterministic (RFC 6979) ECDSA over a fixed 32-byte prehash
+        // with a valid key: the only error paths are a zero `r`/`s`,
+        // which RFC 6979 retries past, so this cannot fail in practice.
+        #[allow(
+            clippy::expect_used,
+            reason = "deterministic sign over a valid 32-byte prehash is infallible"
+        )]
+        let signature: Signature = self
+            .signing_key
+            .sign_prehash(&hash.to_bytes())
+            .expect("deterministic secp256k1 signature over a 32-byte prehash");
+        let signature = signature.normalize_s().unwrap_or(signature);
+        Sig::from_bytes(signature.to_bytes().into())
     }
 }
 
 /// Verifier that accepts compact-form secp256k1 ECDSA signatures from
 /// compressed public keys, with the close hash interpreted as the
-/// pre-hashed message.
-#[derive(Debug)]
-pub struct Secp256k1Verifier {
-    secp: Secp256k1<VerifyOnly>,
-}
+/// pre-hashed message. High-`S` signatures are rejected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Secp256k1Verifier;
 
 impl Secp256k1Verifier {
-    /// Creates a new verifier over a fresh verify-only context.
+    /// Creates a new verifier.
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            secp: Secp256k1::verification_only(),
-        }
-    }
-}
-
-impl Default for Secp256k1Verifier {
-    fn default() -> Self {
-        Self::new()
+    pub const fn new() -> Self {
+        Self
     }
 }
 
 impl SigVerifier for Secp256k1Verifier {
     fn verify_sig(&self, sig: Sig, party_key: Key, hash: PayloadHash) -> bool {
-        let Ok(pk) = PublicKey::from_slice(party_key.as_bytes()) else {
+        let Ok(pk) = VerifyingKey::from_sec1_bytes(party_key.as_bytes()) else {
             return false;
         };
-        let Ok(signature) = Signature::from_compact(sig.as_bytes()) else {
+        let Ok(signature) = Signature::from_slice(sig.as_bytes()) else {
             return false;
         };
-        let message = Message::from_digest(hash.to_bytes());
-        self.secp.verify_ecdsa(message, &signature, &pk).is_ok()
+        // Reject malleable high-`S` witnesses: only the low-`S` normal
+        // form this crate signs is admissible.
+        if signature.normalize_s().is_some() {
+            return false;
+        }
+        pk.verify_prehash(&hash.to_bytes(), &signature).is_ok()
     }
 
     fn verify_auth(&self, auth: &Auth, party_key: Key, hash: PayloadHash) -> bool {

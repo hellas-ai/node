@@ -29,7 +29,7 @@ catgrad-llm = { workspace = true, default-features = false, optional = true }
 chatgrad = { workspace = true, default-features = false, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
-hellas-chain = { workspace = true, features = ["client", "staked"] }
+hellas-chain = { workspace = true, features = ["client"] }
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = [

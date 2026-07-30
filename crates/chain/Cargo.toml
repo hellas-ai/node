@@ -7,10 +7,15 @@ license.workspace = true
 [features]
 default = []
 api = ["dep:hellas-rpc", "hellas-rpc/chain"]
-# Chain/light-client domain vocabulary (`domain` module): addresses,
-# transactions, WebAuthn signature policy, challenge derivation.
+# Chain/light-client domain vocabulary: addresses, transactions,
+# WebAuthn signature policy, challenge derivation (`domain` module), and
+# the staked fraud-game protocol (`staked` module — Channel, vouchers,
+# job contexts). Staking is integral to the chain, not an opt-in: the
+# k256-backed kernel verifier builds on every target, so `domain` (and
+# thus the wasm light client) carries it unconditionally.
 domain = [
     "dep:base64ct",
+    "dep:blake3",
     "dep:bs58",
     "dep:bytes",
     "dep:commonware-codec",
@@ -21,6 +26,7 @@ domain = [
     "dep:sha2",
     "dep:thiserror",
     "dep:url",
+    "hellas-kernel/secp256k1",
 ]
 # Consensus wiring aliases in the domain module (threshold scheme types).
 domain-consensus = ["domain", "dep:commonware-consensus"]
@@ -89,14 +95,9 @@ server = [
 # validators with different cache contents would fork on a violation
 # close. Single-node dev chains only.
 preverified-seals = ["validator"]
-# Staked fraud-game protocol vocabulary (`staked` module): Channel, the
-# job-binding contexts, vouchers. Pure kernel-level types — no consensus
-# stack, so executors/clients can depend on it without `validator`.
-staked = ["dep:blake3", "dep:hellas-kernel", "hellas-kernel/secp256k1"]
 validator = [
     "indexer",
     "server",
-    "staked",
     "dep:axum",
     "dep:commonware-broadcast",
     "dep:opentelemetry",
