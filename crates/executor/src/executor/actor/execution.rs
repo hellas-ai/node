@@ -131,8 +131,8 @@ impl Executor {
         let Some(staked) = self.staked.as_ref() else {
             return Err(refuse("provider does not run the staked flow".into()));
         };
-        let voucher =
-            voucher_from_pb(request, &staked.channel).map_err(ExecutorError::InvalidQuoteRequest)?;
+        let voucher = voucher_from_pb(request, &staked.channel)
+            .map_err(ExecutorError::InvalidQuoteRequest)?;
         let Some(active_request) = staked.channel.active().map(|job| job.request) else {
             return Err(refuse("no job awaiting settlement".into()));
         };
@@ -1252,7 +1252,10 @@ mod tests {
             .unwrap();
         bumped.rescind();
         let (blocked, blocked_job) = acceptance_for(&mut bumped, second_ticket.clone(), 61);
-        assert_eq!(blocked_job.sequence, 2, "the blocked job is the next sequence");
+        assert_eq!(
+            blocked_job.sequence, 2,
+            "the blocked job is the next sequence"
+        );
         let busy = handle.run_ticket_handle(blocked).await;
         assert!(matches!(
             busy,
@@ -1322,6 +1325,64 @@ mod tests {
         let outcome = handle.run_ticket_handle(next).await.unwrap();
         let (chunks, _finished) = drain_outcome(outcome.events).await;
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// The acceptance must commit to *this* ticket and be signed by the
+    /// channel's committed client. Without these, a staked provider
+    /// would run work bound to a different request, a different
+    /// execution environment, or authorized by a stranger.
+    ///
+    /// Each binding previously had no negative test, so all four checks
+    /// in `admit_staked_job` could have been deleted with the suite
+    /// still green.
+    #[tokio::test]
+    async fn staked_admission_refuses_unbound_or_unauthorized_acceptances() {
+        let input = br#"{"hello":"bindings"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+
+        // Bound to a different request commitment.
+        let (mut wrong_request, _) =
+            acceptance_for(&mut staked_channel_fixture(), ticket.clone(), 60);
+        wrong_request.acceptance.as_mut().unwrap().request = vec![0xab; 32];
+        assert!(matches!(
+            handle.run_ticket_handle(wrong_request).await,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("does not commit to this request")
+        ));
+
+        // Bound to a different execution environment.
+        let (mut wrong_env, _) = acceptance_for(&mut staked_channel_fixture(), ticket.clone(), 60);
+        wrong_env.acceptance.as_mut().unwrap().environment = vec![0xcd; 32];
+        assert!(matches!(
+            handle.run_ticket_handle(wrong_env).await,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("does not commit to this environment")
+        ));
+
+        // Correctly bound, but signed by someone who is not the
+        // channel's client — here the provider signing for itself.
+        let (mut forged, context) = acceptance_for(&mut staked_channel_fixture(), ticket, 60);
+        forged.acceptance = Some(crate::acceptance_to_pb(
+            &context,
+            crate::kernel_signer(&key()).sign(context.digest()),
+        ));
+        assert!(matches!(
+            handle.run_ticket_handle(forged).await,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                if msg.contains("client signature does not verify")
+        ));
     }
 
     #[tokio::test]
