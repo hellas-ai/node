@@ -1214,6 +1214,70 @@ mod tests {
         signer
     }
 
+    const FULL_GAME_CAPACITY: u64 = 2_000;
+    const FULL_GAME_STAKE: u64 = 2_000;
+    const FULL_GAME_AWARD: u64 = 1_200;
+
+    /// The bond the full-game e2e commits. Shared with the economics
+    /// test so that test asserts over the terms actually in use rather
+    /// than a copy of them that can silently drift.
+    fn full_game_bond_policy() -> StakeBondTerms {
+        let provider = signer(12).party_key();
+        StakeBondTerms {
+            protocol: STAKE_BOND_PROTOCOL,
+            parties: Parties::new(provider, signer(11).party_key()),
+            timeout: BlockHeight::new(100),
+            timeout_outputs: List::take(
+                [Payout::new(provider, FULL_GAME_STAKE); MAX_EDGE_OUTPUTS],
+                1,
+            ),
+            treasury: signer(13).party_key(),
+            award: FULL_GAME_AWARD,
+            stake: FULL_GAME_STAKE,
+            max_job_price: 1_000,
+            max_dispute_cost: 200,
+            challenge_margin: 20,
+        }
+    }
+
+    /// The bond the preverified-slash e2e commits.
+    fn slash_fixture_bond_policy() -> StakeBondTerms {
+        let provider = signer(5).party_key();
+        StakeBondTerms {
+            protocol: STAKE_BOND_PROTOCOL,
+            parties: Parties::new(provider, signer(6).party_key()),
+            timeout: BlockHeight::new(100),
+            timeout_outputs: List::take([Payout::new(provider, STAKE); MAX_EDGE_OUTPUTS], 1),
+            treasury: signer(7).party_key(),
+            award: AWARD,
+            stake: STAKE,
+            max_job_price: 500,
+            max_dispute_cost: 200,
+            challenge_margin: 20,
+        }
+    }
+
+    /// A channel over the full-game fixture terms, for assertions that
+    /// need the real `Channel` closes without a live chain.
+    fn full_game_channel() -> Channel {
+        let payment = payment_terms(
+            signer(11).party_key(),
+            signer(12).party_key(),
+            BlockHeight::new(100),
+            FULL_GAME_CAPACITY,
+        );
+        let Some(channel) = Channel::new(
+            hellas_kernel::EdgeId::from_bytes([0x44; 32]),
+            Terms::stake_bond(full_game_bond_policy()),
+            hellas_kernel::EdgeId::from_bytes([0x55; 32]),
+            payment,
+            5,
+        ) else {
+            panic!("full-game fixture terms form a valid pairing");
+        };
+        channel
+    }
+
     fn two_payouts(first: Payout, second: Payout) -> List<Payout, MAX_EDGE_OUTPUTS> {
         let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
         slots[0] = first;
@@ -1321,47 +1385,73 @@ mod tests {
     /// payment voucher, so the penalty relative to undetected fraud is
     /// exactly `S`, and the client is made whole from the slash award,
     /// never from clawback.
+    /// Option-1 (stake-only, λ = 0) economics, asserted over the terms
+    /// the fixtures actually commit and the payouts `slash_close`
+    /// actually builds.
+    ///
+    /// A previous version of this test declared its own literals and
+    /// asserted algebraic identities (`(p − c_F − S) − (p − c_H)` vs
+    /// `c_H − c_F − S`) that hold for *every* assignment — it read no
+    /// production value and would have passed with both fixture bonds
+    /// set to economically broken numbers. What follows reads real
+    /// terms, quantifies over the whole space of jobs those terms
+    /// admit, and derives the settlement delta from the close the
+    /// channel emits.
     #[test]
     fn option_one_economics_hold_for_the_committed_bond_shape() {
-        // The shape the e2e fixtures commit.
-        let stake = 1_000_u64; // S
-        let award = 700_u64; // A
-        let max_job_price = 500_u64;
-        let max_dispute_cost = 200_u64;
-        let price = 400_u64; // p_j of the fixture job
-        let dispute_cost = 150_u64; // C_disp ≤ max_dispute_cost
-        let honest_cost = 900_u64; // c_H
-        let fraud_cost = 100_u64; // c_F
+        for policy in [full_game_bond_policy(), slash_fixture_bond_policy()] {
+            // Conditional reimbursement, universally quantified: for
+            // EVERY job this bond can admit and every dispute cost it
+            // can cover, the award makes the client whole without any
+            // clawback of the payment edge. This is exactly what the
+            // open-time floor buys, and it fails if the floor is wrong.
+            assert!(
+                policy.award >= policy.max_job_price + policy.max_dispute_cost,
+                "award floor violated by a committed fixture",
+            );
+            for price in 1..=policy.max_job_price {
+                for dispute in [0, policy.max_dispute_cost / 2, policy.max_dispute_cost] {
+                    assert!(
+                        policy.award >= price + dispute,
+                        "award {} cannot make the client whole for p_j={price}, C_disp={dispute}",
+                        policy.award,
+                    );
+                }
+            }
+            // Strict dispute incentive A > C_disp, for every cost the
+            // bond admits — so challenging is never value-indifferent.
+            assert!(policy.award > policy.max_dispute_cost);
+            // The award is real and bounded by the stake behind it.
+            assert!(policy.award > 0 && policy.award <= policy.stake);
+        }
 
-        // Provider IC: S ≥ c_H − c_F (p_j cancels — the provider keeps
-        // its payment either way).
-        assert!(stake >= honest_cost - fraud_cost);
-        // Strict dispute incentive: A > C_disp.
-        assert!(award > dispute_cost);
-        // Conditional reimbursement: A ≥ p_j + C_disp, guaranteed for
-        // every admissible job by the committed open-time floor.
-        assert!(award >= max_job_price + max_dispute_cost);
-        assert!(price <= max_job_price && dispute_cost <= max_dispute_cost);
-        assert!(award >= price + dispute_cost);
-
-        // The many-job cheat, priced honestly: the provider redeems the
-        // frontier through job k, defrauds job k+1, still collects p_j,
-        // and loses exactly S — never p_j + S. Its marginal payoff for
-        // the fraudulent job is (p_j − c_F − S) vs the honest
-        // (p_j − c_H); with the IC above, fraud is weakly worse.
-        let fraud_payoff = i128::from(price) - i128::from(fraud_cost) - i128::from(stake);
-        let honest_payoff = i128::from(price) - i128::from(honest_cost);
-        assert_eq!(
-            fraud_payoff - honest_payoff,
-            i128::from(honest_cost) - i128::from(fraud_cost) - i128::from(stake),
-        );
-        assert!(fraud_payoff <= honest_payoff);
-        // And the settlement delta on proven fraud is +p_j (payment
-        // kept) − S (stake lost): p_j − S, matching what the kernel's
-        // pinned payouts actually move.
-        assert_eq!(
-            i128::from(price) - i128::from(stake),
-            i128::from(price) - i128::from(award) - i128::from(stake - award),
+        // The settlement delta, read off the close the channel actually
+        // builds rather than restated as arithmetic: a proven fraud
+        // moves exactly the stake — award to the client, remainder to
+        // the treasury — so the provider's loss relative to undetected
+        // fraud is exactly S, never p_j + S. Nothing routes back to the
+        // provider.
+        let channel = full_game_channel();
+        let policy = full_game_bond_policy();
+        let slash = channel.slash_close(Seal::from_bytes([0; 32]));
+        let KernelTx::Close { outputs, .. } = &slash else {
+            panic!("slash_close builds a close");
+        };
+        let moved: u64 = outputs.as_slice().iter().map(|payout| payout.value()).sum();
+        assert_eq!(moved, policy.stake, "a slash moves exactly the stake");
+        let to_client: u64 = outputs
+            .as_slice()
+            .iter()
+            .filter(|payout| payout.owner() == channel.client())
+            .map(|payout| payout.value())
+            .sum();
+        assert_eq!(to_client, policy.award);
+        assert!(
+            !outputs
+                .as_slice()
+                .iter()
+                .any(|payout| payout.owner() == channel.provider()),
+            "no slash output may route back to the provider",
         );
     }
 
@@ -1373,9 +1463,6 @@ mod tests {
     /// `Channel` itself.
     #[test]
     fn the_full_game_plays_out_at_consensus_execution() {
-        const CAPACITY: u64 = 2_000;
-        const STAKE_TOTAL: u64 = 2_000;
-        const SLASH_AWARD: u64 = 1_200;
         run_qmdb(|runtime| async move {
             let client = signer(11);
             let provider = signer(12);
@@ -1384,7 +1471,7 @@ mod tests {
                 client.party_key(),
                 provider.party_key(),
                 BlockHeight::new(100),
-                CAPACITY,
+                FULL_GAME_CAPACITY,
             );
             let client_coin = CoinId::from_bytes(genesis_object_id(0).0);
             let funding = Funding::new(
@@ -1403,21 +1490,7 @@ mod tests {
             // The provider-funded bond, opened on-chain in the same
             // block. Coverage margins: deadline + challenge margin (20)
             // < 100 and deadline + close margin (5) < 100.
-            let bond = Terms::stake_bond(StakeBondTerms {
-                protocol: STAKE_BOND_PROTOCOL,
-                parties: Parties::new(provider.party_key(), client.party_key()),
-                timeout: BlockHeight::new(100),
-                timeout_outputs: List::take(
-                    [Payout::new(provider.party_key(), STAKE_TOTAL); MAX_EDGE_OUTPUTS],
-                    1,
-                ),
-                treasury,
-                award: SLASH_AWARD,
-                stake: STAKE_TOTAL,
-                max_job_price: 1_000,
-                max_dispute_cost: 200,
-                challenge_margin: 20,
-            });
+            let bond = Terms::stake_bond(full_game_bond_policy());
             let provider_coin = CoinId::from_bytes(genesis_object_id(1).0);
             let bond_funding = Funding::new(
                 List::take([provider_coin; MAX_PARTY_INPUTS], 1),
@@ -1432,8 +1505,8 @@ mod tests {
             );
             let bond_edge = KernelTx::edge_id_of(&bond_funding, &bond);
             let allocations = vec![
-                (SettlementKey::from(client.party_key()), CAPACITY),
-                (SettlementKey::from(provider.party_key()), STAKE_TOTAL),
+                (SettlementKey::from(client.party_key()), FULL_GAME_CAPACITY),
+                (SettlementKey::from(provider.party_key()), FULL_GAME_STAKE),
             ];
 
             let verifier = ChainVerifier::new();
@@ -1522,7 +1595,7 @@ mod tests {
                     .expect("client refund read"),
                 Some(Object::Coin(Coin {
                     owner: SettlementKey::from(client.party_key()),
-                    value: CAPACITY - 1_550,
+                    value: FULL_GAME_CAPACITY - 1_550,
                 })),
             );
             assert_eq!(
@@ -1592,7 +1665,7 @@ mod tests {
                     .expect("client award read"),
                 Some(Object::Coin(Coin {
                     owner: SettlementKey::from(client.party_key()),
-                    value: SLASH_AWARD,
+                    value: FULL_GAME_AWARD,
                 })),
             );
             assert_eq!(
@@ -1602,7 +1675,7 @@ mod tests {
                     .expect("treasury remainder read"),
                 Some(Object::Coin(Coin {
                     owner: SettlementKey::from(treasury),
-                    value: STAKE_TOTAL - SLASH_AWARD,
+                    value: FULL_GAME_STAKE - FULL_GAME_AWARD,
                 })),
             );
         });
@@ -1618,22 +1691,7 @@ mod tests {
             let provider = signer(5);
             let client = signer(6);
             let treasury = signer(7).party_key();
-            let parties = Parties::new(provider.party_key(), client.party_key());
-            let terms = Terms::stake_bond(StakeBondTerms {
-                protocol: STAKE_BOND_PROTOCOL,
-                parties,
-                timeout: BlockHeight::new(100),
-                timeout_outputs: List::take(
-                    [Payout::new(provider.party_key(), STAKE); MAX_EDGE_OUTPUTS],
-                    1,
-                ),
-                treasury,
-                award: AWARD,
-                stake: STAKE,
-                max_job_price: 500,
-                max_dispute_cost: 200,
-                challenge_margin: 20,
-            });
+            let terms = Terms::stake_bond(slash_fixture_bond_policy());
 
             let provider_coin = CoinId::from_bytes(genesis_object_id(0).0);
             let funding = Funding::new(
