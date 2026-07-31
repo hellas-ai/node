@@ -288,6 +288,7 @@ let
       name,
       command,
       needsJvm ? false,
+      crate ? "kernel",
     }:
     pkgs.writeShellApplication {
       inherit name;
@@ -299,7 +300,7 @@ let
       ++ lib.optionals needsJvm [ pkgs.temurin-bin ];
       text = ''
         repo_root="$(git rev-parse --show-toplevel)"
-        cd "$repo_root/crates/kernel"
+        cd "$repo_root/crates/${crate}"
         ${lib.optionalString needsJvm ''
           export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
         ''}
@@ -323,6 +324,31 @@ let
     needsJvm = true;
   };
 
+  chainModelCommand = ''
+    quint typecheck models/staked_channel.qnt
+    quint test models/staked_channel.qnt --verbosity=2
+    quint run models/staked_channel.qnt --max-samples=1000 --max-steps=10 \
+      --invariants=atMostOneActiveJob --invariants=frontierWithinCapacity \
+      --invariants=admittedJobsAreCovered --invariants=activeJobIsFunded \
+      --invariants=heightMovesForward --verbosity=1
+  '';
+
+  chainModelTest = mkModelApp {
+    name = "hellas-chain-model-test";
+    command = chainModelCommand;
+    crate = "chain";
+  };
+
+  chainModelFixtures = mkModelApp {
+    name = "hellas-chain-model-fixtures";
+    command = ''
+      rm -f models/traces/*.itf.json
+      mkdir -p models/traces
+      quint test models/staked_channel.qnt --out-itf 'models/traces/staked_channel_{test}.itf.json' --verbosity=0
+    '';
+    crate = "chain";
+  };
+
   modelFixtures = mkModelApp {
     name = "hellas-kernel-model-fixtures";
     command = fixtureCommand;
@@ -339,6 +365,7 @@ in
     kernel-models = modelTest;
     kernel-model-run = modelRun;
     kernel-model-verify = modelVerify;
+    chain-models = chainModelTest;
   };
 
   apps = {
@@ -361,6 +388,11 @@ in
       type = "app";
       program = lib.getExe modelFixtures;
       meta.description = "Regenerate hellas-kernel Quint ITF fixtures";
+    };
+    "update-chain-model-fixtures" = {
+      type = "app";
+      program = lib.getExe chainModelFixtures;
+      meta.description = "Regenerate hellas-chain Quint ITF fixtures";
     };
   };
 }
