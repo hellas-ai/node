@@ -383,11 +383,25 @@ module lifetime {
   val closeReserveCoversCommittedFee =
     not(live) or closeReserve >= PrepaidCloseFee
 
+  // Subsumed by `closeReserveCoversCommittedFee` (canClose unfolds to
+  // exactly that inequality); kept because the *name* is the property
+  // readers look for.
   val closeAlwaysAvailableWhenLive =
     not(live) or canClose
 
-  val feeRaiseCannotStrandClose =
-    not(live) or currentCloseFee <= closeReserve or canClose
+  // `feeRaiseCannotStrandClose` used to live here as
+  //   not(live) or currentCloseFee <= closeReserve or canClose
+  // which is vacuous: when live, `canClose` unfolds to
+  // `closeReserve >= PrepaidCloseFee` (12 >= 8), so the third disjunct
+  // is always true and `currentCloseFee` never does any work. The
+  // invariant named for the fee-raise scenario held precisely *because*
+  // close pricing ignores the raised fee — it could not have caught a
+  // regression that started honouring it.
+  //
+  // The real property is a reachability witness, not an invariant:
+  // there must EXIST a live state where the current fee exceeds the
+  // reserve and the close is still available. See
+  // `feeRaiseDoesNotStrandLiveCloseTest`.
 
   val liveCloseReserveIsNotRent =
     not(live) or closeReserve == CloseReserve
@@ -438,6 +452,20 @@ module lifetime {
 
   val heightAtLeastGenesis =
     height >= GenesisHeight
+
+  // The fee-raise property with teeth: after a raise the current close
+  // fee genuinely exceeds the reserve — so this is a stranding-shaped
+  // scenario, not a no-op — and the close is STILL available, because
+  // it is priced at the committed prepaid fee. If close pricing ever
+  // started reading `currentCloseFee`, `canClose` would go false here
+  // and this test would fail.
+  run feeRaiseDoesNotStrandLiveCloseTest =
+    init
+      .then(openPermanent)
+      .then(raiseFee)
+      .expect(live
+        and currentCloseFee > closeReserve
+        and canClose)
 
   run permanentCloseAfterFeeRaiseTest =
     init

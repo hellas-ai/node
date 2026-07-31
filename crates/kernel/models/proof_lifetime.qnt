@@ -270,10 +270,17 @@ module proof_lifetime {
   val closeReserveCoversCommittedFee =
     phase == Closed or closeReserve >= PrepaidCloseFee
 
-  val feeRaiseCannotStrandProofClose =
-    phase == Closed
-      or currentCloseFee <= closeReserve
-      or closeReserve >= PrepaidCloseFee
+  // `feeRaiseCannotStrandProofClose` used to live here as
+  //   phase == Closed or currentCloseFee <= closeReserve
+  //     or closeReserve >= PrepaidCloseFee
+  // which is `A or B or C` where `A or C` is already the invariant
+  // above — so it could never be violated unless that one was, and
+  // `currentCloseFee` never did any work. Like its `lifetime.qnt`
+  // twin, it held precisely *because* proof-close pricing ignores the
+  // raised fee, so it could not catch a regression that honoured it.
+  //
+  // The property with content is a reachability witness; see
+  // `feeRaiseDoesNotStrandLiveProofCloseTest`.
 
   val latestTermsCoherent =
     termsCoherent(LatestTerms, EdgePrincipal, ReserveSurplus, 0, 0)
@@ -352,8 +359,21 @@ module proof_lifetime {
       .expect(phase == Closed
         and finalProof == SelfContainedLatestProof
         and valueAccounted
-        and latestProofPreservesLatestBound
-        and feeRaiseCannotStrandProofClose)
+        and latestProofPreservesLatestBound)
+
+  // The fee-raise property with teeth: while still Live after a raise,
+  // the current close fee genuinely exceeds the reserve — a
+  // stranding-shaped scenario — and a latest-proof close is STILL
+  // admissible, because it is priced at the committed prepaid fee. If
+  // proof-close pricing ever started reading `currentCloseFee`, this
+  // would fail.
+  run feeRaiseDoesNotStrandLiveProofCloseTest =
+    init
+      .then(tickFundedLive)
+      .then(raiseFee)
+      .expect(phase == Live
+        and currentCloseFee > closeReserve
+        and canCloseWithProof(SelfContainedLatestProof))
 
   run freshMutualLatestProofBeforeExpiryTest =
     init
