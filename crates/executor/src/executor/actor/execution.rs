@@ -1385,6 +1385,112 @@ mod tests {
         ));
     }
 
+    /// A provider must not accept payment, or issue fraud evidence, for
+    /// work it has not terminally recorded.
+    ///
+    /// Settling early would clear the serialization lock while the job
+    /// is still running — breaking serialize-through-resolution — and
+    /// leave the client paid but unable to obtain a receipt, which is
+    /// the evidence it needs if the result turns out to be wrong. The
+    /// gate is `settled ⇒ the client could have obtained its receipt`.
+    #[tokio::test]
+    async fn settlement_and_receipt_are_refused_before_the_work_is_recorded() {
+        let provider = ReleasableFetchProvider::default();
+        let handle = spawn_staked_executor(Arc::new(provider.clone())).await;
+        let mut client_channel = staked_channel_fixture();
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", br#"{"n":1}"#))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, job) = acceptance_for(&mut client_channel, ticket, 60);
+        let _outcome = handle
+            .run_ticket_handle(admitted)
+            .await
+            .expect("the job admits and starts");
+        // The provider is now blocked mid-run: the job is in flight and
+        // nothing is terminally recorded.
+
+        let receipt = handle
+            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
+                acceptance_digest: job.digest().as_bytes().to_vec(),
+            })
+            .await;
+        assert!(
+            matches!(
+                receipt,
+                Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                    if msg.contains("no completed transcript")
+            ),
+            "receipt before completion must be refused, got {receipt:?}",
+        );
+
+        // Even a perfectly valid voucher must not settle yet.
+        let voucher = client_channel
+            .issue(&crate::kernel_signer(&client_key()))
+            .expect("client issues the frontier");
+        let hellas_kernel::Auth::Native(authorization) = voucher.client_auth else {
+            panic!("issued vouchers carry native maker authorization");
+        };
+        let settled = handle
+            .settle_handle(hellas_rpc::pb::execute::SettleRequest {
+                payment_edge: voucher.payment_edge.as_bytes().to_vec(),
+                payment_terms: voucher.terms_hash.as_bytes().to_vec(),
+                cumulative: voucher.cumulative,
+                client_authorization: Some(crate::chain::sig_to_pb(authorization)),
+            })
+            .await;
+        assert!(
+            matches!(
+                settled,
+                Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                    if msg.contains("no completed transcript")
+            ),
+            "settlement before completion must be refused, got {settled:?}",
+        );
+
+        provider.release();
+    }
+
+    /// A receipt hands out the provider's signatures over a job's
+    /// acceptance and result — the client's half of a fraud artifact.
+    /// It must only ever answer for the job actually in flight.
+    #[tokio::test]
+    async fn receipt_refuses_a_digest_that_is_not_the_in_flight_job() {
+        let input = br#"{"hello":"receipt"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let mut client_channel = staked_channel_fixture();
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, _job) = acceptance_for(&mut client_channel, ticket, 60);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
+        let (_chunks, _finished) = drain_outcome(outcome.events).await;
+
+        let foreign = handle
+            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
+                acceptance_digest: vec![0x5a; 32],
+            })
+            .await;
+        assert!(
+            matches!(
+                foreign,
+                Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                    if msg.contains("names a job other than the in-flight one")
+            ),
+            "a foreign acceptance digest must be refused, got {foreign:?}",
+        );
+    }
+
     #[tokio::test]
     async fn a_runtime_failure_does_not_wedge_the_pairing() {
         // The provider serves "run" but has no programmed response for
