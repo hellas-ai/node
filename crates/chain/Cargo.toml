@@ -177,6 +177,8 @@ url = { version = "2", optional = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-kernel = { workspace = true, features = ["test-support"] }
+itf = "0.4"
 proptest = "1.11"
+serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
 test-log = { version = "0.2", features = ["trace"] }
