@@ -9,6 +9,7 @@
 //! node in-process and hand its client here. [`FakeChainView`] drives
 //! tests with scripted heights and a recording submission sink.
 
+use futures_util::StreamExt as _;
 use hellas_chain::domain::{ObjectId, Transaction};
 use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
@@ -17,20 +18,145 @@ use hellas_kernel::{
     TermsHash,
 };
 use hellas_rpc::ProducerSigningKey;
+use hellas_rpc::call::StreamingCall;
+use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind};
 use hellas_rpc::pb::execute::{
     JobAcceptance, ReceiptResponse, SettleRequest, Signature as PbSignature, signature,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Everything a staked provider needs: its side of the pairing and the
-/// chain it observes. One value at the spawn boundary — a staked
-/// executor without a chain view is unrepresentable.
+/// Everything a staked provider needs: its side of the pairing, the
+/// chain it observes, and the feed that tells it the chain moved. One
+/// value at the spawn boundary — a staked executor without a chain view
+/// is unrepresentable.
 pub struct StakedProvider {
     /// The provider's side of the two-edge pairing.
     pub channel: Channel,
     /// The chain the deadline heights are read from.
     pub chain: Arc<dyn ChainView>,
+    /// Where new finalized heights arrive from.
+    pub heights: Arc<dyn HeightFeed>,
+}
+
+/// A source of finalized-height notifications.
+///
+/// Deliberately separate from [`ChainView`]. Every deadline in the
+/// staked protocol is a block height, so the provider's time-based
+/// obligations — banking a due frontier, releasing an abandoned job —
+/// must be driven by chain progress, never by a wall clock: a polling
+/// interval has no defined relationship to block production and would
+/// be an invented constant sitting under derived deadlines.
+///
+/// It cannot live on `ChainView` because a subscription holds state,
+/// and `ChainView` has a blanket impl over the stateless
+/// [`hellas_chain::LightClient`] trait. Keeping it separate also puts
+/// the "how do I learn about new heights" decision where the topology
+/// is known: a remote light client has a finalization stream, an
+/// in-process node has the validator's broadcast.
+#[async_trait::async_trait]
+pub trait HeightFeed: Send + Sync + 'static {
+    /// Resolves once the finalized height has advanced past `after`.
+    ///
+    /// An `Err` ends the provider's maintenance loop: the feed owns its
+    /// own reconnection, so a surfaced error means the feed has given
+    /// up, not that the caller should spin.
+    async fn next_after(&self, after: BlockHeight) -> Result<BlockHeight, QueryError>;
+}
+
+/// The production feed: waits on the chain's finalization stream, then
+/// reads the height it announced.
+pub struct FinalizationFeed {
+    client: hellas_chain::client::RemoteLightClient,
+    stream: tokio::sync::Mutex<Option<StreamingCall<ActivityEvent>>>,
+}
+
+impl FinalizationFeed {
+    /// Wraps a connected light client as a height feed.
+    #[must_use]
+    pub const fn new(client: hellas_chain::client::RemoteLightClient) -> Self {
+        Self {
+            client,
+            stream: tokio::sync::Mutex::const_new(None),
+        }
+    }
+}
+
+impl core::fmt::Debug for FinalizationFeed {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("FinalizationFeed").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl HeightFeed for FinalizationFeed {
+    async fn next_after(&self, after: BlockHeight) -> Result<BlockHeight, QueryError> {
+        let mut guard = self.stream.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                self.client
+                    .subscribe_activity(vec![ActivityEventKind::Finalization])
+                    .await?,
+            );
+        }
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| QueryError::Remote("finalization stream missing".into()))?;
+        while let Some(event) = stream.next().await {
+            event.map_err(|err| QueryError::Remote(err.to_string()))?;
+            // The event says something finalized; the height comes from
+            // the chain itself, exactly as `follower.rs` does it.
+            if let Some(height) = self.client.finalized_height().await?
+                && height.get() > after.get()
+            {
+                return Ok(height);
+            }
+        }
+        Err(QueryError::Remote("finalization stream ended".into()))
+    }
+}
+
+/// Test feed: resolves whatever height a test publishes.
+#[derive(Debug, Clone)]
+pub struct FakeHeightFeed {
+    updates: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for FakeHeightFeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeHeightFeed {
+    /// Creates a feed sitting at height zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            updates: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// Publishes a new finalized height, waking any waiter.
+    pub fn publish(&self, height: u64) {
+        let _ = self.updates.send(height);
+    }
+}
+
+#[async_trait::async_trait]
+impl HeightFeed for FakeHeightFeed {
+    async fn next_after(&self, after: BlockHeight) -> Result<BlockHeight, QueryError> {
+        let mut rx = self.updates.subscribe();
+        loop {
+            let current = *rx.borrow_and_update();
+            if current > after.get() {
+                return Ok(BlockHeight::new(current));
+            }
+            if rx.changed().await.is_err() {
+                return Err(QueryError::ChannelClosed);
+            }
+        }
+    }
 }
 
 /// Encodes a kernel signature as its wire form.

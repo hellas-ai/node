@@ -223,6 +223,33 @@ impl Executor {
             active_fetches: 0,
             staked: config.staked,
         };
+        // A staked provider owes time-based work even when idle: an
+        // unbanked frontier is erased outright by the client's
+        // full-capacity timeout refund, and an abandoned job would hold
+        // the serialization lock. Every such deadline is a BLOCK
+        // HEIGHT, so the loop is woken by chain progress — no polling
+        // interval, which would be an invented constant with no defined
+        // relationship to block production.
+        if let Some(staked) = executor.staked.as_ref() {
+            let heights = Arc::clone(&staked.heights);
+            let ticks = tx.clone();
+            tokio::spawn(async move {
+                let mut seen = hellas_kernel::BlockHeight::new(0);
+                loop {
+                    match heights.next_after(seen).await {
+                        Ok(height) => {
+                            seen = height;
+                            if ticks.send(ExecutorMessage::StakedHeight(height)).is_err() {
+                                return;
+                            }
+                        }
+                        // The feed owns its own reconnection, so an
+                        // error means it gave up — stop rather than spin.
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {
             tx,
@@ -291,6 +318,9 @@ impl Executor {
                 }
                 ExecutorMessage::Receipt { request, reply } => {
                     let _ = reply.send(self.handle_receipt(&request).await);
+                }
+                ExecutorMessage::StakedHeight(height) => {
+                    self.handle_staked_height(height).await;
                 }
                 ExecutorMessage::Settle { request, reply } => {
                     let _ = reply.send(self.handle_settle(&request).await);

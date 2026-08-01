@@ -105,6 +105,10 @@ pub(crate) enum ExecutorMessage {
         request: ReceiptRequest,
         reply: oneshot::Sender<Result<ReceiptResponse, ExecutorError>>,
     },
+    /// Staked flow: the chain reached `height`. Time-based obligations
+    /// (banking a due frontier, releasing an abandoned job) are driven
+    /// by chain progress, never by a wall clock.
+    StakedHeight(hellas_kernel::BlockHeight),
     /// Staked flow: settle the in-flight job with the client's frontier
     /// voucher, releasing the serialization lock.
     Settle {

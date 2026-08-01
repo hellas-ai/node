@@ -186,6 +186,20 @@ impl Executor {
         Ok(SettleResponse {})
     }
 
+    /// Staked maintenance for a newly finalized height: release a job
+    /// abandoned past its deadline, then bank a frontier that is due.
+    ///
+    /// Driven by the height feed rather than by incoming requests: an
+    /// idle provider is the one with the most to lose, since nothing
+    /// else would ever wake it before the payment timeout.
+    pub(super) async fn handle_staked_height(&mut self, height: hellas_kernel::BlockHeight) {
+        if self.staked.is_none() {
+            return;
+        }
+        self.release_abandoned_job(height).await;
+        self.bank_frontier_if_due(height).await;
+    }
+
     /// Submits the latest frontier as an on-chain `Mutual` close once
     /// the channel can no longer admit any job.
     ///
@@ -1254,6 +1268,14 @@ mod tests {
         provider: Arc<dyn FetchProvider>,
         chain: crate::FakeChainView,
     ) -> crate::ExecutorHandle {
+        spawn_staked_executor_feeding(provider, chain, crate::FakeHeightFeed::new()).await
+    }
+
+    async fn spawn_staked_executor_feeding(
+        provider: Arc<dyn FetchProvider>,
+        chain: crate::FakeChainView,
+        heights: crate::FakeHeightFeed,
+    ) -> crate::ExecutorHandle {
         Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
             queue_capacity: 1,
@@ -1270,6 +1292,7 @@ mod tests {
             staked: Some(crate::StakedProvider {
                 channel: staked_channel_fixture(),
                 chain: Arc::new(chain),
+                heights: Arc::new(heights),
             }),
         })
         .await
@@ -1822,6 +1845,72 @@ mod tests {
         assert!(
             matches!(&submitted[0], hellas_chain::domain::Transaction::Kernel(_)),
             "the redemption is a kernel close",
+        );
+    }
+
+    /// An IDLE provider — one that receives no further requests —
+    /// still banks its frontier, because chain progress alone wakes it.
+    ///
+    /// This is the case with real money on it: without a height-driven
+    /// trigger the provider holds the voucher until the payment timeout
+    /// and the client's close refunds the FULL capacity, erasing
+    /// everything earned.
+    #[tokio::test]
+    async fn an_idle_provider_banks_its_frontier_when_the_chain_advances() {
+        let input = br#"{"hello":"idle"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let chain = crate::FakeChainView::new();
+        chain.set_height(143);
+        let heights = crate::FakeHeightFeed::new();
+        let handle =
+            spawn_staked_executor_feeding(Arc::new(provider), chain.clone(), heights.clone()).await;
+        let mut client_channel = staked_channel_fixture();
+
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 144);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
+        let (_chunks, _finished) = drain_outcome(outcome.events).await;
+        let voucher = client_channel
+            .issue(&crate::kernel_signer(&client_key()))
+            .expect("client issues the frontier");
+        let hellas_kernel::Auth::Native(authorization) = voucher.client_auth else {
+            panic!("issued vouchers carry native maker authorization");
+        };
+        handle
+            .settle_handle(hellas_rpc::pb::execute::SettleRequest {
+                payment_edge: voucher.payment_edge.as_bytes().to_vec(),
+                payment_terms: voucher.terms_hash.as_bytes().to_vec(),
+                cumulative: voucher.cumulative,
+                client_authorization: Some(crate::chain::sig_to_pb(authorization)),
+            })
+            .await
+            .expect("settlement lands");
+        assert!(chain.submitted().is_empty(), "not due yet at height 143");
+
+        // No further requests arrive — only the chain moves.
+        chain.set_height(146);
+        heights.publish(146);
+
+        for _ in 0..200 {
+            if !chain.submitted().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            chain.submitted().len(),
+            1,
+            "chain progress alone must bank the frontier",
         );
     }
 
