@@ -62,7 +62,7 @@ pub(crate) fn sig_from_pb(field: &'static str, pb: Option<&PbSignature>) -> Resu
     let signature::Kind::Secp256k1(bytes) = kind else {
         return Err(format!("{field} must be secp256k1"));
     };
-    Ok(Sig::from_bytes(fixed64(field, bytes)?))
+    Ok(Sig::from_bytes(fixed::<64>(field, bytes)?))
 }
 
 /// The provider's staked receipt: signatures over the acceptance digest
@@ -92,8 +92,8 @@ pub(crate) fn receipt_response(
 /// authorization over the payload it derives itself.
 pub(crate) fn voucher_from_pb(request: &SettleRequest) -> Result<MakerVoucher, String> {
     Ok(MakerVoucher {
-        payment_edge: EdgeId::from_bytes(fixed32("payment_edge", &request.payment_edge)?),
-        terms_hash: TermsHash::from_bytes(fixed32("payment_terms", &request.payment_terms)?),
+        payment_edge: EdgeId::from_bytes(fixed::<32>("payment_edge", &request.payment_edge)?),
+        terms_hash: TermsHash::from_bytes(fixed::<32>("payment_terms", &request.payment_terms)?),
         cumulative: request.cumulative,
         client_auth: Auth::native(sig_from_pb(
             "client_authorization",
@@ -107,12 +107,12 @@ pub(crate) fn voucher_from_pb(request: &SettleRequest) -> Result<MakerVoucher, S
 pub fn acceptance_from_pb(pb: &JobAcceptance) -> Result<(JobAcceptanceContext, Sig), String> {
     let signature = sig_from_pb("client signature", pb.client_signature.as_ref())?;
     let context = JobAcceptanceContext {
-        bond_edge: EdgeId::from_bytes(fixed32("bond_edge", &pb.bond_edge)?),
-        bond_terms: TermsHash::from_bytes(fixed32("bond_terms", &pb.bond_terms)?),
-        payment_edge: EdgeId::from_bytes(fixed32("payment_edge", &pb.payment_edge)?),
+        bond_edge: EdgeId::from_bytes(fixed::<32>("bond_edge", &pb.bond_edge)?),
+        bond_terms: TermsHash::from_bytes(fixed::<32>("bond_terms", &pb.bond_terms)?),
+        payment_edge: EdgeId::from_bytes(fixed::<32>("payment_edge", &pb.payment_edge)?),
         sequence: pb.sequence,
-        request: fixed32("request", &pb.request)?,
-        environment: fixed32("environment", &pb.environment)?,
+        request: fixed::<32>("request", &pb.request)?,
+        environment: fixed::<32>("environment", &pb.environment)?,
         price: pb.price,
         terminal_deadline: BlockHeight::new(pb.terminal_deadline),
     };
@@ -136,16 +136,14 @@ pub fn acceptance_to_pb(context: &JobAcceptanceContext, client_signature: Sig) -
     }
 }
 
-fn fixed32(field: &'static str, bytes: &[u8]) -> Result<[u8; 32], String> {
+/// Decodes a fixed-width byte field, naming it in the failure.
+///
+/// The crate's one copy of this: `state` and `evaluate` wrap it in
+/// their own error type rather than restating the conversion.
+pub(crate) fn fixed<const N: usize>(field: &str, bytes: &[u8]) -> Result<[u8; N], String> {
     bytes
         .try_into()
-        .map_err(|_| format!("{field} must be 32 bytes, got {}", bytes.len()))
-}
-
-fn fixed64(field: &'static str, bytes: &[u8]) -> Result<[u8; 64], String> {
-    bytes
-        .try_into()
-        .map_err(|_| format!("{field} must be 64 bytes, got {}", bytes.len()))
+        .map_err(|_| format!("{field} must be {N} bytes, got {}", bytes.len()))
 }
 
 /// Kernel signer sharing the producer identity's secp256k1 scalar: the
