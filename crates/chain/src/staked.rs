@@ -27,7 +27,9 @@ use hellas_kernel::{
     Secp256k1Verifier, Sig, SigVerifier as _, StakeBondTerms, Terms, TermsHash, Tx as KernelTx,
     Writer as _,
 };
+#[cfg(feature = "preverified-seals")]
 use std::collections::HashMap;
+#[cfg(feature = "preverified-seals")]
 use std::sync::{Arc, Mutex};
 
 /// Protocol code for the optimistic payment channel (plain `Basic`
@@ -246,18 +248,6 @@ impl Channel {
         })
     }
 
-    /// The bond edge backing this pairing (the epoch identity).
-    #[must_use]
-    pub const fn bond_edge(&self) -> EdgeId {
-        self.bond_edge
-    }
-
-    /// The payment edge the frontier settles on.
-    #[must_use]
-    pub const fn payment_edge(&self) -> EdgeId {
-        self.payment_edge
-    }
-
     /// The bond's committed policy. The constructor guarantees the shape.
     /// Blocks the provider must reserve to get a close transaction
     /// finalized before the payment timeout.
@@ -449,7 +439,7 @@ impl Channel {
     /// and holding the voucher only risks the client's timeout refund
     /// erasing earnings the provider already banked off-chain.
     #[must_use]
-    pub fn redemption_due(&self, now: BlockHeight) -> bool {
+    fn redemption_due(&self, now: BlockHeight) -> bool {
         self.frontier.is_some()
             && now
                 .get()
@@ -809,14 +799,14 @@ pub fn receipt_request_digest(acceptance: PayloadHash) -> PayloadHash {
 
 /// The stake-bond party convention: the maker funds the stake.
 #[must_use]
-pub fn provider_key(parties: &Parties) -> Key {
+fn provider_key(parties: &Parties) -> Key {
     parties.maker()
 }
 
 /// The stake-bond party convention: the taker is the client and the
 /// committed violation beneficiary.
 #[must_use]
-pub fn client_key(parties: &Parties) -> Key {
+fn client_key(parties: &Parties) -> Key {
     parties.taker()
 }
 
@@ -827,10 +817,12 @@ pub fn client_key(parties: &Parties) -> Key {
 /// violation closes. Inserting an artifact asserts its fraud claim is
 /// true — only the *binding* is re-checked at verify time.
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "preverified-seals")]
 pub struct PreverifiedSeals {
     inner: Arc<Mutex<HashMap<Seal, FraudArtifact>>>,
 }
 
+#[cfg(feature = "preverified-seals")]
 impl PreverifiedSeals {
     /// Creates an empty cache.
     #[must_use]
