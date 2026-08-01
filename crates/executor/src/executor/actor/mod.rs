@@ -6,7 +6,7 @@ use crate::ExecutorError;
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
-use crate::chain::StakedProvider;
+use crate::chain::{ChainView, StakedProvider};
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
@@ -15,6 +15,7 @@ use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::SchemeEngine;
 use crate::state::{ArtifactStoreConfig, ExecutorState};
+use futures_util::StreamExt as _;
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::{Assurance, Dtype, ProducerSigningKey};
@@ -38,8 +39,17 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
-    /// The staked pairing plus its chain view, when configured.
-    pub(super) staked: Option<StakedProvider>,
+    /// The staked pairing plus its chain view, when configured. The
+    /// height stream is not here: it is moved into the maintenance
+    /// task at spawn, since a stream is consumed, not shared.
+    pub(super) staked: Option<StakedState>,
+}
+
+/// What the actor holds for a staked pairing once the height stream
+/// has been split off into the maintenance task.
+pub(super) struct StakedState {
+    pub(super) channel: hellas_chain::staked::Channel,
+    pub(super) chain: Arc<dyn ChainView>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -207,6 +217,16 @@ impl Executor {
         };
         #[cfg(not(feature = "evaluate"))]
         let evaluate: Option<Box<dyn SchemeEngine>> = None;
+        // The stream is consumed, not shared: split it off the pairing
+        // so the actor keeps only what it can borrow repeatedly.
+        let (staked_state, staked_heights) = match config.staked {
+            Some(StakedProvider {
+                channel,
+                chain,
+                heights,
+            }) => (Some(StakedState { channel, chain }), Some(heights)),
+            None => (None, None),
+        };
         let executor = Self {
             rx,
             tx: tx.clone(),
@@ -221,31 +241,21 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
-            staked: config.staked,
+            staked: staked_state,
         };
         // A staked provider owes time-based work even when idle: an
-        // unbanked frontier is erased outright by the client's
-        // full-capacity timeout refund, and an abandoned job would hold
-        // the serialization lock. Every such deadline is a BLOCK
-        // HEIGHT, so the loop is woken by chain progress — no polling
+        // unbanked frontier is erased by the client's full-capacity
+        // timeout refund, and an abandoned job would hold the
+        // serialization lock. Every such deadline is a BLOCK HEIGHT, so
+        // the loop is woken by chain progress — never a polling
         // interval, which would be an invented constant with no defined
         // relationship to block production.
-        if let Some(staked) = executor.staked.as_ref() {
-            let heights = Arc::clone(&staked.heights);
+        if let Some(mut heights) = staked_heights {
             let ticks = tx.clone();
             tokio::spawn(async move {
-                let mut seen = hellas_kernel::BlockHeight::new(0);
-                loop {
-                    match heights.next_after(seen).await {
-                        Ok(height) => {
-                            seen = height;
-                            if ticks.send(ExecutorMessage::StakedHeight(height)).is_err() {
-                                return;
-                            }
-                        }
-                        // The feed owns its own reconnection, so an
-                        // error means it gave up — stop rather than spin.
-                        Err(_) => return,
+                while let Some(height) = heights.next().await {
+                    if ticks.send(ExecutorMessage::StakedHeight(height)).is_err() {
+                        return;
                     }
                 }
             });

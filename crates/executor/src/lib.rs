@@ -25,8 +25,8 @@ mod state;
 mod worker;
 
 pub use chain::{
-    ChainView, FakeChainView, FakeHeightFeed, FinalizationFeed, HeightFeed, StakedProvider,
-    acceptance_from_pb, acceptance_to_pb, kernel_signer,
+    ChainView, FakeChainView, HeightStream, StakedProvider, acceptance_from_pb, acceptance_to_pb,
+    finalization_heights, kernel_signer,
 };
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch_policy::{

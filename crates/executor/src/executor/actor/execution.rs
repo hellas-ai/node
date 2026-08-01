@@ -1269,13 +1269,16 @@ mod tests {
         provider: Arc<dyn FetchProvider>,
         chain: crate::FakeChainView,
     ) -> crate::ExecutorHandle {
-        spawn_staked_executor_feeding(provider, chain, crate::FakeHeightFeed::new()).await
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_staked_executor_feeding(provider, chain, rx).await
     }
 
+    /// Heights arrive on an ordinary channel — no bespoke feed type and
+    /// no timing, so the test drives chain progress exactly.
     async fn spawn_staked_executor_feeding(
         provider: Arc<dyn FetchProvider>,
         chain: crate::FakeChainView,
-        heights: crate::FakeHeightFeed,
+        heights: tokio::sync::mpsc::UnboundedReceiver<hellas_kernel::BlockHeight>,
     ) -> crate::ExecutorHandle {
         Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
@@ -1293,7 +1296,9 @@ mod tests {
             staked: Some(crate::StakedProvider {
                 channel: staked_channel_fixture(),
                 chain: Arc::new(chain),
-                heights: Arc::new(heights),
+                heights: Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                    heights,
+                )),
             }),
         })
         .await
@@ -1868,9 +1873,9 @@ mod tests {
         );
         let chain = crate::FakeChainView::new();
         chain.set_height(143);
-        let heights = crate::FakeHeightFeed::new();
+        let (heights, heights_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle =
-            spawn_staked_executor_feeding(Arc::new(provider), chain.clone(), heights.clone()).await;
+            spawn_staked_executor_feeding(Arc::new(provider), chain.clone(), heights_rx).await;
         let mut client_channel = staked_channel_fixture();
 
         let ticket = handle
@@ -1900,7 +1905,7 @@ mod tests {
 
         // No further requests arrive — only the chain moves.
         chain.set_height(146);
-        heights.publish(146);
+        heights.send(hellas_kernel::BlockHeight::new(146)).unwrap();
 
         for _ in 0..200 {
             if !chain.submitted().is_empty() {
@@ -1920,7 +1925,9 @@ mod tests {
         // one permitted closing touch into per-block L1 spam.
         for height in 147..152 {
             chain.set_height(height);
-            heights.publish(height);
+            heights
+                .send(hellas_kernel::BlockHeight::new(height))
+                .unwrap();
         }
         for _ in 0..200 {
             tokio::task::yield_now().await;
