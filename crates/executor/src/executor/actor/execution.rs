@@ -214,16 +214,17 @@ impl Executor {
     /// earnings, so a submission failure must not fail the client's
     /// settlement. It is logged and retried on the next due check.
     async fn bank_frontier_if_due(&mut self, now: hellas_kernel::BlockHeight) {
-        let Some(staked) = self.staked.as_ref() else {
-            return;
-        };
-        if !staked.channel.redemption_due(now) {
-            return;
-        }
         let signer = crate::kernel_signer(&self.provider.producer_key);
-        let Some(close) = staked.channel.redeem(&signer) else {
+        let Some(staked) = self.staked.as_mut() else {
             return;
         };
+        // Single-shot: `close_on_expiry` consumes the frontier, so the
+        // channel is closed once rather than on every block past the
+        // margin.
+        let Some(close) = staked.channel.close_on_expiry(now, &signer) else {
+            return;
+        };
+        let staked = self.staked.as_ref().expect("staked provider still present");
         if let Err(err) = staked
             .chain
             .submit(hellas_chain::domain::Transaction::Kernel(close))
@@ -231,7 +232,7 @@ impl Executor {
         {
             warn!(
                 chain_error = %err,
-                "failed to submit frontier redemption; will retry when next due"
+                "failed to submit the channel close; the frontier is spent"
             );
         }
     }
@@ -1911,6 +1912,23 @@ mod tests {
             chain.submitted().len(),
             1,
             "chain progress alone must bank the frontier",
+        );
+
+        // The channel closes exactly ONCE. Every further block is still
+        // past the margin, so a redemption that does not record itself
+        // would resubmit the same close on every height — turning the
+        // one permitted closing touch into per-block L1 spam.
+        for height in 147..152 {
+            chain.set_height(height);
+            heights.publish(height);
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            chain.submitted().len(),
+            1,
+            "the payment edge is closed once, not once per block",
         );
     }
 
