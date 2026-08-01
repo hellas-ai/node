@@ -294,7 +294,9 @@ let
       inherit name;
       runtimeInputs = [
         pkgs.coreutils
+        pkgs.diffutils
         pkgs.git
+        pkgs.jq
         pkgs.quint
       ]
       ++ lib.optionals needsJvm [ pkgs.temurin-bin ];
@@ -349,6 +351,52 @@ let
     crate = "chain";
   };
 
+  # Committed ITF traces are what the Rust replays read. If a model
+  # changes and the traces are not regenerated, the replay keeps
+  # asserting the OLD abstract behaviour and CI stays green — the
+  # correspondence silently becomes fiction. This check regenerates
+  # into a scratch tree and fails on any drift.
+  # Committed ITF traces are what the Rust replays read. If a model
+  # changes and the traces are not regenerated, the replay keeps
+  # asserting the OLD abstract behaviour and CI stays green — the
+  # correspondence silently becomes fiction. This regenerates into a
+  # scratch tree and fails on any drift.
+  #
+  # Compares semantic content only: quint stamps a wall-clock time into
+  # `#meta`, so a byte-wise diff could never pass.
+  freshnessCommand = crate: models: ''
+    repo_root="$(git rev-parse --show-toplevel)"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
+    committed="$repo_root/crates/${crate}/models/traces"
+    canon() {
+      for f in "$1"/*.itf.json; do
+        printf '== %s\n' "$(basename "$f")"
+        jq -S 'del(."#meta")' "$f"
+      done
+    }
+    canon "$committed" > "$scratch/committed.txt"
+    ${lib.concatMapStringsSep "\n" (m: ''
+      quint test models/${m}.qnt --out-itf "models/traces/${m}_{test}.itf.json" --verbosity=0
+    '') models}
+    canon "$committed" > "$scratch/regenerated.txt"
+    if ! diff -u "$scratch/committed.txt" "$scratch/regenerated.txt"; then
+      echo "ITF traces are stale: regenerate with 'nix run .#update-${crate}-model-fixtures'" >&2
+      exit 1
+    fi
+  '';
+
+  kernelFixtureFreshness = mkModelApp {
+    name = "hellas-kernel-fixture-freshness";
+    command = freshnessCommand "kernel" [ "l1" "l1_fees" "l1_stake" ];
+  };
+
+  chainFixtureFreshness = mkModelApp {
+    name = "hellas-chain-fixture-freshness";
+    command = freshnessCommand "chain" [ "staked_channel" ];
+    crate = "chain";
+  };
+
   modelFixtures = mkModelApp {
     name = "hellas-kernel-model-fixtures";
     command = fixtureCommand;
@@ -366,6 +414,8 @@ in
     kernel-model-run = modelRun;
     kernel-model-verify = modelVerify;
     chain-models = chainModelTest;
+    kernel-fixture-freshness = kernelFixtureFreshness;
+    chain-fixture-freshness = chainFixtureFreshness;
   };
 
   apps = {

@@ -577,6 +577,8 @@ impl Channel {
 const JOB_ACCEPTANCE_DOMAIN: &[u8] = b"hellas.staked.job_acceptance.v1";
 /// Domain separator for [`JobResultContext::digest`].
 const JOB_RESULT_DOMAIN: &[u8] = b"hellas.staked.job_result.v1";
+/// Domain separator for [`receipt_request_digest`].
+const RECEIPT_REQUEST_DOMAIN: &[u8] = b"hellas.staked.receipt_request.v1";
 /// Domain separator for [`FraudArtifact::seal`].
 const PREVERIFIED_SEAL_DOMAIN: &[u8] = b"hellas.staked.preverified_seal.v1";
 
@@ -737,6 +739,24 @@ impl FraudArtifact {
 /// only the output *sum* at open).
 fn paid_solely_to(outputs: &List<Payout, MAX_EDGE_OUTPUTS>, key: Key) -> bool {
     !outputs.as_slice().is_empty() && outputs.as_slice().iter().all(|p| p.owner() == key)
+}
+
+/// The payload a client signs to authorize a receipt for the job whose
+/// acceptance digest is `acceptance`.
+///
+/// Deliberately NOT the acceptance digest itself. The client's
+/// signature over that digest already travels on the wire inside the
+/// run ticket, so verifying it here would authenticate anyone who
+/// merely saw the ticket — a proxying gateway, or any peer on the
+/// path — which is exactly the party receipt authorization exists to
+/// exclude. Domain separation makes the receipt authorization
+/// unforgeable from anything the client has already published.
+#[must_use]
+pub fn receipt_request_digest(acceptance: PayloadHash) -> PayloadHash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.write(RECEIPT_REQUEST_DOMAIN);
+    acceptance.encode_to(&mut hasher);
+    PayloadHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// The stake-bond party convention: the maker funds the stake.

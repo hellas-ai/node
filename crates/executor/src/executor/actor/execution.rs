@@ -85,7 +85,7 @@ impl Executor {
         };
         // A job the client abandoned past its committed deadline must
         // not hold the lock against the next one.
-        self.release_abandoned_job(now);
+        self.release_abandoned_job(now).await;
         // Opportunistic redemption. `settle` succeeds only while
         // `now + close_margin < payment_timeout` and redemption is due
         // only at `>=`, so the two are exactly complementary — checking
@@ -129,10 +129,14 @@ impl Executor {
             request.client_signature.as_ref()
         })
         .map_err(ExecutorError::InvalidQuoteRequest)?;
+        // Verified over a DOMAIN-SEPARATED receipt digest, not the
+        // acceptance digest: the client's signature over the latter
+        // already travels on the wire in the run ticket, so accepting
+        // it here would authenticate any party that saw the ticket.
         if !hellas_kernel::Secp256k1Verifier::new().verify_sig(
             signature,
             staked.channel.client(),
-            digest,
+            hellas_chain::staked::receipt_request_digest(digest),
         ) {
             return Err(refuse("receipt is not authorized by the channel's client"));
         }
@@ -224,14 +228,39 @@ impl Executor {
     ///
     /// Safe to do unilaterally: the deadline is in the acceptance both
     /// parties signed, so the client computes the same release height.
-    fn release_abandoned_job(&mut self, now: hellas_kernel::BlockHeight) {
-        if let Some(staked) = self.staked.as_mut()
-            && let Some(job) = staked.channel.abandon(now)
-        {
+    ///
+    /// Guarded on the job having TERMINALLY COMPLETED. A deadline can
+    /// pass while the provider's own worker is still running — the
+    /// deadline bounds the client's wait, not the execution — and
+    /// releasing then would admit a second job while the first is still
+    /// in flight, breaking serialize-through-resolution and leaving the
+    /// finishing worker to resolve against a channel that has moved on.
+    /// The only other way to hold the lock without a completed
+    /// transcript is a dispatch or runtime failure, and
+    /// `resolve_staked_failure` has already released those.
+    async fn release_abandoned_job(&mut self, now: hellas_kernel::BlockHeight) {
+        let Some(staked) = self.staked.as_ref() else {
+            return;
+        };
+        let Some(job) = staked.channel.active().copied() else {
+            return;
+        };
+        if now.get() <= job.terminal_deadline.get() {
+            return;
+        }
+        if self.terminal_commitment(job.request).await.is_err() {
+            // Still executing: the deadline lapsed but the work has not
+            // resolved. Holding the lock is correct here.
+            return;
+        }
+        let Some(staked) = self.staked.as_mut() else {
+            return;
+        };
+        if let Some(released) = staked.channel.abandon(now) {
             warn!(
-                sequence = job.sequence,
-                deadline = job.terminal_deadline.get(),
-                "released a job abandoned past its terminal deadline"
+                sequence = released.sequence,
+                deadline = released.terminal_deadline.get(),
+                "released a completed job abandoned past its terminal deadline"
             );
         }
     }
@@ -1254,7 +1283,8 @@ mod tests {
         hellas_rpc::pb::execute::ReceiptRequest {
             acceptance_digest: digest.as_bytes().to_vec(),
             client_signature: Some(crate::chain::sig_to_pb(
-                crate::kernel_signer(&client_key()).sign(digest),
+                crate::kernel_signer(&client_key())
+                    .sign(hellas_chain::staked::receipt_request_digest(digest)),
             )),
         }
     }
@@ -1618,6 +1648,27 @@ mod tests {
         let outcome = handle.run_ticket_handle(admitted).await.unwrap();
         let (_chunks, _finished) = drain_outcome(outcome.events).await;
         let digest = job.digest();
+
+        // THE REPLAY CASE. The client's signature over the acceptance
+        // digest travels on the wire inside the run ticket, so any
+        // party that saw the ticket holds it verbatim. It must not
+        // authorize a receipt — otherwise the auth excludes nobody.
+        let replayed = handle
+            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
+                acceptance_digest: digest.as_bytes().to_vec(),
+                client_signature: Some(crate::chain::sig_to_pb(
+                    crate::kernel_signer(&client_key()).sign(digest),
+                )),
+            })
+            .await;
+        assert!(
+            matches!(
+                replayed,
+                Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                    if msg.contains("not authorized by the channel's client")
+            ),
+            "the admission signature must not authorize a receipt, got {replayed:?}",
+        );
 
         // An observer who knows the digest but cannot sign as the
         // client — here the provider itself — is refused.
