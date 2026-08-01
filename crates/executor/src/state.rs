@@ -272,9 +272,7 @@ fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>
 
 #[cfg(feature = "evaluate")]
 fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
-    bytes.try_into().map_err(|_| {
-        ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
-    })
+    crate::chain::fixed(field, bytes).map_err(ExecutorError::InvalidQuoteRequest)
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

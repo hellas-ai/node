@@ -749,9 +749,9 @@ fn parse_runner_public_key(key: Option<PbPublicKey>) -> Result<PublicKey, Execut
 }
 
 fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {
-    Digest::from_slice(bytes).map_err(|_| {
-        ExecutorError::InvalidQuoteRequest(format!("{field} must be 32 bytes, got {}", bytes.len()))
-    })
+    crate::chain::fixed::<32>(field, bytes)
+        .map(Digest::from_bytes)
+        .map_err(ExecutorError::InvalidQuoteRequest)
 }
 
 fn load_assets(
