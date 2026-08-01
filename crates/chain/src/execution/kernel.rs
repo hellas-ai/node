@@ -1,6 +1,7 @@
 use super::{store::UtxoDatabase, verifier::ChainVerifier, working_set::BlockWorkingSet};
 use crate::domain::{
-    Address, Coin, MAX_STAKED_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey,
+    MergeInputFault, merge_input_fault,
+    Address, Coin, MAX_EDGE_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey,
     Transaction, coin_object_id, edge_object_id, genesis_object_id, output_object_id,
 };
 use commonware_codec::{Encode, EncodeSize};
@@ -52,7 +53,7 @@ pub enum ExecutionError {
     #[error("staked open rejected: the wired verifier cannot verify any dispute seal")]
     StakedOpenUnsupported,
     #[error("staked open lifetime {blocks} blocks exceeds the consensus cap {max}")]
-    StakedLifetimeExceeded { blocks: u64, max: u64 },
+    EdgeLifetimeExceeded { blocks: u64, max: u64 },
 }
 
 impl ExecutionError {
@@ -301,16 +302,15 @@ where
             Ok(batches)
         }
         Transaction::MergeCoin { inputs, .. } => {
-            if inputs.len() < 2 {
-                return Err((batches, ExecutionError::TooFewMergeInputs));
-            }
-            for pair in inputs.as_slice().windows(2) {
-                if pair[0] == pair[1] {
-                    return Err((batches, ExecutionError::DuplicateInput { id: pair[0] }));
-                }
-                if pair[0] > pair[1] {
-                    return Err((batches, ExecutionError::NonCanonicalMergeInputs));
-                }
+            if let Some(fault) = merge_input_fault(inputs.as_slice()) {
+                return Err((
+                    batches,
+                    match fault {
+                        MergeInputFault::TooFew => ExecutionError::TooFewMergeInputs,
+                        MergeInputFault::Duplicate(id) => ExecutionError::DuplicateInput { id },
+                        MergeInputFault::NonCanonical => ExecutionError::NonCanonicalMergeInputs,
+                    },
+                ));
             }
 
             let mut owner: Option<SettlementKey> = None;
@@ -545,10 +545,29 @@ where
 /// opens are refused unless the wired verifier admits them; admitted
 /// bonds must still commit a bounded lifetime, because lifetime fees are
 /// zero and a distant timeout would be operationally permanent.
-fn check_staked_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionError> {
+fn check_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionError> {
     let KernelTx::Open { terms, .. } = tx else {
         return Ok(());
     };
+    // The kernel already prices lifetime: `open_lifetime_fee` charges
+    // `fees.lifetime * blocks` against funding and rejects an open that
+    // cannot pay for the span it commits. `KERNEL_FEES` is `Fees::ZERO`,
+    // so that bound currently charges nothing and bounds nothing, and
+    // consensus caps the span directly instead.
+    //
+    // The cap applies to EVERY open, not just bonds: a `u64::MAX`
+    // timeout on a basic edge is exactly as permanent as one on a
+    // stake bond, and locks its funding just as long.
+    let blocks = terms
+        .timeout()
+        .get()
+        .saturating_sub(context.block_height().get());
+    if blocks > MAX_EDGE_LIFETIME_BLOCKS {
+        return Err(ExecutionError::EdgeLifetimeExceeded {
+            blocks,
+            max: MAX_EDGE_LIFETIME_BLOCKS,
+        });
+    }
     if terms.as_stake_bond().is_none() {
         return Ok(());
     }
@@ -558,16 +577,6 @@ fn check_staked_open(context: KernelContext, tx: &KernelTx) -> Result<(), Execut
     // the same cfg that supplies it (`ChainVerifier::verify_seal`).
     if !cfg!(feature = "preverified-seals") {
         return Err(ExecutionError::StakedOpenUnsupported);
-    }
-    let blocks = terms
-        .timeout()
-        .get()
-        .saturating_sub(context.block_height().get());
-    if blocks > MAX_STAKED_LIFETIME_BLOCKS {
-        return Err(ExecutionError::StakedLifetimeExceeded {
-            blocks,
-            max: MAX_STAKED_LIFETIME_BLOCKS,
-        });
     }
     Ok(())
 }
@@ -581,7 +590,7 @@ async fn apply_kernel_transaction<E>(
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
 {
-    if let Err(err) = check_staked_open(context, tx) {
+    if let Err(err) = check_open(context, tx) {
         return Err((batches, err));
     }
     let working = match load_kernel_slots(&batches, tx).await {
@@ -1045,6 +1054,67 @@ mod tests {
         });
     }
 
+    /// The lifetime cap covers every open, not just stake bonds.
+    ///
+    /// It once sat behind the `as_stake_bond()` early return, so a
+    /// basic edge could commit a `u64::MAX` timeout — permanent under
+    /// exactly the justification the cap exists for, since zero
+    /// lifetime fees price the span at nothing either way.
+    #[test]
+    fn basic_opens_are_bounded_by_the_lifetime_cap() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
+            MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
+            Payout as KernelPayout, ProtocolCode, Sig, Terms as KernelTerms,
+        };
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "basic_lifetime_cap").await;
+            let batches = database.new_batches().await;
+            let basic_open = |timeout: u64| {
+                let terms = KernelTerms::basic(
+                    ProtocolCode::new(1),
+                    Parties::new(
+                        KernelKey::from_bytes([2; KernelKey::LENGTH]),
+                        KernelKey::from_bytes([3; KernelKey::LENGTH]),
+                    ),
+                    KernelHeight::new(timeout),
+                    List::take([KernelPayout::default(); OUTPUTS], 0),
+                );
+                let zero = CoinId::from_bytes([0; CoinId::LENGTH]);
+                let empty = List::take([zero; INPUTS], 0);
+                let garbage = Auth::native(Sig::from_bytes([0; 64]));
+                Transaction::Kernel(KernelTx::open(
+                    Funding::new(empty.clone(), empty),
+                    terms,
+                    garbage.clone(),
+                    garbage,
+                ))
+            };
+            let over = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
+            let (batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &basic_open(over))
+                    .await
+                    .err()
+                    .expect("an unbounded basic open is refused");
+            assert_eq!(
+                error,
+                ExecutionError::EdgeLifetimeExceeded {
+                    blocks: crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1,
+                    max: crate::domain::MAX_EDGE_LIFETIME_BLOCKS,
+                }
+            );
+
+            // In-cap, the gate falls through to ordinary kernel
+            // validation — proof the cap is what refused the first one.
+            let (_batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &basic_open(50))
+                    .await
+                    .err()
+                    .expect("kernel still validates admitted opens");
+            assert!(matches!(error, ExecutionError::KernelApply { .. }));
+        });
+    }
+
     #[test]
     fn staked_opens_are_gated_at_consensus_execution() {
         use hellas_kernel::{
@@ -1120,7 +1190,7 @@ mod tests {
             #[cfg(feature = "preverified-seals")]
             {
             let admitting = ChainVerifier::new();
-            let over_cap = 1 + crate::domain::MAX_STAKED_LIFETIME_BLOCKS + 1;
+            let over_cap = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
             let (batches, error) =
                 apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
                     .await
@@ -1128,9 +1198,9 @@ mod tests {
                     .expect("over-cap staked open refused");
             assert_eq!(
                 error,
-                ExecutionError::StakedLifetimeExceeded {
-                    blocks: crate::domain::MAX_STAKED_LIFETIME_BLOCKS + 1,
-                    max: crate::domain::MAX_STAKED_LIFETIME_BLOCKS,
+                ExecutionError::EdgeLifetimeExceeded {
+                    blocks: crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1,
+                    max: crate::domain::MAX_EDGE_LIFETIME_BLOCKS,
                 }
             );
 
