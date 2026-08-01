@@ -3,7 +3,7 @@
 use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use crate::{
     app::Mempool,
-    execution::store::{UtxoDatabase, root as utxo_root},
+    execution::store::UtxoDatabase,
     indexer::ChainIndexer,
     light_client::{
         ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock, FinalizedBlockQuery,
@@ -130,7 +130,7 @@ async fn get_coin_at(
 
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
-        Ok(Some(utxo_root(&self.databases).await))
+        Ok(Some(self.databases.read().await.root()))
     }
 
     async fn get_proof(&self, object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
