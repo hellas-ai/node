@@ -11,7 +11,6 @@
 
 use core::pin::Pin;
 use futures_core::Stream;
-use futures_util::StreamExt as _;
 use hellas_chain::domain::{ObjectId, Transaction};
 use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
@@ -20,7 +19,6 @@ use hellas_kernel::{
     TermsHash,
 };
 use hellas_rpc::ProducerSigningKey;
-use hellas_rpc::pb::chain::ActivityEventKind;
 use hellas_rpc::pb::execute::{
     JobAcceptance, ReceiptResponse, SettleRequest, Signature as PbSignature, signature,
 };
@@ -48,28 +46,6 @@ pub struct StakedProvider {
     pub chain: Arc<dyn ChainView>,
     /// Finalized heights. Consumed by the maintenance task at spawn.
     pub heights: HeightStream,
-}
-
-/// Adapts a light client's finalization subscription into a height
-/// stream: the event says something finalized, the height comes from
-/// the chain — the same shape `chain::follower` uses.
-///
-/// # Errors
-///
-/// Returns the subscription error if the stream cannot be opened.
-pub async fn finalization_heights(
-    client: hellas_chain::client::RemoteLightClient,
-) -> Result<HeightStream, QueryError> {
-    let stream = client
-        .subscribe_activity(vec![ActivityEventKind::Finalization])
-        .await?;
-    Ok(Box::pin(stream.filter_map(move |event| {
-        let client = client.clone();
-        async move {
-            event.ok()?;
-            client.finalized_height().await.ok().flatten()
-        }
-    })))
 }
 
 /// Encodes a kernel signature as its wire form.

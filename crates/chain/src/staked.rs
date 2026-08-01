@@ -196,7 +196,6 @@ pub struct Channel {
     bond: Terms,
     payment_edge: EdgeId,
     payment: Terms,
-    close_margin: u64,
     frontier: Option<MakerVoucher>,
     active: Option<JobAcceptanceContext>,
     sequence: u64,
@@ -208,7 +207,6 @@ impl Channel {
     /// Returns `None` unless the bond terms are stake-bond shaped, the
     /// payment terms are basic shaped, the parties mirror (bond maker =
     /// payment taker = provider; bond taker = payment maker = client),
-    /// `close_margin` leaves the provider at least one block to redeem,
     /// and — the routing the kernel does *not* pin at open — each edge's
     /// timeout outputs pay the right party: the payment refund goes
     /// wholly to the client, the bond's stake-return wholly to the
@@ -221,10 +219,9 @@ impl Channel {
         bond: Terms,
         payment_edge: EdgeId,
         payment: Terms,
-        close_margin: u64,
     ) -> Option<Self> {
         let policy = bond.as_stake_bond()?;
-        if payment.as_stake_bond().is_some() || close_margin == 0 {
+        if payment.as_stake_bond().is_some() {
             return None;
         }
         let provider = provider_key(&policy.parties);
@@ -243,7 +240,6 @@ impl Channel {
             bond,
             payment_edge,
             payment,
-            close_margin,
             frontier: None,
             active: None,
             sequence: 0,
@@ -263,6 +259,25 @@ impl Channel {
     }
 
     /// The bond's committed policy. The constructor guarantees the shape.
+    /// Blocks the provider must reserve to get a close transaction
+    /// finalized before the payment timeout.
+    ///
+    /// Read from the bond's committed `challenge_margin` rather than
+    /// chosen per-party: it is a margin of the same kind on the same
+    /// clock — inclusion plus finality — and it is the only such value
+    /// both sides can agree on without another handshake. A
+    /// constructor argument here would let two parties run divergent
+    /// admission gates, so the client admits a job the provider
+    /// refuses, with no on-chain fact to arbitrate. Consensus already
+    /// rejects a zero `challenge_margin` at open, so this is non-zero
+    /// for any bond that exists. Reserving the full challenge window is
+    /// deliberately conservative: a channel that close to expiry has no
+    /// remaining useful life anyway.
+    #[must_use]
+    pub fn close_margin(&self) -> u64 {
+        self.bond_policy().challenge_margin
+    }
+
     #[must_use]
     pub fn bond_policy(&self) -> &StakeBondTerms {
         self.bond
@@ -373,7 +388,7 @@ impl Channel {
         let redeemable = job
             .terminal_deadline
             .get()
-            .checked_add(self.close_margin)
+            .checked_add(self.close_margin())
             .is_some_and(|end| end < self.payment.timeout().get());
         if !redeemable {
             return Err(AdmitError::RedemptionMarginExceeded);
@@ -438,7 +453,7 @@ impl Channel {
         self.frontier.is_some()
             && now
                 .get()
-                .checked_add(self.close_margin)
+                .checked_add(self.close_margin())
                 .is_none_or(|end| end >= self.payment.timeout().get())
     }
 
@@ -510,7 +525,7 @@ impl Channel {
         };
         let redeemable = now
             .get()
-            .checked_add(self.close_margin)
+            .checked_add(self.close_margin())
             .is_some_and(|end| end < self.payment.timeout().get());
         if !redeemable {
             return Err(SettleError::TooLateToRedeem);
@@ -629,6 +644,15 @@ pub struct JobAcceptanceContext {
     pub price: u64,
     /// Height by which the provider's terminal output must land. Must
     /// leave the challenge window + margins before the bond timeout.
+    ///
+    /// A NEGOTIATED term, deliberately unbounded above by the protocol.
+    /// The client proposes it and the provider only admits by
+    /// co-signing, so a provider that dislikes a far-future deadline
+    /// simply refuses — a party that habitually proposes absurd ones
+    /// finds nobody will sign with it. A protocol-level maximum would
+    /// be an invented constant solving a problem the handshake already
+    /// solves; a provider wanting its own horizon cap imposes it in its
+    /// admission policy, which is what [`Channel::admit`] is.
     pub terminal_deadline: BlockHeight,
 }
 
@@ -852,7 +876,6 @@ mod channel_tests {
     const AWARD: u64 = 700;
     const BOND_TIMEOUT: u64 = 200;
     const PAYMENT_TIMEOUT: u64 = 150;
-    const CLOSE_MARGIN: u64 = 5;
     const CHALLENGE_MARGIN: u64 = 20;
 
     fn signer(seed: u8) -> Secp256k1Signer {
@@ -919,7 +942,6 @@ mod channel_tests {
             bond_terms(),
             payment_edge(),
             payment(),
-            CLOSE_MARGIN,
         ) else {
             panic!("mirrored pairing constructs");
         };
@@ -978,16 +1000,17 @@ mod channel_tests {
         // 180 + 20 = 200 == bond timeout: the challenge cannot land.
         let stalled = job(&channel, 400, 180);
         assert_eq!(channel.admit(now(), stalled), Err(AdmitError::Uncovered));
-        // 145 + 5 = 150 == payment timeout: the frontier could be
+        // 130 + 20 = 150 == payment timeout: the frontier could be
         // stranded behind the client's unilateral refund.
-        let stranded = job(&channel, 400, 145);
+        let stranded = job(&channel, 400, 130);
         assert_eq!(
             channel.admit(now(), stranded),
             Err(AdmitError::RedemptionMarginExceeded),
         );
-        // 144 + 5 = 149 < 150 and 144 + 20 = 164 < 200: the last
-        // admissible deadline under both margins.
-        let last = job(&channel, 400, 144);
+        // 129 + 20 = 149 < 150: the last admissible deadline. One
+        // committed margin now governs both sides, and the shorter
+        // payment timeout makes it bind first.
+        let last = job(&channel, 400, 129);
         assert_eq!(channel.admit(now(), last), Ok(()));
     }
 
@@ -1190,13 +1213,13 @@ mod channel_tests {
         ) else {
             panic!("voucher issues");
         };
-        // 145 + 5 = 150 == payment timeout: no block left to redeem.
+        // 130 + 20 = 150 == payment timeout: no block left to redeem.
         assert_eq!(
-            theirs.settle(BlockHeight::new(145), voucher.clone()),
+            theirs.settle(BlockHeight::new(130), voucher.clone()),
             Err(SettleError::TooLateToRedeem),
         );
-        // 144 + 5 = 149 < 150: the last height a settlement still fits.
-        assert_eq!(theirs.settle(BlockHeight::new(144), voucher), Ok(()));
+        // 129 + 20 = 149 < 150: the last height a settlement still fits.
+        assert_eq!(theirs.settle(BlockHeight::new(129), voucher), Ok(()));
     }
 
     #[test]
@@ -1246,19 +1269,17 @@ mod channel_tests {
         });
         let cases = [
             // Parties do not mirror across the two edges.
-            (bond_terms(), unmirrored, CLOSE_MARGIN),
+            (bond_terms(), unmirrored),
             // A bond that is not a bond.
-            (payment(), payment(), CLOSE_MARGIN),
+            (payment(), payment()),
             // A payment edge that is a bond.
-            (bond_terms(), bond_terms(), CLOSE_MARGIN),
-            // A zero close margin could never redeem.
-            (bond_terms(), payment(), 0),
+            (bond_terms(), bond_terms()),
             // Timeout outputs routed to the wrong party.
-            (bond_terms(), misrouted_payment, CLOSE_MARGIN),
-            (drained_bond, payment(), CLOSE_MARGIN),
+            (bond_terms(), misrouted_payment),
+            (drained_bond, payment()),
         ];
-        for (bond, payment, margin) in cases {
-            assert!(Channel::new(bond_edge(), bond, payment_edge(), payment, margin).is_none());
+        for (bond, payment) in cases {
+            assert!(Channel::new(bond_edge(), bond, payment_edge(), payment).is_none());
         }
     }
 }
@@ -1612,9 +1633,11 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("opens merkleize");
             database.finalize(merkleized).await;
 
-            let mut mine = Channel::new(bond_edge, bond.clone(), payment_edge, terms.clone(), 5)
+            let mut mine = Channel::new(bond_edge, bond.clone(), payment_edge, terms.clone()
+)
                 .expect("mirrored pairing constructs the client channel");
-            let mut theirs = Channel::new(bond_edge, bond, payment_edge, terms.clone(), 5)
+            let mut theirs = Channel::new(bond_edge, bond, payment_edge, terms.clone()
+)
                 .expect("mirrored pairing constructs the provider channel");
 
             // Two honest jobs: E = 800, then E = 1_550. Both sides run

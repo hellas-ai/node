@@ -31,7 +31,6 @@ module staked_channel {
   pure val MaxJobPrice = 500
   pure val BondTimeout = 200
   pure val PaymentTimeout = 150
-  pure val CloseMargin = 5
   pure val ChallengeMargin = 20
 
   // Job shapes the model explores. Each names one admission outcome
@@ -67,13 +66,14 @@ module staked_channel {
       | _ => 400
     }
 
-  // 144 is the last deadline satisfying BOTH margins:
-  // 144 + 20 = 164 < 200 and 144 + 5 = 149 < 150.
+  // One committed margin governs both sides (the bond's
+  // ChallengeMargin), so the shorter payment timeout binds first:
+  // 129 + 20 = 149 < 150, while 129 + 20 = 149 < 200 on the bond side.
   pure def deadlineOf(s: JobShape): int =
     match s {
       | DeadlineStale => 10
       | DeadlinePastBond => 180
-      | DeadlinePastRedeem => 145
+      | DeadlinePastRedeem => 130
       | _ => 60
     }
 
@@ -133,7 +133,7 @@ module staked_channel {
     price >= 1 and price <= MaxJobPrice and deadline + ChallengeMargin < BondTimeout
 
   pure def redeemable(deadline: int): bool =
-    deadline + CloseMargin < PaymentTimeout
+    deadline + ChallengeMargin < PaymentTimeout
 
   def admitOutcome(s: JobShape): AdmitOutcome =
     val price = priceOf(s)
@@ -149,7 +149,7 @@ module staked_channel {
 
   def settleOutcome(frontier: int): SettleOutcome =
     if (not(activeJob)) NoActiveJob
-    else if (height + CloseMargin >= PaymentTimeout) TooLateToRedeem
+    else if (height + ChallengeMargin >= PaymentTimeout) TooLateToRedeem
     else if (frontier != cumulative + activePrice) WrongFrontier
     else Settled
 
@@ -226,16 +226,16 @@ module staked_channel {
   }
 
   // The chain advances while the parties wait. Without a jump the
-  // late-settle window (height >= PaymentTimeout - CloseMargin) is
+  // late-settle window (height >= PaymentTimeout - ChallengeMargin) is
   // unreachable in a bounded trace, which is how `TooLateToRedeem`
   // came to be a `SettleOutcome` no trace could produce.
   action jumpPastRedemptionMargin = all {
-    height < PaymentTimeout - CloseMargin,
+    height < PaymentTimeout - ChallengeMargin,
     cumulative' = cumulative,
     sequence' = sequence,
     activeJob' = activeJob,
     activePrice' = activePrice,
-    height' = PaymentTimeout - CloseMargin,
+    height' = PaymentTimeout - ChallengeMargin,
     lastInput' = TickInput,
     lastAdmit' = lastAdmit,
     lastSettle' = lastSettle,
