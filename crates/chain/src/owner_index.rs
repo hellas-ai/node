@@ -184,7 +184,6 @@ struct State {
     by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
     edges: BTreeMap<ObjectId, IndexedEdge>,
     edges_by_owner: BTreeMap<SettlementKey, BTreeSet<ObjectId>>,
-    kinds: BTreeMap<ObjectId, ObjectKind>,
 }
 
 impl State {
@@ -200,7 +199,23 @@ impl State {
             by_owner: BTreeMap::new(),
             edges: BTreeMap::new(),
             edges_by_owner: BTreeMap::new(),
-            kinds: BTreeMap::new(),
+        }
+    }
+
+    /// The kind of object `id` names, if this index holds one.
+    ///
+    /// Derived rather than stored. `coins` and `edges` are disjoint by
+    /// construction — every insert refuses an id either map already
+    /// holds — so the pair of maps *is* the kind table. A third map
+    /// maintained alongside them adds no information and one more way
+    /// for the three to fall out of step.
+    fn kind_of(&self, id: &ObjectId) -> Option<ObjectKind> {
+        if self.coins.contains_key(id) {
+            Some(ObjectKind::Coin)
+        } else if self.edges.contains_key(id) {
+            Some(ObjectKind::Edge)
+        } else {
+            None
         }
     }
 
@@ -208,7 +223,7 @@ impl State {
         if let Some(coin) = self.coins.get(id) {
             return Ok(Some(*coin));
         }
-        match self.kinds.get(id).copied() {
+        match self.kind_of(id) {
             Some(actual @ ObjectKind::Edge) => Err(OwnerIndexError::WrongObjectKind {
                 id: *id,
                 expected: ObjectKind::Coin,
@@ -281,7 +296,7 @@ impl State {
         match tx {
             hellas_kernel::Tx::Open { funding, terms, .. } => {
                 let edge_id = edge_object_id(hellas_kernel::Tx::edge_id_of(funding, terms));
-                if self.kinds.contains_key(&edge_id) {
+                if self.kind_of(&edge_id).is_some() {
                     return Err(OwnerIndexError::OutputCollision { id: edge_id });
                 }
                 for id in funding.maker().iter().chain(funding.taker()) {
@@ -337,14 +352,14 @@ impl State {
 
         let tx_digest = Sha256::hash(&tx.encode());
         let recipient_id = output_object_id(&tx_digest, 0);
-        if self.kinds.contains_key(&recipient_id) {
+        if self.kind_of(&recipient_id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id: recipient_id });
         }
 
         let change_value = coin.value - amount;
         let change_id = if change_value > 0 {
             let id = output_object_id(&tx_digest, 1);
-            if self.kinds.contains_key(&id) || id == recipient_id {
+            if self.kind_of(&id).is_some() || id == recipient_id {
                 return Err(OwnerIndexError::OutputCollision { id });
             }
             Some(id)
@@ -413,7 +428,7 @@ impl State {
 
         let tx_digest = Sha256::hash(&tx.encode());
         let output_id = output_object_id(&tx_digest, 0);
-        if self.kinds.contains_key(&output_id) {
+        if self.kind_of(&output_id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id: output_id });
         }
 
@@ -431,7 +446,7 @@ impl State {
     }
 
     fn insert_coin(&mut self, id: ObjectId, coin: Coin) -> Result<(), OwnerIndexError> {
-        if self.kinds.contains_key(&id) {
+        if self.kind_of(&id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id });
         }
         self.by_owner
@@ -439,7 +454,6 @@ impl State {
             .or_default()
             .insert(id, coin.value);
         self.coins.insert(id, coin);
-        self.kinds.insert(id, ObjectKind::Coin);
         Ok(())
     }
 
@@ -459,12 +473,11 @@ impl State {
         if remove_owner {
             self.by_owner.remove(&coin.owner);
         }
-        self.kinds.remove(id);
         Ok(coin)
     }
 
     fn insert_edge(&mut self, id: ObjectId, edge: IndexedEdge) -> Result<(), OwnerIndexError> {
-        if self.kinds.contains_key(&id) {
+        if self.kind_of(&id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id });
         }
         self.edges_by_owner
@@ -476,7 +489,6 @@ impl State {
             .or_default()
             .insert(id);
         self.edges.insert(id, edge);
-        self.kinds.insert(id, ObjectKind::Edge);
         Ok(())
     }
 
@@ -484,7 +496,7 @@ impl State {
         let edge = match self.edges.remove(id) {
             Some(edge) => edge,
             None => {
-                return match self.kinds.get(id).copied() {
+                return match self.kind_of(id) {
                     Some(actual @ ObjectKind::Coin) => Err(OwnerIndexError::WrongObjectKind {
                         id: *id,
                         expected: ObjectKind::Edge,
@@ -515,7 +527,6 @@ impl State {
                 self.edges_by_owner.remove(&owner);
             }
         }
-        self.kinds.remove(id);
         Ok(edge)
     }
 }

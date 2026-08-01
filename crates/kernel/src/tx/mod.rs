@@ -106,6 +106,22 @@ impl Tx {
         }
     }
 
+    /// Creates the unilateral timeout close of `edge` under `terms`:
+    /// a `Timeout` proof paying the terms' own committed
+    /// `timeout_outputs`.
+    ///
+    /// The only close whose payload is fixed at open, so it is the one
+    /// close that needs no negotiation and no signature — either party
+    /// may submit it once the committed height has passed.
+    #[must_use]
+    pub fn timeout_close(edge: EdgeId, terms: &Terms) -> Self {
+        Self::close(
+            edge,
+            Proof::timeout(terms.clone()),
+            terms.timeout_outputs().clone(),
+        )
+    }
+
     /// Predicts the edge id that [`Tx::open`] would produce for `funding` and
     /// `terms`.
     ///

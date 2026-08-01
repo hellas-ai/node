@@ -579,22 +579,14 @@ impl Channel {
     /// edge into its committed full-refund outputs.
     #[must_use]
     pub fn payment_timeout_close(&self) -> KernelTx {
-        KernelTx::close(
-            self.payment_edge,
-            Proof::timeout(self.payment.clone()),
-            self.payment.timeout_outputs().clone(),
-        )
+        KernelTx::timeout_close(self.payment_edge, &self.payment)
     }
 
     /// The provider's clean epoch end: a `Timeout` close of the bond
     /// into its committed stake-return outputs.
     #[must_use]
     pub fn bond_timeout_close(&self) -> KernelTx {
-        KernelTx::close(
-            self.bond_edge,
-            Proof::timeout(self.bond.clone()),
-            self.bond.timeout_outputs().clone(),
-        )
+        KernelTx::timeout_close(self.bond_edge, &self.bond)
     }
 
     /// The client's fraud exit: a `Violation` close of the bond under
@@ -1130,28 +1122,57 @@ mod channel_tests {
     // counterparty.
     #[test]
     fn a_vanished_provider_cannot_stop_the_clients_timeout_refund() {
-        let channel = channel();
+        let KernelTx::Close {
+            input,
+            proof,
+            outputs,
+        } = channel().payment_timeout_close()
+        else {
+            panic!("the timeout refund is a close");
+        };
+        assert_eq!(input, payment_edge());
+        assert!(
+            matches!(proof, Proof::Timeout { .. }),
+            "a Timeout proof carries no counterparty authorization, so a \
+             vanished provider cannot withhold one",
+        );
+        let paid = outputs.as_slice();
+        assert!(!paid.is_empty());
+        assert!(
+            paid.iter().all(|p| p.owner() == client().party_key()),
+            "every timeout payout goes to the client",
+        );
         assert_eq!(
-            channel.payment_timeout_close(),
-            KernelTx::close(
-                payment_edge(),
-                Proof::timeout(payment()),
-                payment().timeout_outputs().clone(),
-            ),
+            paid.iter().map(|p| p.value()).sum::<u64>(),
+            CAPACITY,
+            "the client is refunded the full capacity",
         );
     }
 
     // Scenario 7: the clean epoch end returns the stake.
     #[test]
     fn a_clean_epoch_end_returns_the_stake_to_the_provider() {
-        let channel = channel();
+        let KernelTx::Close {
+            input,
+            proof,
+            outputs,
+        } = channel().bond_timeout_close()
+        else {
+            panic!("the stake return is a close");
+        };
+        assert_eq!(input, bond_edge());
+        assert!(matches!(proof, Proof::Timeout { .. }));
+        let paid = outputs.as_slice();
+        assert!(!paid.is_empty());
+        assert!(
+            paid.iter().all(|p| p.owner() == provider().party_key()),
+            "an unchallenged bond returns the stake to the provider, never \
+             the client or the treasury",
+        );
         assert_eq!(
-            channel.bond_timeout_close(),
-            KernelTx::close(
-                bond_edge(),
-                Proof::timeout(bond_terms()),
-                bond_terms().timeout_outputs().clone(),
-            ),
+            paid.iter().map(|p| p.value()).sum::<u64>(),
+            STAKE,
+            "the whole stake comes back",
         );
     }
 
