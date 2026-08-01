@@ -19,14 +19,6 @@ pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
-#[cfg(feature = "validator")]
-pub async fn root<E>(database: &UtxoDatabase<E>) -> Digest
-where
-    E: Storage + Clock + Metrics + 'static,
-{
-    database.read().await.root()
-}
-
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
 

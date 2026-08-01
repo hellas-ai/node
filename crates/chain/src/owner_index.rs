@@ -99,11 +99,9 @@ impl OwnerIndex {
         self.inner.read().expect("owner index lock poisoned").cursor
     }
 
-    pub fn get_coin(&self, object_id: &ObjectId) -> Result<Option<Coin>, OwnerIndexError> {
-        self.inner
-            .read()
-            .expect("owner index lock poisoned")
-            .get_coin(object_id)
+    #[cfg(test)]
+    pub(crate) fn get_coin(&self, object_id: &ObjectId) -> Result<Option<Coin>, OwnerIndexError> {
+        self.get_coin_snapshot(object_id).1
     }
 
     pub fn get_coin_snapshot(
@@ -134,14 +132,9 @@ impl OwnerIndex {
         (state.cursor, edges)
     }
 
-    pub fn get_coins_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, u64)> {
-        self.inner
-            .read()
-            .expect("owner index lock poisoned")
-            .by_owner
-            .get(owner)
-            .map(|coins| coins.iter().map(|(id, value)| (*id, *value)).collect())
-            .unwrap_or_default()
+    #[cfg(test)]
+    pub(crate) fn get_coins_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, u64)> {
+        self.get_coins_by_owner_snapshot(owner).1
     }
 
     pub fn get_coins_by_owner_snapshot(
