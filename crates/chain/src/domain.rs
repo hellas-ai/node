@@ -1388,6 +1388,20 @@ mod tests {
         assert!(Transaction::decode(encoded).is_err());
     }
 
+    /// Renders bytes for the golden-vector comparisons below.
+    ///
+    /// Local rather than `hex::encode`: `hex` arrives with the
+    /// `indexer` feature, but this module compiles under `domain`
+    /// alone, so reaching for it made `--features domain` fail to
+    /// build its own tests.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            use core::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    }
+
     #[test]
     fn transaction_codec_rejects_unknown_tag() {
         assert!(Transaction::decode([0xff].as_slice()).is_err());
@@ -1398,7 +1412,7 @@ mod tests {
         let key = secp256r1_key_from_seed(1);
         let (_, tx) = sample_transfer(&key);
         assert_eq!(
-            hex::encode(tx.encode()),
+            hex(&tx.encode()),
             "00070707070707070707070707070707070707070707070707070707070707070703e57aa4ea4cd5ed2c6e5b23a5c9895b2ef185df9a63876b948e53179a90727870000000000000000521cf7b0e78dd070f5f3544058cf2b38ea7c2aa724b94d1619ba6123c59c7caa71e37e39da015281fe180e026fefdbafb9bd622d488bdd73659991f0b2afd665325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a226d525768386b6537576541564962714e5171777a2d486771462d554c5a6575697a756c7078584653453541222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
         );
     }
@@ -1439,7 +1453,7 @@ mod tests {
             signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
         };
         assert_eq!(
-            hex::encode(tx.encode()),
+            hex(&tx.encode()),
             "0103010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303a3305f6d5207a36d266e8484ede313ab69280255c7f4b9d10993fc817854acb20707085312612146dedbc66714321677ab71cdc262963b3291571849a127147325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a225363797061444e395263715a615372513164445236753248315346397039524c4e6e4a44746b32376a4b67222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
         );
     }
