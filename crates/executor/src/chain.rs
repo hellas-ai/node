@@ -15,8 +15,7 @@ use hellas_chain::domain::{ObjectId, Transaction};
 use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
 use hellas_kernel::{
-    Auth, BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, PayloadHash, Payout, Secp256k1Signer, Sig,
-    TermsHash,
+    Auth, BlockHeight, EdgeId, PayloadHash, Secp256k1Signer, Sig, TermsHash,
 };
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::pb::execute::{
@@ -85,32 +84,21 @@ pub(crate) fn receipt_response(
     }
 }
 
-/// Rebuilds the maker voucher a settle request stands for, on the
-/// channel's canonical two-output close shape. [`Channel::settle`]
-/// still re-validates everything, including the authorization.
-pub(crate) fn voucher_from_pb(
-    request: &SettleRequest,
-    channel: &Channel,
-) -> Result<MakerVoucher, String> {
-    let payment_edge = EdgeId::from_bytes(fixed32("payment_edge", &request.payment_edge)?);
-    let terms_hash = TermsHash::from_bytes(fixed32("payment_terms", &request.payment_terms)?);
-    let authorization = sig_from_pb(
-        "client_authorization",
-        request.client_authorization.as_ref(),
-    )?;
-    let refund = channel
-        .capacity()
-        .checked_sub(request.cumulative)
-        .ok_or("frontier exceeds the payment capacity")?;
-    let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
-    slots[0] = Payout::new(channel.client(), refund);
-    slots[1] = Payout::new(channel.provider(), request.cumulative);
+/// Decodes the maker voucher a settle request stands for.
+///
+/// A field-for-field decode: the request carries no outputs, because
+/// the canonical close shape is derived from `cumulative` and the
+/// pairing. [`Channel::settle`] re-validates everything, including the
+/// authorization over the payload it derives itself.
+pub(crate) fn voucher_from_pb(request: &SettleRequest) -> Result<MakerVoucher, String> {
     Ok(MakerVoucher {
-        payment_edge,
-        terms_hash,
+        payment_edge: EdgeId::from_bytes(fixed32("payment_edge", &request.payment_edge)?),
+        terms_hash: TermsHash::from_bytes(fixed32("payment_terms", &request.payment_terms)?),
         cumulative: request.cumulative,
-        outputs: List::take(slots, 2),
-        client_auth: Auth::native(authorization),
+        client_auth: Auth::native(sig_from_pb(
+            "client_authorization",
+            request.client_authorization.as_ref(),
+        )?),
     })
 }
 

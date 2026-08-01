@@ -837,6 +837,7 @@ pub enum Transaction {
 /// exactly, so the predicate lives here and each caller maps the fault
 /// into its own error type. Callers keep their distinctions: a
 /// duplicated input is a different fault from an out-of-order one.
+#[cfg(any(feature = "indexer", feature = "validator"))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MergeInputFault {
     /// Fewer than two inputs — nothing to merge.
@@ -848,6 +849,7 @@ pub(crate) enum MergeInputFault {
 }
 
 /// Validates a merge input list, or reports the first fault found.
+#[cfg(any(feature = "indexer", feature = "validator"))]
 pub(crate) fn merge_input_fault(inputs: &[ObjectId]) -> Option<MergeInputFault> {
     if inputs.len() < 2 {
         return Some(MergeInputFault::TooFew);
@@ -1508,6 +1510,7 @@ mod tests {
         assert!(matches!(decoded, Err(CodecError::InvalidLength(8))));
     }
 
+    #[cfg(any(feature = "indexer", feature = "validator"))]
     #[test]
     fn merge_input_faults_are_reported_in_order() {
         let id = |b: u8| ObjectId::from([b; 32]);
