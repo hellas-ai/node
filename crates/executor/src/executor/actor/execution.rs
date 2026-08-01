@@ -92,10 +92,10 @@ impl Executor {
         // at the settle site could never fire. The executor has no
         // height subscription, so an admission attempt is the one
         // height observation that can be late enough to matter. A
-        // provider that goes idle past the margin will not bank until
+        // provider that goes idle past the margin will not close until
         // something pokes it; a periodic watcher is the proper fix and
         // is not built yet.
-        self.bank_frontier_if_due(now).await;
+        self.close_channel_if_expired(now).await;
         let staked = self.staked.as_mut().expect("staked provider still present");
         staked.channel.admit(now, context).map_err(|reason| {
             ExecutorError::InvalidQuoteRequest(format!("job not admitted: {reason:?}"))
@@ -187,7 +187,7 @@ impl Executor {
     }
 
     /// Staked maintenance for a newly finalized height: release a job
-    /// abandoned past its deadline, then bank a frontier that is due.
+    /// abandoned past its deadline, then close a channel that has expired.
     ///
     /// Driven by the height feed rather than by incoming requests: an
     /// idle provider is the one with the most to lose, since nothing
@@ -197,7 +197,7 @@ impl Executor {
             return;
         }
         self.release_abandoned_job(height).await;
-        self.bank_frontier_if_due(height).await;
+        self.close_channel_if_expired(height).await;
     }
 
     /// Submits the latest frontier as an on-chain `Mutual` close once
@@ -210,10 +210,10 @@ impl Executor {
     /// the refund. The trigger is derived from the committed margin
     /// (`Channel::redemption_due`), not a chosen constant.
     ///
-    /// Best effort by design: this is the provider banking its own
+    /// Best effort by design: this is the provider redeeming its own
     /// earnings, so a submission failure must not fail the client's
     /// settlement. It is logged and retried on the next due check.
-    async fn bank_frontier_if_due(&mut self, now: hellas_kernel::BlockHeight) {
+    async fn close_channel_if_expired(&mut self, now: hellas_kernel::BlockHeight) {
         let signer = crate::kernel_signer(&self.provider.producer_key);
         let Some(staked) = self.staked.as_mut() else {
             return;
@@ -1252,7 +1252,6 @@ mod tests {
             fixture_bond_terms(),
             EdgeId::from_bytes([2; 32]),
             payment,
-            5,
         )
         .expect("mirrored staked pairing")
     }
@@ -1776,7 +1775,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
     }
 
-    /// Once the channel can no longer admit any job, the provider banks
+    /// Once the channel can no longer admit any job, the provider closes
     /// its frontier on-chain rather than holding a voucher the client's
     /// timeout refund would erase.
     #[tokio::test]
@@ -1790,9 +1789,10 @@ mod tests {
             [b"event:ok".to_vec(), b"terminal:done".to_vec()],
         );
         let chain = crate::FakeChainView::new();
-        // 143 + close_margin 5 = 148 < payment timeout 150: settlement
-        // still fits, but no further job can be admitted.
-        chain.set_height(143);
+        // 128 + close_margin 20 = 148 < payment timeout 150: settlement
+        // still fits, but no further job can be admitted. The margin is
+        // the bond's committed `challenge_margin`, not a chosen policy.
+        chain.set_height(128);
         let handle = spawn_staked_executor_with(Arc::new(provider), chain.clone()).await;
         let mut client_channel = staked_channel_fixture();
         let ticket = handle
@@ -1800,7 +1800,7 @@ mod tests {
             .await
             .unwrap()
             .response;
-        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 144);
+        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 129);
         let outcome = handle.run_ticket_handle(admitted).await.unwrap();
         let (_chunks, _finished) = drain_outcome(outcome.events).await;
         assert!(
@@ -1825,22 +1825,22 @@ mod tests {
             .expect("settlement lands");
 
         // At 143 redemption is not yet due (143 + 5 < 150), and settle
-        // only ever succeeds while that holds — so nothing is banked
+        // only ever succeeds while that holds — so nothing is submitted
         // yet. The two conditions are complementary by construction.
         assert!(
             chain.submitted().is_empty(),
-            "settling does not itself bank the frontier",
+            "settling does not itself close the channel",
         );
 
         // Past the margin the channel can admit nothing more. The next
         // admission attempt is refused, and that height observation is
-        // what triggers the provider to bank what it earned.
-        chain.set_height(146);
+        // what triggers the provider to close and redeem what it earned.
+        chain.set_height(130);
         let late = fetch_request(&client_key(), "echo", "run", br#"{"n":"late"}"#);
         let late_ticket = handle.create_fetch_ticket(late).await.unwrap().response;
-        // Deadline 144 is admissible when the client builds it, and
-        // stale by the time the provider sees height 146.
-        let (late_job, _) = acceptance_for(&mut staked_channel_fixture(), late_ticket, 144);
+        // Deadline 129 is admissible when the client builds it, and
+        // stale by the time the provider sees height 130.
+        let (late_job, _) = acceptance_for(&mut staked_channel_fixture(), late_ticket, 129);
         assert!(
             handle.run_ticket_handle(late_job).await.is_err(),
             "no job is admissible past the redemption margin",
@@ -1855,14 +1855,14 @@ mod tests {
     }
 
     /// An IDLE provider — one that receives no further requests —
-    /// still banks its frontier, because chain progress alone wakes it.
+    /// still closes the channel, because chain progress alone wakes it.
     ///
     /// This is the case with real money on it: without a height-driven
     /// trigger the provider holds the voucher until the payment timeout
     /// and the client's close refunds the FULL capacity, erasing
     /// everything earned.
     #[tokio::test]
-    async fn an_idle_provider_banks_its_frontier_when_the_chain_advances() {
+    async fn an_idle_provider_closes_the_channel_when_it_expires() {
         let input = br#"{"hello":"idle"}"#;
         let provider = MockFetchProvider::new();
         provider.insert(
@@ -1872,7 +1872,7 @@ mod tests {
             [b"event:ok".to_vec(), b"terminal:done".to_vec()],
         );
         let chain = crate::FakeChainView::new();
-        chain.set_height(143);
+        chain.set_height(128);
         let (heights, heights_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle =
             spawn_staked_executor_feeding(Arc::new(provider), chain.clone(), heights_rx).await;
@@ -1883,7 +1883,7 @@ mod tests {
             .await
             .unwrap()
             .response;
-        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 144);
+        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 129);
         let outcome = handle.run_ticket_handle(admitted).await.unwrap();
         let (_chunks, _finished) = drain_outcome(outcome.events).await;
         let voucher = client_channel
@@ -1901,11 +1901,11 @@ mod tests {
             })
             .await
             .expect("settlement lands");
-        assert!(chain.submitted().is_empty(), "not due yet at height 143");
+        assert!(chain.submitted().is_empty(), "not due yet at height 128");
 
         // No further requests arrive — only the chain moves.
-        chain.set_height(146);
-        heights.send(hellas_kernel::BlockHeight::new(146)).unwrap();
+        chain.set_height(130);
+        heights.send(hellas_kernel::BlockHeight::new(130)).unwrap();
 
         for _ in 0..200 {
             if !chain.submitted().is_empty() {
@@ -1916,7 +1916,7 @@ mod tests {
         assert_eq!(
             chain.submitted().len(),
             1,
-            "chain progress alone must bank the frontier",
+            "chain progress alone must close the channel",
         );
 
         // The channel closes exactly ONCE. Every further block is still

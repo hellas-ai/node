@@ -37,7 +37,6 @@ const CAPACITY: u64 = 2_000;
 const MAX_JOB_PRICE: u64 = 500;
 const BOND_TIMEOUT: u64 = 200;
 const PAYMENT_TIMEOUT: u64 = 150;
-const CLOSE_MARGIN: u64 = 5;
 const CHALLENGE_MARGIN: u64 = 20;
 
 fn signer(seed: u8) -> Secp256k1Signer {
@@ -89,7 +88,6 @@ fn fresh_channel() -> Channel {
         bond_terms(),
         payment_edge(),
         payment(),
-        CLOSE_MARGIN,
     )
     .expect("the fixture pairing is well formed")
 }

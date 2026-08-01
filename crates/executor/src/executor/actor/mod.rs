@@ -244,7 +244,7 @@ impl Executor {
             staked: staked_state,
         };
         // A staked provider owes time-based work even when idle: an
-        // unbanked frontier is erased by the client's full-capacity
+        // unredeemed frontier is erased by the client's full-capacity
         // timeout refund, and an abandoned job would hold the
         // serialization lock. Every such deadline is a BLOCK HEIGHT, so
         // the loop is woken by chain progress — never a polling
