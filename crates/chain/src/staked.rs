@@ -442,6 +442,30 @@ impl Channel {
                 .is_none_or(|end| end >= self.payment.timeout().get())
     }
 
+    /// Builds the channel's CLOSING transaction — exactly once — when
+    /// the pairing has reached the end of its life.
+    ///
+    /// This is not an extra L1 interaction: it *is* the "end the state
+    /// channel" half of the design's two on-chain touches. Everything
+    /// between the opens and this close is off-chain vouchers.
+    ///
+    /// Consumes the frontier, which is what makes it single-shot. The
+    /// transaction closes the payment edge, so afterwards there is
+    /// nothing left to redeem — and a channel that kept handing the
+    /// voucher back would resubmit the same close on every block past
+    /// the margin, turning one permitted touch into per-block spam.
+    pub fn close_on_expiry(
+        &mut self,
+        now: BlockHeight,
+        provider: &Secp256k1Signer,
+    ) -> Option<KernelTx> {
+        if !self.redemption_due(now) || provider.party_key() != self.provider() {
+            return None;
+        }
+        let voucher = self.frontier.take()?;
+        Some(voucher.redeem(provider))
+    }
+
     /// Client-side settlement: issues the frontier voucher paying the
     /// in-flight job's price and resolves the job. Returns `None` when
     /// there is no in-flight job or `client` is not the payment maker.
