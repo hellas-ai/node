@@ -19,6 +19,12 @@ service Execute {
 // transcript is never signed.
 message ReceiptRequest {
   bytes acceptance_digest = 1; // exactly 32 bytes
+  // The caller must prove it is the channel's committed client. A
+  // receipt hands out the provider's signatures over the acceptance and
+  // its own result — the client's half of a fraud artifact — so it must
+  // never answer a party that merely observed the acceptance on the
+  // wire. secp256k1 over the acceptance digest.
+  Signature client_signature = 2;
 }
 
 message ReceiptResponse {

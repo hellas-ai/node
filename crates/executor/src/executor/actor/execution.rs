@@ -83,6 +83,20 @@ impl Executor {
         let Some(now) = height else {
             return refuse("no finalized block observed yet".into());
         };
+        // A job the client abandoned past its committed deadline must
+        // not hold the lock against the next one.
+        self.release_abandoned_job(now);
+        // Opportunistic redemption. `settle` succeeds only while
+        // `now + close_margin < payment_timeout` and redemption is due
+        // only at `>=`, so the two are exactly complementary — checking
+        // at the settle site could never fire. The executor has no
+        // height subscription, so an admission attempt is the one
+        // height observation that can be late enough to matter. A
+        // provider that goes idle past the margin will not bank until
+        // something pokes it; a periodic watcher is the proper fix and
+        // is not built yet.
+        self.bank_frontier_if_due(now).await;
+        let staked = self.staked.as_mut().expect("staked provider still present");
         staked.channel.admit(now, context).map_err(|reason| {
             ExecutorError::InvalidQuoteRequest(format!("job not admitted: {reason:?}"))
         })
@@ -106,6 +120,21 @@ impl Executor {
         let digest = active.digest();
         if request.acceptance_digest.as_slice() != digest.as_bytes().as_slice() {
             return Err(refuse("receipt names a job other than the in-flight one"));
+        }
+        // Caller authentication. Without it, anyone who observed the
+        // acceptance — a gateway proxying the run ticket, or any peer
+        // that can reach the Execute ALPN — could harvest the
+        // provider's fraud-evidence signatures.
+        let signature = crate::chain::sig_from_pb("receipt client_signature", {
+            request.client_signature.as_ref()
+        })
+        .map_err(ExecutorError::InvalidQuoteRequest)?;
+        if !hellas_kernel::Secp256k1Verifier::new().verify_sig(
+            signature,
+            staked.channel.client(),
+            digest,
+        ) {
+            return Err(refuse("receipt is not authorized by the channel's client"));
         }
         let transcript = self.terminal_commitment(active.request).await?;
         let signer = crate::kernel_signer(&self.provider.producer_key);
@@ -151,6 +180,60 @@ impl Executor {
             ExecutorError::InvalidQuoteRequest(format!("settlement refused: {reason:?}"))
         })?;
         Ok(SettleResponse {})
+    }
+
+    /// Submits the latest frontier as an on-chain `Mutual` close once
+    /// the channel can no longer admit any job.
+    ///
+    /// Holding a voucher past that point is pure downside: the channel
+    /// has no remaining useful life, and the client's timeout close
+    /// refunds the FULL capacity — including everything the provider
+    /// earned — so a provider that sits on its frontier can lose it to
+    /// the refund. The trigger is derived from the committed margin
+    /// (`Channel::redemption_due`), not a chosen constant.
+    ///
+    /// Best effort by design: this is the provider banking its own
+    /// earnings, so a submission failure must not fail the client's
+    /// settlement. It is logged and retried on the next due check.
+    async fn bank_frontier_if_due(&mut self, now: hellas_kernel::BlockHeight) {
+        let Some(staked) = self.staked.as_ref() else {
+            return;
+        };
+        if !staked.channel.redemption_due(now) {
+            return;
+        }
+        let signer = crate::kernel_signer(&self.provider.producer_key);
+        let Some(close) = staked.channel.redeem(&signer) else {
+            return;
+        };
+        if let Err(err) = staked
+            .chain
+            .submit(hellas_chain::domain::Transaction::Kernel(close))
+            .await
+        {
+            warn!(
+                chain_error = %err,
+                "failed to submit frontier redemption; will retry when next due"
+            );
+        }
+    }
+
+    /// Releases the serialization lock for a job whose committed
+    /// terminal deadline has passed without settlement, so one
+    /// abandoned job cannot hold the pairing forever.
+    ///
+    /// Safe to do unilaterally: the deadline is in the acceptance both
+    /// parties signed, so the client computes the same release height.
+    fn release_abandoned_job(&mut self, now: hellas_kernel::BlockHeight) {
+        if let Some(staked) = self.staked.as_mut()
+            && let Some(job) = staked.channel.abandon(now)
+        {
+            warn!(
+                sequence = job.sequence,
+                deadline = job.terminal_deadline.get(),
+                "released a job abandoned past its terminal deadline"
+            );
+        }
     }
 
     /// The terminal event commitment of the provider's own completed
@@ -1133,6 +1216,15 @@ mod tests {
     async fn spawn_staked_executor(provider: Arc<dyn FetchProvider>) -> crate::ExecutorHandle {
         let chain = crate::FakeChainView::new();
         chain.set_height(10);
+        spawn_staked_executor_with(provider, chain).await
+    }
+
+    /// Same, but with a caller-supplied chain view so a test can drive
+    /// the observed height.
+    async fn spawn_staked_executor_with(
+        provider: Arc<dyn FetchProvider>,
+        chain: crate::FakeChainView,
+    ) -> crate::ExecutorHandle {
         Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
             queue_capacity: 1,
@@ -1153,6 +1245,18 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// A receipt request authorized by the channel's committed client.
+    fn receipt_request(
+        digest: hellas_kernel::PayloadHash,
+    ) -> hellas_rpc::pb::execute::ReceiptRequest {
+        hellas_rpc::pb::execute::ReceiptRequest {
+            acceptance_digest: digest.as_bytes().to_vec(),
+            client_signature: Some(crate::chain::sig_to_pb(
+                crate::kernel_signer(&client_key()).sign(digest),
+            )),
+        }
     }
 
     /// The client side of the staked handshake: run the same admission
@@ -1266,9 +1370,7 @@ mod tests {
         // fixture bond under the kernel's pinned slash payouts.
         let digest = first_job.digest();
         let receipt = handle
-            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
-                acceptance_digest: digest.as_bytes().to_vec(),
-            })
+            .receipt_handle(receipt_request(digest))
             .await
             .unwrap();
         let transcript: [u8; 32] = receipt.transcript.clone().try_into().unwrap();
@@ -1411,11 +1513,7 @@ mod tests {
         // The provider is now blocked mid-run: the job is in flight and
         // nothing is terminally recorded.
 
-        let receipt = handle
-            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
-                acceptance_digest: job.digest().as_bytes().to_vec(),
-            })
-            .await;
+        let receipt = handle.receipt_handle(receipt_request(job.digest())).await;
         assert!(
             matches!(
                 receipt,
@@ -1479,6 +1577,10 @@ mod tests {
         let foreign = handle
             .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
                 acceptance_digest: vec![0x5a; 32],
+                client_signature: Some(crate::chain::sig_to_pb(
+                    crate::kernel_signer(&client_key())
+                        .sign(hellas_kernel::PayloadHash::from_bytes([0x5a; 32])),
+                )),
             })
             .await;
         assert!(
@@ -1488,6 +1590,187 @@ mod tests {
                     if msg.contains("names a job other than the in-flight one")
             ),
             "a foreign acceptance digest must be refused, got {foreign:?}",
+        );
+    }
+
+    /// A receipt hands out the provider's fraud-evidence signatures, so
+    /// it must answer only the channel's committed client — not any
+    /// party that merely observed the acceptance on the wire (a
+    /// proxying gateway, or any peer that can reach the Execute ALPN).
+    #[tokio::test]
+    async fn receipt_refuses_a_caller_that_is_not_the_channels_client() {
+        let input = br#"{"hello":"auth"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let handle = spawn_staked_executor(Arc::new(provider)).await;
+        let mut client_channel = staked_channel_fixture();
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, job) = acceptance_for(&mut client_channel, ticket, 60);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
+        let (_chunks, _finished) = drain_outcome(outcome.events).await;
+        let digest = job.digest();
+
+        // An observer who knows the digest but cannot sign as the
+        // client — here the provider itself — is refused.
+        let observer = handle
+            .receipt_handle(hellas_rpc::pb::execute::ReceiptRequest {
+                acceptance_digest: digest.as_bytes().to_vec(),
+                client_signature: Some(crate::chain::sig_to_pb(
+                    crate::kernel_signer(&key()).sign(digest),
+                )),
+            })
+            .await;
+        assert!(
+            matches!(
+                observer,
+                Err(ExecutorError::InvalidQuoteRequest(ref msg))
+                    if msg.contains("not authorized by the channel's client")
+            ),
+            "an unauthorized observer must not collect a receipt, got {observer:?}",
+        );
+
+        // The real client still gets its receipt.
+        assert!(handle.receipt_handle(receipt_request(digest)).await.is_ok());
+    }
+
+    /// A client that takes delivery and then neither settles nor
+    /// disputes must not hold the pairing forever. Once the committed
+    /// terminal deadline passes, the provider releases the lock — a
+    /// release the client computes identically, since the deadline is
+    /// in the acceptance both parties signed.
+    #[tokio::test]
+    async fn an_abandoned_job_stops_holding_the_serialization_lock() {
+        let input = br#"{"hello":"abandoned"}"#;
+        let second_input = br#"{"hello":"next"}"#;
+        let provider = MockFetchProvider::new();
+        for body in [input.as_slice(), second_input.as_slice()] {
+            provider.insert(
+                "echo",
+                "run",
+                body,
+                [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+            );
+        }
+        let chain = crate::FakeChainView::new();
+        chain.set_height(10);
+        let handle = spawn_staked_executor_with(Arc::new(provider), chain.clone()).await;
+        let mut client_channel = staked_channel_fixture();
+
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 60);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
+        let (_chunks, _finished) = drain_outcome(outcome.events).await;
+        // The client walks away: no settle, no dispute.
+
+        // While the deadline stands, the lock holds.
+        let request = fetch_request(&client_key(), "echo", "run", second_input);
+        let next_ticket = handle.create_fetch_ticket(request).await.unwrap().response;
+        let (blocked, _) = acceptance_for(&mut staked_channel_fixture(), next_ticket.clone(), 61);
+        assert!(matches!(
+            handle.run_ticket_handle(blocked).await,
+            Err(ExecutorError::InvalidQuoteRequest(ref msg)) if msg.contains("Busy")
+        ));
+
+        // Past the deadline, the provider releases it and takes work again.
+        chain.set_height(61);
+        client_channel.abandon(hellas_kernel::BlockHeight::new(61));
+        let (next, _) = acceptance_for(&mut client_channel, next_ticket, 100);
+        let outcome = handle
+            .run_ticket_handle(next)
+            .await
+            .expect("the next job admits once the abandoned one is released");
+        let (chunks, _finished) = drain_outcome(outcome.events).await;
+        assert_eq!(chunks.len(), 1);
+    }
+
+    /// Once the channel can no longer admit any job, the provider banks
+    /// its frontier on-chain rather than holding a voucher the client's
+    /// timeout refund would erase.
+    #[tokio::test]
+    async fn the_frontier_is_submitted_on_chain_once_redemption_is_due() {
+        let input = br#"{"hello":"redeem"}"#;
+        let provider = MockFetchProvider::new();
+        provider.insert(
+            "echo",
+            "run",
+            input,
+            [b"event:ok".to_vec(), b"terminal:done".to_vec()],
+        );
+        let chain = crate::FakeChainView::new();
+        // 143 + close_margin 5 = 148 < payment timeout 150: settlement
+        // still fits, but no further job can be admitted.
+        chain.set_height(143);
+        let handle = spawn_staked_executor_with(Arc::new(provider), chain.clone()).await;
+        let mut client_channel = staked_channel_fixture();
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&client_key(), "echo", "run", input))
+            .await
+            .unwrap()
+            .response;
+        let (admitted, _) = acceptance_for(&mut client_channel, ticket, 144);
+        let outcome = handle.run_ticket_handle(admitted).await.unwrap();
+        let (_chunks, _finished) = drain_outcome(outcome.events).await;
+        assert!(
+            chain.submitted().is_empty(),
+            "nothing submitted before settle"
+        );
+
+        let voucher = client_channel
+            .issue(&crate::kernel_signer(&client_key()))
+            .expect("client issues the frontier");
+        let hellas_kernel::Auth::Native(authorization) = voucher.client_auth else {
+            panic!("issued vouchers carry native maker authorization");
+        };
+        handle
+            .settle_handle(hellas_rpc::pb::execute::SettleRequest {
+                payment_edge: voucher.payment_edge.as_bytes().to_vec(),
+                payment_terms: voucher.terms_hash.as_bytes().to_vec(),
+                cumulative: voucher.cumulative,
+                client_authorization: Some(crate::chain::sig_to_pb(authorization)),
+            })
+            .await
+            .expect("settlement lands");
+
+        // At 143 redemption is not yet due (143 + 5 < 150), and settle
+        // only ever succeeds while that holds — so nothing is banked
+        // yet. The two conditions are complementary by construction.
+        assert!(
+            chain.submitted().is_empty(),
+            "settling does not itself bank the frontier",
+        );
+
+        // Past the margin the channel can admit nothing more. The next
+        // admission attempt is refused, and that height observation is
+        // what triggers the provider to bank what it earned.
+        chain.set_height(146);
+        let late = fetch_request(&client_key(), "echo", "run", br#"{"n":"late"}"#);
+        let late_ticket = handle.create_fetch_ticket(late).await.unwrap().response;
+        // Deadline 144 is admissible when the client builds it, and
+        // stale by the time the provider sees height 146.
+        let (late_job, _) = acceptance_for(&mut staked_channel_fixture(), late_ticket, 144);
+        assert!(
+            handle.run_ticket_handle(late_job).await.is_err(),
+            "no job is admissible past the redemption margin",
+        );
+
+        let submitted = chain.submitted();
+        assert_eq!(submitted.len(), 1, "the frontier must be submitted once");
+        assert!(
+            matches!(&submitted[0], hellas_chain::domain::Transaction::Kernel(_)),
+            "the redemption is a kernel close",
         );
     }
 
