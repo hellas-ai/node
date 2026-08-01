@@ -1376,7 +1376,6 @@ mod tests {
             Terms::stake_bond(full_game_bond_policy()),
             hellas_kernel::EdgeId::from_bytes([0x55; 32]),
             payment,
-            5,
         ) else {
             panic!("full-game fixture terms form a valid pairing");
         };
