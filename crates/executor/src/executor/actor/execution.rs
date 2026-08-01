@@ -164,7 +164,7 @@ impl Executor {
         let Some(staked) = self.staked.as_ref() else {
             return Err(refuse("provider does not run the staked flow".into()));
         };
-        let voucher = voucher_from_pb(request, &staked.channel)
+        let voucher = voucher_from_pb(request)
             .map_err(ExecutorError::InvalidQuoteRequest)?;
         let Some(active_request) = staked.channel.active().map(|job| job.request) else {
             return Err(refuse("no job awaiting settlement".into()));

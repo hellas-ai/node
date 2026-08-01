@@ -78,11 +78,31 @@ pub struct MakerVoucher {
     /// Cumulative provider earnings `E` this frontier settles at. The
     /// monotonicity index — strictly increasing per voucher.
     pub cumulative: u64,
-    /// The exact close payouts: `[(client, total − E), (provider, E)]`.
-    pub outputs: List<Payout, MAX_EDGE_OUTPUTS>,
     /// Maker authorization over the canonical kernel `Mutual` payload
-    /// hash of exactly these outputs.
+    /// hash of the outputs `cumulative` derives — see [`close_outputs`].
     pub client_auth: Auth,
+}
+
+/// The canonical two-output close shape: refund to the client,
+/// earnings to the provider.
+///
+/// The single definition of the frontier payload. `SettleRequest`
+/// deliberately does not carry outputs — it carries `cumulative` and
+/// the provider rebuilds them — so anything that stored them would be
+/// a second encoding of a derived value, and a chance for the two to
+/// disagree. Returns `None` when `cumulative` exceeds `total`.
+#[must_use]
+fn close_outputs(
+    client: Key,
+    provider: Key,
+    total: u64,
+    cumulative: u64,
+) -> Option<List<Payout, MAX_EDGE_OUTPUTS>> {
+    let refund = total.checked_sub(cumulative)?;
+    let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+    slots[0] = Payout::new(client, refund);
+    slots[1] = Payout::new(provider, cumulative);
+    Some(List::take(slots, 2))
 }
 
 impl MakerVoucher {
@@ -99,17 +119,12 @@ impl MakerVoucher {
         total: u64,
         cumulative: u64,
     ) -> Option<Self> {
-        let refund = total.checked_sub(cumulative)?;
-        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
-        slots[0] = Payout::new(client.party_key(), refund);
-        slots[1] = Payout::new(provider, cumulative);
-        let outputs = List::take(slots, 2);
+        let outputs = close_outputs(client.party_key(), provider, total, cumulative)?;
         let hash = KernelTx::payload_hash(payment_edge, CloseKind::Mutual, terms_hash, &outputs);
         Some(Self {
             payment_edge,
             terms_hash,
             cumulative,
-            outputs,
             client_auth: Auth::native(client.sign(hash)),
         })
     }
@@ -118,19 +133,26 @@ impl MakerVoucher {
     /// produces the executable kernel `Mutual` close. This is the only
     /// place provider authorization is created, and it never leaves the
     /// resulting transaction.
+    ///
+    /// Takes the `channel` because the outputs are derived, not
+    /// carried: the voucher commits to `cumulative`, and the pairing
+    /// supplies the parties and the capacity that turn it into a
+    /// payload. Returns `None` when the voucher does not settle on this
+    /// channel's payment edge.
     #[must_use]
-    pub fn redeem(&self, provider: &Secp256k1Signer) -> KernelTx {
+    pub fn redeem(&self, channel: &Channel, provider: &Secp256k1Signer) -> Option<KernelTx> {
+        let outputs = channel.close_outputs(self.cumulative)?;
         let hash = KernelTx::payload_hash(
             self.payment_edge,
             CloseKind::Mutual,
             self.terms_hash,
-            &self.outputs,
+            &outputs,
         );
-        KernelTx::close(
+        Some(KernelTx::close(
             self.payment_edge,
             Proof::mutual(self.client_auth.clone(), Auth::native(provider.sign(hash))),
-            self.outputs.clone(),
-        )
+            outputs,
+        ))
     }
 }
 
@@ -263,6 +285,13 @@ impl Channel {
     /// for any bond that exists. Reserving the full challenge window is
     /// deliberately conservative: a channel that close to expiry has no
     /// remaining useful life anyway.
+    /// This pairing's canonical close payload at cumulative earnings
+    /// `cumulative`. `None` when `cumulative` exceeds the capacity.
+    #[must_use]
+    pub fn close_outputs(&self, cumulative: u64) -> Option<List<Payout, MAX_EDGE_OUTPUTS>> {
+        close_outputs(self.client(), self.provider(), self.capacity(), cumulative)
+    }
+
     #[must_use]
     pub fn close_margin(&self) -> u64 {
         self.bond_policy().challenge_margin
@@ -468,7 +497,7 @@ impl Channel {
             return None;
         }
         let voucher = self.frontier.take()?;
-        Some(voucher.redeem(provider))
+        voucher.redeem(self, provider)
     }
 
     /// Client-side settlement: issues the frontier voucher paying the
@@ -526,20 +555,17 @@ impl Channel {
         if self.cumulative().checked_add(job.price) != Some(voucher.cumulative) {
             return Err(SettleError::WrongFrontier);
         }
-        let Some(refund) = self.capacity().checked_sub(voucher.cumulative) else {
+        // The payload is derived here, not taken from the voucher, so
+        // there is nothing to cross-check: a client that signed a
+        // different shape fails the authorization check below.
+        let Some(outputs) = self.close_outputs(voucher.cumulative) else {
             return Err(SettleError::WrongFrontier);
         };
-        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
-        slots[0] = Payout::new(self.client(), refund);
-        slots[1] = Payout::new(self.provider(), voucher.cumulative);
-        if voucher.outputs != List::take(slots, 2) {
-            return Err(SettleError::WrongFrontier);
-        }
         let hash = KernelTx::payload_hash(
             self.payment_edge,
             CloseKind::Mutual,
             self.payment.hash(),
-            &voucher.outputs,
+            &outputs,
         );
         if !Secp256k1Verifier::new().verify_auth(&voucher.client_auth, self.client(), hash) {
             return Err(SettleError::BadAuthorization);
@@ -547,19 +573,6 @@ impl Channel {
         self.frontier = Some(voucher);
         self.active = None;
         Ok(())
-    }
-
-    /// Provider-side redemption of the latest frontier as an executable
-    /// kernel `Mutual` close. Returns `None` when no frontier exists or
-    /// `provider` is not the payment taker.
-    #[must_use]
-    pub fn redeem(&self, provider: &Secp256k1Signer) -> Option<KernelTx> {
-        if provider.party_key() != self.provider() {
-            return None;
-        }
-        self.frontier
-            .as_ref()
-            .map(|voucher| voucher.redeem(provider))
     }
 
     /// The client's unilateral exit: a `Timeout` close of the payment
@@ -1226,11 +1239,13 @@ mod channel_tests {
         let Some(_voucher) = mine.issue(&client()) else {
             panic!("client issues");
         };
+        // Past the margin the close is due; only the taker can sign it.
+        let due = BlockHeight::new(130);
         assert!(
-            mine.redeem(&client()).is_none(),
+            mine.close_on_expiry(due, &client()).is_none(),
             "the client cannot redeem the taker close",
         );
-        assert!(mine.redeem(&provider()).is_some());
+        assert!(mine.close_on_expiry(due, &provider()).is_some());
     }
 
     #[test]
@@ -1663,8 +1678,9 @@ mod tests {
                 "a settled frontier has nothing further to settle",
             );
 
-            let close = theirs
-                .redeem(&provider)
+            let latest = theirs.frontier().expect("latest frontier").clone();
+            let close = latest
+                .redeem(&theirs, &provider)
                 .expect("provider redeems the latest frontier");
             let batches = execute_all(
                 context(2),
@@ -1683,8 +1699,10 @@ mod tests {
                     .expect("edge read"),
                 None,
             );
-            let latest = theirs.frontier().expect("latest frontier");
-            let ids = KernelTx::close_output_ids(payment_edge, &latest.outputs);
+            let outputs = theirs
+                .close_outputs(latest.cumulative)
+                .expect("the frontier fits the capacity");
+            let ids = KernelTx::close_output_ids(payment_edge, &outputs);
             let slots: Vec<_> = ids.as_slice().to_vec();
             assert_eq!(
                 batches
