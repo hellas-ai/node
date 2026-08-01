@@ -16,7 +16,7 @@
 
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    Parties, Payout, Proof, ProtocolCode, Secp256k1Signer, SoftPasskey, SoftPasskeyError, Terms,
+    Parties, Payout, ProtocolCode, Secp256k1Signer, SoftPasskey, SoftPasskeyError, Terms,
     Tx as KernelTx,
 };
 
@@ -94,18 +94,6 @@ impl Faucet {
         let edge = KernelTx::edge_id_of(&funding, &terms);
         Ok((open, terms, edge))
     }
-
-    /// The unilateral timeout close that mints the recipient's coin.
-    /// Needs no signature and is valid for anyone to submit once the
-    /// committed timeout height has passed.
-    #[must_use]
-    pub fn timeout_close(edge: EdgeId, terms: &Terms) -> KernelTx {
-        KernelTx::close(
-            edge,
-            Proof::timeout(terms.clone()),
-            terms.timeout_outputs().clone(),
-        )
-    }
 }
 
 #[cfg(all(test, feature = "validator"))]
@@ -176,7 +164,7 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("open merkleizes");
             database.finalize(merkleized).await;
 
-            let close = Faucet::timeout_close(edge, &terms);
+            let close = KernelTx::timeout_close(edge, &terms);
             let batches = execute_all(
                 context(TIMEOUT),
                 &verifier,
