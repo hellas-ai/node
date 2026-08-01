@@ -23,13 +23,6 @@ use hellas_kernel::{
 /// Protocol code for the faucet's `Basic` bridge edge.
 pub const FAUCET_PROTOCOL: ProtocolCode = ProtocolCode::new(4);
 
-/// Failure while building a faucet bridge.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FaucetError {
-    /// The funder passkey could not produce the open assertion.
-    Assertion(SoftPasskeyError),
-}
-
 /// A dev faucet: a P-256 genesis identity plus a secp256k1 party key,
 /// minting secp256k1-owned coins from the genesis funds the P-256
 /// identity holds.
@@ -66,7 +59,7 @@ impl Faucet {
     ///
     /// # Errors
     ///
-    /// Returns [`FaucetError::Assertion`] if the funder passkey cannot
+    /// Returns [`SoftPasskeyError::Assertion`] if the funder passkey cannot
     /// sign the canonical open hash.
     pub fn open(
         &self,
@@ -74,7 +67,7 @@ impl Faucet {
         recipient: Key,
         value: u64,
         timeout: BlockHeight,
-    ) -> Result<(KernelTx, Terms, EdgeId), FaucetError> {
+    ) -> Result<(KernelTx, Terms, EdgeId), SoftPasskeyError> {
         let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
         outputs[0] = Payout::new(recipient, value);
         let terms = Terms::basic(
@@ -91,7 +84,7 @@ impl Faucet {
         let assertion = self
             .funder
             .sign(open_hash)
-            .map_err(FaucetError::Assertion)?;
+            ?;
         let open = KernelTx::open(
             funding.clone(),
             terms.clone(),

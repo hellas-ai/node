@@ -56,23 +56,11 @@ impl Address {
     pub const fn public_key(&self) -> &UserPublicKey {
         &self.0
     }
-
-    /// Consumes the address and returns its public key.
-    #[must_use]
-    pub const fn into_public_key(self) -> UserPublicKey {
-        self.0
-    }
 }
 
 impl From<UserPublicKey> for Address {
     fn from(pk: UserPublicKey) -> Self {
         Self(pk)
-    }
-}
-
-impl AsRef<UserPublicKey> for Address {
-    fn as_ref(&self) -> &UserPublicKey {
-        &self.0
     }
 }
 
@@ -187,21 +175,13 @@ impl From<Address> for SettlementKey {
     }
 }
 
-impl TryFrom<&SettlementKey> for Address {
-    type Error = AddressError;
-
-    fn try_from(key: &SettlementKey) -> Result<Self, Self::Error> {
-        UserPublicKey::decode(key.as_bytes().as_slice())
-            .map(Self)
-            .map_err(|_| AddressError::InvalidKey)
-    }
-}
-
 impl TryFrom<SettlementKey> for Address {
     type Error = AddressError;
 
     fn try_from(key: SettlementKey) -> Result<Self, Self::Error> {
-        Self::try_from(&key)
+        UserPublicKey::decode(key.as_bytes().as_slice())
+            .map(Self)
+            .map_err(|_| AddressError::InvalidKey)
     }
 }
 
@@ -297,7 +277,8 @@ impl<T, const N: usize> Bounded<T, N> {
         self.len
     }
 
-    /// Returns true when the list has no live entries.
+    /// Returns true when the list has no live entries. Kept as the
+    /// pair `len` requires, not because a caller exists today.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -389,12 +370,6 @@ pub type Context = commonware_consensus::simplex::types::Context<Digest, PublicK
 #[cfg(feature = "domain-consensus")]
 pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Digest>;
 
-/// The epoch number used in consensus.
-///
-/// No reconfiguration - the network always starts in epoch 0.
-#[cfg(feature = "domain-consensus")]
-pub const EPOCH: commonware_consensus::types::Epoch = commonware_consensus::types::Epoch::zero();
-
 /// `WebAuthn` policy version.
 pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
 /// Chain identifier committed into `WebAuthn` challenges.
@@ -439,8 +414,6 @@ pub const KERNEL_FEES: Fees = Fees::ZERO;
 /// open. Lifetime fees are currently zero, so without this consensus cap
 /// a `u64::MAX` timeout would make a bond operationally permanent.
 pub const MAX_STAKED_LIFETIME_BLOCKS: u64 = 1_000_000;
-/// Default genesis allocation balance.
-pub const GENESIS_BALANCE: u64 = 100_000_000;
 /// Minimum `WebAuthn` authenticator data length.
 pub const MIN_AUTHENTICATOR_DATA_LEN: usize = 37;
 /// Maximum `WebAuthn` authenticator data length.
