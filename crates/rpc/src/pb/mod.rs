@@ -118,9 +118,9 @@ mod id_pins {
         use super::services::execute::{Execute, Receipt, RunTicket, Settle};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x97f213af);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xa82c0f94);
         assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xd2d6478a);
-        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0x51b8f220);
+        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0xbbb5f3e6);
         assert_eq!(<Settle as MethodMarker>::METHOD_ID, 0xc678dd9f);
     }
 

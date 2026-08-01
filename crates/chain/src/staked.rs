@@ -402,6 +402,46 @@ impl Channel {
         self.active.take()
     }
 
+    /// Releases a job whose committed terminal deadline has passed
+    /// without settlement.
+    ///
+    /// Unlike [`Self::rescind`], this is safe to apply unilaterally:
+    /// the deadline is part of the acceptance BOTH parties signed, so
+    /// each side computes the same release height from data it already
+    /// holds. No coordinating message is needed and the two channels
+    /// cannot desync — which is exactly the hazard one-sided `rescind`
+    /// carries. The sequence stays consumed, as always.
+    ///
+    /// This is the provider's escape from a client that takes delivery
+    /// and then neither settles nor disputes: without it, one abandoned
+    /// job would hold the serialization lock forever.
+    pub fn abandon(&mut self, now: BlockHeight) -> Option<JobAcceptanceContext> {
+        let expired = self
+            .active
+            .as_ref()
+            .is_some_and(|job| now.get() > job.terminal_deadline.get());
+        if expired { self.active.take() } else { None }
+    }
+
+    /// True when no further job could be admitted before the payment
+    /// timeout, so a frontier worth banking should be redeemed on-chain
+    /// now rather than held.
+    ///
+    /// Derived from the committed margin rather than a chosen policy
+    /// constant: once `now + close_margin` reaches the payment timeout,
+    /// [`Self::admit`] refuses everything and [`Self::settle`] returns
+    /// `TooLateToRedeem`, so the channel has no remaining useful life
+    /// and holding the voucher only risks the client's timeout refund
+    /// erasing earnings the provider already banked off-chain.
+    #[must_use]
+    pub fn redemption_due(&self, now: BlockHeight) -> bool {
+        self.frontier.is_some()
+            && now
+                .get()
+                .checked_add(self.close_margin)
+                .is_none_or(|end| end >= self.payment.timeout().get())
+    }
+
     /// Client-side settlement: issues the frontier voucher paying the
     /// in-flight job's price and resolves the job. Returns `None` when
     /// there is no in-flight job or `client` is not the payment maker.
