@@ -410,10 +410,16 @@ pub const MAX_TXS_PER_BLOCK: usize = 256;
 pub const MAX_BLOCK_TX_BYTES: usize = 768 * 1024;
 /// Consensus-critical kernel fee schedule compiled into the chain.
 pub const KERNEL_FEES: Fees = Fees::ZERO;
-/// Longest lifetime, in blocks, a staked (fraud-game) edge may commit at
-/// open. Lifetime fees are currently zero, so without this consensus cap
-/// a `u64::MAX` timeout would make a bond operationally permanent.
-pub const MAX_STAKED_LIFETIME_BLOCKS: u64 = 1_000_000;
+/// Longest lifetime, in blocks, any edge may commit at open.
+///
+/// A stand-in for a bound the kernel already knows how to derive:
+/// `open_lifetime_fee` prices `fees.lifetime * blocks` against the
+/// open's funding, so with a real fee schedule an edge may live
+/// exactly as long as it prepaid for. [`KERNEL_FEES`] is `Fees::ZERO`,
+/// which makes that derivation charge nothing, so consensus caps the
+/// span directly until a schedule is set. Delete this in favour of the
+/// derived bound when it is.
+pub const MAX_EDGE_LIFETIME_BLOCKS: u64 = 1_000_000;
 /// Minimum `WebAuthn` authenticator data length.
 pub const MIN_AUTHENTICATOR_DATA_LEN: usize = 37;
 /// Maximum `WebAuthn` authenticator data length.
@@ -824,8 +830,37 @@ pub enum Transaction {
     Kernel(KernelTx),
 }
 
-fn merge_inputs_are_strictly_sorted(inputs: &[ObjectId]) -> bool {
-    inputs.windows(2).all(|pair| pair[0] < pair[1])
+/// Why a merge transaction's input list is not admissible.
+///
+/// Merge validation runs twice — against QMDB in `execution::kernel`
+/// and against the in-memory `owner_index` — and the two must agree
+/// exactly, so the predicate lives here and each caller maps the fault
+/// into its own error type. Callers keep their distinctions: a
+/// duplicated input is a different fault from an out-of-order one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MergeInputFault {
+    /// Fewer than two inputs — nothing to merge.
+    TooFew,
+    /// The same object appears twice.
+    Duplicate(ObjectId),
+    /// Inputs are not in ascending order.
+    NonCanonical,
+}
+
+/// Validates a merge input list, or reports the first fault found.
+pub(crate) fn merge_input_fault(inputs: &[ObjectId]) -> Option<MergeInputFault> {
+    if inputs.len() < 2 {
+        return Some(MergeInputFault::TooFew);
+    }
+    inputs.windows(2).find_map(|pair| {
+        if pair[0] == pair[1] {
+            Some(MergeInputFault::Duplicate(pair[0]))
+        } else if pair[0] > pair[1] {
+            Some(MergeInputFault::NonCanonical)
+        } else {
+            None
+        }
+    })
 }
 
 fn client_data_rp_hash(bytes: &[u8], expected_challenge: &[u8]) -> Option<[u8; 32]> {
@@ -929,16 +964,6 @@ impl Transaction {
                 verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
             }
             Self::Kernel(_) => false,
-        }
-    }
-
-    /// Returns whether merge transaction inputs use canonical ordering.
-    #[must_use]
-    pub fn merge_is_canonical(&self) -> bool {
-        match self {
-            Self::Transfer { .. } => true,
-            Self::MergeCoin { inputs, .. } => merge_inputs_are_strictly_sorted(inputs.as_slice()),
-            Self::Kernel(_) => true,
         }
     }
 }
@@ -1484,14 +1509,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_inputs_canonical_check() {
-        let key = secp256r1_key_from_seed(1);
-        let inputs = test_merge_inputs(&[Digest::from([3; 32]), Digest::from([1; 32])]);
-        let challenge = merge_challenge(inputs.as_slice());
-        let tx = Transaction::MergeCoin {
-            inputs,
-            signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
-        };
-        assert!(!tx.merge_is_canonical());
+    fn merge_input_faults_are_reported_in_order() {
+        let id = |b: u8| ObjectId::from([b; 32]);
+        assert_eq!(merge_input_fault(&[id(1)]), Some(MergeInputFault::TooFew));
+        assert_eq!(
+            merge_input_fault(&[id(1), id(1)]),
+            Some(MergeInputFault::Duplicate(id(1))),
+        );
+        assert_eq!(
+            merge_input_fault(&[id(3), id(1)]),
+            Some(MergeInputFault::NonCanonical),
+        );
+        assert_eq!(merge_input_fault(&[id(1), id(2), id(3)]), None);
     }
 }

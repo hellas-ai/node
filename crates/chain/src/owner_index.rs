@@ -1,5 +1,6 @@
 use crate::HellasBlock;
 use crate::domain::{
+    MergeInputFault, merge_input_fault,
     Address, Coin, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id,
     edge_object_id, genesis_object_id, output_object_id,
 };
@@ -376,16 +377,12 @@ impl State {
         tx: &Transaction,
         inputs: &[ObjectId],
     ) -> Result<(), OwnerIndexError> {
-        if inputs.len() < 2 {
-            return Err(OwnerIndexError::TooFewMergeInputs);
-        }
-        for pair in inputs.windows(2) {
-            if pair[0] == pair[1] {
-                return Err(OwnerIndexError::DuplicateInput { id: pair[0] });
-            }
-            if pair[0] > pair[1] {
-                return Err(OwnerIndexError::NonCanonicalMergeInputs);
-            }
+        if let Some(fault) = merge_input_fault(inputs) {
+            return Err(match fault {
+                MergeInputFault::TooFew => OwnerIndexError::TooFewMergeInputs,
+                MergeInputFault::Duplicate(id) => OwnerIndexError::DuplicateInput { id },
+                MergeInputFault::NonCanonical => OwnerIndexError::NonCanonicalMergeInputs,
+            });
         }
 
         let mut owner = None;
