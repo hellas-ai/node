@@ -6,7 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-api = ["dep:hellas-rpc", "hellas-rpc/chain"]
 # Chain/light-client domain vocabulary: addresses, transactions,
 # WebAuthn signature policy, challenge derivation (`domain` module), and
 # the staked fraud-game protocol (`staked` module — Channel, vouchers,
@@ -32,7 +31,8 @@ domain = [
 domain-consensus = ["domain", "dep:commonware-consensus"]
 client = ["client-core", "hellas-wire/ws"]
 client-core = [
-    "api",
+    "dep:hellas-rpc",
+    "hellas-rpc/chain",
     "dep:commonware-codec",
     "dep:commonware-cryptography",
     "dep:commonware-parallel",
@@ -71,7 +71,8 @@ indexer = [
     "domain-consensus",
 ]
 server = [
-    "api",
+    "dep:hellas-rpc",
+    "hellas-rpc/chain",
     "dep:futures-util",
     "dep:hellas-wire",
     "dep:p256",

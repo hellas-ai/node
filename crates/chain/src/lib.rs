@@ -4,13 +4,12 @@ extern crate tracing;
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
-#[cfg(any(feature = "client", feature = "wasm-client"))]
+#[cfg(feature = "client-core")]
 pub mod client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod config;
 #[cfg(any(
-    feature = "client",
-    feature = "wasm-client",
+    feature = "client-core",
     feature = "indexer",
     feature = "validator"
 ))]
@@ -25,7 +24,7 @@ pub mod faucet;
 pub mod follower;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod indexer;
-#[cfg(any(feature = "client", feature = "wasm-client", feature = "server"))]
+#[cfg(any(feature = "client-core", feature = "server"))]
 pub mod light_client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod owner_index;
@@ -39,8 +38,7 @@ pub mod staked;
 pub mod validator;
 
 #[cfg(any(
-    feature = "client",
-    feature = "wasm-client",
+    feature = "client-core",
     feature = "indexer",
     feature = "validator"
 ))]
@@ -49,8 +47,7 @@ pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
 #[cfg(any(
-    feature = "client",
-    feature = "wasm-client",
+    feature = "client-core",
     feature = "indexer",
     feature = "validator"
 ))]
@@ -64,7 +61,7 @@ pub use indexer::{
     BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,
     init_finalization_store, spawn_follower_indexer,
 };
-#[cfg(any(feature = "client", feature = "wasm-client", feature = "server"))]
+#[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, ProposalInfo,
