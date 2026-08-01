@@ -1,4 +1,4 @@
-use super::{store::UtxoDatabase, verifier::StakedOpenPolicy, working_set::BlockWorkingSet};
+use super::{store::UtxoDatabase, verifier::ChainVerifier, working_set::BlockWorkingSet};
 use crate::domain::{
     Address, Coin, MAX_STAKED_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey,
     Transaction, coin_object_id, edge_object_id, genesis_object_id, output_object_id,
@@ -9,7 +9,7 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::{Clock, Metrics, Storage};
 use hellas_kernel::{
     ApplyError, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event, EventKind,
-    InvalidProofReason, SealVerifier, SigVerifier, State, Tx as KernelTx,
+    InvalidProofReason, State, Tx as KernelTx,
 };
 use thiserror::Error;
 
@@ -105,16 +105,15 @@ where
         .map_err(storage_err)
 }
 
-pub async fn execute_all<E, V>(
+pub async fn execute_all<E>(
     context: KernelContext,
-    verifier: &V,
+    verifier: &ChainVerifier,
     txs: &[Transaction],
     genesis_allocations: &[(SettlementKey, u64)],
     batches: Batch<E>,
 ) -> Result<Batch<E>, ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     for tx in txs {
@@ -126,9 +125,9 @@ where
     Ok(batches)
 }
 
-pub async fn execute_proposal<E, V>(
+pub async fn execute_proposal<E>(
     context: KernelContext,
-    verifier: &V,
+    verifier: &ChainVerifier,
     candidates: Vec<Transaction>,
     genesis_allocations: &[(SettlementKey, u64)],
     max_txs: usize,
@@ -137,7 +136,6 @@ pub async fn execute_proposal<E, V>(
 ) -> Result<(Batch<E>, Vec<Transaction>, Vec<Transaction>), ExecutionError>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
     let mut included = Vec::new();
@@ -206,15 +204,14 @@ where
     batches
 }
 
-async fn apply_transaction<E, V>(
+async fn apply_transaction<E>(
     mut batches: Batch<E>,
     context: KernelContext,
-    verifier: &V,
+    verifier: &ChainVerifier,
     tx: &Transaction,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
     match tx {
         Transaction::Transfer {
@@ -548,18 +545,18 @@ where
 /// opens are refused unless the wired verifier admits them; admitted
 /// bonds must still commit a bounded lifetime, because lifetime fees are
 /// zero and a distant timeout would be operationally permanent.
-fn check_staked_open<V: StakedOpenPolicy>(
-    context: KernelContext,
-    verifier: &V,
-    tx: &KernelTx,
-) -> Result<(), ExecutionError> {
+fn check_staked_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionError> {
     let KernelTx::Open { terms, .. } = tx else {
         return Ok(());
     };
     if terms.as_stake_bond().is_none() {
         return Ok(());
     }
-    if !verifier.admits_staked_opens() {
+    // A bond whose `Violation` path can never verify is not a bond,
+    // just locked funds with a dead dispute game. The gate lifts
+    // exactly with the seal-verification capability, because it reads
+    // the same cfg that supplies it (`ChainVerifier::verify_seal`).
+    if !cfg!(feature = "preverified-seals") {
         return Err(ExecutionError::StakedOpenUnsupported);
     }
     let blocks = terms
@@ -575,17 +572,16 @@ fn check_staked_open<V: StakedOpenPolicy>(
     Ok(())
 }
 
-async fn apply_kernel_transaction<E, V>(
+async fn apply_kernel_transaction<E>(
     batches: Batch<E>,
     context: KernelContext,
-    verifier: &V,
+    verifier: &ChainVerifier,
     tx: &KernelTx,
 ) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
 where
     E: Storage + Clock + Metrics + Send + Sync + 'static,
-    V: SigVerifier + SealVerifier + StakedOpenPolicy,
 {
-    if let Err(err) = check_staked_open(context, verifier, tx) {
+    if let Err(err) = check_staked_open(context, tx) {
         return Err((batches, err));
     }
     let working = match load_kernel_slots(&batches, tx).await {
@@ -1054,38 +1050,9 @@ mod tests {
         use hellas_kernel::{
             Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
             MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
-            Payout as KernelPayout, ProtocolCode, SealPublicInputs, Sig, StakeBondTerms,
+            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms,
             Terms as KernelTerms,
         };
-
-        /// Delegates all verification to [`ChainVerifier`] but admits
-        /// staked opens, standing in for the future seal-capable dev
-        /// verifier.
-        struct AdmittingVerifier(ChainVerifier);
-        impl SigVerifier for AdmittingVerifier {
-            fn verify_sig(
-                &self,
-                sig: Sig,
-                party_key: KernelKey,
-                hash: hellas_kernel::PayloadHash,
-            ) -> bool {
-                self.0.verify_sig(sig, party_key, hash)
-            }
-        }
-        impl SealVerifier for AdmittingVerifier {
-            fn verify_seal(
-                &self,
-                seal: hellas_kernel::Seal,
-                public: &SealPublicInputs<'_>,
-            ) -> bool {
-                self.0.verify_seal(seal, public)
-            }
-        }
-        impl StakedOpenPolicy for AdmittingVerifier {
-            fn admits_staked_opens(&self) -> bool {
-                true
-            }
-        }
 
         let staked_open = |timeout: u64| {
             let terms = KernelTerms::stake_bond(StakeBondTerms {
@@ -1122,7 +1089,7 @@ mod tests {
             // before the kernel sees it, and dropped (not retained) from
             // proposals.
             #[cfg(not(feature = "preverified-seals"))]
-            let batches = {
+            {
                 let (batches, error) =
                     apply_transaction(batches, context(1), &ChainVerifier::new(), &staked_open(50))
                         .await
@@ -1144,11 +1111,15 @@ mod tests {
                 .expect("gated staked open is a non-fatal drop");
                 assert!(included.is_empty());
                 assert!(retained.is_empty());
-                batches
-            };
+                drop(batches);
+            }
 
-            // Admitting verifier: the lifetime cap holds...
-            let admitting = AdmittingVerifier(ChainVerifier::new());
+            // With the gate lifted (this leg compiles the seal-capable
+            // verifier, so `ChainVerifier` admits), the lifetime cap
+            // holds...
+            #[cfg(feature = "preverified-seals")]
+            {
+            let admitting = ChainVerifier::new();
             let over_cap = 1 + crate::domain::MAX_STAKED_LIFETIME_BLOCKS + 1;
             let (batches, error) =
                 apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
@@ -1173,6 +1144,7 @@ mod tests {
                     .err()
                     .expect("kernel still validates admitted staked opens");
             assert!(matches!(error, ExecutionError::KernelApply { .. }));
+            }
         });
     }
 
