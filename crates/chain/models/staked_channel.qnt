@@ -225,6 +225,22 @@ module staked_channel {
     lastSettle' = lastSettle,
   }
 
+  // The chain advances while the parties wait. Without a jump the
+  // late-settle window (height >= PaymentTimeout - CloseMargin) is
+  // unreachable in a bounded trace, which is how `TooLateToRedeem`
+  // came to be a `SettleOutcome` no trace could produce.
+  action jumpPastRedemptionMargin = all {
+    height < PaymentTimeout - CloseMargin,
+    cumulative' = cumulative,
+    sequence' = sequence,
+    activeJob' = activeJob,
+    activePrice' = activePrice,
+    height' = PaymentTimeout - CloseMargin,
+    lastInput' = TickInput,
+    lastAdmit' = lastAdmit,
+    lastSettle' = lastSettle,
+  }
+
   action step = any {
     nondet s = AllShapes.oneOf()
     admit(s),
@@ -232,6 +248,7 @@ module staked_channel {
     settle(cumulative + activePrice),
     settle(cumulative + activePrice + 1),
     tick,
+    jumpPastRedemptionMargin,
   }
 
   // ---------------------------------------------------------------
@@ -264,8 +281,15 @@ module staked_channel {
   val activeJobIsFunded =
     not(activeJob) or cumulative + activePrice <= Capacity
 
-  val heightMovesForward =
-    height >= 10
+  // NOTE: "the frontier only advanced while redemption was still
+  // possible" is deliberately NOT an invariant here. It is a property
+  // of the settle TRANSITION, not of any reachable state: once a
+  // frontier is settled the height keeps advancing past the margin,
+  // which is exactly the situation `Channel::redemption_due` exists to
+  // handle. Asserting it as a state invariant is simply false, and the
+  // simulator says so. The rule is enforced by `settleOutcome`
+  // returning `TooLateToRedeem`, and pinned end-to-end by
+  // `settleTooLateTest`, which is replayed against the real Channel.
 
   // ---------------------------------------------------------------
   // Named runs (each becomes an ITF trace replayed against Channel)
@@ -322,9 +346,16 @@ module staked_channel {
   // The redemption margin binds at settle time, not just at admission:
   // a client that stalls a voucher until the payment timeout is near
   // forfeits that job rather than stranding the provider.
+  // The redemption margin binds at SETTLE time, not just at admission:
+  // a client that stalls its voucher until the payment timeout is near
+  // forfeits that job rather than stranding the provider behind the
+  // full-capacity timeout refund.
   run settleTooLateTest =
     init
       .then(admit(Ordinary))
-      .then(tick)
-      .expect(activeJob and lastAdmit == Admitted)
+      .then(jumpPastRedemptionMargin)
+      .then(settle(400))
+      .expect(activeJob
+        and cumulative == 0
+        and lastSettle == TooLateToRedeem)
 }

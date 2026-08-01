@@ -330,7 +330,7 @@ let
     quint run models/staked_channel.qnt --max-samples=1000 --max-steps=10 \
       --invariants=atMostOneActiveJob --invariants=frontierWithinCapacity \
       --invariants=admittedJobsAreCovered --invariants=activeJobIsFunded \
-      --invariants=heightMovesForward --verbosity=1
+      --verbosity=1
   '';
 
   chainModelTest = mkModelApp {
