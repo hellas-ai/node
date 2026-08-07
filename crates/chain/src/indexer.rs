@@ -536,7 +536,7 @@ mod tests {
             write_buffer: 32,
             page_cache_size: 1024,
             page_cache_count: 8,
-            ..Config::mainnet()
+            ..Config::default()
         };
         let (indexer, handle) = spawn_follower_indexer(
             context.child("indexer"),

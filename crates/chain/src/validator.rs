@@ -999,7 +999,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
         });
 
-        let chain_config = Config::mainnet();
+        let chain_config = Config::default();
         let partition_prefix = format!("hellas_{me}");
         let page_cache = chain_config.page_cache(&context);
         let finalizations_by_height = init_finalization_store(

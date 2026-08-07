@@ -84,8 +84,8 @@ pub struct Config {
     pub max_repair: usize,
 }
 
-impl Config {
-    pub const fn mainnet() -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Self {
             mailbox_size: 1024,
             replay_buffer: 1024 * 1024,
@@ -103,6 +103,9 @@ impl Config {
             max_repair: 16,
         }
     }
+}
+
+impl Config {
 
     pub fn page_cache(self, pooler: &impl BufferPooler) -> CacheRef {
         let page_cache_count =
