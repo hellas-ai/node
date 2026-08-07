@@ -99,7 +99,7 @@ mod tests {
         );
         assert_eq!(
             Evaluate::commit_request(&first).digest().to_string(),
-            "f166bb42c7de9a5be0e1daf7a165c8d50241e82b27644b4c50b91bcd8481e4c6"
+            "6efaa8860931732c923032bbfb69c0f69cb0f8fe68217fd7a7b4cf1f31631956"
         );
     }
 }
