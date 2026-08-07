@@ -1291,7 +1291,8 @@ mod tests {
             fetch_routes: test_routes("echo", "run", provider, Arc::new(TestFetchProjectorFactory)),
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            artifact_store: ArtifactStoreConfig::Memory,
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+            artifact_store: ArtifactStoreConfig::memory(),
             staked: Some(crate::StakedProvider {
                 channel: staked_channel_fixture(),
                 chain: Arc::new(chain),
