@@ -152,7 +152,7 @@ async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(),
     let (indexer, _marshal) = spawn_follower_indexer(
         context.child("indexer"),
         &options.partition_prefix,
-        Config::mainnet(),
+        Config::default(),
         verifier,
         application.genesis_block(),
     )
