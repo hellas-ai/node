@@ -45,6 +45,13 @@ canonical payload hash. It is exactly 43 ASCII characters using `A-Z`, `a-z`,
 `0-9`, `-`, and `_`, with no `=` padding. An open signs `Tx::open_hash`; a
 cooperative close signs `Tx::payload_hash` with `CloseKind::Mutual`.
 
+Both hashes commit to the `NetworkId` the operation settles on, so the
+same open on two networks produces two different challenges and an
+assertion made for one is not a valid assertion on the other. A signer
+that does not know its network cannot construct the challenge, which is
+the intent: the network is a runtime input, never a compiled-in
+constant.
+
 `clientDataJSON` must be one complete top-level object, with optional JSON
 whitespace and no trailing bytes. Member order is unrestricted. It must contain
 exactly one literal, unescaped `"type"` member whose unescaped string value is
