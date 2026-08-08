@@ -13,7 +13,7 @@ use hellas_adaptors::{
 use hellas_client::{ExecutionRoute, ProducerTrust, ProviderTrustAnchor, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
-use hellas_models::{ChatMessage, ModelAssets, PreparedPrompt};
+use hellas_models::{ChatMessage, ModelAssets, PreparedPrompt, Reach};
 use hellas_rpc::Dtype;
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
@@ -238,9 +238,16 @@ impl GatewayState {
 
         let model_name = model.to_string();
         let dtype = self.dtype;
-        let assets = tokio::task::spawn_blocking(move || ModelAssets::load(&model_name, dtype))
-            .await
-            .context("local model loader panicked")??;
+        // The gateway is the operator's own client-side process: it
+        // tokenizes for requests it is itself submitting, so a download
+        // here is deliberate work on its owner's behalf. That is not
+        // true of anything inside the executor, which is why the reach
+        // is named at every call site rather than defaulted.
+        let assets = tokio::task::spawn_blocking(move || {
+            ModelAssets::load(&model_name, dtype, Reach::Download)
+        })
+        .await
+        .context("local model loader panicked")??;
 
         let assets = Arc::new(assets);
         let mut cache = self.model_cache.write().await;

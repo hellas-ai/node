@@ -85,8 +85,9 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::InvalidQuoteRequest(_)
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
-        ExecutorError::DtypeNotSupported { .. }
-        | ExecutorError::ModelNotMaterialized(_) => WireCode::FailedPrecondition,
+        ExecutorError::DtypeNotSupported { .. } | ExecutorError::ModelNotMaterialized(_) => {
+            WireCode::FailedPrecondition
+        }
         #[cfg(feature = "evaluate")]
         ExecutorError::ModelAssets(model_err) => hellas_models::model_assets_wire_code(model_err),
         ExecutorError::State(StateError::QuoteExpired(_)) => WireCode::FailedPrecondition,

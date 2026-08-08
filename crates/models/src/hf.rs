@@ -36,6 +36,10 @@ pub enum Reach {
 /// someone can forget to consult.
 pub(super) struct RepoFiles {
     model: ModelSpec,
+    /// Where this machine's HuggingFace client keeps its files. Read
+    /// once, so a resolver answers about one cache rather than about
+    /// whatever the environment happens to say per call.
+    cache: Cache,
     api: Option<ApiRepo>,
 }
 
@@ -45,10 +49,15 @@ impl RepoFiles {
             Reach::Local => None,
             Reach::Download => Some(model_repo(model)?),
         };
-        Ok(Self {
+        Ok(Self::with_cache(model, Cache::from_env(), api))
+    }
+
+    fn with_cache(model: &ModelSpec, cache: Cache, api: Option<ApiRepo>) -> Self {
+        Self {
             model: model.clone(),
+            cache,
             api,
-        })
+        }
     }
 
     /// The path to `file`, which this model cannot do without.
@@ -84,30 +93,35 @@ impl RepoFiles {
         if let Some(path) = self.local(file) {
             return Some(path);
         }
-        if self.is_pinned() {
-            // A pinned revision's snapshot directory is the whole truth
-            // about it; asking the hub would only re-derive a path we
-            // already know is empty.
-            return None;
-        }
         self.api.as_ref()?.get(file).ok()
     }
 
     /// Where `file` already is on this disk, if it is here at all.
-    ///
-    /// Exactly the lookup `ApiRepo::get` makes before it decides to
-    /// download, so what is local here is what a download would have
-    /// skipped.
     fn local(&self, file: &str) -> Option<PathBuf> {
-        if self.is_pinned() {
-            return immutable_snapshot_file(&self.model, file);
-        }
-        Cache::from_env().repo(repo_of(&self.model)).get(file)
+        local_file(&self.cache, &self.model, file)
     }
+}
 
-    fn is_pinned(&self) -> bool {
-        immutable_snapshot_root(Cache::from_env().path(), &self.model).is_some()
+/// Resolves `file` against a HuggingFace cache, and nothing else.
+///
+/// Two layouts, because a revision is either pinned or a branch:
+///
+/// - A 40-hex revision names a snapshot directory directly. This is also
+///   the no-network fast path a download would take, since `hf-hub`
+///   keeps no `refs/` entry for a commit sha and would otherwise ask the
+///   hub to re-derive what the path already says.
+/// - Anything else is a ref, resolved through `refs/<revision>` to the
+///   snapshot it currently points at — exactly the lookup `ApiRepo::get`
+///   makes before it decides to download.
+///
+/// So what this finds is what a download would have skipped, and what it
+/// does not find is what a download would have paid for.
+fn local_file(cache: &Cache, model: &ModelSpec, file: &str) -> Option<PathBuf> {
+    if let Some(root) = immutable_snapshot_root(cache.path(), model) {
+        let path = root.join(file);
+        return path.is_file().then_some(path);
     }
+    cache.repo(repo_of(model)).get(file)
 }
 
 fn repo_of(model: &ModelSpec) -> Repo {
@@ -129,11 +143,6 @@ fn model_repo(model: &ModelSpec) -> Result<ApiRepo> {
         .build()
         .map_err(|source| ModelAssetsError::BuildHfApi { source })?;
     Ok(api.repo(repo_of(model)))
-}
-
-fn immutable_snapshot_file(model: &ModelSpec, file: &str) -> Option<PathBuf> {
-    let path = immutable_snapshot_root(Cache::from_env().path(), model)?.join(file);
-    path.is_file().then_some(path)
 }
 
 fn immutable_snapshot_root(cache: &Path, model: &ModelSpec) -> Option<PathBuf> {
@@ -201,6 +210,175 @@ mod tests {
     use super::*;
 
     const REVISION: &str = "c1899de289a04d12100db370d81485cdf75e47ca";
+
+    /// A scratch cache root, unique per test so these run in parallel and
+    /// never read the developer's real HuggingFace cache.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hellas-hf-local-{}-{name}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch cache root");
+        root
+    }
+
+    fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("cache dirs");
+        std::fs::write(path, bytes).expect("write cache file");
+    }
+
+    /// Materializes `files` for `model` in `root`, in the layout the
+    /// HuggingFace client writes: a snapshot directory per commit, plus
+    /// a `refs/<branch>` pointer when the revision is a branch.
+    fn materialize(root: &Path, model: &ModelSpec, commit: &str, files: &[(&str, &[u8])]) {
+        let repo = root.join(repo_of(model).folder_name());
+        for (file, bytes) in files {
+            put(&repo.join("snapshots").join(commit).join(file), bytes);
+        }
+        if model.revision != commit {
+            put(&repo.join("refs").join(&model.revision), commit.as_bytes());
+        }
+    }
+
+    fn local_only(model: &ModelSpec, root: &Path) -> RepoFiles {
+        RepoFiles::with_cache(model, Cache::new(root.to_path_buf()), None)
+    }
+
+    #[test]
+    fn a_local_resolver_has_no_client_to_download_with() {
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        assert!(
+            RepoFiles::open(&model, Reach::Local)
+                .expect("local resolver")
+                .api
+                .is_none(),
+            "Reach::Local must not build a hub client at all",
+        );
+        assert!(
+            RepoFiles::open(&model, Reach::Download)
+                .expect("download resolver")
+                .api
+                .is_some(),
+        );
+    }
+
+    #[test]
+    fn pinned_revision_resolves_inside_its_snapshot() {
+        let root = scratch("pinned");
+        let model =
+            ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{REVISION}")).expect("valid model spec");
+        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
+
+        let repo = local_only(&model, &root);
+        assert_eq!(
+            repo.require("config.json").expect("materialized file"),
+            root.join("models--Qwen--Qwen3-0.6B")
+                .join("snapshots")
+                .join(REVISION)
+                .join("config.json"),
+        );
+        assert!(matches!(
+            repo.require("tokenizer.json"),
+            Err(ModelAssetsError::NotMaterialized { ref file, .. }) if file == "tokenizer.json",
+        ));
+        assert_eq!(repo.optional("chat_template.jinja"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn branch_revision_resolves_through_its_ref() {
+        let root = scratch("branch");
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
+
+        let repo = local_only(&model, &root);
+        assert_eq!(
+            repo.require("config.json").expect("materialized file"),
+            root.join("models--Qwen--Qwen3-0.6B")
+                .join("snapshots")
+                .join(REVISION)
+                .join("config.json"),
+        );
+        assert!(matches!(
+            repo.require("model.safetensors"),
+            Err(ModelAssetsError::NotMaterialized { ref file, .. }) if file == "model.safetensors",
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty cache is a refusal, not a download — and the refusal
+    /// names the model and the file the operator would have to supply.
+    #[test]
+    fn an_empty_cache_refuses_by_name() {
+        let root = scratch("empty");
+        let model = ModelSpec::parse("evil/enormous-repo").expect("valid model spec");
+
+        match local_only(&model, &root).require("config.json") {
+            Err(ModelAssetsError::NotMaterialized {
+                model_id,
+                revision,
+                file,
+            }) => {
+                assert_eq!(model_id, "evil/enormous-repo");
+                assert_eq!(revision, "main");
+                assert_eq!(file, "config.json");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the property: local reach refuses what is
+    /// missing *and* accepts what is present. A guard that refused
+    /// everything would pass the tests above and serve nothing.
+    #[test]
+    fn a_materialized_model_resolves_every_file_a_manifest_needs() {
+        let root = scratch("materialized");
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        let index = br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#;
+        materialize(
+            &root,
+            &model,
+            REVISION,
+            &[
+                ("config.json", b"{}"),
+                ("tokenizer.json", b"{}"),
+                ("tokenizer_config.json", b"{}"),
+                ("model.safetensors.index.json", index),
+                ("model-00001-of-00002.safetensors", b"shard one"),
+                ("model-00002-of-00002.safetensors", b"shard two"),
+            ],
+        );
+
+        let repo = local_only(&model, &root);
+        let snapshot = root
+            .join("models--Qwen--Qwen3-0.6B")
+            .join("snapshots")
+            .join(REVISION);
+        assert_eq!(
+            repo.optional("model.safetensors.index.json"),
+            Some(snapshot.join("model.safetensors.index.json")),
+        );
+        for file in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            assert_eq!(repo.require(file).expect(file), snapshot.join(file));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn immutable_revision_maps_directly_to_snapshot() {

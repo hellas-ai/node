@@ -434,7 +434,7 @@ impl PreparedRoute {
                 {
                     let handle = require_local_executor(runtime)?;
                     handle
-                        .load_model_metadata(local_model_spec(quote_req))
+                        .materialize_model(local_model_spec(quote_req))
                         .await
                         .exec_context("failed to load local model metadata")?;
                     let outcome = handle

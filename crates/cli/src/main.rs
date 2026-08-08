@@ -270,7 +270,9 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Load model metadata on startup. Repeat or use commas: --preload foo/bar --preload baz/qux@rev
+        /// Download a model on startup so it can be quoted. This is the only way this node
+        /// fetches a model: quotes are answered only for models already here. Repeat or use
+        /// commas: --preload foo/bar --preload baz/qux@rev
         #[arg(long = "preload", value_delimiter = ',')]
         preload_models: Vec<String>,
         /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)

@@ -148,7 +148,10 @@ async fn run_with_store(
     eprintln!("Explorer:     {add_url}");
 
     if !preload_models.is_empty() {
-        info!("Loaded model metadata: {}", preload_models.join(", "));
+        info!(
+            "Models available for quoting: {}",
+            preload_models.join(", ")
+        );
     }
 
     if matches!(options.execute_policy, ExecutePolicy::Skip) {

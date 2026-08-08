@@ -268,6 +268,15 @@ impl SchemeEngine for EvaluateEngine {
                 resolved.locator.spec()
             )));
         }
+        // The other way in. This quote does not build a manifest — the
+        // model comes from a stored artifact, and an artifact can be put
+        // here over the wire — so nothing above has yet established that
+        // the model is on this disk. Without this, a ticket issued here
+        // would be redeemed later by a worker whose loader downloads
+        // whatever it does not find: the same hole, one round trip
+        // further away.
+        let spec = resolved.locator.spec();
+        hellas_models::require_program_files(&spec).map_err(|err| refusal_for(&spec, err))?;
         let request_commitment = Evaluate::commit_request(&evaluate_request);
         let (terms, ticket) = quote_ticket(
             request_commitment,
@@ -466,9 +475,9 @@ impl SchemeEngine for EvaluateEngine {
             dtype: self.preferred_dtype(),
         };
         let key = locator.clone();
-        match ModelAssets::load(&locator.spec(), locator.dtype, Reach::Download)
-            .and_then(|assets| hellas_models::materialize_program_files(&key.spec()).map(|()| assets))
-        {
+        match ModelAssets::load(&locator.spec(), locator.dtype, Reach::Download).and_then(
+            |assets| hellas_models::materialize_program_files(&key.spec()).map(|()| assets),
+        ) {
             Ok(_) => {
                 self.models.insert(key.clone(), LocalModelStatus::Ready);
                 info!(
@@ -796,6 +805,123 @@ mod tests {
             },
             tx,
         )
+    }
+
+    /// The vulnerability, at the door it came in by: an unauthenticated
+    /// peer names a model and the node must refuse without fetching it.
+    ///
+    /// `ExecutePolicy::Eager` is the default and permits everything, so
+    /// the policy is deliberately left permissive here — what refuses
+    /// this quote is that the node does not hold the model, and a quote
+    /// may not make it hold one.
+    ///
+    /// The error variant is the assertion that carries the weight. A
+    /// quote path that downloaded would report a fetch failure (or, with
+    /// a real repository and a real network, would succeed after paying
+    /// for it); only a path that never asks the hub can answer
+    /// `ModelNotMaterialized`.
+    #[tokio::test]
+    async fn quoting_an_unmaterialized_model_is_refused_without_fetching_it() {
+        let mut engine = test_engine(Arc::new(key(2)));
+        let mut store = ExecutorState::new();
+        let runner = key(3).public_key();
+
+        let err = engine
+            .quote_prepared_text(
+                &mut store,
+                QuotePreparedTextRequest {
+                    huggingface_model_id: "hellas-test/not-on-this-node".to_string(),
+                    // Pinned, and to a commit no cache holds: nothing but
+                    // a download could resolve this.
+                    huggingface_revision: "c1899de289a04d12100db370d81485cdf75e47ca".to_string(),
+                    prompt_token_ids: vec![1, 2, 3],
+                    max_new_tokens: 4,
+                    stop_token_ids: Vec::new(),
+                    start: Some(EvaluateStart {
+                        kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+                    }),
+                    accept_dtypes: vec![Dtype::F32.as_wire().to_string()],
+                    runner_public_key: Some(public_key_to_pb(&runner)),
+                    assurance: Assurance::ProducerSigned.to_byte().into(),
+                    retain: Some(false),
+                },
+            )
+            .await
+            .expect_err("a model this node does not hold must not be quotable");
+
+        match &err {
+            ExecutorError::ModelNotMaterialized(message) => {
+                assert!(
+                    message.contains("hellas-test/not-on-this-node"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a not-materialized refusal, got {other:?}"),
+        }
+        // Answerable later, not forbidden: a client can ask the operator
+        // for the model and come back.
+        assert_eq!(
+            hellas_wire::WireStatus::from(err).code,
+            hellas_wire::WireCode::FailedPrecondition,
+        );
+        // A refused quote leaves nothing behind to be run against.
+        assert!(
+            store
+                .get_quote(&[0; 32], Instant::now())
+                .is_err_and(|err| matches!(err, crate::StateError::QuoteNotFound(_)))
+        );
+    }
+
+    /// The same door, one round trip further away: the evaluate quote
+    /// takes its model from a stored artifact rather than from the
+    /// request, and artifacts can be put here over the wire. A ticket
+    /// issued for a model this node does not hold would be redeemed by a
+    /// worker that downloads it, so the refusal has to happen here too.
+    #[tokio::test]
+    async fn quoting_an_artifact_bound_to_an_unmaterialized_model_is_refused() {
+        let mut engine = test_engine(Arc::new(key(2)));
+        let mut store = ExecutorState::new();
+        let plan = QuotePlan {
+            locator: ModelLocator {
+                model_id: "hellas-test/not-on-this-node".to_string(),
+                revision: "c1899de289a04d12100db370d81485cdf75e47ca".to_string(),
+                dtype: Dtype::F32,
+            },
+            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
+            invocation: Invocation {
+                input_ids: vec![1, 2, 3],
+                max_new_tokens: 8,
+                stop_token_ids: Vec::new(),
+            },
+            initial_artifact_id: None,
+            runner_public_key: key(3).public_key(),
+            assurance: Assurance::ProducerSigned,
+            retention: hellas_rpc::Retention::Retain,
+        };
+        let recorded = engine
+            .artifacts
+            .for_retention(plan.retention)
+            .record_prepared_text(&plan)
+            .await
+            .expect("record the prepared text an artifact quote resolves through");
+
+        let err = engine
+            .quote_evaluate(
+                &mut store,
+                evaluate_request_to_pb(&recorded.evaluate_request),
+            )
+            .await
+            .expect_err("a ticket must not be issued for a model this node does not hold");
+
+        match &err {
+            ExecutorError::ModelNotMaterialized(message) => {
+                assert!(
+                    message.contains("hellas-test/not-on-this-node"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a not-materialized refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

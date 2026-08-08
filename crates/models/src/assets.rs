@@ -74,6 +74,21 @@ pub fn program_manifest(
     })
 }
 
+/// Refuses unless every file a [`program_manifest`] for this model
+/// needs is already on this disk.
+///
+/// The cheap form of the same question `program_manifest` answers under
+/// [`Reach::Local`]: it resolves paths and does not hash them, so it
+/// costs a handful of `stat` calls. For paths that must not commit to
+/// work on a model this node would have to download later — a ticket
+/// issued now is a run that loads weights later, and the loader that
+/// runs then will fetch whatever it does not find.
+pub fn require_program_files(model: &str) -> Result<()> {
+    let spec = ModelSpec::parse(model)?;
+    get_program_files(&spec, Reach::Local)?;
+    Ok(())
+}
+
 /// Downloads every file a [`program_manifest`] for this model will
 /// need, so that a later [`Reach::Local`] manifest can succeed.
 ///

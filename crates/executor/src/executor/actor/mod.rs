@@ -318,9 +318,9 @@ impl Executor {
                     };
                     let _ = reply.send(result);
                 }
-                ExecutorMessage::LoadModelMetadata { model, reply } => {
+                ExecutorMessage::MaterializeModel { model, reply } => {
                     let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.load_model_metadata(model).await,
+                        Some(engine) => engine.materialize_model(model).await,
                         None => Err(evaluate_disabled()),
                     };
                     let _ = reply.send(result);

@@ -126,8 +126,13 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn load_model_metadata(&self, model: String) -> Result<(), ExecutorError> {
-        self.send(|reply| ExecutorMessage::LoadModelMetadata { model, reply })
+    /// Makes a model available on this node, downloading it if needed.
+    ///
+    /// Only an owner of the handle can call this — there is no RPC for
+    /// it — and calling it is what lets quotes for that model be
+    /// answered at all.
+    pub async fn materialize_model(&self, model: String) -> Result<(), ExecutorError> {
+        self.send(|reply| ExecutorMessage::MaterializeModel { model, reply })
             .await
     }
 
@@ -377,9 +382,14 @@ async fn load_decode_assets(
         ));
     }
     let spec = model_spec(&model_id, &revision);
-    let assets = tokio::task::spawn_blocking(move || ModelAssets::load(&spec, dtype))
-        .await
-        .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
+    // `decode_tokens` is a courtesy convenience any peer can call with a
+    // model id it chooses. Local reach, like every other peer-reachable
+    // path: it detokenizes with what this node holds or it refuses.
+    let assets = tokio::task::spawn_blocking(move || {
+        ModelAssets::load(&spec, dtype, hellas_models::Reach::Local)
+    })
+    .await
+    .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
     Ok(Arc::new(assets))
 }
 

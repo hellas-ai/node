@@ -88,7 +88,7 @@ pub(crate) enum ExecutorMessage {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
     },
-    LoadModelMetadata {
+    MaterializeModel {
         model: String,
         reply: oneshot::Sender<Result<(), ExecutorError>>,
     },
