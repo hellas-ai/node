@@ -10,16 +10,27 @@ use super::prompt::render_chat_prompt;
 use super::{ModelAssetsError, Result};
 use hellas_rpc::{decode_token_ids, spec::ModelSpec};
 
+pub use super::hf::Reach;
 pub use super::prompt::{ChatMessage, PreparedPrompt};
 
+/// The program manifest for a model: the content ids of everything an
+/// execution of it is a function of.
+///
+/// `reach` decides whether a model this node does not hold is an error
+/// or a download. A quote must pass [`Reach::Local`]: building a
+/// manifest reads every weight shard, and under [`Reach::Download`]
+/// resolving those shards *is* fetching them, so a quote answered with
+/// download reach turns "ask a stranger's node for a price" into "make a
+/// stranger's node download a repository of my choosing".
 pub fn program_manifest(
     model: &str,
     dtype: Dtype,
     backend_profile: &str,
+    reach: Reach,
 ) -> Result<EvaluateProgramManifest> {
     let spec = ModelSpec::parse(model)?;
     let (mut weight_paths, config_path, tokenizer_path, tokenizer_config_path) =
-        get_program_files(&spec)?;
+        get_program_files(&spec, reach)?;
     weight_paths.sort();
     let weights = weight_paths
         .iter()
@@ -61,6 +72,18 @@ pub fn program_manifest(
         backend_profile: backend_profile.to_string(),
         build,
     })
+}
+
+/// Downloads every file a [`program_manifest`] for this model will
+/// need, so that a later [`Reach::Local`] manifest can succeed.
+///
+/// The deliberate door: this is what an operator's preload runs, and it
+/// is the only path in the serving process that may spend bandwidth on a
+/// model. It is not reachable from any RPC.
+pub fn materialize_program_files(model: &str) -> Result<()> {
+    let spec = ModelSpec::parse(model)?;
+    get_program_files(&spec, Reach::Download)?;
+    Ok(())
 }
 
 /// Content id of the file at `path`.
@@ -115,10 +138,16 @@ pub struct ModelAssets {
 }
 
 impl ModelAssets {
-    pub fn load(model_name: &str, dtype: Dtype) -> Result<Self> {
+    /// Loads a model's metadata — config, tokenizer, chat template.
+    ///
+    /// `reach` decides what a model this node does not hold means.
+    /// Anything a peer can reach must pass [`Reach::Local`]: these files
+    /// are small only for repos that choose to make them small, and the
+    /// model id comes from the caller.
+    pub fn load(model_name: &str, dtype: Dtype, reach: Reach) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
         let (config_path, tokenizer_path, tokenizer_config_path, chat_template_path) =
-            get_model_metadata_files(&model)?;
+            get_model_metadata_files(&model, reach)?;
         let config_bytes = read_asset(&config_path)?;
         let config: Value = serde_json::from_slice(&config_bytes)
             .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;

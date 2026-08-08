@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
-use hellas_models::{ChatMessage, ModelAssets, PreparedQuote};
+use hellas_models::{ChatMessage, ModelAssets, PreparedQuote, Reach};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
@@ -36,7 +36,7 @@ use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
     ExecutorState, Invocation, LocalModelStatus, ModelLocator, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind,
     QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, model_spec,
-    quote_ticket, resolve_accept_dtypes,
+    quote_ticket, refusal_for, resolve_accept_dtypes,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
@@ -458,7 +458,7 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
-    async fn load_model_metadata(&mut self, model: String) -> Result<(), ExecutorError> {
+    async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError> {
         let spec = ModelSpec::parse(&model).map_err(hellas_models::ModelAssetsError::from)?;
         let locator = ModelLocator {
             model_id: spec.id,
@@ -466,14 +466,16 @@ impl SchemeEngine for EvaluateEngine {
             dtype: self.preferred_dtype(),
         };
         let key = locator.clone();
-        match ModelAssets::load(&locator.spec(), locator.dtype) {
+        match ModelAssets::load(&locator.spec(), locator.dtype, Reach::Download)
+            .and_then(|assets| hellas_models::materialize_program_files(&key.spec()).map(|()| assets))
+        {
             Ok(_) => {
                 self.models.insert(key.clone(), LocalModelStatus::Ready);
                 info!(
                     model = %key.model_id,
                     requested_revision = %key.revision,
                     dtype = %key.dtype,
-                    "loaded model metadata"
+                    "materialized model"
                 );
                 Ok(())
             }
@@ -755,12 +757,15 @@ fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError>
         .map_err(ExecutorError::InvalidQuoteRequest)
 }
 
-fn load_assets(
-    model_id: &str,
-    revision: &str,
-    dtype: Dtype,
-) -> Result<ModelAssets, hellas_models::ModelAssetsError> {
-    ModelAssets::load(&model_spec(model_id, revision), dtype)
+/// Tokenizer and config for a quote, from what this node already holds.
+///
+/// `quote_prompt` and `quote_chat_prompt` are reachable by any peer that
+/// can dial us and take a model id from the request, so they get the
+/// same local reach the manifest does. A repo's `tokenizer.json` is
+/// small only because its author chose to make it small.
+fn load_assets(model_id: &str, revision: &str, dtype: Dtype) -> Result<ModelAssets, ExecutorError> {
+    let spec = model_spec(model_id, revision);
+    ModelAssets::load(&spec, dtype, Reach::Local).map_err(|err| refusal_for(&spec, err))
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

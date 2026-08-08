@@ -72,37 +72,49 @@ pub(crate) struct QuotePlan {
 
 #[cfg(feature = "evaluate")]
 impl QuotePlan {
-    /// The content id of this model's program manifest.
+    /// The content id of this model's program manifest, built only from
+    /// files this node already holds.
     ///
-    /// Split out because it is the only expensive step: it resolves —
-    /// and on a cache miss downloads — every model file, then reads each
-    /// one to hash it. Callers on an async task must run it through
+    /// [`hellas_models::Reach::Local`] is the whole security property of
+    /// the quote path. Resolving a HuggingFace file path is downloading
+    /// it, so with download reach this function — reachable by any peer
+    /// that can dial us, with a model id it chooses — is a remote fetch
+    /// primitive: name a 700 GB repo and the node fetches it. Local
+    /// reach cannot: it holds no HTTP client at all, and a model that is
+    /// not here is [`ExecutorError::ModelNotMaterialized`].
+    ///
+    /// Still split out because it remains the expensive step even when
+    /// it downloads nothing: it reads every weight shard to hash it.
+    /// Callers on an async task must run it through
     /// [`tokio::task::spawn_blocking`]; run inline it holds the
-    /// executor's single actor task for the whole download, so one
-    /// quote stalls every run ticket, receipt and settle behind it.
+    /// executor's single actor task for the whole read, so one quote
+    /// stalls every run ticket, receipt and settle behind it.
     pub(crate) fn execution_environment(
         locator: &ModelLocator,
         backend: &str,
     ) -> Result<ContentId, ExecutorError> {
-        Ok(
-            hellas_rpc::ProgramManifest::Evaluate(hellas_models::program_manifest(
-                &locator.spec(),
-                locator.dtype,
-                backend,
-            )?)
-            .content_id(),
+        let manifest = hellas_models::program_manifest(
+            &locator.spec(),
+            locator.dtype,
+            backend,
+            hellas_models::Reach::Local,
         )
+        .map_err(|err| refusal_for(&locator.spec(), err))?;
+        Ok(hellas_rpc::ProgramManifest::Evaluate(manifest).content_id())
     }
 
     /// Builds the plan, refusing before the expensive part if
     /// `execute_policy` will not run this model.
     ///
     /// The policy is checked *here*, not by the caller afterwards.
-    /// Building the manifest resolves and — on a cache miss —
-    /// **downloads** the model, then reads every shard to hash it. A
-    /// check that runs after this function has returned has already
-    /// paid for a model it is about to refuse, which made even
-    /// `ExecutePolicy::Skip` a remote fetch primitive.
+    /// Building the manifest reads every shard of the model to hash it,
+    /// so a check that runs after this function has returned has already
+    /// paid for a model it is about to refuse.
+    ///
+    /// The policy is not what makes this safe, though — its default is
+    /// `Eager`, which permits everything. What makes it safe is that
+    /// [`Self::execution_environment`] resolves locally: the plan can
+    /// only be built for a model this node already holds.
     pub(crate) fn from_prepared_text_request(
         request: QuotePreparedTextRequest,
         supported_dtypes: &[Dtype],
@@ -183,6 +195,26 @@ impl QuotePlan {
             assurance,
             retention,
         })
+    }
+}
+
+/// Turns a model-layer failure into what a serving path says back.
+///
+/// One case is lifted out of the transparent `ModelAssets` passthrough:
+/// "this node does not hold that model" is a distinct, actionable answer
+/// and deserves a variant a client can match on, rather than being one
+/// more opaque asset error.
+#[cfg(feature = "evaluate")]
+pub(crate) fn refusal_for(
+    model: &str,
+    err: hellas_models::ModelAssetsError,
+) -> crate::ExecutorError {
+    match err {
+        hellas_models::ModelAssetsError::NotMaterialized { .. } => {
+            tracing::info!(model = %model, "refused a quote for a model this node does not hold");
+            ExecutorError::ModelNotMaterialized(err.to_string())
+        }
+        other => other.into(),
     }
 }
 

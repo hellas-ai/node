@@ -18,6 +18,10 @@ pub fn model_assets_wire_code(err: &ModelAssetsError) -> WireCode {
         | ModelAssetsError::MissingChatTemplate
         | ModelAssetsError::NegativeStopTokenId { .. }
         | ModelAssetsError::TokenBytes { .. } => WireCode::InvalidArgument,
+        // Not the caller's fault and not a server fault: a state of this
+        // node the operator can change. A client may legitimately retry
+        // after asking for the model to be made available.
+        ModelAssetsError::NotMaterialized { .. } => WireCode::FailedPrecondition,
         _ => WireCode::Internal,
     }
 }
