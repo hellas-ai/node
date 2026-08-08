@@ -128,16 +128,33 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
 /// Checking here is what makes a partial fetch safe: without it the only
 /// verification available is the file hash, which needs every byte.
 pub fn decode_range(bytes: &[u8], expected: &[Chunk]) -> Result<Vec<Vec<u8>>, XorbError> {
-    let mut decoded = Vec::with_capacity(expected.len());
+    decode_chunks(bytes, expected.len(), Some(expected))
+}
+
+/// Decodes `count` consecutive chunks, verifying each against
+/// `expected` when the caller has a chunk list to check against.
+///
+/// `None` is not laxity for its own sake: a client fetching content it
+/// has never indexed genuinely has nothing to check against, because a
+/// reconstruction response carries no chunk hashes. Such a fetch is
+/// verified once, whole, against the file hash.
+pub fn decode_chunks(
+    bytes: &[u8],
+    count: usize,
+    expected: Option<&[Chunk]>,
+) -> Result<Vec<Vec<u8>>, XorbError> {
+    let mut decoded = Vec::with_capacity(count);
     let mut offset = 0;
-    for chunk in expected {
+    for index in 0..count {
         let next = decode_chunk(bytes.get(offset..).ok_or(XorbError::Truncated)?)?;
-        let actual = chunk_hash(&next.data);
-        if actual != chunk.hash {
-            return Err(XorbError::HashMismatch {
-                expected: chunk.hash,
-                actual,
-            });
+        if let Some(chunk) = expected.and_then(|chunks| chunks.get(index)) {
+            let actual = chunk_hash(&next.data);
+            if actual != chunk.hash {
+                return Err(XorbError::HashMismatch {
+                    expected: chunk.hash,
+                    actual,
+                });
+            }
         }
         offset += next.consumed;
         decoded.push(next.data);

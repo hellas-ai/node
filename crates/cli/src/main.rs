@@ -428,6 +428,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::artifact::ArtifactCommand,
     },
+    /// Inspect and fill the content store
+    Store {
+        #[command(subcommand)]
+        command: commands::store::StoreCommand,
+    },
     /// Query or run Hellas chain components
     #[cfg(feature = "chain")]
     Chain {
@@ -620,8 +625,21 @@ async fn main() {
     // Running them must not create an unrelated provider identity as a side
     // effect; in particular, validator config generation runs in a pure Nix
     // build where there is deliberately no writable home directory.
-    #[cfg(feature = "chain")]
     let command = match cli.command {
+        Commands::Store { command } => {
+            let result = commands::store::run(command).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        command => command,
+    };
+
+    #[cfg(feature = "chain")]
+    let command = match command {
         Commands::Chain { command } => {
             let result = commands::chain::run(command).await;
             tracer_provider.shutdown();
@@ -633,9 +651,6 @@ async fn main() {
         }
         command => command,
     };
-
-    #[cfg(not(feature = "chain"))]
-    let command = cli.command;
 
     // show-node-id is a read-only query; never create an identity file as a
     // side effect of it (would race with a running service's own creator).
@@ -786,6 +801,7 @@ async fn main() {
         Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
+        Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(feature = "evaluate")]
         Commands::Llm {
             node_id,

@@ -70,6 +70,8 @@ hellas-executor = { workspace = true, default-features = false, optional = true 
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-models = { workspace = true, optional = true }
+hellas-store = { workspace = true }
+hellas-xet = { workspace = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
 ] }

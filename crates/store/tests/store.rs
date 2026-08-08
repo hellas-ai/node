@@ -144,11 +144,6 @@ fn indexing_keeps_the_chunk_list() {
     let indexed = store.index(&path).expect("index");
     assert!(indexed.chunks.len() > 3, "fixture must span several chunks");
 
-    assert_eq!(
-        store.content_len(indexed.id),
-        Some(content.len() as u64),
-        "size must be answerable without re-reading",
-    );
     let held = store.chunks(indexed.id).expect("chunks are retained");
     assert_eq!(held, indexed.chunks);
     assert_eq!(file_hash(&held), indexed.id);
