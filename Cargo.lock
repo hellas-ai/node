@@ -3625,7 +3625,9 @@ version = "0.1.0"
 dependencies = [
  "hellas-xet",
  "lz4_flex",
+ "serde_json",
  "thiserror 2.0.18",
+ "ureq 3.3.0",
 ]
 
 [[package]]
@@ -8740,6 +8742,7 @@ dependencies = [
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "socks",

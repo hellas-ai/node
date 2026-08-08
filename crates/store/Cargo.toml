@@ -11,3 +11,8 @@ documentation.workspace = true
 hellas-xet = { workspace = true, features = ["chunking"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "3", default-features = false, features = [
+    "rustls",
+    "platform-verifier",
+] }
