@@ -6,6 +6,7 @@
 //! assembly to them.
 
 mod assets;
+pub mod fastresume;
 mod hf;
 mod prompt;
 
@@ -19,8 +20,8 @@ use tokenizers::Error as TokenizerError;
 use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{
-    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, TextOutputDecoder, program_manifest,
-    to_catgrad_dtype,
+    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, TextOutputDecoder, content_id_of,
+    program_manifest, to_catgrad_dtype,
 };
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;

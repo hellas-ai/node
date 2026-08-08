@@ -303,18 +303,22 @@ impl SchemeEngine for EvaluateEngine {
     ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError> {
         let total_start = Instant::now();
         store.prune_expired_quotes(Instant::now());
-        let plan = QuotePlan::from_prepared_text_request(request, &self.supported_dtypes)?;
+        // Off the actor task: building a plan resolves and may download
+        // every model file, then reads each one to hash it. Run inline
+        // it pins a runtime worker thread for the whole of that, so a
+        // single quote degrades every other connection the process is
+        // serving. (It does not remove the executor's own serialization
+        // — the actor still awaits this before its next message.)
+        let supported_dtypes = self.supported_dtypes.clone();
+        let execute_policy = self.execute_policy.clone();
+        let plan = tokio::task::spawn_blocking(move || {
+            QuotePlan::from_prepared_text_request(request, &supported_dtypes, &execute_policy)
+        })
+        .await
+        .map_err(|err| {
+            ExecutorError::WeightsError(format!("quote planning task failed: {err}"))
+        })??;
         ensure_supported_assurance(plan.assurance, self.provider.assurance)?;
-
-        if !self
-            .execute_policy
-            .allows_execute(&plan.locator.spec(), Some(plan.locator.model_id.as_str()))
-        {
-            return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied model {}",
-                plan.locator.spec()
-            )));
-        }
 
         let resolved = self
             .artifacts

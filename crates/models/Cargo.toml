@@ -15,6 +15,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "execute",
 ] }
 hellas-wire = { workspace = true }
+hellas-xet = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 minijinja = { version = "2.11", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2.11", features = ["pycompat"] }
