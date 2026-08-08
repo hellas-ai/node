@@ -9,8 +9,8 @@
 
 use std::io::Write as _;
 
-use hellas_models::fastresume;
 use hellas_rpc::ContentId;
+use hellas_store::fastresume;
 
 /// Deterministic pseudorandom bytes; a constant run would never trigger
 /// a content-defined chunk boundary.

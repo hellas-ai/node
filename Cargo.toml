@@ -12,6 +12,7 @@ members = [
     "crates/kernel",
     "crates/models",
     "crates/rpc",
+    "crates/store",
     "crates/wire",
     "crates/xet",
 ]
@@ -64,6 +65,7 @@ hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-models = { path = "crates/models", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
+hellas-store = { path = "crates/store", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }

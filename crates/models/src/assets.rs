@@ -63,63 +63,26 @@ pub fn program_manifest(
     })
 }
 
-/// Content id of the file at `path`, streamed rather than held.
+/// Content id of the file at `path`.
 ///
-/// The reason this is not `ContentId::hash(&fs::read(path))`: weight
-/// shards run to gigabytes, and this is on the quote path. Reading in
-/// `STREAM_BUFFER` slices keeps peak memory flat regardless of file
-/// size, and [`crate::fastresume`] means an unchanged file is hashed
-/// once per process rather than once per quote.
+/// Delegates to the content store, which streams rather than holding
+/// the file and remembers what it hashed. The manifest and the store
+/// must agree on ids by construction, not by coincidence — this is the
+/// same code path, not a second implementation of it.
 pub fn content_id_of(path: &std::path::Path) -> Result<ContentId> {
-    use std::io::Read as _;
+    let indexed = store()
+        .index(path)
+        .map_err(|source| ModelAssetsError::Index { source })?;
+    Ok(ContentId::from_bytes(indexed.id.into_bytes()))
+}
 
-    /// Big enough that the read syscall is not the bottleneck, small
-    /// enough to be irrelevant next to a model.
-    const STREAM_BUFFER: usize = 1024 * 1024;
-
-    let mut file = std::fs::File::open(path).map_err(|source| ModelAssetsError::ReadAsset {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| ModelAssetsError::ReadAsset {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if let Some(id) = crate::fastresume::get(&metadata) {
-        return Ok(id);
-    }
-
-    let mut hasher = hellas_xet::XetFileHasher::new();
-    let mut buffer = vec![0_u8; STREAM_BUFFER];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| ModelAssetsError::ReadAsset {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let id = ContentId::from_bytes(hasher.finalize().into_bytes());
-
-    // Re-stat after reading: if the file changed while we were hashing,
-    // the identity we would record is not the one we hashed. Recording
-    // it would be worse than not caching at all.
-    let after = file
-        .metadata()
-        .map_err(|source| ModelAssetsError::ReadAsset {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if crate::fastresume::identical(&metadata, &after) {
-        crate::fastresume::put(&metadata, id);
-    }
-    Ok(id)
+/// The process-wide store the model layer indexes into.
+///
+/// A single instance so a weight file hashed for one quote is not
+/// hashed again for the next.
+pub fn store() -> &'static hellas_store::ContentStore {
+    static STORE: std::sync::OnceLock<hellas_store::ContentStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(hellas_store::ContentStore::new)
 }
 
 fn read_asset(path: &std::path::Path) -> Result<Vec<u8>> {
