@@ -9,4 +9,5 @@ documentation.workspace = true
 
 [dependencies]
 hellas-xet = { workspace = true, features = ["chunking"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
 thiserror = { workspace = true }
