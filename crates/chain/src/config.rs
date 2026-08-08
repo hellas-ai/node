@@ -8,7 +8,9 @@ use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-pub use hellas_genesis::{Genesis, GenesisAllocation as GenesisEntry, GenesisValidator};
+pub use hellas_genesis::{
+    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
+};
 use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -320,7 +322,7 @@ mod tests {
             relay_urls: Vec::new(),
             genesis: Genesis {
                 schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
-                network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
+                network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
                 validators: vec![GenesisValidator {
                     public_key,
                     label: "validator-0".to_string(),

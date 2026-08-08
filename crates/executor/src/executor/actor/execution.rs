@@ -70,7 +70,7 @@ impl Executor {
         if context.price != verified_run.terms.amount {
             return refuse("acceptance price does not match the ticket terms".into());
         }
-        let digest = context.digest();
+        let digest = context.digest(staked.channel.network());
         let verifier = hellas_kernel::Secp256k1Verifier::new();
         if !verifier.verify_sig(client_signature, staked.channel.client(), digest) {
             return refuse("acceptance client signature does not verify".into());
@@ -117,7 +117,8 @@ impl Executor {
         let Some(active) = staked.channel.active().copied() else {
             return Err(refuse("no job awaiting a receipt"));
         };
-        let digest = active.digest();
+        let network = staked.channel.network();
+        let digest = active.digest(network);
         if request.acceptance_digest.as_slice() != digest.as_bytes().as_slice() {
             return Err(refuse("receipt names a job other than the in-flight one"));
         }
@@ -136,13 +137,13 @@ impl Executor {
         if !hellas_kernel::Secp256k1Verifier::new().verify_sig(
             signature,
             staked.channel.client(),
-            hellas_chain::staked::receipt_request_digest(digest),
+            hellas_chain::staked::receipt_request_digest(network, digest),
         ) {
             return Err(refuse("receipt is not authorized by the channel's client"));
         }
         let transcript = self.terminal_commitment(active.request).await?;
         let signer = crate::kernel_signer(&self.provider.producer_key);
-        Ok(receipt_response(&signer, digest, transcript))
+        Ok(receipt_response(network, &signer, digest, transcript))
     }
 
     /// Staked-flow settlement: accepts the client's frontier voucher
@@ -164,8 +165,7 @@ impl Executor {
         let Some(staked) = self.staked.as_ref() else {
             return Err(refuse("provider does not run the staked flow".into()));
         };
-        let voucher = voucher_from_pb(request)
-            .map_err(ExecutorError::InvalidQuoteRequest)?;
+        let voucher = voucher_from_pb(request).map_err(ExecutorError::InvalidQuoteRequest)?;
         let Some(active_request) = staked.channel.active().map(|job| job.request) else {
             return Err(refuse("no job awaiting settlement".into()));
         };
@@ -1204,6 +1204,15 @@ mod tests {
         }
     }
 
+    /// The network these fixtures pair on. Every acceptance, receipt
+    /// and artifact below is bound to it, so the channel under test and
+    /// the digests it checks have to name the same one.
+    const TEST_NETWORK: hellas_kernel::NetworkId =
+        match hellas_kernel::NetworkId::new("hellas-executor-test") {
+            Some(network) => network,
+            None => panic!("literal is a legal network id"),
+        };
+
     fn key() -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
     }
@@ -1248,6 +1257,7 @@ mod tests {
         let payment =
             hellas_chain::staked::payment_terms(client, provider, BlockHeight::new(150), 5_000);
         hellas_chain::staked::Channel::new(
+            TEST_NETWORK,
             EdgeId::from_bytes([1; 32]),
             fixture_bond_terms(),
             EdgeId::from_bytes([2; 32]),
@@ -1312,8 +1322,9 @@ mod tests {
         hellas_rpc::pb::execute::ReceiptRequest {
             acceptance_digest: digest.as_bytes().to_vec(),
             client_signature: Some(crate::chain::sig_to_pb(
-                crate::kernel_signer(&client_key())
-                    .sign(hellas_chain::staked::receipt_request_digest(digest)),
+                crate::kernel_signer(&client_key()).sign(
+                    hellas_chain::staked::receipt_request_digest(TEST_NETWORK, digest),
+                ),
             )),
         }
     }
@@ -1346,7 +1357,7 @@ mod tests {
         channel
             .admit(hellas_kernel::BlockHeight::new(10), context)
             .expect("client admits its own job");
-        let signature = crate::kernel_signer(&client_key()).sign(context.digest());
+        let signature = crate::kernel_signer(&client_key()).sign(context.digest(TEST_NETWORK));
         let mut request = run_ticket_request(ticket, &client_key());
         request.acceptance = Some(crate::acceptance_to_pb(&context, signature));
         (request, context)
@@ -1427,7 +1438,7 @@ mod tests {
 
         // The receipt completes a fraud artifact that binds to the
         // fixture bond under the kernel's pinned slash payouts.
-        let digest = first_job.digest();
+        let digest = first_job.digest(TEST_NETWORK);
         let receipt = handle
             .receipt_handle(receipt_request(digest))
             .await
@@ -1458,6 +1469,7 @@ mod tests {
         slots[1] = hellas_kernel::Payout::new(fixture_treasury(), 500);
         let payouts = hellas_kernel::List::take(slots, 2);
         assert!(artifact.binds(&hellas_kernel::SealPublicInputs {
+            network: TEST_NETWORK,
             edge_id: hellas_kernel::EdgeId::from_bytes([1; 32]),
             terms: &bond,
             payouts: &payouts,
@@ -1537,7 +1549,7 @@ mod tests {
         let (mut forged, context) = acceptance_for(&mut staked_channel_fixture(), ticket, 60);
         forged.acceptance = Some(crate::acceptance_to_pb(
             &context,
-            crate::kernel_signer(&key()).sign(context.digest()),
+            crate::kernel_signer(&key()).sign(context.digest(TEST_NETWORK)),
         ));
         assert!(matches!(
             handle.run_ticket_handle(forged).await,
@@ -1572,7 +1584,9 @@ mod tests {
         // The provider is now blocked mid-run: the job is in flight and
         // nothing is terminally recorded.
 
-        let receipt = handle.receipt_handle(receipt_request(job.digest())).await;
+        let receipt = handle
+            .receipt_handle(receipt_request(job.digest(TEST_NETWORK)))
+            .await;
         assert!(
             matches!(
                 receipt,
@@ -1676,7 +1690,7 @@ mod tests {
         let (admitted, job) = acceptance_for(&mut client_channel, ticket, 60);
         let outcome = handle.run_ticket_handle(admitted).await.unwrap();
         let (_chunks, _finished) = drain_outcome(outcome.events).await;
-        let digest = job.digest();
+        let digest = job.digest(TEST_NETWORK);
 
         // THE REPLAY CASE. The client's signature over the acceptance
         // digest travels on the wire inside the run ticket, so any
@@ -2013,7 +2027,7 @@ mod tests {
         let mut request = run_ticket_request(ticket, &key());
         request.acceptance = Some(crate::acceptance_to_pb(
             &context,
-            crate::kernel_signer(&client_key()).sign(context.digest()),
+            crate::kernel_signer(&client_key()).sign(context.digest(TEST_NETWORK)),
         ));
         let refused = handle.run_ticket_handle(request).await;
         assert!(matches!(

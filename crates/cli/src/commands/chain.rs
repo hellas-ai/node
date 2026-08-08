@@ -1,12 +1,15 @@
 use std::time::Duration;
 use std::{fs, path::PathBuf};
 
+use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
+use hellas_chain::config::{Genesis, HELLAS_DEVNET_1_JSON};
 use hellas_chain::domain::{Digest, SettlementKey, Transaction};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
-    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
+    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId, Parties, Payout, Proof, ProtocolCode,
+    Terms, Tx,
 };
 
 use self::signer::{AuthScheme, DevSigner};
@@ -45,6 +48,10 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
+    /// Genesis document naming the network to sign for
+    /// (default: the built-in hellas-devnet-1 document)
+    #[arg(long)]
+    genesis: Option<PathBuf>,
     /// Maker secret-scalar file path (32 raw bytes or 64 hex digits)
     #[arg(long)]
     maker_key: PathBuf,
@@ -82,6 +89,10 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
+    /// Genesis document naming the network to sign for
+    /// (default: the built-in hellas-devnet-1 document)
+    #[arg(long)]
+    genesis: Option<PathBuf>,
     /// Hex-encoded kernel edge ID
     #[arg(long)]
     edge_id: String,
@@ -432,7 +443,9 @@ async fn run_open(args: OpenArgs) -> CliResult {
         timeout_outputs,
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
-    let open_hash = Tx::open_hash(&funding, &terms);
+    let client = connect_verified(args.rpc).await?;
+    let network = network_for(args.genesis, &client).await?;
+    let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
         funding,
         terms.clone(),
@@ -446,10 +459,7 @@ async fn run_open(args: OpenArgs) -> CliResult {
     if let Some(path) = args.terms_out {
         write_terms(&path, &terms)?;
     }
-    connect_verified(args.rpc)
-        .await?
-        .submit_tx(Transaction::Kernel(tx))
-        .await?;
+    client.submit_tx(Transaction::Kernel(tx)).await?;
 
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     println!("terms_hash {}", hex::encode(terms.hash().to_bytes()));
@@ -462,6 +472,7 @@ async fn run_close(args: CloseArgs) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
     let client = connect_verified(args.rpc).await?;
+    let network = network_for(args.genesis, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
     let proof = match args.kind {
@@ -477,8 +488,13 @@ async fn run_close(args: CloseArgs) -> CliResult {
             if SettlementKey::from(taker.party_key()) != edge.taker {
                 anyhow::bail!("taker key file does not control the live edge taker");
             }
-            let hash =
-                Tx::payload_hash(edge_id, KernelCloseKind::Mutual, edge.terms_hash, &outputs);
+            let hash = Tx::payload_hash(
+                network,
+                edge_id,
+                KernelCloseKind::Mutual,
+                edge.terms_hash,
+                &outputs,
+            );
             Proof::mutual(maker.sign(hash)?, taker.sign(hash)?)
         }
         CloseKind::Timeout => {
@@ -519,6 +535,34 @@ async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
     let client = RemoteLightClient::connect(rpc).await?;
     let consensus_info = client.get_consensus_info().await?;
     Ok(client.with_consensus_info(&consensus_info)?)
+}
+
+/// Resolves the network to sign for, and refuses if the node on the
+/// other end is not on it.
+///
+/// The genesis document is the authority — a signature has to be built
+/// before anyone can tell you whether it was wanted — but the node
+/// reports its own network, so the mismatch is worth catching here
+/// rather than as an unexplained rejected transaction. Pointing devnet
+/// keys at a testnet node is exactly the mistake this slice makes
+/// impossible to get away with silently.
+async fn network_for(genesis: Option<PathBuf>, client: &RemoteLightClient) -> CliResult<NetworkId> {
+    let document = match genesis {
+        Some(path) => std::fs::read_to_string(&path)
+            .with_context(|| format!("reading genesis document {}", path.display()))?,
+        None => HELLAS_DEVNET_1_JSON.to_string(),
+    };
+    let genesis: Genesis =
+        serde_json::from_str(&document).context("parsing the genesis document")?;
+    let network = hellas_chain::config::network_id(&genesis)?;
+
+    let reported = client.get_consensus_info().await?.network_id;
+    if reported != network.as_str() {
+        anyhow::bail!(
+            "genesis names network `{network}`, but the node at the other end reports `{reported}`",
+        );
+    }
+    Ok(network)
 }
 
 async fn get_live_edge(

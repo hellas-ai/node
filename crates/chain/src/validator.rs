@@ -488,7 +488,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         }
         None => Genesis {
             schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
-            network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
+            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()

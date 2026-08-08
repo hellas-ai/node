@@ -10,9 +10,21 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
-pub const DEFAULT_NETWORK_ID: &str = "hellas-devnet-1";
+
+/// The in-tree development network's document.
 pub const HELLAS_DEVNET_1_JSON: &str =
     include_str!("../../../networks/hellas-devnet-1/genesis.json");
+
+/// The id that document names.
+///
+/// Deliberately *not* called a default. Nothing reads this to decide
+/// what network it is on — a node reads its own genesis document, and
+/// every signature domain takes the id as a runtime value. This exists
+/// so tooling that synthesises a fresh devnet document has a name to
+/// write into it. A constant that presents itself as "the network" is
+/// how one moved string silently re-domains every signature in the
+/// tree, which is a mistake this repository has already made once.
+pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
 const PUBLIC_KEY_HEX_BYTES: usize = 64;
 const MAX_NETWORK_ID_BYTES: usize = 63;
@@ -146,7 +158,7 @@ mod tests {
     fn fixture() -> Genesis {
         Genesis {
             schema_version: GENESIS_SCHEMA_VERSION,
-            network_id: DEFAULT_NETWORK_ID.to_string(),
+            network_id: HELLAS_DEVNET_1_ID.to_string(),
             validators: vec![
                 GenesisValidator {
                     public_key: "11".repeat(32),
@@ -164,11 +176,13 @@ mod tests {
         }
     }
 
+    /// The id constant and the document are two copies of one fact;
+    /// this is what keeps them from drifting apart.
     #[test]
-    fn canonical_devnet_genesis_is_valid() {
+    fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
         let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
         genesis.validate().unwrap();
-        assert_eq!(genesis.network_id, DEFAULT_NETWORK_ID);
+        assert_eq!(genesis.network_id, HELLAS_DEVNET_1_ID);
         assert_eq!(genesis.validators.len(), 6);
         assert_eq!(genesis.allocations.len(), 2);
     }
