@@ -48,7 +48,8 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`) or a full network id
+    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
     /// Genesis document to sign for, instead of a shipped network
@@ -91,7 +92,8 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`) or a full network id
+    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
     /// Genesis document to sign for, instead of a shipped network
@@ -447,8 +449,9 @@ async fn run_open(args: OpenArgs) -> CliResult {
         timeout_outputs,
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
+    let network = selected_network(&args.network, args.genesis)?;
     let client = connect_verified(args.rpc).await?;
-    let network = network_for(&args.network, args.genesis, &client).await?;
+    let network = confirm_network(network, &client).await?;
     let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
         funding,
@@ -475,8 +478,9 @@ async fn run_open(args: OpenArgs) -> CliResult {
 async fn run_close(args: CloseArgs) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
+    let network = selected_network(&args.network, args.genesis)?;
     let client = connect_verified(args.rpc).await?;
-    let network = network_for(&args.network, args.genesis, &client).await?;
+    let network = confirm_network(network, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
     let proof = match args.kind {
@@ -550,22 +554,14 @@ async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
 /// rather than as an unexplained rejected transaction. Pointing devnet
 /// keys at a testnet node is exactly the mistake this slice makes
 /// impossible to get away with silently.
-/// `--network` names one of the documents compiled into this binary;
-/// `--genesis` hands over a document instead, for a network that does
-/// not ship with it. Either way what comes back is a document, because
-/// a network id on its own is not enough to check anything against.
+/// Resolves the network to sign for, without touching the network.
 ///
-/// The local choice is the authority — a signature has to be built
-/// before anyone can tell you whether it was wanted — but the node
-/// reports its own network, so the mismatch is caught here rather than
-/// as an unexplained rejected transaction. Pointing devnet keys at a
-/// testnet node is exactly the mistake this makes impossible to get
-/// away with silently.
-async fn network_for(
-    network: &str,
-    genesis: Option<PathBuf>,
-    client: &RemoteLightClient,
-) -> CliResult<NetworkId> {
+/// `--network` names one of the documents compiled into this binary;
+/// `--genesis` hands over a document instead, for a network this binary
+/// does not ship. Local and fallible first, so a mistyped network is
+/// reported as a mistyped network rather than as whatever the RPC
+/// endpoint happens to say.
+fn selected_network(network: &str, genesis: Option<PathBuf>) -> CliResult<NetworkId> {
     let document = match genesis {
         Some(path) => std::fs::read_to_string(&path)
             .with_context(|| format!("reading genesis document {}", path.display()))?,
@@ -582,8 +578,18 @@ async fn network_for(
     };
     let genesis: Genesis =
         serde_json::from_str(&document).context("parsing the genesis document")?;
-    let network = hellas_chain::domain::network_id(&genesis)?;
+    Ok(hellas_chain::domain::network_id(&genesis)?)
+}
 
+/// Refuses if the node on the other end is not on `network`.
+///
+/// The local selection is the authority — a signature has to be built
+/// before anyone can tell you whether it was wanted — but the node
+/// reports its own network, so the mismatch is caught here rather than
+/// as an unexplained rejected transaction. Pointing devnet keys at a
+/// testnet node is exactly the mistake this makes impossible to get
+/// away with silently.
+async fn confirm_network(network: NetworkId, client: &RemoteLightClient) -> CliResult<NetworkId> {
     let reported = client.get_consensus_info().await?.network_id;
     if reported != network.as_str() {
         anyhow::bail!(
