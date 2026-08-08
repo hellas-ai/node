@@ -80,10 +80,15 @@ Three layers, deliberately:
 The hashing is checked against the published Xet spec vectors, and the
 xorb decoder against 50,469 bytes fetched from HuggingFace's own CAS.
 
-Not covered: byte-grouping (compression scheme 2) is exercised only
-against this crate's own encoder, because both chunks in the production
-fixture use scheme 1. A fixture containing a BG4 chunk should precede
-depending on BG4 content.
+Byte-grouping (scheme 2) is covered too, against a fixture from
+`HuggingFaceTB/SmolLM2-135M` whose chunks are both scheme 2 and both a
+ragged length — the case where an ungrouper that assumes equal groups
+goes wrong. The oracle is not our own decoder: HuggingFace serves the
+reconstructed plaintext for the same byte range, and our decoded chunks
+must equal it.
+
+Still not covered: multi-term and multi-xorb reconstructions, a non-zero
+`offset_into_first_range`, and the HTTP layer itself.
 
 ## Why this crate uses `ureq` and not `reqwest`
 
