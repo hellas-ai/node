@@ -21,19 +21,6 @@ use std::{
 };
 use thiserror::Error;
 
-/// The network id a loaded genesis document names.
-///
-/// The single conversion from "the document this node was started with"
-/// to "the network every signature it makes is bound to". Nothing else
-/// in the tree decides what network a node is on — there is deliberately
-/// no compile-time default, because a binary that carries one will
-/// silently re-domain every signature when that constant moves.
-pub fn network_id(genesis: &Genesis) -> Result<NetworkId, ConfigError> {
-    genesis.validate()?;
-    NetworkId::new(&genesis.network_id)
-        .ok_or_else(|| ConfigError::UnrepresentableNetworkId(genesis.network_id.clone()))
-}
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid hex key data")]
@@ -50,8 +37,8 @@ pub enum ConfigError {
     MissingLocalValidator,
     #[error("configured peer identities do not match the genesis committee")]
     PeerSetMismatch,
-    #[error("genesis network id `{0}` does not fit a kernel NetworkId")]
-    UnrepresentableNetworkId(String),
+    #[error(transparent)]
+    NetworkId(#[from] crate::domain::NetworkIdError),
     #[error("invalid network address")]
     InvalidAddress(#[from] std::net::AddrParseError),
     #[error("duplicate keys in peer address map")]
@@ -150,13 +137,13 @@ pub struct PeerEntry {
 impl ValidatorConfig {
     pub fn validate_genesis(&self) -> Result<(), ConfigError> {
         self.genesis.validate()?;
-        network_id(&self.genesis)?;
+        self.network_id()?;
         Ok(())
     }
 
     /// The network every signature domain on this node is bound to.
     pub fn network_id(&self) -> Result<NetworkId, ConfigError> {
-        network_id(&self.genesis)
+        Ok(crate::domain::network_id(&self.genesis)?)
     }
 
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {

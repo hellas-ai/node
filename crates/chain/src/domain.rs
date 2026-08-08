@@ -464,6 +464,26 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
 
+/// A genesis document names a network id the kernel cannot carry.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("genesis network id `{0}` does not fit a kernel NetworkId")]
+pub struct NetworkIdError(pub String);
+
+/// The network id a loaded genesis document names.
+///
+/// The single conversion from "the document this node was started
+/// with" to "the network every signature it makes is bound to". It
+/// lives here, beside the challenge builders it feeds, rather than in
+/// `config`: reading a network off a document is what every signer
+/// does, and only a validator reads a validator config.
+///
+/// There is deliberately no compile-time default. A binary that
+/// carries one silently re-domains every signature in the tree the
+/// moment that constant moves, which is not hypothetical.
+pub fn network_id(genesis: &hellas_genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
+    NetworkId::new(&genesis.network_id).ok_or_else(|| NetworkIdError(genesis.network_id.clone()))
+}
+
 /// Writes the network-scoped domain prefix every `WebAuthn` challenge
 /// starts with.
 ///
