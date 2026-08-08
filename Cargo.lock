@@ -3577,6 +3577,7 @@ dependencies = [
  "catgrad-llm-models",
  "chrono",
  "hellas-rpc",
+ "hellas-store",
  "hellas-wire",
  "hellas-xet",
  "hf-hub 0.5.0",
@@ -3616,6 +3617,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "web-time",
+]
+
+[[package]]
+name = "hellas-store"
+version = "0.1.0"
+dependencies = [
+ "hellas-xet",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

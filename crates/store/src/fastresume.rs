@@ -33,11 +33,10 @@
 //!
 //! # Scope
 //!
-//! In-process only, and deliberately so. A persisted cache is a
-//! correctness contract that survives restarts, upgrades and crashes,
-//! and it should not be introduced before the content store that will
-//! own it. This removes every repeat cost within a process and carries
-//! no such contract.
+//! In-process only, so far. A persisted record is a correctness
+//! contract that survives restarts, upgrades and crashes; this removes
+//! every repeat cost within a process and carries no such contract. It
+//! now lives with the store that will own the persisted version.
 
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -45,7 +44,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use hellas_rpc::ContentId;
+use crate::Indexed;
 
 /// What a file must still look like for its recorded hash to be reused.
 ///
@@ -74,8 +73,8 @@ impl FileIdentity {
     }
 }
 
-fn records() -> &'static Mutex<HashMap<FileIdentity, ContentId>> {
-    static RECORDS: OnceLock<Mutex<HashMap<FileIdentity, ContentId>>> = OnceLock::new();
+fn records() -> &'static Mutex<HashMap<FileIdentity, Indexed>> {
+    static RECORDS: OnceLock<Mutex<HashMap<FileIdentity, Indexed>>> = OnceLock::new();
     RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -84,19 +83,24 @@ fn records() -> &'static Mutex<HashMap<FileIdentity, ContentId>> {
 ///
 /// Keyed on identity rather than path so the same blob reached through
 /// two revisions' snapshot symlinks is hashed once.
-pub(crate) fn get(metadata: &Metadata) -> Option<ContentId> {
+pub(crate) fn get(metadata: &Metadata) -> Option<Indexed> {
     let identity = FileIdentity::of(metadata);
     records()
         .lock()
-        .map(|records| records.get(&identity).copied())
-        .unwrap_or_default()
+        .ok()
+        .and_then(|records| records.get(&identity).cloned())
 }
 
-/// Records that `metadata`'s file hashed to `id`.
-pub(crate) fn put(metadata: &Metadata, id: ContentId) {
+/// Records what indexing `metadata`'s file produced.
+///
+/// The chunk list is stored, not just the id: re-deriving the id costs
+/// a full read, and the chunk list is what a later partial fetch needs
+/// to be verifiable. Remembering only the id would make the cheap thing
+/// cheap and leave the valuable thing to be recomputed.
+pub(crate) fn put(metadata: &Metadata, indexed: &Indexed) {
     let identity = FileIdentity::of(metadata);
     if let Ok(mut records) = records().lock() {
-        records.insert(identity, id);
+        records.insert(identity, indexed.clone());
     }
 }
 

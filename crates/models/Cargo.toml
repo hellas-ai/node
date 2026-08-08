@@ -14,6 +14,7 @@ chrono = "0.4"
 hellas-rpc = { workspace = true, default-features = false, features = [
     "execute",
 ] }
+hellas-store = { workspace = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
