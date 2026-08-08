@@ -34,9 +34,11 @@
 //! Xet hash of the bytes — measured, on real files, with sha256
 //! confirming the bytes were the ones HF meant.
 //!
-//! So the tree is read as a *hint*: it tells us which ids HuggingFace
-//! believes a file has, which is useful for spotting a file we already
-//! hold, and useless as proof. Ids in the store are ones we computed.
+//! So the tree is not read at all. It could serve as a hint — "this is
+//! probably content we already hold" — but a hint we must verify anyway
+//! saves nothing, and code that reads an id we have decided not to
+//! trust invites someone to trust it later. Ids in the store are ones
+//! we computed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -119,48 +121,6 @@ impl HfCache {
             }
         }
         Ok(adopted)
-    }
-
-    /// Ids this cache advertises, per file, read from `trees/*.json`.
-    ///
-    /// A hint only — see the module docs on bridged legacy content. Use
-    /// it to notice that a file is probably one we already hold, never
-    /// to name content in the store.
-    #[must_use]
-    pub fn advertised_ids(&self) -> Vec<(PathBuf, XetHash)> {
-        let mut advertised = Vec::new();
-        for repo in self.repo_directories() {
-            let trees = repo.join("trees");
-            let Ok(entries) = std::fs::read_dir(&trees) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
-                let Some(files) = value.get("files").and_then(serde_json::Value::as_object) else {
-                    continue;
-                };
-                let commit = entry
-                    .path()
-                    .file_stem()
-                    .map(PathBuf::from)
-                    .unwrap_or_default();
-                for (name, meta) in files {
-                    if let Some(hash) = meta
-                        .get("xet_hash")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|hash| hash.parse::<XetHash>().ok())
-                    {
-                        advertised.push((repo.join("snapshots").join(&commit).join(name), hash));
-                    }
-                }
-            }
-        }
-        advertised
     }
 
     /// `models--*` / `datasets--*` directories directly under the root.

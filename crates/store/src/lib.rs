@@ -140,7 +140,6 @@ pub struct ContentStore {
 struct Entry {
     path: PathBuf,
     chunks: Vec<Chunk>,
-    len: u64,
 }
 
 impl ContentStore {
@@ -337,18 +336,6 @@ impl ContentStore {
         &self.records
     }
 
-    /// Byte length of indexed content, without reading it.
-    ///
-    /// A quote needs the size to price work; making it re-read the file
-    /// to learn it would undo the point of indexing.
-    #[must_use]
-    pub fn content_len(&self, id: XetHash) -> Option<u64> {
-        self.index
-            .read()
-            .ok()
-            .and_then(|index| index.get(&id).map(|entry| entry.len))
-    }
-
     /// Number of distinct contents indexed.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -368,7 +355,6 @@ impl ContentStore {
                 Entry {
                     path: path.to_path_buf(),
                     chunks: indexed.chunks.clone(),
-                    len: indexed.len,
                 },
             );
         }

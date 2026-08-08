@@ -104,12 +104,6 @@ pub(crate) fn identical(before: &Metadata, after: &Metadata) -> bool {
 }
 
 impl Records {
-    /// An empty table.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// What indexing this file produced last time, if it still looks
     /// exactly the same.
     ///

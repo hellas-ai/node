@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod rpc;
 #[cfg(feature = "node")]
 pub mod serve;
+pub mod store;
 
 pub(crate) fn http_client(request_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()

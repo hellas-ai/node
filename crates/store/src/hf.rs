@@ -42,8 +42,6 @@ use std::path::Path;
 
 use hellas_xet::{Chunk, XetFileHasher, XetHash};
 
-use crate::xorb::decode_chunk;
-
 /// Which kind of repository a model lives in. The API path pluralises
 /// it, which is why this is not just a string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,13 +263,6 @@ impl HfCas {
         }
     }
 
-    /// Points at a different hub. For tests and mirrors.
-    #[must_use]
-    pub fn with_hub(mut self, hub: impl Into<String>) -> Self {
-        self.hub = hub.into();
-        self
-    }
-
     /// Obtains a CAS read token.
     ///
     /// Deliberately sends no `Authorization` header: public repositories
@@ -332,15 +323,14 @@ impl HfCas {
                 // Verify per-chunk when we already know what to expect.
                 // Without a chunk list this is impossible: the response
                 // carries no chunk hashes.
-                let decoded = match expected {
-                    Some(chunks) => {
-                        let slice = chunks
+                let slice = expected
+                    .map(|chunks| {
+                        chunks
                             .get(chunk_index..chunk_index + count)
-                            .ok_or_else(|| FetchError::Malformed("chunk list too short".into()))?;
-                        crate::xorb::decode_range(&bytes, slice)?
-                    }
-                    None => decode_all(&bytes, count)?,
-                };
+                            .ok_or_else(|| FetchError::Malformed("chunk list too short".into()))
+                    })
+                    .transpose()?;
+                let decoded = crate::xorb::decode_chunks(&bytes, count, slice)?;
                 for data in decoded {
                     assembled.extend_from_slice(&data);
                 }
@@ -389,22 +379,6 @@ pub fn verified(id: XetHash, assembled: &[u8], offset: u64) -> Result<&[u8]> {
         });
     }
     Ok(content)
-}
-
-/// Decodes `count` consecutive chunks with no expected hashes.
-fn decode_all(bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
-    let mut decoded = Vec::with_capacity(count);
-    let mut offset = 0;
-    for _ in 0..count {
-        let next = decode_chunk(
-            bytes
-                .get(offset..)
-                .ok_or(crate::xorb::XorbError::Truncated)?,
-        )?;
-        offset += next.consumed;
-        decoded.push(next.data);
-    }
-    Ok(decoded)
 }
 
 fn get(url: &str, bearer: Option<&str>) -> Result<Vec<u8>> {
