@@ -150,6 +150,10 @@ pub(crate) const fn edge_key(tag: EdgeTag) -> l1::EdgeKey {
 pub(crate) fn context_for_height(height: i64) -> Result<Context, String> {
     let height = u64::try_from(height).map_err(|_| format!("negative l1 height: {height}"))?;
     Ok(Context::new(
+        // The trace is network-agnostic: the model describes the game,
+        // not the deployment. Any single network reproduces it, so long
+        // as the trace and the kernel agree on one. Network separation
+        // itself is pinned by tests/network.rs.
         super::NETWORK,
         BlockHeight::new(height),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),

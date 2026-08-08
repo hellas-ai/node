@@ -53,6 +53,29 @@ module assumptions {
   // `proofOk` is a pure predicate so determinism holds by construction.
 
   // ---------------------------------------------------------------------
+  // Network
+  // ---------------------------------------------------------------------
+
+  // Every trace is a SINGLE-NETWORK trace, and the model has no notion of
+  // a network at all. The real `Tx::open_hash` and `Tx::payload_hash`
+  // commit to the `NetworkId` in `Context`, so a witness made for one
+  // deployment is not admissible on another; `openAuth` and `proofOk`
+  // abstract that away and say only "the named party authorized this",
+  // never "...here".
+  //
+  // Deliberate. Cross-network replay is not a temporal property — no
+  // reachable sequence of actions on one network exhibits it — so a
+  // two-network model would multiply the state space without making any
+  // new property expressible. It is a hash-domain property, and it is
+  // pinned in Rust by `tests/network.rs`, which replays an identical
+  // transaction under two networks and requires the second to be
+  // rejected.
+  //
+  // Consequence of violation: if the signature domains were NOT network
+  // separated, every proof in this model would still hold, and would
+  // still be about a chain whose witnesses another chain could spend.
+
+  // ---------------------------------------------------------------------
   // Store
   // ---------------------------------------------------------------------
 

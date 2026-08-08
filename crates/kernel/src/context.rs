@@ -5,6 +5,13 @@
 //! `heightMonotonic` assumption in `models/deps/assumptions.qnt` is what
 //! lets the kernel trust [`BlockHeight`] without re-checking every apply.
 //!
+//! [`NetworkId`] has no abstract counterpart: the models are
+//! single-network and do not represent one. That is deliberate and
+//! recorded under "Network" in `models/deps/assumptions.qnt` — cross-
+//! network replay is not reachable by any sequence of actions on one
+//! network, so it is pinned in Rust (`tests/network.rs`) rather than
+//! modelled.
+//!
 //! # Deliberately absent
 //!
 //! - **Wall-clock timestamp.** A BFT-safe block timestamp is its own
