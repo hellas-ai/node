@@ -30,6 +30,15 @@ pub const MAX_CHUNK_SIZE: usize = 128 * 1024;
 /// Boundary mask used with the Gear rolling hash.
 pub const CHUNK_BOUNDARY_MASK: u64 = 0xffff_0000_0000_0000;
 
+/// Bytes of input the GearHash window spans; after this many the rolling
+/// state no longer depends on where feeding began.
+#[cfg(feature = "chunking")]
+const HASH_WINDOW_SIZE: usize = 64;
+/// Bytes at the start of a chunk that cannot produce an accepted
+/// boundary, so the rolling hash is not fed them.
+#[cfg(feature = "chunking")]
+const INITIAL_SKIP: usize = MIN_CHUNK_SIZE - HASH_WINDOW_SIZE - 1;
+
 const TREE_BRANCHING_FACTOR: u64 = 4;
 const MAX_GROUP_SIZE: usize = 2 * TREE_BRANCHING_FACTOR as usize + 1;
 const MAX_ENTRY_SIZE: usize = 64 + 3 + 20 + 1;
@@ -306,9 +315,6 @@ impl SingleChunkHasher {
 #[cfg(feature = "chunking")]
 #[must_use]
 pub fn chunk(bytes: &[u8]) -> Vec<Chunk> {
-    const HASH_WINDOW_SIZE: usize = 64;
-    const INITIAL_SKIP: usize = MIN_CHUNK_SIZE - HASH_WINDOW_SIZE - 1;
-
     let mut chunks = Vec::new();
     let mut start = 0;
 
@@ -335,6 +341,142 @@ pub fn chunk(bytes: &[u8]) -> Vec<Chunk> {
     }
 
     chunks
+}
+
+/// Streaming Xet file hasher: the same split [`chunk`] produces, without
+/// holding the input.
+///
+/// [`chunk`] and [`XetHash::hash`] take a whole `&[u8]`, so hashing a
+/// multi-gigabyte file costs a multi-gigabyte allocation. This consumes
+/// arbitrary buffers and yields the identical chunk list, so the caller
+/// reads with a buffer of its own choosing.
+///
+/// Equivalence is exact, not approximate. `gearhash::Hasher` is a single
+/// rolling `u64` and `next_match` leaves it at the matched position, so
+/// splitting the input across calls cannot change where a boundary
+/// falls.
+///
+/// Keep the chunk list, not just the id. It is the metainfo that makes a
+/// later partial fetch of the same file verifiable — a Xet file hash is
+/// a Merkle root over exactly these descriptors, and the reconstruction
+/// protocol does not hand chunk hashes back.
+#[cfg(feature = "chunking")]
+pub struct XetFileHasher {
+    /// Rolling boundary detector for the chunk being accumulated.
+    gear: gearhash::Hasher<'static>,
+    /// DATA-keyed leaf hash of the chunk being accumulated.
+    leaf: blake3::Hasher,
+    /// Bytes accumulated into the current chunk. The only carrier of the
+    /// `INITIAL_SKIP` / `MIN_CHUNK_SIZE` / `MAX_CHUNK_SIZE` rules.
+    chunk_len: usize,
+    chunks: Vec<Chunk>,
+}
+
+#[cfg(feature = "chunking")]
+impl Default for XetFileHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "chunking")]
+impl XetFileHasher {
+    /// Creates a hasher over an empty input.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            gear: gearhash::Hasher::default(),
+            leaf: blake3::Hasher::new_keyed(&DATA_KEY),
+            chunk_len: 0,
+            chunks: Vec::new(),
+        }
+    }
+
+    /// Appends `input`, emitting chunks as their boundaries are found.
+    ///
+    /// Any split of the same byte sequence across calls yields the same
+    /// chunks.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "every index is bounded by input.len() or by MAX_CHUNK_SIZE minus chunk_len"
+    )]
+    pub fn update(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            // Bytes below INITIAL_SKIP are never fed to the rolling
+            // hash, exactly as `chunk` skips them.
+            //
+            // Why that is safe, and why it is an ARGUMENT rather than a
+            // tested fact: `hash = (hash << 1) + table[b]`, so after
+            // HASH_WINDOW_SIZE bytes nothing fed earlier remains in the
+            // bits CHUNK_BOUNDARY_MASK examines. Since
+            // `INITIAL_SKIP + HASH_WINDOW_SIZE == MIN_CHUNK_SIZE - 1`,
+            // the state at the first position where a boundary may be
+            // *accepted* cannot depend on what came before the skip.
+            //
+            // The same argument is why resetting `gear` in `cut` is
+            // belt-and-braces: mutation testing confirms neither the
+            // skip nor the reset is observable. A test for this was
+            // attempted and deleted — the forgetting horizon is nearer
+            // than the first boundary in any realistic fixture, so the
+            // test could not fail and would have been decoration. If
+            // gearhash ever widened its window, this comment is what
+            // would be wrong, and nothing would catch it.
+            if self.chunk_len < INITIAL_SKIP {
+                let skip = (INITIAL_SKIP - self.chunk_len).min(input.len());
+                self.leaf.update(&input[..skip]);
+                self.chunk_len += skip;
+                input = &input[skip..];
+                continue;
+            }
+
+            // A chunk is cut at MAX_CHUNK_SIZE whether or not the
+            // rolling hash ever matched, so never scan past it.
+            let take = input.len().min(MAX_CHUNK_SIZE - self.chunk_len);
+            let window = &input[..take];
+
+            if let Some(consumed) = self.gear.next_match(window, CHUNK_BOUNDARY_MASK) {
+                self.leaf.update(&window[..consumed]);
+                self.chunk_len += consumed;
+                input = &input[consumed..];
+                // A match below MIN_CHUNK_SIZE is discarded and the
+                // search continues with the gear state it left behind.
+                if self.chunk_len >= MIN_CHUNK_SIZE {
+                    self.cut();
+                }
+            } else {
+                self.leaf.update(window);
+                self.chunk_len += take;
+                input = &input[take..];
+                if self.chunk_len == MAX_CHUNK_SIZE {
+                    self.cut();
+                }
+            }
+        }
+    }
+
+    /// Finishes the trailing partial chunk and returns the chunk list.
+    #[must_use]
+    pub fn finalize_chunks(mut self) -> Vec<Chunk> {
+        if self.chunk_len > 0 {
+            self.cut();
+        }
+        self.chunks
+    }
+
+    /// Finishes and returns the Xet file hash.
+    #[must_use]
+    pub fn finalize(self) -> XetHash {
+        file_hash(&self.finalize_chunks())
+    }
+
+    /// Emits the accumulated chunk and starts the next one.
+    fn cut(&mut self) {
+        let hash = XetHash::from(*self.leaf.finalize().as_bytes());
+        self.chunks.push(Chunk::new(hash, self.chunk_len as u64));
+        self.gear = gearhash::Hasher::default();
+        self.leaf = blake3::Hasher::new_keyed(&DATA_KEY);
+        self.chunk_len = 0;
+    }
 }
 
 /// Computes the Merkle root over ordered `(hash, length)` chunk descriptors.
