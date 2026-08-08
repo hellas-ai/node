@@ -18,6 +18,13 @@ pub const HELLAS_DEVNET_1_JSON: &str =
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
+/// The in-tree test network's document.
+pub const HELLAS_TESTNET_1_JSON: &str =
+    include_str!("../../../networks/hellas-testnet-1/genesis.json");
+
+/// The id that document names.
+pub const HELLAS_TESTNET_1_ID: &str = "hellas-testnet-1";
+
 /// A network whose genesis document ships inside the binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownNetwork {
@@ -42,11 +49,18 @@ pub struct KnownNetwork {
 /// once. Adding a network here adds an entry; it never moves an
 /// existing one. Nothing reads this list to decide what network it is
 /// on: a caller names one, or hands over a document.
-pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
-    name: "devnet",
-    id: HELLAS_DEVNET_1_ID,
-    json: HELLAS_DEVNET_1_JSON,
-}];
+pub const KNOWN_NETWORKS: &[KnownNetwork] = &[
+    KnownNetwork {
+        name: "devnet",
+        id: HELLAS_DEVNET_1_ID,
+        json: HELLAS_DEVNET_1_JSON,
+    },
+    KnownNetwork {
+        name: "testnet",
+        id: HELLAS_TESTNET_1_ID,
+        json: HELLAS_TESTNET_1_JSON,
+    },
+];
 
 /// Looks up a shipped network by its short name (`devnet`) or its full
 /// id (`hellas-devnet-1`).
@@ -233,6 +247,45 @@ mod tests {
         }
         assert_eq!(known_network("mainnet"), None);
         assert_eq!(known_network(""), None);
+    }
+
+    /// No two shipped networks may share a name, an id, or — the one
+    /// that actually matters — a validator committee. Two networks with
+    /// the same committee are one network wearing two names, and every
+    /// separation argument above it is decoration.
+    #[test]
+    fn shipped_networks_share_no_name_id_committee_or_account() {
+        let mut names = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut addresses = BTreeSet::new();
+
+        for network in KNOWN_NETWORKS {
+            assert!(
+                names.insert(network.name),
+                "duplicate name {}",
+                network.name
+            );
+            assert!(ids.insert(network.id), "duplicate id {}", network.id);
+
+            let genesis: Genesis = serde_json::from_str(network.json).unwrap();
+            for validator in &genesis.validators {
+                assert!(
+                    keys.insert(validator.public_key.clone()),
+                    "{} reuses validator key {}",
+                    network.name,
+                    validator.public_key,
+                );
+            }
+            for allocation in &genesis.allocations {
+                assert!(
+                    addresses.insert(allocation.address.clone()),
+                    "{} reuses funded account {}",
+                    network.name,
+                    allocation.address,
+                );
+            }
+        }
     }
 
     #[test]

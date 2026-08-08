@@ -1565,6 +1565,41 @@ mod tests {
         assert!(!tx.verify_signature(TEST_NETWORK, &sender));
     }
 
+    /// The funded accounts in the shipped genesis documents are
+    /// derivations, not opaque strings.
+    ///
+    /// Both networks' READMEs promise that their funded accounts come
+    /// from specific low secret scalars, which is what makes them
+    /// usable — a wrong address there is an unspendable balance and a
+    /// document nobody can tell is wrong by looking at it. This derives
+    /// them and checks. It also pins that the two networks fund
+    /// different scalars, so a devnet key is not silently funded on
+    /// testnet.
+    #[test]
+    fn shipped_genesis_allocations_match_their_documented_scalars() {
+        fn address_for(scalar: u8) -> String {
+            let mut raw = [0_u8; 32];
+            raw[31] = scalar;
+            let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("valid scalar");
+            SettlementKey::from(addr_from_signing_key(&key)).to_string()
+        }
+
+        for (json, scalars) in [
+            (hellas_genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
+            (hellas_genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
+        ] {
+            let genesis: hellas_genesis::Genesis =
+                serde_json::from_str(json).expect("shipped document parses");
+            let funded: Vec<&str> = genesis
+                .allocations
+                .iter()
+                .map(|allocation| allocation.address.as_str())
+                .collect();
+            let expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
+            assert_eq!(funded, expected, "{}", genesis.network_id);
+        }
+    }
+
     #[test]
     fn address_base58_roundtrip() {
         let addr = addr_from_signing_key(&secp256r1_key_from_seed(42));
