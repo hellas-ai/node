@@ -330,6 +330,7 @@ mod tests {
             let batches = database.new_batches().await;
             let batches = execute_all(
                 KernelContext::with_fees(
+                    crate::domain::TEST_NETWORK,
                     BlockHeight::new(1),
                     BlockHash::from_bytes([0; BlockHash::LENGTH]),
                     KERNEL_FEES,
@@ -356,7 +357,8 @@ mod tests {
                 .expect("finalized floor");
             assert_eq!(latest.payload, floor_block.digest());
             let finalized_payload = latest.payload;
-            let uninitialized_index = OwnerIndex::new(&genesis, allocations.clone());
+            let uninitialized_index =
+                OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
             assert!(matches!(
                 get_edge_at(
                     &database,
@@ -373,6 +375,7 @@ mod tests {
             let batches = database.new_batches().await;
             let batches = execute_all(
                 KernelContext::with_fees(
+                    crate::domain::TEST_NETWORK,
                     BlockHeight::new(2),
                     BlockHash::from_bytes([0; BlockHash::LENGTH]),
                     KERNEL_FEES,
@@ -388,7 +391,7 @@ mod tests {
             let state_root = merkleized.root();
             database.finalize(merkleized).await;
 
-            let index = OwnerIndex::new(&genesis, allocations.clone());
+            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
             assert_eq!(
                 index.apply_finalized(&floor_block),
                 Ok(ApplyOutcome::Applied)
@@ -483,7 +486,7 @@ mod tests {
                 Err(QueryError::StateUnavailable(_))
             ));
 
-            let skewed_index = OwnerIndex::new(&genesis, allocations);
+            let skewed_index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations);
             assert_eq!(
                 skewed_index.apply_finalized(&floor_block),
                 Ok(ApplyOutcome::Applied)

@@ -16,8 +16,8 @@
 
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    Parties, Payout, ProtocolCode, Secp256k1Signer, SoftPasskey, SoftPasskeyError, Terms,
-    Tx as KernelTx,
+    NetworkId, Parties, Payout, ProtocolCode, Secp256k1Signer, SoftPasskey, SoftPasskeyError,
+    Terms, Tx as KernelTx,
 };
 
 /// Protocol code for the faucet's `Basic` bridge edge.
@@ -63,6 +63,7 @@ impl Faucet {
     /// sign the canonical open hash.
     pub fn open(
         &self,
+        network: NetworkId,
         genesis_coin: CoinId,
         recipient: Key,
         value: u64,
@@ -80,11 +81,8 @@ impl Faucet {
             List::take([genesis_coin; MAX_PARTY_INPUTS], 1),
             List::take([genesis_coin; MAX_PARTY_INPUTS], 0),
         );
-        let open_hash = KernelTx::open_hash(&funding, &terms);
-        let assertion = self
-            .funder
-            .sign(open_hash)
-            ?;
+        let open_hash = KernelTx::open_hash(network, &funding, &terms);
+        let assertion = self.funder.sign(open_hash)?;
         let open = KernelTx::open(
             funding.clone(),
             terms.clone(),
@@ -113,6 +111,7 @@ mod tests {
 
     fn context(height: u64) -> KernelContext {
         KernelContext::with_fees(
+            crate::domain::TEST_NETWORK,
             BlockHeight::new(height),
             BlockHash::from_bytes([0; BlockHash::LENGTH]),
             crate::domain::KERNEL_FEES,
@@ -144,7 +143,13 @@ mod tests {
             let faucet = Faucet::new(passkey(21), secp(22));
             let genesis_coin = CoinId::from_bytes(genesis_object_id(0).0);
             let (open, terms, edge) = faucet
-                .open(genesis_coin, recipient, VALUE, BlockHeight::new(TIMEOUT))
+                .open(
+                    crate::domain::TEST_NETWORK,
+                    genesis_coin,
+                    recipient,
+                    VALUE,
+                    BlockHeight::new(TIMEOUT),
+                )
                 .expect("faucet builds the bridge open");
             // The genesis funds are owned by the faucet's P-256 identity.
             let allocations = vec![(SettlementKey::from(faucet.funder_key()), VALUE)];

@@ -1,8 +1,8 @@
 use super::{store::UtxoDatabase, verifier::ChainVerifier, working_set::BlockWorkingSet};
 use crate::domain::{
-    MergeInputFault, merge_input_fault,
-    Address, Coin, MAX_EDGE_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey,
-    Transaction, coin_object_id, edge_object_id, genesis_object_id, output_object_id,
+    Address, Coin, MAX_EDGE_LIFETIME_BLOCKS, MergeInputFault, Object, ObjectId, ObjectKind,
+    SettlementKey, Transaction, coin_object_id, edge_object_id, genesis_object_id,
+    merge_input_fault, output_object_id,
 };
 use commonware_codec::{Encode, EncodeSize};
 use commonware_cryptography::{Hasher, Sha256};
@@ -234,7 +234,7 @@ where
                 Ok(owner) => owner,
                 Err(err) => return Err((batches, err)),
             };
-            if !tx.verify_signature(&owner) {
+            if !tx.verify_signature(context.network(), &owner) {
                 return Err((batches, ExecutionError::InvalidSignature));
             }
             if *amount == 0 {
@@ -344,7 +344,7 @@ where
                 Ok(address) => address,
                 Err(err) => return Err((batches, err)),
             };
-            if !tx.verify_signature(&address) {
+            if !tx.verify_signature(context.network(), &address) {
                 return Err((batches, ExecutionError::InvalidSignature));
             }
 
@@ -634,6 +634,7 @@ mod tests {
 
     fn context(height: u64) -> KernelContext {
         KernelContext::with_fees(
+            crate::domain::TEST_NETWORK,
             BlockHeight::new(height),
             BlockHash::from_bytes([height.saturating_sub(1) as u8; BlockHash::LENGTH]),
             KERNEL_FEES,
@@ -826,6 +827,7 @@ mod tests {
             allocations.push((SettlementKey::from(&legacy_owner), 90));
 
             let transfer = Transaction::transfer(
+                crate::domain::TEST_NETWORK,
                 &validator_key(21),
                 genesis_object_id(4),
                 legacy_recipient,
@@ -869,7 +871,7 @@ mod tests {
                 SettlementKey::from(timeout_parties.taker()),
             ];
             let genesis = index_genesis();
-            let index = OwnerIndex::new(&genesis, allocations.clone());
+            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
             let first_txs = vec![
                 transfer,
                 Transaction::Kernel(mutual.open.clone()),
@@ -1092,11 +1094,15 @@ mod tests {
                 ))
             };
             let over = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
-            let (batches, error) =
-                apply_transaction(batches, context(1), &ChainVerifier::new(), &basic_open(over))
-                    .await
-                    .err()
-                    .expect("an unbounded basic open is refused");
+            let (batches, error) = apply_transaction(
+                batches,
+                context(1),
+                &ChainVerifier::new(),
+                &basic_open(over),
+            )
+            .await
+            .err()
+            .expect("an unbounded basic open is refused");
             assert_eq!(
                 error,
                 ExecutionError::EdgeLifetimeExceeded {
@@ -1121,8 +1127,7 @@ mod tests {
         use hellas_kernel::{
             Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
             MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
-            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms,
-            Terms as KernelTerms,
+            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms, Terms as KernelTerms,
         };
 
         let staked_open = |timeout: u64| {
@@ -1190,31 +1195,31 @@ mod tests {
             // holds...
             #[cfg(feature = "preverified-seals")]
             {
-            let admitting = ChainVerifier::new();
-            let over_cap = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
-            let (batches, error) =
-                apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
-                    .await
-                    .err()
-                    .expect("over-cap staked open refused");
-            assert_eq!(
-                error,
-                ExecutionError::EdgeLifetimeExceeded {
-                    blocks: crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1,
-                    max: crate::domain::MAX_EDGE_LIFETIME_BLOCKS,
-                }
-            );
+                let admitting = ChainVerifier::new();
+                let over_cap = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
+                let (batches, error) =
+                    apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
+                        .await
+                        .err()
+                        .expect("over-cap staked open refused");
+                assert_eq!(
+                    error,
+                    ExecutionError::EdgeLifetimeExceeded {
+                        blocks: crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1,
+                        max: crate::domain::MAX_EDGE_LIFETIME_BLOCKS,
+                    }
+                );
 
-            // ...and an in-cap staked open falls through to ordinary
-            // kernel validation (here: rejected by the kernel because the
-            // committed stake exceeds the zero funding — proof the gate
-            // itself no longer blocks it).
-            let (_batches, error) =
-                apply_transaction(batches, context(1), &admitting, &staked_open(50))
-                    .await
-                    .err()
-                    .expect("kernel still validates admitted staked opens");
-            assert!(matches!(error, ExecutionError::KernelApply { .. }));
+                // ...and an in-cap staked open falls through to ordinary
+                // kernel validation (here: rejected by the kernel because the
+                // committed stake exceeds the zero funding — proof the gate
+                // itself no longer blocks it).
+                let (_batches, error) =
+                    apply_transaction(batches, context(1), &admitting, &staked_open(50))
+                        .await
+                        .err()
+                        .expect("kernel still validates admitted staked opens");
+                assert!(matches!(error, ExecutionError::KernelApply { .. }));
             }
         });
     }

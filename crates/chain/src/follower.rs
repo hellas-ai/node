@@ -9,6 +9,7 @@ use commonware_consensus::Heightable;
 use commonware_cryptography::Digestible;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use futures_util::StreamExt as _;
+use hellas_kernel::NetworkId;
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -26,6 +27,8 @@ pub enum FollowerError {
     NonUtf8StorageDirectory(PathBuf),
     #[error("invalid validator key data")]
     InvalidValidatorKey,
+    #[error("chain reported network id `{0}`, which does not fit a kernel NetworkId")]
+    UnrepresentableNetworkId(String),
     #[error("invalid {field}: expected 32 bytes, got {len}")]
     InvalidDigest { field: &'static str, len: usize },
     #[error("activity event was missing its event body")]
@@ -141,8 +144,12 @@ async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(),
     let consensus_info = client.get_consensus_info().await?;
     let verifier = ConsensusVerifier::new(&consensus_info)?;
     let genesis_leader = genesis_leader(&consensus_info)?;
+    let network = NetworkId::new(&consensus_info.network_id).ok_or_else(|| {
+        FollowerError::UnrepresentableNetworkId(consensus_info.network_id.clone())
+    })?;
     let application = Application::new(
         context.child("app"),
+        network,
         genesis_leader,
         Vec::new(),
         &format!("{}-genesis", options.partition_prefix),

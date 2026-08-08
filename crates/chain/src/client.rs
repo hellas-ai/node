@@ -256,9 +256,13 @@ impl LightClient for RemoteLightClient {
                     "threshold identity was empty".to_string(),
                 ));
             }
+            if resp.network_id.is_empty() {
+                return Err(QueryError::Remote("network id was empty".to_string()));
+            }
             Ok(ConsensusInfo {
                 validators: resp.validators,
                 threshold_identity: resp.threshold_identity,
+                network_id: resp.network_id,
             })
         }
     }

@@ -143,6 +143,8 @@ pub struct OwnerEdges {
 pub struct ConsensusInfo {
     pub validators: Vec<String>,
     pub threshold_identity: Vec<u8>,
+    /// The network this chain's authorizations are bound to.
+    pub network_id: String,
 }
 
 /// Errors returned by light-client queries.

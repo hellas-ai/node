@@ -490,6 +490,7 @@ mod tests {
     ) -> HellasBlock {
         Application::new(
             context,
+            crate::domain::TEST_NETWORK,
             leader,
             Vec::new(),
             prefix,

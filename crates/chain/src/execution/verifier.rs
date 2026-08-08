@@ -67,4 +67,3 @@ impl SealVerifier for ChainVerifier {
         self.seals.verify(seal, public)
     }
 }
-

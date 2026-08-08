@@ -182,7 +182,7 @@ mod tests {
         let funding = Funding::new(party_one(maker_coin), party_one(taker_coin));
         let edge = Tx::edge_id_of(&funding, &terms);
 
-        let open_hash = Tx::open_hash(&funding, &terms);
+        let open_hash = Tx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
         let open = Tx::open(
             funding,
             terms.clone(),
@@ -191,7 +191,13 @@ mod tests {
         );
 
         let close_outputs = payouts(10, 5);
-        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &close_outputs);
+        let close_hash = Tx::payload_hash(
+            crate::domain::TEST_NETWORK,
+            edge,
+            CloseKind::Mutual,
+            terms.hash(),
+            &close_outputs,
+        );
         let close_output_ids = Tx::close_output_ids(edge, &close_outputs);
         let close = Tx::close(
             edge,
@@ -221,6 +227,7 @@ mod tests {
         )
         .expect("genesis seeds the working set");
         let ctx = hellas_kernel::Context::new(
+            crate::domain::TEST_NETWORK,
             hellas_kernel::BlockHeight::new(1),
             hellas_kernel::BlockHash::from_bytes([0; hellas_kernel::BlockHash::LENGTH]),
         );
