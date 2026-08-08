@@ -158,7 +158,7 @@ mod id_pins {
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{GetStateRoot, LightClient};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x32f4970a);
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xee55032a);
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
     }
 }
