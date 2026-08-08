@@ -10,7 +10,6 @@
 use std::io::Write as _;
 
 use hellas_rpc::ContentId;
-use hellas_store::fastresume;
 
 /// Deterministic pseudorandom bytes; a constant run would never trigger
 /// a content-defined chunk boundary.
@@ -74,15 +73,16 @@ fn remembering_a_file_does_not_change_its_id() {
     let content = bytes(2 * 1024 * 1024 + 7, 99);
     let path = write_temp("remembered", &content);
 
-    fastresume::force_recheck();
+    let records = hellas_models::store().records();
+    records.force_recheck();
     let cold = hellas_models::content_id_of(&path).expect("cold hash");
     let warm = hellas_models::content_id_of(&path).expect("warm hash");
     assert_eq!(cold, warm);
     assert_eq!(cold, ContentId::hash(&content));
-    assert!(fastresume::remembered() >= 1);
+    assert!(records.remembered() >= 1);
 
-    fastresume::force_recheck();
-    assert_eq!(fastresume::remembered(), 0, "force_recheck must forget");
+    records.force_recheck();
+    assert_eq!(records.remembered(), 0, "force_recheck must forget");
     let rechecked = hellas_models::content_id_of(&path).expect("rechecked");
     assert_eq!(rechecked, cold);
 
