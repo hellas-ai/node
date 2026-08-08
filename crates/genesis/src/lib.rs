@@ -16,15 +16,52 @@ pub const HELLAS_DEVNET_1_JSON: &str =
     include_str!("../../../networks/hellas-devnet-1/genesis.json");
 
 /// The id that document names.
-///
-/// Deliberately *not* called a default. Nothing reads this to decide
-/// what network it is on — a node reads its own genesis document, and
-/// every signature domain takes the id as a runtime value. This exists
-/// so tooling that synthesises a fresh devnet document has a name to
-/// write into it. A constant that presents itself as "the network" is
-/// how one moved string silently re-domains every signature in the
-/// tree, which is a mistake this repository has already made once.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
+
+/// A network whose genesis document ships inside the binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KnownNetwork {
+    /// Short name to select it by, e.g. `devnet`.
+    pub name: &'static str,
+    /// Full network id the document declares, e.g. `hellas-devnet-1`.
+    pub id: &'static str,
+    /// The document itself.
+    pub json: &'static str,
+}
+
+/// Every network this binary can join without being handed a file.
+///
+/// Compiled in on purpose: operators should not have to ship genesis
+/// JSON around to talk to a network everyone already agrees on, and a
+/// document passed by path is a document that can be swapped.
+///
+/// This is a *registry selected by name*, which is a different thing
+/// from the constant it replaced. That one presented itself as "the
+/// network", so editing one string silently re-domained every
+/// signature in the tree — a mistake this repository has already made
+/// once. Adding a network here adds an entry; it never moves an
+/// existing one. Nothing reads this list to decide what network it is
+/// on: a caller names one, or hands over a document.
+pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
+    name: "devnet",
+    id: HELLAS_DEVNET_1_ID,
+    json: HELLAS_DEVNET_1_JSON,
+}];
+
+/// Looks up a shipped network by its short name (`devnet`) or its full
+/// id (`hellas-devnet-1`).
+#[must_use]
+pub fn known_network(selector: &str) -> Option<&'static KnownNetwork> {
+    KNOWN_NETWORKS
+        .iter()
+        .find(|network| network.name == selector || network.id == selector)
+}
+
+/// The short names a caller may pass, for help text and error messages.
+#[must_use]
+pub fn known_network_names() -> Vec<&'static str> {
+    KNOWN_NETWORKS.iter().map(|network| network.name).collect()
+}
 
 const PUBLIC_KEY_HEX_BYTES: usize = 64;
 const MAX_NETWORK_ID_BYTES: usize = 63;
@@ -178,6 +215,26 @@ mod tests {
 
     /// The id constant and the document are two copies of one fact;
     /// this is what keeps them from drifting apart.
+    /// Every shipped document must parse, validate, and declare the id
+    /// the registry claims for it. A registry entry that lies about its
+    /// own id would put a node on a network it did not ask for.
+    #[test]
+    fn every_known_network_document_declares_the_id_the_registry_claims() {
+        assert!(!KNOWN_NETWORKS.is_empty());
+        for network in KNOWN_NETWORKS {
+            let genesis: Genesis = serde_json::from_str(network.json)
+                .unwrap_or_else(|err| panic!("{} document parses: {err}", network.name));
+            genesis
+                .validate()
+                .unwrap_or_else(|err| panic!("{} document validates: {err}", network.name));
+            assert_eq!(genesis.network_id, network.id, "{}", network.name);
+            assert_eq!(known_network(network.name), Some(network));
+            assert_eq!(known_network(network.id), Some(network));
+        }
+        assert_eq!(known_network("mainnet"), None);
+        assert_eq!(known_network(""), None);
+    }
+
     #[test]
     fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
         let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();

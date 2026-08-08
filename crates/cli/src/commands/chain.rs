@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
 use hellas_chain::domain::{Digest, SettlementKey, Transaction};
-use hellas_chain::genesis::{Genesis, HELLAS_DEVNET_1_JSON};
+use hellas_chain::genesis::{Genesis, known_network, known_network_names};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
@@ -48,8 +48,10 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Genesis document naming the network to sign for
-    /// (default: the built-in hellas-devnet-1 document)
+    /// Network to sign for: a shipped name (`devnet`) or a full network id
+    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
+    network: String,
+    /// Genesis document to sign for, instead of a shipped network
     #[arg(long)]
     genesis: Option<PathBuf>,
     /// Maker secret-scalar file path (32 raw bytes or 64 hex digits)
@@ -89,8 +91,10 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Genesis document naming the network to sign for
-    /// (default: the built-in hellas-devnet-1 document)
+    /// Network to sign for: a shipped name (`devnet`) or a full network id
+    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
+    network: String,
+    /// Genesis document to sign for, instead of a shipped network
     #[arg(long)]
     genesis: Option<PathBuf>,
     /// Hex-encoded kernel edge ID
@@ -444,7 +448,7 @@ async fn run_open(args: OpenArgs) -> CliResult {
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
     let client = connect_verified(args.rpc).await?;
-    let network = network_for(args.genesis, &client).await?;
+    let network = network_for(&args.network, args.genesis, &client).await?;
     let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
         funding,
@@ -472,7 +476,7 @@ async fn run_close(args: CloseArgs) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
     let client = connect_verified(args.rpc).await?;
-    let network = network_for(args.genesis, &client).await?;
+    let network = network_for(&args.network, args.genesis, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
     let proof = match args.kind {
@@ -546,11 +550,35 @@ async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
 /// rather than as an unexplained rejected transaction. Pointing devnet
 /// keys at a testnet node is exactly the mistake this slice makes
 /// impossible to get away with silently.
-async fn network_for(genesis: Option<PathBuf>, client: &RemoteLightClient) -> CliResult<NetworkId> {
+/// `--network` names one of the documents compiled into this binary;
+/// `--genesis` hands over a document instead, for a network that does
+/// not ship with it. Either way what comes back is a document, because
+/// a network id on its own is not enough to check anything against.
+///
+/// The local choice is the authority — a signature has to be built
+/// before anyone can tell you whether it was wanted — but the node
+/// reports its own network, so the mismatch is caught here rather than
+/// as an unexplained rejected transaction. Pointing devnet keys at a
+/// testnet node is exactly the mistake this makes impossible to get
+/// away with silently.
+async fn network_for(
+    network: &str,
+    genesis: Option<PathBuf>,
+    client: &RemoteLightClient,
+) -> CliResult<NetworkId> {
     let document = match genesis {
         Some(path) => std::fs::read_to_string(&path)
             .with_context(|| format!("reading genesis document {}", path.display()))?,
-        None => HELLAS_DEVNET_1_JSON.to_string(),
+        None => known_network(network)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown network `{network}`; this binary ships {}. \
+                     Pass --genesis <path> for a network it does not ship.",
+                    known_network_names().join(", "),
+                )
+            })?
+            .json
+            .to_string(),
     };
     let genesis: Genesis =
         serde_json::from_str(&document).context("parsing the genesis document")?;
@@ -559,7 +587,7 @@ async fn network_for(genesis: Option<PathBuf>, client: &RemoteLightClient) -> Cl
     let reported = client.get_consensus_info().await?.network_id;
     if reported != network.as_str() {
         anyhow::bail!(
-            "genesis names network `{network}`, but the node at the other end reports `{reported}`",
+            "signing for network `{network}`, but the node at the other end reports `{reported}`",
         );
     }
     Ok(network)

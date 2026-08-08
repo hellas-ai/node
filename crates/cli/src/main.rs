@@ -173,8 +173,20 @@ struct Cli {
     )]
     assurance: hellas_rpc::Assurance,
 
-    /// Out-of-band ContentId pin for the remote provider's canonical enrollment bundle.
-    #[arg(long = "provider-genesis", global = true, value_parser = parse_content_id_hex)]
+    /// The provider to accept remote execution from: an out-of-band
+    /// ContentId pin on its canonical enrollment bundle.
+    ///
+    /// Not a genesis *document* — it is a hash you assert, not a file
+    /// you load — and unrelated to `--network`, which names the chain
+    /// a signature settles on. A staked client sets both: one says
+    /// which chain the payment channel opens on, the other says whose
+    /// work it will pay for.
+    #[arg(
+        long = "provider",
+        global = true,
+        value_name = "CONTENT_ID",
+        value_parser = parse_content_id_hex
+    )]
     provider_genesis: Option<hellas_rpc::ContentId>,
 
     /// Apple App Attest application CDhashes trusted for confidential open.
@@ -1073,7 +1085,7 @@ mod tests {
             "0909090909090909090909090909090909090909090909090909090909090909",
             "--payload",
             r#"{"x":1}"#,
-            "--provider-genesis",
+            "--provider",
             "1111111111111111111111111111111111111111111111111111111111111111",
             "--apple-app-attest-app-id",
             "2F53L9ZR3N.ai.hellas.app",

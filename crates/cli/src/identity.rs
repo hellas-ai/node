@@ -353,7 +353,7 @@ pub(crate) fn provider_trust(
     allowed_cd_hashes: Vec<[u8; 32]>,
 ) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
     let expected_genesis =
-        expected_genesis.context("remote execution requires --provider-genesis <content-id>")?;
+        expected_genesis.context("remote execution requires --provider <content-id>")?;
     let apple_app_attest = match (app_id, allowed_cd_hashes.is_empty()) {
         (None, true) if required_assurance == hellas_rpc::Assurance::ProducerSigned => None,
         (Some(app_id), false) => Some(hellas_client::AppleAppAttestTrust::new(

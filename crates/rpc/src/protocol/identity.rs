@@ -1,19 +1,79 @@
+//! A provider's founding identity statement.
+//!
+//! # What "provider genesis" means
+//!
+//! The same thing a chain's genesis means, for a different subject. A
+//! chain's genesis is the founding document a network's whole history
+//! chains back to; a *provider's* genesis is the founding statement one
+//! provider installation's whole key hierarchy chains back to. Both are
+//! self-authenticating roots, and neither can be reissued without
+//! becoming a different thing.
+//!
+//! It is emitted once, when a provider installation first starts, and
+//! it binds together:
+//!
+//!   - the hardware root that vouches for the installation
+//!     ([`RootKind`] + `root_public_key`) — Secure Enclave, TPM 2.0, or
+//!     a plain software key on a machine with neither;
+//!   - `producer_public_key`, the key that signs the provider's work;
+//!   - `transport_public_key`, the key that terminates its connections;
+//!   - `platform_credential`, its Apple App Attest registration if it
+//!     has one;
+//!   - `installation_nonce`, which makes this installation distinct
+//!     from a reinstall on the same hardware.
+//!
+//! [`RootProof`] is the root key's signature over that statement, which
+//! is what makes it self-authenticating: the root asserts "these are my
+//! keys", and every later signature the provider makes traces back
+//! here.
+//!
+//! # How a requester uses it
+//!
+//! [`ProviderEnrollmentBundle::content_id`] is the Xet hash of the
+//! whole artifact. A requester pins that id **out of band** — the CLI
+//! flag is `--provider <content-id>` — and refuses to run against
+//! anything that does not hash to it. Pinning out of band is the point:
+//! a provider that could hand you its own identity on connect could
+//! hand you any identity.
+//!
+//! # Deliberately unrelated to the network
+//!
+//! This has nothing to do with which *chain* anything settles on. A
+//! staked client sets both, and they answer different questions:
+//! `--network` says which chain the payment channel opens on;
+//! `--provider` says whose work it will pay for. The two are
+//! independent trust decisions about two different parties, and the
+//! shared word "genesis" in the type names below is a statement about
+//! their shape, not a connection between them.
+
 use crate::{ContentId, DagCborEncoder, PublicKey, Signature, SignatureKind};
 
+/// The kind of hardware root vouching for a provider installation.
+///
+/// Discriminants are wire values and must not be reordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RootKind {
+    /// Apple Secure Enclave, attested through App Attest.
     SecureEnclave = 1,
+    /// TPM 2.0 attestation key.
     Tpm20 = 2,
+    /// A plain software key. No hardware claim is made: this is for
+    /// machines with neither of the above, and a requester that cares
+    /// about hardware backing must refuse it.
     Software = 3,
 }
 
+/// A platform attestation credential the provider registered, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformCredential {
+    /// No platform credential; the root proof stands alone.
     Absent,
+    /// Registered, pinned by the content id of its enrollment.
     Registered(ContentId),
 }
 
+/// What one provider installation asserts about itself, once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderGenesisStatement {
     pub root_kind: RootKind,
@@ -24,13 +84,22 @@ pub struct ProviderGenesisStatement {
     pub installation_nonce: [u8; 32],
 }
 
+/// The root key's signature over a [`ProviderGenesisStatement`]. This
+/// is what makes the statement self-authenticating rather than a
+/// claim anyone could make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootProof {
+    /// Apple attestation object over the statement.
     AppleAppAttest(Vec<u8>),
+    /// TPM 2.0 attestation-key signature.
     Tpm20(Signature),
+    /// Software root-key signature. Carries no hardware claim.
     Software(Signature),
 }
 
+/// A provider's founding statement together with the root proof that
+/// authenticates it. The two travel as one; a statement without its
+/// proof asserts nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedProviderGenesis {
     pub statement: ProviderGenesisStatement,
@@ -44,9 +113,13 @@ pub struct AppleAppAttestEnrollment {
     pub validation_time: u64,
 }
 
+/// The platform enrollment evidence shipped alongside the genesis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlatformEnrollment {
+    /// None; the provider registered no platform credential.
     Absent,
+    /// Apple App Attest enrollment, retained in full so a requester can
+    /// re-register it against its own pinned Apple policy.
     AppleAppAttest(AppleAppAttestEnrollment),
 }
 
@@ -62,6 +135,8 @@ pub struct ProviderEnrollmentBundle {
     pub platform: PlatformEnrollment,
 }
 
+/// A provider's genesis plus the content ids of everything it has
+/// rotated through since.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderIdentityV1 {
     pub genesis: SignedProviderGenesis,
