@@ -142,7 +142,7 @@ mod tests {
     fn genesis(private_key: &ed25519::PrivateKey) -> Genesis {
         Genesis {
             schema_version: GENESIS_SCHEMA_VERSION,
-            network_id: hellas_genesis::DEFAULT_NETWORK_ID.to_string(),
+            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
             validators: vec![GenesisValidator {
                 public_key: hex::encode(private_key.public_key().encode()),
                 label: "validator-a".to_string(),

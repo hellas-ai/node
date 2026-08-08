@@ -15,7 +15,7 @@ use hellas_chain::domain::{ObjectId, Transaction};
 use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
 use hellas_kernel::{
-    Auth, BlockHeight, EdgeId, PayloadHash, Secp256k1Signer, Sig, TermsHash,
+    Auth, BlockHeight, EdgeId, NetworkId, PayloadHash, Secp256k1Signer, Sig, TermsHash,
 };
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::pb::execute::{
@@ -69,6 +69,7 @@ pub(crate) fn sig_from_pb(field: &'static str, pb: Option<&PbSignature>) -> Resu
 /// and over the result context binding it to the provider's own
 /// recorded terminal transcript.
 pub(crate) fn receipt_response(
+    network: NetworkId,
     signer: &Secp256k1Signer,
     acceptance: PayloadHash,
     transcript: [u8; 32],
@@ -80,7 +81,7 @@ pub(crate) fn receipt_response(
     ReceiptResponse {
         provider_acceptance_signature: Some(sig_to_pb(signer.sign(acceptance))),
         transcript: transcript.to_vec(),
-        provider_result_signature: Some(sig_to_pb(signer.sign(result.digest()))),
+        provider_result_signature: Some(sig_to_pb(signer.sign(result.digest(network)))),
     }
 }
 
