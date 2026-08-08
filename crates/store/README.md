@@ -85,6 +85,31 @@ against this crate's own encoder, because both chunks in the production
 fixture use scheme 1. A fixture containing a BG4 chunk should precede
 depending on BG4 content.
 
+## Why this crate uses `ureq` and not `reqwest`
+
+Measured, not preferred. The workspace cannot have one HTTP client: at
+whole-workspace scope, `iroh` pulls `reqwest` and `hf-hub` pulls `ureq`
+regardless of what this crate chooses. Dropping `ureq` here removes
+**zero** crates from the workspace and three from a CLI-only build, out
+of 381.
+
+The rule, so nobody has to re-derive it:
+
+> **Streaming or async-context HTTP uses `reqwest`. Synchronous,
+> fully-buffered content fetch inside `hellas-store` uses `ureq`.**
+
+`reqwest::blocking` would panic if called from inside an async runtime,
+and `ContentStore::index` is a sync fn reachable from async code. `ureq`
+has no such landmine. Converging the other way — `reqwest` everywhere —
+would take this crate from 46 to 121 dependencies to save three.
+
+Both clients are configured with **bundled Mozilla roots**
+(`rustls-webpki-roots` / `webpki-roots`) rather than the OS trust store.
+Two clients in one binary trusting two different sets of certificate
+authorities is a silent policy split, and "which roots did we trust when
+we pulled these weights" should have one answer — a reproducible one,
+independent of what an admin or MDM installed on the host.
+
 ## Not built
 
 Peer-to-peer. `Fetcher` is the seam it implements, and the chunk lists

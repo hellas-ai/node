@@ -50,6 +50,13 @@ pub enum ExecutorError {
     ArtifactStore(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
+    /// Deliberately not [`ExecutorError::PolicyDenied`]: the caller is
+    /// permitted to ask, and the answer would be a price if this node
+    /// held the model. It does not, and a quote may not make it hold
+    /// one. What the client hears is "not here yet", which is the thing
+    /// an operator can fix.
+    #[error("{0}")]
+    ModelNotMaterialized(String),
     #[error("{message}")]
     QuotaExceeded {
         retry_after_ms: Option<u64>,
@@ -78,7 +85,8 @@ fn executor_wire_code(err: &ExecutorError) -> WireCode {
         ExecutorError::InvalidQuoteRequest(_)
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
-        ExecutorError::DtypeNotSupported { .. } => WireCode::FailedPrecondition,
+        ExecutorError::DtypeNotSupported { .. }
+        | ExecutorError::ModelNotMaterialized(_) => WireCode::FailedPrecondition,
         #[cfg(feature = "evaluate")]
         ExecutorError::ModelAssets(model_err) => hellas_models::model_assets_wire_code(model_err),
         ExecutorError::State(StateError::QuoteExpired(_)) => WireCode::FailedPrecondition,

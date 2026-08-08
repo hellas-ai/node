@@ -19,8 +19,8 @@ use tokenizers::Error as TokenizerError;
 use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{
-    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, TextOutputDecoder, content_id_of,
-    program_manifest, store, to_catgrad_dtype,
+    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, Reach, TextOutputDecoder,
+    content_id_of, materialize_program_files, program_manifest, store, to_catgrad_dtype,
 };
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
@@ -35,6 +35,14 @@ pub enum ModelAssetsError {
     BuildHfApi {
         #[source]
         source: ApiError,
+    },
+    #[error(
+        "{model_id}@{revision} is not materialized on this node: {file} is not in the local HuggingFace cache. Only models this node already holds can be quoted; ask the operator to make it available (`hellas serve --preload {model_id}@{revision}`, or `hellas store adopt` a cache that has it)"
+    )]
+    NotMaterialized {
+        model_id: String,
+        revision: String,
+        file: String,
     },
     #[error("failed to fetch {file} for {model_id}@{revision}")]
     FetchModelAsset {
