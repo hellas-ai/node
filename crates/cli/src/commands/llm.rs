@@ -7,7 +7,7 @@ use hellas_gateway::{
     CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
     Outcome,
 };
-use hellas_models::{ChatMessage, ModelAssets, TextOutputDecoder};
+use hellas_models::{ChatMessage, ModelAssets, Reach, TextOutputDecoder};
 use hellas_rpc::{Assurance, ContentId, Dtype, ProducerSigningKey, Retention};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
@@ -83,7 +83,11 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     // Pre-tokenize the prompt once. Tokenization is dtype-independent, so the
     // `assets` we use here is throwaway; we reload per attempt below to get
     // the dtype-specific courtesy request construction needs.
-    let bootstrap_assets = Arc::new(ModelAssets::load(&options.model, options.dtype[0])?);
+    let bootstrap_assets = Arc::new(ModelAssets::load(
+        &options.model,
+        options.dtype[0],
+        Reach::Download,
+    )?);
     let messages = vec![ChatMessage::user(&options.prompt)];
     let prepared = if options.raw || !bootstrap_assets.has_chat_template() {
         if options.raw {
@@ -113,7 +117,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
         // Per-attempt assets: same tokenizer/template as bootstrap, but the
         // courtesy request below asks the provider for this dtype.
-        let assets = Arc::new(ModelAssets::load(&options.model, dtype)?);
+        let assets = Arc::new(ModelAssets::load(&options.model, dtype, Reach::Download)?);
 
         #[cfg(feature = "evaluate")]
         let runtime = if options.local || options.verify_local {

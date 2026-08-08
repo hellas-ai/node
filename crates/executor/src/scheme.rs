@@ -62,7 +62,15 @@ pub trait SchemeEngine: Send + Sync {
         request: QuoteChatPromptRequest,
     ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>;
 
-    async fn load_model_metadata(&mut self, model: String) -> Result<(), ExecutorError>;
+    /// Makes a model available on this node, **downloading** it if it is
+    /// not here.
+    ///
+    /// The one path in a serving process that may spend bandwidth on a
+    /// model, and deliberately not an RPC: it is reached only from an
+    /// operator's preload flag or a caller running its own in-process
+    /// executor. Every peer-reachable path resolves locally and refuses
+    /// what this has not made available.
+    async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError>;
 
     async fn put_artifact(
         &mut self,

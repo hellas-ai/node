@@ -123,9 +123,9 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     .context("failed to spawn executor")?;
     for model in &config.preload_models {
         handle
-            .load_model_metadata(model.clone())
+            .materialize_model(model.clone())
             .await
-            .with_context(|| format!("failed to load model metadata for {model}"))?;
+            .with_context(|| format!("failed to make model {model} available"))?;
     }
 
     let alpns = served_alpns();

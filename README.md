@@ -32,7 +32,7 @@ cargo run --features candle -- serve --execute-policy=eager
 (`--execute-policy=skip`). Only pass eager or allow-list policies when you
 intentionally want a node to serve remote work.
 
-Load model metadata on startup:
+Make a model available on startup:
 
 ```bash
 cargo run --features candle -- serve \
@@ -40,7 +40,15 @@ cargo run --features candle -- serve \
   --preload HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
-Repeat `--preload` to load metadata for multiple models.
+Repeat `--preload` for multiple models.
+
+**A node quotes only models it already holds.** `--preload` downloads;
+serving does not. A quote for anything else is refused with
+`FailedPrecondition` and no bytes fetched — otherwise anyone who could
+dial the node could name a 700 GB repository and have the node download
+it. A HuggingFace cache the node can already read counts as holding the
+model, so mounting one (as the Docker example below does) works without
+any preload at all.
 
 Run client:
 
