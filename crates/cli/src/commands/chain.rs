@@ -3,8 +3,8 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
-use hellas_chain::config::{Genesis, HELLAS_DEVNET_1_JSON};
 use hellas_chain::domain::{Digest, SettlementKey, Transaction};
+use hellas_chain::genesis::{Genesis, HELLAS_DEVNET_1_JSON};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
@@ -554,7 +554,7 @@ async fn network_for(genesis: Option<PathBuf>, client: &RemoteLightClient) -> Cl
     };
     let genesis: Genesis =
         serde_json::from_str(&document).context("parsing the genesis document")?;
-    let network = hellas_chain::config::network_id(&genesis)?;
+    let network = hellas_chain::domain::network_id(&genesis)?;
 
     let reported = client.get_consensus_info().await?.network_id;
     if reported != network.as_str() {
