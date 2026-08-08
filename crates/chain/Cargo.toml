@@ -37,6 +37,11 @@ client-core = [
     "dep:commonware-cryptography",
     "dep:commonware-parallel",
     "dep:hellas-wire",
+    # `client.rs` names MuxTransport unconditionally, so client-core has
+    # to ask for it. Both real consumers enable a `ws*` feature that
+    # happens to pull mux in, which is why selecting client-core on its
+    # own was the only way to see this.
+    "hellas-wire/mux",
     "dep:p256",
     "dep:rand",
     "dep:thiserror",

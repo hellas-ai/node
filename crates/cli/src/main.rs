@@ -658,7 +658,7 @@ async fn main() {
     };
     let secret_key = local_identity.transport_key.clone();
     #[cfg(feature = "node")]
-    if matches!(&cli.command, Commands::Serve { .. })
+    if matches!(&command, Commands::Serve { .. })
         && let Err(error) = validate_serve_assurance(
             cli.software_root,
             assurance,

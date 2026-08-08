@@ -34,11 +34,7 @@ mux = []
 ws = ["mux", "dep:tokio-tungstenite"]
 # Opt-in TLS for native WebSocket clients. Keeping this separate from `ws`
 # preserves a TLS-free transport build for constrained native targets.
-ws-rustls = [
-    "ws",
-    "dep:rustls",
-    "tokio-tungstenite/rustls-tls-webpki-roots",
-]
+ws-rustls = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
 ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 
 [dependencies]

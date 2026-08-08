@@ -26,7 +26,9 @@ evaluate = ["hellas-rpc/evaluate"]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
-hellas-attestation = { workspace = true, features = ["apple-app-attest"], optional = true }
+hellas-attestation = { workspace = true, features = [
+    "apple-app-attest",
+], optional = true }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
