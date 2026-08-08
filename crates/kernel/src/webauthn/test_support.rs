@@ -10,12 +10,23 @@ use super::soft_passkey::{
 use super::{AT, ED, MIN_AUTH_DATA_LEN, UP, WebAuthnError, base64url_32};
 use crate::{
     Auth, CloseKind, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    MAX_WEBAUTHN_DATA_LENGTH, Parties, PayloadHash, Payout, Proof, ProtocolCode, Terms, Tx,
-    WebAuthnAssertion, consts::P256_COORDINATE_LENGTH, context::BlockHeight,
+    MAX_WEBAUTHN_DATA_LENGTH, NetworkId, Parties, PayloadHash, Payout, Proof, ProtocolCode, Terms,
+    Tx, WebAuthnAssertion, consts::P256_COORDINATE_LENGTH, context::BlockHeight,
 };
 
 /// Number of named invalid fixtures returned by [`negative_assertions`].
 pub const WEBAUTHN_NEGATIVE_FIXTURE_COUNT: usize = 9;
+
+/// The network every fixture in this module is bound to.
+///
+/// Fixture authorizations commit to it, so a consumer that executes
+/// [`valid_open_tx`] or [`valid_mutual_close_tx`] must build its
+/// [`crate::Context`] with this exact network — under any other one the
+/// signature is correctly rejected.
+pub const FIXTURE_NETWORK: NetworkId = match NetworkId::new("hellas-fixture-1") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
+};
 
 /// Named valid `WebAuthn` v1 fixture.
 #[derive(Debug, Clone)]
@@ -331,9 +342,15 @@ fn fixture_context() -> Result<FixtureContext, SoftPasskeyError> {
         BlockHeight::new(100),
         outputs.clone(),
     );
-    let open_hash = Tx::open_hash(&funding, &terms);
+    let open_hash = Tx::open_hash(FIXTURE_NETWORK, &funding, &terms);
     let edge = Tx::edge_id_of(&funding, &terms);
-    let mutual_close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+    let mutual_close_hash = Tx::payload_hash(
+        FIXTURE_NETWORK,
+        edge,
+        CloseKind::Mutual,
+        terms.hash(),
+        &outputs,
+    );
 
     Ok(FixtureContext {
         passkey,

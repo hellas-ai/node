@@ -26,6 +26,7 @@ use crate::canonical::{
     encode_envelope, tag,
 };
 use crate::consts::HASH_LENGTH;
+use crate::network::NetworkId;
 
 /// Hash of the previous finalized block.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -261,6 +262,7 @@ impl Decode for BlockHeight {
 /// Explicit context for applying one ordered kernel operation.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Context {
+    network: NetworkId,
     block_height: BlockHeight,
     previous_hash: BlockHash,
     fees: Fees,
@@ -268,23 +270,41 @@ pub struct Context {
 
 impl Context {
     /// Creates an operation context.
+    ///
+    /// `network` is not optional and has no default: every
+    /// authorization the kernel checks under this context commits to
+    /// it, and a context that could not name its network would let one
+    /// network's signatures settle on another.
     #[must_use]
-    pub const fn new(block_height: BlockHeight, previous_hash: BlockHash) -> Self {
-        Self::with_fees(block_height, previous_hash, Fees::ZERO)
+    pub const fn new(
+        network: NetworkId,
+        block_height: BlockHeight,
+        previous_hash: BlockHash,
+    ) -> Self {
+        Self::with_fees(network, block_height, previous_hash, Fees::ZERO)
     }
 
     /// Creates an operation context with an explicit fee schedule.
     #[must_use]
     pub const fn with_fees(
+        network: NetworkId,
         block_height: BlockHeight,
         previous_hash: BlockHash,
         fees: Fees,
     ) -> Self {
         Self {
+            network,
             block_height,
             previous_hash,
             fees,
         }
+    }
+
+    /// Returns the network every authorization under this context is
+    /// bound to.
+    #[must_use]
+    pub const fn network(self) -> NetworkId {
+        self.network
     }
 
     /// Returns the finalized block height for this operation.

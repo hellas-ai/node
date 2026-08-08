@@ -26,9 +26,13 @@ use support::{
 };
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
-const TIMEOUT_CONTEXT: Context =
-    Context::new(TIMEOUT, BlockHash::from_bytes([0; BlockHash::LENGTH]));
+const TIMEOUT_CONTEXT: Context = Context::new(
+    support::NETWORK,
+    TIMEOUT,
+    BlockHash::from_bytes([0; BlockHash::LENGTH]),
+);
 const CONTEXT: Context = Context::new(
+    support::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );

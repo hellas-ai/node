@@ -94,6 +94,7 @@ pub(crate) fn context(height: i64, fees: Fees) -> Context {
         panic!("negative l1_fees height");
     };
     Context::with_fees(
+        super::NETWORK,
         BlockHeight::new(height),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         fees,
@@ -126,7 +127,13 @@ pub(crate) fn close(shape: FundingShape, proof: ProofKey) -> Tx {
         }
         ProofKey::Timeout => Proof::timeout(terms(shape)),
         ProofKey::Violation => {
-            let hash = Tx::payload_hash(input, CloseKind::Violation, terms(shape).hash(), &outputs);
+            let hash = Tx::payload_hash(
+                super::NETWORK,
+                input,
+                CloseKind::Violation,
+                terms(shape).hash(),
+                &outputs,
+            );
             Proof::violation(
                 terms(shape),
                 Seal::placeholder(PROTOCOL, CloseKind::Violation, hash),

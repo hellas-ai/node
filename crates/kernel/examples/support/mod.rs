@@ -6,7 +6,14 @@ use std::collections::BTreeMap;
 use hellas_kernel::{
     Batch, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Cost, Edge, EdgeId, EventKind,
     Fees, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    PayloadHash, Payout, SealVerifier, Sig, SigVerifier, State, Store, Tx,
+    NetworkId, PayloadHash, Payout, SealVerifier, Sig, SigVerifier, State, Store, Tx,
+};
+
+/// The network these examples settle on. Every authorization they build
+/// commits to it, and every context they run under names it.
+pub(crate) const NETWORK: NetworkId = match NetworkId::new("hellas-example-1") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 
@@ -140,6 +147,7 @@ pub(crate) fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
 
 pub(crate) const fn context(height: u64, hash_byte: u8, fees: Fees) -> Context {
     Context::with_fees(
+        NETWORK,
         BlockHeight::new(height),
         BlockHash::from_bytes([hash_byte; BlockHash::LENGTH]),
         fees,

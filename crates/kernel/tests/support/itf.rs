@@ -150,6 +150,7 @@ pub(crate) const fn edge_key(tag: EdgeTag) -> l1::EdgeKey {
 pub(crate) fn context_for_height(height: i64) -> Result<Context, String> {
     let height = u64::try_from(height).map_err(|_| format!("negative l1 height: {height}"))?;
     Ok(Context::new(
+        super::NETWORK,
         BlockHeight::new(height),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     ))
@@ -261,6 +262,12 @@ pub(crate) fn close_op(body: &CloseInputBody) -> Tx {
 }
 
 fn seal_for(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Tx::payload_hash(input, CloseKind::Violation, l1::terms().hash(), outputs);
+    let hash = Tx::payload_hash(
+        super::NETWORK,
+        input,
+        CloseKind::Violation,
+        l1::terms().hash(),
+        outputs,
+    );
     Seal::placeholder(ProtocolCode::new(1), CloseKind::Violation, hash)
 }

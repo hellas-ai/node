@@ -15,9 +15,19 @@ pub(crate) mod map_store;
 
 use hellas_kernel::{
     Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
-    KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, Proof, Seal,
-    SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, Terms, TermsHash, Tx,
-    View,
+    KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, Proof,
+    Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, Terms,
+    TermsHash, Tx, View,
+};
+
+/// The network every fixture in this crate's tests is bound to.
+///
+/// One definition on purpose: authorizations built by these helpers are
+/// checked against contexts built by these helpers, so a second network
+/// id anywhere would break that pairing silently rather than loudly.
+pub(crate) const NETWORK: NetworkId = match NetworkId::new("hellas-kernel-test") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
 };
 
 /// Forgeable verifier used by every test in this crate. Accepts the
@@ -39,6 +49,7 @@ impl SigVerifier for FakeVerifier {
 impl SealVerifier for FakeVerifier {
     fn verify_seal(&self, seal: Seal, public: &SealPublicInputs<'_>) -> bool {
         let hash = Tx::payload_hash(
+            public.network,
             public.edge_id,
             CloseKind::Violation,
             public.terms_hash(),
@@ -287,7 +298,7 @@ pub(crate) fn payouts(entries: &[(Key, u64)]) -> List<Payout, MAX_EDGE_OUTPUTS> 
 /// accepts, keyed to `maker`/`taker`. Adversarial tests pass mismatching
 /// keys.
 pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
-    let hash = Tx::open_hash(&funding, &terms);
+    let hash = Tx::open_hash(NETWORK, &funding, &terms);
     Tx::open(
         funding,
         terms,
@@ -317,7 +328,7 @@ pub(crate) fn mutual_hash(
     terms: TermsHash,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> PayloadHash {
-    Tx::payload_hash(input, CloseKind::Mutual, terms, outputs)
+    Tx::payload_hash(NETWORK, input, CloseKind::Mutual, terms, outputs)
 }
 
 /// Placeholder seal bound to the canonical violation close payload, as
@@ -327,6 +338,6 @@ pub(crate) fn placeholder_seal(
     terms: &Terms,
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> Seal {
-    let hash = Tx::payload_hash(input, CloseKind::Violation, terms.hash(), outputs);
+    let hash = Tx::payload_hash(NETWORK, input, CloseKind::Violation, terms.hash(), outputs);
     Seal::placeholder(terms.protocol(), CloseKind::Violation, hash)
 }

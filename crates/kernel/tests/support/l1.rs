@@ -13,12 +13,16 @@ use hellas_kernel::{
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
+    super::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
-pub(crate) const TIMEOUT_CONTEXT: Context =
-    Context::new(TIMEOUT, BlockHash::from_bytes([0; BlockHash::LENGTH]));
+pub(crate) const TIMEOUT_CONTEXT: Context = Context::new(
+    super::NETWORK,
+    TIMEOUT,
+    BlockHash::from_bytes([0; BlockHash::LENGTH]),
+);
 pub(crate) const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 pub(crate) const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 /// Third party owning nothing; the concrete realization of the model's
@@ -261,6 +265,7 @@ fn open_terms(key: OpenKey) -> Terms {
 /// `TermsMismatch`.
 fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
     let bad_hash = Tx::payload_hash(
+        super::NETWORK,
         edge_id(edge),
         CloseKind::Violation,
         other_terms().hash(),

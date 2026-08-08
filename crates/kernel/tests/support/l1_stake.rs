@@ -171,6 +171,7 @@ pub(crate) fn close_mutual(provider_pay: u64, client_pay: u64) -> Tx {
 pub(crate) fn context(height: i64) -> Context {
     let height = u64::try_from(height).unwrap_or(1);
     Context::with_fees(
+        super::NETWORK,
         BlockHeight::new(height),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         FEES,

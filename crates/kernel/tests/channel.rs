@@ -40,16 +40,19 @@ use hellas_kernel::{
 };
 
 const FEE_CONTEXT: Context = Context::with_fees(
+    support::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(3, 0, 0, 0),
 );
 const RESOURCE_CONTEXT: Context = Context::with_fees(
+    support::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
 );
 const RESOURCE_TIMEOUT_CONTEXT: Context = Context::with_fees(
+    support::NETWORK,
     TIMEOUT,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
@@ -118,7 +121,7 @@ fn violation_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> P
 /// `TermsMismatch` (proof terms) or `BadSeal` (payload binding) depending
 /// on which side the test corrupts.
 fn other_seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Tx::payload_hash(input, kind, other_terms(), outputs);
+    let hash = Tx::payload_hash(support::NETWORK, input, kind, other_terms(), outputs);
     Seal::placeholder(l1::OTHER_PROTOCOL, kind, hash)
 }
 

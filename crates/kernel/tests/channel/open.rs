@@ -233,6 +233,7 @@ fn open_fee_uses_resource_cost() {
 #[test]
 fn open_lifetime_fee_scales_with_timeout_span() {
     let lifetime_priced = Context::with_fees(
+        crate::support::NETWORK,
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 1, 0, 1),

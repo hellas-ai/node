@@ -201,7 +201,7 @@ fn run_maker_funded_timeout(wallets: &Wallets, verifier: Secp256k1Verifier) {
 }
 
 fn signed_open(wallets: &Wallets, funding: Funding, terms: Terms) -> Tx {
-    let hash = Tx::open_hash(&funding, &terms);
+    let hash = Tx::open_hash(support::NETWORK, &funding, &terms);
     Tx::open(
         funding,
         terms,
@@ -216,7 +216,13 @@ fn signed_mutual_close(
     terms_hash: TermsHash,
     outputs: List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> Tx {
-    let hash = Tx::payload_hash(edge_id, CloseKind::Mutual, terms_hash, &outputs);
+    let hash = Tx::payload_hash(
+        support::NETWORK,
+        edge_id,
+        CloseKind::Mutual,
+        terms_hash,
+        &outputs,
+    );
     Tx::close(
         edge_id,
         Proof::mutual(
