@@ -72,9 +72,41 @@ pub(crate) struct QuotePlan {
 
 #[cfg(feature = "evaluate")]
 impl QuotePlan {
+    /// The content id of this model's program manifest.
+    ///
+    /// Split out because it is the only expensive step: it resolves —
+    /// and on a cache miss downloads — every model file, then reads each
+    /// one to hash it. Callers on an async task must run it through
+    /// [`tokio::task::spawn_blocking`]; run inline it holds the
+    /// executor's single actor task for the whole download, so one
+    /// quote stalls every run ticket, receipt and settle behind it.
+    pub(crate) fn execution_environment(
+        locator: &ModelLocator,
+        backend: &str,
+    ) -> Result<ContentId, ExecutorError> {
+        Ok(
+            hellas_rpc::ProgramManifest::Evaluate(hellas_models::program_manifest(
+                &locator.spec(),
+                locator.dtype,
+                backend,
+            )?)
+            .content_id(),
+        )
+    }
+
+    /// Builds the plan, refusing before the expensive part if
+    /// `execute_policy` will not run this model.
+    ///
+    /// The policy is checked *here*, not by the caller afterwards.
+    /// Building the manifest resolves and — on a cache miss —
+    /// **downloads** the model, then reads every shard to hash it. A
+    /// check that runs after this function has returned has already
+    /// paid for a model it is about to refuse, which made even
+    /// `ExecutePolicy::Skip` a remote fetch primitive.
     pub(crate) fn from_prepared_text_request(
         request: QuotePreparedTextRequest,
         supported_dtypes: &[Dtype],
+        execute_policy: &hellas_rpc::policy::ExecutePolicy,
     ) -> Result<Self, ExecutorError> {
         let model_id = request.huggingface_model_id.trim();
         if model_id.is_empty() {
@@ -130,10 +162,14 @@ impl QuotePlan {
         } else {
             "cpu"
         };
-        let execution_environment = hellas_rpc::ProgramManifest::Evaluate(
-            hellas_models::program_manifest(&locator.spec(), locator.dtype, backend)?,
-        )
-        .content_id();
+        if !execute_policy.allows_execute(&locator.spec(), Some(locator.model_id.as_str())) {
+            return Err(ExecutorError::PolicyDenied(format!(
+                "execute policy denied model {}",
+                locator.spec()
+            )));
+        }
+
+        let execution_environment = Self::execution_environment(&locator, backend)?;
         Ok(Self {
             locator,
             execution_environment,

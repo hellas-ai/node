@@ -3578,6 +3578,7 @@ dependencies = [
  "chrono",
  "hellas-rpc",
  "hellas-wire",
+ "hellas-xet",
  "hf-hub 0.5.0",
  "minijinja",
  "minijinja-contrib",

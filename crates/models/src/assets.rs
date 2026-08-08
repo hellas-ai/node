@@ -23,7 +23,7 @@ pub fn program_manifest(
     weight_paths.sort();
     let weights = weight_paths
         .iter()
-        .map(|path| read_content_id(path))
+        .map(|path| content_id_of(path))
         .collect::<Result<Vec<_>>>()?;
     let config_bytes = read_asset(&config_path)?;
     let config: Value = serde_json::from_slice(&config_bytes)
@@ -35,8 +35,8 @@ pub fn program_manifest(
         &serde_json::to_vec(&graph)
             .map_err(|source| ModelAssetsError::SerializeProgram { source })?,
     );
-    let tokenizer = read_content_id(&tokenizer_path)?;
-    let tokenizer_config = read_content_id(&tokenizer_config_path)?;
+    let tokenizer = content_id_of(&tokenizer_path)?;
+    let tokenizer_config = content_id_of(&tokenizer_config_path)?;
     let mut tokenizer_manifest = DagCborEncoder::new();
     tokenizer_manifest.array(3);
     tokenizer_manifest.str("hellas.program.tokenizer.v2");
@@ -63,8 +63,63 @@ pub fn program_manifest(
     })
 }
 
-fn read_content_id(path: &std::path::Path) -> Result<ContentId> {
-    read_asset(path).map(|bytes| ContentId::hash(&bytes))
+/// Content id of the file at `path`, streamed rather than held.
+///
+/// The reason this is not `ContentId::hash(&fs::read(path))`: weight
+/// shards run to gigabytes, and this is on the quote path. Reading in
+/// `STREAM_BUFFER` slices keeps peak memory flat regardless of file
+/// size, and [`crate::fastresume`] means an unchanged file is hashed
+/// once per process rather than once per quote.
+pub fn content_id_of(path: &std::path::Path) -> Result<ContentId> {
+    use std::io::Read as _;
+
+    /// Big enough that the read syscall is not the bottleneck, small
+    /// enough to be irrelevant next to a model.
+    const STREAM_BUFFER: usize = 1024 * 1024;
+
+    let mut file = std::fs::File::open(path).map_err(|source| ModelAssetsError::ReadAsset {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| ModelAssetsError::ReadAsset {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Some(id) = crate::fastresume::get(&metadata) {
+        return Ok(id);
+    }
+
+    let mut hasher = hellas_xet::XetFileHasher::new();
+    let mut buffer = vec![0_u8; STREAM_BUFFER];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ModelAssetsError::ReadAsset {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let id = ContentId::from_bytes(hasher.finalize().into_bytes());
+
+    // Re-stat after reading: if the file changed while we were hashing,
+    // the identity we would record is not the one we hashed. Recording
+    // it would be worse than not caching at all.
+    let after = file
+        .metadata()
+        .map_err(|source| ModelAssetsError::ReadAsset {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if crate::fastresume::identical(&metadata, &after) {
+        crate::fastresume::put(&metadata, id);
+    }
+    Ok(id)
 }
 
 fn read_asset(path: &std::path::Path) -> Result<Vec<u8>> {
