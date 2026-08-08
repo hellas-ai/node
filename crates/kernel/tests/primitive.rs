@@ -7,6 +7,12 @@ use hellas_kernel::{
     Sig, Terms, Tx,
 };
 
+const NETWORK: hellas_kernel::NetworkId = match hellas_kernel::NetworkId::new("hellas-kernel-test")
+{
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
+};
+
 #[test]
 fn protocol_code_exposes_value() {
     let code = ProtocolCode::new(7);
@@ -60,6 +66,7 @@ fn context_prices_resource_costs() {
     let fees = Fees::new(3, 5, 7, 11);
     let block_hash_bytes = [9; BlockHash::LENGTH];
     let context = Context::with_fees(
+        NETWORK,
         BlockHeight::new(7),
         BlockHash::from_bytes(block_hash_bytes),
         fees,
@@ -125,7 +132,7 @@ fn byte_newtypes_preserve_their_canonical_bytes() {
         BlockHeight::new(10),
         payouts(Payout::new(key, 0), Payout::new(key, 0)),
     );
-    let payload_hash = Tx::open_hash(&funding, &payload_terms);
+    let payload_hash = Tx::open_hash(NETWORK, &funding, &payload_terms);
     let payload_hash_bytes = *payload_hash.as_bytes();
     assert_eq!(payload_hash.to_bytes(), payload_hash_bytes);
     assert_eq!(payload_hash.encoded_size(), payload_hash_bytes.len());

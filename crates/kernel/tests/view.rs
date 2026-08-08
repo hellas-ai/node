@@ -71,6 +71,7 @@ fn view_compacts_sparse_edges_and_sorts_by_id() {
         ],
     );
     let context = Context::new(
+        support::NETWORK,
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     );

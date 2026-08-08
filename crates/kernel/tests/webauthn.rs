@@ -19,6 +19,7 @@ use hellas_kernel::{
 use support::{FixedStore, coin_id, list, state};
 
 const CONTEXT: Context = Context::new(
+    support::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
@@ -71,7 +72,7 @@ fn webauthn_open_auth_is_checked_in_kernel() {
     let maker_key = maker_sk.party_key();
     let funding = funding();
     let terms = make_terms(maker_key, 1);
-    let hash = Tx::open_hash(&funding, &terms);
+    let hash = Tx::open_hash(support::NETWORK, &funding, &terms);
     let maker_assertion = maker_sk.sign(hash).expect("fixture signing succeeds");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
@@ -106,8 +107,8 @@ fn webauthn_open_rejects_wrong_challenge() {
     let funding = funding();
     let terms = make_terms(maker_key, 1);
     let wrong_terms = make_terms(maker_key, 2);
-    let hash = Tx::open_hash(&funding, &terms);
-    let wrong_hash = Tx::open_hash(&funding, &wrong_terms);
+    let hash = Tx::open_hash(support::NETWORK, &funding, &terms);
+    let wrong_hash = Tx::open_hash(support::NETWORK, &funding, &wrong_terms);
     let maker_assertion = maker_sk.sign(wrong_hash).expect("fixture signing succeeds");
     let taker_sig = Sig::placeholder(TAKER, hash);
     let edge = Tx::edge_id_of(&funding, &terms);
@@ -141,7 +142,7 @@ fn webauthn_open_rejects_assertion_from_wrong_party_key() {
     let maker_key = maker_sk.party_key();
     let funding = funding();
     let terms = make_terms(maker_key, 1);
-    let hash = Tx::open_hash(&funding, &terms);
+    let hash = Tx::open_hash(support::NETWORK, &funding, &terms);
     let maker_assertion = wrong_sk.sign(hash).expect("fixture signing succeeds");
     let assertion_key = wrong_sk.party_key();
     let taker_sig = Sig::placeholder(TAKER, hash);
@@ -207,7 +208,7 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
         outputs.clone(),
     );
     let terms_hash = terms.hash();
-    let open_hash = Tx::open_hash(&funding, &terms);
+    let open_hash = Tx::open_hash(support::NETWORK, &funding, &terms);
     let taker_assertion = taker_sk.sign(open_hash).expect("fixture signing succeeds");
     let assertion_key = taker_sk.party_key();
     let edge = Tx::edge_id_of(&funding, &terms);
@@ -237,7 +238,13 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
         Some(15),
     );
 
-    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms_hash, &outputs);
+    let close_hash = Tx::payload_hash(
+        support::NETWORK,
+        edge,
+        CloseKind::Mutual,
+        terms_hash,
+        &outputs,
+    );
     let taker_close_assertion = taker_sk.sign(close_hash).expect("fixture signing succeeds");
     let close = Tx::close(
         edge,

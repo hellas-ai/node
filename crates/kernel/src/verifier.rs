@@ -32,6 +32,7 @@
 
 use crate::consts::MAX_EDGE_OUTPUTS;
 use crate::list::List;
+use crate::network::NetworkId;
 use crate::primitive::{EdgeId, Key, PayloadHash, ProtocolCode, Sig, TermsHash};
 use crate::terms::Terms;
 use crate::tx::{Auth, Payout, Seal};
@@ -77,6 +78,12 @@ pub trait SigVerifier {
 /// from `terms` instead of resolving it from a bare hash.
 #[derive(Debug, Clone, Copy)]
 pub struct SealPublicInputs<'a> {
+    /// The network this close settles on. A fraud proof is evidence
+    /// about one deployment's execution, so the network is one of its
+    /// public inputs: without it, a seal proving misbehaviour on a dev
+    /// chain would be admissible evidence against the identical edge on
+    /// any other.
+    pub network: NetworkId,
     /// Id of the edge being closed.
     pub edge_id: EdgeId,
     /// The closed edge's revealed terms. Hash-checked by the kernel

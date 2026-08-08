@@ -30,6 +30,7 @@ use crate::{
     error::{ApplyError, InvalidCloseReason, InvalidOpenReason, InvalidProofReason, KernelResult},
     event::Change,
     list::List,
+    network::NetworkId,
     object::{Coin, Edge},
     primitive::{CoinId, EdgeId, PayloadHash, TermsHash},
     store::Batch,
@@ -135,16 +136,22 @@ impl Tx {
     }
 
     /// Returns the canonical hash both parties must sign to authorize an
-    /// open of the edge that `funding` + `terms` would produce.
+    /// open of the edge that `funding` + `terms` would produce on
+    /// `network`.
     ///
     /// Bound to the canonical [`EdgeId`] derived from the open inputs
     /// under a distinct domain separator, so an open signature can never
     /// be replayed as anything else (a close signature, a different
-    /// edge's open, etc.).
+    /// edge's open, etc.) — and bound to [`NetworkId`], so it can never
+    /// be replayed as the same open on another network. The id alone
+    /// does not carry that: nothing stops two deployments deriving
+    /// identical coin ids from identical genesis allocations, and then
+    /// identical edge ids from them.
     #[must_use]
-    pub fn open_hash(funding: &Funding, terms: &Terms) -> PayloadHash {
+    pub fn open_hash(network: NetworkId, funding: &Funding, terms: &Terms) -> PayloadHash {
         let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::OPEN);
+        network.encode_to(&mut hasher);
         Self::edge_id_of(funding, terms).encode_to(&mut hasher);
         PayloadHash::from_bytes(hasher.finalize().into_bytes())
     }
@@ -164,9 +171,16 @@ impl Tx {
         List::take(ids, outputs.len())
     }
 
-    /// Returns the commitment signed or proven by a close witness.
+    /// Returns the commitment signed or proven by a close witness on
+    /// `network`.
+    ///
+    /// Network-bound for the same reason as [`Self::open_hash`]: a
+    /// mutual close is a signature over a payout, and a payout that is
+    /// legitimate on one network must not authorize the identical
+    /// payout on another.
     #[must_use]
     pub fn payload_hash(
+        network: NetworkId,
         input: EdgeId,
         kind: CloseKind,
         terms: TermsHash,
@@ -174,6 +188,7 @@ impl Tx {
     ) -> PayloadHash {
         let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::CLOSE);
+        network.encode_to(&mut hasher);
         input.encode_to(&mut hasher);
         kind.tag().encode_to(&mut hasher);
         terms.encode_to(&mut hasher);
@@ -369,7 +384,13 @@ where
     check_open_terms(output, &edge, terms)?;
     check_stake_bond_open(output, &edge, terms)?;
     check_open_auth(
-        output, funding, terms, parties, maker_auth, taker_auth, verifier,
+        context.network(),
+        output,
+        funding,
+        terms,
+        maker_auth,
+        taker_auth,
+        verifier,
     )?;
     Ok(Change::open(&coins, (output, edge)))
 }
@@ -475,15 +496,16 @@ fn open_lifetime_fee(context: Context, terms: &Terms) -> Result<u64, InvalidOpen
 }
 
 fn check_open_auth<V: SigVerifier + ?Sized>(
+    network: NetworkId,
     output: EdgeId,
     funding: &Funding,
     terms: &Terms,
-    parties: crate::object::Parties,
     maker_auth: &Auth,
     taker_auth: &Auth,
     verifier: &V,
 ) -> KernelResult<()> {
-    let hash = Tx::open_hash(funding, terms);
+    let hash = Tx::open_hash(network, funding, terms);
+    let parties = terms.parties();
     if !verifier.verify_auth(maker_auth, parties.maker(), hash)
         || !verifier.verify_auth(taker_auth, parties.taker(), hash)
     {
@@ -549,7 +571,13 @@ where
             if context.block_height() >= edge.timeout() {
                 return Err(InvalidProofReason::ProofExpired);
             }
-            let hash = Tx::payload_hash(input, CloseKind::Mutual, edge.terms(), outputs);
+            let hash = Tx::payload_hash(
+                context.network(),
+                input,
+                CloseKind::Mutual,
+                edge.terms(),
+                outputs,
+            );
             let parties = edge.parties();
             if verifier.verify_auth(maker, parties.maker(), hash)
                 && verifier.verify_auth(taker, parties.taker(), hash)
@@ -581,6 +609,7 @@ where
             }
             check_violation_payouts(terms, outputs)?;
             let public = SealPublicInputs {
+                network: context.network(),
                 edge_id: input,
                 terms,
                 payouts: outputs,

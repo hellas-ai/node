@@ -68,6 +68,7 @@ mod context;
 mod error;
 mod event;
 mod list;
+mod network;
 mod object;
 mod primitive;
 #[cfg(feature = "secp256k1")]
@@ -91,6 +92,7 @@ pub use error::{
 };
 pub use event::{Diff, Event, EventKind};
 pub use list::List;
+pub use network::{MAX_NETWORK_ID_LENGTH, NetworkId};
 pub use object::{Coin, Edge, Genesis, Parties};
 pub use primitive::{CoinId, EdgeId, Key, Party, PayloadHash, ProtocolCode, Sig, TermsHash};
 #[cfg(feature = "secp256k1")]

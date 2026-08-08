@@ -139,11 +139,13 @@ fn close_has_no_marginal_fee_after_zero_fee_open() {
 #[test]
 fn close_accepts_when_current_fee_exceeds_open_reserve() {
     let cheap = Context::with_fees(
+        crate::support::NETWORK,
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 1, 0),
     );
     let expensive = Context::with_fees(
+        crate::support::NETWORK,
         TIMEOUT,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 3, 0),
@@ -198,6 +200,7 @@ fn close_accepts_when_current_fee_exceeds_open_reserve() {
 #[test]
 fn close_surplus_uses_selected_close_kind() {
     let proof_priced = Context::with_fees(
+        crate::support::NETWORK,
         BlockHeight::new(1),
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 1, 0),
@@ -298,7 +301,13 @@ fn close_rejects_bad_mutual_signature_without_mutation() {
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
     // Maker's witness authorizes the wrong payload (other terms); taker's
     // is canonical. One bad witness fails the whole mutual close.
-    let bad_hash = Tx::payload_hash(edge(), CloseKind::Mutual, other_terms(), &outputs);
+    let bad_hash = Tx::payload_hash(
+        crate::support::NETWORK,
+        edge(),
+        CloseKind::Mutual,
+        other_terms(),
+        &outputs,
+    );
     let proof = Proof::mutual(
         Auth::native(Sig::placeholder(MAKER, bad_hash)),
         Auth::native(Sig::placeholder(TAKER, mutual_hash(edge(), &outputs))),
@@ -473,7 +482,13 @@ fn close_rejects_bad_dispute_seal_without_mutation() {
     // Seal bound to a non-canonical payload (different terms hash); the
     // verifier rejects with `BadSeal` rather than `TermsMismatch` because
     // the proof's own terms commitment is correct.
-    let bad_hash = Tx::payload_hash(edge(), CloseKind::Violation, other_terms(), &outputs);
+    let bad_hash = Tx::payload_hash(
+        crate::support::NETWORK,
+        edge(),
+        CloseKind::Violation,
+        other_terms(),
+        &outputs,
+    );
     let bad_seal = Seal::placeholder(PROTOCOL, CloseKind::Violation, bad_hash);
     let proof = Proof::violation(basic_terms(), bad_seal);
 

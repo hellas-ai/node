@@ -11,6 +11,12 @@ use hellas_kernel::{
     WebAuthnAssertion, WebAuthnData, Writer,
 };
 
+const NETWORK: hellas_kernel::NetworkId = match hellas_kernel::NetworkId::new("hellas-kernel-test")
+{
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
+};
+
 const fn key(byte: u8) -> Key {
     Key::from_bytes([byte; Key::LENGTH])
 }
@@ -347,7 +353,7 @@ fn id_and_hash_newtypes_decode_through_their_canonical_bytes() {
     let mut terms_hash_buf = [0; TermsHash::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&terms_hash, &mut terms_hash_buf);
 
-    let payload_hash: PayloadHash = Tx::open_hash(&funding(), &terms);
+    let payload_hash: PayloadHash = Tx::open_hash(NETWORK, &funding(), &terms);
     let mut payload_hash_buf = [0; PayloadHash::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&payload_hash, &mut payload_hash_buf);
 }

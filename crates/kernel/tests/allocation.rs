@@ -22,6 +22,7 @@ use hellas_kernel::{
 };
 
 const CONTEXT: Context = Context::new(
+    support::NETWORK,
     BlockHeight::new(1),
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
@@ -43,8 +44,13 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
     let expected_open = open_tx(funding_value, terms_value.clone(), maker_key, taker_key);
     let close_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
-    let expected_close_hash =
-        Tx::payload_hash(edge, CloseKind::Mutual, terms_value.hash(), &close_outputs);
+    let expected_close_hash = Tx::payload_hash(
+        support::NETWORK,
+        edge,
+        CloseKind::Mutual,
+        terms_value.hash(),
+        &close_outputs,
+    );
     let expected_close = Tx::close(
         edge,
         Proof::mutual(
@@ -70,7 +76,13 @@ fn open_resolve_and_operation_match_do_not_allocate() {
             BlockHeight::new(2),
             outputs.clone(),
         );
-        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+        let close_hash = Tx::payload_hash(
+            support::NETWORK,
+            edge,
+            CloseKind::Mutual,
+            terms.hash(),
+            &outputs,
+        );
         let proof = Proof::mutual(
             Auth::native(Sig::placeholder(maker_key, close_hash)),
             Auth::native(Sig::placeholder(taker_key, close_hash)),

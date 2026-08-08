@@ -64,7 +64,7 @@ fn main() {
     );
     let funding = Funding::new(party_one(maker_coin), empty_party());
     let edge_id = Tx::edge_id_of(&funding, &terms);
-    let open_hash = Tx::open_hash(&funding, &terms);
+    let open_hash = Tx::open_hash(support::NETWORK, &funding, &terms);
     let taker_assertion = taker_passkey
         .sign(open_hash)
         .expect("fixture signing succeeds");
@@ -103,7 +103,13 @@ fn main() {
     // left after the committed mutual-close fee. The passkey authorizes
     // the close payload hash the same way it authorized the open.
     let mutual_outputs = payouts2(maker_key, 30, taker_key, 15);
-    let close_hash = Tx::payload_hash(edge_id, CloseKind::Mutual, terms.hash(), &mutual_outputs);
+    let close_hash = Tx::payload_hash(
+        support::NETWORK,
+        edge_id,
+        CloseKind::Mutual,
+        terms.hash(),
+        &mutual_outputs,
+    );
     let taker_close_assertion = taker_passkey
         .sign(close_hash)
         .expect("fixture signing succeeds");
